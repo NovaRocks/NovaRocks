@@ -267,7 +267,7 @@ impl novarocks_failure_contract::FailureProjection for ExchangeReceiptError {
 /// Pure, bounded metadata for one exact stream. The caller serializes every
 /// transition with the containing instance's slot and queue transition.
 #[derive(Debug)]
-pub struct ExchangeStreamReceipt {
+pub struct ExchangeStreamReceiverState {
     custody: u64,
     handed_off: u64,
     granted: u64,
@@ -280,7 +280,7 @@ pub struct ExchangeStreamReceipt {
     position_limit: NonZeroUsize,
 }
 
-impl ExchangeStreamReceipt {
+impl ExchangeStreamReceiverState {
     pub fn try_new(position_limit: usize) -> Result<Self, ExchangeReceiptError> {
         Ok(Self {
             custody: 0,

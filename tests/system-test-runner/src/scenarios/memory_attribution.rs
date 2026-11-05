@@ -23,7 +23,7 @@ use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_memory::lane::{MAX_RECORDS, REGION_LABELS, UNATTRIBUTED_RECORDS};
 use serde::Serialize;
 use std::{
@@ -72,7 +72,7 @@ impl Scenario for ObservationFamilies {
                 sql: (*sql).into(),
                 faults: vec![],
                 observations: (0..cluster_size)
-                    .map(|index| (index, "grpc-fragment", None))
+                    .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
                     .collect(),
             })
             .collect();

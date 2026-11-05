@@ -50,6 +50,13 @@ pub(crate) struct SchemaWriterPrefixFacts {
     scratch_work: usize,
     is_flat: bool,
 }
+impl SchemaWriterPrefixFacts {
+    pub(super) fn with_reader_walker_node_bound(mut self, nodes: usize) -> Self {
+        self.walker_node_bound = nodes;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SchemaWriterAllocationFacts {
     pub schema: SchemaPreflight,
@@ -499,19 +506,10 @@ pub(super) fn reader_facts(
     prefix: SchemaWriterPrefixFacts,
 ) -> Result<SchemaWriterRequestFacts, TypeCodecError> {
     let mut requests = Requests::default();
-    // The observed strict pass uses fixed scratch. The following source count
-    // still uses the original sole structural Vec walker, bounded here.
-    // The reader owner retains its existing conservative request model.
-    walkers(
-        &mut requests,
-        if prefix.is_flat {
-            1
-        } else {
-            MAX_VALUE_TYPE_NODES
-        },
-        1,
-        None,
-    )?;
+    // The observed strict pass uses fixed scratch and counts this source's
+    // actual nodes before the sole structural Vec walker starts. Every prefix
+    // admits its known requests; the complete bound precedes the first reserve.
+    walkers(&mut requests, prefix.walker_node_bound, 1, None)?;
     let scratch = Layout::new::<[Option<WalkerEntry<'_>>; MAX_VALUE_TYPE_NODES]>().size();
     let associations = mul(
         mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,

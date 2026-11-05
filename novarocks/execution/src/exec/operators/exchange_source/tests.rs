@@ -27,14 +27,14 @@ use arrow::record_batch::RecordBatch;
 use super::*;
 use crate::exec::pipeline::binding::ExchangeBinding;
 use crate::exec::pipeline::driver::PipelineDriver;
-use crate::exec::pipeline::fragment_context::FragmentContext;
 use crate::exec::pipeline::global_driver_executor::{
-    DriverTask, FragmentCompletion, GlobalDriverExecutor,
+    DriverGroupCompletion, DriverRunner, GlobalDriverExecutor,
 };
 use crate::exec::pipeline::operator::Operator;
-use crate::runtime::fragment::io::ExchangeReceiverPort;
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
+use crate::exec::pipeline::task_context::TaskContext;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::ExchangeReceiverPort;
+use crate::runtime::task::io::exchange::test_support::Fixture;
 use novarocks_types::SlotId;
 
 fn int32_chunk(values: Vec<i32>) -> Chunk {
@@ -65,13 +65,13 @@ fn int32_wire_layout() -> novarocks_local_program::StaticLayout {
 
 fn register_int32_receiver(binding: &ExchangeBinding, fixture: &Fixture, sources: &[UniqueId]) {
     let layout = int32_wire_layout();
-    let creation_factory = fixture.creation(receiver_key(binding.key).fragment_instance_id);
+    let creation_factory = fixture.creation(receiver_key(binding.key).task_key);
     let expected_chunk_schema = creation_factory
         .create_compiled_chunk_schema(&layout)
         .unwrap();
     binding
         .receiver_port
-        .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+        .register(crate::runtime::task::io::ExchangeReceiverRegistration {
             key: receiver_key(binding.key),
             expected_senders: binding.expected_senders,
             wire_chunk_schema: expected_chunk_schema.clone(),
@@ -114,12 +114,12 @@ fn deliver_fixture_item(
     chunk: Option<Chunk>,
     end: bool,
 ) {
-    use crate::runtime::fragment::io::exchange_unit::{
+    use crate::runtime::task::io::exchange_unit::{
         ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitDemand, ExchangeUnitItem,
         ExchangeUnitReceiverFrame, ExchangeUnitSequence,
     };
     let key = receiver_key(binding.key);
-    let stream = fixture.stream(source, key.fragment_instance_id, key.node_id, ordinal);
+    let stream = fixture.stream(source, key.task_key, key.node_id, ordinal);
     let (item, payload) = if let Some(chunk) = chunk {
         let creation = fixture.creation(source);
         let schema = creation
@@ -189,7 +189,7 @@ impl crate::exec::pipeline::operator::InputEncodingPolicy for CountingSink {}
 impl crate::exec::pipeline::shape::SinkKernel for CountingSink {
     fn consume(
         &mut self,
-        _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         input: crate::exec::pipeline::input::PreparedInput,
     ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
         let rows = input.into_uncovered_chunk()?.len();
@@ -202,12 +202,12 @@ impl crate::exec::pipeline::shape::SinkKernel for CountingSink {
 }
 
 fn source_step(source: &mut Box<dyn Operator>, state: &RuntimeState) -> StepResult {
-    use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
+    use crate::exec::pipeline::driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork};
     let control = state.error_state();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
     source
         .as_mut()
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -242,7 +242,7 @@ fn wait_until_parked(parked: &crate::exec::pipeline::driver::DriverScheduleState
 fn assert_quiet_beyond_transport_deadline(
     fixture: &Fixture,
     state: &RuntimeState,
-    completion: &FragmentCompletion,
+    completion: &DriverGroupCompletion,
     parked: &crate::exec::pipeline::driver::DriverScheduleState,
     observable: &Observable,
 ) {
@@ -263,7 +263,7 @@ fn assert_quiet_beyond_transport_deadline(
     );
 }
 
-fn test_guard_failure(message: &str) -> crate::runtime::fragment::ExecutionFailure {
+fn test_guard_failure(message: &str) -> crate::runtime::task::ExecutionFailure {
     novarocks_functions::KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
         message,
     ))
@@ -277,7 +277,7 @@ fn assert_input_consumed(fixture: &Fixture, binding: &ExchangeBinding, sources: 
         .map(|(ordinal, source)| {
             fixture.stream(
                 *source,
-                receiver_key(binding.key).fragment_instance_id,
+                receiver_key(binding.key).task_key,
                 binding.key.node_id,
                 u32::try_from(ordinal).unwrap(),
             )
@@ -299,8 +299,8 @@ struct WaitingPipeline {
     state: Arc<RuntimeState>,
     observable: Arc<Observable>,
     rows: Arc<AtomicUsize>,
-    completion: Arc<FragmentCompletion>,
-    fragment: Arc<FragmentContext>,
+    completion: Arc<DriverGroupCompletion>,
+    fragment: Arc<TaskContext>,
     source: Box<dyn Operator>,
     binding: ExchangeBinding,
 }
@@ -314,18 +314,18 @@ fn waiting_pipeline(key: exchange::ExchangeKey) -> WaitingPipeline {
     };
     register_int32_receiver(&binding, &fixture, &[UniqueId::new(92_000, 1)]);
     let factory = ExchangeSourceFactory::new_compiled(key.node_id, binding.clone());
-    let state = fixture.state(receiver_key(key).fragment_instance_id);
+    let state = fixture.state(receiver_key(key).task_key);
     let (mut source, observable) = factory.create_source(0);
     source.prepare().expect("prepare exchange source");
     source
         .bind_runtime_state(&state)
         .expect("bind exchange source runtime");
     let rows = Arc::new(AtomicUsize::new(0));
-    let completion = FragmentCompletion::new(1, state.error_state());
-    let fragment = Arc::new(FragmentContext::new(
+    let completion = DriverGroupCompletion::new(1, state.error_state());
+    let fragment = Arc::new(TaskContext::new(
         None,
         Arc::clone(&state),
-        Some((key.finst_id_hi, key.finst_id_lo)),
+        Some((key.task_key_hi, key.task_key_lo)),
         None,
         None,
         None,
@@ -347,8 +347,8 @@ fn submit_waiting_pipeline(
     state: Arc<RuntimeState>,
     source: Box<dyn Operator>,
     rows: Arc<AtomicUsize>,
-    completion: Arc<FragmentCompletion>,
-    fragment: Arc<FragmentContext>,
+    completion: Arc<DriverGroupCompletion>,
+    fragment: Arc<TaskContext>,
 ) -> Arc<crate::exec::pipeline::driver::DriverScheduleState> {
     let driver = PipelineDriver::new(
         0,
@@ -361,10 +361,10 @@ fn submit_waiting_pipeline(
         None,
         Vec::new(),
         state,
-        fragment.fragment_instance_id(),
+        fragment.task_key(),
     );
     let parked = driver.schedule_state();
-    let task = DriverTask::new(driver, completion, fragment, Duration::from_millis(5));
+    let task = DriverRunner::new(driver, completion, fragment, Duration::from_millis(5));
     executor.submit(vec![task]);
     parked
 }
@@ -372,8 +372,8 @@ fn submit_waiting_pipeline(
 #[test]
 fn no_first_packet_wait_outlives_transport_deadline_and_real_data_wakes_the_pipeline() {
     let key = exchange::ExchangeKey {
-        finst_id_hi: 92_001,
-        finst_id_lo: 92_002,
+        task_key_hi: 92_001,
+        task_key_lo: 92_002,
         node_id: 92_003,
     };
     let WaitingPipeline {
@@ -424,14 +424,14 @@ fn no_first_packet_wait_outlives_transport_deadline_and_real_data_wakes_the_pipe
     assert_input_consumed(&fixture, &binding, &[UniqueId::new(92_000, 1)]);
     binding
         .receiver_port
-        .cancel_fragment(receiver_key(key).fragment_instance_id);
+        .cancel_task(receiver_key(key).task_key);
 }
 
 #[test]
 fn partial_data_stall_outlives_transport_deadline_and_real_end_rewakes_the_pipeline() {
     let key = exchange::ExchangeKey {
-        finst_id_hi: 92_011,
-        finst_id_lo: 92_012,
+        task_key_hi: 92_011,
+        task_key_lo: 92_012,
         node_id: 92_013,
     };
     let WaitingPipeline {
@@ -498,14 +498,14 @@ fn partial_data_stall_outlives_transport_deadline_and_real_end_rewakes_the_pipel
     assert_input_consumed(&fixture, &binding, &[UniqueId::new(92_000, 1)]);
     binding
         .receiver_port
-        .cancel_fragment(receiver_key(key).fragment_instance_id);
+        .cancel_task(receiver_key(key).task_key);
 }
 
 #[test]
 fn sibling_chunk_consumption_preserves_every_driver_receiver_wake_without_deadlines() {
     let key = exchange::ExchangeKey {
-        finst_id_hi: 92_021,
-        finst_id_lo: 92_022,
+        task_key_hi: 92_021,
+        task_key_lo: 92_022,
         node_id: 92_023,
     };
     let fixture = Fixture::with_runtime(runtime_with_transport_timeout(Duration::from_millis(10)));
@@ -521,7 +521,7 @@ fn sibling_chunk_consumption_preserves_every_driver_receiver_wake_without_deadli
     let (mut second, second_signal) = factory.create_source(1);
     first.prepare().unwrap();
     second.prepare().unwrap();
-    let state = fixture.state(receiver_key(key).fragment_instance_id);
+    let state = fixture.state(receiver_key(key).task_key);
     first.bind_runtime_state(&state).unwrap();
     second.bind_runtime_state(&state).unwrap();
     let first_wait = input_wait(&mut first, &state);
@@ -578,14 +578,14 @@ fn sibling_chunk_consumption_preserves_every_driver_receiver_wake_without_deadli
     assert_input_consumed(&fixture, &binding, &sources);
     binding
         .receiver_port
-        .cancel_fragment(receiver_key(key).fragment_instance_id);
+        .cancel_task(receiver_key(key).task_key);
 }
 
 #[test]
 fn original_task_failure_wakes_a_parked_source_without_input_or_idle_deadline() {
     let key = exchange::ExchangeKey {
-        finst_id_hi: 92_041,
-        finst_id_lo: 92_042,
+        task_key_hi: 92_041,
+        task_key_lo: 92_042,
         node_id: 92_043,
     };
     let WaitingPipeline {
@@ -636,7 +636,7 @@ fn original_task_failure_wakes_a_parked_source_without_input_or_idle_deadline() 
                 receiver_key(key),
                 &[fixture.stream(
                     UniqueId::new(92_000, 1),
-                    receiver_key(key).fragment_instance_id,
+                    receiver_key(key).task_key,
                     key.node_id,
                     0
                 )]
@@ -650,14 +650,14 @@ fn original_task_failure_wakes_a_parked_source_without_input_or_idle_deadline() 
     );
     binding
         .receiver_port
-        .cancel_fragment(receiver_key(key).fragment_instance_id);
+        .cancel_task(receiver_key(key).task_key);
 }
 
 #[test]
 fn every_parked_driver_observes_the_shared_three_sender_eos() {
     let key = exchange::ExchangeKey {
-        finst_id_hi: 92_031,
-        finst_id_lo: 92_032,
+        task_key_hi: 92_031,
+        task_key_lo: 92_032,
         node_id: 92_033,
     };
     let fixture = Fixture::new();
@@ -673,16 +673,16 @@ fn every_parked_driver_observes_the_shared_three_sender_eos() {
     };
     register_int32_receiver(&binding, &fixture, &sources);
     let factory = ExchangeSourceFactory::new_compiled(key.node_id, binding.clone());
-    let state = fixture.state(receiver_key(key).fragment_instance_id);
-    let fragment = Arc::new(FragmentContext::new(
+    let state = fixture.state(receiver_key(key).task_key);
+    let fragment = Arc::new(TaskContext::new(
         None,
         Arc::clone(&state),
-        Some((key.finst_id_hi, key.finst_id_lo)),
+        Some((key.task_key_hi, key.task_key_lo)),
         None,
         None,
         None,
     ));
-    let completion = FragmentCompletion::new(5, state.error_state());
+    let completion = DriverGroupCompletion::new(5, state.error_state());
     let rows = Arc::new(AtomicUsize::new(0));
     let mut parked = Vec::new();
     let mut tasks = Vec::new();
@@ -706,10 +706,10 @@ fn every_parked_driver_observes_the_shared_three_sender_eos() {
             None,
             Vec::new(),
             Arc::clone(&state),
-            fragment.fragment_instance_id(),
+            fragment.task_key(),
         );
         parked.push(driver.schedule_state());
-        tasks.push(DriverTask::new(
+        tasks.push(DriverRunner::new(
             driver,
             Arc::clone(&completion),
             Arc::clone(&fragment),
@@ -754,16 +754,16 @@ fn every_parked_driver_observes_the_shared_three_sender_eos() {
     assert_input_consumed(&fixture, &binding, &sources);
     binding
         .receiver_port
-        .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
+        .cancel_task(UniqueId::new(key.task_key_hi, key.task_key_lo));
 }
 
 #[test]
 fn compiled_factory_leaves_receiver_registration_to_the_fragment_resource_lease() {
-    // Receiver registration is acquired exactly once by FragmentResources during
+    // Receiver registration is acquired exactly once by LocalTaskResources during
     // prepare. The factory only consumes that registration through its binding.
     let key = exchange::ExchangeKey {
-        finst_id_hi: 77_001,
-        finst_id_lo: 88_002,
+        task_key_hi: 77_001,
+        task_key_lo: 88_002,
         node_id: 5,
     };
     let fixture = Fixture::new();

@@ -28,15 +28,15 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{PreparedInput, RawInput},
     shape::{ControlStep, SinkKernel, SinkStep, Transform},
     step::{AdmissionNext, NextStep, WaitFact, WaitReason},
-    step_context::StepContext,
 };
 use crate::runtime::mem_tracker::MemTracker;
 use std::sync::Arc;
@@ -128,7 +128,7 @@ impl OperatorLifecycle for UnionAllSinkOperator {
 }
 impl InputEncodingPolicy for UnionAllSinkOperator {}
 impl SinkKernel for UnionAllSinkOperator {
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if self.state.consumer_closed() {
             self.finish_producer(false);
             Ok(ControlStep::Withdrawn)
@@ -143,7 +143,7 @@ impl SinkKernel for UnionAllSinkOperator {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let observable = self.state.observable();
@@ -162,7 +162,7 @@ impl SinkKernel for UnionAllSinkOperator {
 
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let memory = self.memory.as_ref().ok_or_else(|| {
@@ -179,7 +179,7 @@ impl SinkKernel for UnionAllSinkOperator {
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.finish_producer(true);
         Ok(SinkStep::new(NextStep::Finished, 0))
     }

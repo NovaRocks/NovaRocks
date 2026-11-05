@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::TimeUnit;
 use arrow::record_batch::RecordBatch;
-use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{LogicalType, Type as ParquetPhysicalType};
@@ -37,7 +37,7 @@ fn local_binding() -> IcebergReadBinding {
         None,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime)),
+        Arc::new(TokioFileIoSpawner::new(runtime)),
     )
 }
 

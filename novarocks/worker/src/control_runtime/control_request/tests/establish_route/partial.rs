@@ -19,18 +19,18 @@
 //! not stand in for Native materialization or a credential comparison source.
 
 use super::*;
-use crate::control_runtime::context_io::CONTEXT_IO_CALLBACKS;
 use crate::control_runtime::establish_route::EstablishRouteError;
+use crate::control_runtime::participation_io::PARTICIPATION_IO_CALLBACKS;
 use novarocks_control_runtime::{
-    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
+    obligation::{ReservationObligation, WorkObligation, WorkRetirementObserver},
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::scope::{WorkAdmission, WorkKind};
 
 struct PaidMetadata {
     scope: ScopeHandle,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     retirement: WorkRetirementObserver,
 }
 impl PaidMetadata {
@@ -40,7 +40,7 @@ impl PaidMetadata {
         let resources = f.f.root.resources();
         let scope = resources.scope.clone();
         let parent = resources
-            .roles
+            .metadata_resources
             .iter()
             .find(|role| role.work.kind().unwrap() == WorkKind::Cleanup)
             .expect("the actual Root failure Cleanup author")
@@ -92,15 +92,16 @@ fn header_storage() -> StorageNeed {
 }
 
 #[test]
-fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_retirement() {
-    // Context policy contributes two Control positions, the two actual Root R
+fn a_paid_full_participation_input_returns_its_partial_report_and_survives_repeated_retirement() {
+    // Participation policy contributes two Control positions, the two actual Root R
     // positions contribute two more, and M/R have their independent positions.
     // Every position occupied by this fixture has its own actual payment.
-    let control_positions = 4 + CONTEXT_IO_CALLBACKS;
+    let control_positions = 4 + PARTICIPATION_IO_CALLBACKS;
     let occupier_need = StorageNeed {
         inputs: control_positions,
         batches: control_positions,
-        effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * control_positions,
+        effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS
+            * control_positions,
         ..header_storage()
     };
     let mut f = RouteFixture::with_geometry(
@@ -116,7 +117,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     let registration =
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .registration()
             .clone();
@@ -125,7 +126,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
             f.f.runtime
                 .reserve_admitted_input_for(
                     &registration,
-                    context_actor(),
+                    participation_actor(),
                     InputClass::Control,
                     &occupier.work,
                 )
@@ -133,7 +134,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
         );
     }
     let all_control_positions_occupied =
-        f.f.runtime.snapshot(context_actor()).unwrap().inputs == control_positions;
+        f.f.runtime.snapshot(participation_actor()).unwrap().inputs == control_positions;
     backlog.exit();
     let RouteStarted {
         input,
@@ -144,8 +145,8 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     } = f.start_route(op(11), 10, None);
     let input_capacity_refusal = matches!(
         refusal,
-        Some(ControlRequestError::Route(EstablishRouteError::Driver(
-            DriverError::InputCapacity
+        Some(ControlRequestError::Route(EstablishRouteError::ActorTurn(
+            ActorTurnError::InputCapacity
         )))
     );
     // Root holds both the newly admitted R report and its actual route-leg
@@ -182,7 +183,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     // retirement must not reap or wait for this independent ready backlog.
     let occupier_headers = f.f.ledger.reap_scope_ready(scope.id(), 1).unwrap();
     occupier.release();
-    let address = f.f.root.service().context(f.f.context).unwrap();
+    let address = f.f.root.service().participation(f.f.participation).unwrap();
     let route = address
         .lock()
         .unwrap()
@@ -192,7 +193,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     let first =
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -214,7 +215,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
         // a numeric lookup is not an idempotence capability.
         let lookup = address.lock().unwrap().advance_establish_route(input);
         let refused = matches!(lookup, Err(EstablishRouteError::WrongOwner));
-        (route.try_retire_context().unwrap(), refused)
+        (route.try_retire_participation().unwrap(), refused)
     } else {
         // Preserve actual owner-driven cleanup if the first-turn oracle
         // regresses, then report that original failure after full teardown.
@@ -240,7 +241,7 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
         .expect("the cancelled original source after actual partial retirement");
     let source_exited = thread::spawn(move || disposal.run()).join().unwrap();
     let retired = f.f.root.reap_ready_requests(32).unwrap();
-    let context_restored = scope.snapshot().unwrap().work == baseline.work - 2
+    let participation_restored = scope.snapshot().unwrap().work == baseline.work - 2
         && scope.snapshot().unwrap().storage == baseline.storage;
     f.finish_model_refusal();
 
@@ -260,13 +261,13 @@ fn a_paid_full_context_input_returns_its_partial_report_and_survives_repeated_re
     assert!(repeated_observation_kept_inventory);
     assert!(source_exited);
     assert_eq!(retired, 1);
-    assert!(context_restored);
+    assert!(participation_restored);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
 }
 
 #[test]
-fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
+fn a_route_keeps_every_escrow_unit_until_its_exact_participation_header_retires() {
     let mut f = RouteFixture::with_geometry(2, header_storage(), false);
     let mut backlog = PaidMetadata::admit(&mut f, header_storage());
     let scope = backlog.scope.clone();
@@ -274,13 +275,13 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     backlog.exit();
     let (input, mut handle, getters, drops) = f.begin_route(op(12), 100, None);
     let result = f.probe(input);
-    let address = f.f.root.service().context(f.f.context).unwrap();
+    let address = f.f.root.service().participation(f.f.participation).unwrap();
     let route = address.lock().unwrap().resources_for_test().routes[&input].clone();
-    let escrow_held = !route.context_retired();
+    let escrow_held = !route.participation_retired();
     let first =
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -301,7 +302,7 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
         // a numeric lookup is not an idempotence capability.
         let lookup = address.lock().unwrap().advance_establish_route(input);
         let refused = matches!(lookup, Err(EstablishRouteError::WrongOwner));
-        (route.try_retire_context().unwrap(), refused)
+        (route.try_retire_participation().unwrap(), refused)
     } else {
         // Preserve actual owner-driven cleanup if the first-turn oracle
         // regresses, then report that original failure after full teardown.
@@ -316,16 +317,16 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     };
     let repeated_observation_kept_inventory = scope.snapshot().unwrap() == after_first
         && dimensions.map(|dimension| f.f.ledger.used(dimension.id())) == quota_after_first;
-    let exact_refund = route.context_retired();
+    let exact_refund = route.participation_retired();
     let root_return_still_filled =
         f.f.runtime
             .input_inventory(actor(), None, 16)
             .unwrap()
             .iter()
             .filter(|record| {
-                record.source == context_actor()
+                record.source == participation_actor()
                     && record.phase == InputPhase::Filled
-                    && record.role.is_some()
+                    && record.standing_input_id.is_some()
             })
             .count()
             == 1;
@@ -341,13 +342,13 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
     // external return responsibility remain in the real Root financial Scope.
     let only_original_root_r_report =
         scope.snapshot().unwrap().storage == original_root_reports + 1;
-    f.dispose_context_metadata();
+    f.dispose_participation_metadata();
 
     f.f.runtime.poll_one(Tick(4)).unwrap();
     f.f.root.index_control_effects(64).unwrap();
     let reply = f.f.root.take_control_effect(64).unwrap().unwrap();
     let original_reply = matches!(&reply.effect, WorkerAction::ControlReply(reply)
-        if reply.request.token == input && reply.result == RequestResult::Outcome(OperationOutcome::ContextConflict));
+        if reply.request.token == input && reply.result == RequestResult::Outcome(OperationOutcome::ParticipationConflict));
     let disposal =
         f.f.root
             .begin_rejected_ingress_disposal(&reply)
@@ -364,7 +365,7 @@ fn a_route_keeps_every_escrow_unit_until_its_exact_context_header_retires() {
 
     assert!(matches!(
         result,
-        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
+        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict
     ));
     assert!(first);
     assert!(escrow_held);

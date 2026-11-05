@@ -647,10 +647,10 @@ async fn finish_future(
     ),
 ) -> CallCompletion {
     session.finish_invocations.fetch_add(1, Ordering::SeqCst);
-    let control = session.lease.session();
+    let control = session.write_stack_pin.session();
     let mut original = control.finish_write_with_needed_ready_async(
         novarocks_spi::connector::write_stack::ConnectorWriteFinishRequestRef {
-            commit: session.plan.commit_handle(),
+            commit: session.plan.commit_session(),
             prepared: &input.received.prepared,
             statistics: &input.received.statistics,
             publication: &input.publication,
@@ -684,10 +684,10 @@ async fn reconcile_future(
         Arc<ConnectorWriteNeededReadyReceiving>,
     ),
 ) -> CallCompletion {
-    let control = session.lease.session();
+    let control = session.write_stack_pin.session();
     let mut original = control.reconcile_write_with_needed_ready_async(
         ConnectorWriteSessionReconcileRequest {
-            commit: session.plan.commit_handle(),
+            commit: session.plan.commit_session(),
             evidence: input.evidence.clone(),
             context: input.context.clone(),
         },
@@ -715,9 +715,9 @@ async fn abort_future(
         Arc<CallReceiving>,
     ),
 ) -> CallCompletion {
-    let control = session.lease.session();
+    let control = session.write_stack_pin.session();
     let mut original = control.abort_write_async(ConnectorWriteSessionAbortRequest {
-        commit: session.plan.commit_handle(),
+        commit: session.plan.commit_session(),
         context: input.context.clone(),
         production: input.production,
         received: input

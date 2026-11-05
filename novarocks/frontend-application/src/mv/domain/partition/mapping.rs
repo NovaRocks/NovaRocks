@@ -30,7 +30,7 @@ use crate::mv::domain::model::AffectedTargetPartitions;
 use novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead;
 use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorChangeWindowPartitionImpact,
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
 };
 
 #[derive(Debug)]
@@ -68,7 +68,7 @@ pub(crate) fn plan_prepared_source_partitions(
     projection: &StoredKeyedMvProjection,
     source_occurrence_id: u32,
     source: &MvSourceSchemaObservation,
-    planning: &ConnectorControlPlanningLease,
+    planning: &ConnectorControlPlanningPin,
     prepared: &ConnectorPreparedSourceRead,
     target_partition: &MvPartitionContract,
 ) -> Result<AffectedTargetPartitions, ConnectorError> {

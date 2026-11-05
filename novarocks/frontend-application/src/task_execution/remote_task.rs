@@ -47,11 +47,10 @@ use novarocks_coordination_contract::{
 };
 use novarocks_execution::task_execution::{
     CancelReason, CancelTask, DomainConflict, DomainProgression, ExchangeEdgeId, OperationEnvelope,
-    OperationKind, OperationOutcome, QueryContextRef, TaskDomainUpdate, TaskIdentity,
+    OperationKind, OperationOutcome, ParticipationRef, TaskDomainUpdate, TaskIdentity,
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
 };
 
-use super::context_owner::CreateRefusalObservationHorizon;
 use super::creation::{
     CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes, plan_carrier_bytes,
 };
@@ -60,6 +59,7 @@ use super::intent::{
     AckPayload, OperationAcknowledgement, OperationIntent, TaskOperationQueuePermit,
     TaskOperationQueueRequest,
 };
+use super::participation_owner::CreateRefusalObservationHorizon;
 
 /// The three states of one remote task.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -243,13 +243,13 @@ pub struct RemoteTask {
     pub(super) cancel_queue_preparation: super::intent::TaskOperationQueuePreparation,
     pending_input: Option<PendingUpdateInput>,
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     create_envelope: OperationEnvelope,
     creation: CreationReplay,
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_remote_unknown: bool,
-    // The exact rejected Create and the already-effective context lease cut.
+    // The exact rejected Create and the already-effective participation lease cut.
     // This is immutable observation evidence, never authority for new work.
     rejected_create_observation: Option<(TaskOperationId, MonotonicInstant)>,
     create_ownership_proven: bool,
@@ -327,9 +327,9 @@ impl RemoteTask {
         outbound_destinations: Vec<(ExchangeEdgeId, TaskIdentity)>,
     ) -> Result<Self, TaskExecutionError> {
         let identity = seed.identity();
-        let context = identity
-            .verify_query_context(seed.context())
-            .map(|()| seed.context())
+        let participation = identity
+            .verify_participation(seed.participation())
+            .map(|()| seed.participation())
             .map_err(TaskExecutionError::Identity)?;
         let domains = TaskDomainIntentTracker::new(
             seed.split_plan_nodes().iter().copied(),
@@ -342,7 +342,7 @@ impl RemoteTask {
             cancel_queue_preparation: super::intent::TaskOperationQueuePreparation::new(),
             pending_input: None,
             identity,
-            context,
+            participation,
             create_envelope: OperationEnvelope::with_default_wait(
                 TaskOperationId::new_v7(),
                 OperationKind::CreateTask,
@@ -388,8 +388,8 @@ impl RemoteTask {
         self.cursor
     }
 
-    pub fn context(&self) -> QueryContextRef {
-        self.context
+    pub fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     /// Whether this task still holds a create payload: a seed it has not
@@ -449,7 +449,7 @@ impl RemoteTask {
     }
 
     /// Stops new Create and update work while preserving a possible in-flight
-    /// Create receipt and the identity that the Context fence must classify.
+    /// Create receipt and the identity that the Participation fence must classify.
     pub(crate) fn begin_normal_stand_down(&mut self) {
         self.normal_stand_down = true;
         self.create_waiting_for_establish = false;
@@ -742,7 +742,7 @@ impl RemoteTask {
     pub(crate) fn release_create(
         &mut self,
         now: MonotonicInstant,
-        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
     ) -> Result<OperationIntent, TaskExecutionError> {
         if !self.create_sendable(now) {
             return Err(TaskExecutionError::Schedule(format!(
@@ -1123,7 +1123,7 @@ impl RemoteTask {
         &mut self,
         ack: &OperationAcknowledgement,
         now: MonotonicInstant,
-        context_established: bool,
+        participation_established: bool,
         observation_horizon: Option<CreateRefusalObservationHorizon>,
     ) -> Result<CreateSettlement, TaskExecutionError> {
         if ack.kind() != OperationKind::CreateTask
@@ -1206,7 +1206,7 @@ impl RemoteTask {
                 }
                 match outcome {
                     OperationOutcome::NotReady => {
-                        self.create_waiting_for_establish = !context_established;
+                        self.create_waiting_for_establish = !participation_established;
                     }
                     OperationOutcome::PreparationBusy => {
                         self.create_busy_rejections = self.create_busy_rejections.saturating_add(1);
@@ -1248,7 +1248,7 @@ impl RemoteTask {
                         )
                     )
                     && let Some(horizon) = observation_horizon
-                    && horizon.matches_parent_acknowledgement(context_established)
+                    && horizon.matches_parent_acknowledgement(participation_established)
                     && !now.has_reached(horizon.expiry())
                 {
                     // on_create_ack has matched the original in-flight Task.
@@ -1264,7 +1264,7 @@ impl RemoteTask {
     }
 
     /// The exact Establish acknowledgement satisfies a prior NotReady reply.
-    pub(crate) fn on_context_established(&mut self) {
+    pub(crate) fn on_participation_established(&mut self) {
         self.create_waiting_for_establish = false;
     }
 
@@ -1369,7 +1369,7 @@ impl RemoteTask {
         if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
             self.stand_down_after_owner_failure();
             return Err(TaskExecutionError::OperationFailed {
-                context: self.context,
+                participation: self.participation,
                 operation_id: ack.operation_id(),
                 kind: OperationKind::CancelTask,
                 rejection: ack
@@ -1470,7 +1470,7 @@ impl RemoteTask {
 
     /// Stops business sends after owner failure without inventing terminal
     /// evidence. Existing published status and physical convergence remain
-    /// owned by the status/context channels.
+    /// owned by the status/participation channels.
     fn stand_down_after_owner_failure(&mut self) {
         self.discard_creation_after_attempt_failure();
         if !self.is_terminal() {
@@ -1547,7 +1547,7 @@ mod destination_close_tests {
         let target = identity(2, backend);
         let sibling = identity(3, backend);
         let edge = ExchangeEdgeId::new(1).unwrap();
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             producer.query_execution_id(),
             FrontendProcessId::new_v7(),
             backend,
@@ -1561,7 +1561,7 @@ mod destination_close_tests {
                 cancel_queue_preparation: Default::default(),
                 pending_input: None,
                 identity: producer,
-                context,
+                participation,
                 create_envelope: OperationEnvelope::with_default_wait(
                     TaskOperationId::new_v7(),
                     OperationKind::CreateTask,

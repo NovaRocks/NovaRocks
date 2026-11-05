@@ -23,7 +23,7 @@ use super::read::{KeyReadColumn, KeyReadValues};
 use super::{KeySpec, OwnedKeyReadBatch, checkpoint_at, invariant, original, vector};
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::{Array, ArrayRef, BinaryViewArray, StringViewArray};
 use novarocks_functions::{

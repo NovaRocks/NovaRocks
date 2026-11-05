@@ -23,8 +23,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::oneshot;
 
 use crate::{
-    BoundFile, FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, FileTask,
-    FileTaskSpawner,
+    BoundFile, FileCancellation, FileError, FileErrorKind, FileIoJob, FileIoSpawner, FileReadRange,
+    FileResult,
 };
 
 /// A completed result does not release the spawned operation's ownership.
@@ -33,7 +33,7 @@ use crate::{
 pub struct FileRangeOperation {
     cancellation: FileCancellation,
     result: Option<oneshot::Receiver<FileResult<Bytes>>>,
-    task: FileTask,
+    task: FileIoJob,
 }
 
 impl FileRangeOperation {
@@ -41,7 +41,7 @@ impl FileRangeOperation {
         file: BoundFile,
         range: FileReadRange,
         cancellation: FileCancellation,
-        spawner: &Arc<dyn FileTaskSpawner>,
+        spawner: &Arc<dyn FileIoSpawner>,
     ) -> FileResult<Self> {
         cancellation.check()?;
         let cancellation = cancellation.child();
@@ -65,7 +65,7 @@ impl FileRangeOperation {
         range: FileReadRange,
         target: BytesMut,
         cancellation: FileCancellation,
-        spawner: &Arc<dyn FileTaskSpawner>,
+        spawner: &Arc<dyn FileIoSpawner>,
     ) -> FileResult<Self> {
         Self::start_segmented_into(file, range, target, usize::MAX, cancellation, spawner)
     }
@@ -78,7 +78,7 @@ impl FileRangeOperation {
         mut target: BytesMut,
         max_segment_bytes: usize,
         cancellation: FileCancellation,
-        spawner: &Arc<dyn FileTaskSpawner>,
+        spawner: &Arc<dyn FileIoSpawner>,
     ) -> FileResult<Self> {
         cancellation.check()?;
         if max_segment_bytes == 0 {
@@ -182,7 +182,7 @@ impl FileRangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileIdentity, FileTaskFuture, FsAccessResolver, TokioFileTaskSpawner};
+    use crate::{FileIdentity, FileIoFuture, FsAccessResolver, TokioFileIoSpawner};
     use novarocks_spi::connector::StorageAccessDomainId;
 
     fn local_file() -> (tempfile::TempDir, BoundFile) {
@@ -205,8 +205,8 @@ mod tests {
     #[tokio::test]
     async fn successful_result_still_requires_an_exit_receipt() {
         let (_directory, file) = local_file();
-        let spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current()));
         let mut operation = FileRangeOperation::start(
             file,
             FileReadRange::Bounded {
@@ -228,8 +228,8 @@ mod tests {
     #[tokio::test]
     async fn fixed_target_range_is_published_only_after_exact_fill() {
         let (_directory, file) = local_file();
-        let spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current()));
         let mut operation = FileRangeOperation::start_into(
             file,
             FileReadRange::Bounded {
@@ -251,8 +251,8 @@ mod tests {
     #[tokio::test]
     async fn serial_segments_fill_one_final_backing() {
         let (_directory, file) = local_file();
-        let spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current()));
         let mut operation = FileRangeOperation::start_segmented_into(
             file,
             FileReadRange::WholeFile,
@@ -275,9 +275,9 @@ mod tests {
 
     struct PanickingSpawner;
 
-    impl FileTaskSpawner for PanickingSpawner {
-        fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
-            Ok(FileTask::new(tokio::spawn(async move {
+    impl FileIoSpawner for PanickingSpawner {
+        fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
+            Ok(FileIoJob::new(tokio::spawn(async move {
                 drop(task);
                 panic!("injected range task failure");
             })))
@@ -291,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn abnormal_task_exit_has_separate_result_and_drain_failures() {
         let (_directory, file) = local_file();
-        let spawner: Arc<dyn FileTaskSpawner> = Arc::new(PanickingSpawner);
+        let spawner: Arc<dyn FileIoSpawner> = Arc::new(PanickingSpawner);
         let source = FileCancellation::new();
         let mut operation =
             FileRangeOperation::start(file, FileReadRange::WholeFile, source.clone(), &spawner)

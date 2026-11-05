@@ -24,7 +24,7 @@ use super::aggregate_ds_hll_state::{
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
-use crate::datasketches_hll::{HllHandle, HllTargetType};
+use crate::datasketches_hll::{HllAccumulator, HllTargetType};
 use crate::datasketches_hll_failure::*;
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
@@ -48,14 +48,14 @@ pub(super) struct DsHllKernel {
 }
 /// Fields deliberately destroy library state before releasing its real charge.
 pub(super) struct DsHllState {
-    handle: Option<HllHandle>,
+    accumulator: Option<HllAccumulator>,
     charge: OpaqueRetainedCharge,
     allocator: HostAggregateAllocator,
     failed: bool,
 }
 impl DsHllState {
     fn latch(&mut self) {
-        self.handle = None;
+        self.accumulator = None;
         self.charge.release_retained();
         self.failed = true;
     }
@@ -92,22 +92,23 @@ impl<F: DsHllFailureSink<Error = EvaluationFailure>> TypedDsHllStorage<F> for Ds
     fn allocator(&self) -> HostAggregateAllocator {
         self.allocator.clone()
     }
-    fn handle(&self) -> Option<&HllHandle> {
-        self.handle.as_ref()
+    fn accumulator(&self) -> Option<&HllAccumulator> {
+        self.accumulator.as_ref()
     }
-    fn ensure_handle(
+    fn ensure_accumulator(
         &mut self,
         lg: u8,
         target: HllTargetType,
         sink: &mut F,
     ) -> Result<(), EvaluationFailure> {
-        state_core::ensure_handle(&mut self.handle, &mut self.charge, lg, target, sink).map(|_| ())
+        state_core::ensure_accumulator(&mut self.accumulator, &mut self.charge, lg, target, sink)
+            .map(|_| ())
     }
     fn update_hash(&mut self, hash: u64, sink: &mut F) -> Result<(), EvaluationFailure> {
-        state_core::update_hash(&mut self.handle, &mut self.charge, hash, sink)
+        state_core::update_hash(&mut self.accumulator, &mut self.charge, hash, sink)
     }
     fn merge_payload(&mut self, payload: &[u8], sink: &mut F) -> Result<(), EvaluationFailure> {
-        state_core::merge_payload(&mut self.handle, &mut self.charge, payload, sink)
+        state_core::merge_payload(&mut self.accumulator, &mut self.charge, payload, sink)
     }
 }
 struct RowAccess<'a> {
@@ -317,17 +318,18 @@ struct EmissionPort {
 impl EmissionPort {
     fn payload(
         &mut self,
-        handle: &HllHandle,
+        accumulator: &HllAccumulator,
         sink: &mut FailureSink<'_, '_>,
     ) -> Result<OpaquePayload, EvaluationFailure> {
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let preflight = handle.serialization_allocation_preflight_observed(&mut || {
+        let preflight = accumulator.serialization_allocation_preflight_observed(&mut || {
             sink.observe(HllObservation::Step)
         })?;
         sink.observe(HllObservation::OpaqueBoundary)?;
         let mut charge = OpaqueRetainedCharge::try_new(Arc::clone(&self.host))?;
         let mut lease = charge.reserve_operation(preflight.bounds().additional_headroom_bytes)?;
-        let payload = handle.serialize_under_reservation_with_failure(&preflight, &lease, sink)?;
+        let payload =
+            accumulator.serialize_under_reservation_with_failure(&preflight, &lease, sink)?;
         charge.reconcile_under_reservation(payload.capacity(), &mut lease)?;
         Ok(OpaquePayload {
             payload,
@@ -342,29 +344,32 @@ impl core::DsHllEmissionPort<FailureSink<'_, '_>> for EmissionPort {
         sink: &mut FailureSink<'_, '_>,
     ) -> Result<OpaquePayload, EvaluationFailure> {
         let mut state = DsHllState {
-            handle: None,
+            accumulator: None,
             charge: OpaqueRetainedCharge::try_new(Arc::clone(&self.host))?,
             allocator: self.allocator.clone(),
             failed: false,
         };
-        state_core::ensure_handle(
-            &mut state.handle,
+        state_core::ensure_accumulator(
+            &mut state.accumulator,
             &mut state.charge,
             core::DEFAULT_LOG_K,
             core::DEFAULT_TARGET_TYPE,
             sink,
         )?;
         self.payload(
-            state.handle.as_ref().expect("ds_hll handle initialized"),
+            state
+                .accumulator
+                .as_ref()
+                .expect("ds_hll accumulator initialized"),
             sink,
         )
     }
     fn serialize(
         &mut self,
-        handle: &HllHandle,
+        accumulator: &HllAccumulator,
         sink: &mut FailureSink<'_, '_>,
     ) -> Result<OpaquePayload, EvaluationFailure> {
-        self.payload(handle, sink)
+        self.payload(accumulator, sink)
     }
     fn clone_empty(
         &mut self,
@@ -392,8 +397,8 @@ impl core::DsHllEmissionStates for EmissionStates<'_> {
     fn len(&self) -> usize {
         self.0.len()
     }
-    fn handle(&self, ordinal: usize) -> Option<&HllHandle> {
-        self.0[ordinal].handle.as_ref()
+    fn accumulator(&self, ordinal: usize) -> Option<&HllAccumulator> {
+        self.0[ordinal].accumulator.as_ref()
     }
 }
 impl DsHllKernel {
@@ -524,7 +529,7 @@ impl PreparedAggregateKernel for DsHllKernel {
         let charge = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
         let allocator = HostAggregateAllocator::try_new(host)?;
         Ok(DsHllState {
-            handle: None,
+            accumulator: None,
             charge,
             allocator,
             failed: false,

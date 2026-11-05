@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_control_runtime::{
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
@@ -33,12 +33,12 @@ fn dimension() -> DimensionId {
 fn resources() -> ResourceVector {
     ResourceVector::new([(dimension(), 1)]).unwrap()
 }
-fn release(mut capacity: ReservationBundle) {
+fn release(mut capacity: ReservationObligation) {
     let resources = capacity.resources().unwrap();
     capacity.release_quota(&resources.quota).unwrap();
     capacity.finish().unwrap();
 }
-fn exit(work: &mut WorkLease) {
+fn exit(work: &mut WorkObligation) {
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
 }

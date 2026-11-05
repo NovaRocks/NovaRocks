@@ -34,7 +34,8 @@ use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_task_codec::domain::{WireCredential, stored_credential, stored_message};
 use novarocks_worker::{
-    FrozenCodecContent, HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation,
+    FrozenCodecContent, HostRejection, ReleasedParticipationEvidence,
+    RuntimeFilterReleaseObservation,
 };
 
 use crate::query_options::decode_query_options;
@@ -61,7 +62,7 @@ pub fn runtime_filter_install(
 
 pub fn sealed_runtime_filter_evidence(
     telemetry: QueryTerminalProfileContributionTelemetry,
-) -> ReleasedContextEvidence {
+) -> ReleasedParticipationEvidence {
     let observation = if telemetry.available().is_some() {
         RuntimeFilterReleaseObservation::Available
     } else {
@@ -76,7 +77,7 @@ pub fn sealed_runtime_filter_evidence(
     let digest = hasher.finalize();
     let mut fingerprint = [0u8; 16];
     fingerprint.copy_from_slice(&digest[..16]);
-    ReleasedContextEvidence::with_runtime_filter(
+    ReleasedParticipationEvidence::with_runtime_filter(
         FrozenCodecContent::new(
             RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG,
             ContentFingerprint::from_bytes(fingerprint),
@@ -87,7 +88,7 @@ pub fn sealed_runtime_filter_evidence(
 }
 
 pub fn release_runtime_filter_telemetry(
-    evidence: &ReleasedContextEvidence,
+    evidence: &ReleasedParticipationEvidence,
 ) -> Result<Option<QueryTerminalProfileContributionTelemetry>, HostRejection> {
     evidence
         .runtime_filter()
@@ -164,14 +165,14 @@ mod tests {
         runtime_filter_install,
     };
     use novarocks_execution_contract::task_execution::domain::{
-        CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+        CodecOwnedContent, CredentialDomainId, CredentialEpoch,
     };
     use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter, novarocks as proto};
     use novarocks_task_codec::domain::{WireContent, WireCredential};
     use novarocks_worker::{
-        FrozenCodecContent, ReleasedContextEvidence, RuntimeFilterReleaseObservation,
+        FrozenCodecContent, ReleasedParticipationEvidence, RuntimeFilterReleaseObservation,
     };
     use prost::Message;
     use std::sync::Arc;
@@ -210,7 +211,7 @@ mod tests {
         let material =
             WireCredential::decode(&[], FieldPath::root("credential")).expect("empty rotation");
         let update = CredentialUpdate::new(
-            CredentialLeaseId::new(1),
+            CredentialDomainId::new(1),
             CredentialEpoch::new(1).expect("epoch"),
             Arc::new(material) as Arc<dyn novarocks_execution_contract::ConfidentialContent>,
         );
@@ -225,7 +226,7 @@ mod tests {
     #[test]
     fn foreign_release_evidence_is_refused_rather_than_encoded_as_absent() {
         let foreign = WireContent::new(b"catalog", catalog::CatalogSet::default());
-        let evidence = ReleasedContextEvidence::with_runtime_filter(
+        let evidence = ReleasedParticipationEvidence::with_runtime_filter(
             FrozenCodecContent::new(
                 b"catalog",
                 foreign.fingerprint(),

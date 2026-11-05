@@ -74,7 +74,7 @@ pub(crate) fn assignment_targets(
         for placement in placements {
             entry.push(AssignmentTarget {
                 backend_idx: placement.backend_idx,
-                fragment_instance_id: placement.finst_id,
+                task_key: placement.task_key,
             });
         }
     }
@@ -164,10 +164,8 @@ impl RoundSplitSourceRecipe {
         self.access.access().requires_metadata_split_preparation()
     }
 
-    pub(crate) fn planning_lease(
-        &self,
-    ) -> &novarocks_spi::connector::ConnectorControlPlanningLease {
-        self.access.planning_lease()
+    pub(crate) fn planning_pin(&self) -> &novarocks_spi::connector::ConnectorControlPlanningPin {
+        self.access.planning_pin()
     }
 
     pub(crate) fn generation(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadBinding {
@@ -232,13 +230,13 @@ impl RoundSplitSourceRecipe {
         context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::ConnectorReadAttemptCapabilitiesFuture, ConnectorError>
     {
-        let request = crate::connector::context_for_planning_lease_typed(
-            self.access.planning_lease(),
+        let request = crate::connector::context_for_planning_pin_typed(
+            self.access.planning_pin(),
             context.clone(),
         )?;
         Ok(self.access.access().for_attempt(
             novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(request),
-            self.access.planning_lease().clone(),
+            self.access.planning_pin().clone(),
         ))
     }
     pub(crate) fn begin_split_open(
@@ -1451,7 +1449,7 @@ mod tests {
         let targets = (0..3)
             .map(|backend_idx| AssignmentTarget {
                 backend_idx,
-                fragment_instance_id: novarocks_types::UniqueId::new(17, 20 + backend_idx as i64),
+                task_key: novarocks_types::UniqueId::new(17, 20 + backend_idx as i64),
             })
             .collect();
         let mut round = RoundSplitAssignment::new(
@@ -2328,12 +2326,12 @@ mod tests {
                 sources[0].scan,
                 vec![AssignmentTarget {
                     backend_idx: 0,
-                    fragment_instance_id: round
+                    task_key: round
                         .execution()
                         .graph()
                         .task(identity.task_id())
                         .unwrap()
-                        .fragment_instance_id(),
+                        .task_key(),
                 }],
             )])
         } else {
@@ -2760,7 +2758,7 @@ mod tests {
             scan,
             vec![AssignmentTarget {
                 backend_idx: 0,
-                fragment_instance_id: novarocks_types::UniqueId::new(17, 19),
+                task_key: novarocks_types::UniqueId::new(17, 19),
             }],
         )]);
         let plan = RoundSplitAssignmentPlan::new(

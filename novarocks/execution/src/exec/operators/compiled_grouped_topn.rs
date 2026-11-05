@@ -59,14 +59,14 @@ use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{HydrateInput, Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 fn internal(detail: &str) -> ExecutionFailure {
     KernelFailure::Internal(KernelDiagnostic::new(detail)).into()
@@ -171,7 +171,7 @@ impl CompiledGroupedTopNProcessorFactory {
                 node,
                 role: ProgramNodeExpressionRole::TopNGroup {
                     group: novarocks_local_program::checked_program_ordinal(group)
-                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                        .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
                 },
             });
         }
@@ -182,7 +182,7 @@ impl CompiledGroupedTopNProcessorFactory {
                 node,
                 role: ProgramNodeExpressionRole::TopNOrder {
                     key: novarocks_local_program::checked_program_ordinal(ordinal)
-                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                        .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
                 },
             };
             let ty = root_value_type(&program, site)?;
@@ -211,7 +211,7 @@ impl CompiledGroupedTopNProcessorFactory {
         let mut calls = Vec::new();
         for (ordinal, source) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             let Some(ProgramStateTemplate::Aggregate { scope, kernel }) =
                 program.state_template(ProgramCallSite::TopNState { node, call })
             else {
@@ -674,7 +674,7 @@ impl InputEncodingPolicy for CompiledGroupedTopNProcessor {}
 impl TransformKernel for CompiledGroupedTopNProcessor {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -693,7 +693,7 @@ impl TransformKernel for CompiledGroupedTopNProcessor {
         self.latch(result)?;
         Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
@@ -703,10 +703,9 @@ impl TransformKernel for CompiledGroupedTopNProcessor {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        let result = ctx.perform(
-            crate::runtime::fragment::PipelineOperation::Finishing,
-            |_| self.emit_candidate(index),
-        );
+        let result = ctx.perform(crate::runtime::task::PipelineOperation::Finishing, |_| {
+            self.emit_candidate(index)
+        });
         if let Err(error) = &result {
             ctx.report_failure(error.clone());
         }
@@ -727,7 +726,7 @@ impl TransformKernel for CompiledGroupedTopNProcessor {
         };
         Ok(StepResult::new(Some(output), next, 0))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }

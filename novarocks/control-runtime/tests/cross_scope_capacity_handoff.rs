@@ -22,10 +22,10 @@
 //! distinct facts in the same ledger.
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
-    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
+    exit_custody::{ExitCustody, ExitCustodyPhase, ExitObligation},
+    obligation::{ReservationObligation, WorkObligation, WorkRetirementObserver},
     reported_work::{ReportedWork, ReportedWorkBindingError},
-    transaction::{RoleSpec, RuntimeLedger, ScopeHandle},
+    transaction::{DeclaredInput, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
@@ -63,14 +63,14 @@ fn reservation(
 fn consumer(n: u64) -> ConsumerId {
     ConsumerId::new(n).unwrap()
 }
-fn release(mut capacity: ReservationBundle) {
+fn release(mut capacity: ReservationObligation) {
     let held = capacity.resources().unwrap();
     capacity.release_quota(&held.quota).unwrap();
     capacity.finish().unwrap();
 }
 struct Original {
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     report: ReportSlot,
 }
 struct Fixture {
@@ -78,10 +78,10 @@ struct Fixture {
     root: ScopeHandle,
     context: ScopeHandle,
     rpc: Option<Original>,
-    admission_work: WorkLease,
-    admission_capacity: ReservationBundle,
-    context_work: WorkLease,
-    context_capacity: ReservationBundle,
+    admission_work: WorkObligation,
+    admission_capacity: ReservationObligation,
+    context_work: WorkObligation,
+    context_capacity: ReservationObligation,
     context_report: ReportSlot,
     route: Option<Original>,
 }
@@ -135,7 +135,7 @@ impl Fixture {
             .reserve_child_from(
                 &mut route_funding,
                 &context_work,
-                RoleSpec {
+                DeclaredInput {
                     generation: generation(),
                     kind: WorkKind::Settlement,
                     resources: reservation(2, 1, 1, 1),
@@ -172,7 +172,14 @@ impl Fixture {
             }),
         }
     }
-    fn take_route(&mut self) -> (ExitRole, ExitAuthority, ReportSlot, WorkRetirementObserver) {
+    fn take_route(
+        &mut self,
+    ) -> (
+        ExitCustody,
+        ExitObligation,
+        ReportSlot,
+        WorkRetirementObserver,
+    ) {
         let Original {
             work,
             capacity,
@@ -181,7 +188,7 @@ impl Fixture {
         let retired = work.retirement_observer();
         let observed_report = report.clone();
         let (role, mut authority) =
-            ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report).unwrap());
+            ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report).unwrap());
         authority.start().unwrap();
         (role, authority, observed_report, retired)
     }
@@ -193,7 +200,7 @@ impl Fixture {
         } = self.rpc.take().unwrap();
         let retired = work.retirement_observer();
         let (role, mut authority) =
-            ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report).unwrap());
+            ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report).unwrap());
         authority.start().unwrap();
         authority.exited().unwrap();
         assert!(
@@ -253,7 +260,7 @@ fn the_rpc_retires_independently_while_the_transferred_capacity_waits_for_the_re
     let (role, authority, report, retired) = f.take_route();
     let rpc_retired = f.finish_rpc();
     assert!(rpc_retired.is_retired());
-    assert_eq!(role.phase(), ExitRolePhase::Started);
+    assert_eq!(role.phase(), ExitCustodyPhase::Started);
     assert!(!role.actual_exit_ready().unwrap());
     assert!(!role.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 3);
@@ -282,7 +289,7 @@ fn the_rpc_retires_independently_while_the_transferred_capacity_waits_for_the_re
     assert_eq!(f.ledger.used(dimension()), 3);
     report.consume(consumer(2)).unwrap();
     assert!(role.try_retire().unwrap());
-    assert_eq!(role.phase(), ExitRolePhase::Retired);
+    assert_eq!(role.phase(), ExitCustodyPhase::Retired);
     assert_eq!(
         f.ledger.used(dimension()),
         1,

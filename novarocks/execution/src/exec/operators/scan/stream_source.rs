@@ -34,7 +34,7 @@ use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::node::scan::ScanExitObservation;
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -57,17 +57,17 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::shape::{Source, SourceKernel};
 use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
-use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::scan_stream_metrics::{ScanStreamPending, observe_scan_stream_pending};
+use crate::runtime::task::io::{NoopTaskEventSink, TaskEventSink};
 
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
 #[cfg(test)]
 pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 =
-    crate::exec::pipeline::step_context::DEFAULT_TURN_WORK_UNITS as u64;
+    crate::exec::pipeline::driver_step::DEFAULT_TURN_WORK_UNITS as u64;
 
 /// The operator and profile name of a scan source, always carrying the plan
 /// node id.
@@ -232,7 +232,7 @@ impl OperatorFactory for StreamScanSourceFactory {
             filter: self.filter.for_driver(),
             rows_emitted: 0,
             profiles: None,
-            event_sink: Arc::new(NoopFragmentEventSink),
+            event_sink: Arc::new(NoopTaskEventSink),
             runtime_error: None,
             output_tracker_label: format!(
                 "scan_stream_output node={} driver={driver_id}",
@@ -441,7 +441,7 @@ struct StreamScanSourceOperator {
     source: Arc<dyn ScanStreamSource>,
     stage: StreamStage,
     /// The exit observation of an ended stream, until it resolves.
-    closing: Option<BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>>>,
+    closing: Option<BoxFuture<'static, crate::runtime::task::ExecutionResult<()>>>,
     close_phase: ExitFuturePhase,
     close_result: Option<ExecutionResult<()>>,
     /// Acquired before close consumes the stream; retained across a close panic.
@@ -460,7 +460,7 @@ struct StreamScanSourceOperator {
     filter: ScanDriverFilter,
     rows_emitted: usize,
     profiles: Option<OperatorProfiles>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
     runtime_error: Option<Arc<RuntimeErrorState>>,
     output_tracker_label: String,
     /// Charges every chunk this source hands downstream to the fragment.
@@ -595,7 +595,7 @@ impl OperatorLifecycle for StreamScanSourceOperator {
         self.profiles = Some(profiles);
     }
 
-    fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
+    fn set_task_event_sink(&mut self, sink: Arc<dyn TaskEventSink>) {
         self.event_sink = sink;
     }
 
@@ -746,7 +746,7 @@ impl SourceKernel for StreamScanSourceOperator {
     }
     fn poll_control(
         &mut self,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<crate::exec::pipeline::shape::ControlStep> {
         if self.poll_actual_exit() {
             resume_exit_unwind();
@@ -756,7 +756,7 @@ impl SourceKernel for StreamScanSourceOperator {
     }
     fn poll_output(
         &mut self,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         if matches!(self.stage, StreamStage::Ended) {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
@@ -980,7 +980,7 @@ mod tests {
     #[derive(Default)]
     struct StreamControl {
         chunks: Mutex<VecDeque<Chunk>>,
-        error: Mutex<Option<crate::runtime::fragment::ExecutionFailure>>,
+        error: Mutex<Option<crate::runtime::task::ExecutionFailure>>,
         close_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         observation_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         termination_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -1058,7 +1058,7 @@ mod tests {
 
     async fn observe_fixture_source(
         operations: novarocks_spi::connector::read_stack::ConnectorSourceOperations,
-        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+        failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
     ) -> crate::exec::node::scan::ScanExitProof {
         use novarocks_spi::connector::read_stack::{
             ConnectorSourceExitProof, ConnectorSourceFailureEvent,
@@ -1071,11 +1071,11 @@ mod tests {
         futures::future::poll_fn(move |cx| {
             if !events_ended { loop { match events.poll_event(cx) {
                 Poll::Ready(Some(ConnectorSourceFailureEvent::Required(cause))) => failures.report_failure(
-                    crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                        crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into()),
+                    crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                        crate::runtime::task::connector_failure::ConnectorOperation::SourceExit,cause).into()),
                 Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(cause))) => {
-                    let cause = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                        crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into();
+                    let cause = crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                        crate::runtime::task::connector_failure::ConnectorOperation::SourceExit,cause).into();
                     failures.report_cleanup(&cause); failures.report_unresolved_exit(&cause);
                 }
                 Poll::Ready(None) => {events_ended=true;break;}, Poll::Pending=>break,
@@ -1092,7 +1092,7 @@ mod tests {
     impl ScanChunkStream for ScriptedStream {
         fn take_exit_observation(
             self: Pin<&mut Self>,
-            failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+            failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
         ) -> ExecutionResult<ScanExitObservation> {
             let check = self.control.observation_check.lock().unwrap().take();
             if let Some(check) = check {
@@ -1112,8 +1112,8 @@ mod tests {
         }
         fn close(
             self: Pin<Box<Self>>,
-            _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
-        ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>> {
+            _failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
+        ) -> BoxFuture<'static, crate::runtime::task::ExecutionResult<()>> {
             let check = self.control.close_check.lock().unwrap().take();
             if let Some(check) = check {
                 check();
@@ -1190,7 +1190,7 @@ mod tests {
             }
         }
 
-        fn terminate(&self) -> crate::runtime::fragment::ExecutionResult<()> {
+        fn terminate(&self) -> crate::runtime::task::ExecutionResult<()> {
             self.source
                 .control
                 .terminations
@@ -1221,7 +1221,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -1233,7 +1233,7 @@ mod tests {
         }
         fn finish(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             if let Some(finish) = self.on_finish.take() {
                 finish();
@@ -1806,9 +1806,7 @@ mod tests {
     #[test]
     fn originating_read_error_is_returned_unchanged_when_close_construction_unwinds() {
         use crate::exec::pipeline::operator::ExitProgress;
-        use crate::runtime::fragment::connector_failure::{
-            ConnectorCallFailure, ConnectorOperation,
-        };
+        use crate::runtime::task::connector_failure::{ConnectorCallFailure, ConnectorOperation};
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         let state = RuntimeState::default();
         let control = Arc::new(StreamControl::default());
@@ -1950,11 +1948,11 @@ mod tests {
 
     #[test]
     fn close_construction_panic_cannot_publish_driver_stopped_before_the_source_operation_exits() {
-        use crate::exec::pipeline::fragment_context::FragmentContext;
         use crate::exec::pipeline::global_driver_executor::{
-            DriverTask, FragmentCompletion, GlobalDriverExecutor,
+            DriverGroupCompletion, DriverRunner, GlobalDriverExecutor,
         };
-        use crate::runtime::fragment::ExecutionFailure;
+        use crate::exec::pipeline::task_context::TaskContext;
+        use crate::runtime::task::ExecutionFailure;
 
         let mut pipeline = pipeline();
         let control = pipeline.control.clone();
@@ -1980,8 +1978,8 @@ mod tests {
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         state.error_state().set_error(original.clone());
-        let completion = FragmentCompletion::new(1, state.error_state());
-        let context = Arc::new(FragmentContext::new(
+        let completion = DriverGroupCompletion::new(1, state.error_state());
+        let context = Arc::new(TaskContext::new(
             None,
             state.clone(),
             None,
@@ -1989,14 +1987,14 @@ mod tests {
             None,
             None,
         ));
-        let task = DriverTask::new(pipeline.driver, completion.clone(), context, TURN);
+        let task = DriverRunner::new(pipeline.driver, completion.clone(), context, TURN);
 
         // A second real DriverTask on the same one-worker queue is a barrier:
         // its stopped notification follows the scan driver's stop/park turn.
         // It does not manufacture completion for the scan or its operation.
         let barrier_state = Arc::new(RuntimeState::default());
-        let barrier_completion = FragmentCompletion::new(1, barrier_state.error_state());
-        let barrier_context = Arc::new(FragmentContext::new(
+        let barrier_completion = DriverGroupCompletion::new(1, barrier_state.error_state());
+        let barrier_context = Arc::new(TaskContext::new(
             None,
             barrier_state.clone(),
             None,
@@ -2006,7 +2004,7 @@ mod tests {
         ));
         let barrier_driver =
             PipelineDriver::new(2, Vec::new(), None, Vec::new(), barrier_state, None);
-        let barrier_task = DriverTask::new(
+        let barrier_task = DriverRunner::new(
             barrier_driver,
             barrier_completion.clone(),
             barrier_context,
@@ -2014,8 +2012,8 @@ mod tests {
         );
         let (barrier_sent, barrier_received) = mpsc::channel();
         let mut barrier_finisher: Option<
-            crate::exec::pipeline::global_driver_executor::once_role::Callback<
-                crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
+            crate::exec::pipeline::global_driver_executor::completion_custody::Callback<
+                crate::exec::pipeline::global_driver_executor::DriverGroupStoppedFact,
             >,
         > = Some(Box::new(move |fact| {
             let _ = barrier_sent.send(fact.clone());
@@ -2076,7 +2074,7 @@ mod tests {
 
     #[test]
     fn an_original_background_work_failure_wakes_the_live_scan_before_any_close() {
-        use crate::runtime::fragment::connector_failure::ConnectorOperation;
+        use crate::runtime::task::connector_failure::ConnectorOperation;
         use novarocks_spi::connector::{
             ConnectorError, ConnectorErrorKind, read_stack::ConnectorOperationExit,
         };
@@ -2106,8 +2104,7 @@ mod tests {
             .state
             .error()
             .expect("the original runtime already accepted the work author");
-        let crate::runtime::fragment::ExecutionFailureCause::Connector(cause) = original.cause()
-        else {
+        let crate::runtime::task::ExecutionFailureCause::Connector(cause) = original.cause() else {
             panic!("the real SourceExit author remains typed");
         };
         assert_eq!(cause.operation(), ConnectorOperation::SourceExit);
@@ -2128,10 +2125,8 @@ mod tests {
 
     #[test]
     fn originating_read_failure_is_visible_before_close_and_keeps_its_step_location() {
-        use crate::runtime::fragment::connector_failure::{
-            ConnectorCallFailure, ConnectorOperation,
-        };
-        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use crate::runtime::task::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+        use crate::runtime::task::{ExecutionFailure, PipelineOperation};
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         let mut pipeline = pipeline();
         let original: ExecutionFailure = ConnectorCallFailure::new(
@@ -2264,7 +2259,7 @@ mod tests {
     #[test]
     fn actual_stream_close_outcome_stays_immutable_after_operation_exit() {
         use crate::exec::pipeline::operator::ExitProgress;
-        use crate::runtime::fragment::connector_failure::ConnectorOperation;
+        use crate::runtime::task::connector_failure::ConnectorOperation;
         use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
         for fail in [false, true] {
             let control = Arc::new(StreamControl::default());
@@ -2299,8 +2294,7 @@ mod tests {
             let original = state.error();
             assert_eq!(original.is_some(), fail);
             if let Some(error) = &original {
-                let crate::runtime::fragment::ExecutionFailureCause::Connector(source) =
-                    error.cause()
+                let crate::runtime::task::ExecutionFailureCause::Connector(source) = error.cause()
                 else {
                     panic!("the actual SourceExit domain remains intact");
                 };
@@ -2518,7 +2512,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for GatedSink {
         fn admission(
             &self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             _: &crate::exec::pipeline::input::RawInput,
         ) -> ExecutionResult<Option<crate::exec::pipeline::step::AdmissionNext>> {
             let generation = self.observable.generation();
@@ -2533,7 +2527,7 @@ mod tests {
         }
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -2613,7 +2607,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for BlockingSink {
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;

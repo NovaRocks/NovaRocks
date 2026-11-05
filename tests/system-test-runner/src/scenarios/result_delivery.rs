@@ -20,7 +20,7 @@ use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextR
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use anyhow::{Context, Result, ensure};
-use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
 use novarocks_proto_models::{novarocks as proto, result as result_proto};
 use prost::Message;
@@ -61,11 +61,13 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         )),
         Box::new(WireBoundary("result-delivery/large-row-cross-u24")),
         Box::new(RootReadRefusal),
-        Box::new(ContextRootRetention::new(RootProtocolMode::None)),
-        Box::new(ContextRootRetention::new(RootProtocolMode::ZeroAck)),
-        Box::new(ContextRootRetention::new(RootProtocolMode::FinalAck)),
-        Box::new(ContextRootRetention::new(RootProtocolMode::OneByte)),
-        Box::new(ContextRootRetention::new(RootProtocolMode::MinimumNewRow)),
+        Box::new(ParticipationRootRetention::new(RootProtocolMode::None)),
+        Box::new(ParticipationRootRetention::new(RootProtocolMode::ZeroAck)),
+        Box::new(ParticipationRootRetention::new(RootProtocolMode::FinalAck)),
+        Box::new(ParticipationRootRetention::new(RootProtocolMode::OneByte)),
+        Box::new(ParticipationRootRetention::new(
+            RootProtocolMode::MinimumNewRow,
+        )),
     ]
 }
 
@@ -593,9 +595,9 @@ enum RootProtocolMode {
     OneByte,
     MinimumNewRow,
 }
-struct ContextRootRetention(RootProtocolMode, SqlIntentOwner);
+struct ParticipationRootRetention(RootProtocolMode, SqlIntentOwner);
 
-impl Scenario for ContextRootRetention {
+impl Scenario for ParticipationRootRetention {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
             "result_delivery",
@@ -607,7 +609,7 @@ impl Scenario for ContextRootRetention {
 
     fn name(&self) -> &'static str {
         match self.0 {
-            RootProtocolMode::None => "result-delivery/producer-exit-context-retention",
+            RootProtocolMode::None => "result-delivery/producer-exit-participation-retention",
             RootProtocolMode::OneByte => "result-delivery/one-byte-continuation-normal-wire",
             RootProtocolMode::MinimumNewRow => "result-delivery/minimum-new-row-normal-wire",
             RootProtocolMode::ZeroAck => "result-delivery/installed-root-zero-ack-normal-wire",
@@ -634,7 +636,7 @@ impl Scenario for ContextRootRetention {
                 sql: manifest.sql,
                 faults: vec![],
                 observations: (0..cluster_size)
-                    .map(|index| (index, "grpc-fragment", None))
+                    .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
                     .collect(),
             }],
             &[],
@@ -662,7 +664,7 @@ impl Scenario for ContextRootRetention {
     }
 }
 
-impl ContextRootRetention {
+impl ParticipationRootRetention {
     fn new(mode: RootProtocolMode) -> Self {
         Self(mode, SqlIntentOwner::default())
     }

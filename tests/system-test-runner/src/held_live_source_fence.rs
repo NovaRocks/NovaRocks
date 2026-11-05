@@ -312,7 +312,25 @@ impl SourceFenceOwner {
         self.phase(Phase::Prepared, deadline)?;
         self.write_line(
             output,
-            b"NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase=prepared sequence=1\n",
+            &const {
+                let marker =
+                    novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE.as_bytes();
+                let suffix = b" phase=prepared sequence=1\n";
+                let mut bytes = [0;
+                    novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE.len()
+                        + b" phase=prepared sequence=1\n".len()];
+                let mut index = 0;
+                while index < marker.len() {
+                    bytes[index] = marker[index];
+                    index += 1;
+                }
+                let mut suffix_index = 0;
+                while suffix_index < suffix.len() {
+                    bytes[index + suffix_index] = suffix[suffix_index];
+                    suffix_index += 1;
+                }
+                bytes
+            },
             deadline,
         )?;
         self.wait_ack(deadline)?;
@@ -336,7 +354,8 @@ impl SourceFenceOwner {
             let mut cursor = io::Cursor::new(&mut line[..]);
             if let Err(error) = writeln!(
                 cursor,
-                "NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER role={role} dev={dev} ino={ino}"
+                "{} role={role} dev={dev} ino={ino}",
+                novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_LOG_OWNER
             ) {
                 return self.sticky(failure(FailureClass::Io, Some(error)));
             }
@@ -364,8 +383,11 @@ impl SourceFenceOwner {
             let mut cursor = io::Cursor::new(&mut line[..]);
             if let Err(error) = writeln!(
                 cursor,
-                "NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase={phase} sequence={sequence} sizes={},{},{}",
-                sizes[0], sizes[1], sizes[2]
+                "{} phase={phase} sequence={sequence} sizes={},{},{}",
+                novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE,
+                sizes[0],
+                sizes[1],
+                sizes[2]
             ) {
                 return self.sticky(failure(FailureClass::Io, Some(error)));
             }

@@ -25,7 +25,7 @@ use super::FragmentId;
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
-use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::{ExchangeEdgeId, ParticipationRef, TaskIdentity};
 use novarocks_query_application::api::{NativeScanWork, PlanScanIdentity};
 use novarocks_query_application::coordination::{
     AttemptSchedule, ScheduledFrozenUnits, ScheduledScanAssignment,
@@ -36,9 +36,7 @@ use novarocks_types::{NativeCompatibilityId, UniqueId};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
-use super::{
-    PreparedDistributedNativeTemplate, RequestBoundNativeTemplate, derive_fragment_instance_id,
-};
+use super::{PreparedDistributedNativeTemplate, RequestBoundNativeTemplate, derive_task_key};
 
 /// Exact process-local facts frozen with one backend in the dormant attempt.
 /// Acquire/establish code consumes this value without consulting live
@@ -104,16 +102,16 @@ impl BoundWriterCohort {
     }
 }
 
-/// One exact scheduled context and its complete frozen backend facts.
+/// One exact scheduled participation and its complete frozen backend facts.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct BoundManifestContext {
-    context: QueryContextRef,
+pub(crate) struct BoundManifestParticipation {
+    participation: ParticipationRef,
     backend: BoundManifestBackend,
 }
 
-impl BoundManifestContext {
-    pub(crate) const fn context(&self) -> QueryContextRef {
-        self.context
+impl BoundManifestParticipation {
+    pub(crate) const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub(crate) const fn backend(&self) -> &BoundManifestBackend {
@@ -176,10 +174,10 @@ impl BoundManifestScanWork {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct BoundManifestTask {
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     fragment_id: FragmentId,
     instance_index: usize,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     scan_work: Box<[BoundManifestScanWork]>,
 }
 
@@ -188,8 +186,8 @@ impl BoundManifestTask {
         self.identity
     }
 
-    pub(crate) const fn context(&self) -> QueryContextRef {
-        self.context
+    pub(crate) const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub(crate) const fn fragment_id(&self) -> FragmentId {
@@ -200,8 +198,8 @@ impl BoundManifestTask {
         self.instance_index
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub(crate) const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub(crate) fn scan_work(&self) -> &[BoundManifestScanWork] {
@@ -378,14 +376,14 @@ impl FrozenAttemptTopology {
 /// This value does not submit RPCs, open split sources, or obtain credentials.
 /// It consumes and retains the exact static Native template so later encoding
 /// cannot pair the validated manifest with another logical execution. The
-/// template carries no Connector attempt access or planning lease.
+/// template carries no Connector attempt access or planning pin.
 pub(crate) struct TaskManifestBinding {
     execution: QueryExecutionId,
     topology_revision: u64,
     eligible_backends: Box<[BackendProcessId]>,
     native_template: RequestBoundNativeTemplate,
     tasks: Box<[BoundManifestTask]>,
-    contexts: Box<[BoundManifestContext]>,
+    participations: Box<[BoundManifestParticipation]>,
     edges: Box<[BoundManifestEdge]>,
     root: TaskIdentity,
 }
@@ -397,7 +395,7 @@ impl std::fmt::Debug for TaskManifestBinding {
             .field("execution", &self.execution)
             .field("topology_revision", &self.topology_revision)
             .field("task_count", &self.tasks.len())
-            .field("context_count", &self.contexts.len())
+            .field("context_count", &self.participations.len())
             .field("edge_count", &self.edges.len())
             .field("root", &self.root)
             .finish_non_exhaustive()
@@ -415,10 +413,10 @@ impl TaskManifestBinding {
             self.execution == schedule.execution()
                 && self.root == schedule.root()
                 && self
-                    .contexts
+                    .participations
                     .iter()
-                    .map(|context| context.context())
-                    .eq(schedule.contexts().iter().copied())
+                    .map(|participation| participation.participation())
+                    .eq(schedule.participations().iter().copied())
                 && self.tasks.len()
                     == schedule
                         .fragments()
@@ -435,7 +433,7 @@ impl TaskManifestBinding {
                         bound.fragment_id == fragment.fragment_id()
                             && bound.identity.stage_id() == fragment.stage_id()
                             && bound.identity == task.identity()
-                            && bound.context == task.context()
+                            && bound.participation == task.participation()
                             && bound.instance_index == task.instance_index()
                             && bound.scan_work.len() == task.scan_work().len()
                             && bound
@@ -544,8 +542,8 @@ impl TaskManifestBinding {
         second: UniqueId,
     ) -> Result<(), DistributedQueryError> {
         let mut seen = BTreeSet::new();
-        derive_and_record_fragment_instance_id(&mut seen, || Ok(first))?;
-        derive_and_record_fragment_instance_id(&mut seen, || Ok(second))?;
+        derive_and_record_task_key(&mut seen, || Ok(first))?;
+        derive_and_record_task_key(&mut seen, || Ok(second))?;
         Ok(())
     }
 
@@ -594,13 +592,13 @@ impl TaskManifestBinding {
         let mut task_identities = BTreeSet::new();
         let mut tasks_by_fragment = BTreeMap::<FragmentId, Vec<TaskIdentity>>::new();
         let mut task_fragment = BTreeMap::<TaskIdentity, FragmentId>::new();
-        let mut expected_contexts = BTreeSet::new();
-        let mut context_by_backend = BTreeMap::<BackendProcessId, QueryContextRef>::new();
+        let mut expected_participations = BTreeSet::new();
+        let mut participation_by_backend = BTreeMap::<BackendProcessId, ParticipationRef>::new();
         let mut fragment_tasks = BTreeMap::<FragmentId, Vec<ProjectedTask>>::new();
         let mut fragment_scan_assignments =
             BTreeMap::<PlanScanIdentity, BTreeMap<usize, ProjectedScanAssignment>>::new();
         let mut bound_tasks = Vec::new();
-        let mut fragment_instance_ids = BTreeSet::new();
+        let mut task_keys = BTreeSet::new();
 
         for fragment in schedule.fragments {
             if !scheduled_fragments.insert(fragment.fragment_id) {
@@ -627,7 +625,7 @@ impl TaskManifestBinding {
                     expected_execution,
                     fragment.stage_id,
                     task.identity,
-                    task.context,
+                    task.participation,
                 )?;
                 if !instance_indices.insert(task.instance_index) {
                     return Err(contract_error(format!(
@@ -654,27 +652,26 @@ impl TaskManifestBinding {
                         task.identity
                     )));
                 }
-                if let Some(previous) = context_by_backend.insert(backend, task.context)
-                    && previous != task.context
+                if let Some(previous) = participation_by_backend.insert(backend, task.participation)
+                    && previous != task.participation
                 {
                     return Err(contract_error(format!(
-                        "attempt manifest backend process {backend} is assigned multiple query contexts"
+                        "attempt manifest backend process {backend} is assigned multiple participations"
                     )));
                 }
-                expected_contexts.insert(task.context);
+                expected_participations.insert(task.participation);
                 tasks_by_fragment
                     .entry(fragment.fragment_id)
                     .or_default()
                     .push(task.identity);
                 task_fragment.insert(task.identity, fragment.fragment_id);
-                let fragment_instance_id =
-                    derive_and_record_fragment_instance_id(&mut fragment_instance_ids, || {
-                        derive_fragment_instance_id(
-                            expected_execution,
-                            fragment.fragment_id,
-                            task.instance_index,
-                        )
-                    })?;
+                let task_key = derive_and_record_task_key(&mut task_keys, || {
+                    derive_task_key(
+                        expected_execution,
+                        fragment.fragment_id,
+                        task.instance_index,
+                    )
+                })?;
                 let mut task_scans = BTreeSet::new();
                 let mut bound_scan_work = Vec::new();
                 for scan_work in &task.scan_work {
@@ -722,10 +719,10 @@ impl TaskManifestBinding {
                 }
                 bound_tasks.push(BoundManifestTask {
                     identity: task.identity,
-                    context: task.context,
+                    participation: task.participation,
                     fragment_id: fragment.fragment_id,
                     instance_index: task.instance_index,
-                    fragment_instance_id,
+                    task_key,
                     scan_work: bound_scan_work.into_boxed_slice(),
                 });
             }
@@ -747,31 +744,38 @@ impl TaskManifestBinding {
             ));
         }
 
-        let actual_contexts = schedule.contexts.iter().copied().collect::<BTreeSet<_>>();
-        if actual_contexts.len() != schedule.contexts.len() {
-            return Err(contract_error("attempt manifest repeats a query context"));
+        let actual_participations = schedule
+            .participations
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if actual_participations.len() != schedule.participations.len() {
+            return Err(contract_error("attempt manifest repeats a participation"));
         }
-        if actual_contexts != expected_contexts {
+        if actual_participations != expected_participations {
             return Err(contract_error(format!(
-                "attempt manifest context set mismatch: expected={expected_contexts:?} actual={actual_contexts:?}"
+                "attempt manifest participation set mismatch: expected={expected_participations:?} actual={actual_participations:?}"
             )));
         }
-        let mut bound_contexts = Vec::with_capacity(schedule.contexts.len());
-        for context in schedule.contexts {
-            if context.query_execution_id() != expected_execution {
+        let mut bound_participations = Vec::with_capacity(schedule.participations.len());
+        for participation in schedule.participations {
+            if participation.query_execution_id() != expected_execution {
                 return Err(contract_error(format!(
-                    "attempt manifest context {context} belongs to another execution"
+                    "attempt manifest participation {participation} belongs to another execution"
                 )));
             }
             let backend = endpoint_by_process
-                .get(&context.backend_process_id())
+                .get(&participation.backend_process_id())
                 .cloned()
                 .ok_or_else(|| {
                     contract_error(format!(
-                        "attempt manifest context {context} names a backend absent from the frozen endpoint snapshot"
+                        "attempt manifest participation {participation} names a backend absent from the frozen endpoint snapshot"
                     ))
                 })?;
-            bound_contexts.push(BoundManifestContext { context, backend });
+            bound_participations.push(BoundManifestParticipation {
+                participation,
+                backend,
+            });
         }
 
         let root_fragment = task_fragment.get(&schedule.root).copied().ok_or_else(|| {
@@ -799,7 +803,7 @@ impl TaskManifestBinding {
             eligible_backends,
             native_template: bound_template,
             tasks: bound_tasks.into_boxed_slice(),
-            contexts: bound_contexts.into_boxed_slice(),
+            participations: bound_participations.into_boxed_slice(),
             edges: bound_edges.into_boxed_slice(),
             root: schedule.root,
         })
@@ -872,7 +876,7 @@ impl TaskManifestBinding {
         &self.tasks
     }
 
-    /// Finite facts for actual participant contexts, not all eligible members.
+    /// Finite facts for actual participant participations, not all eligible members.
     /// Both original endpoints are projected; the original paid builder performs
     /// canonical union/dedup. This iterator allocates no second backend list,
     /// invokes no network/callback, and carries no admission authority.
@@ -885,8 +889,8 @@ impl TaskManifestBinding {
             novarocks_resource_contract::DependencyFactError,
         >,
     > + 'a {
-        self.contexts.iter().flat_map(move |context| {
-            let descriptor = context.backend().target().descriptor();
+        self.participations.iter().flat_map(move |participation| {
+            let descriptor = participation.backend().target().descriptor();
             [
                 descriptor.endpoint().native_endpoint(),
                 descriptor.control_endpoint().native_endpoint(),
@@ -934,8 +938,8 @@ impl TaskManifestBinding {
         select_remote_writer_sender(self.writer_cohorts(), self.root, &self.edges)
     }
 
-    pub(crate) fn contexts(&self) -> &[BoundManifestContext] {
-        &self.contexts
+    pub(crate) fn participations(&self) -> &[BoundManifestParticipation] {
+        &self.participations
     }
 
     pub(crate) fn edges(&self) -> &[BoundManifestEdge] {
@@ -1032,7 +1036,7 @@ struct ProjectedScanWork {
 #[derive(Debug)]
 struct ProjectedTask {
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     instance_index: usize,
     scan_work: Vec<ProjectedScanWork>,
 }
@@ -1060,7 +1064,7 @@ struct ScheduleFacts {
     execution: QueryExecutionId,
     fragments: Vec<ProjectedFragment>,
     edges: Vec<ProjectedEdge>,
-    contexts: Vec<QueryContextRef>,
+    participations: Vec<ParticipationRef>,
     root: TaskIdentity,
 }
 
@@ -1186,7 +1190,7 @@ impl ScheduleFacts {
                         .iter()
                         .map(|task| ProjectedTask {
                             identity: task.identity(),
-                            context: task.context(),
+                            participation: task.participation(),
                             instance_index: task.instance_index(),
                             scan_work: task
                                 .scan_work()
@@ -1226,7 +1230,7 @@ impl ScheduleFacts {
                     sender_count: edge.sender_count(),
                 })
                 .collect(),
-            contexts: schedule.contexts().to_vec(),
+            participations: schedule.participations().to_vec(),
             root: schedule.root(),
         }
     }
@@ -1280,7 +1284,7 @@ fn validate_task_identity(
     execution: QueryExecutionId,
     stage_id: StageId,
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> Result<(), DistributedQueryError> {
     if identity.query_execution_id() != execution {
         return Err(contract_error(format!(
@@ -1292,24 +1296,26 @@ fn validate_task_identity(
             "attempt manifest task {identity} differs from its fragment stage {stage_id}"
         )));
     }
-    identity.verify_query_context(context).map_err(|error| {
-        contract_error(format!(
-            "attempt manifest task {identity} differs from context {context}: {error}"
-        ))
-    })
+    identity
+        .verify_participation(participation)
+        .map_err(|error| {
+            contract_error(format!(
+                "attempt manifest task {identity} differs from participation {participation}: {error}"
+            ))
+        })
 }
 
-fn derive_and_record_fragment_instance_id(
+fn derive_and_record_task_key(
     seen: &mut BTreeSet<UniqueId>,
     derive: impl FnOnce() -> Result<UniqueId, DistributedQueryError>,
 ) -> Result<UniqueId, DistributedQueryError> {
-    let fragment_instance_id = derive()?;
-    if !seen.insert(fragment_instance_id) {
+    let task_key = derive()?;
+    if !seen.insert(task_key) {
         return Err(contract_error(format!(
-            "attempt manifest fragment-instance identity collision at {fragment_instance_id}"
+            "attempt manifest fragment-instance identity collision at {task_key}"
         )));
     }
-    Ok(fragment_instance_id)
+    Ok(task_key)
 }
 
 fn validate_scan_assignments(
@@ -1814,7 +1820,7 @@ mod tests {
 
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
-    use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
+    use novarocks_execution_contract::{ExchangeEdgeId, ParticipationRef, TaskIdentity};
     use novarocks_query_application::api::{PlanScanIdentity, PlanSeal};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -1824,9 +1830,9 @@ mod tests {
     use super::{
         BoundManifestFrozenUnits, BoundManifestPartitionKind, FrozenAttemptTopology,
         PreparedManifestFacts, PreparedScanSource, ProjectedEdge, ProjectedScanAssignment,
-        ProjectedTask, derive_and_record_fragment_instance_id, validate_backend_snapshot,
-        validate_edges, validate_frozen_unit_cover, validate_root_backend_support,
-        validate_scan_assignments, validate_schedule_execution, validate_task_identity,
+        ProjectedTask, derive_and_record_task_key, validate_backend_snapshot, validate_edges,
+        validate_frozen_unit_cover, validate_root_backend_support, validate_scan_assignments,
+        validate_schedule_execution, validate_task_identity,
     };
     use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
@@ -1843,15 +1849,15 @@ mod tests {
         stage: u32,
         id: u32,
         backend: BackendProcessId,
-    ) -> (TaskIdentity, QueryContextRef) {
+    ) -> (TaskIdentity, ParticipationRef) {
         let identity = TaskIdentity::new(
             execution,
             StageId::new(stage).expect("nonzero stage"),
             TaskId::new(id).expect("nonzero task"),
             backend,
         );
-        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
-        (identity, context)
+        let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+        (identity, participation)
     }
 
     fn scan_identity() -> PlanScanIdentity {
@@ -1897,10 +1903,10 @@ mod tests {
         (0..count)
             .map(|index| {
                 let backend = BackendProcessId::new_v7();
-                let (identity, context) = task(execution, 1, index as u32 + 1, backend);
+                let (identity, participation) = task(execution, 1, index as u32 + 1, backend);
                 ProjectedTask {
                     identity,
-                    context,
+                    participation,
                     instance_index: index,
                     scan_work: Vec::new(),
                 }
@@ -2165,7 +2171,7 @@ mod tests {
         // This existing component seam projects one task per real fragment at
         // the fixture's original DOP=1 and exact selected backend. It does not
         // construct QA's move-only AttemptSchedule or alter the compiled graph.
-        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
         let mut identities = std::collections::BTreeMap::new();
         let fragments = prepared
             .fragments
@@ -2186,7 +2192,7 @@ mod tests {
                     stage_id,
                     tasks: vec![ProjectedTask {
                         identity,
-                        context,
+                        participation,
                         instance_index: 0,
                         scan_work: Vec::new(),
                     }],
@@ -2241,7 +2247,7 @@ mod tests {
             execution,
             fragments,
             edges,
-            contexts: vec![context],
+            participations: vec![participation],
             root,
         }
     }
@@ -2322,7 +2328,7 @@ mod tests {
             assert_eq!(manifest.root(), root);
             assert_eq!(manifest.topology_revision(), 84);
             assert_eq!(manifest.tasks().len(), 2);
-            assert_eq!(manifest.contexts().len(), 1);
+            assert_eq!(manifest.participations().len(), 1);
             assert_eq!(manifest.eligible_backends(), expected_eligible);
             assert_eq!(manifest.eligible_backends().as_ptr(), original_eligible);
             assert!(manifest.eligible_backends().contains(&legacy_process));
@@ -2340,7 +2346,7 @@ mod tests {
                     .tasks()
                     .iter()
                     .all(|task| task.identity().backend_process_id() == process
-                        && task.context() == manifest.contexts()[0].context())
+                        && task.participation() == manifest.participations()[0].participation())
             );
             let edge = &manifest.edges()[0];
             assert_eq!(
@@ -2360,9 +2366,9 @@ mod tests {
             assert_eq!(edge.producers()[0].sender_ordinal(), 0);
             assert_eq!(edge.destinations(), &[root]);
             assert_eq!(edge.sender_count().get(), 1);
-            assert_eq!(manifest.contexts()[0].backend().process_id(), process);
+            assert_eq!(manifest.participations()[0].backend().process_id(), process);
             assert!(
-                manifest.contexts()[0]
+                manifest.participations()[0]
                     .backend()
                     .target()
                     .descriptor()
@@ -2408,12 +2414,14 @@ mod tests {
         assert!(manifest.eligible_backends().contains(&unplaced_process));
         assert!(!manifest.eligible_backends().contains(&excluded_process));
         assert_eq!(
-            manifest.contexts().len(),
+            manifest.participations().len(),
             1,
-            "eligible candidates are not participant contexts"
+            "eligible candidates are not participant participations"
         );
         assert_eq!(
-            manifest.contexts()[0].context().backend_process_id(),
+            manifest.participations()[0]
+                .participation()
+                .backend_process_id(),
             process
         );
         let transport = novarocks_native_adapter::FrontendNativeTransport::plaintext();
@@ -2719,15 +2727,15 @@ mod tests {
     }
 
     #[test]
-    fn task_identity_rejects_foreign_stage_and_context_process() {
+    fn task_identity_rejects_foreign_stage_and_participation_process() {
         let execution = execution();
         let backend = BackendProcessId::new_v7();
-        let (identity, context) = task(execution, 1, 1, backend);
+        let (identity, participation) = task(execution, 1, 1, backend);
         let wrong_stage = validate_task_identity(
             execution,
             StageId::new(2).expect("stage"),
             identity,
-            context,
+            participation,
         )
         .expect_err("stage mismatch must fail closed");
         assert!(
@@ -2736,7 +2744,7 @@ mod tests {
                 .contains("differs from its fragment stage")
         );
 
-        let foreign_context = QueryContextRef::new(
+        let foreign_participation = ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -2745,10 +2753,10 @@ mod tests {
             execution,
             StageId::new(1).expect("stage"),
             identity,
-            foreign_context,
+            foreign_participation,
         )
-        .expect_err("context process mismatch must fail closed");
-        assert!(error.message().contains("differs from context"));
+        .expect_err("participation process mismatch must fail closed");
+        assert!(error.message().contains("differs from participation"));
     }
 
     fn prepared_edge(source: u32, target: u32, exchange: i32) -> PreparedManifestFacts {
@@ -2890,9 +2898,8 @@ mod tests {
     fn fragment_instance_collision_fails_closed() {
         let collision = UniqueId::new(7, 9);
         let mut seen = Default::default();
-        derive_and_record_fragment_instance_id(&mut seen, || Ok(collision))
-            .expect("first identity is unique");
-        let error = derive_and_record_fragment_instance_id(&mut seen, || Ok(collision))
+        derive_and_record_task_key(&mut seen, || Ok(collision)).expect("first identity is unique");
+        let error = derive_and_record_task_key(&mut seen, || Ok(collision))
             .expect_err("a repeated derived identity must fail closed");
         assert!(error.message().contains("identity collision"));
     }
@@ -2907,7 +2914,7 @@ mod tests {
         for fragment in plan.fragments().values() {
             // Two placements deliberately share static facts but never Task identity.
             for instance in 0..2 {
-                let (identity, context) = task(
+                let (identity, participation) = task(
                     execution,
                     fragment.id().get(),
                     ordinal,
@@ -2916,10 +2923,10 @@ mod tests {
                 ordinal += 1;
                 tasks.push(super::BoundManifestTask {
                     identity,
-                    context,
+                    participation,
                     fragment_id: fragment.id().get(),
                     instance_index: instance,
-                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    task_key: UniqueId::new(1, ordinal as i64),
                     scan_work: Box::default(),
                 });
             }
@@ -3019,7 +3026,7 @@ mod tests {
         for fragment in plan.fragments().values() {
             // Two placements deliberately share static facts but never Task identity.
             for instance in 0..2 {
-                let (identity, context) = task(
+                let (identity, participation) = task(
                     execution,
                     fragment.id().get(),
                     ordinal,
@@ -3028,10 +3035,10 @@ mod tests {
                 ordinal += 1;
                 tasks.push(super::BoundManifestTask {
                     identity,
-                    context,
+                    participation,
                     fragment_id: fragment.id().get(),
                     instance_index: instance,
-                    fragment_instance_id: UniqueId::new(1, ordinal as i64),
+                    task_key: UniqueId::new(1, ordinal as i64),
                     scan_work: Box::default(),
                 });
                 for node in fragment.nodes().values() {
@@ -3167,13 +3174,13 @@ mod tests {
             template, execution, schedule, revision, backends, eligible,
         )
         .unwrap();
-        assert_eq!(manifest.contexts().len(), 1);
+        assert_eq!(manifest.participations().len(), 1);
         assert_eq!(
             manifest.tasks().len(),
             2,
             "the original real encoder supplies both fragments on the same participant"
         );
-        let endpoint = manifest.contexts()[0]
+        let endpoint = manifest.participations()[0]
             .backend()
             .endpoint()
             .native_endpoint();
@@ -3250,11 +3257,16 @@ mod tests {
             changed.root().backend_process_id()
         );
         assert!(manifest.validate_schedule(&changed).is_err());
-        let (_, different_context) = qualification_fixture(execution, &processes, 0);
-        assert_eq!(original.root(), different_context.root());
-        assert_ne!(original.contexts(), different_context.contexts());
+        let (_, different_participation) = qualification_fixture(execution, &processes, 0);
+        assert_eq!(original.root(), different_participation.root());
+        assert_ne!(
+            original.participations(),
+            different_participation.participations()
+        );
         assert!(
-            manifest.validate_schedule(&different_context).is_err(),
+            manifest
+                .validate_schedule(&different_participation)
+                .is_err(),
             "same root identity is not the same exact schedule"
         );
         manifest.validate_schedule(&original).unwrap();

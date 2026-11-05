@@ -151,7 +151,7 @@ fn opaque_host_actual_block_and_opaque_backing_are_separate_real_obligations() {
 
 #[test]
 fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap() {
-    use novarocks_functions::datasketches_hll::{HllHandle, HllTargetType};
+    use novarocks_functions::datasketches_hll::{HllAccumulator, HllTargetType};
     for target in [
         HllTargetType::Hll4,
         HllTargetType::Hll6,
@@ -159,29 +159,30 @@ fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap()
     ] {
         let (tracker, host) = host();
         let mut charge = OpaqueRetainedCharge::try_new(Arc::clone(&host)).unwrap();
-        let preflight = HllHandle::new_allocation_preflight(8, target).unwrap();
+        let preflight = HllAccumulator::new_allocation_preflight(8, target).unwrap();
         let mut lease = charge
             .reserve_operation(preflight.bounds().operation_peak_bytes)
             .unwrap();
-        let (mut handle, outcome) = HllHandle::new_under_reservation(&preflight, &lease).unwrap();
+        let (mut accumulator, outcome) =
+            HllAccumulator::new_under_reservation(&preflight, &lease).unwrap();
         charge
             .reconcile_under_reservation(
                 outcome
                     .current_bytes
-                    .saturating_sub(std::mem::size_of::<HllHandle>()),
+                    .saturating_sub(std::mem::size_of::<HllAccumulator>()),
                 &mut lease,
             )
             .unwrap();
         drop(lease);
         assert_eq!(tracker.current(), charge.bytes() as i64);
         for hash in 0u64..2048 {
-            let preflight = handle
+            let preflight = accumulator
                 .update_hash_allocation_preflight()
                 .expect("valid HLL update preflight");
             let mut lease = charge
                 .reserve_operation(preflight.bounds().additional_headroom_bytes())
                 .unwrap();
-            let outcome = handle
+            let outcome = accumulator
                 .update_hash_under_reservation(
                     hash.wrapping_mul(0x9e3779b97f4a7c15),
                     &preflight,
@@ -192,7 +193,7 @@ fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap()
                 .reconcile_under_reservation(
                     outcome
                         .current_bytes
-                        .saturating_sub(std::mem::size_of::<HllHandle>()),
+                        .saturating_sub(std::mem::size_of::<HllAccumulator>()),
                     &mut lease,
                 )
                 .unwrap();
@@ -200,14 +201,14 @@ fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap()
             assert_eq!(tracker.current(), charge.bytes() as i64);
         }
         let before = tracker.current();
-        let preflight = handle
+        let preflight = accumulator
             .serialization_allocation_preflight_observed(&mut || Ok::<_, KernelFailure>(()))
             .unwrap();
         let mut payload_charge = OpaqueRetainedCharge::try_new(Arc::clone(&host)).unwrap();
         let mut lease = payload_charge
             .reserve_operation(preflight.bounds().additional_headroom_bytes)
             .unwrap();
-        let payload = handle
+        let payload = accumulator
             .serialize_under_reservation(&preflight, &lease)
             .unwrap();
         payload_charge
@@ -218,12 +219,12 @@ fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap()
         // The retained payload is still live at the append/copy frontier.
         assert_eq!(
             novarocks_functions::datasketches_hll::hll_estimate(&payload).unwrap(),
-            handle.estimate().unwrap()
+            accumulator.estimate().unwrap()
         );
         drop(payload);
         drop(payload_charge);
         assert_eq!(tracker.current(), before);
-        drop(handle);
+        drop(accumulator);
         drop(charge);
         assert_eq!(tracker.current(), 0);
     }

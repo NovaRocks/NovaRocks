@@ -37,8 +37,8 @@ use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_chunk_all, instances, root_value_type,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter as execution;
 use crate::runtime_filter::RuntimeFilterExecutionContract;
 

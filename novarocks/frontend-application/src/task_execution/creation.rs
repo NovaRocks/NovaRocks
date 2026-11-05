@@ -43,7 +43,7 @@ use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     ExchangeDestination, ExchangeEdge, ExchangeEdgeId, ExchangeInbound, ExchangeSource,
-    ExchangeTopology, FrozenBytes, OperationEnvelope, PlanNodeId, QueryContextRef, TaskDescriptor,
+    ExchangeTopology, FrozenBytes, OperationEnvelope, ParticipationRef, PlanNodeId, TaskDescriptor,
     TaskIdentity,
 };
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
@@ -60,15 +60,15 @@ use crate::native::fragment_encoder::frozen::FragmentArtifact;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EdgeProducer {
     task: TaskIdentity,
-    kernel_key: UniqueId,
+    task_key: UniqueId,
     sender_ordinal: u32,
 }
 
 impl EdgeProducer {
-    pub(crate) const fn new(task: TaskIdentity, kernel_key: UniqueId, sender_ordinal: u32) -> Self {
+    pub(crate) const fn new(task: TaskIdentity, task_key: UniqueId, sender_ordinal: u32) -> Self {
         Self {
             task,
-            kernel_key,
+            task_key,
             sender_ordinal,
         }
     }
@@ -78,19 +78,19 @@ impl EdgeProducer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EdgeDestination {
     task: TaskIdentity,
-    kernel_key: UniqueId,
+    task_key: UniqueId,
     endpoint: RuntimeEndpoint,
 }
 
 impl EdgeDestination {
     pub(crate) const fn new(
         task: TaskIdentity,
-        kernel_key: UniqueId,
+        task_key: UniqueId,
         endpoint: RuntimeEndpoint,
     ) -> Self {
         Self {
             task,
-            kernel_key,
+            task_key,
             endpoint,
         }
     }
@@ -159,7 +159,7 @@ impl SharedEdge {
             .map(|destination| {
                 ExchangeDestination::new(
                     destination.task,
-                    destination.kernel_key,
+                    destination.task_key,
                     destination.endpoint.clone(),
                     self.destination_node_id,
                 )
@@ -259,7 +259,7 @@ impl AttemptTopology {
             }
             delivery = Some(edge.delivery);
             sources.extend(edge.producers.iter().map(|producer| {
-                ExchangeSource::new(producer.task, producer.kernel_key, producer.sender_ordinal)
+                ExchangeSource::new(producer.task, producer.task_key, producer.sender_ordinal)
             }));
         }
         let delivery = delivery.ok_or_else(|| {
@@ -326,8 +326,8 @@ pub(crate) struct TaskCreationSeed {
     view: TaskTopologyView,
     fragment: Arc<FragmentArtifact>,
     identity: TaskIdentity,
-    context: QueryContextRef,
-    kernel_key: UniqueId,
+    participation: ParticipationRef,
+    task_key: UniqueId,
     pipeline_dop: NonZeroUsize,
     split_plan_nodes: Vec<PlanNodeId>,
     instance_ordinal: u32,
@@ -350,8 +350,8 @@ impl std::fmt::Debug for TaskCreationSeed {
 /// frozen fragment.
 pub(crate) struct TaskCreationFacts {
     pub(crate) identity: TaskIdentity,
-    pub(crate) context: QueryContextRef,
-    pub(crate) kernel_key: UniqueId,
+    pub(crate) participation: ParticipationRef,
+    pub(crate) task_key: UniqueId,
     pub(crate) pipeline_dop: NonZeroUsize,
     pub(crate) split_plan_nodes: Vec<PlanNodeId>,
     pub(crate) instance_ordinal: u32,
@@ -375,8 +375,8 @@ impl TaskCreationSeed {
             view,
             fragment,
             identity: facts.identity,
-            context: facts.context,
-            kernel_key: facts.kernel_key,
+            participation: facts.participation,
+            task_key: facts.task_key,
             pipeline_dop: facts.pipeline_dop,
             split_plan_nodes: facts.split_plan_nodes,
             instance_ordinal: facts.instance_ordinal,
@@ -389,8 +389,8 @@ impl TaskCreationSeed {
         self.identity
     }
 
-    pub(crate) const fn context(&self) -> QueryContextRef {
-        self.context
+    pub(crate) const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub(crate) fn split_plan_nodes(&self) -> &[PlanNodeId] {
@@ -422,7 +422,7 @@ impl TaskCreationSeed {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(TaskDescriptor::try_new(
             self.identity,
-            self.kernel_key,
+            self.task_key,
             self.pipeline_dop,
             self.split_plan_nodes.clone(),
             ExchangeTopology::try_new(outbound, inbound)?,
@@ -501,7 +501,7 @@ impl TaskCreationSeed {
                 host_bytes = add(host_bytes, destination.endpoint.host().len())?;
                 let destination = wire_size::destination(
                     destination.task,
-                    destination.kernel_key,
+                    destination.task_key,
                     destination.endpoint.host(),
                     destination.endpoint.port() as u16,
                     edge.destination_node_id.get(),
@@ -531,7 +531,7 @@ impl TaskCreationSeed {
                 source_count = add(source_count, edge.producers.len())?;
                 for source in edge.producers.iter() {
                     let source =
-                        wire_size::source(source.task, source.kernel_key, source.sender_ordinal)
+                        wire_size::source(source.task, source.task_key, source.sender_ordinal)
                             .map_err(|_| failure())?;
                     bytes = add(bytes, wire_size::message(2, source).map_err(|_| failure())?)?;
                 }
@@ -550,7 +550,7 @@ impl TaskCreationSeed {
         array!(ExchangeSource, source_count);
         array!(proto::TaskExchangeSource, source_count);
         // Every projected task identity has one original 16-byte process ID.
-        // Three more belong to descriptor/context headers; only the actual
+        // Three more belong to descriptor/participation headers; only the actual
         // generated creation constructors allocate these original Vec values.
         array!(
             u8,
@@ -566,7 +566,7 @@ impl TaskCreationSeed {
             })?;
         let descriptor = wire_size::descriptor(
             self.identity,
-            self.kernel_key,
+            self.task_key,
             self.pipeline_dop.get(),
             split_bytes,
             topology_bytes,
@@ -595,8 +595,8 @@ impl TaskCreationSeed {
             assignment,
             wire_size::packed(3, sink_bytes).map_err(|_| failure())?,
         )?;
-        let metadata =
-            wire_size::metadata(self.context, descriptor, assignment).map_err(|_| failure())?;
+        let metadata = wire_size::metadata(self.participation, descriptor, assignment)
+            .map_err(|_| failure())?;
         array!(proto::TaskScanRanges, self.initial_scan_ranges.len());
         array!(proto::ScanRangeParams, range_count);
         array!(u32, self.sink_edges.len());
@@ -635,8 +635,9 @@ impl TaskCreationSeed {
             &self.sink_edges,
         );
         let assignment_len = assignment.encoded_len();
-        let metadata = encode_creation_metadata(self.context, &descriptor, assignment, Vec::new())
-            .encode_to_vec();
+        let metadata =
+            encode_creation_metadata(self.participation, &descriptor, assignment, Vec::new())
+                .encode_to_vec();
         if metadata.len() != priced.metadata || assignment_len != priced.assignment {
             return Err(TaskExecutionError::Schedule(format!(
                 "task {} froze {} metadata bytes and a {}-byte assignment but was admitted for {} and {}",
@@ -741,7 +742,7 @@ struct CreateTaskBody {
 #[derive(Debug)]
 pub(crate) struct CreateTaskIntent {
     original: Arc<CreateTaskBody>,
-    retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+    retention: Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
 }
 impl Clone for CreateTaskIntent {
     fn clone(&self) -> Self {
@@ -762,7 +763,7 @@ impl CreateTaskIntent {
         envelope: OperationEnvelope,
         identity: TaskIdentity,
         parts: Arc<FrozenCreationParts>,
-        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+        retention: Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
     ) -> Self {
         Self {
             original: Arc::new(CreateTaskBody {
@@ -849,7 +850,7 @@ pub(crate) mod tests {
     use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_execution::task_execution::{
-        ExchangeEdgeId, OperationEnvelope, OperationKind, QueryContextRef, TaskIdentity,
+        ExchangeEdgeId, OperationEnvelope, OperationKind, ParticipationRef, TaskIdentity,
         TaskOperationId,
     };
     use novarocks_physical_plan::PipelineDopDomain;
@@ -1026,8 +1027,12 @@ pub(crate) mod tests {
             Arc::from(vec![ExchangeEdgeId::new(1).expect("nonzero edge")]),
             TaskCreationFacts {
                 identity,
-                context: QueryContextRef::new(execution(), fixture.frontend, fixture.backend),
-                kernel_key: UniqueId::new(1, producer as i64),
+                participation: ParticipationRef::new(
+                    execution(),
+                    fixture.frontend,
+                    fixture.backend,
+                ),
+                task_key: UniqueId::new(1, producer as i64),
                 pipeline_dop: NonZeroUsize::new(2).expect("nonzero"),
                 split_plan_nodes: Vec::new(),
                 instance_ordinal: producer as u32,

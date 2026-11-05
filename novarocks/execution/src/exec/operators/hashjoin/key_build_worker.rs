@@ -20,18 +20,18 @@
 
 use super::{build_pages::push_owned, build_state::build_contract};
 #[cfg(test)]
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 use crate::{
     exec::{
-        hash_table::key_index::{BulkClaim, BulkTask, BulkTaskAdvance, BulkTaskGraph, BulkWork},
-        pipeline::step_context::TurnWork,
+        hash_table::key_index::{BulkBuildGraph, BulkBuildStep, BulkClaim, BulkWork, StepAdvance},
+        pipeline::driver_step::TurnWork,
     },
-    runtime::{fragment::ExecutionResult, observable::Observable},
+    runtime::{observable::Observable, task::ExecutionResult},
 };
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 struct Retained {
-    task: BulkTask,
+    task: BulkBuildStep,
     blocked: bool,
 }
 /// The original K graph bounds actual retained routes/workspaces and merge
@@ -83,7 +83,7 @@ impl KeyBuildWorker {
     }
     pub(crate) fn step(
         &mut self,
-        graph: &BulkTaskGraph,
+        graph: &BulkBuildGraph,
         changed: &Observable,
         turn: &mut TurnWork,
         work: &BulkWork<'_>,
@@ -97,7 +97,7 @@ impl KeyBuildWorker {
     }
     fn step_inner(
         &mut self,
-        graph: &BulkTaskGraph,
+        graph: &BulkBuildGraph,
         changed: &Observable,
         turn: &mut TurnWork,
         work: &BulkWork<'_>,
@@ -116,7 +116,7 @@ impl KeyBuildWorker {
         // Even when every worker retains a route, K may issue an eager merge
         // using the same actual position. Never gate claim on retained.len().
         let pending = match graph.claim(work)? {
-            BulkClaim::Task(task) => {
+            BulkClaim::Step(task) => {
                 #[cfg(test)]
                 self.claims.push(task.phase_name_for_test());
                 push_owned(
@@ -146,14 +146,11 @@ impl KeyBuildWorker {
             self.next = (index + 1) % self.retained.len();
             self.advance_calls = self.advance_calls.saturating_add(1);
             let advanced = self.retained[index].task.advance(1, work)?;
-            if matches!(
-                advanced,
-                BulkTaskAdvance::Done | BulkTaskAdvance::Progressed
-            ) {
+            if matches!(advanced, StepAdvance::Done | StepAdvance::Progressed) {
                 self.progress_steps = self.progress_steps.saturating_add(1);
             }
             match advanced {
-                BulkTaskAdvance::Done => {
+                StepAdvance::Done => {
                     let retained = self.retained.swap_remove(index);
                     let mut completion = retained.task.finish()?;
                     graph.complete(&mut completion, work)?;
@@ -164,11 +161,11 @@ impl KeyBuildWorker {
                     self.observed = changed.generation();
                     progressed = true;
                 }
-                BulkTaskAdvance::Progressed => {
+                StepAdvance::Progressed => {
                     self.retained[index].blocked = false;
                     progressed = true;
                 }
-                BulkTaskAdvance::Blocked => {
+                StepAdvance::Blocked => {
                     self.retained[index].blocked = true;
                     if pending && self.retained.iter().all(|task| task.blocked) {
                         break;

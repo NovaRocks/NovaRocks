@@ -473,16 +473,16 @@ mod typed_tests {
     #[test]
     fn typed_hydration_retains_original_connector_funding_through_clone_and_slice() {
         use novarocks_spi::connector::{
-            ConnectorError, ConnectorExecutionResources, ConnectorResourceCheckpoint,
-            ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+            ConnectorError, ConnectorExecutionResources, ConnectorReservationBackend,
+            ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Ledger(Arc<AtomicUsize>);
-        struct Lease {
+        struct CountingReservation {
             bytes: u64,
             released: Arc<AtomicUsize>,
         }
-        impl ConnectorResourceLease for Lease {
+        impl ConnectorReservationBackend for CountingReservation {
             fn bytes(&self) -> u64 {
                 self.bytes
             }
@@ -495,7 +495,7 @@ mod typed_tests {
                 Ok(())
             }
         }
-        impl Drop for Lease {
+        impl Drop for CountingReservation {
             fn drop(&mut self) {
                 self.released.fetch_add(1, Ordering::SeqCst);
             }
@@ -508,8 +508,8 @@ mod typed_tests {
                 &self,
                 _: ConnectorResourceClass,
                 bytes: u64,
-            ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-                Ok(Box::new(Lease {
+            ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
+                Ok(Box::new(CountingReservation {
                     bytes,
                     released: self.0.clone(),
                 }))
@@ -553,7 +553,7 @@ mod typed_tests {
             .unwrap();
         let clone = flat.clone();
         let slice = flat
-            .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            .slice_typed_observed::<crate::runtime::task::ExecutionFailure, _>(
                 1,
                 1,
                 ValueTypeStorageLifetime::pure(),

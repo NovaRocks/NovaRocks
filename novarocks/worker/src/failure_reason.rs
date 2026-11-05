@@ -57,7 +57,7 @@ pub(crate) enum WorkerFailureReason {
     DomainUnknownMember = 63,
     DomainNonMonotonic = 64,
     CredentialLeaseRepeated = 65,
-    InboundContextClosed = 74,
+    InboundParticipationClosed = 74,
     InboundKeyClosed = 75,
     InboundKeyClaimed = 76,
     InboundForeignClosedKey = 77,
@@ -121,9 +121,26 @@ pub(crate) enum WorkerFailureReason {
     RootControlReadCapacity = 170,
     RootControlReadAdmission = 171,
     TaskDisposalCallback = 172,
+    ParticipationMissing = 173,
 }
+
 impl WorkerFailureReason {
     pub(crate) const fn reason(self) -> FailureReason {
         FailureReason::new(domain::WORKER, NonZeroU16::new(self as u16).unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkerFailureReason, domain};
+
+    #[test]
+    fn resource_and_participation_missing_keep_distinct_stable_codes() {
+        let resource = WorkerFailureReason::QueryContextMissing.reason();
+        let participation = WorkerFailureReason::ParticipationMissing.reason();
+        assert_eq!(resource.domain(), domain::WORKER.get());
+        assert_eq!(resource.code(), 85);
+        assert_eq!(participation.domain(), domain::WORKER.get());
+        assert_eq!(participation.code(), 173);
     }
 }

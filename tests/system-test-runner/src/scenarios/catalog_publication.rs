@@ -24,7 +24,7 @@ use mysql::prelude::Queryable;
 use novarocks_cluster_harness::publication::PublicationFixture;
 use novarocks_cluster_harness::publication_service::{CommitOutcome, Hold, HoldStage};
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, TestClusterOwner,
 };
 use serde_json::{Value, json};
 use std::fs;

@@ -19,8 +19,8 @@
 
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::StepGuard,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::StepRegistration,
     owned_return::{OwnedReturnReader, OwnedReturnSender},
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
@@ -60,8 +60,8 @@ fn consumers() -> [ConsumerId; 2] {
 struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     report: ReportSlot,
     sender: Option<OwnedReturnSender<usize>>,
     reader: OwnedReturnReader<usize>,
@@ -98,12 +98,13 @@ impl Fixture {
         )
         .unwrap();
         let (sender, reader) = report.claim_owned_return().unwrap();
-        let (role, authority) =
-            ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+        let (exit_custody, authority) = ExitCustody::from_admitted(
+            ReportedWork::try_new(work, capacity, report.clone()).unwrap(),
+        );
         Self {
             ledger,
             scope,
-            role,
+            exit_custody,
             authority: Some(authority),
             report,
             sender: Some(sender),
@@ -116,13 +117,13 @@ impl Fixture {
     fn start(&mut self) {
         self.authority.as_mut().unwrap().start().unwrap();
     }
-    fn withdraw(&mut self) -> Result<(), ExitRoleError> {
+    fn withdraw(&mut self) -> Result<(), ExitCustodyError> {
         self.authority
             .take()
             .unwrap()
             .withdraw_unpublished_and_exit()
     }
-    fn finish_child(&self, child: ScopeHandle, root: StepGuard) {
+    fn finish_child(&self, child: ScopeHandle, root: StepRegistration) {
         // This actual neutral child never captured or invoked a foreign body.
         let (mut work, mut capacity) = root.bind(WorkKind::Cleanup).unwrap();
         child.close_external().unwrap();
@@ -137,7 +138,7 @@ impl Fixture {
         // role/report and header retirement still belong to finish().
     }
     fn finish(self) {
-        assert!(self.role.try_retire().unwrap());
+        assert!(self.exit_custody.try_retire().unwrap());
         assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
         self.scope.close_external().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
@@ -161,21 +162,21 @@ fn started_unpublished_exit_keeps_the_original_return_and_real_child_retirement_
     f.start();
     f.sender.take().unwrap().publish(29).unwrap();
     f.withdraw().unwrap();
-    let phase = f.role.phase();
-    let body = f.role.body_exited();
-    let captures = f.role.captures_exited();
+    let phase = f.exit_custody.phase();
+    let body = f.exit_custody.body_exited();
+    let captures = f.exit_custody.captures_exited();
     let return_before_take = f.reader.state().unwrap();
     let consumers = f.pending_consumers();
     let report_blocked_by_payload = !f.report.try_retire().unwrap();
-    let parent_blocked_before_take = !f.role.try_retire().unwrap();
+    let parent_blocked_before_take = !f.exit_custody.try_retire().unwrap();
     let held_before_take = f.ledger.used(dimension());
     let returned = f.reader.try_take().unwrap();
     let parent_blocked_by_child =
-        !f.role.actual_exit_ready().unwrap() && !f.role.try_retire().unwrap();
+        !f.exit_custody.actual_exit_ready().unwrap() && !f.exit_custody.try_retire().unwrap();
     let held_before_child = f.ledger.used(dimension());
     f.finish_child(child, root);
     f.finish();
-    assert_eq!(phase, ExitRolePhase::Exited);
+    assert_eq!(phase, ExitCustodyPhase::Exited);
     assert!(body && captures);
     assert_eq!(return_before_take, ReturnState::Filled);
     assert_eq!(consumers, [Consumption::Pending; 2]);
@@ -201,12 +202,12 @@ fn taken_or_unused_return_allows_unpublished_exit_without_acknowledging_consumer
                 assert!(f.reader.try_take().unwrap().is_none());
             }
             f.withdraw().unwrap();
-            let phase = f.role.phase();
+            let phase = f.exit_custody.phase();
             let consumers = f.pending_consumers();
             let ordinary_report_is_revoked =
                 f.report.fill() == Err(RuntimeError::Completion(CompletionError::AlreadyFilled));
             f.finish();
-            assert_eq!(phase, ExitRolePhase::Exited);
+            assert_eq!(phase, ExitCustodyPhase::Exited);
             assert_eq!(consumers, [Consumption::Pending; 2]);
             assert!(ordinary_report_is_revoked);
         }
@@ -223,16 +224,16 @@ fn published_plain_report_refuses_withdrawal_without_inventing_actual_exit() {
     let refusal = f.withdraw();
     assert_eq!(
         refusal,
-        Err(ExitRoleError::Runtime(RuntimeError::Completion(
+        Err(ExitCustodyError::Runtime(RuntimeError::Completion(
             CompletionError::InvalidRevocation
         )))
     );
-    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
-    assert!(!f.role.body_exited());
-    assert!(!f.role.captures_exited());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Unresolved);
+    assert!(!f.exit_custody.body_exited());
+    assert!(!f.exit_custody.captures_exited());
     assert_eq!(f.pending_consumers(), [Consumption::Pending; 2]);
-    assert!(!f.role.actual_exit_ready().unwrap());
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.actual_exit_ready().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 3);
     // The consumed authority failed, so its exact paid custody stays Unknown.
     // No cleanup helper is allowed to manufacture the missing exit witness.
@@ -248,14 +249,14 @@ fn the_never_started_unused_api_still_refuses_a_started_holder() {
     let refusal = f.authority.take().unwrap().revoke_unused_and_exit();
     assert_eq!(
         refusal,
-        Err(ExitRoleError::InvalidPhase(ExitRolePhase::Started))
+        Err(ExitCustodyError::InvalidPhase(ExitCustodyPhase::Started))
     );
-    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
-    assert!(!f.role.body_exited());
-    assert!(!f.role.captures_exited());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Unresolved);
+    assert!(!f.exit_custody.body_exited());
+    assert!(!f.exit_custody.captures_exited());
     assert_eq!(f.pending_consumers(), [Consumption::Pending; 2]);
     assert!(!f.report.try_retire().unwrap());
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 3);
     let _original = ManuallyDrop::new(f);
 }

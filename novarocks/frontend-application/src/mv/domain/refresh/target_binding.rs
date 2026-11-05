@@ -24,7 +24,7 @@
 //!
 //!   - the neutral [`ConnectorTableMetadata`] loaded from one exact generation
 //!     (Arrow schema, bounded planning facts, opaque table handle);
-//!   - the [`ConnectorControlPlanningLease`] that produced it, retained so
+//!   - the [`ConnectorControlPlanningPin`] that produced it, retained so
 //!     every downstream mutation and write acts on the same generation;
 //!   - the [`MvRefreshTargetObservation`] holding the refresh-time snapshot and
 //!     ref identity Core legitimately owns.
@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableColumnRole, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
 };
@@ -53,24 +53,24 @@ use novarocks_mv_application::persistence::schema::MvPartitionContract;
 /// an `Arc`, and the observation's payload is bounded by its own validator.
 ///
 /// Deliberately not `Debug`: `ConnectorTableMetadata` and
-/// `ConnectorControlPlanningLease` are not `Debug` precisely so an opaque
+/// `ConnectorControlPlanningPin` are not `Debug` precisely so an opaque
 /// handle and a live generation cannot end up in a log line.
 #[derive(Clone)]
 pub struct MvTargetBinding {
     metadata: ConnectorTableMetadata,
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     observation: MvRefreshTargetObservation,
 }
 
 impl MvTargetBinding {
     pub(crate) const fn new(
         metadata: ConnectorTableMetadata,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         observation: MvRefreshTargetObservation,
     ) -> Self {
         Self {
             metadata,
-            lease,
+            planning_pin,
             observation,
         }
     }
@@ -80,8 +80,8 @@ impl MvTargetBinding {
     /// Downstream mutation and write preparation must reuse this lease rather
     /// than re-resolving `latest`, otherwise a concurrent commit could split
     /// one refresh attempt across two generations.
-    pub const fn lease(&self) -> &ConnectorControlPlanningLease {
-        &self.lease
+    pub const fn planning_pin(&self) -> &ConnectorControlPlanningPin {
+        &self.planning_pin
     }
 
     pub const fn metadata(&self) -> &ConnectorTableMetadata {
@@ -168,7 +168,7 @@ impl MvTargetBinding {
 
 pub(crate) fn validate_target_lease(
     table: &TableIdentity,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
 ) -> Result<(), ConnectorError> {
     let expected_instance = ConnectorInstanceId::parse(&table.catalog).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
@@ -187,7 +187,7 @@ pub(crate) fn validate_target_lease(
 
 pub(crate) fn complete_target_binding(
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    exact_lease: ConnectorControlPlanningLease,
+    exact_lease: ConnectorControlPlanningPin,
     metadata: ConnectorTableMetadata,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, ConnectorError> {

@@ -23,7 +23,7 @@
 use crate::api::{NativeAttemptTopologyRequirement, QueryExecutionErrorKind};
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_execution_contract::{
-    QueryContextRef, SafeDetail, TaskFailurePhase, TaskIdentity, TaskOperationId,
+    ParticipationRef, SafeDetail, TaskFailurePhase, TaskIdentity, TaskOperationId,
     failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
     operation::OperationKind,
 };
@@ -50,7 +50,7 @@ pub enum ExecutionFailureSite {
         identity: TaskIdentity,
     },
     Operation {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
         kind: OperationKind,
     },

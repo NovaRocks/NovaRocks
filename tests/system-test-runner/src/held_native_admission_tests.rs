@@ -112,7 +112,8 @@ fn original_clocks_positions_input_and_config_policy_are_closed() {
 fn neutral_diagnostic_is_exact_one_line_and_full_actual_clean_revision() {
     let rev = "1".repeat(40);
     let line = format!(
-        "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={rev} build_identity={rev} root_observation=true\n"
+        "{} commit={rev} build_identity={rev} root_observation=true\n",
+        novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_BUILD
     );
     assert!(neutral_identity(line.as_bytes(), &rev).is_ok());
     for bytes in [

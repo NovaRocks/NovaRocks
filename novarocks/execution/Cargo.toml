@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 novarocks-arrow-batch-codec.workspace = true
+novarocks-failpoint.workspace = true
 novarocks-control-runtime.workspace = true
 novarocks-control-runtime-core.workspace = true
 novarocks-failure-contract.workspace = true

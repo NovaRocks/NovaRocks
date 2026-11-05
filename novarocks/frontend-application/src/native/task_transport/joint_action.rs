@@ -119,11 +119,11 @@ fn credential(
     }
     Ok(())
 }
-fn context_domain(
+fn participation_domain(
     invoice: &mut CloneInvoice,
-    domain: &novarocks_execution::task_execution::QueryContextDomainUpdate,
+    domain: &novarocks_execution::task_execution::ParticipationDomainUpdate,
 ) -> Result<(), WorkError> {
-    use novarocks_execution::task_execution::QueryContextDomainUpdate as D;
+    use novarocks_execution::task_execution::ParticipationDomainUpdate as D;
     match domain {
         D::CatalogBinding { payload, .. } => stored::<CatalogSet>(invoice, payload.as_ref()),
         D::SharedDynamicFilter { payload, .. } => {
@@ -140,7 +140,7 @@ pub(super) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usiz
         // digest. This is new byte backing, not a charge of the old input twice.
         invoice.add(4 * 16 + 32)?;
         match operation {
-            OperationIntent::EstablishQueryContext(value) => {
+            OperationIntent::EstablishParticipation(value) => {
                 stored::<CatalogSet>(&mut invoice, value.catalog_binding().as_ref())?;
                 stored::<proto::RuntimeFilterContribution>(
                     &mut invoice,
@@ -148,8 +148,8 @@ pub(super) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usiz
                 )?;
                 credential(&mut invoice, value.initial_credential().material().as_ref())?;
             }
-            OperationIntent::UpdateQueryContext(value) => match value.as_ref() {
-                UpdateQueryContext::Establish(value) => {
+            OperationIntent::UpdateParticipation(value) => match value.as_ref() {
+                UpdateParticipation::Establish(value) => {
                     stored::<CatalogSet>(&mut invoice, value.catalog_binding().as_ref())?;
                     stored::<proto::RuntimeFilterContribution>(
                         &mut invoice,
@@ -157,10 +157,10 @@ pub(super) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usiz
                     )?;
                     credential(&mut invoice, value.initial_credential().material().as_ref())?;
                 }
-                UpdateQueryContext::AdvanceDomain(value) => {
-                    context_domain(&mut invoice, value.domain())?
+                UpdateParticipation::AdvanceDomain(value) => {
+                    participation_domain(&mut invoice, value.domain())?
                 }
-                UpdateQueryContext::RenewLease(_) => {}
+                UpdateParticipation::RenewLease(_) => {}
             },
             OperationIntent::UpdateTask(value) => {
                 invoice.array::<proto::TaskDomainUpdate>(value.domains().len())?;
@@ -270,23 +270,23 @@ pub(super) fn original_run_encoding(
     for operation in operations {
         let control = is_small_control(operation);
         let item = match operation {
-            OperationIntent::AcquireQueryContextAdmissionTicket(value) => size::acquire(*value),
-            OperationIntent::EstablishQueryContext(value) => size::establish(value),
+            OperationIntent::AcquireParticipationAdmissionTicket(value) => size::acquire(*value),
+            OperationIntent::EstablishParticipation(value) => size::establish(value),
             OperationIntent::CreateTask(value) => size::create(
                 value.envelope(),
                 value.parts().fragment().content().len(),
                 value.parts().metadata().len(),
             ),
             OperationIntent::UpdateTask(value) => size::update(value, control),
-            OperationIntent::UpdateQueryContext(value) => match value.as_ref() {
-                UpdateQueryContext::Establish(value) => size::establish(value),
-                UpdateQueryContext::AdvanceDomain(value) => size::advance(value),
-                UpdateQueryContext::RenewLease(value) => size::renew(value, control),
+            OperationIntent::UpdateParticipation(value) => match value.as_ref() {
+                UpdateParticipation::Establish(value) => size::establish(value),
+                UpdateParticipation::AdvanceDomain(value) => size::advance(value),
+                UpdateParticipation::RenewLease(value) => size::renew(value, control),
             },
             OperationIntent::CancelTask(value) => size::cancel(*value, control),
-            OperationIntent::QuiesceQueryContext(value) => size::quiesce(*value, control),
-            OperationIntent::AbortQueryContext(value) => size::abort(*value, control),
-            OperationIntent::ReleaseQueryContext(value) => size::release(*value, control),
+            OperationIntent::QuiesceParticipation(value) => size::quiesce(*value, control),
+            OperationIntent::AbortParticipation(value) => size::abort(*value, control),
+            OperationIntent::ReleaseParticipation(value) => size::release(*value, control),
             #[cfg(test)]
             OperationIntent::FetchTaskDynamicFilters(_) => return Err(WorkError::Conflict),
         }

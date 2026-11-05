@@ -21,7 +21,7 @@ use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextResultObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;

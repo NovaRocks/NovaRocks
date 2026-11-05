@@ -85,14 +85,14 @@ pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
         | OperationOutcome::AdmissionTicketStillActive
         | OperationOutcome::NotReady
         | OperationOutcome::PreparationBusy => FrontendAction::RetryAfterProgress,
-        OperationOutcome::ContextTerminalReceipt
+        OperationOutcome::ParticipationTerminalReceipt
         | OperationOutcome::Gone
         | OperationOutcome::TerminalRejected => FrontendAction::StopSendingAndReconcile,
         OperationOutcome::OwnerFailed
         | OperationOutcome::IdentityMismatch
         | OperationOutcome::CompatibilityMismatch
-        | OperationOutcome::ContextNotEstablished
-        | OperationOutcome::ContextConflict
+        | OperationOutcome::ParticipationNotEstablished
+        | OperationOutcome::ParticipationConflict
         | OperationOutcome::DomainConflict
         | OperationOutcome::LeaseExpired
         | OperationOutcome::InvalidStateOrRequest
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn terminal_receipts_reconcile_instead_of_overriding_task_status() {
         assert_eq!(
-            frontend_action(receipt(OperationOutcome::ContextTerminalReceipt)),
+            frontend_action(receipt(OperationOutcome::ParticipationTerminalReceipt)),
             FrontendAction::StopSendingAndReconcile
         );
         assert_eq!(

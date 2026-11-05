@@ -29,7 +29,7 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 
-use crate::ConnectorWriteStackLease;
+use crate::ConnectorWriteStackPin;
 
 struct TestControl {
     instance_id: ConnectorInstanceId,
@@ -144,8 +144,8 @@ pub fn write_stack_lease(
     control_runtime_id: ConnectorControlRuntimeId,
     group: ConnectorControlWriteBinding,
     release: impl FnOnce() + Send + Sync + 'static,
-) -> ConnectorWriteStackLease {
-    ConnectorWriteStackLease::new(control_runtime_id, group, release)
+) -> ConnectorWriteStackPin {
+    ConnectorWriteStackPin::new(control_runtime_id, group, release)
 }
 
 fn unsupported() -> ConnectorError {

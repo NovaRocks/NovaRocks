@@ -92,16 +92,16 @@ pub(crate) fn hand_over_managed_target(
         return Err("MV provider bound a different logical target for the handover".to_string());
     }
 
-    let documents_lease = lease
+    let document_storage_binding = lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive the handover MV document lease: {error}"))?;
     let request = crate::mv::domain::staged_create::keyed_request(
-        &documents_lease,
+        &document_storage_binding,
         table.clone(),
         binding.object_id.clone(),
         context.clone(),
     );
-    let (documents,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&documents_lease,request.clone(),novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),entrance).map_err(|e|e.to_string())?;
+    let (documents,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&document_storage_binding,request.clone(),novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),entrance).map_err(|e|e.to_string())?;
     if phase != MvManagementPhase::NotObserved
         && (documents.deployment_owner != *entrance.owner()
             || documents.process_incarnation != *entrance.incarnation())
@@ -141,10 +141,10 @@ pub(crate) fn hand_over_managed_target(
     };
 
     let operation_id = ConnectorMutationOperationId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
-    let admission = documents_lease
+    let admission = document_storage_binding
         .admit_management(
             ConnectorDocumentManagementAdmissionRequest::try_new(
-                documents_lease.owner().clone(),
+                document_storage_binding.owner().clone(),
                 catalog_handle,
                 operation_id,
                 table.clone(),
@@ -196,7 +196,7 @@ pub(crate) fn hand_over_managed_target(
             evidence, ..
         } = &resolved
         {
-            let typed = documents_lease
+            let typed = document_storage_binding
                 .decode_keyed_slot_change_evidence(request, evidence.clone())
                 .map_err(|e| e.to_string())?;
             management

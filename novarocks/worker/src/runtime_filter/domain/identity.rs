@@ -91,7 +91,7 @@ impl BackendChannelIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendProducerStreamIdentity {
     channel: BackendChannelIdentity,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     partition_id: PartitionId,
 }
 
@@ -129,19 +129,19 @@ impl BackendTransportSequence {
 pub struct BackendConsumerSubscriptionIdentity {
     channel: BackendChannelIdentity,
     consumer_binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 impl BackendConsumerSubscriptionIdentity {
     pub const fn new(
         channel: BackendChannelIdentity,
         consumer_binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     ) -> Self {
         Self {
             channel,
             consumer_binding_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 
@@ -153,20 +153,20 @@ impl BackendConsumerSubscriptionIdentity {
         self.consumer_binding_id
     }
 
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 }
 
 impl BackendProducerStreamIdentity {
     pub const fn new(
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition_id: PartitionId,
     ) -> Self {
         Self {
             channel,
-            fragment_instance_id,
+            task_key,
             partition_id,
         }
     }
@@ -175,8 +175,8 @@ impl BackendProducerStreamIdentity {
         self.channel
     }
 
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn partition_id(self) -> PartitionId {

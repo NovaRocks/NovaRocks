@@ -383,7 +383,7 @@ mod tests {
                             producer_streams: vec![novarocks::QueryTerminalRuntimeFilterProducerStreamV1 {
                                 channel_binding_id: 7,
                                 channel_id,
-                                producer_fragment_instance_id: Some(common::UniqueId { hi: participant_seed as i64, lo: 41 }),
+                                producer_task_key: Some(common::UniqueId { hi: participant_seed as i64, lo: 41 }),
                                 partition_id: 3,
                                 latest_accepted_sequence: Some(0),
                                 accepted_count: 1,
@@ -409,7 +409,7 @@ mod tests {
                                 channel_binding_id: 7,
                                 channel_id,
                                 consumer_binding_id: 5,
-                                fragment_instance_id: Some(common::UniqueId { hi: participant_seed as i64, lo: 51 }),
+                                task_key: Some(common::UniqueId { hi: participant_seed as i64, lo: 51 }),
                                 latest_delivered_logical_version: Some(4),
                                 latest_applied_logical_version: Some(4),
                                 subscription_terminal: novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed as i32,

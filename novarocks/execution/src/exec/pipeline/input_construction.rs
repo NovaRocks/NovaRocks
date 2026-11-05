@@ -25,7 +25,7 @@ use novarocks_type_contract::ValueTypeStorageLifetime;
 use novarocks_types::SlotId;
 
 use crate::exec::chunk::{ArrayNormalizationStep, ArrayPathStep, Chunk, ChunkSchema};
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 
 #[path = "input_construction/arrow_model.rs"]
 pub mod arrow_model;
@@ -50,7 +50,7 @@ pub enum ConstructionFailure {
     MissingOwner,
     Memory(crate::runtime::mem_tracker::MemTrackerLimitExceeded),
     InvalidSource(String),
-    Source(crate::runtime::fragment::SharedDomainFailure),
+    Source(crate::runtime::task::SharedDomainFailure),
     Control(novarocks_type_contract::CompileControlError),
     Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Caller(Box<ExecutionFailure>),
@@ -81,12 +81,12 @@ impl ConstructionFailure {
 }
 impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for ConstructionFailure {
     fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
-        Self::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+        Self::Source(crate::runtime::task::SharedDomainFailure::new(source))
     }
 }
 impl From<crate::exec::chunk::ChunkConstructionFailure> for ConstructionFailure {
     fn from(source: crate::exec::chunk::ChunkConstructionFailure) -> Self {
-        Self::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+        Self::Source(crate::runtime::task::SharedDomainFailure::new(source))
     }
 }
 impl From<novarocks_type_contract::CompileControlError> for ConstructionFailure {

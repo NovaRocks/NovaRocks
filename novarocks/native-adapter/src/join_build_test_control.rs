@@ -17,7 +17,7 @@
 //! A finite statement/Task action at the existing build publication point.
 use crate::test_controls::{NativeFaultClaim, NativeTestControls};
 use novarocks_execution::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult},
+    task::{ExecutionFailure, ExecutionResult},
     join_test_control::JoinBuildPublicationControl,
 };
 use novarocks_execution_contract::TaskIdentity;

@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
 
 use crate::activity::{
     CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
-    MvActivityLease, MvActivityObservation, MvActivityOwner, MvActivityTicket,
+    MvActivityObservation, MvActivityOwner, MvActivityPermit, MvActivityTicket,
 };
 
 /// Single-use proof that the management owner admitted the exact same Current
@@ -377,7 +377,7 @@ impl ManagementEntrance {
     /// admission mutex. Only terminal conclusions retire pending evidence.
     pub fn resolve_pending_slot_changes(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<SlotChangeConvergence, novarocks_spi::connector::ConnectorError> {
         self.resolve_slot_changes(
@@ -445,7 +445,7 @@ impl ManagementEntrance {
 
     pub async fn resolve_pending_slot_changes_async(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<SlotChangeConvergence, novarocks_spi::connector::ConnectorError> {
         use novarocks_spi::connector::{CommitConclusion, ConnectorError, ConnectorErrorKind};
@@ -536,7 +536,7 @@ impl ManagementEntrance {
     /// publication in a usable projection or a new readmission capability.
     pub fn observe_keyed_drop(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
         budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
@@ -579,7 +579,7 @@ impl ManagementEntrance {
     /// The outer Source retains this future across borrowed waiter cancellation.
     pub async fn observe_keyed_drop_async(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
         budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
@@ -625,7 +625,7 @@ impl ManagementEntrance {
     fn validate_keyed_drop_state(
         &self,
         current: &TargetAdmissionState,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<(), crate::persistence::documents::MvDocumentError> {
         use crate::persistence::documents::MvDocumentError;
@@ -659,7 +659,7 @@ impl ManagementEntrance {
 
     fn validate_keyed_drop_before_observation(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<(), crate::persistence::documents::MvDocumentError> {
         use crate::persistence::documents::MvDocumentError;
@@ -672,7 +672,7 @@ impl ManagementEntrance {
 
     fn finish_keyed_drop_observation(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
         documents: crate::persistence::keyed_documents::MvKeyedDropDocuments,
         convergence: SlotChangeConvergence,
@@ -729,7 +729,7 @@ impl ManagementEntrance {
     /// no raw view supplied by a caller can mint this capability.
     pub fn observe_keyed_admission(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
         budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
@@ -807,7 +807,7 @@ impl ManagementEntrance {
 
     pub async fn observe_keyed_admission_async(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
         budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
@@ -1181,7 +1181,7 @@ impl ManagementEntrance {
         &self,
         request: ManagementRequest,
         cancelled: impl Fn() -> bool,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
         let owner = activity_owner(request.operation);
         self.request(request, owner)?
             .acquire_waiting(cancelled)?
@@ -1194,7 +1194,7 @@ impl ManagementEntrance {
         &self,
         request: ManagementRequest,
         cancelled: impl Future<Output = ()>,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
         let owner = activity_owner(request.operation);
         self.request(request, owner)?
             .acquire_waiting_async(cancelled)
@@ -1210,7 +1210,7 @@ impl ManagementEntrance {
         &self,
         effect: AutomaticMaintenanceEffect,
         cancelled: impl Fn() -> bool,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
         self.request(
             ManagementRequest::for_automatic_maintenance(effect),
             MvActivityOwner::AutomaticMaintenance,
@@ -1225,7 +1225,7 @@ impl ManagementEntrance {
         &self,
         effect: AutomaticMaintenanceEffect,
         cancelled: impl Future<Output = ()>,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
         self.request(
             ManagementRequest::for_automatic_maintenance(effect),
             MvActivityOwner::AutomaticMaintenance,
@@ -1291,7 +1291,7 @@ impl ManagementEntrance {
     /// Historical observations must never be passed to this method.
     pub fn close_on_keyed_current_management_mismatch(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<bool, crate::persistence::documents::MvDocumentError> {
         use crate::persistence::{
@@ -1346,7 +1346,7 @@ impl ManagementEntrance {
 
     pub async fn close_on_keyed_current_management_mismatch_async(
         &self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<bool, crate::persistence::documents::MvDocumentError> {
         use crate::persistence::{
@@ -1485,7 +1485,7 @@ impl ManagementEntranceTicket {
     /// Acquire only when this request is at the head of the target FIFO.
     pub fn try_acquire(
         &mut self,
-    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+    ) -> Result<Option<ManagementEntranceObligation>, ManagementAdmissionError> {
         let Some(activity) = self
             .activity
             .try_acquire()
@@ -1501,7 +1501,7 @@ impl ManagementEntranceTicket {
     pub fn acquire_waiting(
         &mut self,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+    ) -> Result<Option<ManagementEntranceObligation>, ManagementAdmissionError> {
         let Some(activity) = self
             .activity
             .acquire_waiting(cancelled)
@@ -1517,7 +1517,7 @@ impl ManagementEntranceTicket {
     pub async fn acquire_waiting_async(
         &mut self,
         cancelled: impl Future<Output = ()>,
-    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+    ) -> Result<Option<ManagementEntranceObligation>, ManagementAdmissionError> {
         let Some(activity) = self
             .activity
             .acquire_waiting_async(cancelled)
@@ -1531,8 +1531,8 @@ impl ManagementEntranceTicket {
 
     fn finish_acquire(
         &mut self,
-        activity: MvActivityLease,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        activity: MvActivityPermit,
+    ) -> Result<ManagementEntranceObligation, ManagementAdmissionError> {
         let entrance = self
             .entrance
             .upgrade()
@@ -1542,7 +1542,7 @@ impl ManagementEntranceTicket {
             .take()
             .ok_or(ManagementAdmissionError::InvalidRequest)?;
         validate_request_against_state(&entrance, &request)?;
-        Ok(ManagementEntranceLease {
+        Ok(ManagementEntranceObligation {
             entrance: Arc::downgrade(&entrance),
             request,
             activity: Some(activity),
@@ -1557,10 +1557,10 @@ pub struct SlotChangeConvergence {
     pub conclusions: Vec<novarocks_spi::connector::CommitConclusion>,
 }
 
-pub struct ManagementEntranceLease {
+pub struct ManagementEntranceObligation {
     entrance: Weak<EntranceInner>,
     request: ManagementRequest,
-    activity: Option<MvActivityLease>,
+    activity: Option<MvActivityPermit>,
     dispatched: Option<DispatchedEffect>,
 }
 
@@ -1569,7 +1569,7 @@ enum DispatchedEffect {
     CreateIntent(CreateIntentResponsibility),
 }
 
-impl ManagementEntranceLease {
+impl ManagementEntranceObligation {
     /// Worker-owned admissions receive a shutdown cancellation view from the
     /// shared activity gate. Foreground admissions deliberately return none;
     /// their statement WorkScope remains the cancellation owner.
@@ -1578,7 +1578,7 @@ impl ManagementEntranceLease {
     ) -> Option<novarocks_query_application::cancellation::QueryCancellationView> {
         self.activity
             .as_ref()
-            .and_then(MvActivityLease::cancellation)
+            .and_then(MvActivityPermit::cancellation)
     }
 
     /// Must be called immediately before crossing the provider side-effect
@@ -1953,7 +1953,7 @@ fn record_committed(
     Ok(())
 }
 
-impl Drop for ManagementEntranceLease {
+impl Drop for ManagementEntranceObligation {
     fn drop(&mut self) {
         if let Some(dispatched) = self.dispatched.take() {
             match dispatched {

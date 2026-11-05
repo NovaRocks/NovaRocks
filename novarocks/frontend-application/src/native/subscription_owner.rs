@@ -149,10 +149,10 @@ struct OriginalInput {
     future: Mutex<Option<OriginalFuture>>,
     cause: Mutex<Option<RawValue>>,
 }
-struct OriginalTask {
+struct OriginalJob {
     input: Arc<OriginalInput>,
 }
-impl Future for OriginalTask {
+impl Future for OriginalJob {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
         if self
@@ -281,13 +281,13 @@ pub(crate) struct NativeSubscriptionOwner {
 pub(crate) struct NativeSubscriptionPort {
     core: Arc<Core>,
 }
-pub(crate) struct SubscriptionLease {
+pub(crate) struct SubscriptionStopGuard {
     core: Arc<Core>,
     index: usize,
     generation: u64,
     active: bool,
 }
-impl SubscriptionLease {
+impl SubscriptionStopGuard {
     pub(crate) fn stop(&self) {
         stop_record(&self.core, self.index, self.generation, false);
         self.core.changed.notify_waiters();
@@ -301,7 +301,7 @@ impl SubscriptionLease {
         self.active = false;
     }
 }
-impl Drop for SubscriptionLease {
+impl Drop for SubscriptionStopGuard {
     fn drop(&mut self) {
         if self.active {
             self.stop();
@@ -813,8 +813,8 @@ impl SubscriptionReservation {
             _ => Ok(false),
         }
     }
-    pub(crate) fn stop_view(&self) -> SubscriptionLease {
-        SubscriptionLease {
+    pub(crate) fn stop_view(&self) -> SubscriptionStopGuard {
+        SubscriptionStopGuard {
             core: Arc::clone(&self.core),
             index: self.index,
             generation: self.generation,
@@ -845,7 +845,7 @@ impl SubscriptionReservation {
         drop(old_failure);
     }
     /// Commit original F and its join receiving phase before spawn or callback.
-    pub(crate) fn start<F>(mut self, future: F) -> Result<SubscriptionLease, RegistrationError>
+    pub(crate) fn start<F>(mut self, future: F) -> Result<SubscriptionStopGuard, RegistrationError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -883,7 +883,7 @@ impl SubscriptionReservation {
             return Err(RegistrationError::Closed);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.core.handle.spawn(OriginalTask {
+            self.core.handle.spawn(OriginalJob {
                 input: Arc::clone(&input),
             })
         }));
@@ -927,7 +927,7 @@ impl SubscriptionReservation {
         if failed {
             Err(RegistrationError::SpawnUnjoinable)
         } else {
-            Ok(SubscriptionLease {
+            Ok(SubscriptionStopGuard {
                 core: Arc::clone(&self.core),
                 index: self.index,
                 generation: self.generation,
@@ -1001,7 +1001,7 @@ fn add_cleanup_failures(facts: &mut FailureFacts, delta: u64) {
 }
 /// Temporarily lend only the SAME record's phase. Its fixed index remains
 /// occupied throughout poll, callbacks and unwind; another reserve cannot reuse it.
-struct RecordLease {
+struct RecordPhaseLoan {
     core: Arc<Core>,
     index: usize,
     generation: u64,
@@ -1010,7 +1010,7 @@ struct RecordLease {
     backing: Arc<Backing>,
     stopping: bool,
 }
-impl RecordLease {
+impl RecordPhaseLoan {
     fn take(core: &Arc<Core>, index: usize) -> Option<Self> {
         let mut state = core.state.lock().unwrap_or_else(|e| e.into_inner());
         let closed = state.closed;
@@ -1056,7 +1056,7 @@ impl RecordLease {
         drop(record);
     }
 }
-impl Drop for RecordLease {
+impl Drop for RecordPhaseLoan {
     fn drop(&mut self) {
         if let Some(phase) = self.phase.take() {
             let previous = {
@@ -1074,11 +1074,11 @@ impl Drop for RecordLease {
         }
     }
 }
-struct ChildLease {
+struct PendingChildLoan {
     input: Arc<OriginalInput>,
     child: Option<PendingChild>,
 }
-impl Drop for ChildLease {
+impl Drop for PendingChildLoan {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
             let previous = self
@@ -1091,7 +1091,7 @@ impl Drop for ChildLease {
         }
     }
 }
-fn retire_empty_input(lease: &mut RecordLease) {
+fn retire_empty_input(lease: &mut RecordPhaseLoan) {
     let child = lease
         .input
         .child
@@ -1106,7 +1106,7 @@ fn retire_empty_input(lease: &mut RecordLease) {
     )));
 }
 fn poll_record(core: &Arc<Core>, index: usize, cx: &mut std::task::Context<'_>) -> bool {
-    let Some(mut lease) = RecordLease::take(core, index) else {
+    let Some(mut lease) = RecordPhaseLoan::take(core, index) else {
         return false;
     };
     let mut notify = None;
@@ -1126,7 +1126,7 @@ fn poll_record(core: &Arc<Core>, index: usize, cx: &mut std::task::Context<'_>) 
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .expect("same pending child proposal");
-                let mut child = ChildLease {
+                let mut child = PendingChildLoan {
                     input: Arc::clone(&lease.input),
                     child: Some(child),
                 };

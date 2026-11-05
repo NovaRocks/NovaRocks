@@ -22,7 +22,7 @@ mod capacity;
 
 use super::{actors::WorkerActor, control_request::ControlRequestError};
 use novarocks_control_runtime::{
-    driver::{ActorRegistration, ActorRuntime, DriverError},
+    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError},
     notify::Notify,
     publication::PublishedReply,
     transaction::ScopeHandle,
@@ -37,10 +37,10 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Address {
     Control(InputId),
-    // A Context's actual registration owns its scope-local Work addresses.
+    // A Participation's actual registration owns its scope-local Work addresses.
     // The registered actor ID selects its FIFO; the stored original witness
     // qualifies every fill/pop. Neither numeric field grants Work or access.
-    Context { actor: ActorId, work: ScopedWorkRef },
+    Participation { actor: ActorId, work: ScopedWorkRef },
 }
 struct RegisteredSlot {
     original: Weak<RequestReadySlot>,
@@ -50,7 +50,7 @@ struct RegisteredSlot {
 struct ReadyState {
     slots: BTreeMap<Address, RegisteredSlot>,
     control_ready: BTreeMap<u64, InputId>,
-    context_ready: BTreeMap<ActorId, BTreeMap<u64, ScopedWorkRef>>,
+    participation_ready: BTreeMap<ActorId, BTreeMap<u64, ScopedWorkRef>>,
     next_ready: u64,
     capacity: BTreeMap<ActorId, capacity::CapacityWaiters>,
 }
@@ -79,7 +79,7 @@ impl ControlRequestReady {
                 state: Mutex::new(ReadyState {
                     slots: BTreeMap::new(),
                     control_ready: BTreeMap::new(),
-                    context_ready: BTreeMap::new(),
+                    participation_ready: BTreeMap::new(),
                     next_ready: 0,
                     capacity: BTreeMap::new(),
                 }),
@@ -113,18 +113,18 @@ impl ControlRequestReady {
         self.bind_source_capacity_owner(owner)?;
         self.register(Address::Control(input), owner, None)
     }
-    pub(crate) fn register_context(
+    pub(crate) fn register_participation(
         &self,
-        author: &novarocks_control_runtime::lease::WorkLease,
+        author: &novarocks_control_runtime::obligation::WorkObligation,
         owner: &ActorRegistration,
     ) -> Result<Arc<RequestReadySlot>, ControlRequestError> {
         self.shared
             .runtime
             .validate_work_author(owner, author)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let work = author.reference();
         self.register(
-            Address::Context {
+            Address::Participation {
                 actor: owner.actor(),
                 work,
             },
@@ -143,7 +143,7 @@ impl ControlRequestReady {
         self.shared
             .runtime
             .validate_registration(owner)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let mut state = self.shared.state.lock().expect("request ready index");
         if state.slots.contains_key(&address) {
             return Err(ControlRequestError::DuplicateReadySlot);
@@ -188,14 +188,14 @@ impl ControlRequestReady {
                 Address::Control(_) => {
                     state.control_ready.remove(&ordinal);
                 }
-                Address::Context { actor, .. } => {
+                Address::Participation { actor, .. } => {
                     let entries = state
-                        .context_ready
+                        .participation_ready
                         .get_mut(&actor)
-                        .expect("original Context ready FIFO");
+                        .expect("original Participation ready FIFO");
                     entries.remove(&ordinal);
                     if entries.is_empty() {
-                        state.context_ready.remove(&actor);
+                        state.participation_ready.remove(&actor);
                     }
                 }
             }
@@ -223,20 +223,26 @@ impl ControlRequestReady {
         registered.queued = None;
         Some(input)
     }
-    /// Consume only this original Context's next Work address. Actor fairness
-    /// belongs to the Common host queue; one Context cannot steal a sibling's
+    /// Consume only this original Participation's next Work address. Actor fairness
+    /// belongs to the Common host queue; one Participation cannot steal a sibling's
     /// pending return or mistake an old registration for its successor.
-    pub(crate) fn next_context_ready(&self, owner: &ActorRegistration) -> Option<ScopedWorkRef> {
+    pub(crate) fn next_participation_ready(
+        &self,
+        owner: &ActorRegistration,
+    ) -> Option<ScopedWorkRef> {
         let mut state = self.shared.state.lock().expect("request ready index");
-        let (&ordinal, &work) = state.context_ready.get(&owner.actor())?.first_key_value()?;
-        let address = Address::Context {
+        let (&ordinal, &work) = state
+            .participation_ready
+            .get(&owner.actor())?
+            .first_key_value()?;
+        let address = Address::Participation {
             actor: owner.actor(),
             work,
         };
         let registered = state
             .slots
             .get_mut(&address)
-            .expect("original queued Context slot");
+            .expect("original queued Participation slot");
         if !registered.owner.same_registration(owner) {
             return None;
         }
@@ -247,12 +253,12 @@ impl ControlRequestReady {
         );
         registered.queued = None;
         let entries = state
-            .context_ready
+            .participation_ready
             .get_mut(&owner.actor())
-            .expect("original Context ready FIFO");
+            .expect("original Participation ready FIFO");
         entries.remove(&ordinal);
         if entries.is_empty() {
-            state.context_ready.remove(&owner.actor());
+            state.participation_ready.remove(&owner.actor());
         }
         Some(work)
     }
@@ -276,8 +282,8 @@ pub(crate) struct RequestReadySlot {
 }
 impl RequestReadySlot {
     /// The registered original consumer, never a reconstructed actor author.
-    pub(crate) fn context_owner(self: &Arc<Self>) -> Option<ActorRegistration> {
-        self.context_author()?;
+    pub(crate) fn participation_owner(self: &Arc<Self>) -> Option<ActorRegistration> {
+        self.participation_author()?;
         let shared = self.shared.upgrade()?;
         let state = shared.state.lock().expect("original request ready owner");
         let registered = state.slots.get(&self.address)?;
@@ -292,9 +298,9 @@ impl RequestReadySlot {
             .is_some_and(|original| original.same_scope(scope))
     }
     /// Immutable original address only; it grants no Work or input authority.
-    pub(crate) fn context_author(&self) -> Option<(ActorId, ScopedWorkRef)> {
+    pub(crate) fn participation_author(&self) -> Option<(ActorId, ScopedWorkRef)> {
         match self.address {
-            Address::Context { actor, work } => Some((actor, work)),
+            Address::Participation { actor, work } => Some((actor, work)),
             Address::Control(_) => None,
         }
     }
@@ -330,9 +336,9 @@ impl RequestReadySlot {
                 Address::Control(input) => {
                     state.control_ready.insert(ordinal, input);
                 }
-                Address::Context { actor, work } => {
+                Address::Participation { actor, work } => {
                     state
-                        .context_ready
+                        .participation_ready
                         .entry(actor)
                         .or_default()
                         .insert(ordinal, work);
@@ -343,7 +349,8 @@ impl RequestReadySlot {
         // No application callback or asynchronous Waker runs under the index.
         shared.changed.notify();
         match shared.runtime.notify_host_actor(&owner) {
-            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+            Ok(())
+            | Err(ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch) => {}
             Err(_) => std::process::abort(),
         }
     }

@@ -16,7 +16,7 @@
 // under the License.
 
 //! One taskless fragment's finite completion roles. Registration only stores
-//! its one callback; the physical completion driver invokes it after the
+//! its one callback; the physical completion poller invokes it after the
 //! original finisher call returns. No Task identity or protocol is invented.
 
 use std::sync::{Arc, Mutex};
@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use novarocks_control_runtime::{
     completion::ReportSlot,
     continuation::{ContinuationPhase, ContinuationSlot, InvocationResult, RegistrationToken},
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase as Phase},
-    lease::{ReservationBundle, WorkLease},
-    transaction::{RoleSpec, RuntimeLedger, ScopeHandle},
+    exit_custody::{ExitCustody, ExitCustodyPhase as Phase, ExitObligation},
+    obligation::{ReservationObligation, WorkObligation},
+    transaction::{DeclaredInput, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
@@ -36,28 +36,28 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, AdmittedFinisher, AdmittedFragmentRoles, CompletionWorkCapability,
+    AcceptedTaskConclusion, AdmittedFinisher, AdmittedWorkParts, CompletionWorkCapability,
     SettledContinuation, SettlementCapability, SettlementPermit,
     failure::{FailureClass, FailureFact},
 };
 
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionReason},
+    task::{ExecutionFailure, ExecutionReason},
     task_control::ExecutionExitReporter,
 };
 
 type Snapshot = Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>;
-const ROLES: usize = 3;
-const RESPONSIBILITIES: usize = ROLES + 1;
+const COMPLETION_ENTRY_COUNT: usize = 3;
+const RESPONSIBILITIES: usize = COMPLETION_ENTRY_COUNT + 1;
 const FINISHER: usize = 0;
 
-struct Role {
-    slot: ExitRole,
+struct LocalCompletionEntry {
+    slot: ExitCustody,
     report: ReportSlot,
     consumed: bool,
 }
 struct State {
-    roles: [Role; ROLES],
+    entries: [LocalCompletionEntry; COMPLETION_ENTRY_COUNT],
     settlement_consumed: bool,
     settlement_retired: bool,
     removed: bool,
@@ -74,14 +74,14 @@ struct Owner {
     after_initial_reap: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
-/// The original executor holds this driver, independently of settlement
+/// The original executor holds this poller, independently of settlement
 /// registration authority. It runs on its host thread, outside all role locks.
 #[derive(Clone)]
-pub(crate) struct LocalCompletionDriver(Arc<Owner>);
+pub(crate) struct LocalCompletionPoller(Arc<Owner>);
 
 struct Work {
     owner: Arc<Owner>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 impl Work {
     fn exited(mut self) {
@@ -125,7 +125,7 @@ impl SettlementCapability<ExecutionFailure> for Registration {
         self.token
             .register(callback)
             .unwrap_or_else(|_| panic!("one admitted local settlement registration"));
-        // No callback, destructor or driver runs on the registration stack.
+        // No callback, destructor or poller runs on the registration stack.
     }
     fn revoke_unused(self: Box<Self>) {
         drop(self.token);
@@ -154,7 +154,7 @@ fn admit(
     admission: WorkAdmission,
     kind: WorkKind,
     resources: ReservationResources,
-) -> (WorkLease, ReservationBundle, ReportSlot) {
+) -> (WorkObligation, ReservationObligation, ReportSlot) {
     let mut guard = scope
         .reserve_next(Generation::new(1).unwrap(), resources, kind, admission)
         .expect("finite original local completion roles");
@@ -168,10 +168,10 @@ fn admit(
     let (work, capacity) = guard.bind(kind).expect("original local role holder");
     (work, capacity, report)
 }
-impl LocalCompletionDriver {
+impl LocalCompletionPoller {
     pub(crate) fn admit(
         health: ExecutionExitReporter,
-    ) -> (AdmittedFragmentRoles<ExecutionFailure>, Self) {
+    ) -> (AdmittedWorkParts<ExecutionFailure>, Self) {
         // This geometry follows the three named OnceRoles and the sole child
         // continuation. It is unrelated to SQL data size or backend topology.
         let ledger = RuntimeLedger::new(ResourceVector::default());
@@ -190,7 +190,7 @@ impl LocalCompletionDriver {
             .reserve_child_from(
                 &mut finisher_capacity,
                 &finisher,
-                RoleSpec {
+                DeclaredInput {
                     generation: Generation::new(1).unwrap(),
                     kind: WorkKind::Settlement,
                     resources: resources(),
@@ -200,8 +200,8 @@ impl LocalCompletionDriver {
             .expect("one original settlement child from the finisher inventory");
         let child_report = child.report().clone();
         let (settlement, token) = ContinuationSlot::from_admitted(child);
-        let make_role = |work, capacity, report: ReportSlot| {
-            let (slot, authority) = ExitRole::from_admitted(
+        let make_entry = |work, capacity, report: ReportSlot| {
+            let (slot, authority) = ExitCustody::from_admitted(
                 novarocks_control_runtime::reported_work::ReportedWork::try_new(
                     work,
                     capacity,
@@ -210,7 +210,7 @@ impl LocalCompletionDriver {
                 .unwrap(),
             );
             (
-                Role {
+                LocalCompletionEntry {
                     slot,
                     report,
                     consumed: false,
@@ -218,18 +218,18 @@ impl LocalCompletionDriver {
                 authority,
             )
         };
-        let (finisher, authority) = make_role(finisher, finisher_capacity, finisher_report);
-        let mut roles = vec![finisher];
+        let (finisher, authority) = make_entry(finisher, finisher_capacity, finisher_report);
+        let mut completion_entries = vec![finisher];
         let mut authorities = vec![authority];
-        for _ in 1..ROLES {
+        for _ in 1..COMPLETION_ENTRY_COUNT {
             let (work, capacity, report) = admit(
                 &scope,
                 WorkAdmission::External,
                 WorkKind::Cleanup,
                 resources(),
             );
-            let (role, authority) = make_role(work, capacity, report);
-            roles.push(role);
+            let (completion_entry, authority) = make_entry(work, capacity, report);
+            completion_entries.push(completion_entry);
             authorities.push(authority);
         }
         scope.close_external().unwrap();
@@ -238,7 +238,7 @@ impl LocalCompletionDriver {
             ledger,
             scope,
             state: Mutex::new(State {
-                roles: roles
+                entries: completion_entries
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("three named roles")),
                 settlement_consumed: false,
@@ -258,19 +258,20 @@ impl LocalCompletionDriver {
                 authority: Some(authority),
             }) as Box<dyn CompletionWorkCapability>
         };
-        let permit = SettlementPermit::from_admitted_local_role(Box::new(Registration {
+        let permit = SettlementPermit::from_admitted_local_reservation(Box::new(Registration {
             token,
             owner: owner.clone(),
         }));
-        let [finisher, wall_time, publisher]: [ExitAuthority; ROLES] = authorities
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("three original role authorities"));
-        let roles = AdmittedFragmentRoles::from_admitted_roles(
-            AdmittedFinisher::from_admitted_role(permit, work(finisher)),
+        let [finisher, wall_time, publisher]: [ExitObligation; COMPLETION_ENTRY_COUNT] =
+            authorities
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("three original role authorities"));
+        let completion_parts = AdmittedWorkParts::from_admitted_parts(
+            AdmittedFinisher::from_admitted_parts(permit, work(finisher)),
             work(wall_time),
             work(publisher),
         );
-        (roles, Self(owner))
+        (completion_parts, Self(owner))
     }
     pub(crate) fn run(&self) {
         let invoke = {
@@ -310,11 +311,11 @@ impl Owner {
             return;
         }
         if self.settlement.phase() == ContinuationPhase::Unused
-            && state.roles[FINISHER].slot.body_exited()
-            && state.roles[FINISHER].slot.captures_exited()
+            && state.entries[FINISHER].slot.body_exited()
+            && state.entries[FINISHER].slot.captures_exited()
         {
             // Both facts are necessary: revocation alone is not original exit.
-            self.settlement.unused_role_exited().unwrap();
+            self.settlement.unused_holder_exited().unwrap();
         }
         if self.settlement.phase() == ContinuationPhase::Exited {
             if !state.settlement_consumed {
@@ -334,23 +335,24 @@ impl Owner {
                 release.wait();
             }
         }
-        for role in &mut state.roles {
-            if role.slot.phase() != Phase::Exited {
+        for completion_entry in &mut state.entries {
+            if completion_entry.slot.phase() != Phase::Exited {
                 continue;
             }
-            if !role.consumed {
-                role.report.consume(consumer()).unwrap();
-                role.consumed = true;
+            if !completion_entry.consumed {
+                completion_entry.report.consume(consumer()).unwrap();
+                completion_entry.consumed = true;
             }
-            role.slot
+            completion_entry
+                .slot
                 .try_retire()
                 .expect("local original completion custody");
         }
         if state.settlement_retired
             && state
-                .roles
+                .entries
                 .iter()
-                .all(|role| role.slot.phase() == Phase::Retired)
+                .all(|completion_entry| completion_entry.slot.phase() == Phase::Retired)
         {
             // An original can publish its real exit after the first reap and
             // before the loop observes/retire its custody. All four custody
@@ -395,8 +397,8 @@ mod tests {
     }
 
     fn fixture() -> (
-        AdmittedFragmentRoles<ExecutionFailure>,
-        LocalCompletionDriver,
+        AdmittedWorkParts<ExecutionFailure>,
+        LocalCompletionPoller,
         Arc<ExecutionHealth>,
     ) {
         let health = Arc::new(ExecutionHealth::default());
@@ -404,13 +406,13 @@ mod tests {
             health.clone(),
             crate::runtime::execution_health::ExecutionExitOrigin::Local,
         );
-        let (roles, driver) = LocalCompletionDriver::admit(reporter);
-        (roles, driver, health)
+        let (completion_parts, poller) = LocalCompletionPoller::admit(reporter);
+        (completion_parts, poller, health)
     }
     #[test]
     fn registration_returns_before_the_local_driver_and_keeps_the_original_finisher_counted() {
-        let (roles, driver, health) = fixture();
-        let (finisher, wall_time, publisher) = roles.into_parts();
+        let (completion_parts, poller, health) = fixture();
+        let (finisher, wall_time, publisher) = completion_parts.into_parts();
         let (permit, mut work) = finisher.into_parts();
         work.bind();
         work.started();
@@ -421,28 +423,31 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
         }));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(driver.0.scope.snapshot().unwrap().work, RESPONSIBILITIES);
-        driver.run();
+        assert_eq!(poller.0.scope.snapshot().unwrap().work, RESPONSIBILITIES);
+        poller.run();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(driver.0.scope.snapshot().unwrap().work, ROLES);
         assert_eq!(
-            driver.0.scope.snapshot().unwrap().storage,
-            ROLES,
+            poller.0.scope.snapshot().unwrap().work,
+            COMPLETION_ENTRY_COUNT
+        );
+        assert_eq!(
+            poller.0.scope.snapshot().unwrap().storage,
+            COMPLETION_ENTRY_COUNT,
             "the original OnceRoles still hold their actual completion reports"
         );
         work.completed();
         drop(wall_time);
         drop(publisher);
-        assert!(driver.0.ledger.is_empty());
+        assert!(poller.0.ledger.is_empty());
         assert!(health.failure().is_none());
     }
     #[test]
     fn an_unused_local_fragment_retires_only_after_all_original_holders_exit() {
-        let (roles, driver, _) = fixture();
-        drop(roles);
-        assert!(driver.0.ledger.is_empty());
-        driver.run();
-        assert!(driver.0.ledger.is_empty());
+        let (completion_parts, poller, _) = fixture();
+        drop(completion_parts);
+        assert!(poller.0.ledger.is_empty());
+        poller.run();
+        assert!(poller.0.ledger.is_empty());
     }
     #[test]
     fn original_exit_after_the_initial_reap_is_reaped_before_its_scope_is_removed() {
@@ -450,13 +455,13 @@ mod tests {
             sync::Barrier,
             time::{Duration, Instant},
         };
-        let (roles, driver, health) = fixture();
-        let (finisher, wall_time, publisher) = roles.into_parts();
+        let (completion_parts, poller, health) = fixture();
+        let (finisher, wall_time, publisher) = completion_parts.into_parts();
         drop(finisher);
-        let publisher_slot = driver.0.state.lock().unwrap().roles[2].slot.clone();
+        let publisher_slot = poller.0.state.lock().unwrap().entries[2].slot.clone();
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        *driver.0.after_initial_reap.lock().unwrap() = Some((entered.clone(), release.clone()));
+        *poller.0.after_initial_reap.lock().unwrap() = Some((entered.clone(), release.clone()));
         let wall = std::thread::spawn(move || drop(wall_time));
         let mut exits = ExitThreads {
             release: Some(release),
@@ -483,29 +488,29 @@ mod tests {
             joined,
             "Scope retirement must not race its original Work record's retirement"
         );
-        assert!(driver.0.ledger.is_empty());
+        assert!(poller.0.ledger.is_empty());
         assert!(health.failure().is_none());
     }
     #[test]
     fn a_local_continuation_panic_never_releases_its_original_capacity() {
-        let (roles, driver, health) = fixture();
-        let (finisher, wall_time, publisher) = roles.into_parts();
+        let (completion_parts, poller, health) = fixture();
+        let (finisher, wall_time, publisher) = completion_parts.into_parts();
         let (permit, mut work) = finisher.into_parts();
         work.bind();
         work.started();
         permit.register(Box::new(|_| panic!("local settlement call exit unknown")));
-        driver.run();
+        poller.run();
         assert!(health.failure().is_some());
-        assert!(driver.0.settlement.phase() == ContinuationPhase::Unresolved);
+        assert!(poller.0.settlement.phase() == ContinuationPhase::Unresolved);
         work.completed();
         drop(wall_time);
         drop(publisher);
-        assert_eq!(driver.0.scope.snapshot().unwrap().work, 2);
+        assert_eq!(poller.0.scope.snapshot().unwrap().work, 2);
         assert_eq!(
-            driver.0.scope.snapshot().unwrap().storage,
+            poller.0.scope.snapshot().unwrap().storage,
             2,
             "the unresolved continuation and its original parent keep their actual reports"
         );
-        assert!(!driver.0.scope.snapshot().unwrap().join_ready);
+        assert!(!poller.0.scope.snapshot().unwrap().join_ready);
     }
 }

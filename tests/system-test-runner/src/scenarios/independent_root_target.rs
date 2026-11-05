@@ -21,7 +21,7 @@ use super::result_delivery_root_protocol::parse_created_task_candidates;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
-use novarocks_execution_contract::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::identity::{ParticipationRef, TaskIdentity};
 use novarocks_proto_codec::FieldPath;
 use novarocks_task_codec::identity::decode_task_identity;
 use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
@@ -34,15 +34,16 @@ const BACKENDS: usize = 3;
 const LOG_BYTES: u64 = 2 * 1024 * 1024;
 const MARKERS: usize = 8;
 const LINE_BYTES: usize = 384;
-const CREATE: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
-const CONTEXT: &str = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED";
-const ROOT: &str = "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT";
+const CREATE: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
+const PARTICIPATION: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_APPLIED;
+const ROOT: &str = novarocks_failpoint::observation_marker::TASK_PREPARED_CLIENT_ROOT;
 
 #[derive(Debug)]
 enum IncompleteRootObservation {
     NoCreatedTask,
     NoPreparedRoot,
-    ContextTaskPublication,
+    ParticipationTaskPublication,
 }
 impl std::fmt::Display for IncompleteRootObservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,7 +102,7 @@ pub(crate) struct IndependentRootTarget {
     pub root_backend_index: usize,
     pub backend_process_from_descriptor: BackendProcessId,
     pub frontend: FrontendProcessId,
-    pub contexts: [Option<QueryContextRef>; BACKENDS],
+    pub participations: [Option<ParticipationRef>; BACKENDS],
     pub fresh_tasks: Vec<(usize, TaskIdentity)>,
     pub marker_counts: [usize; BACKENDS],
     pub baseline_sha256: [[u8; 32]; BACKENDS],
@@ -190,7 +191,7 @@ impl IndependentRootObserver {
                 "attempt":e.attempt_id().get(),"stage":task.stage_id().get(),"task":task.task_id().get(),
                 "backend":task.backend_process_id().to_string()})
         };
-        let contexts = target.contexts.map(|ctx| {
+        let participations = target.participations.map(|ctx| {
             ctx.map(|ctx| {
                 let e = ctx.query_execution_id();
                 serde_json::json!({"query_hi":e.query_id().high(),"query_lo":e.query_id().low(),
@@ -208,7 +209,7 @@ impl IndependentRootObserver {
             "root_backend_index":target.root_backend_index,
             "backend_process_from_descriptor":target.backend_process_from_descriptor.to_string(),
             "actual_backend_descriptors":self.actual_backends.map(|id| id.to_string()),
-            "original_roles":self.original_roles,"contexts":contexts,"fresh_tasks":tasks,
+            "original_roles":self.original_roles,"participations":participations,"fresh_tasks":tasks,
             "marker_counts":target.marker_counts,
             "baseline_log_bytes":self.before.map(|a| a.bytes),
             "baseline_sha256":target.baseline_sha256,"after_log_bytes":target.after_log_bytes,
@@ -389,7 +390,7 @@ fn scan(
                     }
                     rolling[rolling_used] = *byte;
                     rolling_used += 1;
-                    marker_seen |= [CREATE, CONTEXT, ROOT]
+                    marker_seen |= [CREATE, PARTICIPATION, ROOT]
                         .iter()
                         .any(|name| rolling[..rolling_used].ends_with(name.as_bytes()));
                 }
@@ -439,14 +440,14 @@ fn decode_task_marker(line: &str, prefix: &str) -> Result<TaskIdentity> {
         FieldPath::root("independent_original_root_task"),
     )?)
 }
-fn decode_context_marker(
+fn decode_participation_marker(
     line: &str,
     expected_frontend: FrontendProcessId,
     expected_backend: BackendProcessId,
-) -> Result<QueryContextRef> {
+) -> Result<ParticipationRef> {
     let fields: Vec<_> = line.split(' ').collect();
     ensure!(
-        fields.len() == 4 && fields[0] == CONTEXT,
+        fields.len() == 4 && fields[0] == PARTICIPATION,
         "fresh context has unknown fields"
     );
     let bits: Vec<_> = fields[1]
@@ -481,7 +482,7 @@ fn decode_context_marker(
             && backend == expected_backend,
         "context differs from independently actual original FE/BE processes"
     );
-    Ok(QueryContextRef::new(execution, frontend, backend))
+    Ok(ParticipationRef::new(execution, frontend, backend))
 }
 fn resolve(
     snapshots: &[LogDelta; BACKENDS],
@@ -498,7 +499,7 @@ fn resolve(
     // The total bound derives only from original 3BE x 8 marker positions.
     let mut tasks = Vec::with_capacity(BACKENDS * MARKERS);
     let mut root = None;
-    let mut contexts = [None; BACKENDS];
+    let mut participations = [None; BACKENDS];
     for (backend, snapshot) in snapshots.iter().enumerate() {
         ensure!(
             snapshot.markers.len() <= MARKERS,
@@ -531,10 +532,11 @@ fn resolve(
                     "multiple prepared ClientRows roots"
                 );
             } else {
-                ensure!(line.contains(CONTEXT), "unknown bounded marker kind");
-                let context = decode_context_marker(line, expected_frontend, processes[backend])?;
+                ensure!(line.contains(PARTICIPATION), "unknown bounded marker kind");
+                let participation =
+                    decode_participation_marker(line, expected_frontend, processes[backend])?;
                 ensure!(
-                    contexts[backend].replace(context).is_none(),
+                    participations[backend].replace(participation).is_none(),
                     "duplicate fresh context on one backend"
                 );
             }
@@ -547,7 +549,7 @@ fn resolve(
         .map(|(_, task)| task.query_execution_id())
         .or_else(|| root.map(|(_, task)| task.query_execution_id()))
         .or_else(|| {
-            contexts
+            participations
                 .iter()
                 .flatten()
                 .next()
@@ -559,7 +561,7 @@ fn resolve(
                 .iter()
                 .all(|(_, task)| task.query_execution_id() == execution)
                 && root.is_none_or(|(_, task)| task.query_execution_id() == execution)
-                && contexts
+                && participations
                     .iter()
                     .flatten()
                     .all(|c| c.query_execution_id() == execution),
@@ -575,9 +577,9 @@ fn resolve(
             && tasks.contains(&(root_backend_index, root)),
         "prepared root is not an exact fresh created task on its actual original backend"
     );
-    for (backend, context) in contexts.iter().enumerate() {
-        if context.is_some() != tasks.iter().any(|(slot, _)| *slot == backend) {
-            return Err(IncompleteRootObservation::ContextTaskPublication.into());
+    for (backend, participation) in participations.iter().enumerate() {
+        if participation.is_some() != tasks.iter().any(|(slot, _)| *slot == backend) {
+            return Err(IncompleteRootObservation::ParticipationTaskPublication.into());
         }
     }
     Ok(IndependentRootTarget {
@@ -585,7 +587,7 @@ fn resolve(
         root_backend_index,
         backend_process_from_descriptor: processes[root_backend_index],
         frontend: expected_frontend,
-        contexts,
+        participations,
         fresh_tasks: tasks,
         marker_counts: std::array::from_fn(|i| snapshots[i].markers.len()),
         baseline_sha256,
@@ -662,10 +664,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_context_without_task_or_root_is_fatal_before_waiting() {
+    fn invalid_participation_without_task_or_root_is_fatal_before_waiting() {
         let (mut logs, ids) = fixtures(&[1, 2]);
         for log in &mut logs {
-            log.markers.retain(|line| line.starts_with(CONTEXT));
+            log.markers.retain(|line| line.starts_with(PARTICIPATION));
         }
         logs[2].markers[0] =
             logs[2].markers[0].replace("execution_id=0:-7:2", "execution_id=00:-7:2");
@@ -678,7 +680,7 @@ mod tests {
         assert_eq!(reads, 1);
     }
     #[test]
-    fn source_evidence_retains_all_descriptors_contexts_and_original_log_anchors() {
+    fn source_evidence_retains_all_descriptors_participations_and_original_log_anchors() {
         let (logs, ids) = fixtures(&[1, 2]);
         let mut target = resolve(&logs, frontend(), &ids, [empty_sha(); BACKENDS]).unwrap();
         let observer = IndependentRootObserver {
@@ -702,7 +704,7 @@ mod tests {
             3
         );
         assert_eq!(
-            evidence["contexts"]
+            evidence["participations"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -774,7 +776,7 @@ mod tests {
         for backend in 0..BACKENDS {
             if placements.contains(&backend) {
                 logs[backend].push_str(&format!(
-                    "{CONTEXT} execution_id=0:-7:2 frontend={} backend={}\n",
+                    "{PARTICIPATION} execution_id=0:-7:2 frontend={} backend={}\n",
                     frontend(),
                     processes[backend]
                 ));
@@ -809,7 +811,10 @@ mod tests {
             assert_eq!(target.root_backend_index, placements[0]);
             assert_eq!(target.root.stage_id().get(), 1);
             for slot in 0..BACKENDS {
-                assert_eq!(target.contexts[slot].is_some(), placements.contains(&slot));
+                assert_eq!(
+                    target.participations[slot].is_some(),
+                    placements.contains(&slot)
+                );
             }
         }
     }
@@ -882,13 +887,13 @@ mod tests {
         }
     }
     #[test]
-    fn missing_duplicate_nonparticipant_wrongfe_and_wrongexecution_contexts_refuse() {
+    fn missing_duplicate_nonparticipant_wrongfe_and_wrongexecution_participations_refuse() {
         for alteration in 0..5 {
             let (mut snapshots, processes) = fixtures(&[1, 2]);
             let index = snapshots[1]
                 .markers
                 .iter()
-                .position(|line| line.starts_with(CONTEXT))
+                .position(|line| line.starts_with(PARTICIPATION))
                 .unwrap();
             match alteration {
                 0 => {
@@ -900,7 +905,7 @@ mod tests {
                 }
                 2 => {
                     snapshots[0].markers.push(format!(
-                        "{CONTEXT} execution_id=0:-7:2 frontend={} backend={}",
+                        "{PARTICIPATION} execution_id=0:-7:2 frontend={} backend={}",
                         frontend(),
                         processes[0]
                     ));

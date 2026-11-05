@@ -21,11 +21,11 @@
 use super::{
     actors::WorkerAction, adopted_cleanup::AdoptedCleanupEffect, failure::ScopePublicationsDrained,
 };
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+use crate::{task_completion_set::AdmittedCompletionTransfer, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
+    actor_turn::ActorTurnError,
     completion::ReportSlot,
-    driver::DriverError,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
 };
 use novarocks_control_runtime_core::identity::{ConsumerId, ScopeId, ScopedWorkRef, WorkId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
@@ -83,13 +83,13 @@ struct Custody {
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     ingress_retained_bytes: usize,
     sources: Mutex<Option<LoadingSources>>,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
-    input_role: ExitRole,
+    input_exit_custody: ExitCustody,
     input_scope: novarocks_control_runtime::transaction::ScopeHandle,
     input_key: (ScopeId, WorkId),
     input_report: ReportSlot,
-    input_authority: Mutex<Option<ExitAuthority>>,
+    input_authority: Mutex<Option<ExitObligation>>,
     canceled: AtomicBool,
     measured: AtomicBool,
     panic: Mutex<[Option<PanicPayload>; 3]>,
@@ -100,15 +100,15 @@ struct Custody {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputCleanupError {
-    Exit(ExitRoleError),
-    Driver(DriverError),
+    Exit(ExitCustodyError),
+    ActorTurn(ActorTurnError),
 }
 #[derive(Clone)]
 pub(crate) struct LoaderCustody(Arc<Custody>);
 #[must_use = "The original loader's body/captures must exit or remain unresolved"]
 pub(crate) struct LoaderJob {
     custody: LoaderCustody,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 #[must_use = "The actual input destructor must run on a cleanup host worker"]
 pub(crate) struct InputDisposalJob {
@@ -119,34 +119,35 @@ pub(crate) struct InputDisposalJob {
 pub(crate) enum LoaderOutcome {
     Loaded {
         result: Box<Result<CreationCost, AdmissionRefusal>>,
-        shape: novarocks_worker_protocol::context::TaskShape,
+        shape: novarocks_worker_protocol::participation::TaskShape,
         initial_domains: Vec<novarocks_worker_protocol::domain::TaskDomainInput>,
     },
     Canceled,
-    StartRefused(ExitRoleError),
+    StartRefused(ExitCustodyError),
     Unresolved,
 }
 impl LoaderCustody {
     pub(crate) fn from_admitted(
         payload: TaskCreatePayload,
-        admitted: AdmittedCompletionRole,
-        input_admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
+        input_admitted: AdmittedCompletionTransfer,
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, LoaderJob) {
         let work = admitted.work.reference();
         let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
-        let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
-            admitted.work,
-            admitted.capacity,
-            admitted.report,
-        ));
+        let (exit_custody, authority) =
+            ExitCustody::from_admitted(super::reported_work_admission::adopt_reported_work(
+                admitted.work,
+                admitted.capacity,
+                admitted.report,
+            ));
         let input_key = (input_admitted.work.scope().id(), input_admitted.work.id());
         let input_scope = input_admitted.work.scope().clone();
         let input_report = input_admitted.report.clone();
-        let (input_role, input_authority) =
-            ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
+        let (input_exit_custody, input_authority) =
+            ExitCustody::from_admitted(super::reported_work_admission::adopt_reported_work(
                 input_admitted.work,
                 input_admitted.capacity,
                 input_admitted.report,
@@ -158,9 +159,9 @@ impl LoaderCustody {
             scope,
             ingress_retained_bytes: payload.ingress_retained_bytes,
             sources: Mutex::new(Some(LoadingSources::new(payload.request, payload.input))),
-            role,
+            exit_custody,
             report,
-            input_role,
+            input_exit_custody,
             input_scope,
             input_key,
             input_report,
@@ -209,12 +210,12 @@ impl LoaderCustody {
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.0.report
     }
-    pub(crate) fn phase(&self) -> ExitRolePhase {
-        self.0.role.phase()
+    pub(crate) fn phase(&self) -> ExitCustodyPhase {
+        self.0.exit_custody.phase()
     }
     pub(crate) fn is_retired(&self) -> bool {
-        self.phase() == ExitRolePhase::Retired
-            && self.0.input_role.phase() == ExitRolePhase::Retired
+        self.phase() == ExitCustodyPhase::Retired
+            && self.0.input_exit_custody.phase() == ExitCustodyPhase::Retired
             && self.input_cleanup_completed()
             && self
                 .0
@@ -223,26 +224,26 @@ impl LoaderCustody {
                 .expect("loader source transfer lock")
                 .is_none()
     }
-    pub(crate) fn ready_for_exit(&self) -> Result<bool, ExitRoleError> {
-        self.0.role.actual_exit_ready()
+    pub(crate) fn ready_for_exit(&self) -> Result<bool, ExitCustodyError> {
+        self.0.exit_custody.actual_exit_ready()
     }
     /// The loader body and the original input destructor are distinct roles.
     /// A moved-out source or an exited loader cannot stand in for this proof.
-    pub(crate) fn input_actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
-        self.0.input_role.actual_exit_ready()
+    pub(crate) fn input_actual_exit_ready(&self) -> Result<bool, ExitCustodyError> {
+        self.0.input_exit_custody.actual_exit_ready()
     }
     pub(crate) fn adopt_input_cleanup(
         &self,
         stage: &ScopePublicationsDrained<'_>,
         cleanup: AdoptedCleanupEffect,
-    ) -> Result<(), (DriverError, AdoptedCleanupEffect)> {
+    ) -> Result<(), (ActorTurnError, AdoptedCleanupEffect)> {
         if cleanup.is_completed()
             || !self.0.scope.same_scope(&self.0.input_scope)
-            || !matches!(cleanup.effect(), WorkerAction::Context(
-                novarocks_worker_protocol::context::ContextEffect::DisposeLoadedInput { task, payload }
+            || !matches!(cleanup.effect(), WorkerAction::Participation(
+                novarocks_worker_protocol::participation::ParticipationEffect::DisposeLoadedInput { task, payload }
             ) if *task == self.0.task && *payload == self.0.payload)
         {
-            return Err((DriverError::PublicationTargetMismatch, cleanup));
+            return Err((ActorTurnError::PublicationTargetMismatch, cleanup));
         }
         if let Err(error) = cleanup.validate_scope(stage, &self.0.input_scope) {
             return Err((error, cleanup));
@@ -253,7 +254,7 @@ impl LoaderCustody {
             .lock()
             .expect("original loaded input cleanup effect");
         if slot.is_some() {
-            return Err((DriverError::RoleBusy, cleanup));
+            return Err((ActorTurnError::StandingInputBusy, cleanup));
         }
         *slot = Some(cleanup);
         drop(slot);
@@ -276,7 +277,7 @@ impl LoaderCustody {
             .expect("original loaded input cleanup effect")
             .as_mut()
             .map_or(Ok(false), |cleanup| cleanup.complete())
-            .map_err(InputCleanupError::Driver)?;
+            .map_err(InputCleanupError::ActorTurn)?;
         self.release_retention_if_transferred();
         Ok(progressed)
     }
@@ -297,7 +298,10 @@ impl LoaderCustody {
     }
     pub(crate) fn take_measured_sources(&self) -> Option<LoadingSources> {
         if !self.0.measured.load(Ordering::Acquire)
-            || !matches!(self.phase(), ExitRolePhase::Exited | ExitRolePhase::Retired)
+            || !matches!(
+                self.phase(),
+                ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+            )
         {
             return None;
         }
@@ -336,7 +340,7 @@ impl LoaderCustody {
             .expect("actual host input-exit observation");
         assert!(
             self.0
-                .input_role
+                .input_exit_custody
                 .try_retire()
                 .expect("input exit report retirement")
         );
@@ -346,7 +350,10 @@ impl LoaderCustody {
     /// A rejected/canceled Task keeps input custody until this separately paid
     /// cleanup body runs. Removing a queue entry is never its exit evidence.
     pub(crate) fn take_input_disposal(&self) -> Option<InputDisposalJob> {
-        if !matches!(self.phase(), ExitRolePhase::Exited | ExitRolePhase::Retired) {
+        if !matches!(
+            self.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+        ) {
             return None;
         }
         self.take_sources().map(|sources| InputDisposalJob {
@@ -355,16 +362,17 @@ impl LoaderCustody {
             active: true,
         })
     }
-    pub(crate) fn try_retire(&self) -> Result<bool, ExitRoleError> {
-        let retired = self.phase() == ExitRolePhase::Retired || self.0.role.try_retire()?;
+    pub(crate) fn try_retire(&self) -> Result<bool, ExitCustodyError> {
+        let retired =
+            self.phase() == ExitCustodyPhase::Retired || self.0.exit_custody.try_retire()?;
         if retired {
             self.release_retention_if_transferred();
         }
         Ok(retired)
     }
     fn release_retention_if_transferred(&self) {
-        if self.phase() == ExitRolePhase::Retired
-            && self.0.input_role.phase() == ExitRolePhase::Retired
+        if self.phase() == ExitCustodyPhase::Retired
+            && self.0.input_exit_custody.phase() == ExitCustodyPhase::Retired
             && self.input_cleanup_completed()
             && self
                 .0
@@ -444,7 +452,7 @@ impl LoaderJob {
                         // Codec getters never run on a metadata poller.
                         use novarocks_execution_contract::TaskDomainUpdate;
                         use novarocks_worker_protocol::{
-                            context::TaskShape, domain::TaskDomainInput,
+                            domain::TaskDomainInput, participation::TaskShape,
                         };
                         let descriptor = sources.request.descriptor();
                         let shape = TaskShape {

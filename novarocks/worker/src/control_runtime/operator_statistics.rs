@@ -20,14 +20,14 @@
 //! Final observation seals this producer and captures its actual latest data.
 
 use super::{
-    actors::{ContextMessage, WorkerActor, WorkerMessage},
-    admitted_role::adopt_reported_work,
+    actors::{ParticipationMessage, WorkerActor, WorkerMessage},
+    reported_work_admission::adopt_reported_work,
 };
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+use crate::{task_completion_set::AdmittedCompletionTransfer, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
+    actor_turn::{ActorRuntime, ActorTurnError, InputPhase, StandingInputObligation},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, InputPhase, InputRole},
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{
@@ -36,7 +36,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{FINAL_TASK_INFO_MAX_OPERATORS, TaskIdentity};
-use novarocks_worker_protocol::context::{ContextInput, TerminalStatistics};
+use novarocks_worker_protocol::participation::{ParticipationInput, TerminalStatistics};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const STATISTICS_INPUT_POSITIONS: usize = 1;
@@ -50,7 +50,7 @@ struct State {
 struct Custody {
     task: TaskIdentity,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
     state: Mutex<State>,
     pending: Arc<dyn TaskPendingNotice>,
@@ -59,7 +59,7 @@ struct Custody {
 }
 struct Producer {
     custody: Arc<Custody>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 /// Clones borrow the same actual producer. They reserve neither Work nor
 /// another queue position, and their last exit remains an independent fact.
@@ -176,9 +176,9 @@ struct InFlight {
 }
 #[derive(Debug)]
 pub(crate) enum StatisticsError {
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Runtime(RuntimeError),
-    Role(ExitRoleError),
+    Role(ExitCustodyError),
     MissingOccurrence,
     RefusedInput,
     Unresolved,
@@ -188,7 +188,7 @@ pub(crate) enum StatisticsError {
 impl std::fmt::Display for StatisticsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Driver(error) => write!(f, "Task statistics driver failure: {error}"),
+            Self::ActorTurn(error) => write!(f, "Task statistics driver failure: {error}"),
             Self::Runtime(error) => write!(f, "Task statistics runtime failure: {error}"),
             Self::Role(error) => write!(f, "Task statistics role failure: {error}"),
             Self::MissingOccurrence => f.write_str("Task statistics has no original occurrence"),
@@ -207,7 +207,7 @@ impl std::fmt::Display for StatisticsError {
 impl std::error::Error for StatisticsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Role(error) => Some(error),
             _ => None,
@@ -215,9 +215,9 @@ impl std::error::Error for StatisticsError {
     }
 }
 
-impl From<DriverError> for StatisticsError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
+impl From<ActorTurnError> for StatisticsError {
+    fn from(error: ActorTurnError) -> Self {
+        Self::ActorTurn(error)
     }
 }
 impl From<RuntimeError> for StatisticsError {
@@ -243,7 +243,7 @@ pub(crate) struct TaskStatisticsInbox {
     runtime: ActorRuntime<WorkerActor>,
     actor: ActorId,
     work: WorkId,
-    input: InputRole<WorkerActor>,
+    input: StandingInputObligation<WorkerActor>,
     in_flight: Option<InFlight>,
     rejected: Option<WorkerMessage>,
     input_closed: bool,
@@ -265,19 +265,22 @@ pub(crate) struct StatisticsBinding {
 }
 impl TaskStatisticsInbox {
     pub(crate) fn from_admitted(
-        role: AdmittedCompletionRole,
-        input: InputRole<WorkerActor>,
+        completion_transfer: AdmittedCompletionTransfer,
+        input: StandingInputObligation<WorkerActor>,
         binding: StatisticsBinding,
     ) -> (Self, TaskStatisticsProducer, TaskStatisticsFinalizer) {
-        let scope = role.work.scope().clone();
-        let work = role.work.id();
-        let report = role.report.clone();
-        let (role, authority) =
-            ExitRole::from_admitted(adopt_reported_work(role.work, role.capacity, role.report));
+        let scope = completion_transfer.work.scope().clone();
+        let work = completion_transfer.work.id();
+        let report = completion_transfer.report.clone();
+        let (exit_custody, authority) = ExitCustody::from_admitted(adopt_reported_work(
+            completion_transfer.work,
+            completion_transfer.capacity,
+            completion_transfer.report,
+        ));
         let custody = Arc::new(Custody {
             task: binding.task,
             scope,
-            role,
+            exit_custody,
             report,
             state: Mutex::new(State {
                 pending: None,
@@ -316,8 +319,8 @@ impl TaskStatisticsInbox {
     pub(crate) fn is_retired(&self) -> bool {
         self.closed
     }
-    pub(crate) fn phase(&self) -> ExitRolePhase {
-        self.custody.role.phase()
+    pub(crate) fn phase(&self) -> ExitCustodyPhase {
+        self.custody.exit_custody.phase()
     }
     #[cfg(test)]
     pub(crate) fn report(&self) -> &ReportSlot {
@@ -364,7 +367,7 @@ impl TaskStatisticsInbox {
         };
         result.progressed |= discarded.0.is_some() || discarded.1.is_some();
         drop(discarded);
-        if self.phase() == ExitRolePhase::Unresolved {
+        if self.phase() == ExitCustodyPhase::Unresolved {
             return Err(StatisticsError::Unresolved);
         }
         // A refused WorkerMessage is bounded neutral statistics metadata, not
@@ -392,9 +395,9 @@ impl TaskStatisticsInbox {
                         result.progressed = true;
                     }
                     Err(
-                        DriverError::InputStillQueued
-                        | DriverError::EffectsRemain
-                        | DriverError::ReservationsRemain,
+                        ActorTurnError::InputStillQueued
+                        | ActorTurnError::EffectsRemain
+                        | ActorTurnError::ReservationsRemain,
                     ) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -411,7 +414,7 @@ impl TaskStatisticsInbox {
         }
         if self
             .custody
-            .role
+            .exit_custody
             .actual_exit_ready()
             .map_err(StatisticsError::Role)?
         {
@@ -428,7 +431,7 @@ impl TaskStatisticsInbox {
             if self.input_closed
                 && self
                     .custody
-                    .role
+                    .exit_custody
                     .try_retire()
                     .map_err(StatisticsError::Role)?
             {
@@ -462,14 +465,14 @@ impl TaskStatisticsInbox {
         // pending Core input. Failure cannot suppress this report leg.
         let producer_exited = self
             .custody
-            .role
+            .exit_custody
             .actual_exit_ready()
             .map_err(StatisticsError::Role)?;
         let observer = ConsumerId::new(2).expect("original physical observer");
         if producer_exited && self.custody.report.consumption(observer)? == Consumption::Pending {
             self.custody.report.consume(observer)?;
         }
-        if self.phase() == ExitRolePhase::Unresolved {
+        if self.phase() == ExitCustodyPhase::Unresolved {
             return Err(StatisticsError::Unresolved);
         }
         if self.rejected.is_some() {
@@ -499,9 +502,9 @@ impl TaskStatisticsInbox {
                     progress.consumed = true;
                 }
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => return Ok((progress, None)),
                 Err(error) => return Err(error.into()),
             }
@@ -531,13 +534,13 @@ impl TaskStatisticsInbox {
             producer_exited,
         } = turn;
         if let Some(snapshot) = snapshot {
-            let input = WorkerMessage::Context(ContextMessage::Command {
+            let input = WorkerMessage::Participation(ParticipationMessage::Command {
                 work: novarocks_control_runtime_core::identity::ScopedWorkRef {
                     scope: self.custody.scope.id(),
                     work: self.work,
                 },
                 request: None,
-                command: ContextInput::OperatorStatistics {
+                command: ParticipationInput::OperatorStatistics {
                     task: self.custody.task,
                     statistics: snapshot.statistics.clone(),
                     truncated: snapshot.truncated,
@@ -583,7 +586,7 @@ impl TaskStatisticsInbox {
             }
             if self
                 .custody
-                .role
+                .exit_custody
                 .try_retire()
                 .map_err(StatisticsError::Role)?
             {

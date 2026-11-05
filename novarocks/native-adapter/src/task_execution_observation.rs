@@ -17,13 +17,13 @@
 
 //! Native rendering of already-decided Worker task lifecycle facts.
 //!
-//! The Worker remains the only task/context lifecycle owner. This adapter
+//! The Worker remains the only task/participation lifecycle owner. This adapter
 //! renders its settled facts as role-local evidence, metrics, and result-buffer
 //! cleanup without gaining a second transition or admission authority.
 
 use std::sync::Arc;
 
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskIdentity};
 use novarocks_worker::{
     RuntimeFilterReleaseObservation, TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolEvent,
     TaskProtocolObserver, TaskResultLifecycle,
@@ -80,30 +80,30 @@ pub fn backend_task_execution_ports(
 }
 
 #[cfg(novarocks_dev_controls)]
-fn emit_context(
+fn emit_participation(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     name: &str,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) {
-    emit_context_with(observer, name, context, "");
+    emit_participation_with(observer, name, participation, "");
 }
 
 #[cfg(novarocks_dev_controls)]
-fn emit_context_with(
+fn emit_participation_with(
     observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
     name: &str,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     extra: &str,
 ) {
-    let execution = context.query_execution_id();
+    let execution = participation.query_execution_id();
     let separator = if extra.is_empty() { "" } else { " " };
     observer.observe(&format!(
         "{name} execution_id={}:{}:{} frontend={} backend={}{separator}{extra}",
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
-        context.frontend_process_id(),
-        context.backend_process_id(),
+        participation.frontend_process_id(),
+        participation.backend_process_id(),
     ));
 }
 
@@ -132,7 +132,7 @@ fn emit_task(
 pub(crate) fn emit_prepared_task_dop(
     controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
-    fragment_instance_id: novarocks_types::UniqueId,
+    task_key: novarocks_types::UniqueId,
     dop: usize,
 ) {
     let Some(controls) = controls else { return };
@@ -141,15 +141,16 @@ pub(crate) fn emit_prepared_task_dop(
     };
     let execution = identity.query_execution_id();
     observer.observe(&format!(
-        "NOVAROCKS_TASK_PREPARED_DOP execution_id={}:{}:{} stage={} task={} backend={} finst={:x}:{:x} dop={dop}",
+        "{} execution_id={}:{}:{} stage={} task={} backend={} task_key={:x}:{:x} dop={dop}",
+        novarocks_failpoint::observation_marker::TASK_PREPARED_DOP,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
         identity.stage_id().get(),
         identity.task_id().get(),
         identity.backend_process_id(),
-        fragment_instance_id.high(),
-        fragment_instance_id.low(),
+        task_key.high(),
+        task_key.low(),
     ));
 }
 
@@ -170,7 +171,7 @@ pub(crate) fn emit_prepared_client_root(
     {
         emit_task(
             observer.as_ref(),
-            "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT",
+            novarocks_failpoint::observation_marker::TASK_PREPARED_CLIENT_ROOT,
             identity,
         );
     }
@@ -187,16 +188,17 @@ fn emit(
         | TaskProtocolEvent::TaskTerminalRetained { identity, .. } => {
             (identity.query_execution_id(), identity.backend_process_id())
         }
-        TaskProtocolEvent::ContextEstablishApplied { context }
-        | TaskProtocolEvent::ContextEstablishIdempotent { context }
-        | TaskProtocolEvent::ContextEstablishConflict { context }
-        | TaskProtocolEvent::LeaseRenewed { context, .. }
-        | TaskProtocolEvent::ContextReleaseApplied { context, .. }
-        | TaskProtocolEvent::ContextLeaseExpired { context }
-        | TaskProtocolEvent::ContextTerminationCompleted { context, .. }
-        | TaskProtocolEvent::ContextAbortApplied { context } => {
-            (context.query_execution_id(), context.backend_process_id())
-        }
+        TaskProtocolEvent::ParticipationEstablishApplied { participation }
+        | TaskProtocolEvent::ParticipationEstablishIdempotent { participation }
+        | TaskProtocolEvent::ParticipationEstablishConflict { participation }
+        | TaskProtocolEvent::LeaseRenewed { participation, .. }
+        | TaskProtocolEvent::ParticipationReleaseApplied { participation, .. }
+        | TaskProtocolEvent::ParticipationLeaseExpired { participation }
+        | TaskProtocolEvent::ParticipationTerminationCompleted { participation, .. }
+        | TaskProtocolEvent::ParticipationAbortApplied { participation } => (
+            participation.query_execution_id(),
+            participation.backend_process_id(),
+        ),
     };
     if !controls.owns_backend(process) {
         return;
@@ -205,49 +207,55 @@ fn emit(
         return;
     };
     match event {
-        TaskProtocolEvent::ContextEstablishApplied { context } => {
-            emit_context(
+        TaskProtocolEvent::ParticipationEstablishApplied { participation } => {
+            emit_participation(
                 observer.as_ref(),
-                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED",
-                context,
+                novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_APPLIED,
+                participation,
             );
         }
-        TaskProtocolEvent::ContextEstablishIdempotent { context } => {
-            emit_context(
+        TaskProtocolEvent::ParticipationEstablishIdempotent { participation } => {
+            emit_participation(
                 observer.as_ref(),
-                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_IDEMPOTENT",
-                context,
+                novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_IDEMPOTENT,
+                participation,
             );
         }
-        TaskProtocolEvent::ContextEstablishConflict { context } => {
-            emit_context(
+        TaskProtocolEvent::ParticipationEstablishConflict { participation } => {
+            emit_participation(
                 observer.as_ref(),
-                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_CONFLICT",
-                context,
+                novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_CONFLICT,
+                participation,
             );
         }
-        TaskProtocolEvent::LeaseRenewed { context, sequence } => {
-            let execution = context.query_execution_id();
+        TaskProtocolEvent::LeaseRenewed {
+            participation,
+            sequence,
+        } => {
+            let execution = participation.query_execution_id();
             observer.observe(&format!(
-                "NOVAROCKS_TASK_LEASE_RENEWED execution_id={}:{}:{} frontend={} backend={} sequence={}",
+                "{} execution_id={}:{}:{} frontend={} backend={} sequence={}",
+                novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_RENEWED,
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),
-                context.frontend_process_id(),
-                context.backend_process_id(),
+                participation.frontend_process_id(),
+                participation.backend_process_id(),
                 sequence.get(),
             ));
         }
-        TaskProtocolEvent::TaskCreateApplied { identity } => {
-            emit_task(observer.as_ref(), "NOVAROCKS_TASK_CREATE_APPLIED", identity)
-        }
-        TaskProtocolEvent::TaskCreateIdempotent { identity } => emit_task(
+        TaskProtocolEvent::TaskCreateApplied { identity } => emit_task(
             observer.as_ref(),
-            "NOVAROCKS_TASK_CREATE_IDEMPOTENT",
+            novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
             identity,
         ),
-        TaskProtocolEvent::ContextReleaseApplied {
-            context,
+        TaskProtocolEvent::TaskCreateIdempotent { identity } => emit_task(
+            observer.as_ref(),
+            novarocks_failpoint::observation_marker::TASK_CREATE_IDEMPOTENT,
+            identity,
+        ),
+        TaskProtocolEvent::ParticipationReleaseApplied {
+            participation,
             runtime_filter,
         } => {
             let runtime_filter = match runtime_filter {
@@ -255,40 +263,41 @@ fn emit(
                 RuntimeFilterReleaseObservation::Available => "available",
                 RuntimeFilterReleaseObservation::Unavailable => "unavailable",
             };
-            emit_context_with(
+            emit_participation_with(
                 observer.as_ref(),
-                "NOVAROCKS_TASK_RELEASE_APPLIED",
-                context,
+                novarocks_failpoint::observation_marker::PARTICIPATION_RELEASE_APPLIED,
+                participation,
                 &format!("runtime_filter={runtime_filter}"),
             );
         }
-        TaskProtocolEvent::ContextLeaseExpired { context } => {
-            emit_context(
+        TaskProtocolEvent::ParticipationLeaseExpired { participation } => {
+            emit_participation(
                 observer.as_ref(),
-                "NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED",
-                context,
+                novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_EXPIRED,
+                participation,
             );
         }
-        TaskProtocolEvent::ContextTerminationCompleted {
-            context,
+        TaskProtocolEvent::ParticipationTerminationCompleted {
+            participation,
             cause,
             retained_tasks,
         } => {
-            let execution = context.query_execution_id();
+            let execution = participation.query_execution_id();
             observer.observe(&format!(
-                "NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED execution_id={}:{}:{} frontend={} backend={} cause={} retained_tasks={retained_tasks}",
+                "{} execution_id={}:{}:{} frontend={} backend={} cause={} retained_tasks={retained_tasks}", novarocks_failpoint::observation_marker::PARTICIPATION_TERMINATION_COMPLETED,
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),
-                context.frontend_process_id(),
-                context.backend_process_id(),
+                participation.frontend_process_id(),
+                participation.backend_process_id(),
                 cause,
             ));
         }
         TaskProtocolEvent::TaskTerminalRetained { identity, state } => {
             let execution = identity.query_execution_id();
             observer.observe(&format!(
-                "NOVAROCKS_TASK_TERMINAL_RETAINED execution_id={}:{}:{} stage={} task={} backend={} state={state}",
+                "{} execution_id={}:{}:{} stage={} task={} backend={} state={state}",
+                novarocks_failpoint::observation_marker::TASK_TERMINAL_RETAINED,
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),
@@ -297,15 +306,16 @@ fn emit(
                 identity.backend_process_id(),
             ));
         }
-        TaskProtocolEvent::ContextAbortApplied { context } => {
-            let execution = context.query_execution_id();
+        TaskProtocolEvent::ParticipationAbortApplied { participation } => {
+            let execution = participation.query_execution_id();
             observer.observe(&format!(
-                "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED execution_id={}:{}:{} frontend={} backend={}",
+                "{} execution_id={}:{}:{} frontend={} backend={}",
+                novarocks_failpoint::observation_marker::PARTICIPATION_ABORT_APPLIED,
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),
-                context.frontend_process_id(),
-                context.backend_process_id(),
+                participation.frontend_process_id(),
+                participation.backend_process_id(),
             ));
         }
     }
@@ -316,7 +326,10 @@ fn resolve_observer(
     controls: &crate::test_observation_controls::NativeObservationControls,
     execution: novarocks_types::QueryExecutionId,
 ) -> Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>> {
-    match controls.observation_for("grpc-fragment", execution) {
+    match controls.observation_for(
+        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+        execution,
+    ) {
         Ok(observer) => observer,
         Err(error) => {
             eprintln!("Native task observation rejected: {error}");

@@ -355,7 +355,7 @@ mod tests {
         SnapshotReference, SnapshotRetention, SortOrder, Struct, Summary, TableMetadataBuilder,
         Transform, Type,
     };
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     use super::*;
 
@@ -365,7 +365,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }
 

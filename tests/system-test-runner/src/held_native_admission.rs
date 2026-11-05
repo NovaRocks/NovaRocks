@@ -167,7 +167,8 @@ impl AdmittedHeldNativeRun {
 fn neutral_identity(bytes: &[u8], expected: &str) -> Result<()> {
     revision(expected)?;
     let required = format!(
-        "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={expected} build_identity={expected} root_observation=true\n"
+        "{} commit={expected} build_identity={expected} root_observation=true\n",
+        novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_BUILD
     );
     ensure!(
         bytes == required.as_bytes(),
@@ -202,7 +203,10 @@ fn input(bytes: &[u8]) -> Result<()> {
         ("topology", "1FE+3BE"),
         (
             "expected_fe_source",
-            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE actual original NativeTrust FrontendProcessId; default-off distinct root-observation feature",
+            &*format!(
+                "{} actual original NativeTrust FrontendProcessId; default-off distinct root-observation feature",
+                novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE
+            ),
         ),
         ("config_policy", EFFECTIVE_POLICY),
         ("root_output_kind", "ClientRows"),

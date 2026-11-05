@@ -28,8 +28,8 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 #[cfg(test)]
-use crate::runtime::fragment::ExecutionFailure;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionFailure;
+use crate::runtime::task::ExecutionResult;
 
 #[cfg(test)]
 use std::collections::HashSet;
@@ -38,6 +38,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::exec::chunk::ChunkSlotSchema;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+#[cfg(test)]
+use crate::exec::pipeline::driver_step::DriverStep;
 #[cfg(test)]
 use crate::exec::pipeline::input::PreparedInput;
 #[cfg(test)]
@@ -48,8 +50,6 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::shape::{Transform, TransformKernel};
 #[cfg(test)]
 use crate::exec::pipeline::step::{NextStep, StepResult};
-#[cfg(test)]
-use crate::exec::pipeline::step_context::StepContext;
 #[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
 #[cfg(test)]
@@ -134,7 +134,7 @@ impl std::error::Error for RepeatSchemaViolation {}
 #[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for RepeatSchemaViolation {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let reason = match self {
             Self::Configuration(_) => ExecutionReason::RepeatConfiguration,
             Self::MissingSlot { .. } => ExecutionReason::RepeatMissingSlot,
@@ -537,7 +537,7 @@ impl InputEncodingPolicy for RepeatFixtureKernel {}
 impl TransformKernel for RepeatFixtureKernel {
     fn apply(
         &mut self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         chunk: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = chunk.into_uncovered_chunk()?;
@@ -603,7 +603,7 @@ impl TransformKernel for RepeatFixtureKernel {
         Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
 
-    fn drive(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if self.input.is_none() {
             return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
@@ -871,9 +871,9 @@ mod typed_owner_tests {
     use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
     use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
     use crate::runtime::{
-        fragment::{ExecutionFailure, ExecutionFailureCause},
         mem_tracker::MemTracker,
         runtime_state::RuntimeErrorState,
+        task::{ExecutionFailure, ExecutionFailureCause},
     };
     use arrow::array::{Array, ListArray, StringArray};
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -1425,7 +1425,7 @@ pub(crate) fn repeat_output_columns_owned(
     use std::alloc::Layout;
     fn failure(
         cause: CopyConstructionError<ConstructionFailure>,
-    ) -> crate::runtime::fragment::ExecutionFailure {
+    ) -> crate::runtime::task::ExecutionFailure {
         match cause {
             CopyConstructionError::Creator(cause) => cause.into(),
             CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),

@@ -75,7 +75,7 @@ pub fn connector_query_binding_from_materialization(
                         snapshot_id,
                     ),
                     mv_partition_selection: None,
-                    planning_lease: materialization.planning_lease.clone(),
+                    planning_pin: materialization.planning_pin.clone(),
                 },
             )
         })
@@ -83,13 +83,13 @@ pub fn connector_query_binding_from_materialization(
     Ok(QueryTableBinding {
         resolved: sql_materialization.into_resolved_table(),
         statistics_pin: materialization.statistics_pin.clone(),
-        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_pin.clone()),
         source_metadata: Some(materialization.source_metadata),
         scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
             selector: materialization.read_selector,
             mv_partition_selection: None,
-            planning_lease: materialization.planning_lease,
+            planning_pin: materialization.planning_pin,
         }),
         mv_target_read: None,
         write_target_admission: None,
@@ -100,7 +100,7 @@ pub fn connector_query_binding_from_materialization(
 }
 
 /// Admit one provider-owned change window while the caller holds the exact
-/// table handle and planning lease. The returned sealed scan is the sole
+/// table handle and planning pin. The returned sealed scan is the sole
 /// physical authority retained by Core for later preparation.
 /// Application materializer for connector-controlled table metadata.  The
 /// interface is intentionally application-owned because it returns an exact
@@ -166,7 +166,7 @@ pub trait QueryTableBindingLoader: Send + Sync {
 }
 
 /// Completed provider observation consumed by the original SQL binding author.
-/// It carries the same planning lease and opaque handle, never a new lookup.
+/// It carries the same planning pin and opaque handle, never a new lookup.
 pub struct PreparedQueryTableBinding {
     materialization: ConnectorQueryTableMaterialization,
     catalog: String,
@@ -368,7 +368,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         })?;
         if &current != expected {
             return Err(CatalogResolutionError::failed(
-                "catalog attachment generation changed while acquiring its planning lease",
+                "catalog attachment generation changed while acquiring its planning pin",
             ));
         }
         Ok(())
@@ -698,7 +698,7 @@ pub(crate) struct OriginalCatalogMetadataLookup {
     need: novarocks_sql::compiler::CatalogRelationNeed,
     key: QueryTableBindingKey,
     observation: Option<novarocks_catalog_application::CatalogRuntimeObservation>,
-    pub(crate) lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub(crate) planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     pub(crate) namespace: String,
     pub(crate) physical_table: String,
     pub(crate) resolution: novarocks_spi::connector::ConnectorTableResolution,
@@ -777,7 +777,7 @@ impl CatalogServiceMaterializer<'_> {
                 self.resolve_query_local_overlay(overlay, &relation.namespace, &relation.table);
             if self.original_catalog_admission(catalog)? != observation {
                 return Err(contract_error(
-                    "catalog attachment generation changed while acquiring its planning lease",
+                    "catalog attachment generation changed while acquiring its planning pin",
                 ));
             }
             return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
@@ -811,12 +811,12 @@ impl CatalogServiceMaterializer<'_> {
             });
             if self.original_catalog_admission(catalog)? != observation {
                 return Err(contract_error(
-                    "catalog attachment generation changed while acquiring its planning lease",
+                    "catalog attachment generation changed while acquiring its planning pin",
                 ));
             }
             return original_catalog_fact(need, resolved).map(OriginalCatalogLookup::Fact);
         }
-        let lease =
+        let planning_pin =
             crate::connector::metadata_binding_typed(controls, catalog).map_err(provider_error)?;
         let (physical_table, resolution, snapshot) = match metadata_kind {
             None => {
@@ -851,7 +851,7 @@ impl CatalogServiceMaterializer<'_> {
                 need: need.clone(),
                 key,
                 observation,
-                lease,
+                planning_pin,
                 namespace: relation.namespace.clone(),
                 physical_table,
                 resolution,
@@ -880,7 +880,7 @@ impl CatalogServiceMaterializer<'_> {
         let relation = lookup.need.relation();
         let materialization = match observed {
             Ok(metadata) => crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
-                metadata, lookup.lease,
+                metadata, lookup.planning_pin,
             ).map_err(CatalogResolutionError::failed),
             Err(error) if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {
                 let missing = CatalogResolutionError::missing(format!("unknown table: {}.{}", relation.namespace, relation.table));
@@ -917,7 +917,7 @@ impl CatalogServiceMaterializer<'_> {
             .map_err(|error| contract_error(error.into_message()))?;
         if self.original_catalog_admission(&relation.catalog)? != lookup.observation {
             return Err(contract_error(
-                "catalog attachment generation changed while acquiring its planning lease",
+                "catalog attachment generation changed while acquiring its planning pin",
             ));
         }
         let resolved = self
@@ -1096,7 +1096,7 @@ pub fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>
 }
 
 /// Application adapter for the SQL catalog's provider-neutral materialization
-/// seam. The resulting binding carries the exact planning lease acquired for
+/// seam. The resulting binding carries the exact planning pin acquired for
 /// metadata; SQL itself never names the Iceberg provider.
 pub fn iceberg_table_binding_loader<'a>(
     controls: &'a dyn ConnectorControlResolver,
@@ -1271,13 +1271,13 @@ fn metadata_query_binding_from_materialization(
             binding_id,
         ),
         statistics_pin: materialization.statistics_pin.clone(),
-        admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
+        admission: QueryTableBindingAdmission::Exact(materialization.planning_pin.clone()),
         source_metadata: None,
         scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
             selector: materialization.read_selector,
             mv_partition_selection: None,
-            planning_lease: materialization.planning_lease,
+            planning_pin: materialization.planning_pin,
         }),
         mv_target_read: None,
         write_target_admission: None,
@@ -1864,7 +1864,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "catalog attachment generation changed while acquiring its planning lease"
+            "catalog attachment generation changed while acquiring its planning pin"
         );
     }
 

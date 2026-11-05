@@ -51,7 +51,7 @@ INSERT INTO ${case_db}.kill_query VALUES (3, 10);
 -- query 5
 -- @cancel_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @expect_error=USER_CANCELED
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
 SELECT COUNT(*)
 FROM ${case_db}.kill_query
 WHERE sleep(delay_s);
@@ -68,7 +68,7 @@ SELECT COUNT(*) FROM ${case_db}.kill_query;
 -- @expect_error=USER_CANCELED
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,1
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,1
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
 SELECT COUNT(*)
 FROM ${case_db}.kill_query$files AS metadata
 JOIN ${case_db}.kill_query AS data ON TRUE

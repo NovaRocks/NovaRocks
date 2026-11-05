@@ -25,10 +25,43 @@ use std::time::Instant;
 
 pub(crate) const SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const LINE_BYTES: usize = 384;
-const FE_STEM: &[u8] = b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE";
-const FE_PREFIX: &[u8] = b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id=";
-const BIND_STEM: &[u8] = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND";
-const BIND_PREFIX: &[u8] = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND ";
+const FE_STEM: &[u8] = novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.as_bytes();
+const FE_PREFIX: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.as_bytes();
+    let suffix = b" frontend_process_id=";
+    let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.len()
+        + b" frontend_process_id=".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
+const BIND_STEM: &[u8] =
+    novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.as_bytes();
+const BIND_PREFIX: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.as_bytes();
+    let suffix = b" ";
+    let mut bytes =
+        [0; novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.len() + b" ".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
 
 /// Original source facts only: no write cursor, cancellation, ACK, or backing authority.
 /// Generation fields remain distinct even when the source happens to give equal values.

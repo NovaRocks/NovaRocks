@@ -61,7 +61,7 @@ impl CompletionFixture {
                 task.backend_process_id(),
             );
             let refusal = supervisor
-                .reserve_task_slot(foreign, descriptor.fragment_instance_id(), reporter, exit)
+                .reserve_task_slot(foreign, descriptor.task_key(), reporter, exit)
                 .err()
                 .expect("foreign Task identity must refuse the original reporter and exit");
             let (error, reporter, exit) = refusal.into_task_parts();
@@ -80,7 +80,7 @@ impl CompletionFixture {
         // Capacity is one. Retrying these exact returned originals must work:
         // the refusal cannot leave a foreign slot or consume the exit notice.
         supervisor
-            .reserve_task_slot(task, descriptor.fragment_instance_id(), reporter, exit)
+            .reserve_task_slot(task, descriptor.task_key(), reporter, exit)
             .unwrap()
     }
     pub(super) fn capture(self: &Arc<Self>) -> Option<CompletionCapture> {
@@ -95,7 +95,7 @@ impl CompletionFixture {
     pub(super) fn observe_before_exit(
         &self,
         scene: &Scenario<TaskResources>,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
         resources: &TaskResources,
     ) -> Result<(), Failure> {
@@ -136,10 +136,10 @@ impl CompletionFixture {
         let mut cancel = scene
             .node
             .submit_task_command(
-                context,
+                participation,
                 operation_number(26),
                 MonotonicInstant::from_origin(Duration::from_secs(100)),
-                ContextCommand::Cancel {
+                ParticipationCommand::Cancel {
                     task,
                     reason: CancelReason::UpstreamNoLongerNeeded,
                 },
@@ -152,7 +152,7 @@ impl CompletionFixture {
             )));
         };
         assert!(
-            matches!(delivery.body(), ContextReplyBody::Task { outcome: OperationOutcome::Accepted, status }
+            matches!(delivery.body(), ParticipationReplyBody::Task { outcome: OperationOutcome::Accepted, status }
             if status.identity() == task)
         );
         drop(delivery);
@@ -199,7 +199,7 @@ impl Drop for CompletionCapture {
 fn start(
     root: &mut ProcessControlOwner,
     contract: Contract,
-) -> Result<(TaskDriverPorts, TaskResources), Failure> {
+) -> Result<(TaskIoPorts, TaskResources), Failure> {
     let (ports, resources) = start_tasks(root)?;
     let previous = resources
         .host

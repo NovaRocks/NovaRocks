@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual statistics role/input custody with explicit pure Context facts.
+//! Actual statistics role/input custody with explicit pure Participation facts.
 //! The model does not claim Native runtime or callback physical exit.
 
 use super::*;
@@ -26,7 +26,7 @@ use crate::{
         tests::{Fixture, actor, generation, operation, task},
     },
 };
-use novarocks_control_runtime::{completion::ReportSlot, driver::EffectTicket};
+use novarocks_control_runtime::{actor_turn::EffectTicket, completion::ReportSlot};
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
     completion::ConsumerKind,
@@ -36,10 +36,10 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{OperatorStatistics, SafeDetail, TaskOutputFacts};
-use novarocks_worker_protocol::context::ContextCommand;
+use novarocks_worker_protocol::participation::ParticipationCommand;
 use novarocks_worker_protocol::{
-    context::{ContextEffect, TerminalIntent, TerminalObservation},
     creation::{CreationCost, PayloadId},
+    participation::{ParticipationEffect, TerminalIntent, TerminalObservation},
 };
 use std::{
     collections::BTreeMap,
@@ -61,18 +61,18 @@ fn sample(rows: u64, truncated: bool) -> TerminalStatistics {
         truncated,
     }
 }
-fn command(f: &mut Fixture, input: ContextInput) -> Vec<WorkerAction> {
+fn command(f: &mut Fixture, input: ParticipationInput) -> Vec<WorkerAction> {
     let input = f.send(input, None, InputClass::Lifecycle, 2);
     f.runtime.poll_one(Tick(1)).unwrap();
     f.drain(input)
 }
 fn request(
     f: &mut Fixture,
-    command: ContextCommand,
+    command: ParticipationCommand,
     operation: novarocks_execution_contract::TaskOperationId,
 ) -> Vec<WorkerAction> {
     let input = f.send(
-        ContextInput::Request(command),
+        ParticipationInput::Request(command),
         Some(operation),
         InputClass::Ordinary,
         2,
@@ -90,7 +90,7 @@ fn fixture() -> (
     let identity = task(f.identity, 1);
     request(
         &mut f,
-        ContextCommand::Create {
+        ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(3),
         },
@@ -98,7 +98,7 @@ fn fixture() -> (
     );
     let mut loaded = command(
         &mut f,
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -107,13 +107,15 @@ fn fixture() -> (
             }),
         },
     );
-    while loaded
-        .iter()
-        .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
-    {
-        loaded = command(&mut f, ContextInput::NextInternal);
+    while loaded.iter().any(|effect| {
+        matches!(
+            effect,
+            WorkerAction::Participation(ParticipationEffect::WakeInternal)
+        )
+    }) {
+        loaded = command(&mut f, ParticipationInput::NextInternal);
     }
-    command(&mut f, ContextInput::Installed { task: identity });
+    command(&mut f, ParticipationInput::Installed { task: identity });
     // This role's separate position is charged explicitly before any producer
     // captures it; the Task host factory is tested in its integration slice.
     let (work, mut capacity) = f
@@ -128,7 +130,7 @@ fn fixture() -> (
                     captures: 1,
                     inputs: 1,
                     batches: 1,
-                    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                     ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
                 },
             ),
@@ -163,10 +165,10 @@ fn fixture() -> (
             &work,
         )
         .unwrap()
-        .into_role()
+        .into_standing_input()
         .unwrap_or_else(|_| panic!("the original prepaid statistics input converts once"));
     let (inbox, producer, finalizer) = TaskStatisticsInbox::from_admitted(
-        AdmittedCompletionRole {
+        AdmittedCompletionTransfer {
             work,
             capacity,
             report,
@@ -195,7 +197,7 @@ fn final_info_with_snapshot(
     let identity = task(f.identity, 1);
     command(
         f,
-        ContextInput::TerminalObservation {
+        ParticipationInput::TerminalObservation {
             task: identity,
             observation: TerminalObservation {
                 intent: TerminalIntent::SuccessfulProduction {
@@ -207,16 +209,16 @@ fn final_info_with_snapshot(
             },
         },
     );
-    command(f, ContextInput::CompletionExited { task: identity });
+    command(f, ParticipationInput::CompletionExited { task: identity });
     request(
         f,
-        ContextCommand::GetFinalInfo { task: identity },
+        ParticipationCommand::GetFinalInfo { task: identity },
         operation(20),
     )
     .into_iter()
     .find_map(|effect| match effect {
         WorkerAction::Reply(reply) => match reply.body.as_ref() {
-            novarocks_worker_protocol::context::ContextReplyBody::FinalInfo(info) => {
+            novarocks_worker_protocol::participation::ParticipationReplyBody::FinalInfo(info) => {
                 Some(info.clone())
             }
             _ => None,
@@ -383,7 +385,7 @@ fn the_last_sample_after_an_empty_owner_take_survives_the_actual_producer_exit()
     );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()) + 1, funded);
     // No terminal statistics override: only the actual periodic input can
-    // account for these rows in the pure Context's final information.
+    // account for these rows in the pure Participation's final information.
     let info = final_info_with_snapshot(&mut f, None);
     let rows = info.operator_statistics()[0].output_rows();
     let truncated = info.operator_statistics_truncated();
@@ -399,7 +401,7 @@ fn committed_statistics_wait_for_actual_effect_exit_and_last_producer_before_ref
     let identity = task(f.identity, 1);
     command(
         &mut f,
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: identity,
             proposal: novarocks_worker_protocol::proposal_summary::Proposal {
                 conclusion: novarocks_execution_contract::TaskConclusion::Terminated(
@@ -441,7 +443,7 @@ fn committed_statistics_wait_for_actual_effect_exit_and_last_producer_before_ref
     let effects = complete_effects(&f, input);
     assert!(effects.iter().any(|effect| matches!(
         effect,
-        WorkerAction::Context(ContextEffect::StopTask { .. })
+        WorkerAction::Participation(ParticipationEffect::StopTask { .. })
     )));
     let done = inbox.advance().unwrap();
     assert!(done.consumed && done.retired);
@@ -541,11 +543,11 @@ fn observer_aliases_cannot_sign_producer_exit_and_only_the_last_actual_clone_rel
     assert!(finalizer.seal_for_terminal(None).is_none());
     drop(producer);
     drop(observer_alias);
-    assert_eq!(inbox.phase(), ExitRolePhase::Admitted);
+    assert_eq!(inbox.phase(), ExitCustodyPhase::Admitted);
     assert!(!inbox.advance().unwrap().retired);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), funded);
     drop(clone);
-    assert_eq!(inbox.phase(), ExitRolePhase::Exited);
+    assert_eq!(inbox.phase(), ExitCustodyPhase::Exited);
     assert_eq!(
         inbox
             .report()
@@ -595,7 +597,7 @@ fn a_failed_scope_keeps_the_exact_refused_sample_and_independent_physical_observ
         inbox.advance(),
         Err(StatisticsError::FailurePublicationRequired)
     ));
-    assert_eq!(inbox.phase(), ExitRolePhase::Exited);
+    assert_eq!(inbox.phase(), ExitCustodyPhase::Exited);
     assert_eq!(
         inbox
             .report()
@@ -629,7 +631,7 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
     let funded = f.ledger.used(Dimension::ActiveTasks.id());
     let identity = producer.identity();
     let bad = f.send(
-        ContextInput::Installed {
+        ParticipationInput::Installed {
             task: task(f.identity, 999),
         },
         None,
@@ -652,10 +654,10 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
     );
     assert_eq!(taken_original.0.input, statistics_input);
     match &taken_original.1 {
-        WorkerMessage::Context(ContextMessage::Command {
+        WorkerMessage::Participation(ParticipationMessage::Command {
             request: None,
             command:
-                ContextInput::OperatorStatistics {
+                ParticipationInput::OperatorStatistics {
                     task,
                     statistics,
                     truncated: true,
@@ -691,7 +693,7 @@ fn an_actual_failed_owner_input_is_reported_without_claiming_core_consumption() 
         inbox.advance(),
         Err(StatisticsError::FailurePublicationRequired)
     ));
-    assert_eq!(inbox.phase(), ExitRolePhase::Exited);
+    assert_eq!(inbox.phase(), ExitCustodyPhase::Exited);
     assert_eq!(
         inbox
             .report()

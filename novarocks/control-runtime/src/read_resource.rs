@@ -19,7 +19,7 @@
 //! Loans never destroy payloads; only the original sealed host owner may take.
 
 use crate::{
-    exit_role::{ExitAuthority, ExitRoleError},
+    exit_custody::{ExitCustodyError, ExitObligation},
     notify::Notify,
     sync::{Arc, AtomicBool, Mutex, Ordering},
     transaction::ScopeHandle,
@@ -189,7 +189,7 @@ impl<T: Send + Sync + 'static> Clone for ReadResourceView<T> {
 #[must_use = "Reclaim the original authority at the real caller's exit boundary"]
 pub struct ResourceReadLoan<T: Send + Sync + 'static> {
     row: Option<Arc<Row<T>>>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     changed: StoreArc<Notify>,
 }
 impl<T: Send + Sync + 'static> std::fmt::Debug for ReadResourceOwner<T> {
@@ -479,8 +479,8 @@ impl<T: Send + Sync + 'static> ReadResourceView<T> {
     /// neither this check nor taking a loan starts that job or a generation.
     pub fn loan(
         &self,
-        authority: ExitAuthority,
-    ) -> Result<ResourceReadLoan<T>, (ReadResourceError, ExitAuthority)> {
+        authority: ExitObligation,
+    ) -> Result<ResourceReadLoan<T>, (ReadResourceError, ExitObligation)> {
         let Some(store) = self.store.upgrade() else {
             return Err((ReadResourceError::StoreGone, authority));
         };
@@ -516,7 +516,7 @@ impl<T: Send + Sync + 'static> ResourceReadLoan<T> {
     /// The real worker explicitly starts the same original token. Exposing
     /// neither the token nor a mutable reference prevents replacing it while
     /// the resource is borrowed; acquiring/reclaiming a loan never starts it.
-    pub fn start_original(&mut self) -> Result<(), ExitRoleError> {
+    pub fn start_original(&mut self) -> Result<(), ExitCustodyError> {
         self.authority
             .as_mut()
             .expect("one original read authority")
@@ -524,7 +524,7 @@ impl<T: Send + Sync + 'static> ResourceReadLoan<T> {
     }
     /// Release the physical pin first. The same authority returns untouched;
     /// its real source IO owner still owes body/capture/report completion.
-    pub fn reclaim(mut self) -> ExitAuthority {
+    pub fn reclaim(mut self) -> ExitObligation {
         self.release_pin();
         self.authority.take().expect("one original read authority")
     }

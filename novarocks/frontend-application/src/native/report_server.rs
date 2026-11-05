@@ -21,7 +21,7 @@ use crate::query_execution::runtime_filter_terminal_rollup::{
 };
 
 use novarocks_native_adapter::generated::nova_rocks_grpc_server::NovaRocksGrpc;
-use novarocks_native_adapter::{FrontendNativeTransport, NativeRpcServerHandle};
+use novarocks_native_adapter::{FrontendNativeTransport, NativeRpcListener};
 use novarocks_native_trust::NativeTrust;
 
 pub(crate) const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
@@ -35,7 +35,7 @@ struct LifecycleConvergenceDebugSnapshot {
     failure_fact: Option<Vec<u8>>,
     failure_detail: Option<String>,
     failure_site: Option<serde_json::Value>,
-    worker_contexts_converged: bool,
+    worker_participations_converged: bool,
     runtime_filter: RuntimeFilterTerminalRollupDebug,
 }
 
@@ -94,7 +94,7 @@ struct RuntimeFilterChannelDebug {
 struct RuntimeFilterProducerStreamDebug {
     channel_binding_id: u32,
     channel_id: u32,
-    producer_fragment_instance_id: Option<RuntimeFilterUniqueIdDebug>,
+    producer_task_key: Option<RuntimeFilterUniqueIdDebug>,
     partition_id: u32,
     latest_accepted_sequence: Option<u64>,
     accepted_count: u64,
@@ -124,7 +124,7 @@ struct RuntimeFilterConsumerDebug {
     channel_binding_id: u32,
     channel_id: u32,
     consumer_binding_id: u32,
-    fragment_instance_id: Option<RuntimeFilterUniqueIdDebug>,
+    task_key: Option<RuntimeFilterUniqueIdDebug>,
     latest_delivered_logical_version: Option<u64>,
     latest_applied_logical_version: Option<u64>,
     subscription_terminal: String,
@@ -231,7 +231,7 @@ fn lifecycle_convergence_debug_snapshot(
             .failure
             .as_ref()
             .map(|input| failure_site_debug(input.site())),
-        worker_contexts_converged: snapshot.worker_contexts_converged,
+        worker_participations_converged: snapshot.worker_participations_converged,
         runtime_filter: runtime_filter_terminal_rollup_debug(snapshot.runtime_filter),
     }
 }
@@ -240,7 +240,7 @@ fn failure_site_debug(
     site: novarocks_query_application::execution_error::ExecutionFailureSite,
 ) -> serde_json::Value {
     use novarocks_query_application::execution_error::ExecutionFailureSite as S;
-    use novarocks_task_codec::identity::{encode_query_context_ref, encode_task_identity};
+    use novarocks_task_codec::identity::{encode_participation_ref, encode_task_identity};
     use prost::Message;
     use serde_json::json;
     match site {
@@ -251,11 +251,11 @@ fn failure_site_debug(
             json!({"kind":"task-control", "identity":encode_task_identity(identity).encode_to_vec()})
         }
         S::Operation {
-            context,
+            participation,
             operation_id,
             kind,
         } => {
-            json!({"kind":"operation", "context":encode_query_context_ref(context).encode_to_vec(), "operation_id":operation_id.to_bytes(), "operation_kind":kind.as_str()})
+            json!({"kind":"operation", "participation":encode_participation_ref(participation).encode_to_vec(), "operation_id":operation_id.to_bytes(), "operation_kind":kind.as_str()})
         }
         S::RootRead { root } => {
             json!({"kind":"root-read", "root":encode_task_identity(root).encode_to_vec()})
@@ -355,9 +355,7 @@ fn runtime_filter_participant_available_debug(
             .map(|stream| RuntimeFilterProducerStreamDebug {
                 channel_binding_id: stream.channel_binding_id,
                 channel_id: stream.channel_id,
-                producer_fragment_instance_id: stream
-                    .producer_fragment_instance_id
-                    .map(runtime_filter_unique_id_debug),
+                producer_task_key: stream.producer_task_key.map(runtime_filter_unique_id_debug),
                 partition_id: stream.partition_id,
                 latest_accepted_sequence: stream.latest_accepted_sequence,
                 accepted_count: stream.accepted_count,
@@ -391,9 +389,7 @@ fn runtime_filter_participant_available_debug(
                 channel_binding_id: consumer.channel_binding_id,
                 channel_id: consumer.channel_id,
                 consumer_binding_id: consumer.consumer_binding_id,
-                fragment_instance_id: consumer
-                    .fragment_instance_id
-                    .map(runtime_filter_unique_id_debug),
+                task_key: consumer.task_key.map(runtime_filter_unique_id_debug),
                 latest_delivered_logical_version: consumer.latest_delivered_logical_version,
                 latest_applied_logical_version: consumer.latest_applied_logical_version,
                 subscription_terminal:
@@ -719,11 +715,11 @@ fn status_from_domain_source(
 
 /// Instance-owned report listener. The host exposes only lifecycle methods,
 /// never a Tonic service or a Core listener handle.
-pub struct FrontendReportServerHandle {
-    inner: NativeRpcServerHandle,
+pub struct FrontendReportListener {
+    inner: NativeRpcListener,
 }
 
-impl FrontendReportServerHandle {
+impl FrontendReportListener {
     pub(crate) fn start(
         address: SocketAddr,
         membership: Arc<ClusterBackendService>,
@@ -775,7 +771,7 @@ impl FrontendReportServerHandle {
         transport_admission: novarocks_native_adapter::native_transport_admission::NativeTransportAdmission,
     ) -> Result<Self, String> {
         let deployment_id = native_trust.deployment_id().as_str().to_string();
-        let inner = NativeRpcServerHandle::start_frontend_membership(
+        let inner = NativeRpcListener::start_frontend_membership(
             host,
             port,
             FrontendReportService {
@@ -902,7 +898,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use super::{FrontendReportServerHandle, lifecycle_convergence_debug_snapshot};
+    use super::{FrontendReportListener, lifecycle_convergence_debug_snapshot};
     use crate::query_execution::lifecycle_diagnostics::{
         QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
@@ -956,7 +952,7 @@ mod tests {
             .expect("execution id"),
             primary_error: None,
             failure: None,
-            worker_contexts_converged: false,
+            worker_participations_converged: false,
             runtime_filter,
         }
     }
@@ -989,9 +985,10 @@ mod tests {
                         producer_streams: vec![proto::QueryTerminalRuntimeFilterProducerStreamV1 {
                             channel_binding_id: 3,
                             channel_id: 5,
-                            producer_fragment_instance_id: Some(
-                                novarocks_proto_models::common::UniqueId { hi: 9, lo: 10 },
-                            ),
+                            producer_task_key: Some(novarocks_proto_models::common::UniqueId {
+                                hi: 9,
+                                lo: 10,
+                            }),
                             partition_id: 0,
                             latest_accepted_sequence: Some(0),
                             accepted_count: 1,
@@ -1017,7 +1014,7 @@ mod tests {
                             channel_binding_id: 3,
                             channel_id: 5,
                             consumer_binding_id: 8,
-                            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
+                            task_key: Some(novarocks_proto_models::common::UniqueId {
                                 hi: 12,
                                 lo: 14,
                             }),
@@ -1098,7 +1095,7 @@ mod tests {
             ExecutionFailureSite::Coordinator,
         );
         snapshot.failure = Some(original.clone());
-        snapshot.worker_contexts_converged = true;
+        snapshot.worker_participations_converged = true;
         let json = super::lifecycle_convergence_debug_json(snapshot);
         let bytes: Vec<u8> = serde_json::from_value(json["failure_fact"].clone()).unwrap();
         use prost::Message;
@@ -1115,7 +1112,7 @@ mod tests {
             json["failure_site"],
             serde_json::json!({"kind":"coordinator"})
         );
-        assert_eq!(json["worker_contexts_converged"], true);
+        assert_eq!(json["worker_participations_converged"], true);
     }
 
     #[test]
@@ -1160,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn report_listener_rejects_missing_invalid_and_duplicate_authorization_before_dispatch() {
         let trust = test_trust();
-        let mut server = FrontendReportServerHandle::start(
+        let mut server = FrontendReportListener::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             Arc::new(ClusterBackendService::new_transient_for_test(1)),
             Arc::new(EmptyConvergenceReader),
@@ -1210,7 +1207,7 @@ mod tests {
         let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
             Arc::new(EmptyConvergenceReader);
         let trust = test_trust();
-        let mut server = FrontendReportServerHandle::start(
+        let mut server = FrontendReportListener::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             Arc::new(ClusterBackendService::new_transient_for_test(1)),
             convergence_reader,

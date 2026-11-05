@@ -2489,7 +2489,7 @@ mod tests {
             Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let access = IcebergReadBinding::with_metadata_credential_resolver(fs, resolver.clone());
         let role = Arc::new(IcebergControlRoleBindingFactory::new(
@@ -2633,7 +2633,7 @@ mod tests {
         use novarocks_connector_iceberg::IcebergControlRoleBindingFactory;
         use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
         use novarocks_connector_iceberg::resources::IcebergMetadataResources;
-        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
         let warehouse = tempfile::tempdir().expect("warehouse");
         let runtime = tokio::runtime::Handle::current();
@@ -2641,7 +2641,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.clone())),
         );
         let factory = Arc::new(IcebergControlRoleBindingFactory::new(
             IcebergMetadataResources::new(access, runtime.clone()),
@@ -2819,14 +2819,14 @@ mod tests {
             IcebergCredentialResolver, IcebergReadBinding, IcebergRestAuthMaterial,
         };
         use novarocks_connector_iceberg::{IcebergControlRoleBindingFactory, iceberg};
-        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
         use novarocks_spi::connector::{
-            CatalogActivityPhase, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
-            ConnectorCatalogMutationResolver, ConnectorError, ConnectorErrorKind,
-            ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceOperation,
-            ConnectorMetadataMaintenanceResolver, ConnectorMutationFailureKind,
-            ConnectorMutationOperationId, ConnectorRefAction, ConnectorRefKind,
-            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
+            CatalogActivityPhase, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationResolver, ConnectorCatalogMutationSession, ConnectorError,
+            ConnectorErrorKind, ConnectorMetadataMaintenanceExecuteRequest,
+            ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceResolver,
+            ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorRefAction,
+            ConnectorRefKind, ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
             ConnectorTableIdentity, CreateOrReplacePolicy, ExternalMutationEffect,
             ExternalMutationOutcome,
         };
@@ -3125,7 +3125,7 @@ mod tests {
             .expect("controlled stage did not arrive");
         }
         fn tag(
-            lease: ConnectorCatalogMutationLease,
+            lease: ConnectorCatalogMutationSession,
             instance: ConnectorInstanceId,
             table: &str,
             name: &str,
@@ -3234,7 +3234,7 @@ mod tests {
                 Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
                 FsAccessResolver::new(),
                 Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+                Arc::new(TokioFileIoSpawner::new(runtime.clone())),
             );
             let access =
                 IcebergReadBinding::with_metadata_credential_resolver(fs, Arc::new(Identity));

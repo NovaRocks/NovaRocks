@@ -552,7 +552,7 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
     host.register(binding_with_mutation(8))
         .expect("register replacement generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     let mutation = host
         .acquire_current_mutation(&instance_id)
         .expect("mutation lease");
@@ -577,7 +577,7 @@ fn exact_mutation_lease_never_uses_a_replacement_runtime() {
     let old_control_runtime_id = old_binding.control_runtime_id();
     host.register(old_binding)
         .expect("register old mutation generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     host.retire_current(&instance_id)
         .expect("retire old generation");
 
@@ -661,7 +661,7 @@ fn exact_data_mutation_lease_never_uses_a_replacement_runtime() {
     let old_binding = binding_with_data_mutation(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
     host.register(old_binding).expect("register old generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     host.retire_current(&instance_id)
         .expect("retire old generation");
 
@@ -752,7 +752,7 @@ fn exact_metadata_maintenance_lease_never_uses_a_replacement_runtime() {
     let old_binding = binding_with_metadata_maintenance(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
     host.register(old_binding).expect("register old generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     host.retire_current(&instance_id)
         .expect("retire old generation");
 
@@ -844,7 +844,7 @@ fn exact_cleanup_maintenance_lease_never_uses_a_replacement_runtime() {
     let old_binding = binding_with_cleanup_maintenance(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
     host.register(old_binding).expect("register old generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     host.retire_current(&instance_id)
         .expect("retire old generation");
 
@@ -951,7 +951,7 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     let old = binding_with_distributed_rewrite(7, true);
     let old_control_runtime_id = old.control_runtime_id();
     host.register(old).expect("register old generation");
-    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    let planning = host.acquire_current(&instance_id).expect("planning pin");
     host.retire_current(&instance_id)
         .expect("retire old generation");
 

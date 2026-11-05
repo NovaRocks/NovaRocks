@@ -19,7 +19,7 @@
 //! receiver progress or Task control without an input idle deadline.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::sync::{Arc, Mutex};
 
@@ -30,8 +30,8 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::shape::{Source, SourceKernel};
 use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use crate::runtime::exchange;
-use crate::runtime::fragment::io::ExchangeReceiverKey;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::ExchangeReceiverKey;
 use novarocks_types::UniqueId;
 use tracing::debug;
 
@@ -187,7 +187,7 @@ struct ExchangeSourceOperator {
     node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
     driver_id: i32,
-    receiver: Option<exchange::ExchangeReceiverHandle>,
+    receiver: Option<exchange::ExchangeReceiverPin>,
     source_observable: Arc<Observable>,
     receiver_progress: Arc<ExchangeReceiverProgress>,
     logged_first_pull: bool,
@@ -249,7 +249,7 @@ impl OperatorLifecycle for ExchangeSourceOperator {
         if self.receiver.is_some() {
             return Ok(());
         }
-        let receiver = self.binding.receiver_port.receiver_handle(
+        let receiver = self.binding.receiver_port.receiver_pin(
             receiver_key(self.binding.key),
             self.binding.expected_senders,
         )?;
@@ -257,8 +257,8 @@ impl OperatorLifecycle for ExchangeSourceOperator {
             .attach_receiver(&receiver.observable());
         self.receiver = Some(receiver);
         debug!(
-            "ExchangeSource prepared: finst={} node_id={} expected_senders={}",
-            self.binding.key.finst_uuid(),
+            "ExchangeSource prepared: task_key={} node_id={} expected_senders={}",
+            self.binding.key.task_key_uuid(),
             self.node.node_id,
             self.binding.expected_senders
         );
@@ -278,10 +278,10 @@ impl OperatorLifecycle for ExchangeSourceOperator {
 impl SourceKernel for ExchangeSourceOperator {
     fn poll_output(
         &mut self,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         if self.receiver.is_none() {
-            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
                 ExchangeSourceFailure::NotPrepared,
             ));
         }
@@ -345,8 +345,8 @@ impl SourceKernel for ExchangeSourceOperator {
                         .snapshot(receiver_key(self.binding.key));
                     exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                         format!(
-                            "event=source_finished finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                            self.binding.key.finst_uuid(),
+                            "event=source_finished task_key={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                            self.binding.key.task_key_uuid(),
                             self.node.node_id,
                             self.driver_id,
                             self.binding.expected_senders,
@@ -356,8 +356,8 @@ impl SourceKernel for ExchangeSourceOperator {
                     });
                 }
                 debug!(
-                    "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
-                    self.binding.key.finst_uuid(),
+                    "ExchangeSource finished: task_key={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
+                    self.binding.key.task_key_uuid(),
                     self.node.node_id,
                     self.driver_id,
                     stats.request_received,
@@ -387,8 +387,8 @@ impl SourceKernel for ExchangeSourceOperator {
                         let first_snapshot = snapshot.clone();
                         exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                             format!(
-                                "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                self.binding.key.finst_uuid(),
+                                "event=source_first_block task_key={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                self.binding.key.task_key_uuid(),
                                 self.node.node_id,
                                 self.driver_id,
                                 self.binding.expected_senders,
@@ -404,8 +404,8 @@ impl SourceKernel for ExchangeSourceOperator {
                         self.last_partial_eos_marker_count = snapshot.finished_senders;
                         exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                             format!(
-                                "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                self.binding.key.finst_uuid(),
+                                "event=source_partial_eos_block task_key={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                self.binding.key.task_key_uuid(),
                                 self.node.node_id,
                                 self.driver_id,
                                 self.binding.expected_senders,
@@ -429,7 +429,7 @@ impl SourceKernel for ExchangeSourceOperator {
 
 fn receiver_key(key: exchange::ExchangeKey) -> ExchangeReceiverKey {
     ExchangeReceiverKey {
-        fragment_instance_id: UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+        task_key: UniqueId::new(key.task_key_hi, key.task_key_lo),
         node_id: key.node_id,
     }
 }

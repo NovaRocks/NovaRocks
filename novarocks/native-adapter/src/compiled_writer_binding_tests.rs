@@ -121,14 +121,14 @@ fn bind(
     bind_compiled_writer(
         ProgramNodeId::new(1),
         recipe,
-        &CompiledWriteTask {
+        &CompiledWriteTaskFacts {
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
             #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime,
-            fragment_instance_id: FINST,
+            task_key: FINST,
             query_options: &options,
             stop: ConnectorStopOwner::new().view(),
         },
@@ -221,14 +221,14 @@ fn a_compiled_finish_binds_the_canonical_carrier_validator() {
     let options = QueryOptions::default();
     bind_compiled_finish(
         ProgramNodeId::new(2),
-        &CompiledWriteTask {
+        &CompiledWriteTaskFacts {
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
             #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             backend_process_id: novarocks_types::BackendProcessId::new_v7(),
             runtime: &runtime,
-            fragment_instance_id: FINST,
+            task_key: FINST,
             query_options: &options,
             stop: ConnectorStopOwner::new().view(),
         },

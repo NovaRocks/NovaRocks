@@ -67,7 +67,8 @@ impl Wake for SourceCapacityWake {
         if let Some(owner) = owner {
             match shared.runtime.notify_host_actor(&owner) {
                 Ok(())
-                | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+                | Err(ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch) => {
+                }
                 Err(_) => std::process::abort(),
             }
         }
@@ -81,7 +82,7 @@ impl ControlRequestReady {
         self.shared
             .runtime
             .validate_registration(owner)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let mut original = self
             .shared
             .source_capacity_owner
@@ -178,7 +179,7 @@ impl ControlRequestReady {
         self.shared
             .runtime
             .validate_registration(owner)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let mut state = self.shared.state.lock().expect("original R capacity retry");
         let Some(row) = state.capacity.get_mut(&owner.actor()) else {
             return Ok(false);
@@ -233,7 +234,7 @@ impl ControlRequestReady {
             self.shared
                 .runtime
                 .notify_host_actor(owner)
-                .map_err(ControlRequestError::Driver)?;
+                .map_err(ControlRequestError::ActorTurn)?;
         }
         Ok(remaining)
     }

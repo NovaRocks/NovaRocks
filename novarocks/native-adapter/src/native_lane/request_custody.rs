@@ -17,24 +17,24 @@
 
 //! Original admitted request/response/upload-frame physical tail.
 use super::*;
-use novarocks_resource_contract::ExistingOwnerRetentionLease;
+use novarocks_resource_contract::ExistingOwnerRetentionPin;
 
 /// Typed request extension from the already-installed original action claim.
 /// It grants nothing and cannot be made from a WorkId or scalar byte limit.
 #[derive(Debug)]
 pub struct NativeRequestCustody {
-    lease: ExistingOwnerRetentionLease,
+    retention_pin: ExistingOwnerRetentionPin,
 }
 impl NativeRequestCustody {
-    pub fn from_retained_action(lease: ExistingOwnerRetentionLease) -> Self {
-        Self { lease }
+    pub fn from_retained_action(retention_pin: ExistingOwnerRetentionPin) -> Self {
+        Self { retention_pin }
     }
 }
 impl Clone for NativeRequestCustody {
     fn clone(&self) -> Self {
         Self {
-            lease: self
-                .lease
+            retention_pin: self
+                .retention_pin
                 .try_clone()
                 .expect("original Native action pin count remains representable"),
         }
@@ -43,46 +43,46 @@ impl Clone for NativeRequestCustody {
 struct TailData {
     _permit: NativeLaneStreamPermit,
 }
-pub(super) struct TailHandle {
+pub(super) struct TailPermit {
     // The real permit and Arc allocation leave before this value's action pin.
     data: Option<Arc<TailData>>,
-    lease: Option<ExistingOwnerRetentionLease>,
+    retention_pin: Option<ExistingOwnerRetentionPin>,
 }
-impl Clone for TailHandle {
+impl Clone for TailPermit {
     fn clone(&self) -> Self {
-        let lease = self
-            .lease
+        let tail_retention_pin = self
+            .retention_pin
             .as_ref()
             .unwrap()
             .try_clone()
             .expect("original Native action tail count remains representable");
         Self {
             data: Some(Arc::clone(self.data.as_ref().unwrap())),
-            lease: Some(lease),
+            retention_pin: Some(tail_retention_pin),
         }
     }
 }
-impl Drop for TailHandle {
+impl Drop for TailPermit {
     fn drop(&mut self) {
         let data = self.data.take();
         if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(data))) {
             // A genuine foreign Drop unwind is not an actual-exit proof.
             std::panic::resume_unwind(Box::new(TailDropFailure {
                 _cause: cause,
-                _lease: self.lease.take(),
+                _retention_pin: self.retention_pin.take(),
             }));
         }
-        drop(self.lease.take());
+        drop(self.retention_pin.take());
     }
 }
 struct TailDropFailure {
     _cause: Box<dyn std::any::Any + Send>,
-    _lease: Option<ExistingOwnerRetentionLease>,
+    _retention_pin: Option<ExistingOwnerRetentionPin>,
 }
 pub(super) enum StreamCustody {
     // These original holders remain owned until this stream custody exits.
     Direct { _permit: NativeLaneStreamPermit },
-    Paid { _tail: TailHandle },
+    Paid { _tail: TailPermit },
 }
 impl StreamCustody {
     pub(super) fn install(
@@ -92,9 +92,9 @@ impl StreamCustody {
         match request.extensions_mut().remove::<NativeRequestCustody>() {
             None => Self::Direct { _permit: permit },
             Some(custody) => {
-                let tail = TailHandle {
+                let tail = TailPermit {
                     data: Some(Arc::new(TailData { _permit: permit })),
-                    lease: Some(custody.lease),
+                    retention_pin: Some(custody.retention_pin),
                 };
                 let (parts, body) = std::mem::replace(
                     request,
@@ -115,7 +115,7 @@ impl StreamCustody {
 }
 struct RetainedFrame {
     bytes: Bytes,
-    _tail: TailHandle,
+    _tail: TailPermit,
 }
 impl AsRef<[u8]> for RetainedFrame {
     fn as_ref(&self) -> &[u8] {
@@ -124,7 +124,7 @@ impl AsRef<[u8]> for RetainedFrame {
 }
 struct RetainedRequestBody {
     inner: Option<BoxBody>,
-    tail: Option<TailHandle>,
+    tail: Option<TailPermit>,
 }
 impl HttpBody for RetainedRequestBody {
     type Data = Bytes;
@@ -166,7 +166,7 @@ impl Drop for RetainedRequestBody {
 }
 struct RequestBodyDropFailure {
     _cause: Box<dyn std::any::Any + Send>,
-    _tail: Option<TailHandle>,
+    _tail: Option<TailPermit>,
 }
 /// Actual first-party requested holders. The one unary stream emits at most
 /// one encoded message frame; Bytes aliases/slices share its owner allocation.

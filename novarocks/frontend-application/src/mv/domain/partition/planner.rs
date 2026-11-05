@@ -28,7 +28,7 @@ pub(crate) struct AffectedPartitionPlanInput<'a> {
 /// A prepared impact cannot be separated from its exact generation/schema inputs.
 pub(crate) struct PreparedPartitionSource<'a> {
     pub receipt: &'a novarocks_spi::connector::read_stack::ConnectorPreparedSourceRead,
-    pub planning: &'a novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub planning: &'a novarocks_spi::connector::ConnectorControlPlanningPin,
     pub schema: &'a crate::mv::domain::storage_observation::MvSourceSchemaObservation,
 }
 

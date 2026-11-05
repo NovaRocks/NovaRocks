@@ -53,17 +53,15 @@ use novarocks_type_contract::{
 };
 
 use crate::exec::node::scan::ScanOp;
+use crate::exec::operators::ResultSinkBuffer;
 use crate::exec::operators::ResultSinkFactory;
-use crate::exec::operators::ResultSinkHandle;
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
-use crate::runtime::fragment::scan::compiled_fixture::{
-    FixtureScanOp, SCAN_NODE, rows, scan_chunk,
-};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{TaskEvent, TaskEventSink};
+use crate::runtime::task::scan::compiled_fixture::{FixtureScanOp, SCAN_NODE, rows, scan_chunk};
 use crate::runtime_filter as execution;
 
 const FRAGMENT: FragmentId = FragmentId::new(1);
@@ -825,7 +823,7 @@ impl execution::RuntimeFilterSession for LoopbackSession {
         &self,
         request: execution::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+        execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterProducer>,
         execution::RuntimeFilterContractViolation,
     > {
         if request.contract().binding_id().get() != PRODUCER_BINDING {
@@ -836,7 +834,7 @@ impl execution::RuntimeFilterSession for LoopbackSession {
             .expect("opened")
             .push(request.contract().clone());
         Ok(execution::RuntimeFilterBindOutcome::Bound(
-            Arc::clone(&self.producer) as execution::RuntimeFilterProducerHandle,
+            Arc::clone(&self.producer) as execution::SharedRuntimeFilterProducer,
         ))
     }
 
@@ -844,7 +842,7 @@ impl execution::RuntimeFilterSession for LoopbackSession {
         &self,
         request: execution::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
         execution::RuntimeFilterContractViolation,
     > {
         if request.contract().binding_id().get() != CONSUMER_BINDING {
@@ -857,7 +855,7 @@ impl execution::RuntimeFilterSession for LoopbackSession {
             .expect("subscribed")
             .push(request.contract().clone());
         Ok(execution::RuntimeFilterBindOutcome::Bound(
-            execution::RuntimeFilterSubscriptionHandle::Blocking(
+            execution::RuntimeFilterSubscriptionPin::Blocking(
                 Arc::clone(&self.subscription) as Arc<dyn execution::BlockingSnapshotSubscription>
             ),
         ))
@@ -867,7 +865,7 @@ impl execution::RuntimeFilterSession for LoopbackSession {
         &self,
         _: execution::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterFinalDomainCompletionHandle>,
+        execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterFinalDomainCompletion>,
         execution::RuntimeFilterContractViolation,
     > {
         Err(unauthorized(
@@ -882,9 +880,9 @@ struct RecordingEvents {
     effects: Mutex<Vec<execution::RuntimeFilterRowEffect>>,
 }
 
-impl FragmentEventSink for RecordingEvents {
-    fn record(&self, event: FragmentEvent) {
-        if let FragmentEvent::RuntimeFilterRowEffect(effect) = event {
+impl TaskEventSink for RecordingEvents {
+    fn record(&self, event: TaskEvent) {
+        if let TaskEvent::RuntimeFilterRowEffect(effect) = event {
             self.effects.lock().expect("effects").push(effect);
         }
     }
@@ -969,19 +967,19 @@ fn a_compiled_join_membership_gates_and_filters_its_compiled_probe_scan() {
         bindings.insert(SCAN_NODE, Arc::clone(&op) as Arc<dyn ScanOp>);
         let session = LoopbackSession::new();
         let events = Arc::new(RecordingEvents::default());
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let running = prepare_compiled_program_pipeline_execution_with_profiler(
             Arc::clone(&program),
             Duration::from_millis(10),
             Box::new(ResultSinkFactory::new(output.clone())),
             ExchangeBindings::default(),
             bindings,
-            crate::runtime::fragment::CompiledWriterBindings::default(),
+            crate::runtime::task::CompiledWriterBindings::default(),
             None,
             None,
             i32::try_from(dop).unwrap(),
             state(Arc::clone(&session)),
-            Arc::clone(&events) as Arc<dyn FragmentEventSink>,
+            Arc::clone(&events) as Arc<dyn TaskEventSink>,
         )
         .unwrap_or_else(|error| panic!("dop {dop}: the compiled join prepares: {error}"))
         .start();

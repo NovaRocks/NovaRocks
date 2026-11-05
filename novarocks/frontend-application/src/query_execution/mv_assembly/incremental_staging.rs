@@ -17,7 +17,7 @@
 
 //! Production binding for frontend-owned incremental MV refresh writes.
 
-use novarocks_spi::connector::ConnectorControlPlanningLease;
+use novarocks_spi::connector::ConnectorControlPlanningPin;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::planning::write_sink::{
@@ -97,7 +97,7 @@ pub(crate) fn incremental_change_stream_routes(
     write_session: &ConnectorWriteSession,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_bindings: &QueryTableBindingStore,
-    planning_lease: &ConnectorControlPlanningLease,
+    planning_pin: &ConnectorControlPlanningPin,
 ) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>, String> {
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
@@ -112,7 +112,7 @@ pub(crate) fn incremental_change_stream_routes(
                 target.table.clone(),
             )?,
             write_target,
-            planning_lease.clone(),
+            planning_pin.clone(),
         )?;
         let mode = match write_target.input() {
             ConnectorWriteInputShape::Data { .. } => {
@@ -197,7 +197,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for FakeProvider {
-        type CommitHandle = Value;
+        type CommitSession = Value;
         type WriterHandle = Value;
         type CommitFragment = Value;
 

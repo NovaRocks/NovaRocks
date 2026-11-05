@@ -35,7 +35,7 @@ struct HostAllocatorInner {
     host: Arc<dyn AggregateStateAllocator>,
     failure: Mutex<Option<KernelFailure>>,
     // Declaration order destroys the Mutex backing before releasing its lease.
-    journal_lease: Option<crate::opaque_memory::OpaqueReservation>,
+    journal_reservation: Option<crate::opaque_memory::OpaqueReservation>,
 }
 pub(super) struct HostAggregateAllocator {
     inner: NonNull<HostAllocatorInner>,
@@ -58,7 +58,7 @@ impl HostAggregateAllocator {
     }
     fn try_new_inner(
         host: Arc<dyn AggregateStateAllocator>,
-        journal_lease: Option<crate::opaque_memory::OpaqueReservation>,
+        journal_reservation: Option<crate::opaque_memory::OpaqueReservation>,
     ) -> Result<Self, KernelFailure> {
         let pointer = host
             .allocate(Layout::new::<HostAllocatorInner>())?
@@ -70,13 +70,13 @@ impl HostAggregateAllocator {
                 references: AtomicUsize::new(1),
                 host,
                 failure: Mutex::new(None),
-                journal_lease,
+                journal_reservation,
             })
         };
         // Establish ownership before warming: an unwind destroys the actual
         // initialized Inner and its lease, rather than leaving a raw live block.
         let allocator = Self { inner: pointer };
-        if allocator.inner().journal_lease.is_some() {
+        if allocator.inner().journal_reservation.is_some() {
             drop(
                 allocator
                     .inner()
@@ -116,7 +116,7 @@ impl HostAggregateAllocator {
     /// Zero on the original constructor is not a resource coverage receipt.
     pub(super) fn journal_backing_bytes(&self) -> usize {
         self.inner()
-            .journal_lease
+            .journal_reservation
             .as_ref()
             .map_or(0, crate::opaque_memory::OpaqueReservation::remaining_bytes)
     }

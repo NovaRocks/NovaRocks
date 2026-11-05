@@ -205,7 +205,7 @@ pub(crate) struct ProfileComputationOutput {
 }
 
 impl ProfileComputationOutput {
-    /// Supply only the real token returned by ExecutionHandle::ready_token.
+    /// Supply only the real token returned by ExecutionOutputObligation::ready_token.
     /// The token has no public constructor and the actor mints one cut only.
     /// Reading it here does not depend on a second consumer publication await.
     pub(crate) fn take_ready(

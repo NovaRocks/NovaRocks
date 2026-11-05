@@ -37,7 +37,7 @@ use crate::exec::pipeline::operator::OperatorLifecycle;
 #[cfg(test)]
 use crate::exec::pipeline::shape::TransformStart;
 use crate::exec::pipeline::writer_failure::WriterFailure;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 fn writer_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     WriterFailure::FrozenContract {
         detail: novarocks_failure_contract::BoundedDetail::truncating_display(detail),
@@ -45,7 +45,7 @@ fn writer_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     .into()
 }
 fn writer_connector(source: novarocks_spi::connector::ConnectorError) -> ExecutionFailure {
-    use crate::runtime::fragment::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+    use crate::runtime::task::connector_failure::{ConnectorCallFailure, ConnectorOperation};
     ConnectorCallFailure::new(ConnectorOperation::ValidateWriteRelation, source).into()
 }
 fn writer_arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
@@ -65,7 +65,7 @@ impl std::error::Error for WriterArrowFailure {
 }
 impl novarocks_failure_contract::FailureProjection for WriterArrowFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
             RepresentationLayout, domain,
@@ -124,7 +124,7 @@ use crate::exec::node::table_write_relation::{
 };
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+    TableWriteAggregateBoundary, TableWriteAggregateFaultHook,
 };
 use crate::exec::node::table_writer::{
     TableWriterPhysicalContextTemplate, TableWriterRuntimeBinding,
@@ -135,10 +135,10 @@ use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{PreparedInput, RawInput},
     shape::{ControlStep, HydrateInput, Transform, TransformKernel, child::ChildStep},
     step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
-    step_context::StepContext,
 };
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::observable::ObserverSubscription;
@@ -177,7 +177,7 @@ struct TableWriterPlan {
     #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
 }
 
 /// How one driver projects an input page onto the exact provider schema its
@@ -456,7 +456,7 @@ struct TableWriterOperator {
     #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
     state: TableWriterState,
     physical_rows: u64,
     aggregate_output: Option<Chunk>,
@@ -494,10 +494,12 @@ fn encode_writer_completion(
 ) -> ExecutionResult<WriterCompletion> {
     let mut encoded = VecDeque::with_capacity(fragments.len());
     for fragment in fragments {
-        let bytes = fragment_encoder
-            .encode(target, fragment)
-            .map_err(|error| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                crate::runtime::fragment::connector_failure::ConnectorOperation::EncodeCommitFragment, error))?;
+        let bytes = fragment_encoder.encode(target, fragment).map_err(|error| {
+            crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                crate::runtime::task::connector_failure::ConnectorOperation::EncodeCommitFragment,
+                error,
+            )
+        })?;
         if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
             return Err(
                 crate::exec::pipeline::writer_failure::WriterFailure::CommitFragmentLimit {
@@ -666,7 +668,7 @@ impl OperatorLifecycle for TableWriterOperator {
         }
         let result = state
             .sink_io_executor()
-            .map_err(crate::runtime::fragment::ExecutionFailure::from)
+            .map_err(crate::runtime::task::ExecutionFailure::from)
             .and_then(|executor| self.writer.bind(executor, state.error_state()));
         if result.is_err() {
             self.state = TableWriterState::Failed;
@@ -762,7 +764,7 @@ impl TransformKernel for TableWriterOperator {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.readiness_observable.clone())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = self.writer.error() {
             return Err(error);
         }
@@ -782,7 +784,7 @@ impl TransformKernel for TableWriterOperator {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let generation = self.readiness_observable.generation();
@@ -820,13 +822,13 @@ impl TransformKernel for TableWriterOperator {
     }
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.input = Some(input.into_uncovered_chunk()?);
         self.drive(ctx)
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let generation = self.readiness_observable.generation();
         let result = self.advance(ctx, generation);
         match result {
@@ -838,7 +840,7 @@ impl TransformKernel for TableWriterOperator {
             }
         }
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if self.state == TableWriterState::Open {
             self.state = TableWriterState::Draining;
             self.finish_blocked_intervals();
@@ -848,7 +850,7 @@ impl TransformKernel for TableWriterOperator {
                     .aggregate_guard
                     .check(TableWriteAggregateBoundary::PartialFinalize)
             {
-                let error: crate::runtime::fragment::ExecutionFailure = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateFinalize,error).into();
+                let error: crate::runtime::task::ExecutionFailure = crate::runtime::task::connector_failure::ConnectorCallFailure::new(crate::runtime::task::connector_failure::ConnectorOperation::CheckPartialAggregateFinalize,error).into();
                 ctx.report_failure(error.clone());
                 self.fail_attempt();
                 return Err(error);
@@ -920,7 +922,7 @@ impl TableWriterOperator {
     }
     fn advance(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         generation: u64,
     ) -> ExecutionResult<StepResult> {
         if let Some(error) = self.writer.error() {
@@ -934,7 +936,7 @@ impl TableWriterOperator {
         {
             let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
             let next_rows = self.physical_rows.checked_add(rows).ok_or_else(|| {
-                crate::runtime::fragment::ExecutionFailure::from(
+                crate::runtime::task::ExecutionFailure::from(
                     crate::exec::pipeline::writer_failure::WriterFailure::AcceptedRowsOverflow {
                         current: self.physical_rows,
                         incoming: chunk.len(),
@@ -980,7 +982,7 @@ impl TableWriterOperator {
                 #[cfg(novarocks_dev_controls)]
                     self.aggregate_guard
                         .check(TableWriteAggregateBoundary::PartialUpdate)
-                        .map_err(|source| ExecutionFailure::from(crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateUpdate,source)))?;
+                        .map_err(|source| ExecutionFailure::from(crate::runtime::task::connector_failure::ConnectorCallFailure::new(crate::runtime::task::connector_failure::ConnectorOperation::CheckPartialAggregateUpdate,source)))?;
                 child.offer(projected)?;
                 self.pending_append = Some(PendingAppend {
                     batch: append,
@@ -1615,7 +1617,7 @@ impl<'chunk> TableWriteRelationColumns<'chunk> {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::exec::pipeline::shape::StepOperator;
-    use crate::runtime::fragment::ExecutionFailure;
+    use crate::runtime::task::ExecutionFailure;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1638,8 +1640,8 @@ pub(crate) mod tests {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
-    use crate::exec::pipeline::fragment_context::FragmentContext;
-    use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
+    use crate::exec::pipeline::global_driver_executor::{DriverGroupCompletion, DriverRunner};
+    use crate::exec::pipeline::task_context::TaskContext;
     use crate::runtime::mem_tracker::MemTracker;
 
     fn poll_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) -> bool {
@@ -1657,7 +1659,7 @@ pub(crate) mod tests {
     struct RejectAggregateBoundary(TableWriteAggregateBoundary);
 
     #[cfg(novarocks_dev_controls)]
-    impl TableWriteAggregateGuard for RejectAggregateBoundary {
+    impl TableWriteAggregateFaultHook for RejectAggregateBoundary {
         fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
             if boundary == self.0 {
                 return Err(ConnectorError::new(
@@ -1726,11 +1728,11 @@ pub(crate) mod tests {
         operator.activate(state).expect("activate writer actor");
     }
 
-    fn with_step<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    fn with_step<T>(state: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let error = state.error_state();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &error,
             &mut turn,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1771,9 +1773,9 @@ pub(crate) mod tests {
     fn native_failure(
         operator: &mut dyn Operator,
         state: &RuntimeState,
-        operation: crate::runtime::fragment::PipelineOperation,
+        operation: crate::runtime::task::PipelineOperation,
     ) -> ExecutionFailure {
-        use crate::runtime::fragment::PipelineOperation;
+        use crate::runtime::task::PipelineOperation;
         if operation == PipelineOperation::Push {
             return complete_native_input(operator, state, input_chunk(vec![1])).unwrap_err();
         }
@@ -1886,7 +1888,7 @@ pub(crate) mod tests {
         }
     }
     impl crate::exec::pipeline::shape::SourceKernel for OneChunkSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(self.chunk.take(), NextStep::Finished, 0))
         }
     }
@@ -1914,7 +1916,7 @@ pub(crate) mod tests {
     impl TransformKernel for ProjectedInputObserver {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             chunk: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             let chunk = chunk.into_uncovered_chunk()?;
@@ -1941,7 +1943,7 @@ pub(crate) mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -2009,7 +2011,7 @@ pub(crate) mod tests {
     impl TransformKernel for StreamingPartial {
         fn apply(
             &mut self,
-            ctx: &mut StepContext<'_>,
+            ctx: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             let chunk = input.into_uncovered_chunk()?;
@@ -2018,7 +2020,7 @@ pub(crate) mod tests {
             self.outputs.push_back(self.output(20));
             self.drive(ctx)
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let output = self.outputs.pop_front();
             let next = if !self.outputs.is_empty() {
                 NextStep::Runnable
@@ -2029,7 +2031,7 @@ pub(crate) mod tests {
             };
             Ok(StepResult::new(output, next, 0))
         }
-        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
             self.drive(ctx)
         }
@@ -2040,7 +2042,7 @@ pub(crate) mod tests {
 
     struct TypedFailurePartial {
         error: ExecutionFailure,
-        operation: crate::runtime::fragment::PipelineOperation,
+        operation: crate::runtime::task::PipelineOperation,
         cancelled: bool,
     }
     impl OperatorLifecycle for TypedFailurePartial {
@@ -2054,7 +2056,7 @@ pub(crate) mod tests {
     impl InputEncodingPolicy for TypedFailurePartial {}
     impl TransformKernel for TypedFailurePartial {
         fn start(&self) -> TransformStart {
-            if self.operation == crate::runtime::fragment::PipelineOperation::Pull {
+            if self.operation == crate::runtime::task::PipelineOperation::Pull {
                 TransformStart::Ready
             } else {
                 TransformStart::NeedInput
@@ -2062,21 +2064,21 @@ pub(crate) mod tests {
         }
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
     }
     #[test]
     fn typed_failure_composite_writer_preserves_partial_cause_and_aborts_actual_writer() {
-        use crate::runtime::fragment::PipelineOperation;
+        use crate::runtime::task::PipelineOperation;
         use novarocks_functions::{KernelDiagnostic, KernelFailure};
         for cause in [
             KernelFailure::ResourceExhausted,
@@ -2166,7 +2168,7 @@ pub(crate) mod tests {
     impl TransformKernel for OneShotPartial {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(
@@ -2175,7 +2177,7 @@ pub(crate) mod tests {
                 0,
             ))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
@@ -2208,7 +2210,7 @@ pub(crate) mod tests {
     }
 
     impl ProviderWriteRuntime for TestWriteRuntime {
-        type CommitHandle = ();
+        type CommitSession = ();
         type WriterHandle = TestWriterRecipe;
         type CommitFragment = TestFragment;
 
@@ -2476,7 +2478,7 @@ pub(crate) mod tests {
             })
         }
         #[cfg(novarocks_dev_controls)]
-        fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateFaultHook>) -> Self {
             self.binding = self.binding.with_aggregate_guard(guard);
             self
         }
@@ -3413,7 +3415,7 @@ pub(crate) mod tests {
         let error = native_failure(
             operator.as_mut(),
             &state,
-            crate::runtime::fragment::PipelineOperation::Push,
+            crate::runtime::task::PipelineOperation::Push,
         );
         assert!(error.detail().contains("PartialUpdate"), "{error}");
         assert!(
@@ -3446,7 +3448,7 @@ pub(crate) mod tests {
         let error = native_failure(
             operator.as_mut(),
             &state,
-            crate::runtime::fragment::PipelineOperation::Finishing,
+            crate::runtime::task::PipelineOperation::Finishing,
         );
         assert!(error.detail().contains("PartialFinalize"), "{error}");
         assert!(
@@ -3767,14 +3769,14 @@ pub(crate) mod tests {
         let error = native_failure(
             &mut operator,
             &state,
-            crate::runtime::fragment::PipelineOperation::Push,
+            crate::runtime::task::PipelineOperation::Push,
         );
         use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
         let fact = error.failure_fact();
         assert_eq!(fact.class(), FailureClass::Resource);
         assert_eq!(
             fact.reason(),
-            crate::runtime::fragment::ExecutionReason::WriterOutputBytes.reason()
+            crate::runtime::task::ExecutionReason::WriterOutputBytes.reason()
         );
         let resource = fact.resource().expect("original output budget facts");
         assert_eq!(resource.dimension, ResourceDimension::Bytes);
@@ -4544,7 +4546,7 @@ pub(crate) mod tests {
             "actual queue owns the in-flight Arrow input"
         );
 
-        let fragment = Arc::new(FragmentContext::new(
+        let fragment = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             None,
@@ -4552,9 +4554,9 @@ pub(crate) mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
         let cancellation = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = cancellation.clone();
+        let submitted_failure: crate::runtime::task::ExecutionFailure = cancellation.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion
@@ -4563,7 +4565,7 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .same_occurrence(&submitted_failure)
         );
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
             fragment,
@@ -4628,12 +4630,12 @@ pub(crate) mod tests {
     }
     impl InputEncodingPolicy for ClosedPartial {}
     impl TransformKernel for ClosedPartial {
-        fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
             Ok(ControlStep::Withdrawn)
         }
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             panic!("closed partial never receives data")
@@ -4643,7 +4645,7 @@ pub(crate) mod tests {
     fn required_partial_withdrawal_is_an_invariant_failure_and_aborts_its_actor() {
         use crate::exec::pipeline::shape::StepOperator;
         use crate::exec::pipeline::writer_failure::WriterFailure;
-        use crate::runtime::fragment::ExecutionFailureCause;
+        use crate::runtime::task::ExecutionFailureCause;
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats.clone()));
         let state = test_runtime_state();

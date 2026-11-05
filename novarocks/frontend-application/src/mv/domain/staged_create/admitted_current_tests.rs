@@ -366,7 +366,7 @@ impl ConnectorDocumentStorageObservation for TargetCaps {
     ) -> Result<KeyedDocumentView, KeyedDocumentReadError> {
         self.assert_scope(&request);
         self.events.lock().unwrap().push("observe");
-        // Only ConnectorDocumentStorageLease validates this reply and grants
+        // Only ConnectorDocumentStorage validates this reply and grants
         // the observation authority used by the MV state machine.
         Ok(self.current.lock().unwrap().clone())
     }
@@ -419,8 +419,8 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn lease(&self) -> ConnectorControlPlanningLease {
-        ConnectorControlPlanningLease::new(Arc::clone(&self.binding), || {})
+    fn planning_pin(&self) -> ConnectorControlPlanningPin {
+        ConnectorControlPlanningPin::new(Arc::clone(&self.binding), || {})
     }
 }
 
@@ -447,9 +447,9 @@ impl ConnectorControlResolver for Resolver {
     fn acquire_current(
         &self,
         instance: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
         assert_eq!(instance, &self.binding.descriptor().instance_id);
-        Ok(self.lease())
+        Ok(self.planning_pin())
     }
 }
 
@@ -521,7 +521,10 @@ impl Fixture {
         let resolver = Resolver {
             binding: Arc::new(binding),
         };
-        let lease = resolver.lease().derive_document_storage_lease().unwrap();
+        let lease = resolver
+            .planning_pin()
+            .derive_document_storage_lease()
+            .unwrap();
         let view = caps.current.lock().unwrap().clone();
         let current =
             decode_current_keyed_documents(view, catalog.clone(), Default::default()).unwrap();
@@ -642,7 +645,7 @@ impl Fixture {
         .unwrap()
     }
 
-    fn dispatched(&self) -> novarocks_mv_application::management::ManagementEntranceLease {
+    fn dispatched(&self) -> novarocks_mv_application::management::ManagementEntranceObligation {
         let mut lease = self
             .entrance
             .acquire(self.management_request(), || false)
@@ -741,7 +744,7 @@ async fn resolved_slot_current(still_unknown_first: bool) {
     if still_unknown_first {
         let documents = fixture
             .resolver
-            .lease()
+            .planning_pin()
             .derive_document_storage_lease()
             .unwrap();
         let result = fixture
@@ -1430,7 +1433,7 @@ async fn original_current_capture_uses_each_selected_epoch_and_retains_the_actua
         selector: ConnectorTableObjectSelector::Current,
         context: fixture.request().context().clone(),
     };
-    let first = fixture.resolver.lease();
+    let first = fixture.resolver.planning_pin();
     current_with_driver(
         &cpu.control,
         &mut cpu.driver,
@@ -1471,7 +1474,7 @@ async fn original_current_capture_uses_each_selected_epoch_and_retains_the_actua
     let selected = Resolver {
         binding: Arc::new(binding),
     }
-    .lease();
+    .planning_pin();
     current_with_driver(
         &cpu.control,
         &mut cpu.driver,
@@ -1637,7 +1640,7 @@ async fn original_registration_needed_does_not_drop_its_child_or_opaque_owner() 
         exits: Arc::clone(&exits),
         owner,
     });
-    let lease = ConnectorCatalogMutationLease::new(
+    let lease = ConnectorCatalogMutationSession::new(
         provider.descriptor.clone(),
         fixture.resolver.binding.control_runtime_id(),
         provider.epoch,
@@ -1734,7 +1737,7 @@ async fn original_registration_physical_exit_keeps_failed_cleanup_and_same_owner
         exits: Arc::clone(&exits),
         owner,
     });
-    let lease = ConnectorCatalogMutationLease::new(
+    let lease = ConnectorCatalogMutationSession::new(
         provider.descriptor.clone(),
         fixture.resolver.binding.control_runtime_id(),
         provider.epoch,

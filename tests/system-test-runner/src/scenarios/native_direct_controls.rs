@@ -49,8 +49,8 @@ impl DeclaredQuery {
             frontend,
         }
     }
-    pub fn context(&self, backend: BackendProcessId) -> proto::QueryContextRef {
-        proto::QueryContextRef {
+    pub fn participation(&self, backend: BackendProcessId) -> proto::ParticipationRef {
+        proto::ParticipationRef {
             query_execution_id: Some(proto::QueryExecutionId {
                 query_id: Some(self.query_id),
                 attempt_id: 1,
@@ -148,7 +148,7 @@ impl DirectIntentOwner {
                         | "registry-hold"
                         | "preparation-hold"
                         | "prepared-failure-exit-hold"
-                        | "context-owner-panic-on-renew"
+                        | "participation-owner-panic-on-renew"
                 ),
                 "unsupported Native direct action"
             );
@@ -187,7 +187,7 @@ impl DirectIntentOwner {
             } else {
                 parameters["frontend_process_id"] = json!(query.frontend.to_string());
             }
-            let trigger_operation = (action == "context-owner-panic-on-renew")
+            let trigger_operation = (action == "participation-owner-panic-on-renew")
                 .then(|| novarocks_execution_contract::TaskOperationId::new_v7().to_bytes());
             if let Some(operation) = trigger_operation {
                 parameters["trigger_operation"] = json!(operation);
@@ -364,16 +364,23 @@ pub(super) fn close_hold(stream: &mut std::os::unix::net::UnixStream) {
 mod tests {
     use super::*;
     #[test]
-    fn saturation_contexts_have_distinct_complete_identities() {
+    fn saturation_participations_have_distinct_complete_identities() {
         let queries = (0..8).map(|_| DeclaredQuery::fresh()).collect::<Vec<_>>();
         let backend = BackendProcessId::new_v7();
         for (index, query) in queries.iter().enumerate() {
-            let context = query.context(backend);
-            assert_eq!(context.query_execution_id.as_ref().unwrap().attempt_id, 1);
+            let participation = query.participation(backend);
+            assert_eq!(
+                participation
+                    .query_execution_id
+                    .as_ref()
+                    .unwrap()
+                    .attempt_id,
+                1
+            );
             for other in &queries[..index] {
                 assert_ne!(query.query_id, other.query_id);
                 assert_ne!(query.frontend, other.frontend);
-                assert_ne!(context, other.context(backend));
+                assert_ne!(participation, other.participation(backend));
             }
         }
     }

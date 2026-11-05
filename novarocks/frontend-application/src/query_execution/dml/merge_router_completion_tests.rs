@@ -607,7 +607,7 @@ struct MergeRecipeProvider {
     catalog: novarocks_spi::connector::CatalogHandle,
 }
 impl novarocks_spi::connector::write_stack::ProviderWriteRuntime for MergeRecipeProvider {
-    type CommitHandle = ();
+    type CommitSession = ();
     type WriterHandle = u32;
     type CommitFragment = ();
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {

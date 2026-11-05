@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::HllHandle;
+use super::HllAccumulator;
 #[test]
 fn legacy_ds_hll_semantic_decoder_full_error_before_owner() {
     let coupon = (1u32 << 26) | 1;
@@ -23,7 +23,7 @@ fn legacy_ds_hll_semantic_decoder_full_error_before_owner() {
     payload.extend_from_slice(&2u32.to_le_bytes());
     payload.extend_from_slice(&coupon.to_le_bytes());
     payload.extend_from_slice(&coupon.to_le_bytes());
-    let error = HllHandle::from_payload_unreserved(&payload)
+    let error = HllAccumulator::from_payload_unreserved(&payload)
         .err()
         .expect("original duplicate SET failure");
     assert_eq!(

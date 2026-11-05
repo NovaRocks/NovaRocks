@@ -22,7 +22,7 @@ use novarocks_execution::runtime::kernel_memory::{
     KernelMemoryRequest, request, request_complete_operation,
 };
 use novarocks_memory::{
-    AccountHandle, AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, OWNER_METADATA_BYTES,
+    Account, AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, OWNER_METADATA_BYTES,
 };
 use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
 use novarocks_proto_models::{
@@ -58,7 +58,7 @@ impl PureCompileControl for Control {
 
 struct BoundedFirstQualification<'a> {
     host: TypeMaterializationHost<'a>,
-    pressure_account: Option<AccountHandle>,
+    pressure_account: Option<Account>,
     admissions: usize,
     body_calls: &'a Cell<usize>,
 }

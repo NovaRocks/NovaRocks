@@ -24,9 +24,9 @@
 
 use super::operator::{ExitObservation, ExitProgress, FinishWatch};
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult},
     observable::Observable,
     runtime_state::RuntimeErrorState,
+    task::{ExecutionFailure, ExecutionResult},
 };
 use std::{
     any::Any,
@@ -1051,11 +1051,11 @@ mod tests {
 mod owned_operator_tests {
     use super::*;
     use crate::exec::pipeline::{
+        driver_step::DriverStep,
         instance::OperatorInstance,
         operator::{InputEncodingPolicy, OperatorLifecycle},
         shape::StepOperator,
         step::{NextStep, StepResult},
-        step_context::StepContext,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct MetadataOnly {
@@ -1084,15 +1084,15 @@ mod owned_operator_tests {
         }
         fn try_push(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: super::super::input::RawInput,
         ) -> super::super::step::InputResult {
             unreachable!("retired metadata owner accepts no data")
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             Ok(())
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             unreachable!("metadata-only retired owner has no data work")
         }
     }

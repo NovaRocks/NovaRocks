@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime::endpoint::FragmentDestination;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::endpoint::TaskDestination;
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 pub use novarocks_execution_contract::DataStreamPartitionType;
 use novarocks_types::SlotId;
 use std::collections::HashSet;
@@ -30,7 +30,7 @@ pub struct DataStreamSinkFactoryInput {
     pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     pub output_partition_type: DataStreamPartitionType,
     pub output_columns: Vec<SlotId>,
-    pub destinations: Vec<FragmentDestination>,
+    pub destinations: Vec<TaskDestination>,
 }
 
 impl DataStreamSinkFactoryInput {
@@ -39,7 +39,7 @@ impl DataStreamSinkFactoryInput {
         output_partition_type: DataStreamPartitionType,
         delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         output_columns: Vec<SlotId>,
-        destinations: Vec<FragmentDestination>,
+        destinations: Vec<TaskDestination>,
     ) -> ExecutionResult<Self> {
         let mut seen = HashSet::new();
         if let Some(slot_id) = output_columns
@@ -64,7 +64,7 @@ impl DataStreamSinkFactoryInput {
         output_partition_type: DataStreamPartitionType,
         delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         output_columns: Vec<i32>,
-        destinations: Vec<FragmentDestination>,
+        destinations: Vec<TaskDestination>,
     ) -> ExecutionResult<Self> {
         let mut seen = HashSet::new();
         let mut parsed_output_columns = Vec::with_capacity(output_columns.len());
@@ -123,7 +123,7 @@ impl novarocks_failure_contract::FailureProjection for SinkInputFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::PlanSinkInvariant.reason(),
+            crate::runtime::task::ExecutionReason::PlanSinkInvariant.reason(),
         )
     }
 }
@@ -145,8 +145,7 @@ mod tests {
         .err()
         .expect("negative slot must fail construction");
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
-        let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause()
-        else {
+        let crate::runtime::task::ExecutionFailureCause::Domain(source) = failure.cause() else {
             panic!("construction must retain its nominal source");
         };
         let source = source.downcast_ref::<super::SinkInputFailure>().unwrap();

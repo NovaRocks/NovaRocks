@@ -16,12 +16,12 @@
 // under the License.
 
 //! Low-frequency directory and ticket decisions share the same step/guard
-//! handoff and scheduler as contexts. There is no task-capacity mailbox hop.
+//! handoff and scheduler as participations. There is no task-capacity mailbox hop.
 use super::{RequestMetadata, WorkerAction};
 use crate::control_admission::{AdmissionStorage, ScopeAdmissionPort};
 use novarocks_control_runtime::{
-    actor::{Actor, StepContext},
-    driver::InputAuthor,
+    actor::{Actor, ActorStep},
+    actor_turn::InputAuthor,
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
@@ -32,7 +32,7 @@ use novarocks_control_runtime_core::{
 use novarocks_execution_contract::TaskOperationId;
 use novarocks_worker_protocol::{
     control::{ControlCore, ControlEffect, ControlInput},
-    creation::RequestContext,
+    creation::RequestReplyTag,
     lease::MonotonicInstant,
 };
 use std::{collections::BTreeMap, time::Duration};
@@ -43,7 +43,7 @@ pub(crate) enum ControlMessage {
         work: ScopedWorkRef,
         request: RequestMetadata,
         ticket: novarocks_execution_contract::AdmissionTicketId,
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
         preflight: bool,
     },
     Command {
@@ -109,7 +109,7 @@ impl Actor for ControlActor {
         now: Tick,
         envelope: InputEnvelope,
         message: ControlMessage,
-        step: &mut StepContext<'_, WorkerAction>,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
         assert_eq!(
@@ -129,12 +129,12 @@ impl Actor for ControlActor {
                 work,
                 request,
                 ticket,
-                context,
+                participation,
                 preflight,
             } => {
                 use novarocks_worker_protocol::{
-                    context::{RequestResult, RequestSettlement},
                     control::{ControlReplyBody, ControlRequestSettlement},
+                    participation::{RequestResult, RequestSettlement},
                 };
                 let (result, body) = if now.has_reached(request.deadline) {
                     let result = RequestResult::Outcome(
@@ -148,12 +148,15 @@ impl Actor for ControlActor {
                         ),
                         if preflight {
                             ControlReplyBody::PreflightExpired(
-                                self.core.preflight_expired_establish(context, ticket, now),
+                                self.core
+                                    .preflight_expired_establish(participation, ticket, now),
                             )
                         } else {
-                            ControlReplyBody::TicketObservation(
-                                self.core.admission().observe(ticket, context, now),
-                            )
+                            ControlReplyBody::TicketObservation(self.core.admission().observe(
+                                ticket,
+                                participation,
+                                now,
+                            ))
                         },
                     )
                 };
@@ -173,7 +176,7 @@ impl Actor for ControlActor {
                     },
                     WorkerAction::ControlReply(ControlRequestSettlement {
                         settlement: RequestSettlement {
-                            request: RequestContext {
+                            request: RequestReplyTag {
                                 author: work,
                                 token: envelope.input,
                                 operation: request.operation,
@@ -221,7 +224,7 @@ impl Actor for ControlActor {
         let result = match request {
             Some(request) => self.core.handle_request(
                 now,
-                RequestContext {
+                RequestReplyTag {
                     author: work,
                     token: envelope.input,
                     operation: request.operation,
@@ -257,7 +260,7 @@ impl Actor for ControlActor {
         }
         assert!(
             reservations.len() <= 1,
-            "one control command can admit only its original context materialization"
+            "one control command can admit only its original participation materialization"
         );
         let mut next = 0u64;
         let epoch = self.core.admission().capability();
@@ -318,7 +321,7 @@ impl Actor for ControlActor {
                 match &effect {
                     ControlEffect::RetireReservation(_)
                     | ControlEffect::RemoveHost { .. }
-                    | ControlEffect::AbortContext { .. } => EffectKind::Cleanup,
+                    | ControlEffect::AbortParticipation { .. } => EffectKind::Cleanup,
                     _ => EffectKind::Publication,
                 }
             };
@@ -410,8 +413,8 @@ impl Actor for ControlActor {
         scope: ScopeId,
         generation: Generation,
         input: InputEnvelope,
-        step: &mut StepContext<'_, WorkerAction>,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
-        <super::ContextActor as Actor>::owner_failed(scope, generation, input, step);
+        <super::ParticipationActor as Actor>::owner_failed(scope, generation, input, step);
     }
 }

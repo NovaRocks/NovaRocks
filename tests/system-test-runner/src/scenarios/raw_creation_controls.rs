@@ -56,7 +56,7 @@ impl RawCreationObservationOwner {
         let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
         plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
         let backend = plan.reserve_launch(RoleSlot::Backend(0))?;
-        let parameters = json!({"action":"grpc-fragment","root":root,"backend_index":0,
+        let parameters = json!({"action":novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),"root":root,"backend_index":0,
             "target_session_id":backend.session_id,"max_events":16384,
             "query_execution":{"query_id_hi":identity.0.hi,"query_id_lo":identity.0.lo,"attempt_id":1}});
         ensure!(

@@ -26,9 +26,9 @@ use novarocks_types::{StageId, TaskId, UniqueId};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-const PREPARED: &str = "NOVAROCKS_TASK_PREPARED_DOP";
-const OPENED: &str = "NOVAROCKS_CONNECTOR_WRITER_OPENED";
-const READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
+const PREPARED: &str = novarocks_failpoint::observation_marker::TASK_PREPARED_DOP;
+const OPENED: &str = novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED;
+const READER_CLOSE: &str = novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_CLOSE;
 
 pub(super) fn mutate_observed(
     context: &mut ScenarioContext,
@@ -88,13 +88,13 @@ pub(super) fn mutate_observed(
             // verify this exact launch/session/process/request/attempt.
             let grpc = context.handle().selected_native_observation_binding(
                 index,
-                "grpc-fragment",
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
                 &selected.token,
                 None,
             )?;
             let writer = context.handle().selected_native_observation_binding(
                 index,
-                "writer-marker",
+                novarocks_failpoint::observation_marker::ObservationAction::WriterMarker.as_str(),
                 &selected.token,
                 None,
             )?;
@@ -110,7 +110,8 @@ pub(super) fn mutate_observed(
             if let Some(prefixes) = reader_before.as_ref() {
                 let reader = context.handle().selected_native_observation_binding(
                     index,
-                    "reader-marker",
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
                     &selected.token,
                     None,
                 )?;
@@ -235,11 +236,11 @@ fn number<T: FromStr>(fields: &BTreeMap<&str, &str>, name: &str) -> Result<T> {
         .parse()
         .map_err(|_| anyhow!("typed writer/Task marker has invalid {name}"))
 }
-fn finst(fields: &BTreeMap<&str, &str>) -> Result<String> {
-    let text = field(fields, "finst")?;
+fn task_key(fields: &BTreeMap<&str, &str>) -> Result<String> {
+    let text = field(fields, "task_key")?;
     let (hi, lo) = text
         .split_once(':')
-        .context("typed writer/Task marker has invalid finst")?;
+        .context("typed writer/Task marker has invalid task_key")?;
     let id = UniqueId::new(
         u64::from_str_radix(hi, 16)? as i64,
         u64::from_str_radix(lo, 16)? as i64,
@@ -247,7 +248,7 @@ fn finst(fields: &BTreeMap<&str, &str>) -> Result<String> {
     let canonical = format!("{:x}:{:x}", id.high(), id.low());
     anyhow::ensure!(
         text == canonical,
-        "typed writer/Task marker has noncanonical finst"
+        "typed writer/Task marker has noncanonical task_key"
     );
     Ok(canonical)
 }
@@ -303,14 +304,14 @@ fn inventory(
             TaskId::new(number(&fields, "task")?)?,
             process,
         );
-        let finst = finst(&fields)?;
+        let task_key = task_key(&fields)?;
         let task = Prepared {
             identity,
             dop: number(&fields, "dop")?,
         };
         anyhow::ensure!(
-            prepared.insert(finst, task).is_none(),
-            "one prepared finst has multiple Task observations"
+            prepared.insert(task_key, task).is_none(),
+            "one prepared task_key has multiple Task observations"
         );
         raw.push(line.to_owned());
     }
@@ -323,9 +324,9 @@ fn inventory(
             continue;
         }
         binding.context("writer marker lacks its authenticated execution binding")?;
-        let finst = finst(&fields)?;
+        let task_key = task_key(&fields)?;
         let task = prepared
-            .get(&finst)
+            .get(&task_key)
             .context("opened writer has no exact prepared Task")?;
         anyhow::ensure!(
             task.dop == dop,
@@ -337,7 +338,7 @@ fn inventory(
         let driver = number::<u32>(&fields, "driver_id")?;
         let plan_node = number::<i32>(&fields, "plan_node")?;
         let group = groups
-            .entry((target, finst, ordinal))
+            .entry((target, task_key, ordinal))
             .or_insert_with(|| Writers {
                 task: task.identity,
                 plan_node,
@@ -356,7 +357,7 @@ fn inventory(
     let expected = (0..u32::try_from(dop)?).collect::<BTreeSet<_>>();
     let mut writers = Vec::new();
     let mut observed_opens = 0_usize;
-    for ((target, finst, ordinal), group) in groups {
+    for ((target, task_key, ordinal), group) in groups {
         anyhow::ensure!(
             group.drivers == expected,
             "Task {} target {target} writer ordinal {ordinal} actual driver set {:?}, expected {:?}",
@@ -365,7 +366,7 @@ fn inventory(
             expected
         );
         observed_opens += group.drivers.len();
-        writers.push(serde_json::json!({"task":group.task.to_string(),"finst":finst,"target":target,"writer_ordinal":ordinal,"plan_node":group.plan_node,"driver_ids":group.drivers,"descriptor_dop":dop}));
+        writers.push(serde_json::json!({"task":group.task.to_string(),"task_key":task_key,"target":target,"writer_ordinal":ordinal,"plan_node":group.plan_node,"driver_ids":group.drivers,"descriptor_dop":dop}));
     }
     // The original private binding retains its run token. The derived report
     // needs process/execution attribution, never another copy of that token.
@@ -449,15 +450,15 @@ mod tests {
         )
         .unwrap()
     }
-    fn prepared(binding: &StatementExecutionBinding, finst: &str, dop: i32) -> String {
+    fn prepared(binding: &StatementExecutionBinding, task_key: &str, dop: i32) -> String {
         format!(
-            "{PREPARED} execution_id=1:2:1 stage=1 task=2 backend={} finst={finst} dop={dop}\n",
+            "{PREPARED} execution_id=1:2:1 stage=1 task=2 backend={} task_key={task_key} dop={dop}\n",
             binding.backend_process_id
         )
     }
-    fn writer(finst: &str, driver: u32) -> String {
+    fn writer(task_key: &str, driver: u32) -> String {
         format!(
-            "{OPENED} execution_id=1:2:1 finst={finst} plan_node=1 write_target=0 driver_id={driver} writer_ordinal=0\n"
+            "{OPENED} execution_id=1:2:1 task_key={task_key} plan_node=1 write_target=0 driver_id={driver} writer_ordinal=0\n"
         )
     }
     #[test]

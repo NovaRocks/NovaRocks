@@ -27,7 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_local_program::KernelAbiVersion;
 
 use std::sync::Arc;
@@ -41,14 +41,14 @@ use super::builder::{
     CompiledOrderedFilterContext, PipelineGraph, build_compiled_pipeline_graph_typed,
 };
 use super::dependency::DependencyManager;
-use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{
-    DriverBatch, DriverTask, FragmentCompletion, FragmentStoppedFact,
+    DriverBatch, DriverGroupCompletion, DriverGroupStoppedFact, DriverRunner,
 };
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
+use super::task_context::TaskContext;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::fragment::io::FragmentEventSink;
+use crate::runtime::task::io::TaskEventSink;
 
 use crate::runtime::profile::Profiler;
 
@@ -62,18 +62,18 @@ fn test_driver_executor() -> &'static super::global_driver_executor::GlobalDrive
 /// A fully materialized pipeline that has not submitted any drivers to the global executor.
 pub struct PreparedPipelineExecution {
     tasks: DriverBatch,
-    completion: Arc<FragmentCompletion>,
-    fragment_ctx: Arc<FragmentContext>,
+    completion: Arc<DriverGroupCompletion>,
+    task_ctx: Arc<TaskContext>,
     runtime_state: Arc<RuntimeState>,
-    fragment_profiler: Option<Profiler>,
+    task_profiler: Option<Profiler>,
 }
 
 impl PreparedPipelineExecution {
-    pub(crate) fn admit_local_completion_driver(
+    pub(crate) fn admit_local_completion_poller(
         &self,
-        driver: crate::runtime::local_completion::LocalCompletionDriver,
+        poller: crate::runtime::local_completion::LocalCompletionPoller,
     ) {
-        self.completion.admit_local_completion_driver(driver);
+        self.completion.admit_local_completion_poller(poller);
     }
 
     pub(crate) fn admit_completion_work(
@@ -90,13 +90,16 @@ impl PreparedPipelineExecution {
 
     pub(crate) fn resources_finisher(
         &self,
-    ) -> Arc<super::global_driver_executor::once_role::OnceRole<FragmentStoppedFact>> {
+    ) -> Arc<super::global_driver_executor::completion_custody::OnceCustody<DriverGroupStoppedFact>>
+    {
         self.completion.resources_finisher()
     }
 
     pub(crate) fn bind_resources_finisher(
         &self,
-        slot: &mut Option<super::global_driver_executor::once_role::Callback<FragmentStoppedFact>>,
+        slot: &mut Option<
+            super::global_driver_executor::completion_custody::Callback<DriverGroupStoppedFact>,
+        >,
     ) -> ExecutionResult<()> {
         self.completion.bind_resources_finisher(slot)
     }
@@ -126,9 +129,9 @@ impl PreparedPipelineExecution {
         let Self {
             tasks,
             completion,
-            fragment_ctx,
+            task_ctx,
             runtime_state,
-            fragment_profiler,
+            task_profiler,
         } = self;
         let submitted_driver_count = tasks.len();
         let control = runtime_state.error_state();
@@ -136,13 +139,13 @@ impl PreparedPipelineExecution {
         // The original batch was installed during preparation. Every start
         // callback borrows it, so unwind cannot discard a raw driver Vec.
         tasks.metadata(0, &control, || {
-            let mut fragment_wall_timer = fragment_profiler
+            let mut task_wall_timer = task_profiler
                 .as_ref()
-                .map(|p| p.scoped_timer("FragmentWallTime"));
+                .map(|p| p.scoped_timer("TaskWallTime"));
             let mut wall_time: Option<
-                super::global_driver_executor::once_role::Callback<FragmentStoppedFact>,
+                super::global_driver_executor::completion_custody::Callback<DriverGroupStoppedFact>,
             > = Some(Box::new(move |_| {
-                drop(fragment_wall_timer.take());
+                drop(task_wall_timer.take());
                 true
             }));
             completion
@@ -155,7 +158,7 @@ impl PreparedPipelineExecution {
             // offered through the same control; no catch invents another cause.
             let proposal = tasks.install_initial_failure(error);
             let handed_off = tasks
-                .metadata(1, &control, || fragment_ctx.set_final_status(proposal))
+                .metadata(1, &control, || task_ctx.set_final_status(proposal))
                 .is_some();
             if handed_off {
                 start_work_exited = tasks.dispose_initial_failure(&control);
@@ -194,7 +197,7 @@ impl PreparedPipelineExecution {
 
         RunningPipelineExecution {
             completion,
-            fragment_ctx,
+            task_ctx,
             runtime_state,
             submitted_driver_count,
         }
@@ -203,8 +206,8 @@ impl PreparedPipelineExecution {
 
 /// A submitted fragment-local pipeline execution.
 pub struct RunningPipelineExecution {
-    completion: Arc<FragmentCompletion>,
-    fragment_ctx: Arc<FragmentContext>,
+    completion: Arc<DriverGroupCompletion>,
+    task_ctx: Arc<TaskContext>,
     runtime_state: Arc<RuntimeState>,
     submitted_driver_count: usize,
 }
@@ -217,7 +220,7 @@ impl RunningPipelineExecution {
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
     pub fn cancel(&self, err: impl Into<ExecutionFailure>) {
         let err = err.into();
-        self.fragment_ctx.set_final_status(err);
+        self.task_ctx.set_final_status(err);
     }
 
     pub fn fail(&self, err: impl Into<ExecutionFailure>) {
@@ -232,7 +235,7 @@ impl RunningPipelineExecution {
     }
 
     /// Returns actual-stop proof only after every submitted driver has exited.
-    pub fn stopped_fact(&self) -> Option<FragmentStoppedFact> {
+    pub fn stopped_fact(&self) -> Option<DriverGroupStoppedFact> {
         self.completion.stopped_fact()
     }
 
@@ -244,7 +247,7 @@ impl RunningPipelineExecution {
             .and_then(|opts| opts.query_timeout)
             .filter(|secs| *secs > 0)
             .map(|secs| {
-                crate::runtime::fragment::ExecutionFailure::from(
+                crate::runtime::task::ExecutionFailure::from(
                     super::driver_failure::DriverFailure::DeadlineExceeded(
                         novarocks_failure_contract::BoundedDetail::truncating_display(
                             format_args!("query timed out after {} ms", i64::from(secs) * 1000),
@@ -260,17 +263,17 @@ impl RunningPipelineExecution {
                         .and_then(|opts| opts.query_timeout)
                         .expect("timeout was checked") as u64,
                 );
-                let fragment_ctx = Arc::clone(&self.fragment_ctx);
+                let task_ctx = Arc::clone(&self.task_ctx);
                 let timeout_error = err.clone();
                 self.completion
                     .wait_timeout_with_local_cancel(timeout, err, move || {
-                        fragment_ctx.set_final_status(timeout_error);
+                        task_ctx.set_final_status(timeout_error);
                     })
             }
             None => self.completion.wait(),
         };
         if let Err(err) = &result {
-            self.fragment_ctx.set_final_status(err.clone());
+            self.task_ctx.set_final_status(err.clone());
         }
         result
     }
@@ -295,7 +298,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
     exchange_finst_id: Option<(i64, i64)>,
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     prepare_compiled_program_pipeline_execution_with_profiler(
         program,
@@ -303,7 +306,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
         sink,
         exchange_bindings,
         ScanBindings::default(),
-        crate::runtime::fragment::CompiledWriterBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
         exchange_finst_id,
         None,
         pipeline_dop,
@@ -330,12 +333,12 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     sink: Box<dyn OperatorFactory>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
         program,
@@ -364,12 +367,12 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
     sink: Box<dyn OperatorFactory>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
     schema_preparation: Option<
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
@@ -377,7 +380,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
     prepare_compiled_program_with_sink_materializer(
         program,
         time_slice,
-        |_| Ok(crate::runtime::fragment::sink::MaterializedCompiledSink::single(sink)),
+        |_| Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(sink)),
         exchange_bindings,
         scan_bindings,
         writer_bindings,
@@ -402,25 +405,25 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
     materialize: impl FnOnce(
         std::num::NonZeroUsize,
     ) -> Result<
-        crate::runtime::fragment::sink::MaterializedCompiledSink,
-        crate::runtime::fragment::error::FragmentLaunchError,
+        crate::runtime::task::sink::MaterializedCompiledSink,
+        crate::runtime::task::error::LocalTaskLaunchError,
     >,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     exchange_finst_id: Option<(i64, i64)>,
     profiler: Option<Profiler>,
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
     schema_preparation: Option<
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
-) -> Result<PreparedPipelineExecution, crate::runtime::fragment::error::FragmentLaunchError> {
+) -> Result<PreparedPipelineExecution, crate::runtime::task::error::LocalTaskLaunchError> {
     let mut graph = (|| -> ExecutionResult<PipelineGraph> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings.get(node_id).ok_or_else(|| {
-            crate::runtime::fragment::ExecutionFailure::from(
+            crate::runtime::task::ExecutionFailure::from(
                 crate::exec::fragment::error::FragmentBindingError::new(
                     crate::exec::fragment::error::FragmentBindingTarget::ExchangeNode(node_id),
                     crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
@@ -428,12 +431,12 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
                 ),
             )
         })?;
-        if exchange_finst_id != Some((binding.key.finst_id_hi, binding.key.finst_id_lo)) {
+        if exchange_finst_id != Some((binding.key.task_key_hi, binding.key.task_key_lo)) {
             return Err(crate::exec::fragment::error::program_binding_failure(
                 crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
                 format!(
                     "compiled exchange binding for node {node_id} belongs to fragment instance {}, not {exchange_finst_id:?}",
-                    binding.key.finst_uuid(),
+                    binding.key.task_key_uuid(),
                 ),
             ));
         }
@@ -536,13 +539,13 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
 
 fn compiled_pipeline_launch_error(
     cause: ExecutionFailure,
-) -> crate::runtime::fragment::error::FragmentLaunchError {
-    use crate::runtime::fragment::error::{
-        FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,
+) -> crate::runtime::task::error::LocalTaskLaunchError {
+    use crate::runtime::task::error::{
+        LocalTaskLaunchError, LocalTaskLaunchErrorKind, LocalTaskLaunchStage,
     };
-    FragmentLaunchError::from_failure(
-        FragmentLaunchStage::BuildPipelines,
-        FragmentLaunchErrorKind::PipelineBuild,
+    LocalTaskLaunchError::from_failure(
+        LocalTaskLaunchStage::BuildPipelines,
+        LocalTaskLaunchErrorKind::PipelineBuild,
         cause,
     )
 }
@@ -562,21 +565,21 @@ fn prepare_pipeline_execution_from_graph(
     query_id: Option<novarocks_types::QueryId>,
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
     report_neutral: bool,
     mut schema_preparation: Option<
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let ctx = Arc::new(if report_neutral {
-        FragmentContext::new_report_neutral(
+        TaskContext::new_report_neutral(
             profiler.clone(),
             Arc::clone(&runtime_state),
             exchange_finst_id,
             event_sink,
         )
     } else {
-        FragmentContext::new(
+        TaskContext::new(
             profiler.clone(),
             Arc::clone(&runtime_state),
             exchange_finst_id,
@@ -652,10 +655,10 @@ fn prepare_pipeline_execution_from_graph(
     };
 
     let completion =
-        FragmentCompletion::new_prepared(all_drivers.len(), runtime_state.error_state());
+        DriverGroupCompletion::new_prepared(all_drivers.len(), runtime_state.error_state());
     let mut tasks = Vec::with_capacity(all_drivers.len());
     for driver in all_drivers {
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
             Arc::clone(&ctx),
@@ -666,9 +669,9 @@ fn prepare_pipeline_execution_from_graph(
     Ok(PreparedPipelineExecution {
         tasks: DriverBatch::new(tasks),
         completion,
-        fragment_ctx: ctx,
+        task_ctx: ctx,
         runtime_state,
-        fragment_profiler: profiler,
+        task_profiler: profiler,
     })
 }
 
@@ -676,7 +679,7 @@ fn prepare_pipeline_execution_from_graph(
 mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::operator::OperatorLifecycle;
-    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+    use crate::runtime::task::{ExecutionFailure, ExecutionResult};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, mpsc};
     use std::time::{Duration, Instant};
@@ -685,15 +688,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+    use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::driver::PipelineDriver;
-    use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::{
-        DriverBatch, DriverTask, FragmentCompletion,
+        DriverBatch, DriverGroupCompletion, DriverRunner,
     };
     use crate::exec::pipeline::operator::Operator;
     use crate::exec::pipeline::schedule::observer::Observable;
+    use crate::exec::pipeline::task_context::TaskContext;
 
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
@@ -786,7 +789,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for ActivationProbe {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             unreachable!("a rejected driver cannot run work")
         }
@@ -804,7 +807,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for ParkedSourceOperator {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             let generation = self.observable.generation();
             assert!(
@@ -835,7 +838,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for PanicOperator {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("injected pipeline panic")
         }
@@ -846,7 +849,7 @@ mod tests {
         runtime_state: Arc<RuntimeState>,
         query_id: Option<QueryId>,
     ) -> PreparedPipelineExecution {
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             None,
@@ -854,19 +857,19 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new_prepared(1, runtime_state.error_state());
-        let task = DriverTask::new(
+        let completion = DriverGroupCompletion::new_prepared(1, runtime_state.error_state());
+        let task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
-            Arc::clone(&fragment_ctx),
+            Arc::clone(&task_ctx),
             Duration::from_millis(10),
         );
         PreparedPipelineExecution {
             tasks: DriverBatch::new(vec![task]),
             completion,
-            fragment_ctx,
+            task_ctx,
             runtime_state,
-            fragment_profiler: None,
+            task_profiler: None,
         }
     }
 
@@ -893,7 +896,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for TypedFailureSource {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             Err(self.error.clone())
         }
@@ -1046,10 +1049,10 @@ mod tests {
                 );
                 if !activation {
                     assert_eq!(
-                        result.context(),
-                        Some(crate::runtime::fragment::ExecutionFailureContext {
+                        result.site(),
+                        Some(crate::runtime::task::OperatorFailureSite {
                             operator_ordinal: 0,
-                            operation: crate::runtime::fragment::PipelineOperation::Pull,
+                            operation: crate::runtime::task::PipelineOperation::Pull,
                         })
                     );
                 }
@@ -1058,7 +1061,7 @@ mod tests {
     }
     #[test]
     fn typed_failure_required_root_preserves_original_sparse_row_journal_and_typed_site() {
-        use crate::runtime::fragment::{ExecutionFailureCause, RequiredExpressionRowError};
+        use crate::runtime::task::{ExecutionFailureCause, RequiredExpressionRowError};
         use novarocks_functions::{RowDataError, Selection};
         use novarocks_local_program::{
             ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
@@ -1120,7 +1123,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for PrepareFailureFactory {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("preparation failure must prevent data work")
         }
@@ -1131,7 +1134,7 @@ mod tests {
         for in_bind in [false, true] {
             let original: ExecutionFailure =
                 novarocks_functions::KernelFailure::ResourceExhausted.into();
-            let context = Arc::new(FragmentContext::new(
+            let context = Arc::new(TaskContext::new(
                 None,
                 test_runtime_state(),
                 None,
@@ -1152,7 +1155,7 @@ mod tests {
                 .err()
                 .expect("actual preparation failed");
             assert_eq!(error, original);
-            assert_eq!(error.context(), None);
+            assert_eq!(error.site(), None);
         }
     }
 
@@ -1294,7 +1297,7 @@ mod tests {
     impl crate::exec::node::scan::ScanChunkStream for ScanHolderMetadataStream {
         fn take_exit_observation(
             self: std::pin::Pin<&mut Self>,
-            _: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+            _: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
         ) -> ExecutionResult<crate::exec::node::scan::ScanExitObservation> {
             let state = self.0.clone();
             Ok(crate::exec::node::scan::ScanExitObservation {
@@ -1312,7 +1315,7 @@ mod tests {
         }
         fn close(
             self: std::pin::Pin<Box<Self>>,
-            _: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+            _: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
         ) -> futures::future::BoxFuture<'static, ExecutionResult<()>> {
             self.0.close();
             Box::pin(async { Ok(()) })
@@ -1342,8 +1345,8 @@ mod tests {
             drop_entered: entered_send,
             drop_release: std::sync::Mutex::new(release_recv),
         });
-        let program = crate::runtime::fragment::scan::compiled_fixture::scan_program(1, false);
-        let chunk = crate::runtime::fragment::scan::compiled_fixture::scan_chunk(
+        let program = crate::runtime::task::scan::compiled_fixture::scan_program(1, false);
+        let chunk = crate::runtime::task::scan::compiled_fixture::scan_chunk(
             &program,
             &[7, 11, 19],
             &[7, 11, 19],
@@ -1373,22 +1376,19 @@ mod tests {
         )
         .unwrap();
         let mut bindings = ScanBindings::default();
-        bindings.insert(
-            crate::runtime::fragment::scan::compiled_fixture::SCAN_NODE,
-            op,
-        );
+        bindings.insert(crate::runtime::task::scan::compiled_fixture::SCAN_NODE, op);
         prepare_compiled_program_pipeline_execution_with_profiler(
             program,
             Duration::from_millis(10),
             Box::new(crate::exec::operators::NoopSinkFactory::new()),
             ExchangeBindings::default(),
             bindings,
-            crate::runtime::fragment::CompiledWriterBindings::default(),
+            crate::runtime::task::CompiledWriterBindings::default(),
             None,
             None,
             1,
             test_runtime_state_with_construction_owner("scan-holder-exit"),
-            Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+            Arc::new(crate::runtime::task::io::NoopTaskEventSink),
         )
         .unwrap()
     }
@@ -1455,53 +1455,51 @@ mod tests {
     #[test]
     fn stopped_dormant_scan_joins_unclaimed_data_through_its_original_driver() {
         use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
-        use crate::runtime::fragment::{
-            BackendNum, CompiledFragmentSubmission, DormantFragmentHandle,
-            ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec, FragmentOutcome,
-            FragmentPrepareContext, FragmentRuntimeOptions, FragmentSinkAssignment,
-            ScanAssignments,
+        use crate::runtime::task::{
+            CompiledTaskSubmission, ExchangeInputAssignments, InstanceOrdinal, LocalTaskOutcome,
+            LocalTaskPrepareContext, PreparedTaskExecution, ScanAssignments, TaskInstanceSpec,
+            TaskKey, TaskRuntimeOptions, TaskSinkAssignment,
         };
         use std::collections::BTreeMap;
         use std::num::NonZeroUsize;
         let (program, source, state, payload, entered, mut release) = scan_holder_fixture(false);
         let scan = *program.scan_inputs().keys().next().unwrap();
-        let physical_scan = crate::runtime::fragment::scan::compiled_fixture::SCAN_NODE;
+        let physical_scan = crate::runtime::task::scan::compiled_fixture::SCAN_NODE;
         let sources =
             BTreeMap::from([(scan, source as Arc<dyn crate::exec::node::scan::ScanSource>)]);
         let owner = crate::runtime::task_control::test_support::Owner::new();
         let control =
             Arc::new(owner.view(novarocks_execution_contract::TaskFailurePhase::Preparation));
         let identity = control.identity();
-        let instance = FragmentInstanceSpec::new_native(
+        let instance = TaskInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             identity.query_execution_id().query_id(),
-            FragmentInstanceId::new(novarocks_types::UniqueId::new(98_711, 1)),
+            TaskKey::new(novarocks_types::UniqueId::new(98_711, 1)),
             ScanAssignments::try_new(BTreeMap::from([(
                 FragmentNodeId::new(physical_scan),
                 crate::exec::node::scan::BoundScanRanges::None,
             )]))
             .unwrap(),
             ExchangeInputAssignments::default(),
-            FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), false),
+            TaskSinkAssignment::None,
+            TaskRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::MIN,
-            BackendNum::try_new(1).unwrap(),
+            InstanceOrdinal::try_new(1).unwrap(),
         );
-        let submission = CompiledFragmentSubmission::try_new(program, sources, instance).unwrap();
-        let context = FragmentPrepareContext::default()
+        let submission = CompiledTaskSubmission::try_new(program, sources, instance).unwrap();
+        let context = LocalTaskPrepareContext::default()
             .with_execution_runtime(test_execution_runtime())
             .with_task_control(control.clone())
             .with_result_identity(identity)
-            .with_completion_roles(owner.admit_completion_roles());
-        let dormant =
-            crate::runtime::fragment::prepare_compiled_fragment(submission, context).unwrap();
+            .with_completion_work(owner.issue_fixture_completion_work());
+        let dormant = crate::runtime::task::prepare_compiled_task(submission, context).unwrap();
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         control.report_failure(original.clone());
         let _ = control.accepted().unwrap();
         state.armed.store(true, Ordering::Release);
         let mut slot = Some(dormant);
-        let running = DormantFragmentHandle::try_drain_stopped(&mut slot).unwrap();
+        let running = PreparedTaskExecution::try_drain_stopped(&mut slot).unwrap();
         let drop_started = entered.recv_timeout(Duration::from_secs(2)).is_ok();
         let terminal_before_drop_return = running.stopped_fact();
         let real_data_still_held = payload.upgrade().is_some();
@@ -1517,14 +1515,14 @@ mod tests {
         assert_eq!(state.claims.load(Ordering::SeqCst), 0);
         assert_eq!(state.terminations.load(Ordering::SeqCst), 1);
         match terminal.outcome() {
-            FragmentOutcome::Failed(error) => assert!(error.cause().same_occurrence(&original)),
+            LocalTaskOutcome::Failed(error) => assert!(error.cause().same_occurrence(&original)),
             other => panic!("the original preparation failure must remain selected: {other:?}"),
         }
     }
 
     #[test]
     fn prepared_pipeline_defers_submission_until_start_then_joins() {
-        let handle = ResultSinkHandle::new();
+        let handle = ResultSinkBuffer::new();
         let prepared = super::prepare_compiled_program_pipeline_execution(
             single_values_program(),
             Duration::from_millis(10),
@@ -1533,7 +1531,7 @@ mod tests {
             None,
             1,
             test_runtime_state_with_construction_owner("compiled deferred driver fixture"),
-            Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+            Arc::new(crate::runtime::task::io::NoopTaskEventSink),
         )
         .expect("prepare pipeline without submitting drivers");
 
@@ -1585,7 +1583,7 @@ mod tests {
     impl crate::exec::pipeline::shape::TransformKernel for CancellableWait {
         fn apply(
             &mut self,
-            _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             let chunk = input.into_uncovered_chunk()?;
@@ -1643,7 +1641,7 @@ mod tests {
                 Some(Arc::clone(&runtime)),
                 Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             ));
-            let output = ResultSinkHandle::new();
+            let output = ResultSinkBuffer::new();
             let graph = super::PipelineGraph {
                 root_id: 0,
                 pipelines: vec![crate::exec::pipeline::builder::PipelinePlan {
@@ -1664,7 +1662,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+                Arc::new(crate::runtime::task::io::NoopTaskEventSink),
                 true,
                 None,
             )
@@ -1682,8 +1680,7 @@ mod tests {
         }
         let entered_wait = state.error_state().waiting_count() == 1;
         let original_cancel: ExecutionFailure =
-            crate::runtime::fragment::FragmentCancelReason::new("cancel actual SLEEP".to_string())
-                .into();
+            crate::runtime::task::TaskCancelDetail::new("cancel actual SLEEP".to_string()).into();
         running.cancel(original_cancel.clone());
         assert!(state.error().unwrap().same_occurrence(&original_cancel));
         let cancellation = state.error().expect("cancel installed its actual cause");
@@ -1829,7 +1826,7 @@ mod tests {
             "the parked driver owns the source's only scoped wake slot"
         );
 
-        running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
+        running.cancel(crate::runtime::task::TaskCancelDetail::new(
             "local cancel".to_string(),
         ));
         assert_eq!(
@@ -2063,7 +2060,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for StartKernelProbe {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(crate::exec::pipeline::step::StepResult::new(
@@ -2178,8 +2175,7 @@ mod tests {
             control.local_exit_fault().unwrap().fact().reason(),
             novarocks_failure_contract::FailureReason::new(
                 novarocks_failure_contract::domain::EXECUTION,
-                crate::runtime::fragment::ExecutionReason::DriverStartInitialFailureCaptureDrop
-                    .code()
+                crate::runtime::task::ExecutionReason::DriverStartInitialFailureCaptureDrop.code()
             )
         );
     }

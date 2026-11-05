@@ -124,7 +124,7 @@ impl ExecutionHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::fragment::ExecutionFailure;
+    use crate::runtime::task::ExecutionFailure;
     use novarocks_failure_contract::{
         FailureClass, FailureProjection, FailureReason, ResourceDimension, ResourceFacts,
         ResourceScope, domain,

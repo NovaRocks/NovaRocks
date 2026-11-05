@@ -17,7 +17,7 @@
 
 //! Exact real admission refusal projected at the existing task-resource boundary.
 use super::memory_admission_failure_to_host;
-use crate::native_fragment_query::{NativeFragmentAdmissionError, NativeFragmentQueryRuntime};
+use crate::native_query_context::{NativeQueryContextRuntime, NativeTaskAdmissionError};
 use novarocks_execution_contract::{TaskFailureCategory, TaskIdentity};
 use novarocks_memory::{AuthorityConfig, CapacityError, MemoryAuthority};
 use novarocks_types::UniqueId;
@@ -33,7 +33,7 @@ fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category()
     config.max_accounts = 1;
     let authority = Arc::new(MemoryAuthority::new(config).unwrap());
     let runtime =
-        NativeFragmentQueryRuntime::new_for_test(QueryContextManager::new_for_test(), authority);
+        NativeQueryContextRuntime::new_for_test(QueryContextManager::new_for_test(), authority);
     let execution =
         QueryExecutionId::new(QueryId::new(97401, 97402), AttemptId::new(1).unwrap()).unwrap();
     let identity = TaskIdentity::new(
@@ -55,7 +55,7 @@ fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category()
         .unwrap();
     assert!(matches!(
         &error,
-        NativeFragmentAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(
+        NativeTaskAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(
             CapacityError::MetadataExhausted { .. }
         ))
     ));
@@ -130,7 +130,7 @@ fn actual_schema_tracker_refusal_is_projected_as_resource_without_text_inference
     use novarocks_execution::exec::pipeline::operator::input_construction::{
         ConstructionFailure, InputConstructionRequestHost, runtime::TrackedInputConstructionHost,
     };
-    use novarocks_execution::runtime::{fragment::ExecutionFailure, mem_tracker::MemTracker};
+    use novarocks_execution::runtime::{mem_tracker::MemTracker, task::ExecutionFailure};
     let tracker = MemTracker::new_root("typed schema limit");
     tracker.install_limit_once(1).unwrap();
     let host = TrackedInputConstructionHost::new(tracker.clone());

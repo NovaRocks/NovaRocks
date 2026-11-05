@@ -23,15 +23,15 @@
 use std::sync::Arc;
 
 use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskOperationId};
+use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskOperationId};
 use novarocks_execution_contract::task_execution::operation::{
-    CreateTaskReceipt, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
+    CreateTaskReceipt, OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
     ReleaseOutcome, UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, SafeDetail, TaskStatus,
 };
-use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_execution_contract::task_execution::transition::ParticipationState;
 
 /// One operation's Worker result. Domain failure carries no acknowledgement.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,39 +126,39 @@ impl<T> OperationReceipt<T> {
     }
 }
 
-/// The acknowledgement body of a context release.
+/// The acknowledgement body of a participation release.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseAcknowledgement {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     release: ReleaseOutcome,
-    state: QueryContextState,
+    state: ParticipationState,
     termination_cause: Option<AbortCause>,
 }
 
 impl ReleaseAcknowledgement {
     pub const fn new(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         release: ReleaseOutcome,
-        state: QueryContextState,
+        state: ParticipationState,
         termination_cause: Option<AbortCause>,
     ) -> Self {
         Self {
-            context,
+            participation,
             release,
             state,
             termination_cause,
         }
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn release(self) -> ReleaseOutcome {
         self.release
     }
 
-    pub const fn state(self) -> QueryContextState {
+    pub const fn state(self) -> ParticipationState {
         self.state
     }
 
@@ -191,12 +191,12 @@ impl TaskDynamicFilterRead {
 }
 
 pub type CreateTaskOutcome = OperationReceipt<CreateTaskReceipt>;
-pub type AdmissionTicketOutcome = OperationReceipt<QueryContextAdmissionTicketReceipt>;
+pub type AdmissionTicketOutcome = OperationReceipt<ParticipationAdmissionTicketReceipt>;
 pub type UpdateTaskOutcome = OperationReceipt<UpdateTaskReceipt>;
-pub type QueryContextOutcome = OperationReceipt<QueryContextReceipt>;
-pub type ReleaseQueryContextOutcome = OperationReceipt<ReleaseAcknowledgement>;
-pub type QuiesceQueryContextOutcome =
-    OperationReceipt<novarocks_execution_contract::QuiesceQueryContextReceipt>;
+pub type ParticipationOutcome = OperationReceipt<ParticipationReceipt>;
+pub type ReleaseParticipationOutcome = OperationReceipt<ReleaseAcknowledgement>;
+pub type QuiesceParticipationOutcome =
+    OperationReceipt<novarocks_execution_contract::QuiesceParticipationReceipt>;
 pub type CancelTaskOutcome = OperationReceipt<TaskStatus>;
 pub type DynamicFilterReadOutcome = OperationReceipt<TaskDynamicFilterRead>;
 pub type FinalTaskInfoOutcome = OperationReceipt<FinalTaskInfo>;

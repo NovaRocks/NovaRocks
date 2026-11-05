@@ -19,7 +19,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use arrow::record_batch::RecordBatch;
 
 enum ComparisonFailure {
@@ -32,10 +32,10 @@ impl From<novarocks_type_contract::ValueTypeError> for ComparisonFailure {
     }
 }
 impl ComparisonFailure {
-    fn into_execution(self) -> crate::runtime::fragment::ExecutionFailure {
+    fn into_execution(self) -> crate::runtime::task::ExecutionFailure {
         match self {
             Self::Creator(cause) => cause.into(),
-            Self::Value(cause) => crate::runtime::fragment::ExecutionFailure::from_domain(cause),
+            Self::Value(cause) => crate::runtime::task::ExecutionFailure::from_domain(cause),
         }
     }
 }
@@ -176,7 +176,7 @@ impl<'a> SortCreation<'a> {
                 cause,
             ) => copy_failure(cause),
             novarocks_functions::selected_copy::RowConversionStructureFailure::ValueType(cause) => {
-                crate::runtime::fragment::ExecutionFailure::from_domain(cause)
+                crate::runtime::task::ExecutionFailure::from_domain(cause)
             }
             novarocks_functions::selected_copy::RowConversionStructureFailure::Unsupported(
                 cause,
@@ -243,11 +243,11 @@ impl<'a> SortCreation<'a> {
                 let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                     actual.typed_binding().clone(),
                 )
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
                 let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                     expected.typed_binding().clone(),
                 )
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
                 let same = actual
                     .fits_physical_binding_observed::<ComparisonFailure>(&expected, || {
                         self.factory
@@ -704,7 +704,7 @@ impl<'a> SortCreation<'a> {
 
 fn copy_failure(
     error: novarocks_functions::selected_copy::CopyConstructionError<ConstructionFailure>,
-) -> crate::runtime::fragment::ExecutionFailure {
+) -> crate::runtime::task::ExecutionFailure {
     use novarocks_functions::selected_copy::CopyConstructionError;
     match error {
         CopyConstructionError::Creator(cause) => cause.into(),
@@ -715,13 +715,13 @@ fn copy_failure(
 
 fn concat_failure(
     error: novarocks_functions::selected_copy::ConcatStructureFailure<ConstructionFailure>,
-) -> crate::runtime::fragment::ExecutionFailure {
+) -> crate::runtime::task::ExecutionFailure {
     match error {
         novarocks_functions::selected_copy::ConcatStructureFailure::Construction(cause) => {
             copy_failure(cause)
         }
         novarocks_functions::selected_copy::ConcatStructureFailure::ValueType(cause) => {
-            crate::runtime::fragment::ExecutionFailure::from_domain(cause)
+            crate::runtime::task::ExecutionFailure::from_domain(cause)
         }
         novarocks_functions::selected_copy::ConcatStructureFailure::Source(cause) => {
             ConstructionFailure::from(cause).into()

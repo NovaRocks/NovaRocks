@@ -23,7 +23,7 @@
 //! production dependency does not enable `test-support`.
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, QueryContextRef, ResultPacketSequence,
+    AcquireParticipationAdmissionTicket, ParticipationRef, ResultPacketSequence,
 };
 use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{
@@ -35,16 +35,16 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::api::{
-    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryResultStream, ResultField,
-    ResultSchema,
+    ExecutionOutput, ExecutionOutputObligation, QueryExecutionError, QueryResultStream,
+    ResultField, ResultSchema,
 };
 use crate::coordination::{
-    AdmissionIssueReceipt, AdmissionIssueSettlement, ContextStandDownSnapshot,
-    LogicalExecutionActor, LogicalExecutionActorConfig, LogicalExecutionActorError,
-    LogicalExecutionActorSnapshot, LogicalExecutionJoinReadiness, LogicalExecutionOutputTransfer,
-    LogicalExecutionRegistration, LogicalExecutionRuntimeRegistry,
-    LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
-    LogicalExecutionRuntimeShutdownError, RunningAttemptPermit,
+    AdmissionIssueReceipt, AdmissionIssueSettlement, LogicalExecutionActor,
+    LogicalExecutionActorConfig, LogicalExecutionActorError, LogicalExecutionActorSnapshot,
+    LogicalExecutionJoinReadiness, LogicalExecutionOutputTransfer, LogicalExecutionRegistration,
+    LogicalExecutionRuntimeRegistry, LogicalExecutionRuntimeRegistryError,
+    LogicalExecutionRuntimeRegistryHandle, LogicalExecutionRuntimeShutdownError,
+    ParticipationStandDownSnapshot, RunningAttemptPermit,
 };
 use novarocks_coordination_contract::AttemptActivationIdentity;
 
@@ -101,7 +101,7 @@ impl ResultStreamTestProducer {
     ) -> Result<
         (
             Self,
-            ExecutionHandle,
+            ExecutionOutputObligation,
             LocalResourceAuthority,
             TestResultDeliveryReceipt,
         ),
@@ -134,7 +134,7 @@ impl ResultStreamTestProducer {
     ) -> Result<
         (
             Self,
-            ExecutionHandle,
+            ExecutionOutputObligation,
             LocalResourceAuthority,
             TestResultDeliveryReceipt,
         ),
@@ -172,7 +172,7 @@ impl ResultStreamTestProducer {
             carrier,
             delivery_capacity,
         )?;
-        let handle = ExecutionHandle::new(
+        let obligation = ExecutionOutputObligation::new(
             root.owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),
         );
@@ -187,7 +187,7 @@ impl ResultStreamTestProducer {
                 window,
                 capacity,
             },
-            handle,
+            obligation,
             resources,
             TestResultDeliveryReceipt(schema_receipt),
         ))
@@ -474,12 +474,12 @@ impl LogicalExecutionTestHarness {
         runtime: Handle,
         config: LogicalExecutionActorConfig,
         initial_execution: novarocks_types::QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> Result<Self, LogicalExecutionRuntimeRegistryError> {
         let registry_owner = LogicalExecutionRuntimeRegistry::new(runtime);
         let registry = registry_owner.handle();
         let (registration, initial, output) = registry
-            .reserve(initial_execution, contexts)?
+            .reserve(initial_execution, participations)?
             .spawn_and_install(config)?
             .into_parts();
         let actor = registry.actor(&registration)?;
@@ -506,13 +506,13 @@ impl LogicalExecutionTestHarness {
         clock: std::sync::Arc<dyn novarocks_coordination_contract::MonotonicClock>,
         budgets: crate::api::ComputationObservationBudgets,
         initial_execution: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> Result<Self, LogicalExecutionRuntimeRegistryError> {
         let config = config
             .with_internal_computation(description, delivery_capacity)?
             .with_clock(clock)
             .with_internal_observation_budgets(budgets);
-        Self::install(runtime, config, initial_execution, contexts)
+        Self::install(runtime, config, initial_execution, participations)
     }
 
     /// Exposes the original effect-free recovery configuration only to the
@@ -522,7 +522,7 @@ impl LogicalExecutionTestHarness {
     pub fn internal_pre_visibility_recovery_config(
         initial_execution: QueryExecutionId,
         mailbox_capacity: std::num::NonZeroUsize,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
         max_admission_issues: std::num::NonZeroUsize,
         max_establish_authorizations: std::num::NonZeroUsize,
         max_attempts: std::num::NonZeroU32,
@@ -534,7 +534,7 @@ impl LogicalExecutionTestHarness {
         LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
             initial_execution,
             mailbox_capacity,
-            contexts,
+            participations,
             max_admission_issues,
             max_establish_authorizations,
             max_attempts,
@@ -553,7 +553,7 @@ impl LogicalExecutionTestHarness {
         &mut self,
         failure: novarocks_coordination_contract::AttemptFailureClass,
         successor: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> Result<AttemptActivationIdentity, LogicalExecutionActorError> {
         let running = self
             .running
@@ -561,7 +561,7 @@ impl LogicalExecutionTestHarness {
             .ok_or(LogicalExecutionActorError::WrongPhase)?;
         let qualification = self
             .actor()
-            .begin_replacement(running, failure, successor, contexts)
+            .begin_replacement(running, failure, successor, participations)
             .await?;
         let initial = self.actor().activate_replacement(qualification).await?;
         let running = self.actor().activate(initial.ready()).await?;
@@ -573,12 +573,12 @@ impl LogicalExecutionTestHarness {
     /// Replays the fixture's original accepted admission and Establish facts
     /// through the real actor-owned permit/transport/Worker-settlement path.
     /// The caller supplies the already-observed operation identities and ACKs;
-    /// this helper never clears required contexts or writes a ledger state.
+    /// this helper never clears required participations or writes a ledger state.
     pub async fn settle_original_applied_establish(
         &self,
-        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        admission_request: novarocks_execution_contract::AcquireParticipationAdmissionTicket,
         admission_settlement: crate::coordination::AdmissionIssueSettlement,
-        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishParticipation>,
         establish_ack_operation: novarocks_execution_contract::TaskOperationId,
         establish_outcome: novarocks_execution_contract::OperationOutcome,
     ) -> Result<(), LogicalExecutionActorError> {
@@ -596,8 +596,8 @@ impl LogicalExecutionTestHarness {
     /// reservation. Reuse that exact grant without issuing admission twice.
     pub async fn settle_original_qualified_establish(
         &self,
-        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
-        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        admission_request: novarocks_execution_contract::AcquireParticipationAdmissionTicket,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishParticipation>,
         establish_ack_operation: novarocks_execution_contract::TaskOperationId,
         establish_outcome: novarocks_execution_contract::OperationOutcome,
     ) -> Result<(), LogicalExecutionActorError> {
@@ -613,9 +613,9 @@ impl LogicalExecutionTestHarness {
 
     async fn settle_original_establish(
         &self,
-        admission_request: novarocks_execution_contract::AcquireQueryContextAdmissionTicket,
+        admission_request: novarocks_execution_contract::AcquireParticipationAdmissionTicket,
         admission_settlement: Option<crate::coordination::AdmissionIssueSettlement>,
-        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishQueryContext>,
+        establish_request: std::sync::Arc<novarocks_execution_contract::EstablishParticipation>,
         establish_ack_operation: novarocks_execution_contract::TaskOperationId,
         establish_outcome: novarocks_execution_contract::OperationOutcome,
     ) -> Result<(), LogicalExecutionActorError> {
@@ -641,7 +641,7 @@ impl LogicalExecutionTestHarness {
             }
         }
         if establish_request.envelope().operation_id() != establish_ack_operation
-            || establish_request.context() != admission_request.context()
+            || establish_request.participation() != admission_request.participation()
             || !matches!(
                 establish_outcome,
                 novarocks_execution_contract::OperationOutcome::Accepted
@@ -681,7 +681,7 @@ impl LogicalExecutionTestHarness {
         // Actor mailbox roundtrip is an observation/barrier, never a direct
         // assignment to the Establish ledger or the Ready state.
         self.actor()
-            .establish_snapshot(admission_request.context())
+            .establish_snapshot(admission_request.participation())
             .await?;
         Ok(())
     }
@@ -916,7 +916,7 @@ impl LogicalExecutionTestHarness {
     /// abandons the running permit so the actor must supervise stand-down.
     pub async fn begin_admission_issue_and_abandon(
         &mut self,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
     ) -> Result<(AttemptActivationIdentity, AdmissionIssueReceipt), LogicalExecutionActorError>
     {
         let running = self
@@ -950,9 +950,9 @@ impl LogicalExecutionTestHarness {
 
     pub async fn stand_down_snapshot(
         &self,
-        context: QueryContextRef,
-    ) -> Result<Option<ContextStandDownSnapshot>, LogicalExecutionActorError> {
-        self.actor().stand_down_snapshot(context).await
+        participation: ParticipationRef,
+    ) -> Result<Option<ParticipationStandDownSnapshot>, LogicalExecutionActorError> {
+        self.actor().stand_down_snapshot(participation).await
     }
 
     pub async fn actor_snapshot(
@@ -963,10 +963,10 @@ impl LogicalExecutionTestHarness {
 
     pub async fn establish_snapshot(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<Option<crate::coordination::EstablishIssueSnapshot>, LogicalExecutionActorError>
     {
-        self.actor().establish_snapshot(context).await
+        self.actor().establish_snapshot(participation).await
     }
 
     pub async fn join_readiness(
@@ -975,21 +975,21 @@ impl LogicalExecutionTestHarness {
         self.registry.join_readiness(self.registration()).await
     }
 
-    pub async fn observe_worker_stopped_and_context_fenced(
+    pub async fn observe_worker_stopped_and_participation_fenced(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         self.registry
-            .observe_worker_stopped_and_context_fenced(self.registration(), context)
+            .observe_worker_stopped_and_participation_fenced(self.registration(), participation)
             .await
     }
 
     pub async fn observe_worker_process_replaced(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         self.registry
-            .observe_worker_process_replaced(self.registration(), context)
+            .observe_worker_process_replaced(self.registration(), participation)
             .await
     }
 

@@ -91,7 +91,7 @@ ORDER BY p.k1;
 
 -- query 14
 -- @skip_result_check=true
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_not_contains=RuntimeFilterDormancy:
 -- @result_contains=ConnectorWholeFilesPruned=1
 -- @result_contains=TypedConnectorPageSourcesOpened=2

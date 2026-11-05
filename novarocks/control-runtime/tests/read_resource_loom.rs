@@ -28,7 +28,7 @@ use loom::{
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyPhase, ExitObligation},
     read_resource::{ReadResourceError, ReadResourceStore},
     reported_work::ReportedWork,
     transaction::{RuntimeLedger, ScopeHandle},
@@ -60,8 +60,8 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     report: ReportSlot,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
 }
 fn fixture() -> Fixture {
     let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
@@ -101,19 +101,19 @@ fn fixture() -> Fixture {
         ],
     )
     .unwrap();
-    let (role, authority) =
-        ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+    let (exit_custody, authority) =
+        ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
     Fixture {
         ledger,
         scope,
         report,
-        role,
+        exit_custody,
         authority: Some(authority),
     }
 }
 fn assert_original_unexited(f: &Fixture) {
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
-    assert!(!f.role.body_exited() && !f.role.captures_exited());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
+    assert!(!f.exit_custody.body_exited() && !f.exit_custody.captures_exited());
     assert_eq!(f.ledger.used(dimension()), 1);
     for consumer in [1, 2] {
         assert_eq!(
@@ -124,18 +124,18 @@ fn assert_original_unexited(f: &Fixture) {
         );
     }
 }
-fn finish(f: Fixture, authority: ExitAuthority) {
+fn finish(f: Fixture, authority: ExitObligation) {
     // Only the actual caller supplies this original positive exit. Neither a
     // released row pin nor a successful take can sign it on the caller's behalf.
     assert_original_unexited(&f);
     authority.exited().unwrap();
-    assert_eq!(f.role.phase(), ExitRolePhase::Exited);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Exited);
     assert_eq!(f.ledger.used(dimension()), 1);
     f.report.consume(ConsumerId::new(1).unwrap()).unwrap();
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     f.report.consume(ConsumerId::new(2).unwrap()).unwrap();
-    assert!(f.role.try_retire().unwrap());
+    assert!(f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 0);
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
     f.scope.close_external().unwrap();

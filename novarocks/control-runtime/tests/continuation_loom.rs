@@ -311,7 +311,7 @@ fn dropping_registration_authority_and_actual_unused_exit_are_separate_observati
         );
         let revoke = thread::spawn(move || drop(token));
         let exiting = slot.clone();
-        let exit = thread::spawn(move || exiting.unused_role_exited());
+        let exit = thread::spawn(move || exiting.unused_holder_exited());
         revoke.join().unwrap();
         match exit.join().unwrap() {
             Ok(InvocationResult::Exited) => (),
@@ -319,7 +319,10 @@ fn dropping_registration_authority_and_actual_unused_exit_are_separate_observati
                 assert!(!slot.body_exited());
                 assert!(!slot.captures_exited());
                 assert!(!slot.try_retire().unwrap());
-                assert_eq!(slot.unused_role_exited().unwrap(), InvocationResult::Exited);
+                assert_eq!(
+                    slot.unused_holder_exited().unwrap(),
+                    InvocationResult::Exited
+                );
             }
             other => panic!("unexpected role observation: {other:?}"),
         }

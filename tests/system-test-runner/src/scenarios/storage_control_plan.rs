@@ -24,7 +24,7 @@ use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
-use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -65,7 +65,7 @@ pub(super) struct Inputs {
 pub(super) struct QueryIntent {
     pub run_token: &'static str,
     pub sql: String,
-    pub lease_markers: bool,
+    pub task_protocol_markers: bool,
 }
 
 pub(super) fn held_sql(catalog: &str, database: &str, table: &str) -> String {
@@ -110,10 +110,16 @@ pub(super) fn plan(
             !query.sql.is_empty() && tokens.insert(query.run_token),
             "Storage query targets must be finite and unique"
         );
-        for action in if query.lease_markers {
-            &["reader-marker", "grpc-fragment"][..]
+        const READER_ACTIONS: &[&str] =
+            &[novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str()];
+        const LEASE_ACTIONS: &[&str] = &[
+            novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(),
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+        ];
+        for action in if query.task_protocol_markers {
+            LEASE_ACTIONS
         } else {
-            &["reader-marker"][..]
+            READER_ACTIONS
         } {
             for index in 0..cluster_size {
                 fe_grants.push(DomainGrant { domain:"native-observation".into(),grant_id:format!("{}-bind-{action}-{index}",query.run_token),
@@ -526,7 +532,7 @@ fn check_acquisition_failure(
         "Storage statement lost its acquisition cause: {snapshot:?}"
     );
     ensure!(
-        snapshot.worker_contexts_converged,
+        snapshot.worker_participations_converged,
         "Storage failure was not an original converged attempt: {snapshot:?}"
     );
     let Some(QueryLifecycleFailureSite::Task { identity, phase }) = &snapshot.failure_site else {
@@ -1096,7 +1102,7 @@ mod tests {
             &[QueryIntent {
                 run_token: REFRESH_HELD_TOKEN,
                 sql: sql.clone(),
-                lease_markers: true,
+                task_protocol_markers: true,
             }],
         )
         .unwrap();
@@ -1112,10 +1118,20 @@ mod tests {
                 .filter(|grant| grant["action"] == action)
                 .count()
         };
-        assert_eq!(count("reader-marker"), 3);
-        assert_eq!(count("grpc-fragment"), 3);
+        assert_eq!(
+            count(
+                novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str()
+            ),
+            3
+        );
+        assert_eq!(
+            count(
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str()
+            ),
+            3
+        );
         assert_eq!(count("bind-reader-marker"), 3);
-        assert_eq!(count("bind-grpc-fragment"), 3);
+        assert_eq!(count("bind-task-protocol"), 3);
         assert_eq!(count("close"), 0);
     }
 
@@ -1133,12 +1149,12 @@ mod tests {
                 QueryIntent {
                     run_token: FAULT_READ_TOKEN,
                     sql: "SELECT 1".into(),
-                    lease_markers: false,
+                    task_protocol_markers: false,
                 },
                 QueryIntent {
                     run_token: FAULT_READ_TOKEN,
                     sql: "SELECT 2".into(),
-                    lease_markers: false,
+                    task_protocol_markers: false,
                 },
             ],
         );

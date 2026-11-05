@@ -17,10 +17,10 @@
 
 //! Pure domain facts. Confidential content remains in driver custody.
 use novarocks_execution_contract::{
-    ContentFingerprint, CredentialEpoch, CredentialLeaseId, DomainConflict, DomainProgression,
-    DomainVersion, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeId, PlanNodeId,
-    PlanNodeSplitReceipt, QueryContextDomainReceipt, SplitOffer, SplitSequence, SplitWatermark,
-    TaskDomainReceipt, TaskIdentity,
+    ContentFingerprint, CredentialDomainId, CredentialEpoch, DomainConflict, DomainProgression,
+    DomainVersion, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeId, ParticipationDomainReceipt,
+    PlanNodeId, PlanNodeSplitReceipt, SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt,
+    TaskIdentity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 /// Accepted state for a scalar-versioned Worker domain.
@@ -375,7 +375,7 @@ impl TaskDomains {
     }
     /// Frozen descriptor sets transfer into the actor in constant time. Their
     /// structural decoding, duplicate checks and resource charge precede this
-    /// handoff; no initial metadata traversal is hidden in ContextCore.
+    /// handoff; no initial metadata traversal is hidden in ParticipationCore.
     pub fn from_frozen_shape(
         split_members: BTreeSet<PlanNodeId>,
         members: BTreeSet<ExchangeEdgeId>,
@@ -503,7 +503,7 @@ impl TaskDomains {
 /// credential owner. The pure core never hashes or retains secret material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CredentialInput {
-    pub lease: CredentialLeaseId,
+    pub credential_domain_id: CredentialDomainId,
     pub epoch: CredentialEpoch,
     pub current_resource: u64,
     pub replacement_resource: u64,
@@ -511,13 +511,15 @@ pub struct CredentialInput {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CredentialState {
-    pub lease: CredentialLeaseId,
+    pub credential_domain_id: CredentialDomainId,
     pub epoch: CredentialEpoch,
     pub resource: u64,
 }
 impl CredentialState {
     pub fn classify(self, update: CredentialInput) -> DomainProgression {
-        if update.lease != self.lease || update.current_resource != self.resource {
+        if update.credential_domain_id != self.credential_domain_id
+            || update.current_resource != self.resource
+        {
             return DomainProgression::Conflict(DomainConflict::UnknownMember);
         }
         if update.epoch == self.epoch {
@@ -538,7 +540,7 @@ impl CredentialState {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContextDomainInput {
+pub enum ParticipationDomainInput {
     Catalog {
         version: DomainVersion,
         fingerprint: ContentFingerprint,
@@ -550,12 +552,12 @@ pub enum ContextDomainInput {
     Credential(CredentialInput),
 }
 #[derive(Clone, Debug, Default)]
-pub struct QueryContextDomains {
+pub struct ParticipationDomains {
     catalog: ScalarDomain,
     shared_filter: ScalarDomain,
     credential: Option<CredentialState>,
 }
-impl QueryContextDomains {
+impl ParticipationDomains {
     pub const fn credential(&self) -> Option<CredentialState> {
         self.credential
     }
@@ -570,17 +572,17 @@ impl QueryContextDomains {
             credential: Some(credential),
         }
     }
-    pub fn classify(&self, input: ContextDomainInput) -> DomainProgression {
+    pub fn classify(&self, input: ParticipationDomainInput) -> DomainProgression {
         match input {
-            ContextDomainInput::Catalog {
+            ParticipationDomainInput::Catalog {
                 version,
                 fingerprint,
             } => self.catalog.classify(version, fingerprint),
-            ContextDomainInput::Filter {
+            ParticipationDomainInput::Filter {
                 version,
                 fingerprint,
             } => self.shared_filter.classify(version, fingerprint),
-            ContextDomainInput::Credential(input) => self.credential.map_or(
+            ParticipationDomainInput::Credential(input) => self.credential.map_or(
                 DomainProgression::Conflict(DomainConflict::UnknownMember),
                 |current| current.classify(input),
             ),
@@ -588,7 +590,7 @@ impl QueryContextDomains {
     }
     pub fn apply(
         &mut self,
-        input: ContextDomainInput,
+        input: ParticipationDomainInput,
     ) -> Result<DomainProgression, DomainConflict> {
         let progression = self.classify(input);
         if let DomainProgression::Conflict(c) = progression {
@@ -596,17 +598,17 @@ impl QueryContextDomains {
         }
         if progression == DomainProgression::Apply {
             match input {
-                ContextDomainInput::Catalog {
+                ParticipationDomainInput::Catalog {
                     version,
                     fingerprint,
                 } => self.catalog = self.catalog.apply(version, fingerprint),
-                ContextDomainInput::Filter {
+                ParticipationDomainInput::Filter {
                     version,
                     fingerprint,
                 } => self.shared_filter = self.shared_filter.apply(version, fingerprint),
-                ContextDomainInput::Credential(input) => {
+                ParticipationDomainInput::Credential(input) => {
                     self.credential = Some(CredentialState {
-                        lease: input.lease,
+                        credential_domain_id: input.credential_domain_id,
                         epoch: input.epoch,
                         resource: input.replacement_resource,
                     })
@@ -617,20 +619,24 @@ impl QueryContextDomains {
     }
     pub fn receipt(
         &self,
-        input: ContextDomainInput,
+        input: ParticipationDomainInput,
         progression: DomainProgression,
-    ) -> QueryContextDomainReceipt {
+    ) -> ParticipationDomainReceipt {
         match input {
-            ContextDomainInput::Catalog { .. } => QueryContextDomainReceipt::CatalogBinding {
-                accepted_version: self.catalog.accepted_version(),
-                progression,
-            },
-            ContextDomainInput::Filter { .. } => QueryContextDomainReceipt::SharedDynamicFilter {
-                accepted_version: self.shared_filter.accepted_version(),
-                progression,
-            },
-            ContextDomainInput::Credential(input) => QueryContextDomainReceipt::Credential {
-                lease_id: input.lease,
+            ParticipationDomainInput::Catalog { .. } => {
+                ParticipationDomainReceipt::CatalogBinding {
+                    accepted_version: self.catalog.accepted_version(),
+                    progression,
+                }
+            }
+            ParticipationDomainInput::Filter { .. } => {
+                ParticipationDomainReceipt::SharedDynamicFilter {
+                    accepted_version: self.shared_filter.accepted_version(),
+                    progression,
+                }
+            }
+            ParticipationDomainInput::Credential(input) => ParticipationDomainReceipt::Credential {
+                credential_domain_id: input.credential_domain_id,
                 accepted_epoch: self.credential.map_or(input.epoch, |c| c.epoch),
                 progression,
             },
@@ -642,7 +648,7 @@ impl QueryContextDomains {
 /// behind it until its host result commits or its journal rolls back.
 /// The journal owns only unpublished speculative tokens of this request. It
 /// never rewinds a previously committed request. Partially executed host work
-/// keeps its original WorkLease and Task cleanup obligations after rollback;
+/// keeps its original WorkObligation and Task cleanup obligations after rollback;
 /// restoring pure tokens is not evidence of host exit or physical convergence.
 #[derive(Debug)]
 pub struct TaskDomainTransaction {
@@ -956,12 +962,12 @@ mod tests {
     #[test]
     fn credential_equality_is_bound_to_the_exact_installed_resource() {
         let state = CredentialState {
-            lease: CredentialLeaseId::new(3),
+            credential_domain_id: CredentialDomainId::new(3),
             epoch: CredentialEpoch::FIRST,
             resource: 7,
         };
         let input = CredentialInput {
-            lease: state.lease,
+            credential_domain_id: state.credential_domain_id,
             epoch: state.epoch,
             current_resource: 7,
             replacement_resource: 8,

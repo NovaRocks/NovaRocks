@@ -428,7 +428,7 @@ impl Fixture {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let original_io = FileIO::new_with_fs();
         // Retired manifests use the production writer's close metadata. Keep

@@ -21,7 +21,7 @@
 //! only the actual physical-tail event which invokes `capacity_returned`.
 
 use super::actors::WorkerActor;
-use novarocks_control_runtime::driver::{ActorRegistration, ActorRuntime, DriverError};
+use novarocks_control_runtime::actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError};
 use novarocks_control_runtime_core::{
     identity::ActorId,
     scheduler::{ReadyQueue, SchedulerError},
@@ -40,7 +40,7 @@ pub(crate) enum TaskCapacityError {
     WrongOwner,
     ForeignRegistration,
     FutureRevision,
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Queue(SchedulerError),
 }
 impl std::fmt::Display for TaskCapacityError {
@@ -51,7 +51,7 @@ impl std::fmt::Display for TaskCapacityError {
                 f.write_str("Task capacity waiter has a foreign registration")
             }
             Self::FutureRevision => f.write_str("Task capacity waiter refers to a future revision"),
-            Self::Driver(error) => write!(f, "Task capacity notification failed: {error}"),
+            Self::ActorTurn(error) => write!(f, "Task capacity notification failed: {error}"),
             Self::Queue(error) => write!(f, "Task capacity waiter queue failed: {error:?}"),
         }
     }
@@ -59,7 +59,7 @@ impl std::fmt::Display for TaskCapacityError {
 impl std::error::Error for TaskCapacityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             // SchedulerError is a closed neutral leaf without an Error impl.
             Self::Queue(_)
             | Self::WrongOwner
@@ -99,7 +99,7 @@ impl TaskCapacitySignal {
     ) -> Result<Self, TaskCapacityError> {
         runtime
             .validate_registration(&root)
-            .map_err(TaskCapacityError::Driver)?;
+            .map_err(TaskCapacityError::ActorTurn)?;
         Ok(Self(Arc::new(Shared {
             runtime,
             root,
@@ -138,11 +138,11 @@ impl TaskCapacitySignal {
         self.0
             .runtime
             .validate_registration(&self.0.root)
-            .map_err(TaskCapacityError::Driver)?;
+            .map_err(TaskCapacityError::ActorTurn)?;
         self.0
             .runtime
             .validate_registration(registration)
-            .map_err(TaskCapacityError::Driver)?;
+            .map_err(TaskCapacityError::ActorTurn)?;
         if registration.same_registration(&self.0.root) {
             return Err(TaskCapacityError::WrongOwner);
         }
@@ -184,7 +184,7 @@ impl TaskCapacitySignal {
             self.0
                 .runtime
                 .notify_host_actor(&self.0.root)
-                .map_err(TaskCapacityError::Driver)?;
+                .map_err(TaskCapacityError::ActorTurn)?;
         }
         Ok(())
     }
@@ -230,7 +230,8 @@ impl TaskCapacitySignal {
             })
             .unwrap_or_else(|_| std::process::abort());
         match self.0.runtime.notify_host_actor(&self.0.root) {
-            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+            Ok(())
+            | Err(ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch) => {}
             Err(_) => std::process::abort(),
         }
     }
@@ -248,7 +249,7 @@ impl TaskCapacitySignal {
         self.0
             .runtime
             .validate_registration(&self.0.root)
-            .map_err(TaskCapacityError::Driver)?;
+            .map_err(TaskCapacityError::ActorTurn)?;
         let mut state = self
             .0
             .waiters
@@ -273,14 +274,16 @@ impl TaskCapacitySignal {
             let original = state
                 .original
                 .get(&actor)
-                .expect("queued original Context registration");
+                .expect("queued original Participation registration");
             if original.before < revision {
                 // Keep the metadata lock through this fixed Common mark. A
                 // concurrent Busy registration cannot coalesce into the old
                 // row after the mark and then be accidentally removed with it.
                 match self.0.runtime.notify_host_actor(&original.registration) {
                     Ok(())
-                    | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {
+                    | Err(
+                        ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch,
+                    ) => {
                         state
                             .fifo
                             .unregister_claimed(actor)
@@ -294,7 +297,7 @@ impl TaskCapacitySignal {
                             .release(actor, true)
                             .map_err(TaskCapacityError::Queue)?;
                         state.rescan = true;
-                        return Err(TaskCapacityError::Driver(error));
+                        return Err(TaskCapacityError::ActorTurn(error));
                     }
                 }
             } else {

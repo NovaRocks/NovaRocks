@@ -124,6 +124,15 @@ SQL client
    - User interaction and design docs: Chinese
    - Code comments, logs, error messages, commit messages: English
 
+8. **执行与句柄词汇**
+   遵循 [ADR-0216](docs/adr/ADR-0216-execution-vocabulary-participation-task-and-handles.md)：
+   Participation 指协议参与，QueryContext 只指查询资源上下文；Task 只指协议 task，
+   plan fragment 与 commit fragment 保留。execution、worker、control-runtime 中的 driver
+   只指 pipeline driver，调度单元为 DriverRunner。Lease 只用于限时、可续约的授予；
+   Role 不用于义务；Handle 只用于惰性引用。两类必须消费的义务均以 Obligation 结尾，
+   没有 Drop 的类型也不例外，文档须说明是否受检。测试消费的日志标记须先在
+   `novarocks/failpoint/src/observation_marker.rs` 注册，生产方与 Rust 消费方共用常量。
+
 ---
 
 ## 4. Key Code Index (Validated Against Current Repository)
@@ -152,7 +161,7 @@ SQL client
   structurally cannot own durable state (ADR-0114).
 
 - `novarocks/worker/src/**` and `novarocks/native-adapter/src/**`
-  Worker owns BE-local Task/context admission, lifecycle, leases, convergence
+  Worker owns BE-local Task/Participation admission, lifecycle, leases, convergence
   and connector execution policy. Native Adapter owns generated stubs/codec,
   listener composition, data-plane handlers and role-local wire projection.
   Keep generated DTO decode at the adapter boundary; do not move it into
@@ -272,7 +281,7 @@ SQL client
   Rust `plan` 模块仍存在不代表存在 v1 decoder。
 
 - `novarocks/task-codec/src/{creation.rs,resource_preflight.rs}` 与
-  `novarocks/native-adapter/src/{task_protocol_ingress.rs,static_package_admission.rs}`
+  `novarocks/native-adapter/src/{task_protocol.rs,static_package_admission.rs}`
   在 Task 接管之前约束载体资源，准确保留 replay/identity 与 Worker 的 charge 所有权。
   接管后的 package 语义解码和局部编译仍由 BE preparation 执行。
 
@@ -340,15 +349,15 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/exec/pipeline/builder/compiled.rs`
   从 `LocalProgram` 和本 Task 准确绑定的能力建立 pipeline；`builder.rs` 拥有共享图值。
-  `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/fragment`。
+  `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/task`。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
   生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
-  绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/FragmentCompletion，
+  绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/DriverGroupCompletion，
   不等待 Task terminal，也不从请求 profile 猜贡献者数量。program 与 Task 能力分别传入，
   不能重建已删除的 construction plan bridge。
 
-- `novarocks/execution/src/runtime/fragment/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
+- `novarocks/execution/src/runtime/task/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
   Router 按原 static branch 绑定 provider route 与独立 summary，表达式 root 保留原 branch 身份。
   writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
   WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
@@ -380,7 +389,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   接收 registry、原队列与结构 slot owner。唯一解码资格、提交、真实移交和退休由同一实例串行化；
   roster 与原 Task failure owner 在 Installed 前冻结，slot 只数单元，不是内存容量。
 
-- `novarocks/execution/src/runtime/fragment/io/**`
+- `novarocks/execution/src/runtime/task/io/**`
   `exchange_edge.rs` 拥有 Installed/正常撤回门；`exchange_sender_group.rs` 将同一 factory 的
   drivers 接到逐流 `exchange_stream_sender.rs`，留存与实际 RPC 活动分开。driver 单 payload
   和待授予位置决定输入背压；进程活动额度只在授予后取得。`exchange_retained_payload.rs`
@@ -392,7 +401,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   records actual Unit/End handoff, and observes sender completion without an
   input idle deadline.
 
-- `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
+- `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,exchange_grant_subscription.rs}`
   Native 三方法的线路投影与传输，准确路由始终由 Worker `with_claimed_stream` 作者准入。
 
 - `novarocks/native-adapter/src/backend_metrics.rs`
@@ -419,7 +428,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/memory/src/membership.rs` owns direct account members used by
   lifecycle/control traversal; membership is not stored in allocation tails.
 - `novarocks/memory/src/attribution/**` owns the 512 B size band, 8 B tail,
-  destructor-free one-slot TLS (Q=1 MiB), synchronous `LaneHandle::run`,
+  destructor-free one-slot TLS (Q=1 MiB), synchronous `Lane::run`,
   per-poll `AttributedFuture` and R1 `ExplicitOwner` helpers. Observation grants
   no capacity; publish one fact per actual block, never both manually and through
   wrapper/helper. R1 zero-sized requests publish no physical fact.
@@ -463,7 +472,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `commit/write_stack/` 冻结完整目标 schema，`commit/frozen_write.rs` 投影 SDK writer schema，
   `commit/write_adaptation.rs` 适配执行输入；Variant/uuid 数据写出准入与逻辑 Variant 读取分别属于 Provider。
   CREATE / ALTER ADD 在所有格式版本递归拒绝新 Variant 列；已有表的 DELETE、合法普通键 equality delete、
-  TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 lease 做 Provider 纯准入，再执行原 MV / DROP 保护。
+  TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 generation pin 做 Provider 纯准入，再执行原 MV / DROP 保护。
 
   Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。
@@ -509,7 +518,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    请求未知则保原项重放，custody 与实际 RPC/Bytes 退出分别观察。
 2. An exchange edge starts Closed and opens only after every frozen destination
    has an Installed fact or has normally withdrawn its exact input demand
-   (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no frame
+   (`novarocks/execution/src/runtime/task/io/exchange_edge.rs`), so no frame
    can precede the receiver that counts it.
 3. Native 的活动 Exchange 数据路径仅有 `DeliverExchangeUnit`、`RegisterExchangeDemand`、`SubscribeExchangeGrants`。
    旧双向 `Exchange` 保留 Retired 空入口并直接返回 `unimplemented`；`ExchangeUnary` 已删除，旧消息字段永久 reserved。
@@ -521,7 +530,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    EOS; early withdrawal remains Withdrawn. MustDrain inputs cannot use ordinary
    demand withdrawal to authorize success or normal retirement. Pre-success
    validation, settled conclusion and the retirement re-read remain distinct.
-5. On cancellation, `exchange::cancel_fragment` / `cancel_exchange_key` clear
+5. On cancellation, `exchange::cancel_task` / `cancel_exchange_key` clear
    exchange keys and wake blocked waiters.
 
 ### 5.3 Native Distributed Task Execution Path
@@ -531,8 +540,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    续接原凭据与 attempt 责任。`native_execution_adapter.rs` 从一个实际 backend snapshot 冻结
    Task graph；`novarocks/frontend-application/src/task_execution/graph.rs` mints a `TaskIdentity`
    ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
-   `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
-   per participating backend. A context exists only where the scheduler placed
+   `ParticipationRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
+   per participating backend. A participation exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
    `coordination/schedule.rs` 消费显式 Singleton/ScanWork/Spread/FollowSources policy，
@@ -544,9 +553,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
    结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
    ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
-   `execute_round_on_task_protocol` establishes every context and creates every
+   `execute_round_on_task_protocol` establishes every participation and creates every
    task through a bounded, fair dispatcher
-   (`novarocks/frontend-application/src/task_execution/{round,dispatch,context_owner}.rs`).
+   (`novarocks/frontend-application/src/task_execution/{round,dispatch,participation_owner}.rs`).
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
    Conflict -- and a domain never rolls back, which is why replaying the exact
    request is the prescribed recovery for an unknown outcome and a conflicting
@@ -555,7 +564,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    completed. FE retains a per-backend deployment window W across Accepted or
    unknown RPC outcomes until Installed, terminal evidence or permanent
    stand-down. W must not exceed that exact backend descriptor's advertised
-   per-context preparation positions P.
+   per-participation preparation positions P.
    FE 只发送 compiled package。BE 的 `CompiledPackageInterpreter` 解码并局部编译，
    `NativeTaskExecutionHost` 绑定 Task 能力后准备 compiled pipeline；没有 v1 解码或树构造桥。
    BE 的 typed 能力拒绝沿 `TaskFailureCategory::Unsupported` 与
@@ -566,19 +575,19 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    不把 root seal 当成 source/writer 已完成，也不为普通读新增全参与者成功屏障。
 3. Push exchange edges start Closed and open once every frozen destination has
    an Installed fact or has normally withdrawn its exact input demand
-   (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
+   (`novarocks/execution/src/runtime/task/io/exchange_edge.rs`), so no
    frame can precede the receiver that counts it.
-4. `novarocks/worker-protocol/src/{control,context}.rs` owns pure BE-local
+4. `novarocks/worker-protocol/src/{control,participation}.rs` owns pure BE-local
    admission and lifecycle decisions. `novarocks/worker/src/control_runtime/**`
-   connects the common `control-runtime` driver to original request, Task,
+   connects the common `control-runtime` actor turn to original request, Task,
    preparation and host owners; it replaces the former TaskExecutionRegistry.
    A Task conclusion is first-wins with one refinement: an originating failure
    may replace the derived `Aborted(PeerTaskFailed)` placeholder exactly once.
-   Accepted jobs enter a bounded fair FIFO; count, byte and per-context
+   Accepted jobs enter a bounded fair FIFO; count, byte and per-participation
    preparation-position charges remain until the original preparation job
    actually exits, including after Installed or terminal publication.
-   Converged Contexts retain compact protocol facts through their request
-   horizon, without an execution WorkLease. Contexts, tickets and inbound
+   Converged Participations retain compact protocol facts through their request
+   horizon, without an execution WorkObligation. Participations, tickets and inbound
    normal-close retention have no count/byte admission caps or early eviction.
    Process drain retires retained metadata without waiting for that horizon;
    it still joins every actual request, host action and physical holder.
@@ -586,12 +595,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    nonzero generation (`novarocks/native-adapter/src/task_protocol.rs`);
    cursor-only generation-zero requests are refused.
 5. Runtime-filter contributions and an operator's own counters ride
-   `ReleaseQueryContextAck`: release is the backend's own statement that every
+   `ReleaseParticipationAck`: release is the backend's own statement that every
    local task is a terminal record, and the Frontend Application drives it for every
    intent. The task protocol mints no participant proof or attestation -- a
    task's terminal *is* its own status.
 6. Client cancellation is `KILL QUERY` through the Query Application query-control
-   owner, delivered as `AbortQueryContext`. The Frontend Application withholds the
+   owner, delivered as `AbortParticipation`. The Frontend Application withholds the
    interrupt until this statement's local supervised orchestration exits, so the
    next statement cannot race its generation. This does not require remote
    Unknown publication or residual cleanup to disappear; its stable owner retains
@@ -609,7 +618,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Runtime context for cache and runtime filter behavior.
 
 - `ExchangeKey`: `novarocks/execution/src/runtime/exchange.rs`
-  Exchange routing key (`finst_id_hi` + `finst_id_lo` + `node_id`).
+  Exchange routing key (`task_key_hi` + `task_key_lo` + `node_id`).
 
 - `QueryResult`: `novarocks/query-application/src/api/result.rs`
   Query-application result type consumed by the MySQL adapter's result encoding.
@@ -617,7 +626,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `QueryExecutionId`: `novarocks/types/src/identity.rs`
   Immutable native query-attempt identity, shared across the process boundary.
 
-- `TaskIdentity` / `QueryContextRef`:
+- `TaskIdentity` / `ParticipationRef`:
   `novarocks/execution-contract/src/identity.rs`
   The indivisible {QueryExecutionId, StageId, TaskId, BackendProcessId} a task
   is addressed by, and the {QueryExecutionId, FrontendProcessId,
@@ -1111,9 +1120,9 @@ suspected case against a clean server before attributing it to the change.
   `exec/operators/**`；`exec/node/**` 仍有共享值类型和运行能力，不能当旧树整片删除。
 - **Scheduling/parallelism**: inspect `novarocks/execution/src/exec/pipeline/**`.
 - **Exchange behavior**: inspect `novarocks/execution/src/runtime/exchange.rs`,
-  `novarocks/execution/src/runtime/fragment/io/**`,
+  `novarocks/execution/src/runtime/task/io/**`,
   `novarocks/execution/src/exec/operators/exchange_source.rs`, and
-  `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,fragment_exchange_receiver}.rs`.
+  `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,exchange_grant_subscription}.rs`.
 - **Statistics collection/publication**: inspect
   `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`,
   `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
@@ -1133,7 +1142,7 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/frontend-application/src/task_execution/**`,
   `novarocks/worker-protocol/src/**`, `novarocks/worker/src/control_runtime/**`,
   `novarocks/control-runtime{,-core}/src/**`,
-  `novarocks/native-adapter/src/{backend_application,task_protocol_ingress}.rs`, and
+  `novarocks/native-adapter/src/{backend_application,task_protocol}.rs`, and
   `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
@@ -1182,9 +1191,9 @@ suspected case against a clean server before attributing it to the change.
 
 ---
 
-## 10. StarRocks Reference Code Location
+## 10. Trino Reference Code Location
 
-For StarRocks side-by-side reference implementation, use: `~/project/starrocks`
+主要参照代码：`~/project/trino`。Velox 与 Impala 作为补充参照；StarRocks 仅用于识别历史遗留。
 
 ---
 

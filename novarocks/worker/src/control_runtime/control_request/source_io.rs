@@ -252,7 +252,7 @@ impl ControlRequestCustody {
             if self.ingress_outcome.is_none()
                 && let Err(error) = self.take_establish_ingress()
             {
-                if self.ingress_source_phase() == Some(ExitRolePhase::Unresolved) {
+                if self.ingress_source_phase() == Some(ExitCustodyPhase::Unresolved) {
                     // This existing gate verifies Taken/Unknown and the actual
                     // lost original, without inventing an observed call result.
                     self.submit_ingress_owner_failure()
@@ -267,7 +267,7 @@ impl ControlRequestCustody {
                     Some(EstablishIngressOutcome::Projected(projection)) => {
                         self.submit(ControlInput::Establish {
                             request: projection.operation,
-                            context: projection.context,
+                            participation: projection.participation,
                             ticket: projection.ticket,
                             payload: projection.payload,
                             semantics: projection.semantics,
@@ -286,7 +286,7 @@ impl ControlRequestCustody {
                 }
             }
         }
-        if self.ingress_source_phase() == Some(ExitRolePhase::Unresolved) {
+        if self.ingress_source_phase() == Some(ExitCustodyPhase::Unresolved) {
             // The healthy supervisor's reply can drain independently. This
             // original lost child and its raw captures remain Unknown; no
             // getter retry or guessed disposal can release their responsibility.
@@ -328,7 +328,7 @@ impl ControlRequestCustody {
         }
         if self.pending_disposal.is_none() {
             // These original gates require M's actual loan/call retirement or
-            // a cancelled replay's real Context leg. A reply alone is no proof.
+            // a cancelled replay's real Participation leg. A reply alone is no proof.
             self.pending_disposal = self
                 .take_consumed_creator_disposal()?
                 .or_else(|| self.take_retired_route_disposal());

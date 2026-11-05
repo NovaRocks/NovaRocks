@@ -26,7 +26,7 @@ pub const METRIC_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// and running jobs, independently of active Task and completion limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskPreparationLimits {
-    per_context: usize,
+    per_participation: usize,
     tasks: usize,
     bytes: usize,
     workers: usize,
@@ -34,17 +34,17 @@ pub struct TaskPreparationLimits {
 
 impl TaskPreparationLimits {
     pub fn try_new(
-        per_context: usize,
+        per_participation: usize,
         tasks: usize,
         bytes: usize,
         workers: usize,
     ) -> Result<Self, String> {
-        if per_context == 0 || tasks == 0 || bytes == 0 || workers == 0 {
+        if per_participation == 0 || tasks == 0 || bytes == 0 || workers == 0 {
             return Err("preparation limits must be nonzero".to_owned());
         }
-        if per_context > tasks {
+        if per_participation > tasks {
             return Err(
-                "per-context preparation task limit must not exceed the backend task limit"
+                "per-participation preparation task limit must not exceed the backend task limit"
                     .to_owned(),
             );
         }
@@ -54,14 +54,14 @@ impl TaskPreparationLimits {
             );
         }
         Ok(Self {
-            per_context,
+            per_participation,
             tasks,
             bytes,
             workers,
         })
     }
-    pub const fn per_context(self) -> usize {
-        self.per_context
+    pub const fn per_participation(self) -> usize {
+        self.per_participation
     }
     pub const fn tasks(self) -> usize {
         self.tasks
@@ -77,7 +77,7 @@ impl TaskPreparationLimits {
 impl Default for TaskPreparationLimits {
     fn default() -> Self {
         Self {
-            per_context: 4096,
+            per_participation: 4096,
             tasks: 32768,
             bytes: 256 * 1024 * 1024,
             workers: 4,

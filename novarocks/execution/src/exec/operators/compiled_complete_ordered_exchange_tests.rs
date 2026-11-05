@@ -23,8 +23,8 @@
 use super::*;
 use crate::exec::operators::data_stream_sink::partition_chunk_by_hash_arrays_created;
 use crate::runtime::exchange::{ExchangeColumnBinding, ExchangePopResult, online_unit};
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
-use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
+use crate::runtime::task::io::exchange::test_support::Fixture;
+use crate::runtime::task::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
 use novarocks_types::UniqueId;
 
 pub(super) fn retain_received_buffer(
@@ -102,7 +102,7 @@ pub(super) fn retain_received_buffer(
     );
     let port = fixture.port.clone();
     let key = ExchangeReceiverKey {
-        fragment_instance_id: UniqueId::new(0xc28, 2),
+        task_key: UniqueId::new(0xc28, 2),
         node_id: 7,
     };
     port.register(ExchangeReceiverRegistration {
@@ -115,7 +115,7 @@ pub(super) fn retain_received_buffer(
     })
     .unwrap();
     port.ensure_mem_tracker(key, &tracker).unwrap();
-    let handle = port.receiver_handle(key, 1).unwrap();
+    let receiver_pin = port.receiver_pin(key, 1).unwrap();
     fixture.bind(key, &[source]);
     let stream = fixture.stream(source, destination, key.node_id, 0);
     let mut actual = Vec::new();
@@ -123,8 +123,8 @@ pub(super) fn retain_received_buffer(
     let mut projection = None;
     for (ordinal, part) in parts.iter().enumerate() {
         let payload = online_unit::encode(&recipe, part, sender, control).unwrap();
-        let demand = crate::runtime::fragment::io::exchange_unit::ExchangeUnitDemand {
-            sequence: crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::try_new(
+        let demand = crate::runtime::task::io::exchange_unit::ExchangeUnitDemand {
+            sequence: crate::runtime::task::io::exchange_unit::ExchangeUnitSequence::try_new(
                 u64::try_from(ordinal + 1).unwrap(),
             )
             .unwrap(),
@@ -132,10 +132,10 @@ pub(super) fn retain_received_buffer(
         };
         port.register_unit_demand(
             key,
-            crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry {
+            crate::runtime::task::io::exchange_unit::ExchangeDemandEntry {
                 stream,
                 operation:
-                    crate::runtime::fragment::io::exchange_unit::ExchangeDemandOperation::Register(
+                    crate::runtime::task::io::exchange_unit::ExchangeDemandOperation::Register(
                         demand,
                     ),
             },
@@ -143,12 +143,12 @@ pub(super) fn retain_received_buffer(
         .unwrap();
         port.receive_unit(
             key,
-            crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+            crate::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame {
                 stream,
                 sender_count: 1,
                 sender_id: 0,
                 backend_number: 0,
-                item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::Unit {
+                item: crate::runtime::task::io::exchange_unit::ExchangeUnitItem::Unit {
                     demand,
                     end_after_unit: ordinal + 1 == parts.len(),
                 },
@@ -157,7 +157,7 @@ pub(super) fn retain_received_buffer(
             },
         )
         .unwrap();
-        match handle
+        match receiver_pin
             .try_pop_next_with_stats(1)
             .unwrap()
             .expect("synchronous delivered frame")
@@ -196,7 +196,7 @@ pub(super) fn retain_received_buffer(
         }
     }
     drop(parts);
-    let ExchangePopResult::Finished(stats) = handle
+    let ExchangePopResult::Finished(stats) = receiver_pin
         .try_pop_next_with_stats(1)
         .unwrap()
         .expect("the final Unit carries the real End")
@@ -216,7 +216,7 @@ pub(super) fn retain_received_buffer(
     let retained = retained.unwrap();
     let projection = projection.unwrap();
     port.remove(key);
-    drop(handle);
+    drop(receiver_pin);
     drop(port);
     drop(fixture);
     drop(original);

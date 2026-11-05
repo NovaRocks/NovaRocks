@@ -22,7 +22,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::num::NonZeroUsize;
 
-use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_result_contract::RootProfileV1;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use std::sync::Arc;

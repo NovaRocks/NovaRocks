@@ -22,7 +22,7 @@
 //!
 //!   - the [`ConnectorTableMetadata`] that generation produced (neutral Arrow
 //!     schema, bounded planning facts, opaque table handle);
-//!   - the [`ConnectorControlPlanningLease`] that produced it, retained so the
+//!   - the [`ConnectorControlPlanningPin`] that produced it, retained so the
 //!     write lease derived from it acts on that same generation.
 //!
 //! Core never interprets the opaque handle. Physical write facts a writer
@@ -37,12 +37,11 @@
 //! meaning for an INSERT or a row mutation.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorRowMutationIntent,
+    ConnectorControlPlanningPin, ConnectorRequestContext, ConnectorRowMutationIntent,
     ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
     ConnectorRowMutationPreparationRequest, ConnectorTableColumnRole,
     ConnectorTableColumnVisibility, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWriteTargetRef,
+    ConnectorTableMetadata, ConnectorWrite, ConnectorWriteOperationId, ConnectorWriteTargetRef,
 };
 
 /// One write target, resolved once against a single provider generation.
@@ -51,20 +50,23 @@ use novarocks_spi::connector::{
 /// handle onto an already-resolved generation.
 ///
 /// Deliberately not `Debug`: neither [`ConnectorTableMetadata`] nor
-/// [`ConnectorControlPlanningLease`] is `Debug`, precisely so an opaque
+/// [`ConnectorControlPlanningPin`] is `Debug`, precisely so an opaque
 /// provider handle and a live generation cannot end up in a log line.
 #[derive(Clone)]
 pub struct ConnectorWriteTargetBinding {
     metadata: ConnectorTableMetadata,
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
 }
 
 impl ConnectorWriteTargetBinding {
     pub const fn new(
         metadata: ConnectorTableMetadata,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
     ) -> Self {
-        Self { metadata, lease }
+        Self {
+            metadata,
+            planning_pin,
+        }
     }
 
     /// The exact generation that produced every fact in this binding.
@@ -72,8 +74,8 @@ impl ConnectorWriteTargetBinding {
     /// Write preparation must derive its lease from this one rather than
     /// re-resolving `latest`, otherwise a concurrent commit could split one
     /// statement across two generations.
-    pub const fn lease(&self) -> &ConnectorControlPlanningLease {
-        &self.lease
+    pub const fn planning_pin(&self) -> &ConnectorControlPlanningPin {
+        &self.planning_pin
     }
 
     pub const fn metadata(&self) -> &ConnectorTableMetadata {
@@ -123,8 +125,8 @@ impl ConnectorWriteTargetBinding {
     }
 
     /// Derive the write lease for this statement from the same generation.
-    pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, String> {
-        self.lease
+    pub fn derive_write_lease(&self) -> Result<ConnectorWrite, String> {
+        self.planning_pin
             .derive_write_lease()
             .map_err(|error| error.to_string())
     }
@@ -139,8 +141,8 @@ impl ConnectorWriteTargetBinding {
     pub(crate) fn derive_write_stack_lease(
         &self,
         host: &novarocks_catalog_application::ConnectorControlHost,
-    ) -> Result<novarocks_catalog_application::ConnectorWriteStackLease, String> {
-        derive_write_stack_lease(host, &self.lease)
+    ) -> Result<novarocks_catalog_application::ConnectorWriteStackPin, String> {
+        derive_write_stack_lease(host, &self.planning_pin)
     }
 
     /// Ask the exact generation that resolved this target to sign one row
@@ -151,11 +153,11 @@ impl ConnectorWriteTargetBinding {
         operation_id: ConnectorWriteOperationId,
         intent: ConnectorRowMutationIntent,
         context: ConnectorRequestContext,
-    ) -> Result<(ConnectorWriteLease, ConnectorRowMutationPreparation), String> {
-        let lease = self
+    ) -> Result<(ConnectorWrite, ConnectorRowMutationPreparation), String> {
+        let connector_write = self
             .derive_write_lease()
             .map_err(|error| format!("derive connector row-mutation write lease: {error}"))?;
-        let preparation = match lease
+        let preparation = match connector_write
             .prepare_row_mutation(ConnectorRowMutationPreparationRequest {
                 operation_id,
                 table: self.handle().clone(),
@@ -172,7 +174,7 @@ impl ConnectorWriteTargetBinding {
                 return Err(format!("connector row-mutation admission denied: {error}"));
             }
         };
-        Ok((lease, preparation))
+        Ok((connector_write, preparation))
     }
 }
 
@@ -185,9 +187,9 @@ impl ConnectorWriteTargetBinding {
 /// happens to be active at commit time.
 pub(crate) fn derive_write_stack_lease(
     host: &novarocks_catalog_application::ConnectorControlHost,
-    planning_lease: &ConnectorControlPlanningLease,
-) -> Result<novarocks_catalog_application::ConnectorWriteStackLease, String> {
-    host.acquire_exact_write_stack(planning_lease.control_runtime_id())
+    planning_pin: &ConnectorControlPlanningPin,
+) -> Result<novarocks_catalog_application::ConnectorWriteStackPin, String> {
+    host.acquire_exact_write_stack(planning_pin.control_runtime_id())
         .map_err(|error| format!("derive connector write-stack lease: {error}"))
 }
 

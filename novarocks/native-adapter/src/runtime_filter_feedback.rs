@@ -263,7 +263,10 @@ fn emit_advertised_marker(
     if !controls.owns_backend(carrier.backend_process_id()) {
         return;
     }
-    let observer = match controls.observation_for("reader-marker", carrier.query_execution_id()) {
+    let observer = match controls.observation_for(
+        novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(),
+        carrier.query_execution_id(),
+    ) {
         Ok(Some(observer)) => observer,
         Ok(None) => return,
         Err(error) => {
@@ -273,7 +276,8 @@ fn emit_advertised_marker(
     };
     let execution = carrier.query_execution_id();
     observer.observe(&format!(
-        "NOVAROCKS_TASK_DYNAMIC_FILTER_ADVERTISED execution_id={}:{}:{} stage={} task={} channel={} version={}",
+        "{} execution_id={}:{}:{} stage={} task={} channel={} version={}",
+        novarocks_failpoint::observation_marker::TASK_DYNAMIC_FILTER_ADVERTISED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -440,7 +444,7 @@ mod tests {
         status.stop(PreparationStop::Cancel(
             novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
         ));
-        NativeNodePreparation::release_context(std::slice::from_ref(&status));
+        NativeNodePreparation::release_participation(std::slice::from_ref(&status));
         assert!(
             status
                 .wait_status(|current| current.is_terminal())

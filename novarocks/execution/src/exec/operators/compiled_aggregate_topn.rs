@@ -33,7 +33,7 @@ use super::aggregate::topn_boundary::{
 };
 use super::compiled_expression::RuntimeKernelControl;
 use crate::exec::hash_table::allocation::AggregateVec;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::{
     OrderedTopNAllocationHost, RuntimeFilterProducerFailure, RuntimeFilterSessionRef,
 };

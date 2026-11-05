@@ -21,10 +21,10 @@
 
 use super::actors::{WorkerAction, WorkerActor};
 use crate::task_port::{ProjectionError, TaskProjection, TaskRuntimePort};
-use novarocks_control_runtime::driver::{ActorRuntime, DriverError, EffectTicket};
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_control_runtime::actor_turn::{ActorRuntime, ActorTurnError, EffectTicket};
+use novarocks_execution::runtime::task::ExecutionFailure;
 use novarocks_execution_contract::{AcceptedTaskConclusion, RetainedTaskSource};
-use novarocks_worker_protocol::context::ContextEffect;
+use novarocks_worker_protocol::participation::ParticipationEffect;
 use std::{num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +32,7 @@ pub(crate) enum TaskPublicationError {
     WrongEffect,
     WrongTask,
     Projection(ProjectionError),
-    Runtime(DriverError),
+    Runtime(ActorTurnError),
 }
 
 /// The started host job retains these exact values on failure. Neither a
@@ -73,18 +73,18 @@ pub(crate) fn commit_task_projection(
     ticket: &EffectTicket<WorkerAction>,
     port: &TaskRuntimePort,
 ) -> Result<Arc<TaskProjection>, TaskPublicationRefusal> {
-    let WorkerAction::Context(effect) = &ticket.effect else {
+    let WorkerAction::Participation(effect) = &ticket.effect else {
         return Err(TaskPublicationRefusal::metadata(
             TaskPublicationError::WrongEffect,
         ));
     };
     let task = match effect {
-        ContextEffect::PublishTask { task, .. }
-        | ContextEffect::PublishMetrics { task, .. }
-        | ContextEffect::PublishTaskConvergence { task, .. }
-        | ContextEffect::SummaryConsumed { task, .. }
-        | ContextEffect::PublishConclusion { task, .. }
-        | ContextEffect::RetireTask { task, .. } => *task,
+        ParticipationEffect::PublishTask { task, .. }
+        | ParticipationEffect::PublishMetrics { task, .. }
+        | ParticipationEffect::PublishTaskConvergence { task, .. }
+        | ParticipationEffect::SummaryConsumed { task, .. }
+        | ParticipationEffect::PublishConclusion { task, .. }
+        | ParticipationEffect::RetireTask { task, .. } => *task,
         _ => {
             return Err(TaskPublicationRefusal::metadata(
                 TaskPublicationError::WrongEffect,
@@ -98,20 +98,26 @@ pub(crate) fn commit_task_projection(
     }
     let current = port.publication().read();
     let projection = match effect {
-        ContextEffect::PublishTask {
+        ParticipationEffect::PublishTask {
             snapshot,
             convergence,
             ..
         } => current
             .with_status(snapshot.clone())
             .and_then(|next| next.with_convergence(*convergence)),
-        ContextEffect::PublishMetrics { snapshot, .. } => current.with_status(snapshot.clone()),
-        ContextEffect::PublishTaskConvergence { snapshot, .. } => {
+        ParticipationEffect::PublishMetrics { snapshot, .. } => {
+            current.with_status(snapshot.clone())
+        }
+        ParticipationEffect::PublishTaskConvergence { snapshot, .. } => {
             current.with_convergence(*snapshot)
         }
-        ContextEffect::SummaryConsumed { diagnostics, .. } => current.with_diagnostics(diagnostics),
-        ContextEffect::RetireTask { convergence, .. } => current.with_convergence(*convergence),
-        ContextEffect::PublishConclusion {
+        ParticipationEffect::SummaryConsumed { diagnostics, .. } => {
+            current.with_diagnostics(diagnostics)
+        }
+        ParticipationEffect::RetireTask { convergence, .. } => {
+            current.with_convergence(*convergence)
+        }
+        ParticipationEffect::PublishConclusion {
             generation,
             conclusion,
             source,
@@ -172,7 +178,7 @@ mod tests {
     use crate::{
         control_admission::{AdmissionStorage, Dimension},
         control_runtime::{
-            actors::{ContextActor, ContextMessage, RequestMetadata, WorkerMessage},
+            actors::{ParticipationActor, ParticipationMessage, RequestMetadata, WorkerMessage},
             effect_dispatch::EffectDispatch,
             task::{TaskHostBinding, TaskHostRecord, TaskHostResources},
         },
@@ -181,8 +187,8 @@ mod tests {
     };
     use novarocks_control_runtime::{
         actor::ActorConfig,
-        driver::InputPhase,
-        lease::{ReservationBundle, WorkLease},
+        actor_turn::InputPhase,
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -195,18 +201,18 @@ mod tests {
     };
     use novarocks_execution::runtime::execution_health::ExecutionHealth;
     use novarocks_execution_contract::{
-        CancelReason, QueryContextRef, SafeDetail, TaskConclusionProposal, TaskFailurePhase,
+        CancelReason, ParticipationRef, SafeDetail, TaskConclusionProposal, TaskFailurePhase,
         TaskIdentity, TaskOperationId,
         failure::{FailureClass, FailureFact, FailureProjection},
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-    use novarocks_worker_protocol::context::ContextCommand;
+    use novarocks_worker_protocol::participation::ParticipationCommand;
     use novarocks_worker_protocol::{
-        context::{ContextConfig, ContextCore, ContextInput},
         creation::{CreationCost, PayloadId},
         lease::{LeaseBounds, MonotonicInstant},
+        participation::{ParticipationConfig, ParticipationCore, ParticipationInput},
         proposal_summary::{Diagnostic, ProposalSummary, SourceId},
     };
     use std::{
@@ -238,15 +244,15 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
-        registration: novarocks_control_runtime::driver::ActorRegistration,
+        registration: novarocks_control_runtime::actor_turn::ActorRegistration,
         port: Option<Arc<TaskRuntimePort>>,
         host: Option<TaskHostRecord>,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         // Exact SourceIds from the actual prefix, observed Committed before
         // its input record is retired. No failed-owner receipt is fabricated.
         core_consumed: Mutex<BTreeMap<SourceId, InputId>>,
-        roles: Vec<(WorkLease, ReservationBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
+        obligation_pairs: Vec<(WorkObligation, ReservationObligation)>,
+        jobs: BTreeMap<ReservationId, (WorkObligation, ReservationObligation)>,
         dispatch: EffectDispatch,
     }
     impl Fixture {
@@ -260,7 +266,7 @@ mod tests {
                 .unwrap(),
             );
             let scope = ledger.open_scope_next(None, generation()).unwrap();
-            let mut roles = Vec::new();
+            let mut obligation_pairs = Vec::new();
             for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
                 .into_iter()
                 .enumerate()
@@ -268,7 +274,7 @@ mod tests {
                 let (mut work, capacity) = scope
                     .reserve_next(
                         generation(),
-                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
+                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ParticipationActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
                         kind,
                         WorkAdmission::External,
                     )
@@ -278,32 +284,32 @@ mod tests {
                 if kind != WorkKind::Cleanup {
                     work.start().unwrap();
                 }
-                roles.push((work, capacity));
+                obligation_pairs.push((work, capacity));
             }
-            let context = QueryContextRef::new(
+            let participation = ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(551, 552), AttemptId::new(1).unwrap()).unwrap(),
                 FrontendProcessId::new_v7(),
                 BackendProcessId::new_v7(),
             );
             let task = TaskIdentity::new(
-                context.query_execution_id(),
+                participation.query_execution_id(),
                 StageId::new(1).unwrap(),
                 TaskId::new(1).unwrap(),
-                context.backend_process_id(),
+                participation.backend_process_id(),
             );
-            let config = ContextConfig {
+            let config = ParticipationConfig {
                 request_horizon: crate::RequestHorizon::DEFAULT,
                 max_tasks: 1,
                 max_creation_waiters: 2,
                 max_pending_requests: 4,
                 max_preparing: 1,
                 max_task_bytes: 100,
-                step_budget: ContextCore::MAX_STEP_WORK,
+                step_budget: ParticipationCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
             };
-            let core = ContextCore::new(
-                context,
+            let core = ParticipationCore::new(
+                participation,
                 generation(),
                 crate::control_runtime::actors::tests::initial_establishment(),
                 config,
@@ -313,28 +319,28 @@ mod tests {
             let registration = runtime.register_supervised_bound(
                     actor(),
                     scope.clone(),
-                    WorkerActor::Context(Box::new(ContextActor::new(
+                    WorkerActor::Participation(Box::new(ParticipationActor::new(
                         core,
                         scope.clone(),
                         AdmissionStorage {
-                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
-                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
-                            context: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
+                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressPositionLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
+                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressPositionLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
+                            participation: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                         },
-                        roles[1].0.reference(),
-                        roles[2].0.reference(),
+                        obligation_pairs[1].0.reference(),
+                        obligation_pairs[2].0.reference(),
                     ))),
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
                         max_effects_per_step:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         max_dependencies_per_effect:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
-                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
-                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
                     },
-                    &roles[0].0,
+                    &obligation_pairs[0].0,
                 )
                 .unwrap_or_else(|(error, _)| panic!("actual actor admission: {error:?}"));
             let mut f = Self {
@@ -344,28 +350,28 @@ mod tests {
                 registration,
                 port: None,
                 host: None,
-                context,
+                participation,
                 core_consumed: Mutex::new(BTreeMap::new()),
-                roles,
+                obligation_pairs,
                 jobs: BTreeMap::new(),
                 dispatch: EffectDispatch::new(actor(), 64),
             };
             for (command, request) in [
                 (
-                    ContextInput::MaterializationFinished {
+                    ParticipationInput::MaterializationFinished {
                         result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
                     },
                     None,
                 ),
                 (
-                    ContextInput::Request(ContextCommand::Create {
+                    ParticipationInput::Request(ParticipationCommand::Create {
                         task,
                         payload: PayloadId(1),
                     }),
                     Some(operation(1)),
                 ),
                 (
-                    ContextInput::Loaded {
+                    ParticipationInput::Loaded {
                         task,
                         result: Ok(CreationCost {
                             input_retained_bytes: 1,
@@ -375,7 +381,7 @@ mod tests {
                     },
                     None,
                 ),
-                (ContextInput::Installed { task }, None),
+                (ParticipationInput::Installed { task }, None),
             ] {
                 let input = f.send(command, request);
                 f.drain();
@@ -388,9 +394,11 @@ mod tests {
                 .as_ref()
                 .expect("the actual LoadInput elected this Task")
         }
-        fn send(&self, command: ContextInput, request: Option<TaskOperationId>) -> InputId {
+        fn send(&self, command: ParticipationInput, request: Option<TaskOperationId>) -> InputId {
             let sources: Vec<_> = match &command {
-                ContextInput::Summary { summary, .. } => summary.candidate_sources().collect(),
+                ParticipationInput::Summary { summary, .. } => {
+                    summary.candidate_sources().collect()
+                }
                 _ => Vec::new(),
             };
             let input = self
@@ -399,17 +407,19 @@ mod tests {
                     &self.registration,
                     ActorId::new(2).unwrap(),
                     InputClass::Lifecycle,
-                    &self.roles[2].0,
+                    &self.obligation_pairs[2].0,
                 )
                 .unwrap()
-                .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.reference(),
-                    command,
-                    request: request.map(|operation| RequestMetadata {
-                        operation,
-                        deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
-                    }),
-                }))
+                .fill(WorkerMessage::Participation(
+                    ParticipationMessage::Command {
+                        work: self.obligation_pairs[2].0.reference(),
+                        command,
+                        request: request.map(|operation| RequestMetadata {
+                            operation,
+                            deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
+                        }),
+                    },
+                ))
                 .unwrap();
             self.runtime.poll_one(Tick(1)).unwrap();
             if !sources.is_empty() {
@@ -474,25 +484,25 @@ mod tests {
             while let Some(ticket) = self.next() {
                 let publication = matches!(
                     ticket.effect,
-                    WorkerAction::Context(
-                        ContextEffect::PublishTask { .. }
-                            | ContextEffect::PublishMetrics { .. }
-                            | ContextEffect::PublishTaskConvergence { .. }
-                            | ContextEffect::SummaryConsumed { .. }
-                            | ContextEffect::PublishConclusion { .. }
-                            | ContextEffect::RetireTask { .. }
+                    WorkerAction::Participation(
+                        ParticipationEffect::PublishTask { .. }
+                            | ParticipationEffect::PublishMetrics { .. }
+                            | ParticipationEffect::PublishTaskConvergence { .. }
+                            | ParticipationEffect::SummaryConsumed { .. }
+                            | ParticipationEffect::PublishConclusion { .. }
+                            | ParticipationEffect::RetireTask { .. }
                     )
                 );
                 if publication {
                     self.commit(&ticket);
                 }
                 match &ticket.effect {
-                    WorkerAction::Context(ContextEffect::LoadInput { .. }) => {
+                    WorkerAction::Participation(ParticipationEffect::LoadInput { .. }) => {
                         let host = TaskHostRecord::adopt_loading(
                             &self.runtime,
                             &ticket,
                             &TaskHostBinding {
-                                context: self.context,
+                                participation: self.participation,
                                 task_source: ActorId::new(2).unwrap(),
                                 protocol_generation: generation(),
                                 max_cuts: 4,
@@ -500,13 +510,13 @@ mod tests {
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
-                            &self.roles[0].0,
+                            &self.obligation_pairs[0].0,
                         )
                         .unwrap();
                         assert!(self.port.replace(host.port()).is_none());
                         assert!(self.host.replace(host).is_none());
                     }
-                    WorkerAction::Context(ContextEffect::EnqueuePreparation {
+                    WorkerAction::Participation(ParticipationEffect::EnqueuePreparation {
                         reservation,
                         ..
                     }) => {
@@ -603,7 +613,7 @@ mod tests {
                 pending_loading,
                 preparation,
                 preparation_remainder,
-                accepted_role_storage,
+                accepted_completion_storage,
                 pending_preparation_adoption,
                 mut source_partials,
                 completion,
@@ -695,7 +705,7 @@ mod tests {
             assert_eq!(ingress.retained_sources(), 0);
             // No further Task host issuer remains. Only this parcel's unused
             // role inventory is returned; bound Source/report exits above are real.
-            if let Some(mut original) = accepted_role_storage {
+            if let Some(mut original) = accepted_completion_storage {
                 assert!(original.resources().unwrap().quota.is_empty());
                 original.finish().unwrap();
             }
@@ -707,7 +717,7 @@ mod tests {
             active.finish().unwrap();
             drop(causal);
             drop(ingress);
-            for (mut work, mut capacity) in self.roles.drain(..) {
+            for (mut work, mut capacity) in self.obligation_pairs.drain(..) {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 32).unwrap();
@@ -745,7 +755,7 @@ mod tests {
         let mut f = Fixture::new();
         let task = f.port().identity();
         let canceled = f.send(
-            ContextInput::Request(ContextCommand::Cancel {
+            ParticipationInput::Request(ParticipationCommand::Cancel {
                 task,
                 reason: CancelReason::UpstreamNoLongerNeeded,
             }),
@@ -756,9 +766,12 @@ mod tests {
         let before = f.port().publication().read();
         assert!(!before.status().is_terminal());
         assert!(!before.convergence().conclusion_stable());
-        let input = f.send(ContextInput::FinishWithOutput { task, output: None }, None);
+        let input = f.send(
+            ParticipationInput::FinishWithOutput { task, output: None },
+            None,
+        );
         let ticket = f.next().unwrap();
-        let WorkerAction::Context(ContextEffect::PublishTask {
+        let WorkerAction::Participation(ParticipationEffect::PublishTask {
             snapshot,
             convergence,
             ..
@@ -801,7 +814,7 @@ mod tests {
         let mut f = Fixture::new();
         let task = f.port().identity();
         let first = f.send(
-            ContextInput::Summary {
+            ParticipationInput::Summary {
                 task,
                 generation: generation(),
                 cut: None,
@@ -810,7 +823,7 @@ mod tests {
             None,
         );
         let second = f.send(
-            ContextInput::Summary {
+            ParticipationInput::Summary {
                 task,
                 generation: generation(),
                 cut: None,
@@ -822,7 +835,7 @@ mod tests {
         assert_eq!(first_ticket.input, first);
         assert!(matches!(
             first_ticket.effect,
-            WorkerAction::Context(ContextEffect::SummaryConsumed { .. })
+            WorkerAction::Participation(ParticipationEffect::SummaryConsumed { .. })
         ));
         assert!(
             f.next().is_none(),
@@ -938,7 +951,7 @@ mod tests {
             let source_id = summary.summary.candidate_sources().next().unwrap();
             *source.lock().unwrap() = Some(source_id);
             let summary_input = f.send(
-                ContextInput::Summary {
+                ParticipationInput::Summary {
                     task,
                     generation: generation(),
                     cut: summary.cut,
@@ -952,7 +965,10 @@ mod tests {
                 f.drain();
                 f.port().ingress().summary_consumed(summary.cut).unwrap();
                 f.runtime.retire_input(actor(), summary_input).unwrap();
-                f.send(ContextInput::FinishWithOutput { task, output: None }, None)
+                f.send(
+                    ParticipationInput::FinishWithOutput { task, output: None },
+                    None,
+                )
             } else {
                 summary_input
             };
@@ -960,10 +976,10 @@ mod tests {
             assert!(matches!(
                 (&ticket.effect, stale),
                 (
-                    WorkerAction::Context(ContextEffect::PublishTask { .. }),
+                    WorkerAction::Participation(ParticipationEffect::PublishTask { .. }),
                     true
                 ) | (
-                    WorkerAction::Context(ContextEffect::PublishConclusion { .. }),
+                    WorkerAction::Participation(ParticipationEffect::PublishConclusion { .. }),
                     false
                 )
             ));
@@ -976,12 +992,12 @@ mod tests {
             // the old batch's explicit abandonment and actual cleanup.
             let failed_input = stale.then(|| {
                 let unknown_task = TaskIdentity::new(
-                    f.context.query_execution_id(),
+                    f.participation.query_execution_id(),
                     StageId::new(1).unwrap(),
                     TaskId::new(999).unwrap(),
-                    f.context.backend_process_id(),
+                    f.participation.backend_process_id(),
                 );
-                let original = f.send(ContextInput::Installed { task: unknown_task }, None);
+                let original = f.send(ParticipationInput::Installed { task: unknown_task }, None);
                 assert!(f.runtime.snapshot(actor()).unwrap().failed);
                 assert_eq!(
                     f.runtime
@@ -1001,12 +1017,12 @@ mod tests {
             if stale {
                 assert!(matches!(
                     refusal.error,
-                    TaskPublicationError::Runtime(DriverError::FailurePublicationRequired)
+                    TaskPublicationError::Runtime(ActorTurnError::FailurePublicationRequired)
                 ));
             } else {
                 assert!(matches!(
                     refusal.error,
-                    TaskPublicationError::Runtime(DriverError::UnknownActor)
+                    TaskPublicationError::Runtime(ActorTurnError::UnknownActor)
                 ));
                 assert_eq!(
                     f.port().ingress().retained_sources(),
@@ -1097,8 +1113,9 @@ mod tests {
                 // fixed cleanup action. None of these neutral receipts owns
                 // the original rich Source, which still awaits port disposal.
                 f.dispatch.clear_failed_index(&f.runtime).unwrap();
-                let novarocks_control_runtime::driver::FailureSourceState::ClosedPending(cleanup) =
-                    f.runtime.failure_source_state(actor()).unwrap()
+                let novarocks_control_runtime::actor_turn::FailureSourceState::ClosedPending(
+                    cleanup,
+                ) = f.runtime.failure_source_state(actor()).unwrap()
                 else {
                     panic!("the original failure source retains its actual cleanup");
                 };
@@ -1116,8 +1133,11 @@ mod tests {
                     cleanup_ticket.effect,
                     WorkerAction::OwnerFailed { scope, .. } if scope == f.scope.id()
                 ));
-                assert_eq!(cleanup_ticket.descriptor.work, f.roles[0].0.reference());
-                f.roles[0].0.start().unwrap();
+                assert_eq!(
+                    cleanup_ticket.descriptor.work,
+                    f.obligation_pairs[0].0.reference()
+                );
+                f.obligation_pairs[0].0.start().unwrap();
                 f.runtime.effect_completed(cleanup_ticket).unwrap();
                 f.runtime.retire_input(actor(), cleanup).unwrap();
                 f.runtime.retire_input(actor(), failed_input).unwrap();

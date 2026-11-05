@@ -20,14 +20,16 @@
 //! a bound sender, a bank entry or an opaque producer.
 
 use super::{
-    admitted_role::{
-        adopt_reported_work, reserve_reported_role, reserve_reported_role_from_authority,
+    reported_work_admission::{
+        adopt_reported_work, reserve_reported_work, reserve_reported_work_from_authority,
     },
     source_positions::{SOURCE_SLOT_STORAGE, SourceSlotAdmission, SourceSlotStorageError},
 };
 use novarocks_control_runtime::{
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{ReservationBundle, WorkChildAuthority, WorkLease, WorkRetirementObserver},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::{
+        ReservationObligation, WorkChildAuthority, WorkObligation, WorkRetirementObserver,
+    },
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -65,11 +67,11 @@ impl std::error::Error for SourceSlotIssueError {
 /// may instead hand off its entire final original bundle without adding a
 /// reservation header or a dummy retained resource.
 pub(crate) enum SourceSlotPayer<'a> {
-    Retained(&'a mut ReservationBundle),
-    Pool(&'a mut Option<ReservationBundle>),
+    Retained(&'a mut ReservationObligation),
+    Pool(&'a mut Option<ReservationObligation>),
 }
 impl SourceSlotPayer<'_> {
-    fn payer(&mut self) -> Result<&mut ReservationBundle, SourceSlotIssueError> {
+    fn payer(&mut self) -> Result<&mut ReservationObligation, SourceSlotIssueError> {
         match self {
             Self::Retained(payer) => Ok(payer),
             Self::Pool(pool) => pool
@@ -84,26 +86,26 @@ impl From<RuntimeError> for SourceSlotIssueError {
         Self::Runtime(error)
     }
 }
-fn exit_error(error: ExitRoleError) -> SourceSlotIssueError {
+fn exit_error(error: ExitCustodyError) -> SourceSlotIssueError {
     match error {
-        ExitRoleError::Runtime(error) => SourceSlotIssueError::Runtime(error),
+        ExitCustodyError::Runtime(error) => SourceSlotIssueError::Runtime(error),
         // An unexpected phase cannot turn a possibly exposed original into
         // an unused exit. Its role and payment stay in the same partial.
-        ExitRoleError::InvalidPhase(_) => {
+        ExitCustodyError::InvalidPhase(_) => {
             SourceSlotIssueError::Runtime(RuntimeError::UnresolvedWork)
         }
     }
 }
 
 struct UnusedSourceSlot {
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     retirement: WorkRetirementObserver,
 }
 impl std::fmt::Debug for UnusedSourceSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnusedSourceSlot")
-            .field("role", &self.role)
+            .field("role", &self.exit_custody)
             .field("authority", &self.authority)
             .field("retirement", &self.retirement)
             .finish()
@@ -112,9 +114,9 @@ impl std::fmt::Debug for UnusedSourceSlot {
 impl UnusedSourceSlot {
     fn new(reported: ReportedWork) -> Self {
         let retirement = reported.work().retirement_observer();
-        let (role, authority) = ExitRole::from_admitted(reported);
+        let (exit_custody, authority) = ExitCustody::from_admitted(reported);
         Self {
-            role,
+            exit_custody,
             authority: Some(authority),
             retirement,
         }
@@ -183,29 +185,29 @@ impl SourceSlotIssuePartial {
     ) -> Result<UnusedRetirementProgress, SourceSlotIssueError> {
         let mut progressed = false;
         for slot in &mut self.slots {
-            let before = slot.role.phase();
+            let before = slot.exit_custody.phase();
             if let Some(authority) = slot.authority.take() {
                 // No capture, bank entry or sender ever left this partial.
                 // Revocation is not consumption by either report observer.
                 authority.revoke_unused_and_exit().map_err(exit_error)?;
                 progressed = true;
             }
-            match slot.role.phase() {
-                ExitRolePhase::Retired => {}
-                ExitRolePhase::Unresolved => {
+            match slot.exit_custody.phase() {
+                ExitCustodyPhase::Retired => {}
+                ExitCustodyPhase::Unresolved => {
                     return Err(SourceSlotIssueError::Runtime(RuntimeError::UnresolvedWork));
                 }
                 _ => {
-                    slot.role.try_retire().map_err(exit_error)?;
+                    slot.exit_custody.try_retire().map_err(exit_error)?;
                 }
             }
-            progressed |= slot.role.phase() != before;
+            progressed |= slot.exit_custody.phase() != before;
         }
         if self.slots.iter().any(|slot| !slot.retirement.is_retired()) {
             progressed |= ledger.reap_scope_ready(self.scope.id(), 1)? > 0;
         }
         let complete = self.slots.iter().all(|slot| {
-            slot.role.phase() == ExitRolePhase::Retired && slot.retirement.is_retired()
+            slot.exit_custody.phase() == ExitCustodyPhase::Retired && slot.retirement.is_retired()
         });
         if complete {
             self.slots.clear();
@@ -231,7 +233,7 @@ pub(crate) struct SourceSlotIssueRefusal {
 /// financial Scope. The tuple describes a receipt target, not Work authority.
 pub(crate) fn reserve_source_slots<const N: usize>(
     scope: &ScopeHandle,
-    actual_parent: &WorkLease,
+    actual_parent: &WorkObligation,
     core_owner: (ScopeId, Generation),
     payer: SourceSlotPayer<'_>,
 ) -> Result<[SourceSlotAdmission; N], SourceSlotIssueRefusal> {
@@ -259,7 +261,7 @@ pub(crate) fn reserve_source_slots_from_authority<const N: usize>(
     )
 }
 enum SourceParent<'a> {
-    Work(&'a WorkLease),
+    Work(&'a WorkObligation),
     Authority(&'a WorkChildAuthority),
 }
 fn reserve_source_slots_with_parent<const N: usize>(
@@ -283,7 +285,7 @@ fn reserve_source_slots_with_parent<const N: usize>(
             }
         };
         let issued = match &actual_parent {
-            SourceParent::Work(parent) => reserve_reported_role(
+            SourceParent::Work(parent) => reserve_reported_work(
                 scope,
                 current,
                 parent,
@@ -291,7 +293,7 @@ fn reserve_source_slots_with_parent<const N: usize>(
                 WorkKind::Cleanup,
                 Some(core_owner),
             ),
-            SourceParent::Authority(parent) => reserve_reported_role_from_authority(
+            SourceParent::Authority(parent) => reserve_reported_work_from_authority(
                 scope,
                 current,
                 parent,

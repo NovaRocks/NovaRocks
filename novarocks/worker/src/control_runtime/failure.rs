@@ -18,4 +18,4 @@
 //! Evidence from the live failure owner's scope publication-drain stage.
 //! Actor failure alone supplies no authority to abandon Core consumption.
 
-pub(crate) use super::context_host::failure::ScopePublicationsDrained;
+pub(crate) use super::participation_host::failure::ScopePublicationsDrained;

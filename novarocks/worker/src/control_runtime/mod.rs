@@ -18,17 +18,7 @@
 //! Worker binding of the common control runtime and the pure protocol.
 
 pub(crate) mod actors;
-pub(crate) mod admitted_role;
 pub(crate) mod adopted_cleanup;
-pub(crate) mod context_close;
-pub(crate) mod context_executors;
-pub(crate) mod context_forget;
-pub(crate) mod context_host;
-pub(crate) mod context_host_jobs;
-pub(crate) mod context_io;
-pub(crate) mod context_lifecycle;
-pub(crate) mod context_ready;
-mod context_removal;
 pub(crate) mod control_internal;
 pub(crate) mod control_request;
 pub(crate) mod dynamic_filters;
@@ -40,7 +30,17 @@ pub(crate) mod node_api;
 pub(crate) mod node_bootstrap;
 pub(crate) mod node_geometry;
 pub(crate) mod node_metrics;
+pub(crate) mod participation_close;
+pub(crate) mod participation_executors;
+pub(crate) mod participation_forget;
+pub(crate) mod participation_host;
+pub(crate) mod participation_host_jobs;
+pub(crate) mod participation_io;
+pub(crate) mod participation_lifecycle;
+pub(crate) mod participation_ready;
+mod participation_removal;
 pub(crate) mod process_control;
+pub(crate) mod reported_work_admission;
 pub(crate) mod request_endpoint;
 pub(crate) mod request_observation;
 pub(crate) mod request_ready;

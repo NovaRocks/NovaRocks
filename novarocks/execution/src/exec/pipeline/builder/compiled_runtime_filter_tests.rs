@@ -60,7 +60,7 @@ use super::join_tests::{
 use crate::exec::chunk::Chunk;
 use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::StreamScanSourceFactory;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::{
     PreparedPipelineExecution, prepare_compiled_program_pipeline_execution,
@@ -68,13 +68,13 @@ use crate::exec::pipeline::executor::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::ExecutionResult;
-use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
-use crate::runtime::fragment::scan::compiled_fixture::{
-    FixtureScanOp, SCAN_NODE, rows, scan_chunk, scan_program,
-};
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionResult;
+use crate::runtime::task::io::{NoopTaskEventSink, TaskEvent, TaskEventSink};
+use crate::runtime::task::scan::compiled_fixture::{
+    FixtureScanOp, SCAN_NODE, rows, scan_chunk, scan_program,
+};
 use crate::runtime_filter as execution;
 use novarocks_types::SlotId;
 
@@ -1132,7 +1132,7 @@ impl execution::RuntimeFilterSession for FakeSession {
         &self,
         request: execution::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+        execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterProducer>,
         execution::RuntimeFilterContractViolation,
     > {
         if let Some(installed) = self
@@ -1163,7 +1163,7 @@ impl execution::RuntimeFilterSession for FakeSession {
         &self,
         request: execution::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
         execution::RuntimeFilterContractViolation,
     > {
         let subscription = self
@@ -1181,7 +1181,7 @@ impl execution::RuntimeFilterSession for FakeSession {
             .expect("subscribed")
             .push(request.contract().clone());
         Ok(execution::RuntimeFilterBindOutcome::Bound(
-            execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+            execution::RuntimeFilterSubscriptionPin::Blocking(subscription),
         ))
     }
 
@@ -1189,7 +1189,7 @@ impl execution::RuntimeFilterSession for FakeSession {
         &self,
         _: execution::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterFinalDomainCompletionHandle>,
+        execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterFinalDomainCompletion>,
         execution::RuntimeFilterContractViolation,
     > {
         Err(execution::RuntimeFilterContractViolation::new(
@@ -1205,9 +1205,9 @@ struct RecordingEvents {
     effects: Mutex<Vec<execution::RuntimeFilterRowEffect>>,
 }
 
-impl FragmentEventSink for RecordingEvents {
-    fn record(&self, event: FragmentEvent) {
-        if let FragmentEvent::RuntimeFilterRowEffect(effect) = event {
+impl TaskEventSink for RecordingEvents {
+    fn record(&self, event: TaskEvent) {
+        if let TaskEvent::RuntimeFilterRowEffect(effect) = event {
             self.effects.lock().expect("effects").push(effect);
         }
     }
@@ -1252,9 +1252,9 @@ fn bound(op: &Arc<FixtureScanOp>) -> ScanBindings {
 fn prepare_scan(
     program: &Arc<LocalProgram>,
     op: &Arc<FixtureScanOp>,
-    output: &ResultSinkHandle,
+    output: &ResultSinkBuffer,
     state: Arc<RuntimeState>,
-    events: Arc<dyn FragmentEventSink>,
+    events: Arc<dyn TaskEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     prepare_compiled_program_pipeline_execution_with_profiler(
@@ -1263,7 +1263,7 @@ fn prepare_scan(
         Box::new(ResultSinkFactory::new(output.clone())),
         ExchangeBindings::default(),
         bound(op),
-        crate::runtime::fragment::CompiledWriterBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
         None,
         None,
         dop,
@@ -1277,9 +1277,9 @@ fn scan_refusal(program: &Arc<LocalProgram>, session: Option<Arc<FakeSession>>) 
     match prepare_scan(
         program,
         &op,
-        &ResultSinkHandle::new(),
+        &ResultSinkBuffer::new(),
         state(session, Duration::from_secs(1), None),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     ) {
         Ok(_) => panic!("compiled runtime-filter preparation must be refused"),
         Err(error) => {
@@ -1301,13 +1301,13 @@ fn a_compiled_scan_holds_its_first_read_until_its_filter_arrives_then_filters_ro
         let subscription = ControlledSubscription::new();
         let session = FakeSession::consumers(&[(7, &subscription)]);
         let events = Arc::new(RecordingEvents::default());
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let running = prepare_scan(
             &program,
             &op,
             &output,
             state(Some(Arc::clone(&session)), Duration::from_secs(60), None),
-            Arc::clone(&events) as Arc<dyn FragmentEventSink>,
+            Arc::clone(&events) as Arc<dyn TaskEventSink>,
         )
         .unwrap_or_else(|error| panic!("dop {dop}: the scan prepares: {error}"))
         .start();
@@ -1368,13 +1368,13 @@ fn several_consumers_of_one_compiled_scan_share_its_gate_and_key_their_own_roots
     let first = ControlledSubscription::new();
     let second = ControlledSubscription::new();
     let session = FakeSession::consumers(&[(7, &first), (8, &second)]);
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let running = prepare_scan(
         &program,
         &op,
         &output,
         state(Some(session), Duration::from_secs(60), None),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .expect("the scan prepares")
     .start();
@@ -1401,14 +1401,14 @@ fn an_expired_compiled_scan_wait_passes_rows_through_as_timed_out_once() {
     let subscription = ControlledSubscription::new();
     let session = FakeSession::consumers(&[(7, &subscription)]);
     let events = Arc::new(RecordingEvents::default());
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let started = Instant::now();
     prepare_scan(
         &program,
         &op,
         &output,
         state(Some(session), Duration::from_millis(50), None),
-        Arc::clone(&events) as Arc<dyn FragmentEventSink>,
+        Arc::clone(&events) as Arc<dyn TaskEventSink>,
     )
     .expect("the scan prepares")
     .start()
@@ -1743,7 +1743,7 @@ fn single_join(null_safe: bool) -> Arc<LocalProgram> {
 }
 
 fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> ExecutionResult<Rows> {
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let sink: Box<dyn OperatorFactory> = result_sink(program, SINGLE_FINST, &output);
     prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
@@ -1753,7 +1753,7 @@ fn run_join(program: &Arc<LocalProgram>, session: Arc<FakeSession>) -> Execution
         Some((SINGLE_FINST.high(), SINGLE_FINST.low())),
         1,
         state(Some(session), Duration::from_secs(1), None),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )?
     .start()
     .join()?;
@@ -2326,9 +2326,9 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
     )
     .unwrap();
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     let source_array = chunk.columns()[0].clone();
     let step = operator.as_mut();
@@ -2337,7 +2337,7 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
     let control = runtime.error_state();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+    let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
     let InputResult::Deferred {
         input,
         next: AdmissionNext::Wait(wait),
@@ -2593,8 +2593,8 @@ fn join_probe_owned_contract_rejects_bad_ordinal_and_unsafe_local_join_direction
 #[test]
 fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
     use crate::runtime::{
-        fragment::ExecutionFailureCause, query_memory::QueryMemoryBinding,
-        scalar_memory::RuntimeScalarMemoryRefusal,
+        query_memory::QueryMemoryBinding, scalar_memory::RuntimeScalarMemoryRefusal,
+        task::ExecutionFailureCause,
     };
     use novarocks_memory::{AccountKind, ExternalRef};
     use novarocks_types::{
@@ -2728,7 +2728,7 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
         ));
         let budget = novarocks_spi::connector::read_stack::ConnectorPollBudget::new();
         budget.refill(u64::from(
-            crate::exec::pipeline::step_context::DEFAULT_TURN_WORK_UNITS,
+            crate::exec::pipeline::driver_step::DEFAULT_TURN_WORK_UNITS,
         ));
         operator.bind_poll_budget(budget);
         operator.prepare().unwrap();
@@ -3208,7 +3208,7 @@ fn b3_input_keeps_required_key_row_failure_and_fails_rf_without_empty_completion
     assert!(
         matches!(
             original.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::RequiredRow(_)
+            crate::runtime::task::ExecutionFailureCause::RequiredRow(_)
         ),
         "{original:?}"
     );

@@ -24,7 +24,7 @@ use super::{
     request_endpoint::RequestNotice,
 };
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, DriverError, EffectTicket},
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket},
     transaction::ScopeHandle,
 };
 
@@ -39,7 +39,7 @@ impl AdoptedCleanupEffect {
         runtime: &ActorRuntime<WorkerActor>,
         ticket: EffectTicket<WorkerAction>,
         notice: Option<RequestNotice>,
-    ) -> Result<Self, (DriverError, EffectTicket<WorkerAction>)> {
+    ) -> Result<Self, (ActorTurnError, EffectTicket<WorkerAction>)> {
         if let Err(error) = runtime.validate_effect_ticket(&ticket) {
             return Err((error, ticket));
         }
@@ -54,12 +54,12 @@ impl AdoptedCleanupEffect {
         stage: &ScopePublicationsDrained<'_>,
         ticket: EffectTicket<WorkerAction>,
         notice: Option<RequestNotice>,
-    ) -> Result<Self, (DriverError, EffectTicket<WorkerAction>)> {
+    ) -> Result<Self, (ActorTurnError, EffectTicket<WorkerAction>)> {
         if let Err(error) = stage.validate(runtime, ticket.actor) {
             return Err((error, ticket));
         }
         if !ticket.descriptor.kind.allowed_after_failure() {
-            return Err((DriverError::PublicationTargetMismatch, ticket));
+            return Err((ActorTurnError::PublicationTargetMismatch, ticket));
         }
         Ok(Self {
             runtime: runtime.clone(),
@@ -84,10 +84,13 @@ impl AdoptedCleanupEffect {
         &self,
         stage: &ScopePublicationsDrained<'_>,
         scope: &ScopeHandle,
-    ) -> Result<(), DriverError> {
+    ) -> Result<(), ActorTurnError> {
         stage.validate_scope(
             &self.runtime,
-            self.ticket.as_ref().ok_or(DriverError::UnknownInput)?.actor,
+            self.ticket
+                .as_ref()
+                .ok_or(ActorTurnError::UnknownInput)?
+                .actor,
             scope,
         )
     }
@@ -98,7 +101,7 @@ impl AdoptedCleanupEffect {
 
     /// Only the concrete original owner calls this after its own positive
     /// completion condition. An epoch change never invalidates a real exit.
-    pub(crate) fn complete(&mut self) -> Result<bool, DriverError> {
+    pub(crate) fn complete(&mut self) -> Result<bool, ActorTurnError> {
         let Some(ticket) = self.ticket.take() else {
             return Ok(false);
         };

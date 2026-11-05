@@ -34,7 +34,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
-    CrossProcessConfigOverlay, ServerHandle,
+    CrossProcessConfigOverlay, TestClusterOwner,
     resource_registration::{self, Registration},
 };
 use reqwest::Method;

@@ -33,6 +33,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 
 #[cfg(all(unix, feature = "typed"))]
 pub mod liveness;
+pub mod observation_marker;
 #[cfg(novarocks_dev_controls)]
 pub mod scope;
 pub mod session;
@@ -65,11 +66,11 @@ pub enum QueryLifecycleFaultKind {
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
-    /// Drops the acknowledgement of one `EstablishQueryContext` after the
+    /// Drops the acknowledgement of one `EstablishParticipation` after the
     /// backend has installed the context. The context exists and the frontend
     /// does not know it, which is the unknown-outcome case the protocol's
     /// idempotent replay exists to survive.
-    EstablishContextAckDrop,
+    EstablishParticipationAckDrop,
     /// Drops the acknowledgement of one `CreateTask` after the task is
     /// admitted and running. It is the successor of the retired protocol's
     /// separate Stage and Start acknowledgements, because `CreateTask` is the
@@ -105,7 +106,7 @@ pub enum QueryLifecycleFaultKind {
     /// a complete visible client prefix, then fails the original live Task.
     /// Client observation grants no ACK or replacement Task authority.
     TaskExecutionFailureAfterVisiblePrefix,
-    /// Holds one applied `EstablishQueryContext` open so the harness can
+    /// Holds one applied `EstablishParticipation` open so the harness can
     /// replace that exact backend process.
     ///
     /// The successor of the retired `RestartAfterInitAck`: the establish is the task
@@ -118,7 +119,7 @@ pub enum QueryLifecycleFaultKind {
     /// wait is shorter than the hold, so it replays the establish while the
     /// rendezvous is still waiting, and answering that replay would tell the
     /// frontend this backend is ready moments before the harness replaces it.
-    RestartAfterEstablishContext,
+    RestartAfterEstablishParticipation,
     /// Answers one admitted `CreateTask` with the protocol's first-creation
     /// refusal, `InvalidStateOrRequest`.
     ///
@@ -201,7 +202,7 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
-        Self::EstablishContextAckDrop,
+        Self::EstablishParticipationAckDrop,
         Self::CreateTaskAckDrop,
         Self::CreateTaskBeforeWorkerHold,
         Self::TaskStatusSubscriptionDrop,
@@ -210,7 +211,7 @@ impl QueryLifecycleFaultKind {
         Self::TaskExecutionFailure,
         Self::RootTaskExecutionFailureBeforeData,
         Self::TaskExecutionFailureAfterVisiblePrefix,
-        Self::RestartAfterEstablishContext,
+        Self::RestartAfterEstablishParticipation,
         Self::CreateTaskRejectedAfterApply,
         Self::CreateTaskReceiptForeignTask,
         Self::TaskStatusForeignProcess,
@@ -240,7 +241,7 @@ impl QueryLifecycleFaultKind {
             }
             Self::RuntimeFilterFeedbackUnavailable => "runtime-filter-feedback-unavailable",
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
-            Self::EstablishContextAckDrop => "establish-context-ack-drop",
+            Self::EstablishParticipationAckDrop => "establish-participation-ack-drop",
             Self::CreateTaskAckDrop => "create-task-ack-drop",
             Self::CreateTaskBeforeWorkerHold => "create-task-before-worker-hold",
             Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
@@ -251,7 +252,7 @@ impl QueryLifecycleFaultKind {
             Self::TaskExecutionFailureAfterVisiblePrefix => {
                 "task-execution-failure-after-visible-prefix"
             }
-            Self::RestartAfterEstablishContext => "restart-after-establish-context",
+            Self::RestartAfterEstablishParticipation => "restart-after-establish-participation",
             Self::CreateTaskRejectedAfterApply => "create-task-rejected-after-apply",
             Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
             Self::TaskStatusForeignProcess => "task-status-foreign-process",
@@ -301,7 +302,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 28] = [
     // acknowledgement the backend already earned; none of them skips the
     // operation, because a fault that never applied anything would exercise
     // no replay path at all.
-    QueryLifecycleFaultKind::EstablishContextAckDrop,
+    QueryLifecycleFaultKind::EstablishParticipationAckDrop,
     QueryLifecycleFaultKind::CreateTaskAckDrop,
     QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
     QueryLifecycleFaultKind::LeaseRenewalAckDrop,
@@ -314,7 +315,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 28] = [
     QueryLifecycleFaultKind::TaskExecutionFailure,
     QueryLifecycleFaultKind::RootTaskExecutionFailureBeforeData,
     QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix,
-    QueryLifecycleFaultKind::RestartAfterEstablishContext,
+    QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
     // The exact ordinary Create remains outside Worker admission until the
     // runner releases it, proving unknown ownership during root completion.
     QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
@@ -1013,8 +1014,8 @@ mod tests {
             Some(QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop)
         );
         assert_eq!(
-            parse_runner_rfo_kind("establish-context-ack-drop"),
-            Some(QueryLifecycleFaultKind::EstablishContextAckDrop)
+            parse_runner_rfo_kind("establish-participation-ack-drop"),
+            Some(QueryLifecycleFaultKind::EstablishParticipationAckDrop)
         );
         assert_eq!(
             parse_runner_rfo_kind("create-task-ack-drop"),
@@ -1033,8 +1034,8 @@ mod tests {
             Some(QueryLifecycleFaultKind::TaskExecutionFailure)
         );
         assert_eq!(
-            parse_runner_rfo_kind("restart-after-establish-context"),
-            Some(QueryLifecycleFaultKind::RestartAfterEstablishContext)
+            parse_runner_rfo_kind("restart-after-establish-participation"),
+            Some(QueryLifecycleFaultKind::RestartAfterEstablishParticipation)
         );
         assert_eq!(
             parse_runner_rfo_kind("create-task-rejected-after-apply"),

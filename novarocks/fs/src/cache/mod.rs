@@ -24,10 +24,10 @@ pub(crate) mod parquet_cache;
 pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey, get_block_cache, init_block_cache};
 pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
 pub use data_cache::{
-    DataCacheContext, DataCacheManager, DataCacheMetricsRecorder, DataCachePageCache,
-    DataCachePageCacheOptions, DataCachePageKey,
+    DataCacheManager, DataCacheMetricsRecorder, DataCachePageCache, DataCachePageCacheOptions,
+    DataCachePageKey, DataCachePolicy,
 };
-pub use page_cache::{PageCache, PageCacheStats, PageCacheValue, PageHandle};
+pub use page_cache::{PageCache, PageCacheStats, PageCacheValue, PagePin};
 pub use parquet_cache::{ParquetCacheOptions, init_parquet_cache};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

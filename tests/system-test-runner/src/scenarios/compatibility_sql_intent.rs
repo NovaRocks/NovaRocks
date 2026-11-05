@@ -24,7 +24,7 @@ use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
 use novarocks_cluster_harness::{
-    CrossProcessServerHandle, QueryLifecycleStatementObservation, ServerHandle,
+    CrossProcessCluster, QueryLifecycleStatementObservation, TestClusterOwner,
 };
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::json;
@@ -128,7 +128,7 @@ impl CompatibilityIntent {
                 be,
                 "native-observation",
                 json!({
-                    "action":"grpc-fragment", "root":root, "backend_index":index,
+                    "action":novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), "root":root, "backend_index":index,
                     "target_session_id":target_session, "max_events":16384,
                     "query_execution":{"query_id_hi":91,"query_id_lo":92,"attempt_id":1},
                 }),
@@ -160,7 +160,7 @@ impl CompatibilityIntent {
                     &mut fe,
                     "native-observation",
                     json!({
-                        "action":"bind-grpc-fragment", "root":root, "backend_index":index,
+                        "action":"bind-task-protocol", "root":root, "backend_index":index,
                         "statement_run_token":token, "target_session_id":be.reference.session_id,
                         "target_process_receipt":be.reference.process_receipt,
                     }),
@@ -170,7 +170,7 @@ impl CompatibilityIntent {
                     be,
                     "native-observation",
                     json!({
-                        "action":"grpc-fragment", "root":root, "backend_index":index,
+                        "action":novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), "root":root, "backend_index":index,
                         "statement_run_token":token, "target_session_id":target_session, "max_events":16384,
                     }),
                 );
@@ -277,7 +277,7 @@ pub(super) fn run_baselines(
         for &backend in expected_backends {
             context.handle().assert_be_log(
                 backend,
-                super::super::task_evidence::CONTEXT_ESTABLISH_APPLIED,
+                super::super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED,
             )?;
         }
         Ok(())
@@ -293,7 +293,7 @@ fn require_public_error_reentry(connection: &mut mysql::Conn) -> Result<()> {
 }
 
 fn settle_sql_observation(
-    handle: &mut dyn ServerHandle,
+    handle: &mut dyn TestClusterOwner,
     observation: &QueryLifecycleStatementObservation,
     sql_succeeded: bool,
     deadline: Instant,
@@ -423,7 +423,7 @@ impl std::fmt::Debug for SourcePanic {
 impl std::error::Error for SourcePanic {}
 
 pub(super) fn run_peer_baseline(
-    target: &mut CrossProcessServerHandle,
+    target: &mut CrossProcessCluster,
     selected: SelectedStatement,
     sql: &str,
     deadline: Instant,

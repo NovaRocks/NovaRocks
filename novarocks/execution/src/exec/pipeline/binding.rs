@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::exec::node::scan::ScanOp;
 use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::fragment::io::ExchangeReceiverPort;
+use crate::runtime::task::io::ExchangeReceiverPort;
 
 /// Instance-materialized exchange input for a single exchange-source node.
 #[derive(Clone)]
@@ -89,13 +89,13 @@ impl std::fmt::Debug for ScanBindings {
 mod tests {
     use super::*;
     use crate::runtime::exchange::ExchangeKey;
-    use crate::runtime::fragment::io::UnavailableExchangeReceiverPort;
+    use crate::runtime::task::io::UnavailableExchangeReceiverPort;
 
     #[test]
     fn exchange_bindings_lookup_by_node_id() {
         let key = ExchangeKey {
-            finst_id_hi: 1,
-            finst_id_lo: 2,
+            task_key_hi: 1,
+            task_key_lo: 2,
             node_id: 7,
         };
         let mut b = ExchangeBindings::default();

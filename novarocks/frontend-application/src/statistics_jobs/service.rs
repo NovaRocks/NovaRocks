@@ -138,11 +138,11 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         })?;
         let origin = capacity.try_window_alias().map_err(fail)?;
         let scope = capacity.scope().clone();
-        let planning = self.target_resolver.planning_lease(&target)?;
-        let lease = planning
+        let planning = self.target_resolver.planning_pin(&target)?;
+        let statistics_session = planning
             .derive_statistics_lease()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
-        let profile = lease
+        let profile = statistics_session
             .collection_io_profile()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
         // Original inline Source declaration only; it is neither an SDK
@@ -161,7 +161,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
                 columns,
                 context,
                 planning,
-                lease,
+                statistics_session,
                 #[cfg(novarocks_dev_controls)]
                 nomination: execution.test_statement_nomination().cloned(),
             }),
@@ -691,8 +691,8 @@ struct StatisticsSubmitInput {
     target: application::StatisticsTableTarget,
     columns: application::StatisticsColumnIntent,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    planning: novarocks_spi::connector::ConnectorControlPlanningLease,
-    lease: novarocks_spi::connector::ConnectorStatisticsLease,
+    planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    statistics_session: novarocks_spi::connector::ConnectorStatisticsSession,
     #[cfg(novarocks_dev_controls)]
     nomination: Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
 }
@@ -760,7 +760,7 @@ impl novarocks_query_application::session_control::GovernedStatementAction
                 .statistics_binding_cpu_port(
                     &work.scope(),
                     self.origin.clone(),
-                    &input.lease,
+                    &input.statistics_session,
                     self.cancellation.clone(),
                     self.runtime.clone(),
                     self.wake.clone(),
@@ -947,7 +947,7 @@ async fn prepare_statistics_submission(
         columns,
         context,
         planning,
-        lease,
+        statistics_session,
         #[cfg(novarocks_dev_controls)]
         nomination,
     } = input;
@@ -956,7 +956,7 @@ async fn prepare_statistics_submission(
         .await?;
     novarocks_spi::connector::ConnectorOperationControl::check_active(&context)
         .map_err(|e| application::StatisticsApplicationError::new(e.to_string()))?;
-    let profile = lease
+    let profile = statistics_session
         .collection_io_profile()
         .map_err(application::StatisticsApplicationError::from_connector_error)?;
     let submitted_at_ms = now_ms().map_err(application::StatisticsApplicationError::new)?;

@@ -144,7 +144,7 @@ fn seed_position_rewrite(lake: &FrozenRewriteLake) {
     let result = lake
         .control
         .finish_write(ConnectorWriteFinishRequest {
-            commit: session.commit_handle(),
+            commit: session.commit_session(),
             prepared: set,
             statistics: Vec::new(),
             publication: ConnectorWriteFinishPublication::None,
@@ -225,7 +225,7 @@ fn provider_position_rewrite_preparation_begins_with_its_exact_identity_roles() 
     assert!(matches!(
         lake.control
             .abort_write(ConnectorWriteSessionAbortRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context: request_context(),
                 received: None,
@@ -531,7 +531,7 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
     assert!(matches!(
         lake.control
             .abort_write(ConnectorWriteSessionAbortRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context,
                 received: None,
@@ -633,7 +633,7 @@ fn ordinary_equality_delete_sessions_apply_the_existing_table_shape_guards() {
             Ok(session) => {
                 lake.control
                     .abort_write(ConnectorWriteSessionAbortRequest {
-                        commit: session.commit_handle(),
+                        commit: session.commit_session(),
                         production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                         context,
                         received: None,

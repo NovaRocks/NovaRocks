@@ -39,8 +39,8 @@ use crate::{
         pipeline::operator::{ConstructionFailure, InputConstructionOwner},
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         mem_tracker::MemTracker,
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use arrow::{
@@ -63,7 +63,7 @@ fn assert_value_failure(
     error: &ExecutionFailure,
     expected: novarocks_value_arrays::ValueViolation,
 ) {
-    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::task::ExecutionFailureCause;
     use novarocks_failure_contract::FailureProjection;
     use novarocks_value_arrays::ValueError;
     assert_eq!(

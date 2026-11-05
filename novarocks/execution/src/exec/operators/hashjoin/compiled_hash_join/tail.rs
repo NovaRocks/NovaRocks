@@ -23,7 +23,7 @@ use super::super::{
     build_finalize::{FinalizedBuild, JoinBuildFrame},
     build_state::build_contract,
     join_completion::{RemainingDemand, funded_vec},
-    tail_ranges::{TailClaim, TailLease},
+    tail_ranges::{TailClaim, TailObligation},
 };
 use super::frame::CompiledJoinFrame;
 use super::*;
@@ -77,7 +77,7 @@ impl OperatorFactory for CompiledJoinTailSourceFactory {
             tracker: None,
             frame: None,
             prepared: None,
-            lease: None,
+            obligation: None,
             position: 0,
             done: false,
             prepare_failure: invalid,
@@ -98,7 +98,7 @@ struct JoinTail {
     tracker: Option<Arc<MemTracker>>,
     frame: Option<Arc<JoinBuildFrame>>,
     prepared: Option<TailPreparation>,
-    lease: Option<TailLease<FinalizedBuild>>,
+    obligation: Option<TailObligation<FinalizedBuild>>,
     position: usize,
     done: bool,
     prepare_failure: Option<ExecutionFailure>,
@@ -118,10 +118,10 @@ impl JoinTail {
             .frame
             .as_ref()
             .map_or_else(|| cause.clone(), |frame| frame.fail(cause.clone()));
-        if let Some(lease) = self.lease.as_mut() {
+        if let Some(lease) = self.obligation.as_mut() {
             lease.fail(cause.clone());
         }
-        self.lease = None;
+        self.obligation = None;
         cause
     }
     fn exit(&mut self) -> ExecutionResult<()> {
@@ -129,7 +129,7 @@ impl JoinTail {
             self.fail(cause);
             return Ok(());
         }
-        if let Some(lease) = self.lease.as_mut() {
+        if let Some(lease) = self.obligation.as_mut() {
             if lease.check()? == RemainingDemand::Released {
                 lease.withdraw_after_demand_released()?;
             } else {
@@ -138,7 +138,7 @@ impl JoinTail {
                 )));
             }
         }
-        self.lease = None;
+        self.obligation = None;
         Ok(())
     }
     fn wait(
@@ -308,7 +308,7 @@ impl SourceKernel for JoinTail {
             .as_ref()
             .map(|frame| frame.completion.observable())
     }
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(cause) = self.error.error() {
             return Err(self.fail(cause));
         }
@@ -320,7 +320,7 @@ impl SourceKernel for JoinTail {
             Ok(ControlStep::Active)
         }
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let result = (|| -> ExecutionResult<StepResult> {
             if self.done {
                 return Ok(StepResult::new(None, NextStep::Finished, 0));
@@ -330,25 +330,25 @@ impl SourceKernel for JoinTail {
             let generation = observable.generation();
             frame.completion.check()?;
             if frame.completion.remaining_demand()? == RemainingDemand::Released {
-                if let Some(lease) = self.lease.as_mut() {
+                if let Some(lease) = self.obligation.as_mut() {
                     lease.withdraw_after_demand_released()?;
                 }
-                self.lease = None;
+                self.obligation = None;
                 self.done = true;
                 return Ok(StepResult::new(None, NextStep::Finished, 0));
             }
             if self
-                .lease
+                .obligation
                 .as_ref()
                 .is_some_and(|lease| self.position == lease.rows().end)
             {
                 // Re-entry proves the last returned page transferred. Completing
                 // in its producing call could expose EOS before that page.
-                self.lease
+                self.obligation
                     .as_mut()
                     .expect("original pending range")
                     .complete_after_output()?;
-                self.lease = None;
+                self.obligation = None;
             }
             if frame.completion.published()?.is_none() {
                 return Ok(self.wait(observable, generation));
@@ -375,7 +375,7 @@ impl SourceKernel for JoinTail {
                 NonZeroUsize::new(RANGE_ROWS).expect("nonzero working range"),
                 &work,
             )?;
-            if self.lease.is_none() {
+            if self.obligation.is_none() {
                 match ranges.claim()? {
                     TailClaim::Pending => return Ok(self.wait(observable, generation)),
                     TailClaim::Unavailable => {
@@ -393,11 +393,11 @@ impl SourceKernel for JoinTail {
                     }
                     TailClaim::Range(lease) => {
                         self.position = lease.rows().start;
-                        self.lease = Some(lease);
+                        self.obligation = Some(lease);
                     }
                 }
             }
-            let lease = self.lease.as_ref().expect("claimed original range");
+            let lease = self.obligation.as_ref().expect("claimed original range");
             let data = lease.artifact();
             let bits = data.matches.as_ref().ok_or_else(|| {
                 build_contract("tail publication has no original fixed match bitmap")

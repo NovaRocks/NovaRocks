@@ -18,8 +18,8 @@
 //! This view never chooses a first cause, turns a notification into a decision,
 //! or keeps an independent logical conclusion.
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionReason, ExecutionResult},
     observable::Observable,
+    task::{ExecutionFailure, ExecutionReason, ExecutionResult},
 };
 #[cfg(test)]
 use novarocks_execution_contract::{AbortCause, CancelReason};
@@ -265,7 +265,7 @@ impl TaskExecutionControl {
         }
     }
 }
-impl crate::runtime::fragment::ExecutionFailureReporter for TaskExecutionControl {
+impl crate::runtime::task::ExecutionFailureReporter for TaskExecutionControl {
     fn report_cleanup(&self, cause: &ExecutionFailure) {
         TaskExecutionControl::report_cleanup(self, cause);
     }
@@ -348,50 +348,58 @@ pub(crate) mod test_support {
         // one settlement child) and two independent observation roles. Issuing a
         // permit consumes its original position; registration never adds credit.
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub(super) enum FixtureRolePhase {
+        pub(super) enum FixtureCompletionPhase {
             Reserved,
             Issued,
             Started,
             Exited,
             Unresolved,
         }
-        pub(super) struct FixtureRoles(Mutex<[FixtureRolePhase; 6]>);
-        impl FixtureRoles {
+        /// Finite inventory of original completion positions. Individual
+        /// capabilities author transitions; sharing this inventory creates no
+        /// additional completion capability.
+        pub(super) struct FixtureCompletionInventory(Mutex<[FixtureCompletionPhase; 6]>);
+        impl FixtureCompletionInventory {
             pub(super) fn new() -> Arc<Self> {
-                Arc::new(Self(Mutex::new([FixtureRolePhase::Reserved; 6])))
+                Arc::new(Self(Mutex::new([FixtureCompletionPhase::Reserved; 6])))
             }
             pub(super) fn issue(&self, indexes: &[usize]) {
-                let mut roles = self.0.lock().unwrap();
+                let mut phases = self.0.lock().unwrap();
                 assert!(
                     indexes
                         .iter()
-                        .all(|i| roles[*i] == FixtureRolePhase::Reserved),
+                        .all(|i| phases[*i] == FixtureCompletionPhase::Reserved),
                     "fixture role admission is finite and cannot be repeated"
                 );
                 for i in indexes {
-                    roles[*i] = FixtureRolePhase::Issued;
+                    phases[*i] = FixtureCompletionPhase::Issued;
                 }
             }
-            fn transition(&self, index: usize, expected: FixtureRolePhase, next: FixtureRolePhase) {
-                let mut roles = self.0.lock().unwrap();
+            fn transition(
+                &self,
+                index: usize,
+                expected: FixtureCompletionPhase,
+                next: FixtureCompletionPhase,
+            ) {
+                let mut phases = self.0.lock().unwrap();
                 assert_eq!(
-                    roles[index], expected,
+                    phases[index], expected,
                     "the original fixture role owns its exit"
                 );
-                roles[index] = next;
+                phases[index] = next;
             }
             pub(super) fn take_observation(&self) -> Option<usize> {
-                let mut roles = self.0.lock().unwrap();
-                let index = (4..6).find(|i| roles[*i] == FixtureRolePhase::Reserved)?;
-                roles[index] = FixtureRolePhase::Issued;
+                let mut phases = self.0.lock().unwrap();
+                let index = (4..6).find(|i| phases[*i] == FixtureCompletionPhase::Reserved)?;
+                phases[index] = FixtureCompletionPhase::Issued;
                 Some(index)
             }
-            pub(super) fn phases(&self) -> [FixtureRolePhase; 6] {
+            pub(super) fn phases(&self) -> [FixtureCompletionPhase; 6] {
                 *self.0.lock().unwrap()
             }
         }
         struct FixtureOriginal {
-            pool: Arc<FixtureRoles>,
+            pool: Arc<FixtureCompletionInventory>,
             index: usize,
             started: bool,
         }
@@ -399,8 +407,8 @@ pub(crate) mod test_support {
             fn started(&mut self) {
                 self.pool.transition(
                     self.index,
-                    FixtureRolePhase::Issued,
-                    FixtureRolePhase::Started,
+                    FixtureCompletionPhase::Issued,
+                    FixtureCompletionPhase::Started,
                 );
                 self.started = true;
             }
@@ -408,40 +416,40 @@ pub(crate) mod test_support {
                 self.pool.transition(
                     self.index,
                     if self.started {
-                        FixtureRolePhase::Started
+                        FixtureCompletionPhase::Started
                     } else {
-                        FixtureRolePhase::Issued
+                        FixtureCompletionPhase::Issued
                     },
-                    FixtureRolePhase::Exited,
+                    FixtureCompletionPhase::Exited,
                 );
             }
             fn unused_exited(self: Box<Self>) {
                 self.pool.transition(
                     self.index,
-                    FixtureRolePhase::Issued,
-                    FixtureRolePhase::Exited,
+                    FixtureCompletionPhase::Issued,
+                    FixtureCompletionPhase::Exited,
                 );
             }
             fn unresolved(self: Box<Self>) {
                 self.pool.transition(
                     self.index,
                     if self.started {
-                        FixtureRolePhase::Started
+                        FixtureCompletionPhase::Started
                     } else {
-                        FixtureRolePhase::Issued
+                        FixtureCompletionPhase::Issued
                     },
-                    FixtureRolePhase::Unresolved,
+                    FixtureCompletionPhase::Unresolved,
                 );
             }
         }
         type RegistrationRoute = Box<dyn FnOnce(SettledContinuation<ExecutionFailure>) + Send>;
         struct FixturePermit {
-            pool: Arc<FixtureRoles>,
+            pool: Arc<FixtureCompletionInventory>,
             index: usize,
             route: RegistrationRoute,
         }
         struct FixtureCall {
-            pool: Arc<FixtureRoles>,
+            pool: Arc<FixtureCompletionInventory>,
             index: usize,
             exited: bool,
         }
@@ -449,11 +457,11 @@ pub(crate) mod test_support {
             fn drop(&mut self) {
                 self.pool.transition(
                     self.index,
-                    FixtureRolePhase::Started,
+                    FixtureCompletionPhase::Started,
                     if self.exited {
-                        FixtureRolePhase::Exited
+                        FixtureCompletionPhase::Exited
                     } else {
-                        FixtureRolePhase::Unresolved
+                        FixtureCompletionPhase::Unresolved
                     },
                 );
             }
@@ -462,7 +470,11 @@ pub(crate) mod test_support {
             fn register(self: Box<Self>, continuation: SettledContinuation<ExecutionFailure>) {
                 let Self { pool, index, route } = *self;
                 route(Box::new(move |snapshot| {
-                    pool.transition(index, FixtureRolePhase::Issued, FixtureRolePhase::Started);
+                    pool.transition(
+                        index,
+                        FixtureCompletionPhase::Issued,
+                        FixtureCompletionPhase::Started,
+                    );
                     let mut call = FixtureCall {
                         pool,
                         index,
@@ -475,27 +487,27 @@ pub(crate) mod test_support {
             fn revoke_unused(self: Box<Self>) {
                 self.pool.transition(
                     self.index,
-                    FixtureRolePhase::Issued,
-                    FixtureRolePhase::Exited,
+                    FixtureCompletionPhase::Issued,
+                    FixtureCompletionPhase::Exited,
                 );
             }
         }
         pub(super) fn fixture_permit(
             identity: TaskIdentity,
-            pool: Arc<FixtureRoles>,
+            pool: Arc<FixtureCompletionInventory>,
             index: usize,
             route: RegistrationRoute,
         ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
-            novarocks_execution_contract::SettlementPermit::from_admitted_role(
+            novarocks_execution_contract::SettlementPermit::from_admitted_reservation(
                 identity,
                 Box::new(FixturePermit { pool, index, route }),
             )
         }
-        pub(super) fn fixture_fragment_roles(
+        pub(super) fn fixture_completion_work(
             identity: TaskIdentity,
-            pool: Arc<FixtureRoles>,
+            pool: Arc<FixtureCompletionInventory>,
             route: RegistrationRoute,
-        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+        ) -> novarocks_execution_contract::AdmittedWorkParts<ExecutionFailure> {
             pool.issue(&[0, 1, 2, 3]);
             let permit = fixture_permit(identity, pool.clone(), 3, route);
             let work = |index| {
@@ -506,15 +518,18 @@ pub(crate) mod test_support {
                 })
                     as Box<dyn novarocks_execution_contract::CompletionWorkCapability>
             };
-            novarocks_execution_contract::AdmittedFragmentRoles::from_admitted_roles(
-                novarocks_execution_contract::AdmittedFinisher::from_admitted_role(permit, work(0)),
+            novarocks_execution_contract::AdmittedWorkParts::from_admitted_parts(
+                novarocks_execution_contract::AdmittedFinisher::from_admitted_parts(
+                    permit,
+                    work(0),
+                ),
                 work(1),
                 work(2),
             )
         }
     }
     #[cfg(test)]
-    use finite_fixture::{FixtureRoles, fixture_fragment_roles, fixture_permit};
+    use finite_fixture::{FixtureCompletionInventory, fixture_completion_work, fixture_permit};
     // Project a source on its reporting thread before either queue or owner lock.
     struct PreparedConclusion {
         reported_evidence: Option<novarocks_failure_contract::FailureEvidence>,
@@ -526,7 +541,7 @@ pub(crate) mod test_support {
         cleanup: Mutex<[Option<FailureFact>; 4]>,
         identity: TaskIdentity,
         #[cfg(test)]
-        roles: Arc<FixtureRoles>,
+        completion_inventory: Arc<FixtureCompletionInventory>,
         accepted: Mutex<Option<Snapshot>>,
         stopped: AtomicBool,
         cv: Condvar,
@@ -549,7 +564,7 @@ pub(crate) mod test_support {
                 cleanup: Mutex::new([None; 4]),
                 identity,
                 #[cfg(test)]
-                roles: FixtureRoles::new(),
+                completion_inventory: FixtureCompletionInventory::new(),
                 accepted: Mutex::new(None),
                 stopped: AtomicBool::new(false),
                 cv: Condvar::new(),
@@ -561,13 +576,13 @@ pub(crate) mod test_support {
             TaskExecutionControl::new(self.identity, self.clone(), phase).unwrap()
         }
         #[cfg(test)]
-        pub(crate) fn admit_completion_roles(
+        pub(crate) fn issue_fixture_completion_work(
             self: &Arc<Self>,
-        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+        ) -> novarocks_execution_contract::AdmittedWorkParts<ExecutionFailure> {
             let owner = self.clone();
-            fixture_fragment_roles(
+            fixture_completion_work(
                 self.identity,
-                self.roles.clone(),
+                self.completion_inventory.clone(),
                 Box::new(move |callback| callback(owner.accepted())),
             )
         }
@@ -576,13 +591,13 @@ pub(crate) mod test_support {
             self: &Arc<Self>,
         ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
             let index = self
-                .roles
+                .completion_inventory
                 .take_observation()
                 .expect("both prepaid observation roles were consumed");
             let owner = self.clone();
             fixture_permit(
                 self.identity,
-                self.roles.clone(),
+                self.completion_inventory.clone(),
                 index,
                 Box::new(move |callback| callback(owner.accepted())),
             )
@@ -762,13 +777,13 @@ pub(crate) mod test_support {
             TaskExecutionControl::new(self.identity(), self.clone(), phase).unwrap()
         }
         #[cfg(test)]
-        pub(crate) fn admit_completion_roles(
+        pub(crate) fn issue_fixture_completion_work(
             self: &Arc<Self>,
-        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+        ) -> novarocks_execution_contract::AdmittedWorkParts<ExecutionFailure> {
             let owner = self.clone();
-            fixture_fragment_roles(
+            fixture_completion_work(
                 self.identity(),
-                self.owner.roles.clone(),
+                self.owner.completion_inventory.clone(),
                 Box::new(move |callback| owner.route_admitted(callback)),
             )
         }
@@ -778,13 +793,13 @@ pub(crate) mod test_support {
         ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
             let index = self
                 .owner
-                .roles
+                .completion_inventory
                 .take_observation()
                 .expect("both prepaid observation roles were consumed");
             let owner = self.clone();
             fixture_permit(
                 self.identity(),
-                self.owner.roles.clone(),
+                self.owner.completion_inventory.clone(),
                 index,
                 Box::new(move |callback| owner.route_admitted(callback)),
             )
@@ -978,16 +993,16 @@ pub(crate) mod test_support {
         );
     }
     #[test]
-    fn fixture_admission_prepays_original_fragment_and_finite_observer_roles_once() {
-        use finite_fixture::FixtureRolePhase as Phase;
+    fn fixture_admission_prepays_original_task_and_finite_observer_work_once() {
+        use finite_fixture::FixtureCompletionPhase as Phase;
         let owner = Owner::new();
-        assert_eq!(owner.roles.phases(), [Phase::Reserved; 6]);
-        let originals = owner.admit_completion_roles();
+        assert_eq!(owner.completion_inventory.phases(), [Phase::Reserved; 6]);
+        let originals = owner.issue_fixture_completion_work();
         let one = owner.admit_barrier();
         let two = owner.admit_barrier();
-        assert_eq!(owner.roles.phases(), [Phase::Issued; 6]);
+        assert_eq!(owner.completion_inventory.phases(), [Phase::Issued; 6]);
         assert!(
-            owner.roles.take_observation().is_none(),
+            owner.completion_inventory.take_observation().is_none(),
             "clone count cannot create another role"
         );
         let calls = Arc::new(AtomicUsize::new(0));
@@ -996,14 +1011,14 @@ pub(crate) mod test_support {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(owner.roles.phases()[4], Phase::Exited);
-        assert_eq!(owner.roles.phases()[5], Phase::Issued);
+        assert_eq!(owner.completion_inventory.phases()[4], Phase::Exited);
+        assert_eq!(owner.completion_inventory.phases()[5], Phase::Issued);
         drop(two);
-        assert_eq!(owner.roles.phases()[5], Phase::Exited);
+        assert_eq!(owner.completion_inventory.phases()[5], Phase::Exited);
         drop(originals);
-        assert_eq!(owner.roles.phases(), [Phase::Exited; 6]);
+        assert_eq!(owner.completion_inventory.phases(), [Phase::Exited; 6]);
         assert!(
-            owner.roles.take_observation().is_none(),
+            owner.completion_inventory.take_observation().is_none(),
             "exited positions are not newly signed credentials"
         );
     }
@@ -1245,7 +1260,7 @@ pub(crate) mod test_support {
     #[test]
     fn fragment_group_has_only_physical_completion_and_the_same_task_acceptance() {
         use crate::exec::pipeline::{
-            fragment_context::FragmentContext, global_driver_executor::FragmentCompletion,
+            global_driver_executor::DriverGroupCompletion, task_context::TaskContext,
         };
         use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
         let owner = Owner::new();
@@ -1261,8 +1276,8 @@ pub(crate) mod test_support {
                 owner.view(TaskFailurePhase::Execution),
             ))),
         ));
-        let fragment = FragmentContext::new(None, state.clone(), None, None, None, None);
-        let completion = FragmentCompletion::new(2, state.error_state());
+        let fragment = TaskContext::new(None, state.clone(), None, None, None, None);
+        let completion = DriverGroupCompletion::new(2, state.error_state());
         let reentered = Arc::new(AtomicUsize::new(0));
         let callback_count = reentered.clone();
         let callback_completion = Arc::downgrade(&completion);
@@ -1306,7 +1321,7 @@ pub(crate) mod test_support {
         assert!(completion.driver_finished());
         assert!(completion.wait().unwrap_err().same_occurrence(&original));
         let owner = Owner::new();
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             0,
             Arc::new(RuntimeErrorState::for_task(Arc::new(
                 owner.view(TaskFailurePhase::Execution),
@@ -1339,13 +1354,13 @@ pub(crate) mod test_support {
 
     #[test]
     fn task_runtime_requires_exact_actual_control_and_local_execution_stays_taskless() {
-        use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+        use crate::runtime::task::runtime_state::{RuntimeStateInputs, build_runtime_state};
         let owner = Owner::new();
         let other = Owner::new();
         let inputs = |task_identity, task_control| RuntimeStateInputs {
             query_options: None,
             query_id: None,
-            fragment_instance_id: None,
+            task_key: None,
             backend_num: None,
             mem_tracker: None,
             runtime_filter_session: None,

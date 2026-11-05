@@ -17,8 +17,8 @@
 
 //! Pure covered observation, using the same selection/delivery distinction as production.
 use novarocks_execution_contract::{
-    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextRef,
-    QuiesceQueryContextReceipt, TaskConvergenceCursor, TaskConvergenceReceipt, TaskIdentity,
+    ParticipationConvergenceCursor, ParticipationConvergenceReceipt, ParticipationRef,
+    QuiesceParticipationReceipt, TaskConvergenceCursor, TaskConvergenceReceipt, TaskIdentity,
     TaskStatus, TaskStatusCursor,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -37,8 +37,8 @@ pub enum CoveredObservationFact {
     Gone(TaskIdentity),
     TaskConvergence(TaskConvergenceReceipt),
     TaskConvergenceUnchanged(TaskIdentity),
-    ContextConvergence(QueryContextConvergenceReceipt),
-    Quiesce(Arc<QuiesceQueryContextReceipt>),
+    ParticipationConvergence(ParticipationConvergenceReceipt),
+    Quiesce(Arc<QuiesceParticipationReceipt>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,17 +71,17 @@ pub struct CoveredObservationBookmark {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct QuiesceObservationCursor {
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub fence_version: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoveredSubscriptionError {
     InvalidGeneration,
-    MismatchedContext,
+    MismatchedParticipation,
     FutureTaskCursor(TaskIdentity),
     FutureTaskConvergenceCursor(TaskIdentity),
-    FutureContextCursor,
+    FutureParticipationCursor,
     FutureQuiesceCursor,
     TargetLimitExceeded,
     InitialSnapshotTooLarge { bytes: usize, limit: usize },
@@ -109,7 +109,7 @@ pub enum ObservationKey {
     Status(TaskIdentity),
     Gone(TaskIdentity),
     TaskConvergence(TaskIdentity),
-    ContextConvergence,
+    ParticipationConvergence,
     Quiesce,
 }
 
@@ -153,7 +153,7 @@ impl CoveredSubscriberState {
             ObservationKey::Status(identity)
             | ObservationKey::Gone(identity)
             | ObservationKey::TaskConvergence(identity) => Some(identity),
-            ObservationKey::ContextConvergence | ObservationKey::Quiesce => None,
+            ObservationKey::ParticipationConvergence | ObservationKey::Quiesce => None,
         };
         if let Some(identity) = identity
             && !self.tracked.contains(&identity)
@@ -213,7 +213,7 @@ struct StoredFact {
 pub struct CoveredSubscriptionRequest {
     pub status: Vec<TaskStatusCursor>,
     pub convergence: Vec<TaskConvergenceCursor>,
-    pub context: Option<QueryContextConvergenceCursor>,
+    pub participation: Option<ParticipationConvergenceCursor>,
     pub quiesce: Option<QuiesceObservationCursor>,
     pub required: Vec<TaskIdentity>,
 }
@@ -225,8 +225,8 @@ struct InitialCatchUp {
     required_index: usize,
     requested: BTreeSet<TaskIdentity>,
     convergence_requested: BTreeSet<TaskIdentity>,
-    context_cursor: Option<QueryContextConvergenceCursor>,
-    context_observed: Option<novarocks_execution_contract::QueryContextConvergenceVersion>,
+    participation_cursor: Option<ParticipationConvergenceCursor>,
+    participation_observed: Option<novarocks_execution_contract::ParticipationConvergenceVersion>,
     quiesce_cursor: Option<QuiesceObservationCursor>,
     scan_after: Option<ObservationKey>,
     bytes: usize,
@@ -272,7 +272,7 @@ pub struct ObservationProgress {
 }
 #[derive(Debug)]
 pub struct ObservationSource {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     revision: u64,
     facts: BTreeMap<ObservationKey, StoredFact>,
     subscribers: BTreeMap<SubscriptionId, CoveredSubscriberState>,
@@ -292,7 +292,9 @@ fn key(fact: &CoveredObservationFact) -> ObservationKey {
         CoveredObservationFact::Gone(t) => ObservationKey::Gone(*t),
         CoveredObservationFact::TaskConvergence(r) => ObservationKey::TaskConvergence(r.identity()),
         CoveredObservationFact::TaskConvergenceUnchanged(t) => ObservationKey::TaskConvergence(*t),
-        CoveredObservationFact::ContextConvergence(_) => ObservationKey::ContextConvergence,
+        CoveredObservationFact::ParticipationConvergence(_) => {
+            ObservationKey::ParticipationConvergence
+        }
         CoveredObservationFact::Quiesce(_) => ObservationKey::Quiesce,
     }
 }
@@ -306,14 +308,14 @@ fn task(key: ObservationKey) -> Option<TaskIdentity> {
 }
 impl ObservationSource {
     pub fn new(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         max_tasks: usize,
         max_subscribers: usize,
         max_frame_bytes: usize,
         max_initial_bytes: usize,
     ) -> Self {
         Self {
-            context,
+            participation,
             revision: 0,
             facts: BTreeMap::new(),
             subscribers: BTreeMap::new(),
@@ -348,16 +350,18 @@ impl ObservationSource {
         }
         let k = key(&fact);
         if let Some(t) = task(k)
-            && t.verify_query_context(self.context).is_err()
+            && t.verify_participation(self.participation).is_err()
         {
-            return Err(CoveredSubscriptionError::MismatchedContext);
+            return Err(CoveredSubscriptionError::MismatchedParticipation);
         }
         match &fact {
-            CoveredObservationFact::ContextConvergence(r) if r.context() != self.context => {
-                return Err(CoveredSubscriptionError::MismatchedContext);
+            CoveredObservationFact::ParticipationConvergence(r)
+                if r.participation() != self.participation =>
+            {
+                return Err(CoveredSubscriptionError::MismatchedParticipation);
             }
-            CoveredObservationFact::Quiesce(r) if r.context() != self.context => {
-                return Err(CoveredSubscriptionError::MismatchedContext);
+            CoveredObservationFact::Quiesce(r) if r.participation() != self.participation => {
+                return Err(CoveredSubscriptionError::MismatchedParticipation);
             }
             _ => {}
         }
@@ -402,8 +406,8 @@ impl ObservationSource {
                     CoveredObservationFact::TaskConvergence(new),
                 ) => Some(new.version().cmp(&old.version())),
                 (
-                    CoveredObservationFact::ContextConvergence(old),
-                    CoveredObservationFact::ContextConvergence(new),
+                    CoveredObservationFact::ParticipationConvergence(old),
+                    CoveredObservationFact::ParticipationConvergence(new),
                 ) => Some(new.version().cmp(&old.version())),
                 _ => None,
             };
@@ -571,8 +575,10 @@ impl ObservationSource {
                     convergence_index: 0,
                     required_index: 0,
                     convergence_requested: BTreeSet::new(),
-                    context_observed: request.context.and_then(|cursor| cursor.current_version()),
-                    context_cursor: request.context,
+                    participation_observed: request
+                        .participation
+                        .and_then(|cursor| cursor.current_version()),
+                    participation_cursor: request.participation,
                     quiesce_cursor: request.quiesce,
                     position: request,
                     requested: BTreeSet::new(),
@@ -658,8 +664,8 @@ impl ObservationSource {
             if let Some(cursor) = initial.next_status() {
                 work += 1;
                 let identity = cursor.identity();
-                if identity.verify_query_context(self.context).is_err() {
-                    return Err(CoveredSubscriptionError::MismatchedContext);
+                if identity.verify_participation(self.participation).is_err() {
+                    return Err(CoveredSubscriptionError::MismatchedParticipation);
                 }
                 if !initial.requested.insert(identity) {
                     continue;
@@ -705,8 +711,8 @@ impl ObservationSource {
             } else if let Some(cursor) = initial.next_convergence() {
                 work += 1;
                 let identity = cursor.identity();
-                if identity.verify_query_context(self.context).is_err() {
-                    return Err(CoveredSubscriptionError::MismatchedContext);
+                if identity.verify_participation(self.participation).is_err() {
+                    return Err(CoveredSubscriptionError::MismatchedParticipation);
                 }
                 if !initial.convergence_requested.insert(identity) {
                     continue;
@@ -757,8 +763,8 @@ impl ObservationSource {
                 }
             } else if let Some(identity) = initial.next_required() {
                 work += 1;
-                if identity.verify_query_context(self.context).is_err() {
-                    return Err(CoveredSubscriptionError::MismatchedContext);
+                if identity.verify_participation(self.participation).is_err() {
+                    return Err(CoveredSubscriptionError::MismatchedParticipation);
                 }
                 subscriber.tracked.insert(identity);
                 if initial.requested.insert(identity) {
@@ -771,19 +777,19 @@ impl ObservationSource {
                     initial.bytes = initial.bytes.saturating_add(bytes);
                     subscriber.initial.push_back(fact);
                 }
-            } else if let Some(cursor) = initial.context_cursor.take() {
+            } else if let Some(cursor) = initial.participation_cursor.take() {
                 work += 1;
-                if cursor.context() != self.context {
-                    return Err(CoveredSubscriptionError::MismatchedContext);
+                if cursor.participation() != self.participation {
+                    return Err(CoveredSubscriptionError::MismatchedParticipation);
                 }
-                let stored = frozen(ObservationKey::ContextConvergence, &initial.overrides);
+                let stored = frozen(ObservationKey::ParticipationConvergence, &initial.overrides);
                 if let Some(version) = cursor.current_version()
-                    && stored.as_ref().is_none_or(|stored| !matches!(stored.fact, CoveredObservationFact::ContextConvergence(receipt) if version <= receipt.version()))
-                { return Err(CoveredSubscriptionError::FutureContextCursor); }
+                    && stored.as_ref().is_none_or(|stored| !matches!(stored.fact, CoveredObservationFact::ParticipationConvergence(receipt) if version <= receipt.version()))
+                { return Err(CoveredSubscriptionError::FutureParticipationCursor); }
             } else if let Some(cursor) = initial.quiesce_cursor.take() {
                 work += 1;
-                if cursor.context != self.context {
-                    return Err(CoveredSubscriptionError::MismatchedContext);
+                if cursor.participation != self.participation {
+                    return Err(CoveredSubscriptionError::MismatchedParticipation);
                 }
                 let stored = frozen(ObservationKey::Quiesce, &initial.overrides);
                 if let Some(version) = cursor.fence_version
@@ -834,8 +840,8 @@ impl ObservationSource {
                     }
                     subscriber.tracked.insert(identity);
                 }
-                if let CoveredObservationFact::ContextConvergence(receipt) = &stored.fact
-                    && initial.context_observed == Some(receipt.version())
+                if let CoveredObservationFact::ParticipationConvergence(receipt) = &stored.fact
+                    && initial.participation_observed == Some(receipt.version())
                 {
                     continue;
                 }

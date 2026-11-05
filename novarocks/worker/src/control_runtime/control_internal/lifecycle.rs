@@ -21,67 +21,66 @@
 
 use super::{ControlInput, ControlInternalError};
 use crate::control_runtime::actors::WorkerActor;
-use crate::control_runtime::context_ready::ContextReadyNotice;
-use novarocks_control_runtime::driver::{ActorRegistration, ActorRuntime};
+use crate::control_runtime::participation_ready::ParticipationReadyNotice;
+use novarocks_control_runtime::actor_turn::{ActorRegistration, ActorRuntime};
 use novarocks_control_runtime_core::identity::{InputId, ScopedWorkRef};
-use novarocks_execution_contract::QueryContextRef;
-use novarocks_worker_protocol::retention::ContextRetirementIdentity;
+use novarocks_execution_contract::ParticipationRef;
+use novarocks_worker_protocol::retention::ParticipationRetirementIdentity;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RootLifecycleFact {
+pub(crate) enum ControlLifecycleFact {
     ExecutionRetired {
-        context: QueryContextRef,
-        retirement: ContextRetirementIdentity,
+        participation: ParticipationRef,
+        retirement: ParticipationRetirementIdentity,
     },
-    ContextExpired {
-        context: QueryContextRef,
-        retirement: ContextRetirementIdentity,
+    ParticipationExpired {
+        participation: ParticipationRef,
+        retirement: ParticipationRetirementIdentity,
     },
     HostRemoved {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         subject: ScopedWorkRef,
     },
 }
-impl RootLifecycleFact {
-    pub(crate) fn context(self) -> QueryContextRef {
+impl ControlLifecycleFact {
+    pub(crate) fn participation(self) -> ParticipationRef {
         match self {
-            Self::ExecutionRetired { context, .. }
-            | Self::ContextExpired { context, .. }
-            | Self::HostRemoved { context, .. } => context,
+            Self::ExecutionRetired { participation, .. }
+            | Self::ParticipationExpired { participation, .. }
+            | Self::HostRemoved { participation, .. } => participation,
         }
     }
-    pub(crate) fn retirement(self) -> Option<ContextRetirementIdentity> {
+    pub(crate) fn retirement(self) -> Option<ParticipationRetirementIdentity> {
         match self {
-            Self::ExecutionRetired { retirement, .. } | Self::ContextExpired { retirement, .. } => {
-                Some(retirement)
-            }
+            Self::ExecutionRetired { retirement, .. }
+            | Self::ParticipationExpired { retirement, .. } => Some(retirement),
             Self::HostRemoved { .. } => None,
         }
     }
     pub(super) fn into_command(self) -> ControlInput {
         match self {
             Self::ExecutionRetired {
-                context,
+                participation,
                 retirement,
             } => ControlInput::ExecutionRetired {
-                context,
+                participation,
                 retirement,
             },
-            Self::ContextExpired {
-                context,
+            Self::ParticipationExpired {
+                participation,
                 retirement,
-            } => ControlInput::ContextExpired {
-                context,
+            } => ControlInput::ParticipationExpired {
+                participation,
                 retirement,
             },
-            Self::HostRemoved { context, .. } => ControlInput::HostRemoved { context },
+            Self::HostRemoved { participation, .. } => ControlInput::HostRemoved { participation },
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RootLifecycleConsumption {
+pub(crate) enum ControlLifecycleConsumption {
     Queued,
     Submitted(InputId),
     Consumed(InputId),
@@ -90,32 +89,36 @@ pub(crate) enum RootLifecycleConsumption {
 /// Clones only read the original source's receipt. Neither consumption nor
 /// retirement of this input proves another Work, Scope or host body exited.
 #[derive(Clone)]
-pub(crate) struct RootLifecycleReceipt(
-    Arc<Mutex<RootLifecycleConsumption>>,
-    RootLifecycleFact,
+pub(crate) struct ControlLifecycleReceipt(
+    Arc<Mutex<ControlLifecycleConsumption>>,
+    ControlLifecycleFact,
     ActorRegistration,
 );
-impl RootLifecycleReceipt {
-    pub(crate) fn fact(&self) -> RootLifecycleFact {
+impl ControlLifecycleReceipt {
+    pub(crate) fn fact(&self) -> ControlLifecycleFact {
         self.1
     }
-    pub(crate) fn consumption(&self) -> RootLifecycleConsumption {
+    pub(crate) fn consumption(&self) -> ControlLifecycleConsumption {
         *self.0.lock().expect("original Root lifecycle receipt")
     }
     pub(crate) fn is_retired(&self) -> bool {
-        self.consumption() == RootLifecycleConsumption::Retired
+        self.consumption() == ControlLifecycleConsumption::Retired
     }
     pub(crate) fn matches_host_removed(
         &self,
         root: &ActorRegistration,
         subject: ScopedWorkRef,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> bool {
         self.2.same_registration(root)
-            && self.1 == (RootLifecycleFact::HostRemoved { context, subject })
+            && self.1
+                == (ControlLifecycleFact::HostRemoved {
+                    participation,
+                    subject,
+                })
     }
 }
-impl std::fmt::Debug for RootLifecycleReceipt {
+impl std::fmt::Debug for ControlLifecycleReceipt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_tuple("RootLifecycleReceipt")
@@ -125,12 +128,12 @@ impl std::fmt::Debug for RootLifecycleReceipt {
 }
 
 pub(super) struct PendingLifecycle {
-    pub(super) fact: RootLifecycleFact,
-    receipt: RootLifecycleReceipt,
+    pub(super) fact: ControlLifecycleFact,
+    receipt: ControlLifecycleReceipt,
     notice: LifecycleNotice,
 }
 enum LifecycleNotice {
-    Context(ContextReadyNotice),
+    Participation(ParticipationReadyNotice),
     Root {
         runtime: ActorRuntime<WorkerActor>,
         registration: ActorRegistration,
@@ -139,7 +142,7 @@ enum LifecycleNotice {
 impl LifecycleNotice {
     fn notify(&self) -> Result<(), ControlInternalError> {
         match self {
-            Self::Context(notice) => {
+            Self::Participation(notice) => {
                 notice.notify();
                 Ok(())
             }
@@ -148,23 +151,23 @@ impl LifecycleNotice {
                 registration,
             } => runtime
                 .notify_host_actor(registration)
-                .map_err(ControlInternalError::Driver),
+                .map_err(ControlInternalError::ActorTurn),
         }
     }
 }
 impl PendingLifecycle {
     pub(super) fn new(
-        fact: RootLifecycleFact,
-        notice: ContextReadyNotice,
+        fact: ControlLifecycleFact,
+        notice: ParticipationReadyNotice,
         root: &ActorRegistration,
-    ) -> (Self, RootLifecycleReceipt) {
-        Self::with_notice(fact, LifecycleNotice::Context(notice), root)
+    ) -> (Self, ControlLifecycleReceipt) {
+        Self::with_notice(fact, LifecycleNotice::Participation(notice), root)
     }
     pub(super) fn for_root(
-        fact: RootLifecycleFact,
+        fact: ControlLifecycleFact,
         runtime: &ActorRuntime<WorkerActor>,
         root: &ActorRegistration,
-    ) -> (Self, RootLifecycleReceipt) {
+    ) -> (Self, ControlLifecycleReceipt) {
         Self::with_notice(
             fact,
             LifecycleNotice::Root {
@@ -175,12 +178,12 @@ impl PendingLifecycle {
         )
     }
     fn with_notice(
-        fact: RootLifecycleFact,
+        fact: ControlLifecycleFact,
         notice: LifecycleNotice,
         root: &ActorRegistration,
-    ) -> (Self, RootLifecycleReceipt) {
-        let receipt = RootLifecycleReceipt(
-            Arc::new(Mutex::new(RootLifecycleConsumption::Queued)),
+    ) -> (Self, ControlLifecycleReceipt) {
+        let receipt = ControlLifecycleReceipt(
+            Arc::new(Mutex::new(ControlLifecycleConsumption::Queued)),
             fact,
             root.clone(),
         );
@@ -199,10 +202,10 @@ impl PendingLifecycle {
             .0
             .lock()
             .expect("original Root lifecycle submission");
-        if *state != RootLifecycleConsumption::Queued {
+        if *state != ControlLifecycleConsumption::Queued {
             return Err(ControlInternalError::WrongOwner);
         }
-        *state = RootLifecycleConsumption::Submitted(input);
+        *state = ControlLifecycleConsumption::Submitted(input);
         Ok(())
     }
     pub(super) fn consumed(&self, input: InputId) -> Result<(), ControlInternalError> {
@@ -212,12 +215,12 @@ impl PendingLifecycle {
             .lock()
             .expect("original Root lifecycle consumption");
         match *state {
-            RootLifecycleConsumption::Submitted(original) if original == input => {
-                *state = RootLifecycleConsumption::Consumed(input);
+            ControlLifecycleConsumption::Submitted(original) if original == input => {
+                *state = ControlLifecycleConsumption::Consumed(input);
                 drop(state);
                 self.notice.notify()
             }
-            RootLifecycleConsumption::Consumed(original) if original == input => Ok(()),
+            ControlLifecycleConsumption::Consumed(original) if original == input => Ok(()),
             _ => Err(ControlInternalError::WrongOwner),
         }
     }
@@ -227,10 +230,10 @@ impl PendingLifecycle {
             .0
             .lock()
             .expect("original Root lifecycle retirement");
-        if *state != RootLifecycleConsumption::Consumed(input) {
+        if *state != ControlLifecycleConsumption::Consumed(input) {
             return Err(ControlInternalError::WrongOwner);
         }
-        *state = RootLifecycleConsumption::Retired;
+        *state = ControlLifecycleConsumption::Retired;
         drop(state);
         self.notice.notify()
     }

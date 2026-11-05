@@ -130,8 +130,8 @@ impl PreparedMvRefreshWrite {
     pub(crate) async fn begin_session_in(
         &self,
         context: novarocks_spi::connector::ConnectorRequestContext,
-        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
-        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        exact_lease: &novarocks_spi::connector::ConnectorWrite,
+        planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
         typed_connector_control: &std::sync::Arc<
             novarocks_catalog_application::ConnectorControlHost,
         >,
@@ -147,7 +147,7 @@ impl PreparedMvRefreshWrite {
                     write,
                     context,
                     exact_lease,
-                    planning_lease,
+                    planning_pin,
                     typed_connector_control,
                     receiving,
                 )
@@ -156,8 +156,11 @@ impl PreparedMvRefreshWrite {
             PreparedMvRefreshWriteArtifact::Incremental(write) => {
                 let request = write.request();
                 if !exact_lease.matches_provider_binding_key(&request.observed_binding)
-                    || exact_lease.control_runtime_id() != planning_lease.control_runtime_id()
-                    || !std::sync::Arc::ptr_eq(target.lease().binding(), planning_lease.binding())
+                    || exact_lease.control_runtime_id() != planning_pin.control_runtime_id()
+                    || !std::sync::Arc::ptr_eq(
+                        target.planning_pin().binding(),
+                        planning_pin.binding(),
+                    )
                     || target.handle() != request.target_table()
                 {
                     return Err(novarocks_spi::connector::ConnectorError::new(
@@ -179,7 +182,7 @@ impl PreparedMvRefreshWrite {
                     &fields,
                     context,
                     exact_lease,
-                    planning_lease,
+                    planning_pin,
                     typed_connector_control,
                     receiving,
                 )

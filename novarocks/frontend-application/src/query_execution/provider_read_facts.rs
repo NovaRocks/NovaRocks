@@ -62,7 +62,7 @@ use novarocks_query_application::preparation::{
     FrozenReadAccess, ProviderReadFactPort, ReadAccessDeposit, ReadAccessSink,
 };
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorControlPlanningLease, ConnectorControlReadBinding, ConnectorError,
+    CatalogProperties, ConnectorControlPlanningPin, ConnectorControlReadBinding, ConnectorError,
     ConnectorPlanningContext, ConnectorReadAttemptAccess, ConnectorReadWireEncoder,
     ConnectorRequestContext,
     read_stack::{
@@ -114,7 +114,7 @@ pub(crate) struct FrozenProviderRead {
     /// The generation this read was frozen against, held open for as long as
     /// the plan may run. Releasing it earlier would let the provider retire a
     /// generation a frozen read still names.
-    pub(crate) generation: ConnectorControlPlanningLease,
+    pub(crate) generation: ConnectorControlPlanningPin,
     pub(crate) catalog: CatalogProperties,
     pub(crate) encoding: FrozenReadEncoding,
 }
@@ -362,10 +362,10 @@ impl FrontendProviderReadFacts {
                 // generation. Read only its pure route facts; do not construct
                 // a request-bound control or perform Provider I/O yet.
                 let admitted = self.bindings.binding(need.binding())?;
-                let lease = admitted.admission.exact_planning_lease()?;
+                let lease = admitted.admission.exact_planning_pin()?;
                 let read = self
                     .control
-                    .typed_read_for_planning_lease(&lease)
+                    .typed_read_for_planning_pin(&lease)
                     .map_err(ProviderReadError::from)?;
                 let factory = read.request_factory().ok_or_else(|| {
                     ProviderReadError::Contract({
@@ -556,13 +556,13 @@ enum AdmittedRead {
 impl AdmittedRead {
     /// The generation this read was admitted through, and the only one it may
     /// be frozen through.
-    fn planning_lease(&self) -> &ConnectorControlPlanningLease {
+    fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
             Self::Relation(materialization)
             | Self::MvTarget {
                 materialization, ..
-            } => &materialization.planning_lease,
-            Self::Cohort(cohort) => cohort.planning_lease(),
+            } => &materialization.planning_pin,
+            Self::Cohort(cohort) => cohort.planning_pin(),
             Self::PreparedSource(source) => &source.planning,
         }
     }
@@ -608,7 +608,7 @@ struct ReadOpening {
     table: SchemaTableName,
     request_control: ConnectorReadRequestControl,
     read: ConnectorControlReadBinding,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     // Keep the original admitted materialization/generation through the
     // request control and Provider facts' actual destruction.
     admitted: AdmittedRead,
@@ -698,9 +698,9 @@ fn prepare_read_opening(
             }
         }
     };
-    let planning_lease = admitted.planning_lease().clone();
+    let planning_pin = admitted.planning_pin().clone();
     let read = control
-        .typed_read_for_planning_lease(&planning_lease)
+        .typed_read_for_planning_pin(&planning_pin)
         .map_err(|error| {
             ProviderReadError::from(error)
                 .context(format!("provider read of {name} has no typed read binding"))
@@ -723,7 +723,7 @@ fn prepare_read_opening(
     Ok(ReadOpening {
         name,
         admitted,
-        planning_lease,
+        planning_pin,
         read,
         request_control,
         table,
@@ -1082,7 +1082,7 @@ fn finish_read_from_opened(
 ) -> Result<ProviderReadFact, ProviderReadError> {
     let relation = need.relation();
     let name = &opening.name;
-    let planning_lease = &opening.planning_lease;
+    let planning_pin = &opening.planning_pin;
     let read = &opening.read;
     let request_control = &opening.request_control;
     let metadata = request_control.metadata();
@@ -1177,7 +1177,7 @@ fn finish_read_from_opened(
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
         column_facts(need.columns(), &assignments, encoder.as_ref(), name)?;
-    let catalog_properties = planning_lease
+    let catalog_properties = planning_pin
         .binding()
         .catalog_properties()
         .map_err(|error| {
@@ -1201,7 +1201,7 @@ fn finish_read_from_opened(
                 binding: need.binding(),
                 access: FrozenProviderRead {
                     access,
-                    generation: planning_lease.clone(),
+                    generation: planning_pin.clone(),
                     catalog: catalog_properties,
                     encoding: FrozenReadEncoding {
                         columns: named_columns,

@@ -27,7 +27,7 @@ use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
 use crate::commit::staging::{PreparedChange, Preparer};
 use novarocks_spi::connector::{
     ConnectorIoAdmissionPort, ConnectorMetadataMaintenanceIoGeometry, ConnectorRequestContext,
-    ConnectorStatisticsLease, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorStatisticsSession, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 use publication::{Projection, StatisticsDraftPreparer};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -363,7 +363,7 @@ pub(super) fn geometry(
     let io = OperationLimits::default().io_requests as usize;
     let headers = std::mem::size_of::<IcebergStatisticsCollectionSession>()
         .checked_add(std::mem::size_of::<StatisticsPublicationProgress>())
-        .and_then(|n| n.checked_add(ConnectorStatisticsLease::session_backing_bytes()))
+        .and_then(|n| n.checked_add(ConnectorStatisticsSession::session_backing_bytes()))
         .and_then(|n| n.checked_add(std::mem::size_of::<StatisticsDraftPreparer>() + arc))
         .and_then(|n| n.checked_add(std::mem::size_of::<CatalogPublisher>() + arc))
         .and_then(|n| {

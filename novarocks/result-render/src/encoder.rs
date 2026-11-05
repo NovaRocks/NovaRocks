@@ -262,7 +262,7 @@ struct Variant {
     depth: usize,
     offset: i32,
 }
-enum Task {
+enum EncodeStep {
     JsonEscape(bool),
     TrinoKey {
         array: ArrayRef,
@@ -528,7 +528,7 @@ struct CellCursor {
     escaped: [u8; 6],
     escaped_at: usize,
     escaped_len: usize,
-    stack: Vec<Task>,
+    stack: Vec<EncodeStep>,
     elements: usize,
 }
 impl CellCursor {
@@ -548,9 +548,9 @@ impl CellCursor {
         self.escaped_at = 0;
         self.escaped_len = 0;
         self.elements = base;
-        self.stack.push(Task::Value { array, row, path });
+        self.stack.push(EncodeStep::Value { array, row, path });
     }
-    fn push(&mut self, t: Task) -> Result<(), RenderError> {
+    fn push(&mut self, t: EncodeStep) -> Result<(), RenderError> {
         if self.stack.len() >= CELL_TASK_CAPACITY {
             return Err(extent_error(E::WorkStackLimit, self.stack.len() + 1));
         }
@@ -558,7 +558,7 @@ impl CellCursor {
         Ok(())
     }
     fn literal(&mut self, b: &[u8]) -> Result<(), RenderError> {
-        self.push(Task::Atom(Atom::literal(b)))
+        self.push(EncodeStep::Atom(Atom::literal(b)))
     }
     fn element(&mut self) -> Result<(), RenderError> {
         self.elements = self
@@ -576,7 +576,7 @@ impl CellCursor {
         if matches!(mode, Mode::Json) {
             stream.utf8 = Some(Utf8::default());
         }
-        self.push(Task::Stream(stream))?;
+        self.push(EncodeStep::Stream(stream))?;
         self.literal(&[quote])
     }
     fn drain(
@@ -602,7 +602,7 @@ impl CellCursor {
             }
         };
         match self.stack.last_mut() {
-            Some(Task::Atom(a)) => {
+            Some(EncodeStep::Atom(a)) => {
                 let n = (a.len - a.at).min(limit);
                 if let Some(out) = output {
                     out[..n].copy_from_slice(&a.data[a.at..a.at + n]);
@@ -612,7 +612,7 @@ impl CellCursor {
                 charge(b, n);
                 Ok(n)
             }
-            Some(Task::Stream(stream)) => {
+            Some(EncodeStep::Stream(stream)) => {
                 let source = stream.source.clone();
                 let metadata = source.metadata_work();
                 if !b.room(metadata + 2) {
@@ -682,7 +682,7 @@ impl CellCursor {
             if !b.room(4096) {
                 return Ok(Poll::Yield);
             }
-            if let Some(Task::Atom(a)) = self.stack.last_mut() {
+            if let Some(EncodeStep::Atom(a)) = self.stack.last_mut() {
                 if a.at < a.len {
                     let byte = a.data[a.at];
                     a.at += 1;
@@ -692,7 +692,7 @@ impl CellCursor {
                 self.stack.pop();
                 continue;
             }
-            if let Some(Task::Stream(stream)) = self.stack.last_mut() {
+            if let Some(EncodeStep::Stream(stream)) = self.stack.last_mut() {
                 let source = stream.source.clone();
                 b.scan(source.metadata_work());
                 match stream_next(stream, source.data(s)?, b, &mut self.elements)? {
@@ -703,7 +703,7 @@ impl CellCursor {
                     poll => return Ok(poll),
                 }
             }
-            if let Some(Task::Metadata {
+            if let Some(EncodeStep::Metadata {
                 source,
                 view,
                 next,
@@ -739,20 +739,22 @@ impl CellCursor {
                 return Ok(Poll::Done);
             };
             match task {
-                Task::JsonEscape(enabled) => self.json_escape = enabled,
-                Task::TrinoKey { array, row, path } => {
+                EncodeStep::JsonEscape(enabled) => self.json_escape = enabled,
+                EncodeStep::TrinoKey { array, row, path } => {
                     if !b.cell() {
-                        self.push(Task::TrinoKey { array, row, path })?;
+                        self.push(EncodeStep::TrinoKey { array, row, path })?;
                         return Ok(Poll::Yield);
                     }
                     self.element()?;
                     b.scan(32 + usize::from(path.depth) * 2);
                     self.trino_value(array, row, path, s, true, b)?;
                 }
-                Task::Stream(_) | Task::Atom(_) => unreachable!("byte tasks are advanced in place"),
-                Task::Value { array, row, path } => {
+                EncodeStep::Stream(_) | EncodeStep::Atom(_) => {
+                    unreachable!("byte tasks are advanced in place")
+                }
+                EncodeStep::Value { array, row, path } => {
                     if !b.cell() {
-                        self.push(Task::Value { array, row, path })?;
+                        self.push(EncodeStep::Value { array, row, path })?;
                         return Ok(Poll::Yield);
                     }
                     self.element()?;
@@ -786,7 +788,7 @@ impl CellCursor {
                         N::List(_) => {
                             let (values, start, end) = list_values(&array, row)?;
                             self.literal(b"]")?;
-                            self.push(Task::List {
+                            self.push(EncodeStep::List {
                                 array: values,
                                 next: start,
                                 end,
@@ -804,7 +806,7 @@ impl CellCursor {
                                 return Err(invalid());
                             }
                             self.literal(b"}")?;
-                            self.push(Task::Map {
+                            self.push(EncodeStep::Map {
                                 array,
                                 next: start,
                                 end,
@@ -816,7 +818,7 @@ impl CellCursor {
                         }
                         N::Struct(_) => {
                             self.literal(b"}")?;
-                            self.push(Task::Struct {
+                            self.push(EncodeStep::Struct {
                                 array,
                                 row,
                                 path,
@@ -851,20 +853,19 @@ impl CellCursor {
                                     b'"'
                                 };
                                 self.literal(&[q])?;
-                                self.push(Task::Stream(stream))?;
+                                self.push(EncodeStep::Stream(stream))?;
                                 self.literal(&[q])?;
                             } else {
-                                self.push(Task::Stream(stream))?;
+                                self.push(EncodeStep::Stream(stream))?;
                             }
                         }
                         N::Opaque(_) | N::Null => {
                             self.literal(if nested { b"null" } else { &[0xfb] })?
                         }
                         N::Variant => match f.presentation {
-                            P::VariantSerializedBytes => self.push(Task::Stream(Stream::new(
-                                Source::array(array, row),
-                                Mode::Raw,
-                            )))?,
+                            P::VariantSerializedBytes => self.push(EncodeStep::Stream(
+                                Stream::new(Source::array(array, row), Mode::Raw),
+                            ))?,
                             P::VariantJson {
                                 timezone_offset_seconds,
                             } => {
@@ -872,14 +873,14 @@ impl CellCursor {
                                 let data = source.data(s)?;
                                 let view = VariantView::parse(data)?;
                                 let range = view.metadata_end..data.len();
-                                self.push(Task::Variant(Variant {
+                                self.push(EncodeStep::Variant(Variant {
                                     source: source.clone(),
                                     view,
                                     range,
                                     depth: path.depth as usize,
                                     offset: timezone_offset_seconds,
                                 }))?;
-                                self.push(Task::Metadata {
+                                self.push(EncodeStep::Metadata {
                                     source,
                                     view,
                                     next: 0,
@@ -911,22 +912,22 @@ impl CellCursor {
                                 } = &f.native_type
                                     && matches!(f.presentation, P::TimestampContainerText)
                                 {
-                                    self.push(Task::Stream(Stream::new(
+                                    self.push(EncodeStep::Stream(Stream::new(
                                         Source::Timezone(path),
                                         Mode::Raw,
                                     )))?;
                                     self.literal(b" ")?;
                                 }
-                                self.push(Task::Atom(a))?;
+                                self.push(EncodeStep::Atom(a))?;
                                 self.literal(b"\"")?;
                             } else {
                                 a.at = 0;
-                                self.push(Task::Atom(a))?;
+                                self.push(EncodeStep::Atom(a))?;
                             }
                         }
                     }
                 }
-                Task::List {
+                EncodeStep::List {
                     array,
                     next,
                     end,
@@ -935,14 +936,14 @@ impl CellCursor {
                 } => {
                     if next < end {
                         let child = path.child(0)?;
-                        self.push(Task::List {
+                        self.push(EncodeStep::List {
                             array: array.clone(),
                             next: next + 1,
                             end,
                             path,
                             first: false,
                         })?;
-                        self.push(Task::Value {
+                        self.push(EncodeStep::Value {
                             array,
                             row: next,
                             path: child,
@@ -952,7 +953,7 @@ impl CellCursor {
                         }
                     }
                 }
-                Task::Map {
+                EncodeStep::Map {
                     array,
                     next,
                     end,
@@ -967,7 +968,7 @@ impl CellCursor {
                         } else {
                             m.values().clone()
                         };
-                        self.push(Task::Map {
+                        self.push(EncodeStep::Map {
                             array,
                             next: if phase == 0 { next } else { next + 1 },
                             end,
@@ -980,13 +981,13 @@ impl CellCursor {
                             if phase == 0
                                 && matches!(s.family(), ClientPresentationFamily::TrinoJson(_))
                             {
-                                Task::TrinoKey {
+                                EncodeStep::TrinoKey {
                                     array: a,
                                     row: next,
                                     path: child,
                                 }
                             } else {
-                                Task::Value {
+                                EncodeStep::Value {
                                     array: a,
                                     row: next,
                                     path: child,
@@ -1000,7 +1001,7 @@ impl CellCursor {
                         }
                     }
                 }
-                Task::Struct {
+                EncodeStep::Struct {
                     array,
                     row,
                     path,
@@ -1015,14 +1016,14 @@ impl CellCursor {
                     if next < fields.len() {
                         if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
                             let a = down::<StructArray>(&array)?.column(next).clone();
-                            self.push(Task::Struct {
+                            self.push(EncodeStep::Struct {
                                 array,
                                 row,
                                 path,
                                 next: next + 1,
                                 phase: 0,
                             })?;
-                            self.push(Task::Value {
+                            self.push(EncodeStep::Value {
                                 array: a,
                                 row,
                                 path: path.child(next)?,
@@ -1033,7 +1034,7 @@ impl CellCursor {
                             continue;
                         }
                         if phase == 0 {
-                            self.push(Task::Struct {
+                            self.push(EncodeStep::Struct {
                                 array,
                                 row,
                                 path,
@@ -1053,14 +1054,14 @@ impl CellCursor {
                             }
                         } else {
                             let a = down::<StructArray>(&array)?.column(next).clone();
-                            self.push(Task::Struct {
+                            self.push(EncodeStep::Struct {
                                 array,
                                 row,
                                 path,
                                 next: next + 1,
                                 phase: 0,
                             })?;
-                            self.push(Task::Value {
+                            self.push(EncodeStep::Value {
                                 array: a,
                                 row,
                                 path: path.child(next)?,
@@ -1069,10 +1070,10 @@ impl CellCursor {
                         }
                     }
                 }
-                Task::Metadata { .. } => unreachable!("metadata is checked in place"),
-                Task::Variant(value) => {
+                EncodeStep::Metadata { .. } => unreachable!("metadata is checked in place"),
+                EncodeStep::Variant(value) => {
                     if !b.cell() {
-                        self.push(Task::Variant(value))?;
+                        self.push(EncodeStep::Variant(value))?;
                         return Ok(Poll::Yield);
                     }
                     self.element()?;
@@ -1082,7 +1083,7 @@ impl CellCursor {
                     }
                     self.variant(value, s, b)?;
                 }
-                Task::VariantCollection {
+                EncodeStep::VariantCollection {
                     value,
                     info,
                     next,
@@ -1100,7 +1101,7 @@ impl CellCursor {
                             )? as usize;
                             let key = value.view.key(data, id)?;
                             let source = value.source.slice(key)?;
-                            self.push(Task::VariantCollection {
+                            self.push(EncodeStep::VariantCollection {
                                 value,
                                 info,
                                 next,
@@ -1117,7 +1118,7 @@ impl CellCursor {
                             );
                             stream.utf8 = Some(Utf8::default());
                             self.literal(b"\"")?;
-                            self.push(Task::Stream(stream))?;
+                            self.push(EncodeStep::Stream(stream))?;
                             self.literal(b"\"")?;
                             if next != 0 {
                                 self.literal(b",")?;
@@ -1126,14 +1127,14 @@ impl CellCursor {
                             let mut child = value.clone();
                             child.range = range;
                             child.depth += 1;
-                            self.push(Task::VariantCollection {
+                            self.push(EncodeStep::VariantCollection {
                                 value,
                                 info,
                                 next: next + 1,
                                 phase: 0,
                                 object,
                             })?;
-                            self.push(Task::Variant(child))?;
+                            self.push(EncodeStep::Variant(child))?;
                             if object {
                                 self.literal(b":")?;
                             } else if next != 0 {
@@ -1168,7 +1169,7 @@ impl CellCursor {
                     return Err(extent_error(E::ElementLimit, self.elements));
                 }
                 self.literal(if object { b"}" } else { b"]" })?;
-                self.push(Task::VariantCollection {
+                self.push(EncodeStep::VariantCollection {
                     value: v,
                     info,
                     next: 0,
@@ -1423,7 +1424,7 @@ impl CellCursor {
                 };
                 if let Some(a) = a {
                     b.scan(a.len * 2 + 512);
-                    self.push(Task::Atom(a))?;
+                    self.push(EncodeStep::Atom(a))?;
                 }
             }
             _ => return Err(error(E::InvalidVariant)),
@@ -2070,8 +2071,10 @@ impl ArrowClientRowEncoder {
                 .reset(array, self.row, Path::root(self.column), self.elements);
             if trino && self.column + 1 == self.schema.columns().len() {
                 // Closing delimiter is part of this last cell's measured payload.
-                self.cursor.stack.insert(0, Task::Atom(Atom::literal(b"]")));
-                b.scan(size_of::<Task>());
+                self.cursor
+                    .stack
+                    .insert(0, EncodeStep::Atom(Atom::literal(b"]")));
+                b.scan(size_of::<EncodeStep>());
             }
             self.cell_atom = if self.phase == Phase::Emit && trino {
                 Atom::literal(if self.column == 0 { b"[" } else { b"," })
@@ -2426,7 +2429,7 @@ impl BoundedClientRowEncoder for ArrowClientRowEncoder {
         size_of::<Self>()
             + size_of::<[u8; V::SMALL_ROW_BYTES]>()
             + size_of::<[u32; V::MAX_COLUMNS]>()
-            + self.cursor.stack.capacity() * size_of::<Task>()
+            + self.cursor.stack.capacity() * size_of::<EncodeStep>()
     }
 }
 
@@ -2436,7 +2439,7 @@ pub(super) const fn scratch_capacity_bound_bytes() -> usize {
     size_of::<ArrowClientRowEncoder>()
         + size_of::<[u8; V::SMALL_ROW_BYTES]>()
         + size_of::<[u32; V::MAX_COLUMNS]>()
-        + CELL_TASK_CAPACITY * size_of::<Task>()
+        + CELL_TASK_CAPACITY * size_of::<EncodeStep>()
 }
 
 /// Existing MySQL text presentation over the shared bounded row machine.

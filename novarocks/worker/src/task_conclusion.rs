@@ -20,7 +20,7 @@
 
 use crate::failure_reason::WorkerFailureReason;
 use crate::task_diagnostics::TaskSecondaryDiagnostic;
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::task::ExecutionFailure;
 use novarocks_execution_contract::{
     TaskConclusion, TaskConclusionProposal, TaskFailure, TerminationDetail,
     failure::{FailureClass, FailureEvidence, FailureFact, FailureProjection},

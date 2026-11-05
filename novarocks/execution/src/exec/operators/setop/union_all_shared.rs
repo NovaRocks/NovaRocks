@@ -33,9 +33,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::chunk_buffer_memory_manager::ChunkBufferMemoryManager;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionResult;
 
 struct UnionAllState {
     buffer: VecDeque<Chunk>,
@@ -243,11 +243,11 @@ mod tests {
     use crate::exec::{
         chunk::ChunkSchema,
         pipeline::{
+            driver_step::{DriverStep, TurnWork},
             input::RawInput,
             operator_factory::OperatorFactory,
             shape::SourceRead,
             step::{AdmissionNext, InputResult},
-            step_context::{StepContext, TurnWork},
             test_driver::TestDriver,
         },
     };
@@ -258,10 +258,10 @@ mod tests {
     };
     use novarocks_types::SlotId;
 
-    fn with_test_step<T>(rt: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    fn with_test_step<T>(rt: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+        action(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),

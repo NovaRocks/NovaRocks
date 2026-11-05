@@ -272,13 +272,13 @@ mod tests {
         assert!(categories.is_null(1));
     }
     fn local_file_io(location: &str) -> FileIO {
-        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
         let runtime = tokio::runtime::Handle::current();
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         crate::fs_io::build_file_io_for_location(location, binding)
     }

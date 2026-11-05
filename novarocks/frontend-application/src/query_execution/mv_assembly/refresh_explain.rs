@@ -92,7 +92,7 @@ async fn explain_original_inner(
     let binding = io.target_binding(ports, &target, context).await?;
     let schema = crate::mv::domain::storage_observation::observe_schema_validation(
         ports.storage_observation(),
-        binding.lease(),
+        binding.planning_pin(),
         binding.metadata(),
         context.clone(),
     )?;
@@ -150,7 +150,7 @@ async fn explain_original_inner(
         context,
     )
     .await?;
-    let lease = binding.lease().clone();
+    let lease = binding.planning_pin().clone();
     let rewrite =
         crate::mv::domain::refresh::rewrite_context::freeze_refresh_rewrite_context_original(
             io,

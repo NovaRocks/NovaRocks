@@ -30,14 +30,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorMutationFailure, ConnectorPartitionTransform,
-    ConnectorStagedCreateLease, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreatePublishRequest, ConnectorStagedTableHandle,
+    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease, CreatePolicy,
-    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
+    ConnectorUnanchoredCtasCleanupSession, ConnectorWrite, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, CreatePolicy, ExternalMutationEvidence,
+    ExternalMutationFinalization, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -631,13 +631,14 @@ impl CoreCtasCatalogAction {
 #[derive(Clone)]
 struct CoreStandardCtasTargetPreflight {
     target: crate::catalog_application::resolver::TargetBackend,
-    lease: ConnectorStagedCreateLease,
+    staged_session: ConnectorStagedCreateSession,
     /// Retained so the write session opens on the *same* control generation
     /// that staged the target. Re-acquiring the current one at write time could
     /// hand the session a runtime that never saw the staged create.
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
-    write_lease: ConnectorWriteLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+    unanchored_ctas_cleanup_session:
+        novarocks_spi::connector::ConnectorUnanchoredCtasCleanupSession,
+    write: ConnectorWrite,
     target_catalog_properties: novarocks_spi::connector::CatalogProperties,
 }
 
@@ -671,9 +672,9 @@ impl CtasPreparedSource for CorePreparedStandardCtasSource {
 }
 
 struct CoreStandardCtasTargetSession {
-    lease: ConnectorStagedCreateLease,
-    write_lease: ConnectorWriteLease,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    staged_session: ConnectorStagedCreateSession,
+    write: ConnectorWrite,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     target: crate::catalog_application::resolver::TargetBackend,
     handle: ConnectorStagedTableHandle,
     stage_receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
@@ -689,8 +690,8 @@ impl CoreStandardCtasTargetSession {
     fn facts(&self) -> StandardCtasTargetFacts {
         StandardCtasTargetFacts {
             provider_id: "iceberg".to_string(),
-            instance_id: self.lease.instance_id().as_str().to_string(),
-            control_runtime_id: self.lease.control_runtime_id().to_bytes(),
+            instance_id: self.staged_session.instance_id().as_str().to_string(),
+            control_runtime_id: self.staged_session.control_runtime_id().to_bytes(),
             publication_id: self.publication_id,
             target_handle_digest: self.handle.digest(),
         }
@@ -767,7 +768,7 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
         write: ConnectorStagedWriteProof,
         terminal_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.lease.bind_write(self.handle.clone(), write)?;
+        self.staged_session.bind_write(self.handle.clone(), write)?;
         *self
             .context
             .lock()
@@ -777,7 +778,7 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError> {
         self.write_unknown_latched.store(true, Ordering::Release);
-        self.lease.mark_write_unknown(&self.handle)
+        self.staged_session.mark_write_unknown(&self.handle)
     }
 }
 
@@ -1059,13 +1060,13 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
-        let request = source.preflight.lease.prepare_request(
+        let request = source.preflight.staged_session.prepare_request(
             publication_id,
             novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
                 publication_id.to_bytes(),
             ),
             novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: source.preflight.lease.instance_id().clone(),
+                instance_id: source.preflight.staged_session.instance_id().clone(),
                 namespace: Arc::from(source.target.namespace.as_str()),
                 table: Arc::from(source.target.table.as_str()),
             },
@@ -1099,9 +1100,9 @@ impl CtasEngine for DmlExecutionKernel {
             handle: Arc::new(CoreCtasCatalogAction {
                 kind: CoreCtasCatalogActionKind::StandardPublish {
                     target: Arc::new(CoreStandardCtasTargetSession {
-                        lease: target.lease.clone(),
-                        write_lease: target.write_lease.clone(),
-                        planning_lease: target.planning_lease.clone(),
+                        staged_session: target.staged_session.clone(),
+                        write: target.write.clone(),
+                        planning_pin: target.planning_pin.clone(),
                         target: target.target.clone(),
                         handle: target.handle.clone(),
                         stage_receipt: target.stage_receipt.clone(),
@@ -1261,7 +1262,7 @@ async fn prepare_planned_ctas_connector_write_async(
                 target.target.table.clone(),
             ),
             write_target,
-            target.planning_lease.clone(),
+            target.planning_pin.clone(),
         )?;
     let sink =
         crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
@@ -1359,7 +1360,7 @@ async fn prepare_planned_ctas_connector_write_async(
 
 async fn sweep_unanchored_ctas_roots_async(
     kernel: &DmlExecutionKernel,
-    lease: &ConnectorUnanchoredCtasCleanupLease,
+    cleanup_session: &ConnectorUnanchoredCtasCleanupSession,
     context: novarocks_spi::connector::ConnectorRequestContext,
     receiving: &GovernedCtasControlReceiving,
 ) -> Result<(), CtasFailure> {
@@ -1379,8 +1380,10 @@ async fn sweep_unanchored_ctas_roots_async(
     let cutoff_ms = now_ms
         .checked_sub(safe_age_ms)
         .ok_or_else(|| internal_failure("lake publication safe GC cutoff underflows"))?;
-    let warehouse_root = lease.warehouse_root().map_err(connector_failure)?;
-    let candidates = lease
+    let warehouse_root = cleanup_session
+        .warehouse_root()
+        .map_err(connector_failure)?;
+    let candidates = cleanup_session
         .discover_unanchored_ctas_async(
             warehouse_root.clone(),
             cutoff_ms,
@@ -1393,7 +1396,7 @@ async fn sweep_unanchored_ctas_roots_async(
         // An exact delete whose acknowledgement is uncertain stays an aged
         // residue for a later GC pass. It never grants this new CTAS attempt
         // authority to reconcile, retry, or infer the old publication.
-        let _ = lease
+        let _ = cleanup_session
             .inspect_then_delete_unanchored_ctas_async(
                 warehouse_root.clone(),
                 cutoff_ms,
@@ -1436,14 +1439,14 @@ impl CoreStandardCtasTargetSession {
         // This is the only way to reach them: the catalog will not know this
         // table until the publication commits.
         let binding = self
-            .lease
+            .staged_session
             .plan_write(ConnectorStagedWritePlanningRequest {
                 handle: self.handle.clone(),
                 context,
             })
             .map_err(connector_failure)?;
         let stack =
-            crate::connector::write_target::derive_write_stack_lease(host, &self.planning_lease)
+            crate::connector::write_target::derive_write_stack_lease(host, &self.planning_pin)
                 .map_err(internal_failure)?;
         let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(format!("{}.{}", self.target.namespace, self.target.table).as_str()),
@@ -1463,13 +1466,9 @@ impl CoreStandardCtasTargetSession {
                 ),
             context: binding.context().clone(),
         };
-        let properties = self
-            .write_lease
-            .catalog_properties()
-            .cloned()
-            .ok_or_else(|| {
-                internal_failure("connector write lease has no immutable catalog runtime identity")
-            })?;
+        let properties = self.write.catalog_properties().cloned().ok_or_else(|| {
+            internal_failure("connector write lease has no immutable catalog runtime identity")
+        })?;
         crate::query_execution::write_session::ConnectorWriteSession::begin_async_in(
             stack, properties, request, receiving,
         )
@@ -1503,15 +1502,16 @@ impl DmlExecutionKernel {
         // The standard staged-create capability is the only mutation
         // authority.  Acquiring it before source planning preserves the
         // unsupported-at-zero-side-effect boundary.
-        let lease = planning
+        let staged_session = planning
             .derive_staged_create_lease()
             .map_err(connector_failure)?;
-        let unanchored_ctas_cleanup_lease = planning
+        let unanchored_ctas_cleanup_session = planning
             .derive_unanchored_ctas_cleanup_lease()
             .map_err(connector_failure)?;
-        let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
-        if !lease.matches_write_lease(&write_lease)
-            || lease.control_runtime_id() != unanchored_ctas_cleanup_lease.control_runtime_id()
+        let write = planning.derive_write_lease().map_err(connector_failure)?;
+        if !staged_session.matches_write_lease(&write)
+            || staged_session.control_runtime_id()
+                != unanchored_ctas_cleanup_session.control_runtime_id()
         {
             return Err(internal_failure(
                 "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
@@ -1531,7 +1531,7 @@ impl DmlExecutionKernel {
                 facts: CtasTargetPreflightFacts {
                     provider_id: binding.descriptor().provider_id.as_str().to_string(),
                     instance_id: binding.descriptor().instance_id.as_str().to_string(),
-                    control_runtime_id: lease.control_runtime_id().to_bytes(),
+                    control_runtime_id: staged_session.control_runtime_id().to_bytes(),
                     capability_version:
                         novarocks_spi::connector::CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
                     target_namespace: target.namespace.clone(),
@@ -1539,10 +1539,10 @@ impl DmlExecutionKernel {
                 },
                 handle: Arc::new(CoreStandardCtasTargetPreflight {
                     target,
-                    lease,
-                    planning_lease: planning.clone(),
-                    unanchored_ctas_cleanup_lease,
-                    write_lease,
+                    staged_session,
+                    planning_pin: planning.clone(),
+                    unanchored_ctas_cleanup_session,
+                    write,
                     target_catalog_properties,
                 }),
             },
@@ -1692,7 +1692,7 @@ impl DmlExecutionKernel {
         };
         action.begin_dispatch()?;
         match preflight
-            .lease
+            .staged_session
             .prepare_async(request.as_ref().clone(), &receiving.stage)
             .await
             .map_err(connector_failure)?
@@ -1703,9 +1703,9 @@ impl DmlExecutionKernel {
                 finalization,
             } => {
                 let target = Arc::new(CoreStandardCtasTargetSession {
-                    lease: preflight.lease.clone(),
-                    write_lease: preflight.write_lease.clone(),
-                    planning_lease: preflight.planning_lease.clone(),
+                    staged_session: preflight.staged_session.clone(),
+                    write: preflight.write.clone(),
+                    planning_pin: preflight.planning_pin.clone(),
                     target: preflight.target.clone(),
                     handle,
                     stage_receipt: receipt.clone(),
@@ -1724,7 +1724,7 @@ impl DmlExecutionKernel {
                 // so static and vended catalogs retain one CTAS lifecycle.
                 if let Err(failure) = sweep_unanchored_ctas_roots_async(
                     self,
-                    &preflight.unanchored_ctas_cleanup_lease,
+                    &preflight.unanchored_ctas_cleanup_session,
                     request.context.clone(),
                     receiving,
                 )
@@ -1785,7 +1785,7 @@ impl DmlExecutionKernel {
         // This is the once-call guard, not evidence of external dispatch.
         action.begin_dispatch()?;
         let execution = match target
-            .lease
+            .staged_session
             .begin_publish_original(request.as_ref().clone(), &receiving.publication_original)
         {
             Ok(execution) => execution,
@@ -1847,7 +1847,7 @@ impl DmlExecutionKernel {
                 .clone()
         };
         let outcome = target
-            .lease
+            .staged_session
             .adjudicate_publication_async(
                 ConnectorStagedCreatePublicationAdjudicationRequest {
                     target_operation_id:
@@ -2574,7 +2574,7 @@ impl PreparedCtasTargetPreflight {
         let preflight = downcast_standard_preflight(self.handle.as_ref())?;
         let stack = crate::connector::write_target::derive_write_stack_lease(
             kernel.typed_connector_control(),
-            &preflight.planning_lease,
+            &preflight.planning_pin,
         )
         .map_err(internal_failure)?;
         stack.session().io_profile().map_err(connector_failure)
@@ -2708,7 +2708,7 @@ pub(crate) fn governed_ctas_target_cleanup_responsibility(
 ) -> Result<novarocks_spi::connector::ConnectorMetadataCleanupResponsibility, CtasFailure> {
     let target = downcast_standard_target(target)?;
     target
-        .lease
+        .staged_session
         .cleanup_responsibility(&target.handle)
         .map_err(connector_failure)
 }
@@ -2723,7 +2723,7 @@ pub(crate) async fn settle_governed_ctas_target_cleanup(
         .map_err(|error| internal_failure(format!("CTAS terminal context lock: {error}")))?
         .clone();
     target
-        .lease
+        .staged_session
         .settle_cleanup_async(target.handle.clone(), context, &receiving.target_cleanup)
         .await
         .map_err(connector_failure)
@@ -2734,7 +2734,7 @@ pub(crate) fn acknowledge_governed_ctas_target_cleanup(
 ) -> Result<(), CtasFailure> {
     let target = downcast_standard_target(target)?;
     target
-        .lease
+        .staged_session
         .acknowledge_cleanup_disposed(&target.handle)
         .map_err(connector_failure)
 }
@@ -2761,7 +2761,7 @@ pub(crate) async fn abort_governed_unlaunched_ctas_target(
         .map_err(|error| internal_failure(format!("CTAS terminal context lock: {error}")))?
         .clone();
     target
-        .lease
+        .staged_session
         .abort_async(
             novarocks_spi::connector::ConnectorStagedCreateAbortRequest {
                 operation_id: target.handle.operation_id(),
@@ -2792,7 +2792,7 @@ pub(crate) fn observed_governed_ctas_adjudication(
     let CoreCtasCatalogActionKind::StandardPublish { target, request } = &action.kind else {
         return novarocks_spi::connector::LakePublicationDisposition::CommitUnknown;
     };
-    if request.handle.owner() != target.lease.owner()
+    if request.handle.owner() != target.staged_session.owner()
         || request.handle.digest() != target.handle.digest()
         || request.operation_id.to_bytes() != target.publication_id.to_bytes()
     {
@@ -2800,7 +2800,7 @@ pub(crate) fn observed_governed_ctas_adjudication(
     }
     observed_ctas_adjudication_for_request(
         request,
-        target.planning_lease.binding().descriptor(),
+        target.planning_pin.binding().descriptor(),
         evidence,
         raw,
     )

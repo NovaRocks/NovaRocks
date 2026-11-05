@@ -27,9 +27,9 @@ use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_chunk_all, root_value_type,
 };
 use crate::exec::pipeline::operator::InputConstructionFactory;
-use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{TaskEvent, TaskEventSink};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::{self as execution, OrderedTopNAllocationHost};
 use novarocks_functions::{
     KernelDiagnostic, KernelEvaluationControl, KernelFailure, SourceBackingOwner,
@@ -197,8 +197,8 @@ impl CompiledOrderedScanFactory {
 
     /// This infallible shell allocates no binding inventory or subscription.
     /// All fallible work happens in the source's original runtime bind phase.
-    pub(crate) fn for_driver(&self) -> CompiledOrderedScanDriver {
-        CompiledOrderedScanDriver {
+    pub(crate) fn for_driver(&self) -> CompiledOrderedScanEvaluator {
+        CompiledOrderedScanEvaluator {
             factory: self.clone(),
             control: self.control.clone(),
             bindings: AggregateVec::new_in(self.host.vector_allocator()),
@@ -223,14 +223,14 @@ struct OrderedBinding {
     instance: Option<CompiledExpressionInstance>,
 }
 
-pub(crate) struct CompiledOrderedScanDriver {
+pub(crate) struct CompiledOrderedScanEvaluator {
     factory: CompiledOrderedScanFactory,
     control: RuntimeKernelControl,
     bindings: AggregateVec<OrderedBinding>,
     bound: bool,
     failed: Option<ExecutionFailure>,
 }
-impl CompiledOrderedScanDriver {
+impl CompiledOrderedScanEvaluator {
     pub(crate) fn bind_mem_tracker(
         &mut self,
         tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
@@ -293,7 +293,7 @@ impl CompiledOrderedScanDriver {
                     ));
             binding.state = match outcome {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
-                    execution::RuntimeFilterSubscriptionHandle::Live(subscription),
+                    execution::RuntimeFilterSubscriptionPin::Live(subscription),
                 )) => OrderedBindingState::Live {
                     subscription,
                     observed: None,
@@ -385,7 +385,7 @@ impl CompiledOrderedScanDriver {
     pub(crate) fn apply(
         &mut self,
         chunk: Chunk,
-        event_sink: &Arc<dyn FragmentEventSink>,
+        event_sink: &Arc<dyn TaskEventSink>,
     ) -> ExecutionResult<Option<Chunk>> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
@@ -396,7 +396,7 @@ impl CompiledOrderedScanDriver {
     fn apply_inner(
         &mut self,
         chunk: Chunk,
-        event_sink: &Arc<dyn FragmentEventSink>,
+        event_sink: &Arc<dyn TaskEventSink>,
     ) -> ExecutionResult<Option<Chunk>> {
         self.poll()?;
         if !chunk.chunk_schema().is_typed() || !chunk.source_authority().is_attached() {
@@ -480,7 +480,7 @@ impl CompiledOrderedScanDriver {
             // alive throughout synchronous filtering; no naked mask escapes.
         }
         for effect in effects {
-            event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
+            event_sink.record(TaskEvent::RuntimeFilterRowEffect(effect));
         }
         Ok(current)
     }

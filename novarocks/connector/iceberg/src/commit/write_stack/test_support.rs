@@ -166,7 +166,7 @@ pub(crate) fn admitted_document_publication_declaration(
     })
     .and_then(|binding| binding.try_with_document_storage(Some(documents)))
     .expect("control binding");
-    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+    let lease = ConnectorControlPlanningPin::new(Arc::new(binding), || {})
         .derive_document_storage_lease()
         .expect("document lease");
     let publication_id = document_publication_id();

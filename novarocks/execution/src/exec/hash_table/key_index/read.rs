@@ -20,7 +20,7 @@
 //! and encoded complex values never masquerade as their signed Arrow carriers.
 
 use super::{checkpoint_at, invariant, prepared::sort_by_key, reserve_push, vector};
-use crate::{exec::pipeline::operator::InputConstructionOwner, runtime::fragment::ExecutionResult};
+use crate::{exec::pipeline::operator::InputConstructionOwner, runtime::task::ExecutionResult};
 use arrow::array::{ArrayRef, BinaryViewArray};
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
 use novarocks_value_arrays::{ValueViolation, batch::OwnedBytesPage};

@@ -16,7 +16,7 @@
 // under the License.
 //! Task-hosted account capability transport; this module performs no grant.
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_memory::{AccountHandle, CapacityError, MemoryAuthority};
+use novarocks_memory::{Account, CapacityError, MemoryAuthority};
 use novarocks_types::identity::QueryExecutionId;
 use std::sync::Arc;
 
@@ -60,13 +60,13 @@ impl std::error::Error for QueryMemoryBindingError {
 pub struct QueryMemoryBinding {
     execution: QueryExecutionId,
     authority: Arc<MemoryAuthority>,
-    account: AccountHandle,
+    account: Account,
 }
 impl QueryMemoryBinding {
     pub fn try_new(
         execution: QueryExecutionId,
         authority: Arc<MemoryAuthority>,
-        account: AccountHandle,
+        account: Account,
     ) -> Result<Self, QueryMemoryBindingError> {
         authority
             .validate_account(&account)
@@ -83,7 +83,7 @@ impl QueryMemoryBinding {
     pub fn authority(&self) -> &Arc<MemoryAuthority> {
         &self.authority
     }
-    pub fn account(&self) -> &AccountHandle {
+    pub fn account(&self) -> &Account {
         &self.account
     }
     pub fn validate_task(
@@ -110,7 +110,7 @@ mod tests;
 
 impl novarocks_failure_contract::FailureProjection for QueryMemoryBindingError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::OwnerAttemptMismatch => ExecutionReason::QueryMemoryOwnerAttempt,
@@ -126,7 +126,7 @@ impl novarocks_failure_contract::FailureProjection for QueryMemoryBindingError {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<QueryMemoryBindingError> for crate::runtime::fragment::ExecutionFailure {
+impl From<QueryMemoryBindingError> for crate::runtime::task::ExecutionFailure {
     fn from(cause: QueryMemoryBindingError) -> Self {
         Self::from_domain(cause)
     }

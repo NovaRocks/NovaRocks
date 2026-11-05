@@ -28,7 +28,7 @@ use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryOptions as Protoco
 use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
-    CatalogStorageAccessDomainInput, ConnectorControlPlanningLease, ConnectorError,
+    CatalogStorageAccessDomainInput, ConnectorControlPlanningPin, ConnectorError,
     ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
     ConnectorVendedCredentialLeaseSink, CredentialConsumerRole, CredentialLeaseDescriptor,
     CredentialLeaseId, CredentialLeaseProvider, CredentialLeaseSecretEnvelope,
@@ -1115,23 +1115,23 @@ impl QueryInitOptions {
 /// than by a transport or fragment carrier.  Catalog materialization is already
 /// frozen when the attempt is prepared, while control-runtime lifetime remains
 /// a Frontend-local concern.
-pub(crate) struct QueryCatalogLease {
+pub(crate) struct QueryCatalogPin {
     catalog_set: CatalogSet,
     #[allow(
         dead_code,
         reason = "Drop retains these exact FE control leases until the attempt is done with them."
     )]
-    control_leases: Vec<ConnectorControlPlanningLease>,
+    control_pins: Vec<ConnectorControlPlanningPin>,
 }
 
-impl QueryCatalogLease {
+impl QueryCatalogPin {
     pub(crate) fn new(
         catalog_set: CatalogSet,
-        control_leases: Vec<ConnectorControlPlanningLease>,
+        control_pins: Vec<ConnectorControlPlanningPin>,
     ) -> Self {
         Self {
             catalog_set,
-            control_leases,
+            control_pins,
         }
     }
 
@@ -1140,8 +1140,8 @@ impl QueryCatalogLease {
     }
 
     #[cfg(test)]
-    pub(crate) fn control_lease_count(&self) -> usize {
-        self.control_leases.len()
+    pub(crate) fn control_pin_count(&self) -> usize {
+        self.control_pins.len()
     }
 }
 
@@ -1151,7 +1151,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
+    use super::{AttemptCredentialLeaseCollector, QueryCatalogPin, QueryInitOptions};
     use crate::query_execution::contract::ResolvedQueryOptions;
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_codec::catalog::CatalogSet;
@@ -1161,7 +1161,7 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogVersion, ConnectorControlPlanningLease, ConnectorInstanceId,
+        CatalogProperties, CatalogVersion, ConnectorControlPlanningPin, ConnectorInstanceId,
         ConnectorProviderId, ConnectorStorageResolver, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialConsumerRole, StorageAccessRequest,
         StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
@@ -2172,7 +2172,7 @@ mod tests {
     fn query_catalog_lease_drains_its_control_leases_exactly_once_when_dropped() {
         let releases = Arc::new(AtomicUsize::new(0));
         let release_counter = Arc::clone(&releases);
-        let planning_lease = ConnectorControlPlanningLease::new(
+        let planning_pin = ConnectorControlPlanningPin::new(
             crate::connector::scan_model::planned_files_fixture_binding(
                 "catalog.lease",
                 HashMap::new(),
@@ -2183,11 +2183,11 @@ mod tests {
                 release_counter.fetch_add(1, Ordering::SeqCst);
             },
         );
-        let catalog_lease = QueryCatalogLease::new(catalog_set(), vec![planning_lease]);
-        assert_eq!(catalog_lease.control_lease_count(), 1);
+        let catalog_pin = QueryCatalogPin::new(catalog_set(), vec![planning_pin]);
+        assert_eq!(catalog_pin.control_pin_count(), 1);
         assert_eq!(releases.load(Ordering::SeqCst), 0);
 
-        drop(catalog_lease);
+        drop(catalog_pin);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 

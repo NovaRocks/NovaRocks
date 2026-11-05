@@ -14,18 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::runtime::cache::ExecutionCacheOptions;
-#[cfg(test)]
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker, query_tracker_label};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_options::QueryOptions;
+#[cfg(test)]
+use crate::runtime::task::ExecutionResult;
 use crate::runtime::{ExecutionRuntime, execution_services::IoExecutor};
 use crate::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::QueryId;
@@ -41,7 +41,7 @@ pub struct RuntimeState {
     error_state: std::sync::Arc<RuntimeErrorState>,
     last_report_exec_state_ns: AtomicI64,
     query_id: Option<QueryId>,
-    fragment_instance_id: Option<UniqueId>,
+    task_key: Option<UniqueId>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
@@ -113,7 +113,7 @@ impl std::fmt::Debug for RuntimeErrorState {
             .finish_non_exhaustive()
     }
 }
-impl crate::runtime::fragment::ExecutionFailureReporter for RuntimeErrorState {
+impl crate::runtime::task::ExecutionFailureReporter for RuntimeErrorState {
     fn report_cleanup(&self, cause: &ExecutionFailure) {
         RuntimeErrorState::report_cleanup(self, cause);
     }
@@ -303,7 +303,7 @@ impl Default for RuntimeState {
             // immediately once the process had been alive for one interval.
             last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id: None,
-            fragment_instance_id: None,
+            task_key: None,
             backend_num: None,
             mem_tracker: None,
             runtime_filter_session: None,
@@ -329,7 +329,7 @@ impl Clone for RuntimeState {
                 self.last_report_exec_state_ns.load(Ordering::Acquire),
             ),
             query_id: self.query_id,
-            fragment_instance_id: self.fragment_instance_id,
+            task_key: self.task_key,
             backend_num: self.backend_num,
             mem_tracker: self.mem_tracker.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
@@ -390,7 +390,7 @@ impl RuntimeState {
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,
         query_id: Option<QueryId>,
-        fragment_instance_id: Option<UniqueId>,
+        task_key: Option<UniqueId>,
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
@@ -399,7 +399,7 @@ impl RuntimeState {
             query_options,
             cache_options,
             query_id,
-            fragment_instance_id,
+            task_key,
             backend_num,
             mem_tracker,
             execution_runtime,
@@ -411,7 +411,7 @@ impl RuntimeState {
         query_options: Option<QueryOptions>,
         cache_options: Option<ExecutionCacheOptions>,
         query_id: Option<QueryId>,
-        fragment_instance_id: Option<UniqueId>,
+        task_key: Option<UniqueId>,
         backend_num: Option<i32>,
         mem_tracker: Option<std::sync::Arc<MemTracker>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
@@ -424,8 +424,7 @@ impl RuntimeState {
             // process root, under the same label the Backend query-context
             // owner mints, so one query cannot end up as two subtrees whose
             // charges never meet.
-            if execution_runtime.is_none() || (query_id.is_none() && fragment_instance_id.is_none())
-            {
+            if execution_runtime.is_none() || (query_id.is_none() && task_key.is_none()) {
                 return None;
             }
             let process = process_mem_tracker();
@@ -433,9 +432,9 @@ impl RuntimeState {
                 .map(|id| query_tracker_label(id.high(), id.low()))
                 .unwrap_or_else(|| "query_unknown".to_string());
             let query_tracker = MemTracker::new_child(query_label, &process);
-            let fragment_label = fragment_instance_id
-                .map(|id| format!("fragment_{:x}_{:x}", id.high(), id.low()))
-                .unwrap_or_else(|| "fragment_unknown".to_string());
+            let fragment_label = task_key
+                .map(|id| format!("task_{:x}_{:x}", id.high(), id.low()))
+                .unwrap_or_else(|| "task_unknown".to_string());
             Some(MemTracker::new_child(fragment_label, &query_tracker))
         });
         Self {
@@ -444,7 +443,7 @@ impl RuntimeState {
             error_state,
             last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id,
-            fragment_instance_id,
+            task_key,
             backend_num,
             mem_tracker,
             runtime_filter_session: None,
@@ -533,7 +532,7 @@ impl RuntimeState {
     /// Handle to the dedicated sink I/O execution service (IW-1).
     ///
     /// Operators reach this via `&RuntimeState` in `bind_runtime_state` /
-    /// `StepContext` so they never grab the shared `data_runtime` directly.
+    /// `DriverStep` so they never grab the shared `data_runtime` directly.
     pub fn sink_io_executor(&self) -> Result<IoExecutor, RuntimeBindingFailure> {
         self.execution_runtime
             .as_ref()
@@ -702,10 +701,10 @@ impl novarocks_failure_contract::FailureProjection for RuntimeBindingFailure {
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::MissingExecutionRuntime => {
-                crate::runtime::fragment::ExecutionReason::ExecutionRuntimeMissing
+                crate::runtime::task::ExecutionReason::ExecutionRuntimeMissing
             }
             Self::MissingOperatorMemoryTracker { .. } => {
-                crate::runtime::fragment::ExecutionReason::OperatorMemoryTrackerMissing
+                crate::runtime::task::ExecutionReason::OperatorMemoryTrackerMissing
             }
         };
         FailureFact::new(FailureClass::Invariant, reason.reason())

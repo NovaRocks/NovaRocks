@@ -32,7 +32,7 @@ use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, OperatorLifecycle,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -168,7 +168,7 @@ impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
     }
     fn poll_output(
         &mut self,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         let chunk_size = self
             .chunk_size
@@ -248,7 +248,7 @@ impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
         out_arrays
             .try_reserve_exact(exported.arrays().len())
             .map_err(|source| {
-                crate::runtime::fragment::ExecutionFailure::from_domain(
+                crate::runtime::task::ExecutionFailure::from_domain(
                     novarocks_value_arrays::ValueError::Allocation {
                         requested: layout.size(),
                         source,
@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use crate::exec::{
         operators::setop::{except_shared::ExceptSemantics, set_op_stage::SetOpStageController},
-        pipeline::step_context::{StepContext, TurnWork},
+        pipeline::driver_step::{DriverStep, TurnWork},
     };
     use crate::runtime::{mem_tracker::MemTracker, query_options::QueryOptions};
     use arrow::{
@@ -378,7 +378,7 @@ mod tests {
             let mut work = TurnWork::new(NonZeroU64::new(turn as u64).unwrap(), 1);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
+            let mut context = DriverStep::new(&control, &mut work, &mut value_conversions);
             let step = source.as_mut().drive(&mut context).unwrap();
             if let Some(output) = step.output {
                 assert!(output.len() <= 3);
@@ -415,7 +415,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 1);
         let step = inactive
             .as_mut()
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &control,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),

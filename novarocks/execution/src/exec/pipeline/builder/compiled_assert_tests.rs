@@ -214,7 +214,7 @@ fn compiled_keyed_builder_keeps_when_true_and_parallel_driver_key_authority() {
             &program,
             ExchangeBindings::default(),
             ScanBindings::default(),
-            crate::runtime::fragment::CompiledWriterBindings::default(),
+            crate::runtime::task::CompiledWriterBindings::default(),
             None,
             DependencyManager::new(),
             dop as i32,

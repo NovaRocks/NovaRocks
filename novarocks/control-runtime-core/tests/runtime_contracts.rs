@@ -464,7 +464,7 @@ fn turn_guarantees_every_class_before_round_robin_excess() {
 }
 
 #[test]
-fn preparation_is_fifo_with_one_body_per_context_and_context_fairness() {
+fn preparation_is_fifo_with_one_body_per_group_and_group_fairness() {
     let a = ScopeId::new(1).unwrap();
     let b = ScopeId::new(2).unwrap();
     let mut q = FairWorkQueue::new(4, 3);

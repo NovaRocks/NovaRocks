@@ -176,18 +176,19 @@ mod tests {
     }
     #[test]
     fn witnessed_identity_refusal_adds_a_basis_without_reclassifying_or_bypassing_policy() {
-        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_execution_contract::ParticipationRef;
         use novarocks_types::{
             AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
         };
         let execution =
             QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
-        let (_, witness, failure) = crate::api::pre_ready_identity_refusal_test_fixture(context);
+        let (_, witness, failure) =
+            crate::api::pre_ready_identity_refusal_test_fixture(participation);
         let basis = RecoveryInput {
             failure: failure.class(),
             pre_ready_replacement: Some(&witness),

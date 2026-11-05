@@ -456,8 +456,8 @@ async fn actual_foreign_old_claim_and_cut_cannot_consume_new_profile_custody() {
 // its original TaskRound. It supplies neither an actor nor a Ready token.
 #[derive(Debug)]
 struct ProfileRecoveryFacts {
-    failed: QueryContextRef,
-    successor: QueryContextRef,
+    failed: ParticipationRef,
+    successor: ParticipationRef,
     admissions:
         Mutex<Option<Box<[novarocks_query_application::coordination::QualifiedWorkerAdmission]>>>,
     submitted: std::sync::atomic::AtomicUsize,
@@ -494,8 +494,8 @@ impl novarocks_query_application::coordination::ReplacementQualificationEffectRe
     ) {
         use novarocks_query_application::coordination as qa;
         let request = submission.request();
-        if request.failed_contexts() != [self.0.failed]
-            || request.replacement_contexts() != [self.0.successor]
+        if request.failed_participations() != [self.0.failed]
+            || request.replacement_participations() != [self.0.successor]
         {
             submission.refused(qa::ReplacementQualificationFailure::InvalidReservation);
             return;
@@ -521,7 +521,7 @@ impl novarocks_query_application::coordination::ReplacementQualificationEffectRe
 #[derive(Debug)]
 struct ProfileRecoveryIsolation {
     identity: novarocks_query_application::coordination::ReplacementQualificationIdentity,
-    failed: QueryContextRef,
+    failed: ParticipationRef,
     admissions: Box<[novarocks_query_application::coordination::QualifiedWorkerAdmission]>,
     exits: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -541,7 +541,7 @@ impl novarocks_query_application::coordination::AttemptIsolationReservation
     }
     fn validate_binding(
         &self,
-        failed: &[QueryContextRef],
+        failed: &[ParticipationRef],
     ) -> Result<(), novarocks_query_application::coordination::ReplacementQualificationFailure>
     {
         (failed == [self.failed]).then_some(()).ok_or(novarocks_query_application::coordination::ReplacementQualificationFailure::InvalidReservation)
@@ -658,15 +658,25 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         );
     let first_root = first_round.root_task();
     let next_root = next_round.root_task();
-    let first_context = *first_round.execution().graph().contexts().next().unwrap();
-    let next_context = *next_round.execution().graph().contexts().next().unwrap();
+    let first_participation = *first_round
+        .execution()
+        .graph()
+        .participations()
+        .next()
+        .unwrap();
+    let next_participation = *next_round
+        .execution()
+        .graph()
+        .participations()
+        .next()
+        .unwrap();
     let mut admission = None;
     let mut establish = None;
     let mut qualified = Vec::new();
     for (intent, ack) in next_facts {
         assert_eq!(intent.operation_id(), ack.operation_id());
         match intent {
-            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+            OperationIntent::AcquireParticipationAdmissionTicket(request) => {
                 let AckPayload::AdmissionTicket(ticket) = ack.payload() else {
                     panic!("original replacement admission ACK")
                 };
@@ -676,7 +686,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
                 );
                 assert!(admission.replace(request).is_none());
             }
-            OperationIntent::EstablishQueryContext(request) => {
+            OperationIntent::EstablishParticipation(request) => {
                 assert!(
                     establish
                         .replace((request, ack.operation_id(), ack.worker_outcome().unwrap()))
@@ -688,8 +698,8 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
     }
     let isolation_exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let facts = Arc::new(ProfileRecoveryFacts {
-        failed: first_context,
-        successor: next_context,
+        failed: first_participation,
+        successor: next_participation,
         admissions: Mutex::new(Some(qualified.into_boxed_slice())),
         submitted: std::sync::atomic::AtomicUsize::new(0),
         isolation_exits: Arc::clone(&isolation_exits),
@@ -711,7 +721,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
     let config = LogicalExecutionTestHarness::internal_pre_visibility_recovery_config(
         first_execution,
         NonZeroUsize::new(8).unwrap(),
-        vec![first_context],
+        vec![first_participation],
         NonZeroUsize::new(2).unwrap(),
         NonZeroUsize::new(2).unwrap(),
         NonZeroU32::new(2).unwrap(),
@@ -721,8 +731,8 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         Duration::from_secs(30),
     )
     .unwrap()
-    .with_abort_query_context_effect_port(
-        abort as Arc<dyn AbortQueryContextEffectPort>,
+    .with_abort_participation_effect_port(
+        abort as Arc<dyn AbortParticipationEffectPort>,
         NonZeroUsize::new(2).unwrap(),
     );
     let mut logical = LogicalExecutionTestHarness::install_internal(
@@ -733,7 +743,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         Arc::clone(&actor_clock) as Arc<dyn MonotonicClock>,
         ComputationObservationBudgets::new(Duration::from_secs(1), Duration::from_secs(5)),
         first_execution,
-        vec![first_context],
+        vec![first_participation],
     )
     .unwrap();
     let first_activation = watchdog(
@@ -780,7 +790,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         clock: actor_clock,
         plan,
         root: first_root,
-        context: first_context,
+        participation: first_participation,
         logical,
         native_credentials: credentials,
         diagnostics,
@@ -806,7 +816,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         attempt.logical.replace_original_running_attempt(
             novarocks_coordination_contract::AttemptFailureClass::RecoverableInfrastructure,
             next_execution,
-            vec![next_context],
+            vec![next_participation],
         ),
     )
     .await
@@ -829,7 +839,7 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
     let mut old_round = std::mem::replace(&mut attempt.round, next_round);
     let old_acks = std::mem::replace(&mut attempt.acks, next_acks);
     let old_release = attempt.release.replace(next_release).unwrap();
-    let old_context = std::mem::replace(&mut attempt.context, next_context);
+    let old_participation = std::mem::replace(&mut attempt.participation, next_participation);
     attempt.root = next_root;
     attempt.clock = next_clock;
     let next_credentials = original_credentials(next_execution);
@@ -897,15 +907,18 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
     let has_original_next_credentials =
         Arc::ptr_eq(received.original_credentials().unwrap(), &next_credentials)
             && !Arc::ptr_eq(received.original_credentials().unwrap(), &old_credentials);
-    let OperationIntent::ReleaseQueryContext(request) = attempt.release.as_ref().unwrap() else {
+    let OperationIntent::ReleaseParticipation(request) = attempt.release.as_ref().unwrap() else {
         unreachable!()
     };
     attempt.acks.publish(OperationAcknowledgement::new(
         request.envelope().operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(next_context, QueryContextState::TerminalRetained),
+            receipt: ParticipationReceipt::new(
+                next_participation,
+                ParticipationState::TerminalRetained,
+            ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,
         },
@@ -929,17 +942,20 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         && old_diagnostics.is_closed();
     let after_old_read = received.current_diagnostics().unwrap().unwrap();
 
-    // Drive the original failed round and its exact context to real fixture
+    // Drive the original failed round and its exact participation to real fixture
     // closure before retiring the one logical registry/actor.
-    let OperationIntent::ReleaseQueryContext(request) = old_release else {
+    let OperationIntent::ReleaseParticipation(request) = old_release else {
         unreachable!()
     };
     old_acks.publish(OperationAcknowledgement::new(
         request.envelope().operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(old_context, QueryContextState::TerminalRetained),
+            receipt: ParticipationReceipt::new(
+                old_participation,
+                ParticipationState::TerminalRetained,
+            ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,
         },
@@ -949,14 +965,14 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         .execution_mut()
         .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
             ObservationFrame::Covered {
-                context: old_context,
+                participation: old_participation,
                 generation: 1,
                 event: CoveredStatusStreamEvent {
-                    fact: CoveredStatusStreamFact::ContextConvergence(
-                        QueryContextConvergenceReceipt::new(
-                            old_context,
-                            QueryContextConvergenceVersion::FIRST,
-                            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    fact: CoveredStatusStreamFact::ParticipationConvergence(
+                        ParticipationConvergenceReceipt::new(
+                            old_participation,
+                            ParticipationConvergenceVersion::FIRST,
+                            ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
                         ),
                     ),
                     source_revision: None,
@@ -966,10 +982,10 @@ async fn one_logical_profile_owner_replaces_before_visibility_and_receives_only_
         .unwrap();
     let old_round_closed = old_round.attempt_drained()
         && old_round.pumps_closed()
-        && old_round.execution().worker_contexts_stopped();
+        && old_round.execution().worker_participations_stopped();
     attempt
         .logical
-        .observe_worker_stopped_and_context_fenced(old_context)
+        .observe_worker_stopped_and_participation_fenced(old_participation)
         .await
         .unwrap();
     first_producer.retire_unclaimed();

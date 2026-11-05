@@ -21,11 +21,11 @@
 
 use super::{KeySpec, LocalHashBatch, LocalHashPolicy, invariant, shared};
 use crate::exec::pipeline::operator::InputConstructionOwner;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluationCheckpoints, KernelEvaluationControl,
     builtin::aggregate_ds_hll_state::hll_heap_bytes,
-    datasketches_hll::{HllHandle, HllTargetType},
+    datasketches_hll::{HllAccumulator, HllTargetType},
     datasketches_hll_failure::{
         ClassifiedHllFailure, HllFailureDetail, HllFailureRecipe, HllFailureSink,
         HllInvariantRecipe, HllObservation,
@@ -96,10 +96,10 @@ impl SizingDomain {
 
 /// The caller funds the actual containing holder/container through its original
 /// construction owner. Opaque retained owns only the library heap, so inline
-/// HllHandle storage is not charged twice.
-/// Field order destroys the live library handle before returning its heap charge.
+/// HllAccumulator storage is not charged twice.
+/// Field order destroys the live library accumulator before returning its heap charge.
 pub(super) struct SizingSketch {
-    handle: Option<HllHandle>,
+    accumulator: Option<HllAccumulator>,
     charge: OpaqueRetainedCharge,
     host: Arc<dyn AggregateStateAllocator>,
     domain: SizingDomain,
@@ -137,7 +137,7 @@ impl SizingPayload {
 // author; this source-string lease does not invoice those different metadata.
 struct LibraryFailure {
     source: ClassifiedHllFailure,
-    _lease: OpaqueReservation,
+    _reservation: OpaqueReservation,
 }
 impl std::fmt::Debug for LibraryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,7 +163,7 @@ impl novarocks_failure_contract::FailureProjection for LibraryFailure {
 }
 struct Sink<'a, 'control> {
     work: &'a mut EvaluationCheckpoints<'control>,
-    library_failure_lease: Option<OpaqueReservation>,
+    library_failure_reservation: Option<OpaqueReservation>,
 }
 impl HllFailureSink for Sink<'_, '_> {
     type Error = ExecutionFailure;
@@ -173,10 +173,10 @@ impl HllFailureSink for Sink<'_, '_> {
             HllFailureDetail::Deserialize(_) | HllFailureDetail::Create(_)
         );
         let source = recipe.classify();
-        if carries_library_source && let Some(lease) = self.library_failure_lease.take() {
+        if carries_library_source && let Some(lease) = self.library_failure_reservation.take() {
             return ExecutionFailure::from_domain(LibraryFailure {
                 source,
-                _lease: lease,
+                _reservation: lease,
             });
         }
         source.into()
@@ -202,20 +202,21 @@ impl SizingSketch {
         let mut work = EvaluationCheckpoints::new(control);
         let mut sink = Sink {
             work: &mut work,
-            library_failure_lease: None,
+            library_failure_reservation: None,
         };
         sink.observe(HllObservation::OpaqueBoundary)?;
         let mut charge = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
-        let preflight = HllHandle::new_allocation_preflight_with_failure(LOG_K, TARGET, &mut sink)?;
+        let preflight =
+            HllAccumulator::new_allocation_preflight_with_failure(LOG_K, TARGET, &mut sink)?;
         let mut lease = charge.reserve_operation(preflight.bounds().operation_peak_bytes)?;
-        // Local declaration order also drops this handle before lease/charge if
+        // Local declaration order also drops this accumulator before lease/charge if
         // creation reconciliation or its next control observation refuses.
-        let (handle, outcome) =
-            HllHandle::new_under_reservation_with_failure(&preflight, &lease, &mut sink)?;
+        let (accumulator, outcome) =
+            HllAccumulator::new_under_reservation_with_failure(&preflight, &lease, &mut sink)?;
         charge.reconcile_under_reservation(hll_heap_bytes(outcome.current_bytes), &mut lease)?;
         sink.observe(HllObservation::OpaqueBoundary)?;
         Ok(Self {
-            handle: Some(handle),
+            accumulator: Some(accumulator),
             charge,
             host,
             domain: domain.clone(),
@@ -226,7 +227,7 @@ impl SizingSketch {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
         }
-        if self.handle.is_none() {
+        if self.accumulator.is_none() {
             return Err(invariant(ValueViolation::Layout));
         }
         Ok(())
@@ -237,7 +238,7 @@ impl SizingSketch {
         }
         // Actual backing is destroyed while any local operation lease remains
         // live; only then can retained and unused headroom be returned.
-        self.handle = None;
+        self.accumulator = None;
         self.charge.release_retained();
     }
     #[cfg(test)]
@@ -260,7 +261,7 @@ impl SizingSketch {
         let mut work = EvaluationCheckpoints::new(control);
         let mut sink = Sink {
             work: &mut work,
-            library_failure_lease: None,
+            library_failure_reservation: None,
         };
         let result = (|| {
             sink.observe(HllObservation::OpaqueBoundary)?;
@@ -280,7 +281,7 @@ impl SizingSketch {
     }
     fn update_one(&mut self, hash: u64, sink: &mut Sink<'_, '_>) -> ExecutionResult<()> {
         let preflight = self
-            .handle
+            .accumulator
             .as_ref()
             .ok_or_else(|| invariant(ValueViolation::Layout))?
             .update_hash_allocation_preflight_with_failure(sink)?;
@@ -288,7 +289,7 @@ impl SizingSketch {
             .charge
             .reserve_operation(preflight.bounds().additional_headroom_bytes())?;
         let result = self
-            .handle
+            .accumulator
             .as_mut()
             .ok_or_else(|| invariant(ValueViolation::Layout))?
             .update_hash_under_reservation_with_failure(hash, &preflight, &lease, sink);
@@ -326,21 +327,21 @@ impl SizingSketch {
         let mut work = EvaluationCheckpoints::new(control);
         let mut sink = Sink {
             work: &mut work,
-            library_failure_lease: None,
+            library_failure_reservation: None,
         };
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let handle = self
-            .handle
+        let accumulator = self
+            .accumulator
             .as_ref()
             .ok_or_else(|| invariant(ValueViolation::Layout))?;
-        let preflight = handle.serialization_allocation_preflight_observed(&mut || {
+        let preflight = accumulator.serialization_allocation_preflight_observed(&mut || {
             sink.observe(HllObservation::Step)
         })?;
         sink.observe(HllObservation::OpaqueBoundary)?;
         let mut charge = OpaqueRetainedCharge::try_new(Arc::clone(&self.host))?;
         let mut lease = charge.reserve_operation(preflight.bounds().additional_headroom_bytes)?;
         let bytes =
-            handle.serialize_under_reservation_with_failure(&preflight, &lease, &mut sink)?;
+            accumulator.serialize_under_reservation_with_failure(&preflight, &lease, &mut sink)?;
         charge.reconcile_under_reservation(bytes.capacity(), &mut lease)?;
         sink.observe(HllObservation::OpaqueBoundary)?;
         Ok(SizingPayload {
@@ -350,7 +351,7 @@ impl SizingSketch {
         })
     }
     /// Prefer this ownership handoff when a route partial no longer needs its
-    /// sketch. The source handle is destroyed before its retained charge and
+    /// sketch. The source accumulator is destroyed before its retained charge and
     /// the returned payload keeps only its own real capacity reservation.
     pub(super) fn seal(
         self,
@@ -368,7 +369,7 @@ impl SizingSketch {
         let mut work = EvaluationCheckpoints::new(control);
         let mut sink = Sink {
             work: &mut work,
-            library_failure_lease: None,
+            library_failure_reservation: None,
         };
         let result = (|| {
             sink.observe(HllObservation::OpaqueBoundary)?;
@@ -376,7 +377,7 @@ impl SizingSketch {
                 return Err(invariant(ValueViolation::Layout));
             }
             let preflight = self
-                .handle
+                .accumulator
                 .as_ref()
                 .ok_or_else(|| invariant(ValueViolation::Layout))?
                 .merge_payload_allocation_preflight_with_failure(&payload.bytes, &mut sink)?;
@@ -388,13 +389,13 @@ impl SizingSketch {
                 .charge
                 .reserve_operation(preflight.bounds().additional_headroom_bytes())?;
             let error_headroom = preflight.library_error_headroom_bytes();
-            sink.library_failure_lease = if error_headroom == 0 {
+            sink.library_failure_reservation = if error_headroom == 0 {
                 None
             } else {
                 Some(self.charge.reserve_operation(error_headroom)?)
             };
             let result = self
-                .handle
+                .accumulator
                 .as_mut()
                 .ok_or_else(|| invariant(ValueViolation::Layout))?
                 .merge_payload_under_reservation_with_failure(
@@ -442,11 +443,11 @@ impl SizingSketch {
         let mut work = EvaluationCheckpoints::new(control);
         let mut sink = Sink {
             work: &mut work,
-            library_failure_lease: None,
+            library_failure_reservation: None,
         };
         sink.observe(HllObservation::OpaqueBoundary)?;
         let estimate = self
-            .handle
+            .accumulator
             .as_ref()
             .ok_or_else(|| invariant(ValueViolation::Layout))?
             .estimate_with_failure(&mut sink)?;

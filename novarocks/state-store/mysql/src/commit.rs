@@ -33,7 +33,7 @@ use super::codec::{
     COMMIT_STATE_NOT_COMMITTED, COMMIT_STATE_PENDING, DurableCommitState, MysqlCodec,
     encode_attempt_id,
 };
-use super::runtime::MysqlOperationLease;
+use super::runtime::MysqlOperationGate;
 use novarocks_state_store_api::{
     AttemptId, AttemptOutcome, CommitReceipt, InDoubtAdjudicator, StateStoreError,
     StateStoreErrorKind, StoreRevision,
@@ -914,7 +914,7 @@ const MAX_DEFERRED_EVIDENCE_RELEASES: usize = 256;
 /// to prevent.
 pub(super) struct MysqlEvidence {
     pool: Arc<dyn PoolLifecycle>,
-    operations: MysqlOperationLease,
+    operations: MysqlOperationGate,
     codec: MysqlCodec,
     deadline_budget: Duration,
     /// Releases that failed, plus terminals decided by adjudication whose
@@ -927,7 +927,7 @@ pub(super) struct MysqlEvidence {
 impl MysqlEvidence {
     pub(super) fn new(
         pool: Arc<dyn PoolLifecycle>,
-        operations: MysqlOperationLease,
+        operations: MysqlOperationGate,
         codec: MysqlCodec,
         deadline_budget: Duration,
     ) -> Self {

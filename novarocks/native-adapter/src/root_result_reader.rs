@@ -25,7 +25,7 @@ use std::alloc::Layout;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_execution_contract::root_result::{
     RootReadDeferral, RootReadDeferred, RootReadRefusal, RootResultRead, RootResultReply,
 };
@@ -194,15 +194,17 @@ impl NativeRootResultReader {
         if !controls.owns_backend(identity.backend_process_id()) {
             return;
         }
-        let observer =
-            match controls.observation_for("grpc-fragment", identity.query_execution_id()) {
-                Ok(Some(observer)) => observer,
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::warn!(%error, task = %identity, "root read observation refused");
-                    return;
-                }
-            };
+        let observer = match controls.observation_for(
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+            identity.query_execution_id(),
+        ) {
+            Ok(Some(observer)) => observer,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, task = %identity, "root read observation refused");
+                return;
+            }
+        };
         if !observer.is_active() {
             return;
         }
@@ -314,7 +316,7 @@ impl NativeRootResultReader {
                     }
                     let execution = identity.query_execution_id();
                     eprintln!(
-                        "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}",
+                        "{} execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}", novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED,
                         execution.query_id().high(),
                         execution.query_id().low(),
                         execution.attempt_id().get(),
@@ -501,7 +503,8 @@ fn root_marker_identity(
 ) -> String {
     let execution = identity.query_execution_id();
     format!(
-        "NOVAROCKS_GRPC_FETCH_TYPED query_hi={} query_lo={} attempt={} stage={} task={} backend={} protocol=root-v1",
+        "{} query_hi={} query_lo={} attempt={} stage={} task={} backend={} protocol=root-v1",
+        novarocks_failpoint::observation_marker::GRPC_FETCH_TYPED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),

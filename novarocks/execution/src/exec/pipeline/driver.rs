@@ -37,7 +37,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 #[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, PipelineOperation};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult, PipelineOperation};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -49,20 +49,20 @@ use super::{
     driver_retirement::{
         DriverExitCustody, EdgeRetirement, ProcessPanicCustody, RetainedDriverOwners,
     },
+    driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork},
     input::RawInput,
     instance::OperatorInstance,
     shape::StepOperator,
     step::{AdmissionNext, InputResult, NextStep, RootPending, RootStep, UpstreamPull, WaitFact},
-    step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork},
 };
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::{
-    FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink, RootInputPermit,
-};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::profile::{CounterRef, OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{
+    NoopTaskEventSink, RootInputPermit, TaskEvent, TaskEventSink, TaskProgress,
+};
 use novarocks_types::{UniqueId, format_uuid};
 use std::num::NonZeroU64;
 use tracing::{debug, error};
@@ -234,8 +234,8 @@ pub struct PipelineDriver {
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    fragment_instance_id: Option<(i64, i64)>,
-    event_sink: Option<std::mem::ManuallyDrop<Arc<dyn FragmentEventSink>>>,
+    task_key: Option<(i64, i64)>,
+    event_sink: Option<std::mem::ManuallyDrop<Arc<dyn TaskEventSink>>>,
     progress: ProgressEndpoint,
     state: DriverState,
     blocked_since: Option<(Instant, DriverBlockedKind)>,
@@ -291,11 +291,11 @@ pub struct PipelineDriver {
 /// asynchronous operator can start.
 pub(crate) struct PipelineDriverBindings {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
 }
 
 impl PipelineDriverBindings {
-    pub(crate) fn new(event_sink: Arc<dyn FragmentEventSink>) -> Self {
+    pub(crate) fn new(event_sink: Arc<dyn TaskEventSink>) -> Self {
         Self {
             event_sink,
             query_memory: None,
@@ -348,10 +348,10 @@ impl PipelineDriver {
         profiler: Option<Profiler>,
         operator_profiles: Vec<OperatorProfiles>,
         runtime_state: Arc<RuntimeState>,
-        fragment_instance_id: Option<(i64, i64)>,
+        task_key: Option<(i64, i64)>,
     ) -> Self {
         let query_memory = runtime_state.query_memory().cloned();
-        let event_sink: Arc<dyn FragmentEventSink> = Arc::new(NoopFragmentEventSink);
+        let event_sink: Arc<dyn TaskEventSink> = Arc::new(NoopTaskEventSink);
         let mem_root = runtime_state.mem_tracker();
         let operators = operators
             .into_iter()
@@ -366,7 +366,7 @@ impl PipelineDriver {
                 if let Some(tracker) = &tracker {
                     operator.set_mem_tracker(tracker.clone());
                 }
-                operator.set_fragment_event_sink(event_sink.clone());
+                operator.set_task_event_sink(event_sink.clone());
                 if let Some(profiles) = operator_profiles.get(ordinal) {
                     operator.set_profiles(profiles.clone());
                 }
@@ -379,7 +379,7 @@ impl PipelineDriver {
             profiler,
             operator_profiles,
             runtime_state,
-            fragment_instance_id,
+            task_key,
             PipelineDriverBindings::new(event_sink).with_query_memory(query_memory),
         )
     }
@@ -390,7 +390,7 @@ impl PipelineDriver {
         profiler: Option<Profiler>,
         operator_profiles: Vec<OperatorProfiles>,
         runtime_state: Arc<RuntimeState>,
-        fragment_instance_id: Option<(i64, i64)>,
+        task_key: Option<(i64, i64)>,
         bindings: PipelineDriverBindings,
     ) -> Self {
         let PipelineDriverBindings {
@@ -503,7 +503,7 @@ impl PipelineDriver {
             operator_counters,
             runtime_state,
             query_memory,
-            fragment_instance_id,
+            task_key,
             event_sink: Some(std::mem::ManuallyDrop::new(event_sink)),
             progress,
             state: DriverState::Ready,
@@ -546,9 +546,9 @@ impl PipelineDriver {
             .map(|op| op.name().to_string())
             .collect();
         tracing::info!(
-            "PipelineDriver structure: driver_id={} fragment_instance_id={:?} operators={:?}",
+            "PipelineDriver structure: driver_id={} task_key={:?} operators={:?}",
             self.driver_id,
-            self.fragment_instance_id,
+            self.task_key,
             op_names
         );
     }
@@ -557,8 +557,8 @@ impl PipelineDriver {
         self.driver_id
     }
 
-    pub(crate) fn fragment_instance_id(&self) -> Option<(i64, i64)> {
-        self.fragment_instance_id
+    pub(crate) fn task_key(&self) -> Option<(i64, i64)> {
+        self.task_key
     }
 
     pub fn state(&self) -> &DriverState {
@@ -758,7 +758,7 @@ impl PipelineDriver {
     /// The executor can observe a fragment abort while a driver is parked and
     /// discard that task without another `process` turn.  Cancellation must
     /// still reach source-owned resources such as connector reader groups.
-    pub(crate) fn cancel_for_fragment_abort(&mut self) -> DriverState {
+    pub(crate) fn cancel_for_task_abort(&mut self) -> DriverState {
         // An externally aborted parked task does not receive another normal
         // `process` turn before the executor accounts it as complete. Route it
         // through the same PendingFinish latch as in-driver cancellation so an
@@ -992,7 +992,7 @@ impl PipelineDriver {
     fn poll_operator_controls(&mut self) -> ExecutionResult<()> {
         let control = self.runtime_state.error_state();
         let mut context =
-            StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
+            DriverStep::new(&control, &mut self.turn_work, &mut self.value_conversions);
         for operator in &mut self.operators {
             operator.poll_control(&mut context)?;
         }
@@ -1198,7 +1198,7 @@ impl PipelineDriver {
         if !self.runtime_state.should_report_exec_state() {
             return;
         }
-        let Some((hi, lo)) = self.fragment_instance_id else {
+        let Some((hi, lo)) = self.task_key else {
             return;
         };
         let sink = self
@@ -1207,7 +1207,7 @@ impl PipelineDriver {
             .expect("the driver owns its progress holder");
         self.progress.record(
             (**sink).as_ref(),
-            FragmentEvent::Progress(FragmentProgress::new(UniqueId::new(hi, lo), 0, 0, 0)),
+            TaskEvent::Progress(TaskProgress::new(UniqueId::new(hi, lo), 0, 0, 0)),
         );
     }
 
@@ -1255,9 +1255,9 @@ impl PipelineDriver {
             BlockedReason::Dependency(dep) => {
                 self.blocked_observable = None;
                 self.start_blocked_interval(DriverBlockedKind::Dependency);
-                if let Some((hi, lo)) = self.fragment_instance_id {
+                if let Some((hi, lo)) = self.task_key {
                     debug!(
-                        "Driver blocked on dependency: finst={} driver_id={} dep_name={}",
+                        "Driver blocked on dependency: task_key={} driver_id={} dep_name={}",
                         format_uuid(hi, lo),
                         self.driver_id,
                         dep.name()
@@ -1399,9 +1399,9 @@ impl PipelineDriver {
                     .last()
                     .map(|op| op.name())
                     .unwrap_or("unknown");
-                if let Some((hi, lo)) = self.fragment_instance_id {
+                if let Some((hi, lo)) = self.task_key {
                     debug!(
-                        "Driver finished: finst={} driver_id={} last_op={}",
+                        "Driver finished: task_key={} driver_id={} last_op={}",
                         format_uuid(hi, lo),
                         self.driver_id,
                         last_op
@@ -1414,9 +1414,9 @@ impl PipelineDriver {
                 }
             }
             DriverState::Canceled => {
-                if let Some((hi, lo)) = self.fragment_instance_id {
+                if let Some((hi, lo)) = self.task_key {
                     debug!(
-                        "Driver canceled: finst={} driver_id={}",
+                        "Driver canceled: task_key={} driver_id={}",
                         format_uuid(hi, lo),
                         self.driver_id
                     );
@@ -1425,9 +1425,9 @@ impl PipelineDriver {
                 }
             }
             DriverState::Failed(err) => {
-                if let Some((hi, lo)) = self.fragment_instance_id {
+                if let Some((hi, lo)) = self.task_key {
                     error!(
-                        "Driver failed: finst={} driver_id={} error={}",
+                        "Driver failed: task_key={} driver_id={} error={}",
                         format_uuid(hi, lo),
                         self.driver_id,
                         err
@@ -1627,7 +1627,7 @@ impl PipelineDriver {
         }
         let control = self.runtime_state.error_state();
         let mut context =
-            StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
+            DriverStep::new(&control, &mut self.turn_work, &mut self.value_conversions);
         let step = terminal
             .drive(&mut context)
             .map_err(|error| error.at_operator(idx, PipelineOperation::Pull))?;
@@ -1673,7 +1673,7 @@ impl PipelineDriver {
             let start = Instant::now();
             let control = self.runtime_state.error_state();
             let mut context =
-                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
+                DriverStep::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let result = self.operators[downstream_idx].try_push(&mut context, input);
             let accepted = matches!(result, InputResult::Accepted(_));
             let elapsed = start.elapsed();
@@ -1754,7 +1754,7 @@ impl PipelineDriver {
             let has_output = retained_root_input || upstream.has_continuation();
             let control = self.runtime_state.error_state();
             let mut context =
-                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
+                DriverStep::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let admission = if !has_output {
                 UpstreamPull::Busy
             } else if retained_root_input {
@@ -1809,7 +1809,7 @@ impl PipelineDriver {
             };
             let start = Instant::now();
             let control = self.runtime_state.error_state();
-            let mut context = super::step_context::StepContext::new(
+            let mut context = super::driver_step::DriverStep::new(
                 &control,
                 &mut self.turn_work,
                 &mut self.value_conversions,
@@ -2007,7 +2007,7 @@ impl PipelineDriver {
             let start = Instant::now();
             let control = self.runtime_state.error_state();
             let mut context =
-                StepContext::new(&control, &mut self.turn_work, &mut self.value_conversions);
+                DriverStep::new(&control, &mut self.turn_work, &mut self.value_conversions);
             let result = op.finish(&mut context);
             let elapsed = start.elapsed();
             if self.profiler.is_some() {
@@ -2076,20 +2076,20 @@ impl Drop for PipelineDriver {
 #[cfg(test)]
 mod tests {
     use crate::exec::pipeline::operator::OperatorLifecycle;
-    use crate::runtime::fragment::ExecutionResult;
+    use crate::runtime::task::ExecutionResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{BlockedReason, DriverState, Observable, PipelineDriver};
 
+    use crate::exec::pipeline::driver_step::DriverStep;
     use crate::exec::pipeline::input::PreparedInput;
     use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, SourceStart, Transform,
     };
     use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
-    use crate::exec::pipeline::step_context::StepContext;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FinalizationState {
@@ -2114,7 +2114,7 @@ mod tests {
         fn start(&self) -> SourceStart {
             SourceStart::Finished
         }
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("finished source must not be polled")
         }
     }
@@ -2142,7 +2142,7 @@ mod tests {
         fn start(&self) -> SourceStart {
             SourceStart::Finished
         }
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("finished source must not be polled")
         }
     }
@@ -2250,15 +2250,15 @@ mod tests {
     impl SinkKernel for ScriptedSink {
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             panic!("scripted finalization sink has an empty input stream")
         }
-        fn poll(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        fn poll(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
             Ok(self.advance_finalization())
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
             assert_eq!(
                 self.finish_signals.fetch_add(1, Ordering::SeqCst),
                 0,
@@ -2287,7 +2287,7 @@ mod tests {
         fn start(&self) -> SourceStart {
             SourceStart::Finished
         }
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("already finished source")
         }
     }
@@ -2348,7 +2348,7 @@ mod tests {
             )
             .unwrap();
             let source = Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
@@ -2416,7 +2416,7 @@ mod tests {
                     .unwrap(),
             );
             let other = Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 source.chunk_schema_ref(),
@@ -2684,7 +2684,7 @@ mod terminal_signal_tests {
         fn control_observable(&self) -> Option<Arc<Observable>> {
             Some(self.event.clone())
         }
-        fn reserve_upstream(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<UpstreamPull> {
+        fn reserve_upstream(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<UpstreamPull> {
             Ok(UpstreamPull::Wait(WaitFact {
                 reason: super::super::step::WaitReason::Output,
                 observable: self.event.clone(),
@@ -2692,13 +2692,13 @@ mod terminal_signal_tests {
                 deadline: None,
             }))
         }
-        fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
             panic!("capacity has not accepted input")
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("capacity wait must precede data work")
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -2777,7 +2777,7 @@ mod terminal_signal_tests {
             fn control_observable(&self) -> Option<Arc<Observable>> {
                 Some(self.event.clone())
             }
-            fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+            fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
                 if self.requested.load(Ordering::Acquire) && !self.scheduled {
                     self.scheduled = true;
                     Ok(ControlStep::Runnable)
@@ -2785,10 +2785,10 @@ mod terminal_signal_tests {
                     Ok(ControlStep::Active)
                 }
             }
-            fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+            fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
                 panic!("no input was produced")
             }
-            fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 assert!(
                     self.scheduled,
                     "only control made this finalization runnable"
@@ -2796,7 +2796,7 @@ mod terminal_signal_tests {
                 self.calls.fetch_add(1, Ordering::AcqRel);
                 Ok(StepResult::new(None, NextStep::Finished, 0))
             }
-            fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+            fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
                 panic!("upstream is still open and empty")
             }
         }
@@ -2861,10 +2861,10 @@ mod terminal_signal_tests {
         }
     }
     impl StepOperator for ReportedWaitSource {
-        fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
             panic!("source cannot accept input")
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.polls.fetch_add(1, Ordering::AcqRel);
             Ok(StepResult::new(
                 None,
@@ -2877,7 +2877,7 @@ mod terminal_signal_tests {
                 0,
             ))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             panic!("source cannot receive input EOS")
         }
     }
@@ -2981,13 +2981,13 @@ mod terminal_signal_tests {
                 deadline: None,
             })
         }
-        fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
             panic!("source has no input edge")
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("active source polling must remain on a driver worker")
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             panic!("source has no input EOS")
         }
     }
@@ -3009,16 +3009,16 @@ mod terminal_signal_tests {
         }
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: super::super::input::PreparedInput,
         ) -> ExecutionResult<StepResult> {
             self.output = Some(input.into_uncovered_chunk()?);
             Ok(StepResult::new(None, NextStep::Runnable, 0))
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(self.output.take(), NextStep::NeedInput, 0))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             assert!(self.output.is_none(), "buffered output drains before EOS");
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
@@ -3034,7 +3034,7 @@ mod terminal_signal_tests {
     impl crate::exec::pipeline::shape::SinkKernel for RecoveringTerminal {
         fn admission(
             &self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: &RawInput,
         ) -> ExecutionResult<Option<AdmissionNext>> {
             let generation = self.observable.generation();
@@ -3049,7 +3049,7 @@ mod terminal_signal_tests {
         }
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: super::super::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let _chunk = input.into_uncovered_chunk()?;
@@ -3072,7 +3072,7 @@ mod terminal_signal_tests {
     }
 
     impl crate::exec::pipeline::shape::SourceKernel for GenerationChangingSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let generation = self.observable.generation();
             self.polls.fetch_add(1, Ordering::AcqRel);
             if !self.changed.swap(true, Ordering::AcqRel) {
@@ -3098,13 +3098,13 @@ mod terminal_signal_tests {
     }
 
     impl StepOperator for SynchronousJoinCompletion {
-        fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
             InputResult::Deferred {
                 input,
                 next: AdmissionNext::ResumeExisting,
             }
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             if self
                 .phase
                 .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
@@ -3128,7 +3128,7 @@ mod terminal_signal_tests {
                 ))
             }
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -3140,13 +3140,13 @@ mod terminal_signal_tests {
     }
 
     impl StepOperator for DependencyBlockedJoin {
-        fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
             InputResult::Deferred {
                 input,
                 next: AdmissionNext::ResumeExisting,
             }
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let event = self.dependency.observable();
             let generation = event.generation();
             Ok(StepResult::new(
@@ -3164,7 +3164,7 @@ mod terminal_signal_tests {
                 0,
             ))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -3194,7 +3194,7 @@ mod terminal_signal_tests {
         fn initial_step(&self) -> NextStep {
             self.bound(self.next)
         }
-        fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
             match self.next {
                 FixtureStep::NeedInput => {
                     // No columns are inspected by this scheduling fixture.
@@ -3214,7 +3214,7 @@ mod terminal_signal_tests {
                 },
             }
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             if matches!(self.next, FixtureStep::Output) {
                 self.next = self.after_output;
                 Ok(StepResult::new(
@@ -3226,7 +3226,7 @@ mod terminal_signal_tests {
                 Ok(StepResult::new(None, self.bound(self.next), 0))
             }
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             self.next = FixtureStep::Finished;
             Ok(())
         }
@@ -3262,7 +3262,7 @@ mod terminal_signal_tests {
         fn start(&self) -> crate::exec::pipeline::shape::SourceStart {
             crate::exec::pipeline::shape::SourceStart::Finished
         }
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("finished lifecycle fixture must not produce data")
         }
     }
@@ -3342,17 +3342,17 @@ mod terminal_signal_tests {
         }
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: super::super::input::PreparedInput,
         ) -> ExecutionResult<StepResult> {
             panic!("the source is already at EOS")
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(self.output.take(), NextStep::NeedInput, 1))
         }
         fn end_input(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
             assert!(
                 self.output.is_none(),
@@ -3361,7 +3361,7 @@ mod terminal_signal_tests {
             self.ends.fetch_add(1, Ordering::SeqCst);
             Ok(crate::exec::pipeline::shape::TransformInputEnd::Finished)
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("no-output EOS must not require a payload step")
         }
     }
@@ -3736,7 +3736,7 @@ mod terminal_signal_tests {
         }
 
         impl crate::exec::pipeline::shape::SourceKernel for ActivationProbe {
-            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 Ok(StepResult::new(None, NextStep::Yield, 0))
             }
         }
@@ -3761,7 +3761,7 @@ mod terminal_signal_tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         let mut rejected = new_driver();
-        assert_eq!(rejected.cancel_for_fragment_abort(), DriverState::Canceled);
+        assert_eq!(rejected.cancel_for_task_abort(), DriverState::Canceled);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
@@ -3776,14 +3776,8 @@ mod terminal_signal_tests {
             Arc::clone(&failure_count),
         );
 
-        assert_eq!(
-            driver.cancel_for_fragment_abort(),
-            DriverState::PendingFinish
-        );
-        assert_eq!(
-            driver.cancel_for_fragment_abort(),
-            DriverState::PendingFinish
-        );
+        assert_eq!(driver.cancel_for_task_abort(), DriverState::PendingFinish);
+        assert_eq!(driver.cancel_for_task_abort(), DriverState::PendingFinish);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
         assert_eq!(failure_count.load(Ordering::SeqCst), 0);
 
@@ -3810,16 +3804,13 @@ mod terminal_signal_tests {
             driver.finish_with_state(DriverState::Failed(original.clone())),
             DriverState::PendingFinish
         );
-        assert_eq!(
-            driver.cancel_for_fragment_abort(),
-            DriverState::PendingFinish
-        );
+        assert_eq!(driver.cancel_for_task_abort(), DriverState::PendingFinish);
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
 
         pending.store(false, Ordering::SeqCst);
         assert_eq!(
-            driver.cancel_for_fragment_abort(),
+            driver.cancel_for_task_abort(),
             DriverState::Failed(original)
         );
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
@@ -3836,7 +3827,7 @@ mod terminal_signal_tests {
     impl crate::exec::pipeline::shape::SinkKernel for TypedErrorSink {
         fn admission(
             &self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             _: &RawInput,
         ) -> ExecutionResult<Option<crate::exec::pipeline::step::AdmissionNext>> {
             if self.1 == PipelineOperation::Admission {
@@ -3847,7 +3838,7 @@ mod terminal_signal_tests {
         }
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -3862,7 +3853,7 @@ mod terminal_signal_tests {
         }
         fn finish(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             Err(self.0.clone())
         }
@@ -3870,9 +3861,7 @@ mod terminal_signal_tests {
 
     #[test]
     fn typed_failure_push_admission_and_finishing_preserve_cause_and_exact_operator_context() {
-        use crate::runtime::fragment::{
-            ExecutionFailure, ExecutionFailureContext, PipelineOperation,
-        };
+        use crate::runtime::task::{ExecutionFailure, OperatorFailureSite, PipelineOperation};
         for operation in [
             PipelineOperation::Push,
             PipelineOperation::Admission,
@@ -3916,8 +3905,8 @@ mod terminal_signal_tests {
             };
             assert_eq!(error.cause(), original.cause());
             assert_eq!(
-                error.context(),
-                Some(ExecutionFailureContext {
+                error.site(),
+                Some(OperatorFailureSite {
                     operator_ordinal: 1,
                     operation
                 })
@@ -3948,10 +3937,7 @@ mod terminal_signal_tests {
             )),
             DriverState::PendingFinish
         );
-        assert_eq!(
-            driver.cancel_for_fragment_abort(),
-            DriverState::PendingFinish
-        );
+        assert_eq!(driver.cancel_for_task_abort(), DriverState::PendingFinish);
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
         pending.store(false, Ordering::SeqCst);
@@ -3977,7 +3963,7 @@ mod terminal_signal_tests {
     }
 
     impl crate::exec::pipeline::shape::SourceKernel for RootCancelledDuringFailure {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::Yield, 0))
         }
     }
@@ -3993,7 +3979,7 @@ mod terminal_signal_tests {
     struct RunPeerDuringFailure {
         cancelled: Arc<AtomicBool>,
         peer: Arc<Mutex<PipelineDriver>>,
-        completion: Arc<super::super::global_driver_executor::FragmentCompletion>,
+        completion: Arc<super::super::global_driver_executor::DriverGroupCompletion>,
         observations: Arc<Mutex<Vec<PeerCleanupObservation>>>,
     }
 
@@ -4028,14 +4014,14 @@ mod terminal_signal_tests {
     }
 
     impl crate::exec::pipeline::shape::SourceKernel for RunPeerDuringFailure {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::Yield, 0))
         }
     }
 
     #[test]
     fn deferred_originating_failure_precedes_cleanup_induced_peer_failure() {
-        use super::super::global_driver_executor::FragmentCompletion;
+        use super::super::global_driver_executor::DriverGroupCompletion;
 
         use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
         let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
@@ -4052,7 +4038,7 @@ mod terminal_signal_tests {
             )),
         ));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let completion = FragmentCompletion::new(2, runtime.error_state());
+        let completion = DriverGroupCompletion::new(2, runtime.error_state());
         let observations = Arc::new(Mutex::new(Vec::new()));
         let peer = Arc::new(Mutex::new(PipelineDriver::new(
             2,
@@ -4119,11 +4105,11 @@ mod terminal_signal_tests {
     }
     #[test]
     fn originating_failure_precedes_cleanup_induced_peer_failure() {
-        use super::super::global_driver_executor::FragmentCompletion;
+        use super::super::global_driver_executor::DriverGroupCompletion;
 
         let runtime = Arc::new(RuntimeState::default());
         let cancelled = Arc::new(AtomicBool::new(false));
-        let completion = FragmentCompletion::new(2, runtime.error_state());
+        let completion = DriverGroupCompletion::new(2, runtime.error_state());
         let observations = Arc::new(Mutex::new(Vec::new()));
         let peer = Arc::new(Mutex::new(PipelineDriver::new(
             2,
@@ -4215,9 +4201,9 @@ mod terminal_signal_tests {
             InputConstructionFactory, InputConstructionProfile,
             try_runtime_input_construction_factory,
         };
-        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
         use crate::runtime::mem_tracker::MemTracker;
         use crate::runtime::runtime_state::RuntimeErrorState;
+        use crate::runtime::task::{ExecutionFailure, PipelineOperation};
         use arrow::array::{
             Array, ArrayData, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, ListArray,
             StringArray,
@@ -4247,7 +4233,7 @@ mod terminal_signal_tests {
         impl crate::exec::pipeline::shape::SinkKernel for RetainingSink {
             fn consume(
                 &mut self,
-                _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+                _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
                 input: crate::exec::pipeline::input::PreparedInput,
             ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
                 let chunk = input.into_uncovered_chunk()?;
@@ -4271,7 +4257,7 @@ mod terminal_signal_tests {
             }
             fn poll_output(
                 &mut self,
-                _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+                _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             ) -> ExecutionResult<StepResult> {
                 panic!("typed receiver fixture injects its original raw edge directly")
             }
@@ -4303,7 +4289,7 @@ mod terminal_signal_tests {
             )
             .unwrap();
             Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
@@ -4317,7 +4303,7 @@ mod terminal_signal_tests {
         fn required_list_source(
             offset: usize,
             len: usize,
-        ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
+        ) -> crate::runtime::task::ExecutionResult<Chunk> {
             // A NULL value deliberately retains nonempty payload bytes. The
             // typed source admits only its active parent/offset-visible rows.
             let values = ArrayData::builder(arrow::datatypes::DataType::Utf8)
@@ -4377,7 +4363,7 @@ mod terminal_signal_tests {
             )
             .unwrap();
             Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
@@ -4548,9 +4534,7 @@ mod terminal_signal_tests {
                 vec![],
                 state,
                 None,
-                PipelineDriverBindings::new(Arc::new(
-                    crate::runtime::fragment::io::NoopFragmentEventSink,
-                )),
+                PipelineDriverBindings::new(Arc::new(crate::runtime::task::io::NoopTaskEventSink)),
             )
         }
         #[test]
@@ -4702,7 +4686,7 @@ mod fanout_exit_tests;
 mod root_quantum_retirement_tests {
     use super::*;
     use crate::runtime::execution_health::ExecutionHealth;
-    use crate::runtime::fragment::io::{
+    use crate::runtime::task::io::{
         ResultWriteCredit, RootInputAdmission, RootInputAuthority, RootInputReservationAdmission,
         RootResultWriteSpec, RootWorkExitProgress,
     };
@@ -4803,21 +4787,21 @@ mod root_quantum_retirement_tests {
         fn initial_step(&self) -> NextStep {
             NextStep::Runnable
         }
-        fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
             panic!("source input")
         }
         fn drive(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
         ) -> ExecutionResult<super::super::step::StepResult> {
             panic!("must borrow exact Root input")
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             panic!("source EOS")
         }
         fn drive_with_root_input(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             permit: &RootInputPermit,
         ) -> ExecutionResult<RootStep> {
             let quantum = self.counts.pulls.fetch_add(1, Ordering::SeqCst);
@@ -4899,7 +4883,7 @@ mod root_quantum_retirement_tests {
         fn initial_step(&self) -> NextStep {
             NextStep::NeedInput
         }
-        fn reserve_upstream(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<UpstreamPull> {
+        fn reserve_upstream(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<UpstreamPull> {
             let RootInputReservationAdmission::Granted(mut reservation) =
                 self.authority.try_reserve().unwrap()
             else {
@@ -4936,7 +4920,7 @@ mod root_quantum_retirement_tests {
             self.generations.lock().unwrap().push(permit.generation());
             Ok(UpstreamPull::Root(permit))
         }
-        fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
             assert!(
                 self.authority.owns_original(input.permit().unwrap()),
                 "output must retain its original unretired grant"
@@ -4961,7 +4945,7 @@ mod root_quantum_retirement_tests {
         }
         fn drive(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
         ) -> ExecutionResult<super::super::step::StepResult> {
             Ok(super::super::step::StepResult::new(
                 None,
@@ -4973,7 +4957,7 @@ mod root_quantum_retirement_tests {
                 0,
             ))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             self.finishing = true;
             Ok(())
         }

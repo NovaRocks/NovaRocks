@@ -152,7 +152,7 @@ impl std::fmt::Debug for FileCancellation {
     }
 }
 
-pub type FileTaskFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub type FileIoFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type FileBytesFuture = Pin<Box<dyn Future<Output = FileResult<Bytes>> + Send + 'static>>;
 pub type FileU64Future = Pin<Box<dyn Future<Output = FileResult<u64>> + Send + 'static>>;
 
@@ -172,10 +172,10 @@ pub trait FileIoRuntime: Send + Sync {
     }
 }
 
-pub trait FileTaskSpawner: Send + Sync {
+pub trait FileIoSpawner: Send + Sync {
     /// On Err no job was delivered, and destruction of the supplied future
     /// and its captures has returned. Panic is not a NoJob exit receipt.
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask>;
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob>;
 
     /// Run one synchronous job somewhere other than the caller's thread.
     ///
@@ -188,11 +188,11 @@ pub trait FileTaskSpawner: Send + Sync {
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>);
 }
 
-pub struct FileTask {
+pub struct FileIoJob {
     join: Option<JoinHandle<()>>,
 }
 
-impl FileTask {
+impl FileIoJob {
     pub fn new(join: JoinHandle<()>) -> Self {
         Self { join: Some(join) }
     }
@@ -253,7 +253,7 @@ impl FileTask {
     }
 }
 
-impl Drop for FileTask {
+impl Drop for FileIoJob {
     fn drop(&mut self) {
         self.abort();
     }
@@ -309,19 +309,19 @@ fn block_on<T>(handle: &Handle, future: impl Future<Output = T>) -> FileResult<T
 }
 
 #[derive(Clone)]
-pub struct TokioFileTaskSpawner {
+pub struct TokioFileIoSpawner {
     handle: Handle,
 }
 
-impl TokioFileTaskSpawner {
+impl TokioFileIoSpawner {
     pub fn new(handle: Handle) -> Self {
         Self { handle }
     }
 }
 
-impl FileTaskSpawner for TokioFileTaskSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
-        Ok(FileTask::new(self.handle.spawn(task)))
+impl FileIoSpawner for TokioFileIoSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
+        Ok(FileIoJob::new(self.handle.spawn(task)))
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -486,7 +486,7 @@ mod tests {
         let exited = Arc::new(AtomicBool::new(false));
         let (started, receiver) = tokio::sync::oneshot::channel();
         let flag = Arc::clone(&exited);
-        let mut task = FileTask::new(tokio::spawn(async move {
+        let mut task = FileIoJob::new(tokio::spawn(async move {
             let _flag = ExitFlag(flag);
             let _ = started.send(());
             futures::future::pending::<()>().await;
@@ -501,7 +501,7 @@ mod tests {
         let input = Arc::new(vec![7_u8; 8]);
         let weak = Arc::downgrade(&input);
         let (release, gate) = tokio::sync::oneshot::channel();
-        let mut task = FileTask::new(tokio::spawn(async move {
+        let mut task = FileIoJob::new(tokio::spawn(async move {
             let _ = gate.await;
             drop(input);
         }));

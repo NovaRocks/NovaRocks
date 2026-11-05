@@ -73,11 +73,11 @@ fn terminal_profile_contribution(
         .map(|stream| {
             let identity = stream.identity();
             let channel = identity.channel();
-            let fragment = identity.fragment_instance_id();
+            let fragment = identity.task_key();
             wire::QueryTerminalRuntimeFilterProducerStreamV1 {
                 channel_binding_id: channel.binding_id().get(),
                 channel_id: channel.channel_id().get(),
-                producer_fragment_instance_id: Some(common::UniqueId {
+                producer_task_key: Some(common::UniqueId {
                     hi: fragment.high(),
                     lo: fragment.low(),
                 }),
@@ -152,12 +152,12 @@ fn terminal_profile_contribution(
                 },
             };
             let channel = identity.channel();
-            let fragment = identity.fragment_instance_id();
+            let fragment = identity.task_key();
             wire::QueryTerminalRuntimeFilterConsumerV1 {
                 channel_binding_id: channel.binding_id().get(),
                 channel_id: channel.channel_id().get(),
                 consumer_binding_id: identity.consumer_binding_id().get(),
-                fragment_instance_id: Some(common::UniqueId {
+                task_key: Some(common::UniqueId {
                     hi: fragment.high(),
                     lo: fragment.low(),
                 }),

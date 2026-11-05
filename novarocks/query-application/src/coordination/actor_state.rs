@@ -24,14 +24,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use novarocks_execution_contract::{
-    CredentialLeaseId, PlanNodeId, QueryContextRef, TaskOperationId,
+    CredentialDomainId, ParticipationRef, PlanNodeId, TaskOperationId,
 };
 use novarocks_types::identity::{QueryExecutionId, QueryId};
 
 use super::{
     BeginSchemaDelivery, CompletedDelivery, DeliveryCompletion, DeliveryCompletionError,
-    DeliveryGate, DeliveryGateError, DeliveryPermit, DeliveryPhase, DeliveryRejection,
-    RecoveryDecision, RecoveryInput, ResultPacket, SchemaDeliveryPermit, evaluate_recovery,
+    DeliveryGate, DeliveryGateError, DeliveryObligation, DeliveryPhase, DeliveryRejection,
+    RecoveryDecision, RecoveryInput, ResultPacket, SchemaDeliveryObligation, evaluate_recovery,
 };
 use novarocks_coordination_contract::{AttemptFailureClass, ExecutionEffect, RecoveryMode};
 
@@ -124,7 +124,7 @@ pub enum ExecutionPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) enum ReplacementFact {
-    ReachableContextsClosed,
+    ReachableParticipationsClosed,
     AttemptIsolationProven,
     StaleUsageAccounted,
     NewCapacityAdmitted,
@@ -168,7 +168,7 @@ pub(crate) struct PendingReplacementEffect {
 #[derive(Debug)]
 #[must_use = "the logical execution actor must complete or fail the authorized success EOF"]
 pub(crate) struct SuccessEndOfStreamPermit {
-    inner: DeliveryPermit<()>,
+    inner: DeliveryObligation<()>,
 }
 
 /// Opaque, actor-instance-scoped authority for one exact attempt.  The
@@ -306,7 +306,7 @@ impl EffectReceiptOwner {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ReplacementProgress {
-    reachable_contexts_closed: bool,
+    reachable_participations_closed: bool,
     attempt_isolation_proven: bool,
     stale_usage_accounted: bool,
     new_capacity_admitted: bool,
@@ -315,7 +315,9 @@ struct ReplacementProgress {
 impl ReplacementProgress {
     fn record(&mut self, fact: ReplacementFact) {
         match fact {
-            ReplacementFact::ReachableContextsClosed => self.reachable_contexts_closed = true,
+            ReplacementFact::ReachableParticipationsClosed => {
+                self.reachable_participations_closed = true
+            }
             ReplacementFact::AttemptIsolationProven => self.attempt_isolation_proven = true,
             ReplacementFact::StaleUsageAccounted => self.stale_usage_accounted = true,
             ReplacementFact::NewCapacityAdmitted => self.new_capacity_admitted = true,
@@ -323,8 +325,8 @@ impl ReplacementProgress {
     }
 
     const fn missing(self) -> Option<ReplacementFact> {
-        if !self.reachable_contexts_closed {
-            return Some(ReplacementFact::ReachableContextsClosed);
+        if !self.reachable_participations_closed {
+            return Some(ReplacementFact::ReachableParticipationsClosed);
         }
         if !self.attempt_isolation_proven {
             return Some(ReplacementFact::AttemptIsolationProven);
@@ -340,7 +342,7 @@ impl ReplacementProgress {
 
     const fn contains(self, fact: ReplacementFact) -> bool {
         match fact {
-            ReplacementFact::ReachableContextsClosed => self.reachable_contexts_closed,
+            ReplacementFact::ReachableParticipationsClosed => self.reachable_participations_closed,
             ReplacementFact::AttemptIsolationProven => self.attempt_isolation_proven,
             ReplacementFact::StaleUsageAccounted => self.stale_usage_accounted,
             ReplacementFact::NewCapacityAdmitted => self.new_capacity_admitted,
@@ -376,20 +378,20 @@ impl From<DeliveryGateError> for ActorStateError {
 }
 
 /// Exact timer identity. One actor owns one aggregate sleep, while this key
-/// prevents deadlines for distinct contexts, operations, scans, or attempts
+/// prevents deadlines for distinct participations, operations, scans, or attempts
 /// from overwriting one another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum WakeKey {
     Statement,
     AttemptBackoff(QueryExecutionId),
-    Lease(QueryContextRef),
+    Lease(ParticipationRef),
     Operation {
         execution: QueryExecutionId,
         operation: TaskOperationId,
     },
     Credential {
         execution: QueryExecutionId,
-        lease: CredentialLeaseId,
+        credential_domain_id: CredentialDomainId,
     },
     Split {
         execution: QueryExecutionId,
@@ -632,7 +634,7 @@ impl LogicalExecutionState {
         self.require_current_capability(failed)?;
         let failed_execution = failed.execution;
         if pre_ready_replacement
-            .is_some_and(|witness| witness.context().query_execution_id() != failed_execution)
+            .is_some_and(|witness| witness.participation().query_execution_id() != failed_execution)
         {
             return Err(ActorStateError::NotCurrent);
         }
@@ -886,7 +888,7 @@ impl LogicalExecutionState {
 
     pub(crate) fn complete_schema_delivery(
         &mut self,
-        permit: SchemaDeliveryPermit,
+        permit: SchemaDeliveryObligation,
     ) -> Result<(), ActorStateError> {
         self.require_running(permit.execution())?;
         self.delivery
@@ -896,7 +898,7 @@ impl LogicalExecutionState {
 
     pub(crate) fn fail_schema_delivery(
         &mut self,
-        permit: SchemaDeliveryPermit,
+        permit: SchemaDeliveryObligation,
     ) -> Result<(), ActorStateError> {
         let execution = permit.execution();
         self.require_running(execution)?;
@@ -909,7 +911,7 @@ impl LogicalExecutionState {
         capability: &AttemptCapability,
         sequence: u64,
         packet: ResultPacket<P>,
-    ) -> Result<DeliveryPermit<P>, DeliveryRejection<P>> {
+    ) -> Result<DeliveryObligation<P>, DeliveryRejection<P>> {
         if !matches!(
             self.output_mode,
             LogicalOutputMode::ResultStream | LogicalOutputMode::InternalResultStream
@@ -937,7 +939,7 @@ impl LogicalExecutionState {
 
     pub(crate) fn complete_result_delivery<P>(
         &mut self,
-        permit: DeliveryPermit<P>,
+        permit: DeliveryObligation<P>,
     ) -> Result<CompletedDelivery<P>, DeliveryCompletionError<P>> {
         self.delivery.complete_delivery(permit)
     }
@@ -946,7 +948,7 @@ impl LogicalExecutionState {
         &mut self,
         capability: &AttemptCapability,
         sequence: u64,
-    ) -> Result<DeliveryPermit<()>, DeliveryRejection<()>> {
+    ) -> Result<DeliveryObligation<()>, DeliveryRejection<()>> {
         if self.output_mode != LogicalOutputMode::InternalResultStream
             || self.require_running_capability(capability).is_err()
         {
@@ -973,7 +975,7 @@ impl LogicalExecutionState {
 
     pub(crate) fn fail_result_delivery<P>(
         &mut self,
-        permit: DeliveryPermit<P>,
+        permit: DeliveryObligation<P>,
     ) -> Result<ResultPacket<P>, DeliveryCompletionError<P>> {
         let execution = permit.execution();
         let packet = self.delivery.fail_delivery(permit)?;
@@ -1375,7 +1377,7 @@ mod tests {
 
     fn ready_replacement(state: &mut LogicalExecutionState, token: &ReplacementToken) {
         for fact in [
-            ReplacementFact::ReachableContextsClosed,
+            ReplacementFact::ReachableParticipationsClosed,
             ReplacementFact::AttemptIsolationProven,
             ReplacementFact::StaleUsageAccounted,
             ReplacementFact::NewCapacityAdmitted,
@@ -1409,7 +1411,8 @@ mod tests {
     }
 
     fn emit_schema(state: &mut LogicalExecutionState, capability: &AttemptCapability) {
-        let BeginSchemaDelivery::Permit(permit) = state.begin_schema_delivery(capability).unwrap()
+        let BeginSchemaDelivery::Obligation(permit) =
+            state.begin_schema_delivery(capability).unwrap()
         else {
             panic!("schema must not already be emitted");
         };
@@ -1545,7 +1548,7 @@ mod tests {
         assert_eq!(
             state.activate_replacement(&token),
             Err(ActorStateError::ReplacementNotReady(
-                ReplacementFact::ReachableContextsClosed
+                ReplacementFact::ReachableParticipationsClosed
             ))
         );
         ready_replacement(&mut state, &token);
@@ -1681,7 +1684,8 @@ mod tests {
                 .error(),
             DeliveryGateError::SchemaNotEmitted
         );
-        let BeginSchemaDelivery::Permit(schema) = state.begin_schema_delivery(&initial).unwrap()
+        let BeginSchemaDelivery::Obligation(schema) =
+            state.begin_schema_delivery(&initial).unwrap()
         else {
             panic!("first schema write must receive a permit");
         };
@@ -1794,7 +1798,7 @@ mod tests {
                 &token,
                 ReplacementEffectReceipt::from_effect(
                     &stale,
-                    ReplacementFact::ReachableContextsClosed,
+                    ReplacementFact::ReachableParticipationsClosed,
                 ),
             ),
             Err(ActorStateError::StaleReplacement)
@@ -1895,10 +1899,10 @@ mod tests {
             )
             .unwrap();
         let pending = state
-            .issue_replacement_effect(&token, ReplacementFact::ReachableContextsClosed)
+            .issue_replacement_effect(&token, ReplacementFact::ReachableParticipationsClosed)
             .unwrap();
         assert!(matches!(
-            state.issue_replacement_effect(&token, ReplacementFact::ReachableContextsClosed),
+            state.issue_replacement_effect(&token, ReplacementFact::ReachableParticipationsClosed),
             Err(ActorStateError::EffectAlreadyPending)
         ));
         let replay = PendingReplacementEffect {
@@ -1911,7 +1915,7 @@ mod tests {
             Err(ActorStateError::StaleEffectReceipt)
         );
         assert!(matches!(
-            state.issue_replacement_effect(&token, ReplacementFact::ReachableContextsClosed),
+            state.issue_replacement_effect(&token, ReplacementFact::ReachableParticipationsClosed),
             Err(ActorStateError::EffectAlreadySatisfied)
         ));
     }
@@ -2008,7 +2012,8 @@ mod tests {
         )
         .unwrap();
         let initial = running_capability(&mut state, execution(1));
-        let BeginSchemaDelivery::Permit(permit) = state.begin_schema_delivery(&initial).unwrap()
+        let BeginSchemaDelivery::Obligation(permit) =
+            state.begin_schema_delivery(&initial).unwrap()
         else {
             panic!("first schema write must receive a permit");
         };
@@ -2069,7 +2074,7 @@ mod tests {
     }
     #[test]
     fn replacement_witness_is_rechecked_against_actual_running_attempt() {
-        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_execution_contract::ParticipationRef;
         use novarocks_types::{BackendProcessId, FrontendProcessId};
         let mut state = LogicalExecutionState::new(
             execution(1),
@@ -2080,7 +2085,7 @@ mod tests {
         )
         .unwrap();
         let initial = running_capability(&mut state, execution(1));
-        let foreign = QueryContextRef::new(
+        let foreign = ParticipationRef::new(
             execution(2),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -2108,7 +2113,7 @@ mod tests {
                 RecoveryRefusal::FailureClass
             ))
         );
-        let current = QueryContextRef::new(
+        let current = ParticipationRef::new(
             execution(1),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),

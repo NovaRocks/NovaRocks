@@ -607,7 +607,7 @@ pub(crate) fn execute_drop_database_statement(
 type AdmittedForceDropChildren = (Vec<String>, Vec<String>);
 
 fn enumerate_admitted_force_drop_children(
-    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
     namespace_identity: ConnectorNamespaceIdentity,
     if_exists: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -723,11 +723,11 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err(err),
     }
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+    let exact_lease = crate::connector::acquire_metadata_planning_pin(
         context.connector_control(),
         &target.catalog,
     )?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_pin(
         &exact_lease,
         connector_context.clone(),
         &target.namespace,
@@ -941,7 +941,7 @@ fn external_view_exists(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<bool, String> {
     let lease =
-        crate::connector::acquire_metadata_planning_lease(context.connector_control(), catalog)?;
+        crate::connector::acquire_metadata_planning_pin(context.connector_control(), catalog)?;
     let binding = lease.binding();
     let Some(view_metadata) = binding.view_metadata() else {
         return Ok(false);
@@ -1857,7 +1857,7 @@ mod force_drop_admission_tests {
             .unwrap()
             .try_with_view_metadata(Some(capability.clone()))
             .unwrap();
-            let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+            let lease = ConnectorControlPlanningPin::new(Arc::new(binding), || {});
             let context =
                 crate::connector::connector_request_context(None, ConnectorStopOwner::new().view())
                     .unwrap();

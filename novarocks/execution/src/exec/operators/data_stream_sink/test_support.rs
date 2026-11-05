@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::runtime::execution_runtime::ExecutionRuntime;
-use crate::runtime::fragment::io::exchange_unit::*;
+use crate::runtime::task::io::exchange_unit::*;
 use novarocks_execution_contract::{ExchangeStreamIdentity, TaskFailurePhase, TaskIdentity};
 use novarocks_failure_contract::FailureFact;
 use std::collections::BTreeMap;
@@ -135,7 +135,7 @@ pub(super) fn bind_test_operator(fixture: &Fixture, op: &mut DataStreamSinkOpera
         None,
         None,
         Some(source.query_execution_id().query_id()),
-        Some(op.fragment_instance_id),
+        Some(op.task_key),
         Some(op.be_number),
         fixture.state.mem_tracker(),
         Some(fixture.runtime.clone()),

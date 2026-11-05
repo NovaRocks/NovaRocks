@@ -18,7 +18,7 @@
 //! Task protocol identity codec.
 
 use novarocks_execution_contract::task_execution::identity::{
-    AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionEpochCapability, AdmissionTicketId, ParticipationRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_models::novarocks;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, StageId, TaskId};
@@ -156,36 +156,36 @@ pub fn encode_task_identity(value: TaskIdentity) -> novarocks::TaskIdentity {
 }
 
 /// Decodes an exact query context reference.
-pub fn decode_query_context_ref(
-    src: &novarocks::QueryContextRef,
+pub fn decode_participation_ref(
+    src: &novarocks::ParticipationRef,
     path: FieldPath,
-) -> Result<QueryContextRef, ProtocolError> {
+) -> Result<ParticipationRef, ProtocolError> {
     let execution = src.query_execution_id.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_execution_id"),
-            "query context requires a query execution id",
+            "participation requires a query execution id",
         )
     })?;
     let execution = decode_query_execution_id(execution)?;
     let frontend = src.frontend_process_id.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("frontend_process_id"),
-            "query context requires a frontend process id",
+            "participation requires a frontend process id",
         )
     })?;
     let frontend = decode_frontend_process_id(frontend, path.clone().field("frontend_process_id"))?;
     let backend = src.backend_process_id.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("backend_process_id"),
-            "query context requires a backend process id",
+            "participation requires a backend process id",
         )
     })?;
     let backend = decode_backend_process_id(backend, path.field("backend_process_id"))?;
-    Ok(QueryContextRef::new(execution, frontend, backend))
+    Ok(ParticipationRef::new(execution, frontend, backend))
 }
 
-pub fn encode_query_context_ref(value: QueryContextRef) -> novarocks::QueryContextRef {
-    novarocks::QueryContextRef {
+pub fn encode_participation_ref(value: ParticipationRef) -> novarocks::ParticipationRef {
+    novarocks::ParticipationRef {
         query_execution_id: Some(encode_query_execution_id(value.query_execution_id())),
         frontend_process_id: Some(encode_frontend_process_id(value.frontend_process_id())),
         backend_process_id: Some(encode_backend_process_id(value.backend_process_id())),

@@ -196,7 +196,7 @@ mod keyed_publication_trace_tests {
         ConnectorManagedPublicationShape, ConnectorPreparedWriteSet,
     };
     use novarocks_spi::connector::{
-        CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningLease,
+        CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningPin,
         ConnectorDocumentFormat, ConnectorDocumentManagementAdmissionRequest,
         ConnectorDocumentManagementOperation, ConnectorDocumentPublicationDeclaration,
         ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
@@ -419,7 +419,7 @@ mod keyed_publication_trace_tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime)),
+                Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime)),
             )
         };
         let concrete = Arc::new(
@@ -517,7 +517,7 @@ mod keyed_publication_trace_tests {
 
     fn document_storage_lease(
         fixture: &Fixture,
-    ) -> novarocks_spi::connector::ConnectorDocumentStorageLease {
+    ) -> novarocks_spi::connector::ConnectorDocumentStorage {
         let descriptor = fixture.provider.descriptor().clone();
         let incarnation = fixture.provider.incarnation();
         let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
@@ -559,7 +559,7 @@ mod keyed_publication_trace_tests {
         })
         .and_then(|binding| binding.try_with_document_storage(Some(document_storage)))
         .expect("control binding");
-        ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+        ConnectorControlPlanningPin::new(Arc::new(binding), || {})
             .derive_document_storage_lease()
             .expect("document storage lease")
     }
@@ -669,13 +669,13 @@ mod keyed_publication_trace_tests {
     fn iceberg_handle<'a>(
         fixture: &Fixture,
         plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
-    ) -> &'a crate::commit::write_stack::domain::IcebergCommitHandle {
+    ) -> &'a crate::commit::write_stack::domain::IcebergWriteCommitSession {
         crate::commit::write_stack::runtime::build_write_adapter(
             fixture.provider.descriptor().clone(),
             fixture.catalog_handle.clone(),
         )
-        .commit_handle(plan.commit_handle())
-        .expect("Iceberg commit handle")
+        .commit_session(plan.commit_session())
+        .expect("Iceberg commit session")
     }
 
     fn assert_exact_target_mutation(
@@ -748,7 +748,7 @@ mod keyed_publication_trace_tests {
         let session_marker = iceberg_handle(&fixture, &plan).session_id().to_string();
         let outcome = control
             .finish_write(ConnectorWriteFinishRequest {
-                commit: plan.commit_handle(),
+                commit: plan.commit_session(),
                 prepared: ConnectorPreparedWriteSet::try_new(
                     0,
                     Vec::new(),

@@ -37,7 +37,7 @@ use arrow::datatypes::Schema;
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorReadSelector, StatisticsArtifactDraft,
+    ConnectorControlPlanningPin, ConnectorReadSelector, StatisticsArtifactDraft,
     StatisticsArtifactIdentity, StatisticsRequiredAggregation,
 };
 
@@ -283,7 +283,7 @@ fn admit_statistics_scan_binding(
     bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     identity: &StatisticsRelationIdentity,
     program: &StatisticsCollectionProgram,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
     let input_schema = Arc::new(Schema::new(
         program
@@ -322,7 +322,7 @@ fn admit_statistics_scan_binding(
                 ),
                 statistics_pin: None,
                 admission: crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
-                    planning_lease.clone(),
+                    planning_pin.clone(),
                 ),
                 source_metadata: None,
                 // A collection measures one snapshot, so the binding offers
@@ -340,7 +340,7 @@ fn admit_statistics_scan_binding(
                         table: program.table().clone(),
                         selector: ConnectorReadSelector::SnapshotId(version_ordinal),
                         mv_partition_selection: None,
-                        planning_lease: planning_lease.clone(),
+                        planning_pin: planning_pin.clone(),
                     },
                 )]),
                 prepared_source_reads: BTreeMap::new(),

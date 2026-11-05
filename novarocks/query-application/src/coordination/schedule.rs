@@ -23,7 +23,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, EstablishQueryContext, ExchangeEdgeId, QueryContextRef,
+    AcquireParticipationAdmissionTicket, EstablishParticipation, ExchangeEdgeId, ParticipationRef,
     TaskIdentity,
 };
 use novarocks_types::NativeCompatibilityId;
@@ -64,7 +64,7 @@ impl std::error::Error for AttemptScheduleError {}
 #[derive(Debug)]
 pub struct ScheduledTask {
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     instance_index: usize,
     scan_work: Box<[ScheduledScanWork]>,
 }
@@ -74,8 +74,8 @@ impl ScheduledTask {
         self.identity
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn instance_index(&self) -> usize {
@@ -240,7 +240,7 @@ pub struct AttemptSchedule {
     execution: QueryExecutionId,
     fragments: Box<[ScheduledFragment]>,
     edges: Box<[ScheduledEdge]>,
-    contexts: Box<[QueryContextRef]>,
+    participations: Box<[ParticipationRef]>,
     root: TaskIdentity,
 }
 
@@ -257,8 +257,8 @@ impl AttemptSchedule {
         &self.edges
     }
 
-    pub fn contexts(&self) -> &[QueryContextRef] {
-        &self.contexts
+    pub fn participations(&self) -> &[ParticipationRef] {
+        &self.participations
     }
 
     pub const fn root(&self) -> TaskIdentity {
@@ -424,7 +424,7 @@ pub(crate) fn build_attempt_schedule(
     let preferred = match preferred_process.map_err(AttemptScheduleError::new)? { Some(process) => backends.iter().position(|backend| *backend == process).ok_or_else(|| AttemptScheduleError::new("the exact controlled placement process is absent from the retained eligible set"))?, None => preferred };
     let mut next_stage = 1_u32;
     let mut next_task = 1_u32;
-    let mut contexts = BTreeSet::new();
+    let mut participations = BTreeSet::new();
     let mut scheduled = Vec::with_capacity(counts.len());
     for (&fragment_id, &count) in &counts {
         let stage_id = StageId::new(next_stage)
@@ -448,11 +448,11 @@ pub(crate) fn build_attempt_schedule(
             next_task = next_task
                 .checked_add(1)
                 .ok_or_else(|| AttemptScheduleError::new("attempt task id space exhausted"))?;
-            let context = QueryContextRef::new(execution, frontend_process_id, backend);
-            contexts.insert(context);
+            let participation = ParticipationRef::new(execution, frontend_process_id, backend);
+            participations.insert(participation);
             tasks.push(ScheduledTask {
                 identity: TaskIdentity::new(execution, stage_id, task_id, backend),
-                context,
+                participation,
                 instance_index,
                 scan_work: Box::new([]),
             });
@@ -476,7 +476,10 @@ pub(crate) fn build_attempt_schedule(
         execution,
         fragments: scheduled.into_boxed_slice(),
         edges: edges.into_boxed_slice(),
-        contexts: contexts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        participations: participations
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         root,
     })
 }
@@ -501,7 +504,7 @@ pub(crate) fn protocol_fixture_schedule(
         ));
     }
     let mut fragments = Vec::new();
-    let mut contexts = BTreeSet::new();
+    let mut participations = BTreeSet::new();
     let mut next_task = 1_u32;
     for (stage_index, (&fragment_id, backends)) in placements.iter().enumerate() {
         let stage =
@@ -521,11 +524,11 @@ pub(crate) fn protocol_fixture_schedule(
             next_task = next_task.checked_add(1).ok_or_else(|| {
                 AttemptScheduleError::new("protocol fixture task space exhausted")
             })?;
-            let context = QueryContextRef::new(execution, frontend, backend);
-            contexts.insert(context);
+            let participation = ParticipationRef::new(execution, frontend, backend);
+            participations.insert(participation);
             tasks.push(ScheduledTask {
                 identity: TaskIdentity::new(execution, stage, id, backend),
-                context,
+                participation,
                 instance_index,
                 scan_work: Box::new([]),
             });
@@ -548,7 +551,10 @@ pub(crate) fn protocol_fixture_schedule(
         execution,
         fragments: fragments.into_boxed_slice(),
         edges: edges.into_boxed_slice(),
-        contexts: contexts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        participations: participations
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         root,
     })
 }
@@ -765,7 +771,7 @@ impl NativeAttemptDrive {
 
     pub async fn begin_admission_issue(
         &self,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
     ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
         self.authority.begin_admission_issue(request).await
     }
@@ -782,7 +788,7 @@ impl NativeAttemptDrive {
 
     pub async fn authorize_establish(
         &self,
-        request: Arc<EstablishQueryContext>,
+        request: Arc<EstablishParticipation>,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
         self.authority
@@ -792,9 +798,9 @@ impl NativeAttemptDrive {
 
     pub async fn reauthorize_establish(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
-        self.authority.reauthorize_establish(context).await
+        self.authority.reauthorize_establish(participation).await
     }
 }
 
@@ -920,9 +926,10 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(schedule.contexts().len(), 3);
-        assert!(schedule.contexts().iter().all(|context| {
-            context.query_execution_id() == execution && context.frontend_process_id() == frontend
+        assert_eq!(schedule.participations().len(), 3);
+        assert!(schedule.participations().iter().all(|participation| {
+            participation.query_execution_id() == execution
+                && participation.frontend_process_id() == frontend
         }));
 
         let edge = &schedule.edges()[0];
@@ -1110,7 +1117,7 @@ mod tests {
                     TaskId::new((index + 1) as u32).unwrap(),
                     backend,
                 ),
-                context: QueryContextRef::new(execution, frontend, backend),
+                participation: ParticipationRef::new(execution, frontend, backend),
                 instance_index: index,
                 scan_work: Box::new([]),
             })
@@ -1272,13 +1279,13 @@ mod tests {
                 .map(|edge| edge.edge_id().get())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(first.contexts(), second.contexts());
+        assert_eq!(first.participations(), second.participations());
         forward.sort_unstable();
         assert_eq!(
-            first.contexts(),
+            first.participations(),
             forward
                 .into_iter()
-                .map(|backend| QueryContextRef::new(execution, frontend, backend))
+                .map(|backend| ParticipationRef::new(execution, frontend, backend))
                 .collect::<Vec<_>>()
         );
     }
@@ -1314,9 +1321,9 @@ mod tests {
             build_attempt_schedule(execution, frontend, &backends, &plan, Ok(Some(backends[2])))
                 .unwrap();
         assert_eq!(
-            schedule.contexts().len(),
+            schedule.participations().len(),
             1,
-            "a placement preference cannot mint service-only contexts"
+            "a placement preference cannot mint service-only participations"
         );
         assert!(
             schedule

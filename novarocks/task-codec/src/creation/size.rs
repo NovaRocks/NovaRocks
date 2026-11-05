@@ -68,7 +68,7 @@ pub fn task(value: TaskIdentity) -> Result<usize, CreationSizeOverflow> {
         add(uint(3, value.task_id().get() as u64), message(4, process)?)?,
     )
 }
-pub fn context(value: QueryContextRef) -> Result<usize, CreationSizeOverflow> {
+pub fn participation(value: ParticipationRef) -> Result<usize, CreationSizeOverflow> {
     let query = novarocks_proto_codec::lifecycle::identity::encode_query_execution_id(
         value.query_execution_id(),
     )
@@ -154,12 +154,15 @@ pub fn descriptor(
     )
 }
 pub fn metadata(
-    context_id: QueryContextRef,
+    participation_ref: ParticipationRef,
     descriptor: usize,
     assignment: usize,
 ) -> Result<usize, CreationSizeOverflow> {
     add(
-        add(message(1, context(context_id)?)?, message(2, descriptor)?)?,
+        add(
+            message(1, participation(participation_ref)?)?,
+            message(2, descriptor)?,
+        )?,
         message(5, assignment)?,
     )
 }

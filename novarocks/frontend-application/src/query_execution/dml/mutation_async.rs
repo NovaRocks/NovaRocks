@@ -24,7 +24,7 @@ use crate::query_execution::dml::mutation::OwnedMutationStatement;
 use crate::query_execution::write_session::WriteBeginReceiving;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorRowMutationPreparation,
+    ConnectorControlPlanningPin, ConnectorRequestContext, ConnectorRowMutationPreparation,
     ConnectorRowMutationSelection, ConnectorRowMutationStrategy, ConnectorWriteOperationId,
 };
 
@@ -44,7 +44,7 @@ pub(crate) async fn prepare_mutation_facts_async(
     target: &Target,
     target_ref: &str,
     current_catalog: Option<&str>,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     execution: QueryExecutionContext,
     connector_context: &ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
@@ -57,17 +57,17 @@ pub(crate) async fn prepare_mutation_facts_async(
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge
         }
     };
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
-        state.mv_storage_observation().as_ref(), &planning_lease,
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
+        state.mv_storage_observation().as_ref(), &planning_pin,
         state.mv_readiness().as_ref(), target, mutation, connector_context.clone(),
     ).await?;
     let context =
-        crate::connector::context_for_planning_lease(&planning_lease, connector_context.clone())?;
+        crate::connector::context_for_planning_pin(&planning_pin, connector_context.clone())?;
     let metadata = crate::connector::schema_creation::load_frontend_table_async(
-        planning_lease.binding().metadata().as_ref(),
+        planning_pin.binding().metadata().as_ref(),
         novarocks_spi::connector::ConnectorTableRequest {
             table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: planning_lease.binding().descriptor().instance_id.clone(),
+                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(target.namespace.as_str()),
                 table: Arc::from(target.table.as_str()),
             },
@@ -78,7 +78,7 @@ pub(crate) async fn prepare_mutation_facts_async(
     .await
     .map_err(|error| error.to_string())?;
     let binding =
-        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_lease);
+        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_pin);
     // The same pure signers own strategy, base, complete target types and
     // assignment/partition admission. No second preparation or lease is minted.
     match statement {
@@ -151,16 +151,16 @@ impl PreparedMutationFacts {
             Self::Merge(p) => &p.target_columns,
         }
     }
-    fn planning_lease(&self) -> &ConnectorControlPlanningLease {
+    fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
-            Self::Update(p) => &p.planning_lease,
-            Self::Merge(p) => &p.planning_lease,
+            Self::Update(p) => &p.planning_pin,
+            Self::Merge(p) => &p.planning_pin,
         }
     }
-    fn write_lease(&self) -> &novarocks_spi::connector::ConnectorWriteLease {
+    fn write(&self) -> &novarocks_spi::connector::ConnectorWrite {
         match self {
-            Self::Update(p) => &p.write_lease,
-            Self::Merge(p) => &p.write_lease,
+            Self::Update(p) => &p.write,
+            Self::Merge(p) => &p.write,
         }
     }
     fn signed(&self) -> Result<&ConnectorRowMutationPreparation, String> {
@@ -180,17 +180,13 @@ impl PreparedMutationFacts {
         if self.strategy() != ConnectorRowMutationStrategy::MergeOnRead {
             return Err("MOR preparation requires the signed merge-on-read strategy".into());
         }
-        let catalog_properties = self
-            .write_lease()
-            .catalog_properties()
-            .cloned()
-            .ok_or_else(|| {
-                "connector write lease has no immutable catalog runtime identity".to_owned()
-            })?;
+        let catalog_properties = self.write().catalog_properties().cloned().ok_or_else(|| {
+            "connector write lease has no immutable catalog runtime identity".to_owned()
+        })?;
         let session = ConnectorWriteSession::begin_async_in(
             crate::connector::write_target::derive_write_stack_lease(
                 state.typed_connector_control(),
-                self.planning_lease(),
+                self.planning_pin(),
             )?,
             catalog_properties,
             crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
@@ -309,14 +305,14 @@ impl PreparedMutationFacts {
             self.target(),
             self.signed()?,
             selection,
-            self.planning_lease(),
+            self.planning_pin(),
             &selection_execution,
             self.context(),
         )?;
         let session =
             crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
-                input.lease,
-                self.write_lease(),
+                input.write_stack_pin,
+                self.write(),
                 input.request,
                 input.original,
                 receiving.as_ref(),
@@ -328,7 +324,7 @@ impl PreparedMutationFacts {
             state.constant_policy(),
             &CowMaterializedCompileControl(self.context()),
             self.target(),
-            self.planning_lease().clone(),
+            self.planning_pin().clone(),
             self.signed()?,
             Arc::clone(&session),
         )?;
@@ -358,7 +354,7 @@ impl PreparedMorMutationWrite {
         let (routes, statistics_targets) = bind_change_stream_routes(
             self.facts.target(),
             &self.session,
-            self.facts.planning_lease(),
+            self.facts.planning_pin(),
             self.bindings.as_ref(),
         )?;
         install_fact_source(&self.state, &self.facts, &self.bindings, provider)?;
@@ -623,7 +619,7 @@ impl PreparedCowMutationWrite {
         let (sink, bindings, overlays) = prepare_cow_target_binding(
             self.facts.target(),
             plan,
-            &self.write.planning_lease,
+            &self.write.planning_pin,
             &self.write.write_session,
         )?;
         let assembly =

@@ -48,14 +48,19 @@ fn original_host_reporters_only_propose_and_keep_the_same_sealed_neutral_read_af
     let mut f = Fixture::new();
     let strong = Arc::strong_count(f.port());
     let original_work = f.scope.snapshot().unwrap();
-    let original_inputs = f.runtime.role_inventory(actor(), None, 64).unwrap();
+    let original_inputs = f
+        .runtime
+        .standing_input_inventory(actor(), None, 64)
+        .unwrap();
     let reporter = f.host.as_ref().unwrap().reporter();
     let clones: Vec<_> = (0..8).map(|_| reporter.clone()).collect();
     let another = f.host.as_ref().unwrap().reporter();
     assert_eq!(Arc::strong_count(f.port()), strong);
     assert_eq!(f.scope.snapshot().unwrap(), original_work);
     assert_eq!(
-        f.runtime.role_inventory(actor(), None, 64).unwrap(),
+        f.runtime
+            .standing_input_inventory(actor(), None, 64)
+            .unwrap(),
         original_inputs
     );
     assert_eq!(reporter.identity(), f.port().identity());
@@ -71,7 +76,7 @@ fn original_host_reporters_only_propose_and_keep_the_same_sealed_neutral_read_af
     );
     let drops = Arc::new(AtomicUsize::new(0));
     clones[0].failing(
-        novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(OriginalSource(
+        novarocks_execution::runtime::task::ExecutionFailure::from_domain(OriginalSource(
             drops.clone(),
         )),
         TaskFailurePhase::Execution,
@@ -98,7 +103,7 @@ fn original_host_reporters_only_propose_and_keep_the_same_sealed_neutral_read_af
         detail: SafeDetail::truncating("original neutral reporter diagnostic"),
         cleanup: true,
     });
-    f.command(ContextInput::Summary {
+    f.command(ParticipationInput::Summary {
         task: reporter.identity(),
         generation: generation(),
         cut: None,

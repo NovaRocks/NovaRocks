@@ -30,13 +30,13 @@ use novarocks_execution::runtime_filter::{
     PartitionId, ProducerSequence, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterContribution, RuntimeFilterContributionKind,
     RuntimeFilterFinalDomain, RuntimeFilterFinalDomainCompletion,
-    RuntimeFilterFinalDomainPartition, RuntimeFilterFinalDomainPartitionHandle,
-    RuntimeFilterProducerFailure, RuntimeFilterProducerHandle, RuntimeFilterSubmitOutcome,
+    RuntimeFilterFinalDomainPartition, RuntimeFilterFinalDomainPartitionObligation,
+    RuntimeFilterProducerFailure, RuntimeFilterSubmitOutcome, SharedRuntimeFilterProducer,
 };
 
 /// One Worker-local FinalDomain completion for a bound producer.
 pub struct WorkerRuntimeFilterFinalDomainCompletion {
-    producer: RuntimeFilterProducerHandle,
+    producer: SharedRuntimeFilterProducer,
     data_type: DataType,
     contract_digest: [u8; 32],
     max_domain_canonical_bytes: usize,
@@ -46,7 +46,7 @@ pub struct WorkerRuntimeFilterFinalDomainCompletion {
 
 impl WorkerRuntimeFilterFinalDomainCompletion {
     pub fn new(
-        producer: RuntimeFilterProducerHandle,
+        producer: SharedRuntimeFilterProducer,
         data_type: DataType,
         contract_digest: [u8; 32],
         max_domain_canonical_bytes: usize,
@@ -90,7 +90,7 @@ impl RuntimeFilterFinalDomainCompletion for WorkerRuntimeFilterFinalDomainComple
     fn claim_partition(
         &self,
         partition: PartitionId,
-    ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation> {
+    ) -> Result<RuntimeFilterFinalDomainPartitionObligation, RuntimeFilterContractViolation> {
         if partition.get() >= self.local_partition_count {
             return Err(violation(
                 RuntimeFilterContractViolationKind::ContractMismatch,

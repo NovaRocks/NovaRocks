@@ -30,7 +30,7 @@ use crate::{
         hash_table::allocation::AggregateAllocator,
         pipeline::operator::{ConstructionFailure, InputConstructionOwner},
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{
     array::{ArrayRef, PrimitiveArray, new_null_array},

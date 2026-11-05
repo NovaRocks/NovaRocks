@@ -177,10 +177,10 @@ fn compiled_grouped_topn_retained_sum_overflow_is_only_a_final_data_failure() {
 #[test]
 fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefilling_outputs() {
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         shape::StepOperator,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     let f = text_fixture(&["a".into(), "z".into()], 2);
     let tracker = MemTracker::new_root("grouped-step-candidate-output");
@@ -188,14 +188,14 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     let control = RuntimeErrorState::default();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
     processor
-        .finish(&mut StepContext::new(
+        .finish(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
         ))
         .unwrap();
     let ready = processor
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -205,7 +205,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     assert!(matches!(ready.next, NextStep::Runnable));
     let before = tracker.allocated();
     let blocked = processor
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -217,7 +217,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     assert_eq!(processor.kernel_for_test().emission, Some(0));
     work.begin_turn(1).unwrap();
     let first = processor
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -231,7 +231,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     );
     let before = tracker.allocated();
     let blocked = processor
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -243,7 +243,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     assert_eq!(processor.kernel_for_test().emission, Some(1));
     work.begin_turn(1).unwrap();
     let last = processor
-        .drive(&mut StepContext::new(
+        .drive(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -257,7 +257,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     );
     assert!(
         processor
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &control,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default()
@@ -271,7 +271,7 @@ fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefillin
     let InputResult::Rejected {
         input: returned, ..
     } = processor.try_push(
-        &mut StepContext::new(
+        &mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),

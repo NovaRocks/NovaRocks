@@ -48,11 +48,11 @@ pub trait RetentionOwner: Send + Sync + std::panic::RefUnwindSafe + 'static {
 
 /// A pin to one original paid record. Owner and key are deliberately private;
 /// no accessor, numeric lookup, arbitrary-release or source API is provided.
-pub struct ExistingOwnerRetentionLease {
+pub struct ExistingOwnerRetentionPin {
     owner: Arc<dyn RetentionOwner>,
     key: Option<[u64; 2]>,
 }
-impl ExistingOwnerRetentionLease {
+impl ExistingOwnerRetentionPin {
     /// Original-author construction only: the caller has already installed
     /// this exact one pin in its stable owner transaction. This function does
     /// not acquire another pin. Possessing numbers without that original owner
@@ -81,16 +81,16 @@ impl ExistingOwnerRetentionLease {
         self.key.is_some() && self.key == other.key && Arc::ptr_eq(&self.owner, &other.owner)
     }
 }
-impl Drop for ExistingOwnerRetentionLease {
+impl Drop for ExistingOwnerRetentionPin {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
             self.owner.release_pin(key);
         }
     }
 }
-impl fmt::Debug for ExistingOwnerRetentionLease {
+impl fmt::Debug for ExistingOwnerRetentionPin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExistingOwnerRetentionLease")
+        f.debug_struct("ExistingOwnerRetentionPin")
             .finish_non_exhaustive()
     }
 }

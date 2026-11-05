@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_execution::runtime::fragment::io::exchange_unit::{
+use novarocks_execution::runtime::task::io::ExchangeReceiverPort;
+use novarocks_execution::runtime::task::io::exchange_unit::{
     ExchangeGrantNotice, ExchangeGrantWake, ExchangeStreamObservation, ExchangeUnitStateListener,
 };
 use novarocks_execution_contract::ExchangeStreamIdentity;

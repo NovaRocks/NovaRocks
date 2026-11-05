@@ -20,7 +20,7 @@
 
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
 use novarocks_control_runtime::{
-    lease::StepGuard,
+    obligation::StepRegistration,
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -29,7 +29,7 @@ use novarocks_control_runtime_core::{
     owned_storage::OwnedSlotNeed,
     scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::{OperationOutcome, QueryContextRef};
+use novarocks_execution_contract::{OperationOutcome, ParticipationRef};
 use novarocks_worker_protocol::creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal};
 use std::collections::BTreeMap;
 
@@ -80,7 +80,7 @@ impl StorageNeed {
 pub(crate) struct AdmissionStorage {
     pub loading: ReservationResources,
     pub accepted: ReservationResources,
-    pub context: ReservationResources,
+    pub participation: ReservationResources,
 }
 impl AdmissionStorage {
     fn request(&self, need: AdmissionNeed) -> ReservationResources {
@@ -95,7 +95,7 @@ impl AdmissionStorage {
                     (Dimension::PreparingBytes.id(), bytes),
                 ],
             ),
-            AdmissionNeed::Context { .. } => (&self.context, Vec::new()),
+            AdmissionNeed::Participation { .. } => (&self.participation, Vec::new()),
         };
         ReservationResources::new(
             ResourceVector::new(resources)
@@ -111,28 +111,28 @@ impl AdmissionStorage {
 pub(crate) struct ScopeAdmissionPort {
     scope: ScopeHandle,
     generation: Generation,
-    context: Option<QueryContextRef>,
+    participation: Option<ParticipationRef>,
     storage: AdmissionStorage,
-    guards: BTreeMap<ReservationId, StepGuard>,
+    guards: BTreeMap<ReservationId, StepRegistration>,
     admission: WorkAdmission,
 }
 impl ScopeAdmissionPort {
     pub(crate) fn new(
         scope: ScopeHandle,
         generation: Generation,
-        context: Option<QueryContextRef>,
+        participation: Option<ParticipationRef>,
         storage: AdmissionStorage,
     ) -> Self {
         Self {
             scope,
             generation,
-            context,
+            participation,
             storage,
             guards: BTreeMap::new(),
             admission: WorkAdmission::External,
         }
     }
-    /// Existing context responsibility admits its drain work even after the
+    /// Existing participation responsibility admits its drain work even after the
     /// process closes external intake. The actual ledger validates this parent.
     pub(crate) fn with_parent(mut self, parent: WorkId) -> Self {
         self.admission = WorkAdmission::Derived(parent);
@@ -141,7 +141,7 @@ impl ScopeAdmissionPort {
 
     /// Transfers the same reservations to the step/batch custodian. These
     /// cannot be dropped as unused after a queue/capture has been bound.
-    pub(crate) fn take_guards(&mut self) -> Vec<StepGuard> {
+    pub(crate) fn take_guards(&mut self) -> Vec<StepRegistration> {
         std::mem::take(&mut self.guards).into_values().collect()
     }
 
@@ -155,13 +155,16 @@ impl ScopeAdmissionPort {
 }
 impl AdmissionPort for ScopeAdmissionPort {
     fn try_reserve(&mut self, need: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
-        let context = match need {
-            AdmissionNeed::ActiveTask { context, .. }
-            | AdmissionNeed::Preparation { context, .. }
-            | AdmissionNeed::Context { context, .. } => context,
+        let participation = match need {
+            AdmissionNeed::ActiveTask { participation, .. }
+            | AdmissionNeed::Preparation { participation, .. }
+            | AdmissionNeed::Participation { participation, .. } => participation,
         };
-        if let Some(bound) = self.context {
-            assert_eq!(bound, context, "scope admission exact context binding");
+        if let Some(bound) = self.participation {
+            assert_eq!(
+                bound, participation,
+                "scope admission exact participation binding"
+            );
         }
         let resources = self.storage.request(need);
         let reserved = match need {
@@ -208,19 +211,19 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    fn context() -> QueryContextRef {
-        QueryContextRef::new(
+    fn participation() -> ParticipationRef {
+        ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(391, 392), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         )
     }
-    fn task(context: QueryContextRef) -> TaskIdentity {
+    fn task(participation: ParticipationRef) -> TaskIdentity {
         TaskIdentity::new(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             StageId::new(1).unwrap(),
             TaskId::new(1).unwrap(),
-            context.backend_process_id(),
+            participation.backend_process_id(),
         )
     }
     fn generation() -> Generation {
@@ -247,44 +250,44 @@ mod tests {
         .unwrap()
     }
     fn storage() -> AdmissionStorage {
-        let resource = StorageNeed::role(true).resources().unwrap();
+        let resource = StorageNeed::causal_cut_storage(true).resources().unwrap();
         AdmissionStorage {
             loading: resource.clone(),
             accepted: resource.clone(),
-            context: resource,
+            participation: resource,
         }
     }
-    fn port(ledger: &RuntimeLedger, context: QueryContextRef) -> ScopeAdmissionPort {
+    fn port(ledger: &RuntimeLedger, participation: ParticipationRef) -> ScopeAdmissionPort {
         ScopeAdmissionPort::new(
             ledger.open_scope_next(None, generation()).unwrap(),
             generation(),
-            Some(context),
+            Some(participation),
             storage(),
         )
     }
-    fn preparing(context: QueryContextRef, active: ReservationId) -> AdmissionNeed {
+    fn preparing(participation: ParticipationRef, active: ReservationId) -> AdmissionNeed {
         AdmissionNeed::Preparation {
-            context,
-            task: task(context),
+            participation,
+            task: task(participation),
             active,
             generation: generation(),
-            preparing_in_context: 0,
+            preparing_in_participation: 0,
             bytes: 14,
         }
     }
 
     fn active_task(
         port: &mut ScopeAdmissionPort,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> (
         ReservationId,
-        novarocks_control_runtime::lease::WorkLease,
-        novarocks_control_runtime::lease::ReservationBundle,
+        novarocks_control_runtime::obligation::WorkObligation,
+        novarocks_control_runtime::obligation::ReservationObligation,
     ) {
         let id = port
             .try_reserve(AdmissionNeed::ActiveTask {
-                context,
-                task: task(context),
+                participation,
+                task: task(participation),
                 generation: generation(),
             })
             .unwrap();
@@ -296,8 +299,8 @@ mod tests {
     }
     fn finish_parent(
         ledger: &RuntimeLedger,
-        mut work: novarocks_control_runtime::lease::WorkLease,
-        mut capacity: novarocks_control_runtime::lease::ReservationBundle,
+        mut work: novarocks_control_runtime::obligation::WorkObligation,
+        mut capacity: novarocks_control_runtime::obligation::ReservationObligation,
     ) {
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
@@ -310,10 +313,10 @@ mod tests {
     #[test]
     fn a_successful_guard_is_scope_visible_before_return_and_bound_storage_waits_for_real_exit() {
         let ledger = RuntimeLedger::new(limits(2));
-        let context = context();
-        let mut port = port(&ledger, context);
-        let (active, parent, parent_capacity) = active_task(&mut port, context);
-        port.try_reserve(preparing(context, active)).unwrap();
+        let participation = participation();
+        let mut port = port(&ledger, participation);
+        let (active, parent, parent_capacity) = active_task(&mut port, participation);
+        port.try_reserve(preparing(participation, active)).unwrap();
         assert_eq!(port.scope.snapshot().unwrap().work, 2);
         let mut guards = port.take_guards();
         let (mut work, mut bundle) = guards.pop().unwrap().bind(WorkKind::Business).unwrap();
@@ -335,10 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn competing_contexts_share_one_synchronous_quota_and_contention_is_not_a_refusal() {
+    fn competing_participations_share_one_synchronous_quota_and_contention_is_not_a_refusal() {
         let ledger = RuntimeLedger::new(limits(1));
-        let first = context();
-        let second = QueryContextRef::new(
+        let first = participation();
+        let second = ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(393, 394), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             first.backend_process_id(),

@@ -82,7 +82,7 @@ fn complete_fixture_with_types(
     let fragment = FragmentId::new(1);
     let mut builder = FragmentBuilder::new(fragment);
     let source = builder.reserve_node_id().unwrap();
-    let (columns, read) = crate::runtime::fragment::scan::compiled_fixture::add_typed_scan(
+    let (columns, read) = crate::runtime::task::scan::compiled_fixture::add_typed_scan(
         &mut builder,
         source,
         &types,
@@ -240,7 +240,7 @@ fn complete_fixture_with_types(
         &catalog,
         dop,
         true,
-        &crate::runtime::fragment::scan::compiled_fixture::providers(),
+        &crate::runtime::task::scan::compiled_fixture::providers(),
     );
     let producer = program.graph().nodes().iter().enumerate().find_map(|(id, node)| {
         matches!(node.kind(), ProgramNodeKind::Aggregate { topn_filters, .. } if !topn_filters.is_empty())
@@ -348,11 +348,10 @@ fn run_complete_typed(
     let batches = [(0, 3), (3, 3), (6, 2)]
         .map(|(offset, rows)| slice(&f.input, offset, rows, creation.as_ref()))
         .to_vec();
-    let source =
-        crate::runtime::fragment::scan::compiled_fixture::FixtureScanOp::new(batches, false);
+    let source = crate::runtime::task::scan::compiled_fixture::FixtureScanOp::new(batches, false);
     let mut scans = ScanBindings::default();
     scans.insert(i32::try_from(input.scan_node).unwrap(), source.clone());
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let effects = Arc::new(Effects::default());
     let prepared = prepare_compiled_program_pipeline_execution_with_profiler(
         f.program.clone(),
@@ -625,7 +624,7 @@ fn compiled_ordered_complete_largeint_payload_keeps_real_source_and_last_buffer_
     let mut operator = factory.create(1, 0);
     operator.set_mem_tracker(tracker.clone());
     operator.set_construction_factory(creation.clone());
-    operator.set_fragment_event_sink(effects.clone());
+    operator.set_task_event_sink(effects.clone());
     operator.prepare().unwrap();
     operator.bind_runtime_state(&runtime).unwrap();
     let mut processor =

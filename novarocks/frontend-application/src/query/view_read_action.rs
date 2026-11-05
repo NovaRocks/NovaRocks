@@ -42,7 +42,7 @@ use novarocks_query_application::{
     view::{PreparedShowViews, ShowViewsSource, ViewRequestContext},
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorListViewsRequest,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorListViewsRequest,
     ConnectorListingBound, ConnectorNamespaceIdentity, ConnectorRequestContext,
     ConnectorViewIdentity, ProviderMetadataCpuPort,
 };
@@ -76,7 +76,7 @@ struct Body {
     context: Option<ConnectorRequestContext>,
     turn: Turn,
     prepared: Option<PreparedShowViews>,
-    lease: Option<ConnectorControlPlanningLease>,
+    planning_pin: Option<ConnectorControlPlanningPin>,
     names: Option<Vec<String>>,
     raw: Option<Result<Vec<ConnectorViewIdentity>, ConnectorError>>,
     producer: Option<LocalResultProducer>,
@@ -155,7 +155,7 @@ impl ViewShowOriginal {
                                     catalog,
                                 ) {
                                     Ok(lease) => {
-                                        body.lease = Some(lease);
+                                        body.planning_pin = Some(lease);
                                         body.turn = Turn::List;
                                     }
                                     Err(error) => body.refuse(connector(error)),
@@ -201,13 +201,13 @@ impl ViewShowOriginal {
         let mut loan = BodyLoan::take(self);
         loan.body.as_mut().unwrap().refuse(error);
     }
-    fn listing_lease(self: &Arc<Self>) -> Result<ConnectorControlPlanningLease, QueryServiceError> {
+    fn listing_lease(self: &Arc<Self>) -> Result<ConnectorControlPlanningPin, QueryServiceError> {
         let loan = BodyLoan::take(self);
         let body = loan.body.as_ref().unwrap();
         let lease = body
-            .lease
+            .planning_pin
             .as_ref()
-            .ok_or_else(|| contract("SHOW listing has no frozen planning lease"))?;
+            .ok_or_else(|| contract("SHOW listing has no frozen planning pin"))?;
         // Preserve the View capability's own Unsupported before asking for a
         // metadata CPU author. No missing capability may be a sync fallback.
         if lease.binding().view_metadata().is_none() {
@@ -245,7 +245,7 @@ impl ViewShowOriginal {
         // Actual Provider/CPU quiescence precedes delivery. Retire only the
         // completed admission aliases here so the result graph alone retains
         // its Local position; residual health still owns this same body.
-        drop(body.lease.take());
+        drop(body.planning_pin.take());
         drop(body.context.take());
         drop(body.input.take());
         body.result
@@ -263,7 +263,10 @@ async fn run_io(
     let mut loan = BodyLoan::take(&source);
     let body = loan.body.as_mut().unwrap();
     assert!(body.turn == Turn::List, "one original SHOW listing phase");
-    let lease = body.lease.as_ref().expect("one frozen Provider generation");
+    let lease = body
+        .planning_pin
+        .as_ref()
+        .expect("one frozen Provider generation");
     let ShowViewsSource::External { namespace, .. } = &body.prepared.as_ref().unwrap().source
     else {
         panic!("local SHOW cannot dispatch Provider I/O");
@@ -307,7 +310,7 @@ fn select_root_stop(
 /// Borrow exactly the already-selected generation. No fallback or bridge is
 /// allowed when its view capability has no asynchronous listing.
 pub(crate) fn open_views<'a>(
-    lease: &'a ConnectorControlPlanningLease,
+    lease: &'a ConnectorControlPlanningPin,
     namespace: &str,
     context: &ConnectorRequestContext,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
@@ -652,7 +655,7 @@ impl State {
                 context: Some(context),
                 turn: Turn::Prepare,
                 prepared: None,
-                lease: None,
+                planning_pin: None,
                 names: None,
                 raw: None,
                 producer: self.producer.take(),

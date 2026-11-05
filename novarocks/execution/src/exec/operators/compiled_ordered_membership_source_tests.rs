@@ -130,7 +130,7 @@ impl rf::RuntimeFilterSession for MixedSession {
         &self,
         _: rf::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterProducerHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterProducer>,
         rf::RuntimeFilterContractViolation,
     > {
         panic!("source-only component has no producer calls")
@@ -139,7 +139,7 @@ impl rf::RuntimeFilterSession for MixedSession {
         &self,
         _: rf::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterFinalDomainCompletionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterFinalDomainCompletion>,
         rf::RuntimeFilterContractViolation,
     > {
         panic!("source-only component has no FinalDomain calls")
@@ -148,7 +148,7 @@ impl rf::RuntimeFilterSession for MixedSession {
         &self,
         request: rf::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionPin>,
         rf::RuntimeFilterContractViolation,
     > {
         self.requests.lock().unwrap().push(request.clone());
@@ -159,7 +159,7 @@ impl rf::RuntimeFilterSession for MixedSession {
                 "the complete declared membership contract is preserved"
             );
             Ok(rf::RuntimeFilterBindOutcome::Bound(
-                rf::RuntimeFilterSubscriptionHandle::Blocking(self.publication.clone()),
+                rf::RuntimeFilterSubscriptionPin::Blocking(self.publication.clone()),
             ))
         } else {
             rf::RuntimeFilterSession::subscribe(self.ordered.as_ref(), request)
@@ -242,7 +242,7 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
     operator.bind_poll_budget(turn.poll_budget());
     operator.set_mem_tracker(consumer.tracker.clone());
     operator.set_construction_factory(consumer._creation.clone());
-    operator.set_fragment_event_sink(consumer.effects.clone());
+    operator.set_task_event_sink(consumer.effects.clone());
     operator.prepare().unwrap();
     let tracker = consumer.tracker.clone();
     let runtime_error = consumer.state.error_state();

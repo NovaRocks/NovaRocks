@@ -37,9 +37,24 @@ pub(super) fn observation_specs(cluster_size: usize) -> impl Iterator<Item = Sta
         observations: (0..cluster_size)
             .flat_map(|index| {
                 [
-                    (index, "reader-marker", None),
-                    (index, "writer-marker", None),
-                    (index, "grpc-fragment", None),
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                            .as_str(),
+                        None,
+                    ),
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::WriterMarker
+                            .as_str(),
+                        None,
+                    ),
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    ),
                 ]
             })
             .collect(),

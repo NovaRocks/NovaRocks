@@ -356,6 +356,7 @@ fn preflight_source_policy_core<H>(
             string_bytes: field.name().len(),
             ..Counts::default()
         };
+        let mut reader_prefix = *prefix;
         let current = std::cell::RefCell::new(&mut **admission);
         let mut scratch_gate = |layout: std::alloc::Layout| {
             let mut admission = current.borrow_mut();
@@ -368,6 +369,13 @@ fn preflight_source_policy_core<H>(
             admission.update(facts).map_err(control_cause_host)
         };
         let mut capture = |visit: ValueTypeVisit<'_>| {
+            if let ValueTypeVisit::TypeNode(_) = visit {
+                headers.types = headers
+                    .types
+                    .checked_add(1)
+                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                reader_prefix = reader_prefix.with_reader_walker_node_bound(headers.types);
+            }
             if let ValueTypeVisit::Field(field) = visit {
                 headers.fields = headers
                     .fields
@@ -389,7 +397,7 @@ fn preflight_source_policy_core<H>(
             let facts = Policy(true)
                 .numeric(headers.schema())
                 .and_then(|schema| {
-                    Policy(true).numeric(writer_resources::reader_facts(schema, *prefix))
+                    Policy(true).numeric(writer_resources::reader_facts(schema, reader_prefix))
                 })
                 .map_err(control_cause)?;
             current
@@ -403,6 +411,9 @@ fn preflight_source_policy_core<H>(
             &mut capture,
             work,
         )?;
+        // This same source's complete scratch count now pre-admits every
+        // allocation of the following structural Vec walk.
+        *prefix = reader_prefix;
     } else {
         validate_type(field.data_type(), work)?;
     }
@@ -871,15 +882,10 @@ fn verify_single_field_schema_profile_with_host_in<H>(
         )?;
     }
     source_floor(expected, source)?;
-    let prefix = policy.numeric(writer_resources::prefix_initial(
-        expected,
-        source,
-        if crate::ipc_flat_batch_v2::layout(expected.data_type()).is_ok() {
-            1
-        } else {
-            novarocks_type_contract::MAX_VALUE_TYPE_NODES
-        },
-    ))?;
+    // Before the existing fixed-scratch pass only the root is known. That
+    // pass counts all actual nodes and admits the full Vec request bound
+    // before the subsequent structural source walk allocates anything.
+    let prefix = policy.numeric(writer_resources::prefix_initial(expected, source, 1))?;
     let mut admission = Admission {
         parent: Some(admit),
         source,

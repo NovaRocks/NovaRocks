@@ -27,12 +27,12 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use bytes::Bytes;
 use novarocks_control_runtime::notify::Notify as RuntimeNotify;
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
-use novarocks_execution::runtime::fragment::io::{
-    ResultWriteAdmission, ResultWriteCredit, RootFailureObservation, RootProducerState,
-    RootResultWriteSpec,
-};
 use novarocks_execution::runtime::observable::{
     BoundedNotification, Observable, ObserverSubscription,
+};
+use novarocks_execution::runtime::task::io::{
+    ResultWriteAdmission, ResultWriteCredit, RootFailureObservation, RootProducerState,
+    RootResultWriteSpec,
 };
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::ordered_retained_stream::{
@@ -142,7 +142,7 @@ pub enum RootChannelError {
     MetadataTooSmall { requested: usize, minimum: usize },
     Backing(novarocks_execution_contract::failure::SharedFailureCause),
     Observable(novarocks_execution::runtime::observable::ObservableCapacityError),
-    Execution(novarocks_execution::runtime::fragment::ExecutionFailure),
+    Execution(novarocks_execution::runtime::task::ExecutionFailure),
     Contract(novarocks_result_contract::RootContractError),
     Record(novarocks_execution_contract::root_result::RootResultError),
     Lifetime(novarocks_execution_contract::root_lifetime::RootLifetimeError),
@@ -200,7 +200,7 @@ impl novarocks_execution_contract::failure::FailureProjection for RootProducerFa
     }
 }
 
-pub enum ContextRootRoute {
+pub enum ParticipationRootRoute {
     Read(RootChannelRead),
     AwaitTerminalControl { accepted_consumed: u64 },
     Preparing,
@@ -260,10 +260,10 @@ impl novarocks_execution_contract::failure::FailureProjection for RootChannelErr
     }
 }
 impl RootChannelError {
-    pub fn into_execution(self) -> novarocks_execution::runtime::fragment::ExecutionFailure {
+    pub fn into_execution(self) -> novarocks_execution::runtime::task::ExecutionFailure {
         match self {
             Self::Execution(cause) => cause,
-            other => novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(other),
+            other => novarocks_execution::runtime::task::ExecutionFailure::from_domain(other),
         }
     }
     fn reserve_backing(
@@ -955,7 +955,7 @@ struct ChannelState {
     payloads: VecDeque<RootResultData>,
     retiring_payloads: Option<VecDeque<RootResultData>>,
     lifetime: RootResultLifetime,
-    context_owned: bool,
+    participation_owned: bool,
     finishing: bool,
     failed: Option<RootFailureObservation>,
     output_rows: u64,
@@ -1127,11 +1127,11 @@ impl RootResultChannel {
         // does not allocate or upgrade its empty Weak metadata capability.
         let budget_wake = Self::budget_wake_callback(Weak::new());
         #[cfg(target_vendor = "apple")]
-        let context_custody_lock_bytes = Layout::new::<(isize, [u8; 56])>().size();
+        let participation_custody_lock_bytes = Layout::new::<(isize, [u8; 56])>().size();
         #[cfg(not(target_vendor = "apple"))]
-        let context_custody_lock_bytes = 0;
+        let participation_custody_lock_bytes = 0;
         let parts = [
-            context_custody_lock_bytes,
+            participation_custody_lock_bytes,
             Layout::new::<RootArcAllocation<Self>>().size(),
             Layout::new::<RootArcAllocation<PhysicalOwners>>().size(),
             // The unique installed Context custody replaces Task execution
@@ -1303,7 +1303,7 @@ impl RootResultChannel {
                 stream,
                 payloads,
                 retiring_payloads: None,
-                context_owned: false,
+                participation_owned: false,
                 finishing: false,
                 failed: None,
                 output_rows: 0,
@@ -1461,12 +1461,12 @@ impl RootResultChannel {
     }
     /// Called by the creation transaction after the exact context takes this
     /// channel. A provisional preparation channel is never a readable route.
-    pub fn mark_context_owned(&self) -> Result<(), RootChannelError> {
+    pub fn mark_participation_owned(&self) -> Result<(), RootChannelError> {
         let mut state = self.state.lock().unwrap();
         if !state.lifetime.allows_read() {
             return Err(RootChannelError::Closed);
         }
-        state.context_owned = true;
+        state.participation_owned = true;
         self.try_handoff(&mut state);
         Ok(())
     }
@@ -1507,7 +1507,7 @@ impl RootResultChannel {
             ));
             drop(state);
             return Err(RootChannelError::Execution(
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(failure),
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(failure),
             ));
         };
         state.output_rows = total;
@@ -1535,7 +1535,7 @@ impl RootResultChannel {
             return RootProducerState::AwaitTerminalControl;
         }
         if state.lifetime.root_finished() {
-            RootProducerState::ContextHeld
+            RootProducerState::ParticipationHeld
         } else if state.finishing {
             RootProducerState::Finishing
         } else {
@@ -1881,7 +1881,7 @@ impl RootResultChannel {
             return Ok(None);
         }
         let state = self.state.lock().unwrap();
-        if !state.context_owned {
+        if !state.participation_owned {
             return Err(RootChannelError::Identity);
         }
         Ok((!state.lifetime.allows_read()).then(|| state.stream.snapshot().consumed_through))
@@ -1899,7 +1899,7 @@ impl RootResultChannel {
             return Err(RootChannelError::Identity);
         }
         let state = self.state.lock().unwrap();
-        if !state.context_owned {
+        if !state.participation_owned {
             return Err(RootChannelError::Identity);
         }
         if !state.lifetime.allows_read() {
@@ -1976,7 +1976,7 @@ impl RootResultChannel {
     ) -> Result<RootResultReply, RootChannelError> {
         let (reply, acknowledged_end, retired) = {
             let mut state = self.state.lock().unwrap();
-            if !state.context_owned {
+            if !state.participation_owned {
                 return Err(RootChannelError::Identity);
             }
             if !state.lifetime.allows_read() {
@@ -2056,7 +2056,7 @@ impl RootResultChannel {
     ) -> Result<u64, RootChannelError> {
         let (accepted, acknowledged_end, retired) = {
             let mut state = self.state.lock().unwrap();
-            if !state.context_owned {
+            if !state.participation_owned {
                 return Err(RootChannelError::Identity);
             }
             if !state.lifetime.allows_read() {
@@ -2087,14 +2087,14 @@ impl RootResultChannel {
         }
     }
     fn try_handoff(&self, state: &mut ChannelState) {
-        if state.context_owned
+        if state.participation_owned
             && self.physical.producer_exited.load(Ordering::Acquire)
             && state.lifetime.end().is_some()
             && state.lifetime.allows_read()
         {
             state
                 .lifetime
-                .handoff_to_context()
+                .handoff_to_participation()
                 .expect("exact root context takes completed producer");
         }
     }
@@ -2112,9 +2112,7 @@ impl RootProducerExit {
     /// End publication and dropping this token do not satisfy that obligation.
     /// Whole-job exit remains the responsibility of its independent owner.
     #[must_use = "handoff the first encoder failure to its actual Task owner"]
-    pub fn finish_encoder(
-        self,
-    ) -> Option<novarocks_execution::runtime::fragment::ExecutionFailure> {
+    pub fn finish_encoder(self) -> Option<novarocks_execution::runtime::task::ExecutionFailure> {
         let mut state = self.channel.state.lock().unwrap();
         let failure = if state.lifetime.end().is_none()
             && state.lifetime.allows_read()
@@ -2142,7 +2140,7 @@ impl RootProducerExit {
         });
         drop(state);
         let failure =
-            failure.map(novarocks_execution::runtime::fragment::ExecutionFailure::from_domain);
+            failure.map(novarocks_execution::runtime::task::ExecutionFailure::from_domain);
         if drive {
             self.channel.physical.drain_notifications();
         }
@@ -2346,7 +2344,7 @@ mod tests {
         let metadata = channel
             .try_reserve_metadata(std::mem::size_of::<RootMetadataReservation>())
             .unwrap();
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         let (entered, resume) =
             notification_checkpoint(&channel, RootNotificationTestPoint::OwnerExitCommitted);
         let exit = std::thread::spawn(move || drop(metadata));
@@ -2372,7 +2370,7 @@ mod tests {
     #[test]
     fn pending_notification_pass_has_no_physical_idle_gap() {
         let (channel, _) = channel(facts());
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         let weak = Arc::downgrade(&channel.physical);
         let once = AtomicBool::new(true);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2411,8 +2409,8 @@ mod tests {
     #[test]
     fn sealed_empty_batch_and_late_wakes_obey_the_join_cut() {
         let (channel, _) = channel(facts());
-        channel.seal_reads(RootRetentionClose::ContextReleased);
-        channel.seal_reads(RootRetentionClose::ContextReleased);
+        channel.seal_reads(RootRetentionClose::ParticipationReleased);
+        channel.seal_reads(RootRetentionClose::ParticipationReleased);
         assert!(
             !channel.physical_idle(),
             "the first empty seal still has real finish work"
@@ -2431,7 +2429,7 @@ mod tests {
         // These public repeated seal calls must not manufacture another empty
         // retirement or call a foreign observer, even before the join cut.
         channel.finish_seal();
-        channel.seal_reads(RootRetentionClose::ContextAborted);
+        channel.seal_reads(RootRetentionClose::ParticipationAborted);
         channel.finish_seal();
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert!(channel.try_join_physical());
@@ -2495,7 +2493,7 @@ mod tests {
                 })
             });
             funding_entered.recv().unwrap();
-            channel.close(RootRetentionClose::ContextAborted);
+            channel.close(RootRetentionClose::ParticipationAborted);
             assert_eq!(channel.physical.retained_reservations.count(), 1);
             let (notified, notification) = std::sync::mpsc::sync_channel(1);
             let subscription = channel.writable_observable().subscribe(Arc::new(move || {
@@ -2538,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn ownership_snapshot_distinguishes_ack_from_last_alias_and_producer_exit() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let producer = channel.start_producer().unwrap();
         channel.request_finish().unwrap();
         publish(&channel, b"abc", true);
@@ -2585,7 +2583,7 @@ mod tests {
         );
         // The original offered body alias also keeps its read/delivery guard.
         assert_eq!((acknowledged.segments, acknowledged.deliveries), (1, 1));
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert_eq!(channel.try_ownership_snapshot().unwrap().unwrap().sealed, 1);
         assert!(!channel.physical_idle());
         drop(alias);
@@ -2664,7 +2662,7 @@ mod tests {
         assert_eq!(channel.physical.retained_reservations.count(), 1);
         assert_eq!(budget.retained_bytes_for_test(), base + 512);
         let observation = channel.physical_exit_observation();
-        channel.close(RootRetentionClose::ContextAborted);
+        channel.close(RootRetentionClose::ParticipationAborted);
         assert!(!observation.output_exited());
         assert!(matches!(
             channel.begin_cow_construction(),
@@ -2710,7 +2708,7 @@ mod tests {
                 .load(Ordering::Acquire),
             covered
         );
-        channel.close(RootRetentionClose::ContextAborted);
+        channel.close(RootRetentionClose::ParticipationAborted);
         assert!(matches!(
             metadata.try_grow(1),
             Err(RootChannelError::Closed)
@@ -3023,7 +3021,7 @@ mod tests {
         for secondary in [false, true] {
             let (channel, budget) = channel(FrozenRootOutput::CountOnly);
             let health = channel.physical.health.clone();
-            channel.mark_context_owned().unwrap();
+            channel.mark_participation_owned().unwrap();
             let producer = channel.start_producer().unwrap();
             channel.request_finish().unwrap();
             channel.publish_end().unwrap();
@@ -3048,7 +3046,7 @@ mod tests {
                 health.clone(),
             )
             .unwrap();
-            sibling.mark_context_owned().unwrap();
+            sibling.mark_participation_owned().unwrap();
             let sibling_producer = sibling.start_producer().unwrap();
             let gate = Arc::new(Gate {
                 open: Mutex::new(false),
@@ -3114,11 +3112,11 @@ mod tests {
                 }
             );
             assert_eq!(fault.fact().reason().code(), 163);
-            assert_eq!(encoder_state, RootProducerState::ContextHeld);
+            assert_eq!(encoder_state, RootProducerState::ParticipationHeld);
             assert!(!original_idle);
             assert!(charged > 0);
             assert!(sibling_exited);
-            assert_eq!(sibling_state, RootProducerState::ContextHeld);
+            assert_eq!(sibling_state, RootProducerState::ParticipationHeld);
             assert_eq!(health.failure(), Some(fault));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
@@ -3348,7 +3346,7 @@ mod tests {
             1024 * 1024,
             "suballocation does not create another wallet or charge"
         );
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert!(!channel.physical_idle());
         drop(first);
         assert!(!channel.physical_idle());
@@ -3439,14 +3437,17 @@ mod tests {
     #[tokio::test]
     async fn immutable_replay_atomic_end_and_finish_ignore_consumer_ack() {
         let (channel, budget) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let producer = channel.start_producer().unwrap();
         channel.note_rows(7).unwrap();
         channel.request_finish().unwrap();
         publish(&channel, b"abc", true);
         assert_eq!(channel.producer_state(), RootProducerState::Finishing);
         assert!(producer.finish_encoder().is_none());
-        assert_eq!(channel.producer_state(), RootProducerState::ContextHeld);
+        assert_eq!(
+            channel.producer_state(),
+            RootProducerState::ParticipationHeld
+        );
         let first = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let replay = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         assert_eq!(first.reply(), replay.reply());
@@ -3454,7 +3455,7 @@ mod tests {
         assert_eq!(data(&first).end_after_data().unwrap().sequence.get(), 2);
         assert_eq!(data(&first).end_after_data().unwrap().output_rows, 7);
         // Closing is legal without any final ACK and cannot erase RootFinished.
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert_eq!(channel.snapshot().consumed_through, 0);
         assert!(!channel.physical_idle());
         drop(first);
@@ -3467,7 +3468,7 @@ mod tests {
     #[tokio::test]
     async fn applied_ack_survives_not_ready_and_lost_reply_with_backing_held() {
         let (channel, budget) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
         let first = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let alias = data(&first).body().clone();
@@ -3508,7 +3509,7 @@ mod tests {
             Arc::new(ExecutionHealth::default()),
         )
         .unwrap();
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         (channel, budget)
     }
 
@@ -3578,11 +3579,11 @@ mod tests {
     #[tokio::test]
     async fn seal_before_native_ack_pregrant_preserves_the_applied_frontier() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
         drop(channel.read(&read(&channel, Some(1), 0)).await.unwrap());
         let admitted = channel.begin_read(&read(&channel, None, 1)).unwrap();
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert_eq!(admitted.apply_consumed(), Err(RootChannelError::Closed));
         assert_eq!(admitted.accepted_consumed(), 0);
         assert!(matches!(
@@ -3599,7 +3600,7 @@ mod tests {
     #[test]
     fn native_ack_pregrant_refuses_unoffered_data_without_retiring_it() {
         let (channel, budget) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
         let retained = budget.retained_bytes_for_test();
         let admitted = channel.begin_read(&read(&channel, None, 1)).unwrap();
@@ -3616,7 +3617,7 @@ mod tests {
     #[tokio::test]
     async fn aliases_hold_delivery_positions_after_handler_and_ack() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
         let first = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let alias = data(&first).body().clone();
@@ -3631,7 +3632,7 @@ mod tests {
             Err(RootChannelError::Capacity(_))
         ));
         assert_eq!(channel.physical.deliveries.load(Ordering::Acquire), 2);
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert_eq!(channel.physical.segments.load(Ordering::Acquire), 2);
         assert!(!channel.physical_idle());
         drop(alias);
@@ -3641,7 +3642,7 @@ mod tests {
     #[tokio::test]
     async fn full_window_has_reserved_standalone_end_and_rejects_bad_ack_gap() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"a", false);
         publish(&channel, b"b", false);
         assert!(channel.try_segment().unwrap().is_none());
@@ -3671,9 +3672,9 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn context_seal_wakes_long_poll_and_waits_actual_guard_exit() {
+    async fn participation_seal_wakes_long_poll_and_waits_actual_guard_exit() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let request = RootResultRead::try_new(
             channel.spec.task,
             channel.spec.contract.profile(),
@@ -3707,7 +3708,7 @@ mod tests {
             channel.read(&read(&channel, Some(1), 0)).await,
             Err(RootChannelError::Identity)
         ));
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let mismatch = RootResultRead::try_new(
             channel.spec.task,
             RootProfileId::V1,
@@ -3726,7 +3727,7 @@ mod tests {
     #[tokio::test]
     async fn count_zero_overflow_and_actual_producer_exit() {
         let (channel, _) = channel(FrozenRootOutput::CountOnly);
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let producer = channel.start_producer().unwrap();
         assert!(matches!(
             channel.try_segment(),
@@ -3747,12 +3748,12 @@ mod tests {
         ));
         drop(end);
         let (empty, _) = super::tests::channel(FrozenRootOutput::CountOnly);
-        empty.mark_context_owned().unwrap();
+        empty.mark_participation_owned().unwrap();
         let producer = empty.start_producer().unwrap();
         empty.request_finish().unwrap();
         empty.publish_end().unwrap();
         assert!(producer.finish_encoder().is_none());
-        assert_eq!(empty.producer_state(), RootProducerState::ContextHeld);
+        assert_eq!(empty.producer_state(), RootProducerState::ParticipationHeld);
         let end = empty.read(&read(&empty, Some(1), 0)).await.unwrap();
         assert!(matches!(
             end.reply().outcome,
@@ -3786,7 +3787,7 @@ mod tests {
     #[tokio::test]
     async fn encoder_finish_without_end_records_failure_and_cannot_publish_success() {
         let (channel, _) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         let producer = channel.start_producer().unwrap();
         assert!(!channel.physical_idle());
         let original = producer
@@ -3840,7 +3841,7 @@ mod tests {
     async fn a_builder_admitted_before_failure_cannot_publish_data_or_end() {
         for with_end in [false, true] {
             let (channel, _) = channel(facts());
-            channel.mark_context_owned().unwrap();
+            channel.mark_participation_owned().unwrap();
             let producer = channel.start_producer().unwrap();
             let mut builder = channel.try_segment().unwrap().unwrap();
             builder.output()[0] = b'x';
@@ -3867,7 +3868,7 @@ mod tests {
         let ResultWriteAdmission::Granted(mut credit) = channel.try_reserve(4096).unwrap() else {
             panic!("admitted credit");
         };
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         assert!(!channel.physical_idle());
         assert_eq!(channel.physical.retained_reservations.count(), 1);
         credit.shrink_to(0).unwrap();
@@ -3883,12 +3884,12 @@ mod tests {
     #[tokio::test]
     async fn channel_metadata_and_wallet_follow_last_response_body_alias() {
         let (channel, budget) = channel(facts());
-        channel.mark_context_owned().unwrap();
+        channel.mark_participation_owned().unwrap();
         publish(&channel, b"x", false);
         let delivery = channel.read(&read(&channel, Some(1), 0)).await.unwrap();
         let alias = data(&delivery).body().clone();
         drop(delivery);
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         drop(channel);
         let expected = 1024 * 1024
             + NativeResultSupportGeometry::V1.root_segment_backing_capacity_bytes as usize;
@@ -3999,16 +4000,16 @@ mod tests {
                 matches!(root.producer_state(), RootProducerState::Failed(ref observation) if observation.fact() == first_fact)
             );
         }
-        root.close(RootRetentionClose::ContextAborted);
+        root.close(RootRetentionClose::ParticipationAborted);
         assert!(root.physical_idle());
         assert_eq!(exits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn ordinary_producer_token_drop_never_proves_encoder_exit_or_context_handoff() {
+    fn ordinary_producer_token_drop_never_proves_encoder_exit_or_participation_handoff() {
         for with_end in [false, true] {
             let (root, _) = channel(FrozenRootOutput::CountOnly);
-            root.mark_context_owned().unwrap();
+            root.mark_participation_owned().unwrap();
             let references = Arc::strong_count(&root);
             let producer = root.start_producer().unwrap();
             assert_eq!(Arc::strong_count(&root), references + 1);
@@ -4026,7 +4027,7 @@ mod tests {
             assert!(state.failed.is_none(), "token loss is not a producer exit");
             assert_eq!(
                 state.lifetime.validate_task_retirement(),
-                Err(novarocks_execution_contract::root_lifetime::RootLifetimeError::ContextNotHolding)
+                Err(novarocks_execution_contract::root_lifetime::RootLifetimeError::ParticipationNotHolding)
             );
             drop(state);
             let snapshot = root.try_ownership_snapshot().unwrap().unwrap();
@@ -4034,17 +4035,18 @@ mod tests {
                 (snapshot.producers_running, snapshot.producers_exited),
                 (1, 0)
             );
-            assert_ne!(root.producer_state(), RootProducerState::ContextHeld);
+            assert_ne!(root.producer_state(), RootProducerState::ParticipationHeld);
             assert!(!root.physical_idle());
         }
     }
 
     #[test]
-    fn explicit_encoder_finish_follows_actual_builder_drop_and_allows_exact_context_handoff() {
-        for context_first in [false, true] {
+    fn explicit_encoder_finish_follows_actual_builder_drop_and_allows_exact_participation_handoff()
+    {
+        for participation_first in [false, true] {
             let (root, budget) = channel(facts());
-            if context_first {
-                root.mark_context_owned().unwrap();
+            if participation_first {
+                root.mark_participation_owned().unwrap();
             }
             let producer = root.start_producer().unwrap();
             let builder = root.try_segment().unwrap().unwrap();
@@ -4064,11 +4066,11 @@ mod tests {
             assert!(!root.physical.producer_exited.load(Ordering::Acquire));
             assert!(producer.finish_encoder().is_none());
             assert!(root.physical.producer_exited.load(Ordering::Acquire));
-            if !context_first {
+            if !participation_first {
                 assert_eq!(root.producer_state(), RootProducerState::Finishing);
-                root.mark_context_owned().unwrap();
+                root.mark_participation_owned().unwrap();
             }
-            assert_eq!(root.producer_state(), RootProducerState::ContextHeld);
+            assert_eq!(root.producer_state(), RootProducerState::ParticipationHeld);
             assert!(root.state.lock().unwrap().lifetime.root_finished());
             assert!(
                 root.state
@@ -4083,7 +4085,7 @@ mod tests {
                 (snapshot.producers_running, snapshot.producers_exited),
                 (0, 1)
             );
-            root.close(RootRetentionClose::ContextReleased);
+            root.close(RootRetentionClose::ParticipationReleased);
             assert!(root.physical_idle());
             drop(root);
             assert_eq!(budget.retained_bytes_for_test(), 0);
@@ -4091,17 +4093,17 @@ mod tests {
     }
 
     #[test]
-    fn context_cancellation_does_not_replace_explicit_encoder_exit() {
+    fn participation_cancellation_does_not_replace_explicit_encoder_exit() {
         let (root, _) = channel(FrozenRootOutput::CountOnly);
-        root.mark_context_owned().unwrap();
+        root.mark_participation_owned().unwrap();
         let producer = root.start_producer().unwrap();
         root.request_finish().unwrap();
         root.publish_end().unwrap();
-        root.close(RootRetentionClose::ContextAborted);
+        root.close(RootRetentionClose::ParticipationAborted);
         assert!(root.is_closed());
         assert!(!root.physical.producer_exited.load(Ordering::Acquire));
         assert!(!root.state.lock().unwrap().lifetime.root_finished());
-        assert_ne!(root.producer_state(), RootProducerState::ContextHeld);
+        assert_ne!(root.producer_state(), RootProducerState::ParticipationHeld);
         assert!(!root.physical_idle());
         let snapshot = root.try_ownership_snapshot().unwrap().unwrap();
         assert_eq!(
@@ -4113,7 +4115,7 @@ mod tests {
         assert!(producer.finish_encoder().is_none());
         assert!(root.physical.producer_exited.load(Ordering::Acquire));
         assert!(!root.state.lock().unwrap().lifetime.root_finished());
-        assert_ne!(root.producer_state(), RootProducerState::ContextHeld);
+        assert_ne!(root.producer_state(), RootProducerState::ParticipationHeld);
         let snapshot = root.try_ownership_snapshot().unwrap().unwrap();
         assert_eq!(
             (snapshot.producers_running, snapshot.producers_exited),

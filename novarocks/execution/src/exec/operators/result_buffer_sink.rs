@@ -21,6 +21,7 @@ use crate::exec::pipeline::operator::OperatorLifecycle;
 #[cfg(test)]
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{AcceptedInput, InputPreparationFailure, RawInput},
     operator::{ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator},
     operator_factory::OperatorFactory,
@@ -29,15 +30,14 @@ use crate::exec::pipeline::{
         StepOperator,
     },
     step::{AdmissionNext, InputResult, NextStep, StepResult, WaitFact, WaitReason},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime::{
-    fragment::io::{
-        FragmentResultSession, ResultInputMetadata, ResultWriteAdmission, ResultWriteCredit,
-        ResultWriteFailure,
-    },
     mem_tracker::MemTracker,
+    task::io::{
+        ResultInputMetadata, ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure,
+        TaskResultSession,
+    },
 };
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
@@ -70,11 +70,11 @@ impl ResultBufferSinkShared {
 
 pub struct ResultBufferSinkFactory {
     name: String,
-    session: Arc<dyn FragmentResultSession>,
+    session: Arc<dyn TaskResultSession>,
     shared: Arc<ResultBufferSinkShared>,
 }
 impl ResultBufferSinkFactory {
-    pub fn new(session: Arc<dyn FragmentResultSession>, plan_node_id: Option<i32>) -> Self {
+    pub fn new(session: Arc<dyn TaskResultSession>, plan_node_id: Option<i32>) -> Self {
         let plan_node_id = plan_node_id.filter(|id| *id >= 0).unwrap_or(-1);
         Self {
             name: format!("RESULT_BUFFER_SINK (plan_node_id={plan_node_id})"),
@@ -123,7 +123,7 @@ struct ResultPreparation {
 impl InputPreparation<ResultEncoding> for ResultPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: &RawInput,
         _: &ResultEncoding,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -135,7 +135,7 @@ impl InputPreparation<ResultEncoding> for ResultPreparation {
     }
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         encoding: &ResultEncoding,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -152,7 +152,7 @@ impl ResultPreparation {
     fn reserve(
         &mut self,
         input: ResultInputMetadata,
-        session: &dyn FragmentResultSession,
+        session: &dyn TaskResultSession,
     ) -> ExecutionResult<Option<WaitFact>> {
         if input.rows() == 0 {
             return Ok(None);
@@ -208,7 +208,7 @@ struct ResultBufferSinkOperator {
     // Accepted storage exits before its reserved credit and private bindings.
     receiver: ReceiverSlot<ResultPreparation>,
     name: String,
-    session: Arc<dyn FragmentResultSession>,
+    session: Arc<dyn TaskResultSession>,
     shared: Arc<ResultBufferSinkShared>,
     construction_factory: Option<Arc<dyn InputConstructionFactory>>,
     next: NextStep,
@@ -277,7 +277,7 @@ impl ResultBufferSinkOperator {
             .as_deref()
             .ok_or_else(|| ConstructionFailure::MissingOwner.into())
     }
-    fn fail(&mut self, ctx: &StepContext<'_>, error: ExecutionFailure) -> ExecutionFailure {
+    fn fail(&mut self, ctx: &DriverStep<'_>, error: ExecutionFailure) -> ExecutionFailure {
         ctx.report_failure(error.clone());
         self.failure.get_or_insert(error).clone()
     }
@@ -287,7 +287,7 @@ impl ResultBufferSinkOperator {
         drop(preparation.reserved.take());
         preparation.blocked = None;
     }
-    fn advance(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn advance(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
@@ -419,7 +419,7 @@ impl StepOperator for ResultBufferSinkOperator {
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
             return InputResult::Rejected { input, failure };
         }
@@ -463,7 +463,7 @@ impl StepOperator for ResultBufferSinkOperator {
             }
         }
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -483,7 +483,7 @@ impl StepOperator for ResultBufferSinkOperator {
             Err(error) => Err(self.fail(ctx, error)),
         }
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -519,11 +519,9 @@ mod tests {
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::operator::BlockedReason;
 
-    use crate::runtime::fragment::io::{
-        FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort,
-    };
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
+    use crate::runtime::task::io::{ResultAbort, TaskIoError, TaskIoErrorKind, TaskIoOperation};
     use novarocks_types::SlotId;
 
     struct CreditSession {
@@ -610,19 +608,19 @@ mod tests {
         }
     }
 
-    impl FragmentResultSession for CreditSession {
+    impl TaskResultSession for CreditSession {
         fn reservation_bytes(
             &self,
-            input: crate::runtime::fragment::io::ResultInputMetadata,
-        ) -> Result<usize, FragmentIoError> {
+            input: crate::runtime::task::io::ResultInputMetadata,
+        ) -> Result<usize, TaskIoError> {
             Ok(input.retained_bytes())
         }
 
-        fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
+        fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, TaskIoError> {
             if bytes > self.inner.capacity {
-                return Err(FragmentIoError::new(
-                    FragmentIoOperation::ResultWrite,
-                    FragmentIoErrorKind::InvalidResponse,
+                return Err(TaskIoError::new(
+                    TaskIoOperation::ResultWrite,
+                    TaskIoErrorKind::InvalidResponse,
                     format!(
                         "result chunk of {bytes} bytes exceeds capacity {}",
                         self.inner.capacity
@@ -668,7 +666,7 @@ mod tests {
             Ok(())
         }
 
-        fn finish(&self) -> Result<(), FragmentIoError> {
+        fn finish(&self) -> Result<(), TaskIoError> {
             Ok(())
         }
 
@@ -706,7 +704,7 @@ mod tests {
         )
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
             schema,
             vec![Arc::new(Int32Array::from(values))],
             rows,
@@ -737,11 +735,11 @@ mod tests {
         operator.prepare().unwrap();
     }
 
-    fn with_context<T>(action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    fn with_context<T>(action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &control,
             &mut turn,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -873,10 +871,10 @@ mod tests {
         let allocated = tracker.allocated();
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         let step = operator.as_mut().drive(&mut ctx).unwrap();
         assert!(matches!(step.next, NextStep::Yield));
         operator.as_mut().finish(&mut ctx).unwrap();
@@ -905,7 +903,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for OneChunkSource {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             Ok(crate::exec::pipeline::step::StepResult::new(
                 self.0.take(),
@@ -937,14 +935,14 @@ mod tests {
         }
     }
 
-    impl FragmentResultSession for RacingCreditSession {
+    impl TaskResultSession for RacingCreditSession {
         fn reservation_bytes(
             &self,
-            input: crate::runtime::fragment::io::ResultInputMetadata,
-        ) -> Result<usize, FragmentIoError> {
+            input: crate::runtime::task::io::ResultInputMetadata,
+        ) -> Result<usize, TaskIoError> {
             self.inner.reservation_bytes(input)
         }
-        fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, FragmentIoError> {
+        fn try_acquire(&self, bytes: usize) -> Result<ResultWriteAdmission, TaskIoError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if !self.notified.load(Ordering::SeqCst) {
                 self.rejected.store(true, Ordering::SeqCst);
@@ -975,7 +973,7 @@ mod tests {
             self.inner
                 .write_with_credit(chunk, credit, factory, control)
         }
-        fn finish(&self) -> Result<(), FragmentIoError> {
+        fn finish(&self) -> Result<(), TaskIoError> {
             self.finished.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1051,7 +1049,7 @@ mod tests {
         let error = operator.prepare().unwrap_err();
         assert!(matches!(
             error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
+            crate::runtime::task::ExecutionFailureCause::Construction(
                 ConstructionFailure::MissingOwner
             )
         ));

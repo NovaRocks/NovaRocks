@@ -462,7 +462,7 @@ fn discover_managed_mv_targets(
             "connector lease does not match MV discovery attachment identity",
         ));
     }
-    let namespaces = crate::connector::metadata_list_namespaces_with_planning_lease(
+    let namespaces = crate::connector::metadata_list_namespaces_with_planning_pin(
         planning.clone(),
         context.clone(),
         novarocks_spi::connector::ConnectorListingBound::V1,
@@ -494,7 +494,7 @@ fn discover_managed_mv_targets(
 }
 
 fn discover_managed_mv_targets_in_namespace(
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     namespace: &str,
     context: ConnectorRequestContext,
 ) -> Result<ManagedMvDiscovery, ConnectorError> {
@@ -733,7 +733,7 @@ fn project_connector_error(error: ConnectorError) -> MvProjectionError {
 /// its same read-only installation operation; it cannot readmit management.
 pub(crate) async fn rebuild_one_lake_package_if_missing_verified_original(
     readiness: &crate::mv::domain::readiness::MvReadinessExecution<'_>,
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     catalog: CatalogHandle,
     target: MvTarget,
     table: ConnectorTableIdentity,
@@ -778,7 +778,7 @@ pub(crate) async fn rebuild_one_lake_package_if_missing_verified_original(
 }
 struct CapturedReadOnlyCurrentSource {
     reader: crate::mv::domain::readiness::MvCandidateReader,
-    documents: novarocks_spi::connector::ConnectorDocumentStorageLease,
+    documents: novarocks_spi::connector::ConnectorDocumentStorage,
     observation: novarocks_spi::connector::KeyedDocumentObservationRequest,
 }
 #[async_trait::async_trait]

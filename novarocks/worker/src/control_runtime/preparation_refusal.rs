@@ -21,7 +21,7 @@
 
 use super::preparation::PreparationParent;
 use crate::{
-    HostRejection, task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice,
+    HostRejection, task_completion_set::AdmittedCompletionTransfer, task_port::TaskPendingNotice,
 };
 use novarocks_control_runtime::{completion::ReportSlot, transaction::RuntimeError};
 use novarocks_control_runtime_core::{
@@ -30,7 +30,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    fragment::ExecutionFailure,
+    task::ExecutionFailure,
 };
 use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity,
@@ -52,7 +52,7 @@ const HOST: ConsumerId = ConsumerId::new(2).unwrap();
 /// Drop before binding a refusal is a real unused-holder exit, not a failed
 /// callback or a canceled preparation assumed to have released its captures.
 pub(crate) struct RefusalPosition {
-    role: Option<AdmittedCompletionRole>,
+    completion_transfer: Option<AdmittedCompletionTransfer>,
 }
 impl RefusalPosition {
     pub(crate) fn reserve(parent: &PreparationParent) -> Result<Self, RuntimeError> {
@@ -82,9 +82,10 @@ impl RefusalPosition {
             }
         };
         let (work, capacity, report) =
-            super::admitted_role::adopt_reported_work(work, capacity, report).into_parts();
+            super::reported_work_admission::adopt_reported_work(work, capacity, report)
+                .into_parts();
         Ok(Self {
-            role: Some(AdmittedCompletionRole {
+            completion_transfer: Some(AdmittedCompletionTransfer {
                 work,
                 capacity,
                 report,
@@ -104,7 +105,7 @@ impl RefusalPosition {
             health,
             state: Mutex::new(State {
                 rejection: Some(ManuallyDrop::new(rejection)),
-                role: self.role.take(),
+                completion_transfer: self.completion_transfer.take(),
                 panic: None,
             }),
             retained: Mutex::new(None),
@@ -116,41 +117,48 @@ impl RefusalPosition {
         }
     }
 }
-fn exit_role(mut role: AdmittedCompletionRole) {
-    role.work
-        .body_exited_with_report(&role.report)
+fn exit_completion_transfer(mut original_transfer: AdmittedCompletionTransfer) {
+    original_transfer
+        .work
+        .body_exited_with_report(&original_transfer.report)
         .expect("original host refusal body exit");
-    role.work
+    original_transfer
+        .work
         .captures_exited()
         .expect("original host refusal captures exit");
-    role.report
+    original_transfer
+        .report
         .body_exited()
         .expect("host refusal report producer exit");
-    role.report
+    original_transfer
+        .report
         .captures_exited()
         .expect("host refusal report capture exit");
-    role.report
+    original_transfer
+        .report
         .consume(HOST)
         .expect("actual host disposal consumes its observer leg");
     assert!(
-        role.report
+        original_transfer
+            .report
             .try_retire()
             .expect("host refusal report retirement")
     );
-    role.capacity
+    original_transfer
+        .capacity
         .finish()
         .expect("original host refusal storage exit");
 }
 impl Drop for RefusalPosition {
     fn drop(&mut self) {
-        if let Some(role) = self.role.take() {
-            exit_role(role);
+        if let Some(original_transfer) = self.completion_transfer.take() {
+            exit_completion_transfer(original_transfer);
         }
     }
 }
 struct State {
     rejection: Option<ManuallyDrop<HostRejection>>,
-    role: Option<AdmittedCompletionRole>,
+    completion_transfer: Option<AdmittedCompletionTransfer>,
     panic: Option<ManuallyDrop<Box<dyn Any + Send>>>,
 }
 struct RefusalCustody {
@@ -162,8 +170,13 @@ struct RefusalCustody {
 }
 impl RefusalCustody {
     fn unresolved(&self) {
-        if let Some(role) = &self.state.lock().expect("host refusal custody").role {
-            role.work.mark_unresolved();
+        if let Some(original_transfer) = &self
+            .state
+            .lock()
+            .expect("host refusal custody")
+            .completion_transfer
+        {
+            original_transfer.work.mark_unresolved();
         }
         self.health.report_unresolved(
             ExecutionExitOrigin::Task {
@@ -202,16 +215,20 @@ impl novarocks_execution_contract::SourceRetentionCapability for RefusalSourceRe
 
 /// Finish only the original source holder after its real canonical last Drop.
 /// Keeping this borrowed preserves the complete original role on every error.
-fn finish_retained_role(role: &mut AdmittedCompletionRole) -> Result<bool, RuntimeError> {
-    role.work.body_exited_with_report(&role.report)?;
-    role.work.captures_exited()?;
-    role.report.body_exited()?;
-    role.report.captures_exited()?;
-    role.report.consume(HOST)?;
-    if !role.report.try_retire()? {
+fn finish_retained_transfer(
+    original_transfer: &mut AdmittedCompletionTransfer,
+) -> Result<bool, RuntimeError> {
+    original_transfer
+        .work
+        .body_exited_with_report(&original_transfer.report)?;
+    original_transfer.work.captures_exited()?;
+    original_transfer.report.body_exited()?;
+    original_transfer.report.captures_exited()?;
+    original_transfer.report.consume(HOST)?;
+    if !original_transfer.report.try_retire()? {
         return Ok(false);
     }
-    role.capacity.finish()?;
+    original_transfer.capacity.finish()?;
     Ok(true)
 }
 impl Drop for RefusalSourceRetention {
@@ -222,19 +239,21 @@ impl Drop for RefusalSourceRetention {
             self.custody.unresolved();
             return;
         }
-        let mut role = {
+        let mut original_transfer = {
             let mut state = self.custody.state.lock().expect("canonical refusal role");
             state
-                .role
+                .completion_transfer
                 .take()
                 .expect("one original canonical source role")
         };
         // No custody/publication lock surrounds source exit or raw panic
         // custody. Common errors also preserve this exact role, not a retry.
-        let exited = catch_unwind(AssertUnwindSafe(|| finish_retained_role(&mut role)));
+        let exited = catch_unwind(AssertUnwindSafe(|| {
+            finish_retained_transfer(&mut original_transfer)
+        }));
         match exited {
             Ok(Ok(true)) => {
-                drop(role);
+                drop(original_transfer);
                 self.custody.pending.pending();
                 self.custody.release_retention();
             }
@@ -244,7 +263,7 @@ impl Drop for RefusalSourceRetention {
                     .state
                     .lock()
                     .expect("canonical refusal Unknown");
-                state.role = Some(role);
+                state.completion_transfer = Some(original_transfer);
                 if let Err(panic) = result {
                     state.panic = Some(ManuallyDrop::new(panic));
                 }
@@ -269,7 +288,7 @@ impl HostPreparationRefusal {
     /// A start refusal or unwinding source remains Unknown in the original
     /// self-retained custody; dropping a marker cannot invent a positive exit.
     pub(crate) fn into_retained_source(mut self) -> ExecutionFailure {
-        let (rejection, mut role) = {
+        let (rejection, mut original_transfer) = {
             let mut state = self
                 .custody
                 .state
@@ -278,12 +297,12 @@ impl HostPreparationRefusal {
             (
                 state.rejection.take().expect("original refusal source"),
                 state
-                    .role
+                    .completion_transfer
                     .take()
                     .expect("original refusal preparation child"),
             )
         };
-        let start = catch_unwind(AssertUnwindSafe(|| role.work.start()));
+        let start = catch_unwind(AssertUnwindSafe(|| original_transfer.work.start()));
         let started = matches!(&start, Ok(Ok(())));
         {
             let mut state = self
@@ -291,7 +310,7 @@ impl HostPreparationRefusal {
                 .state
                 .lock()
                 .expect("original canonical refusal role");
-            state.role = Some(role);
+            state.completion_transfer = Some(original_transfer);
             if let Err(panic) = start {
                 state.panic = Some(ManuallyDrop::new(panic));
             }
@@ -313,20 +332,23 @@ impl HostPreparationRefusal {
     /// Only a real host disposal observes source exit. Any panic keeps the
     /// original work, prepaid header and opaque panic in bounded custody.
     pub(crate) fn dispose(mut self) -> bool {
-        let (rejection, mut role) = {
+        let (rejection, mut original_transfer) = {
             let mut state = self.custody.state.lock().expect("host refusal custody");
             (
                 state
                     .rejection
                     .take()
                     .expect("one original host refusal disposal"),
-                state.role.take().expect("original disposal work"),
+                state
+                    .completion_transfer
+                    .take()
+                    .expect("original disposal work"),
             )
         };
-        if role.work.start().is_err() {
+        if original_transfer.work.start().is_err() {
             let mut state = self.custody.state.lock().expect("host refusal custody");
             state.rejection = Some(rejection);
-            state.role = Some(role);
+            state.completion_transfer = Some(original_transfer);
             drop(state);
             self.active = false;
             self.custody.unresolved();
@@ -338,7 +360,7 @@ impl HostPreparationRefusal {
         self.active = false;
         match result {
             Ok(()) => {
-                exit_role(role);
+                exit_completion_transfer(original_transfer);
                 self.custody.pending.pending();
                 self.custody.release_retention();
                 true
@@ -346,7 +368,7 @@ impl HostPreparationRefusal {
             Err(payload) => {
                 let mut state = self.custody.state.lock().expect("host refusal custody");
                 state.panic = Some(ManuallyDrop::new(payload));
-                state.role = Some(role);
+                state.completion_transfer = Some(original_transfer);
                 drop(state);
                 self.custody.unresolved();
                 false

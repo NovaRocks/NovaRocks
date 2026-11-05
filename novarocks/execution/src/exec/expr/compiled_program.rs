@@ -685,8 +685,8 @@ impl CompiledExpressionInstance {
         selection: Selection<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
-    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
-        self.evaluate_controlled::<crate::runtime::fragment::ExecutionFailure>(
+    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
+        self.evaluate_controlled::<crate::runtime::task::ExecutionFailure>(
             input, selection, activation, control, None,
         )
     }
@@ -699,7 +699,7 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
         self.evaluate_input_runtime(
             CompiledInputLoan::RecordBatch(input),
             selection,
@@ -717,7 +717,7 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
         self.evaluate_input_controlled(
             input,
             selection,
@@ -735,7 +735,7 @@ impl CompiledExpressionInstance {
         scope: novarocks_functions::ScalarInvocationScope<'a>,
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
-    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
         self.evaluate_input_controlled(
             CompiledInputLoan::RecordBatch(input),
             scope.actual_domain(),
@@ -752,7 +752,7 @@ impl CompiledExpressionInstance {
         activation: novarocks_functions::ScalarInvocationActivation,
         control: &dyn KernelEvaluationControl,
         runtime: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
-    ) -> crate::runtime::fragment::ExecutionResult<SelectedValues<'a>> {
+    ) -> crate::runtime::task::ExecutionResult<SelectedValues<'a>> {
         self.evaluate_input_controlled(
             CompiledInputLoan::RecordBatch(input),
             invocation.actual_domain(),
@@ -1360,10 +1360,10 @@ mod first_cause_settlement_footer_tests {
     use super::*;
     use crate::exec::operators::compiled_expression::RuntimeKernelControl;
     use crate::runtime::{
-        fragment::ExecutionFailure,
         kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
         query_memory::QueryMemoryBinding,
         runtime_state::{RuntimeErrorState, RuntimeState},
+        task::ExecutionFailure,
     };
     use novarocks_memory::attribution::{
         AttributingAllocator,

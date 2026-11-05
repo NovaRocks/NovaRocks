@@ -31,7 +31,7 @@ pub struct TransportBudget {
     max_query_backend_queued_bytes: usize,
     max_backend_queued_operations: usize,
     max_backend_queued_bytes: usize,
-    max_tasks_per_context: usize,
+    max_tasks_per_participation: usize,
     max_active_tasks_per_backend: usize,
     frontend_queue_residence: Duration,
 }
@@ -45,7 +45,7 @@ impl TransportBudget {
         max_query_backend_queued_bytes: 256 * 1024 * 1024,
         max_backend_queued_operations: 16384,
         max_backend_queued_bytes: 512 * 1024 * 1024,
-        max_tasks_per_context: 4096,
+        max_tasks_per_participation: 4096,
         max_active_tasks_per_backend: 32768,
         frontend_queue_residence: Duration::from_secs(15),
     };
@@ -62,7 +62,7 @@ impl TransportBudget {
     /// one encoded request for both an ordinary batch and its control reserve,
     /// so it must fit two maximum retained batches. The task counts nest for
     /// the same reason — a
-    /// `QueryContextRef` names one query on one backend, so one context's
+    /// `ParticipationRef` names one query on one backend, so one context's
     /// tasks are a subset of that backend's.
     pub fn new(
         max_batch_items: usize,
@@ -72,7 +72,7 @@ impl TransportBudget {
         max_query_backend_queued_bytes: usize,
         max_backend_queued_operations: usize,
         max_backend_queued_bytes: usize,
-        max_tasks_per_context: usize,
+        max_tasks_per_participation: usize,
         max_active_tasks_per_backend: usize,
         frontend_queue_residence: Duration,
     ) -> Option<Self> {
@@ -83,7 +83,7 @@ impl TransportBudget {
             || max_query_backend_queued_bytes == 0
             || max_backend_queued_operations == 0
             || max_backend_queued_bytes == 0
-            || max_tasks_per_context == 0
+            || max_tasks_per_participation == 0
             || max_active_tasks_per_backend == 0
             || frontend_queue_residence.is_zero()
         {
@@ -97,7 +97,7 @@ impl TransportBudget {
             || max_query_backend_queued_bytes > max_backend_queued_bytes
             || max_batch_items > max_query_backend_queued_operations
             || max_query_backend_queued_operations > max_backend_queued_operations
-            || max_tasks_per_context > max_active_tasks_per_backend
+            || max_tasks_per_participation > max_active_tasks_per_backend
             || minimum_process_items > max_backend_queued_operations
             || minimum_process_retained_bytes > max_backend_queued_bytes
         {
@@ -111,7 +111,7 @@ impl TransportBudget {
             max_query_backend_queued_bytes,
             max_backend_queued_operations,
             max_backend_queued_bytes,
-            max_tasks_per_context,
+            max_tasks_per_participation,
             max_active_tasks_per_backend,
             frontend_queue_residence,
         })
@@ -158,8 +158,8 @@ impl TransportBudget {
         self.max_backend_queued_bytes
     }
 
-    pub const fn max_tasks_per_context(self) -> usize {
-        self.max_tasks_per_context
+    pub const fn max_tasks_per_participation(self) -> usize {
+        self.max_tasks_per_participation
     }
 
     pub const fn max_active_tasks_per_backend(self) -> usize {

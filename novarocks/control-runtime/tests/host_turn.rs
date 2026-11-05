@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorHostTurn, ActorRegistration, ActorRuntime},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -44,13 +44,13 @@ impl Actor for OriginalActor {
     fn timer_input(_: Tick) -> usize {
         unreachable!("the original actor has no deadline")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, value: usize, _: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, value: usize, _: &mut ActorStep<'_, ()>) {
         self.calls.fetch_add(value, Ordering::SeqCst);
     }
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!("the original actor does not panic")
     }
 }
@@ -84,8 +84,8 @@ struct OriginalActorFixture {
     runtime: ActorRuntime<OriginalActor>,
     scope: ScopeHandle,
     registration: ActorRegistration,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     calls: Arc<AtomicUsize>,
 }
 impl OriginalActorFixture {

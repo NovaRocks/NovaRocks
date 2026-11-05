@@ -51,15 +51,15 @@ pub enum RuntimeFilterObservationError {
     UnknownChannel(BackendChannelIdentity),
     UnknownProducerInstance {
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     },
     ProducerInstanceNotOpened {
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     },
     ConflictingProducerPartitionCount {
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     },
     UnknownProducerStream(BackendProducerStreamIdentity),
     ProducerPartitionCountExceeded,
@@ -513,7 +513,7 @@ impl RuntimeFilterConflictingReportObservations {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProducerInstanceIdentity {
     channel: BackendChannelIdentity,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,11 +558,11 @@ impl RuntimeFilterObservationStore {
                 let identity =
                     BackendChannelIdentity::new(participant, *binding_id, channel.channel_id());
                 channels.insert(identity, channel_observation(identity));
-                for fragment_instance_id in producer.expected_fragment_instances() {
+                for task_key in producer.expected_tasks() {
                     producer_instances.insert(
                         ProducerInstanceIdentity {
                             channel: identity,
-                            fragment_instance_id: *fragment_instance_id,
+                            task_key: *task_key,
                         },
                         ProducerInstanceState {
                             partition_count: None,
@@ -597,11 +597,11 @@ impl RuntimeFilterObservationStore {
                 let channel_identity =
                     BackendChannelIdentity::new(participant, *binding_id, channel.channel_id());
                 channels.insert(channel_identity, channel_observation(channel_identity));
-                for fragment_instance_id in consumer.expected_fragment_instances() {
+                for task_key in consumer.expected_tasks() {
                     let identity = BackendConsumerSubscriptionIdentity::new(
                         channel_identity,
                         *binding_id,
-                        *fragment_instance_id,
+                        *task_key,
                     );
                     consumers.insert(identity, consumer_observation(identity));
                 }
@@ -646,7 +646,7 @@ impl RuntimeFilterObservationStore {
     pub fn register_producer_instance(
         &self,
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition_count: u32,
     ) {
         let mut state = self.lock();
@@ -654,15 +654,11 @@ impl RuntimeFilterObservationStore {
             increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
             return;
         }
-        let key = ProducerInstanceIdentity {
-            channel,
-            fragment_instance_id,
-        };
+        let key = ProducerInstanceIdentity { channel, task_key };
         let result = match state.producer_instances.get_mut(&key) {
-            None => Err(RuntimeFilterObservationError::UnknownProducerInstance {
-                channel,
-                fragment_instance_id,
-            }),
+            None => {
+                Err(RuntimeFilterObservationError::UnknownProducerInstance { channel, task_key })
+            }
             Some(_) if partition_count == 0 => Err(RuntimeFilterObservationError::IdentityMismatch),
             Some(_)
                 if partition_count
@@ -674,7 +670,7 @@ impl RuntimeFilterObservationStore {
                 Some(existing) if existing != partition_count => Err(
                     RuntimeFilterObservationError::ConflictingProducerPartitionCount {
                         channel,
-                        fragment_instance_id,
+                        task_key,
                     },
                 ),
                 Some(_) => Ok(()),
@@ -803,11 +799,11 @@ impl RuntimeFilterObservationEmitter {
     pub fn register_producer_instance(
         &self,
         channel: BackendChannelIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition_count: u32,
     ) {
         self.store
-            .register_producer_instance(channel, fragment_instance_id, partition_count);
+            .register_producer_instance(channel, task_key, partition_count);
     }
 
     #[allow(
@@ -1277,18 +1273,18 @@ fn producer_stream_mut(
     if !state.producer_streams.contains_key(&identity) {
         let instance_key = ProducerInstanceIdentity {
             channel: identity.channel(),
-            fragment_instance_id: identity.fragment_instance_id(),
+            task_key: identity.task_key(),
         };
         let instance = state.producer_instances.get(&instance_key).ok_or(
             RuntimeFilterObservationError::UnknownProducerInstance {
                 channel: identity.channel(),
-                fragment_instance_id: identity.fragment_instance_id(),
+                task_key: identity.task_key(),
             },
         )?;
         let partition_count = instance.partition_count.ok_or(
             RuntimeFilterObservationError::ProducerInstanceNotOpened {
                 channel: identity.channel(),
-                fragment_instance_id: identity.fragment_instance_id(),
+                task_key: identity.task_key(),
             },
         )?;
         if identity.partition_id().get() >= partition_count {

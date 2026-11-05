@@ -18,11 +18,11 @@
 //! Owner-level observation access, atomically published as a complete group.
 // Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
 use super::{
-    CoverageError, LANE_SHARDS, LaneHandle, ProductionState, RecordRef, RecordRegion,
-    RecordSnapshot, ResponsibilityClass,
+    CoverageError, LANE_SHARDS, Lane, ProductionState, RecordRef, RecordRegion, RecordSnapshot,
+    ResponsibilityClass,
 };
 use crate::{
-    AccountHandle,
+    Account,
     account::Path,
     membership::MemberNode,
     sync::{Arc, Ordering},
@@ -41,7 +41,7 @@ pub enum CoverageGap {
 pub struct LaneShards(Arc<ShardsState>);
 #[derive(Debug)]
 enum ShardsState {
-    Covered([LaneHandle; LANE_SHARDS]),
+    Covered([Lane; LANE_SHARDS]),
     Uncovered(CoverageGap),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,12 +67,12 @@ struct Prepared {
     members: [Arc<MemberNode>; LANE_SHARDS],
 }
 impl Prepared {
-    fn new(account: &AccountHandle) -> Result<Self, CoverageError> {
+    fn new(account: &Account) -> Result<Self, CoverageError> {
         let mut lanes = Vec::with_capacity(LANE_SHARDS);
         for _ in 0..LANE_SHARDS {
-            lanes.push(LaneHandle::new(account, RecordRegion::Observation)?);
+            lanes.push(Lane::new(account, RecordRegion::Observation)?);
         }
-        let lanes: [LaneHandle; LANE_SHARDS] = lanes.try_into().expect("complete shard group");
+        let lanes: [Lane; LANE_SHARDS] = lanes.try_into().expect("complete shard group");
         let members = std::array::from_fn(|i| MemberNode::lane(&lanes[i].0, None));
         // The shell and every member are allocated before acquiring any gate.
         Ok(Self {
@@ -80,7 +80,7 @@ impl Prepared {
             members,
         })
     }
-    fn publish(&self, account: &AccountHandle) {
+    fn publish(&self, account: &Account) {
         let ShardsState::Covered(lanes) = &*self.owner.0 else {
             unreachable!()
         };
@@ -90,7 +90,7 @@ impl Prepared {
         account.0.shared.retain_observations(lanes);
     }
 }
-impl AccountHandle {
+impl Account {
     /// Observation never qualifies or consumes funding. A coverage gap remains
     /// an owner handle whose scope shadows unrelated ambient owners.
     pub fn create_lane_shards(&self) -> LaneShards {
@@ -143,7 +143,7 @@ impl LaneShards {
         }
     }
     #[cfg(not(loom))]
-    fn selected(&self) -> Option<&LaneHandle> {
+    fn selected(&self) -> Option<&Lane> {
         match &*self.0 {
             ShardsState::Covered(lanes) => {
                 Some(&lanes[crate::attribution::tls::current_shard() % LANE_SHARDS])

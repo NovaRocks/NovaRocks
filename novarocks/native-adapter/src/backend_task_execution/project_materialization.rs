@@ -25,7 +25,6 @@ use novarocks_execution::exec::chunk::original_compiled_schema_metadata_request;
 #[cfg(test)]
 use novarocks_execution::runtime::preparation_metadata::CompiledSchemaMetadataScope;
 use novarocks_execution::runtime::{
-    fragment::ExecutionResult,
     kernel_memory::KernelMemoryJournal,
     preparation_memory::{
         PreparationMemoryJournalLoan, PreparationMemoryRefusal, SynchronousPreparationFailure,
@@ -33,6 +32,7 @@ use novarocks_execution::runtime::{
     },
     preparation_metadata::{CompiledSchemaSite, PreparationMetadataFailure},
     query_memory::QueryMemoryBinding,
+    task::ExecutionResult,
 };
 use novarocks_local_compiler::{
     FragmentCompileError, ProjectMetadataFailure, ProjectMetadataOutput, ProjectMetadataScope,

@@ -37,14 +37,14 @@
 pub(crate) mod logical_input;
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 use super::table_finish_failure::{
     FinishArrowOperation, FinishContractSite, FinishOutputBound, finish_arrow, finish_contract,
 };
 fn finish_connector(source: novarocks_spi::connector::ConnectorError) -> ExecutionFailure {
-    crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-        crate::runtime::fragment::connector_failure::ConnectorOperation::ValidateWriteRelation,
+    crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+        crate::runtime::task::connector_failure::ConnectorOperation::ValidateWriteRelation,
         source,
     )
     .into()
@@ -86,11 +86,12 @@ use crate::exec::node::table_write_relation::{
 };
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+    TableWriteAggregateBoundary, TableWriteAggregateFaultHook,
 };
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
+use crate::exec::pipeline::driver_step::DriverStep;
 use crate::exec::pipeline::input::{PreparedInput, RawInput};
 use crate::exec::pipeline::operator::{InputConstructionFactory, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -99,7 +100,6 @@ use crate::exec::pipeline::shape::{ControlStep, HydrateInput, Transform, Transfo
 use crate::exec::pipeline::shape::{Source, SourceKernel, child::ChildStep};
 use crate::exec::pipeline::step::{AdmissionNext, WaitFact, WaitReason};
 use crate::exec::pipeline::step::{NextStep, StepResult};
-use crate::exec::pipeline::step_context::StepContext;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -208,7 +208,7 @@ impl GroupedOutput {
             retiring: false,
         })
     }
-    fn step(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn step(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let NextStep::Wait(wait) = &self.next
             && !wait.is_ready()
         {
@@ -280,7 +280,7 @@ pub struct TableFinishOperatorFactory {
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
 }
 
 impl TableFinishOperatorFactory {
@@ -431,14 +431,14 @@ struct BufferedFragment {
 /// Streams the non-statistics Root prefix without materializing a second copy
 /// of the complete prepared write set. The summary is its own first batch;
 /// prepared fragments then move through bounded, byte-aware batches.
-struct PrefixOutputDriver {
+struct PrefixOutputCursor {
     summary_rows: Option<i64>,
     fragments: VecDeque<BufferedFragment>,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<Arc<MemTracker>>,
 }
 
-impl PrefixOutputDriver {
+impl PrefixOutputCursor {
     fn try_new(
         rows: u64,
         fragments: Vec<BufferedFragment>,
@@ -648,7 +648,7 @@ struct TableFinishOperator {
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(novarocks_dev_controls)]
-    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
     channel_to_call: Vec<Option<usize>>,
     parallelism_error: Option<ExecutionFailure>,
     rows: WriteRowCountAccumulator,
@@ -661,7 +661,7 @@ struct TableFinishOperator {
     aggregate_coverage: HashMap<u32, Vec<bool>>,
     final_groups_seen: HashSet<u32>,
     grouped_unpivot: Option<GroupedOutput>,
-    prefix_output: Option<PrefixOutputDriver>,
+    prefix_output: Option<PrefixOutputCursor>,
     phase: FinishPhase,
     mem_tracker: Option<Arc<MemTracker>>,
     fragment_tracker: Option<Arc<MemTracker>>,
@@ -968,7 +968,7 @@ impl TableFinishOperator {
 
     fn begin_finalize(&mut self) -> ExecutionResult<()> {
         self.validate_coverage()?;
-        self.prefix_output = Some(PrefixOutputDriver::try_new(
+        self.prefix_output = Some(PrefixOutputCursor::try_new(
             self.logical_rows
                 .map_or(self.rows.get(), |counts| counts.affected_rows()),
             std::mem::take(&mut self.fragments),
@@ -1654,7 +1654,7 @@ impl std::fmt::Display for TableFinishStepFailure {
 impl std::error::Error for TableFinishStepFailure {}
 impl novarocks_failure_contract::FailureProjection for TableFinishStepFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         FailureFact::new(
             FailureClass::Invariant,
@@ -1671,7 +1671,7 @@ impl TransformKernel for TableFinishOperator {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.source_observable.clone())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = self.runtime_error() {
             return Err(error);
         }
@@ -1693,7 +1693,7 @@ impl TransformKernel for TableFinishOperator {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let generation = self.source_observable.generation();
@@ -1724,13 +1724,13 @@ impl TransformKernel for TableFinishOperator {
     }
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.input = Some(input.into_uncovered_chunk()?);
         self.drive(ctx)
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let generation = self.source_observable.generation();
         let result = self.advance(ctx);
         match result {
@@ -1759,7 +1759,7 @@ impl TransformKernel for TableFinishOperator {
             }
         }
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.phase = FinishPhase::Finalizing;
         self.finish_final_aggregate_blocked_interval();
         self.drive(ctx)
@@ -1825,7 +1825,7 @@ impl TableFinishOperator {
         };
         StepResult::new(output, next, rows)
     }
-    fn advance(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn advance(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = self.runtime_error() {
             return Err(error);
         }
@@ -1838,21 +1838,18 @@ impl TableFinishOperator {
             return Ok(self.result(None, NextStep::Yield));
         }
         if self.phase == FinishPhase::Finalizing {
-            ctx.perform(
-                crate::runtime::fragment::PipelineOperation::Finishing,
-                |_| {
-                    #[cfg(novarocks_dev_controls)]
-                    if self.aggregate.is_some() {
-                        self.aggregate_guard
-                            .check(TableWriteAggregateBoundary::FinalFinalize)
-                            .map_err(ExecutionFailure::from_domain)?;
-                    }
-                    self.begin_finalize()
-                },
-            )?;
+            ctx.perform(crate::runtime::task::PipelineOperation::Finishing, |_| {
+                #[cfg(novarocks_dev_controls)]
+                if self.aggregate.is_some() {
+                    self.aggregate_guard
+                        .check(TableWriteAggregateBoundary::FinalFinalize)
+                        .map_err(ExecutionFailure::from_domain)?;
+                }
+                self.begin_finalize()
+            })?;
         }
         if let Some(chunk) = self.input.take() {
-            let result = ctx.perform(crate::runtime::fragment::PipelineOperation::Push, |_| {
+            let result = ctx.perform(crate::runtime::task::PipelineOperation::Push, |_| {
                 self.consume_relation(&chunk)
             });
             if let Err(error) = result {
@@ -2068,7 +2065,7 @@ mod tests {
     #[test]
     fn compiled_outer_root_prepare_preserves_first_tracker_refusal_without_publishing() {
         use crate::exec::pipeline::operator::ConstructionFailure;
-        use crate::runtime::fragment::ExecutionFailureCause;
+        use crate::runtime::task::ExecutionFailureCause;
         let (factory, program, state) = compiled_root_owner_fixture();
         let mut operator = factory.create_operator(1, 0);
         let tracker = install_compiled_root_creator(&mut operator, &state);
@@ -2234,7 +2231,7 @@ mod tests {
     struct RejectAggregateBoundary(TableWriteAggregateBoundary);
 
     #[cfg(novarocks_dev_controls)]
-    impl TableWriteAggregateGuard for RejectAggregateBoundary {
+    impl TableWriteAggregateFaultHook for RejectAggregateBoundary {
         fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
             if boundary == self.0 {
                 return Err(ConnectorError::new(
@@ -2249,12 +2246,12 @@ mod tests {
     fn with_step<T>(
         state: &RuntimeState,
         units: u32,
-        action: impl FnOnce(&mut StepContext<'_>) -> T,
+        action: impl FnOnce(&mut DriverStep<'_>) -> T,
     ) -> T {
         let error = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, units);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, units);
+        action(&mut DriverStep::new(
             &error,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -2337,7 +2334,7 @@ mod tests {
         }
         fn admission(
             &self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: &RawInput,
         ) -> ExecutionResult<Option<AdmissionNext>> {
             let generation = self.observable.generation();
@@ -2352,13 +2349,13 @@ mod tests {
         }
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             self.pushed_rows += input.chunk().len();
             Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let generation = self.observable.generation();
             if !self.ready.load(Ordering::Acquire) {
                 return Ok(StepResult::new(
@@ -2383,7 +2380,7 @@ mod tests {
                 0,
             ))
         }
-        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
             self.drive(ctx)
         }
@@ -2401,12 +2398,12 @@ mod tests {
     impl TransformKernel for ErrorOnlyFinalAggregate {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let failure: ExecutionFailure = novarocks_functions::KernelFailure::Internal(
                 novarocks_functions::KernelDiagnostic::new(
                     "scripted final aggregate failed asynchronously",
@@ -2430,12 +2427,12 @@ mod tests {
     impl TransformKernel for FinalizeErrorAggregate {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
-        fn finish(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let failure: ExecutionFailure = novarocks_functions::KernelFailure::Internal(
                 novarocks_functions::KernelDiagnostic::new(
                     "scripted final aggregate synchronous finalize failure",
@@ -2833,7 +2830,7 @@ mod tests {
         fn control_observable(&self) -> Option<Arc<Observable>> {
             Some(self.observable.clone())
         }
-        fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let output = self.child.advance(ctx)?;
             Ok(StepResult::new(output, self.child.work_next(), 0))
         }
@@ -3355,7 +3352,7 @@ mod tests {
     #[test]
     fn native_finish_retains_accepted_rows_across_zero_quota_and_signals_eos_once() {
         use crate::exec::pipeline::{
-            shape::StepOperator, step::InputResult, step_context::TurnWork,
+            driver_step::TurnWork, shape::StepOperator, step::InputResult,
         };
         let tracker = MemTracker::new_root("native finish quantum custody");
         let factory = factory(1);
@@ -3369,7 +3366,7 @@ mod tests {
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&error, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(
                 &mut ctx,
@@ -4294,7 +4291,7 @@ mod tests {
             "the final merge keeps the original Connector category and reason"
         );
         assert!(
-            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Domain(source)
+            matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Domain(source)
                 if source.downcast_ref::<ConnectorError>() == Some(&expected)),
             "the original typed Connector source survives the final merge boundary"
         );
@@ -4608,7 +4605,7 @@ mod tests {
         impl crate::exec::pipeline::shape::TransformKernel for CleanupAggregate {
             fn apply(
                 &mut self,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
                 _: crate::exec::pipeline::input::PreparedInput,
             ) -> ExecutionResult<StepResult> {
                 unreachable!("lifecycle test has no aggregate data work")
@@ -4683,7 +4680,7 @@ mod tests {
             }
         }
         impl SourceKernel for GatedGrouped {
-            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 Ok(StepResult::new(None, NextStep::Finished, 0))
             }
         }
@@ -6176,7 +6173,7 @@ mod tests {
             logical_change_summary::tests::IngressFixture,
             setop::union_all_shared::UnionAllSharedState,
         };
-        use crate::exec::pipeline::step_context::TurnWork;
+        use crate::exec::pipeline::driver_step::TurnWork;
         for summary_first in [true, false] {
             let state = RuntimeState::default();
             let shared = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
@@ -6199,7 +6196,7 @@ mod tests {
             for _ in 0..20 {
                 work.begin_turn(1).unwrap();
                 let step = source
-                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                     .unwrap();
                 assert!(step.output.is_none());
             }
@@ -6220,7 +6217,7 @@ mod tests {
             for _ in 0..20 {
                 work.begin_turn(1).unwrap();
                 let step = source
-                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                     .unwrap();
                 assert!(
                     step.output.is_none(),
@@ -6241,7 +6238,7 @@ mod tests {
             for _ in 0..100 {
                 work.begin_turn(1).unwrap();
                 let step = source
-                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                     .unwrap();
                 outputs.extend(step.output);
                 if matches!(step.next, NextStep::Finished) {
@@ -6264,7 +6261,7 @@ mod tests {
     #[test]
     fn logical_change_summary_finish_real_driver_drains_early_statistics_under_a_tiny_waterline() {
         use crate::exec::operators::{
-            ResultSinkFactory, ResultSinkHandle, logical_change_summary::tests::IngressFixture,
+            ResultSinkBuffer, ResultSinkFactory, logical_change_summary::tests::IngressFixture,
             setop::union_all_shared::UnionAllSharedState,
         };
         use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
@@ -6326,7 +6323,7 @@ mod tests {
             .with_logical_input(shared.clone(), ingress.input());
         let mut source = factory.create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let mut sink = ResultSinkFactory::new(output.clone()).create(1, 0);
         sink.set_construction_factory(super::super::logical_change_summary::tests::creator(&state));
         sink.prepare().unwrap();
@@ -6439,7 +6436,7 @@ mod tests {
             FinishContractSite::Relation,
             "original required input failure",
         );
-        crate::runtime::fragment::ExecutionFailureReporter::report_failure(
+        crate::runtime::task::ExecutionFailureReporter::report_failure(
             state.error_state().as_ref(),
             original.clone(),
         );
@@ -6456,7 +6453,7 @@ mod tests {
             logical_change_summary::tests::IngressFixture,
             setop::union_all_shared::UnionAllSharedState,
         };
-        use crate::exec::pipeline::step_context::TurnWork;
+        use crate::exec::pipeline::driver_step::TurnWork;
         let (fixture, state, schema) = composite_fixture(2, 1, 1);
         let shared = UnionAllSharedState::new_with_limits(1, 905, 1, 1);
         let state = IngressFixture::task_state(&state);
@@ -6516,7 +6513,7 @@ mod tests {
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
         assert!(matches!(
             source
-                .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                 .unwrap()
                 .next,
             NextStep::Yield
@@ -6526,7 +6523,7 @@ mod tests {
         for _ in 0..1024 {
             work.begin_turn(1).unwrap();
             let step = source
-                .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                 .unwrap();
             chunks.extend(step.output);
             if matches!(step.next, NextStep::Finished) {
@@ -6559,7 +6556,7 @@ mod tests {
             logical_change_summary::tests::IngressFixture,
             setop::union_all_shared::UnionAllSharedState,
         };
-        use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, TurnWork};
+        use crate::exec::pipeline::driver_step::{DEFAULT_TURN_WORK_UNITS, TurnWork};
         for units in [1, DEFAULT_TURN_WORK_UNITS] {
             let (fixture, state, schema) = composite_fixture(2, 1, 1);
             let shared = UnionAllSharedState::new_with_limits(1, 905, 1, 1);
@@ -6623,7 +6620,7 @@ mod tests {
             let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
             assert!(matches!(
                 source
-                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                     .unwrap()
                     .next,
                 NextStep::Yield
@@ -6633,7 +6630,7 @@ mod tests {
             for _ in 0..1024 {
                 work.begin_turn(units).unwrap();
                 let step = source
-                    .drive(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                     .unwrap();
                 if let NextStep::Wait(wait) = &step.next {
                     assert!(

@@ -23,16 +23,16 @@
 use super::ControlStep;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{RawInput, derived_raw_input},
     operator::{ExitFailure, ExitObservation, ExitProgress, FinishWatch, Operator},
     operator_exit::{ExitAction, ExitObservations, OperatorExitScope, OwnedOperator},
     step::{AdmissionNext, InputResult, NextStep, StepResult, WaitFact},
-    step_context::StepContext,
 };
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult, PipelineOperation},
     observable::{Observable, ObserverSubscription},
     runtime_state::{RuntimeErrorState, RuntimeState},
+    task::{ExecutionFailure, ExecutionResult, PipelineOperation},
 };
 use std::{
     ops::{Deref, DerefMut},
@@ -65,7 +65,7 @@ impl std::fmt::Display for ChildContractFailure {
 impl std::error::Error for ChildContractFailure {}
 impl novarocks_failure_contract::FailureProjection for ChildContractFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let code = match self {
             Self::InputSlotOccupied => ExecutionReason::ChildInputSlotOccupied,
@@ -232,7 +232,7 @@ impl ChildStep {
     }
     pub(crate) fn poll_control(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<ControlStep> {
         if !self.operator.is_live() {
             return Ok(ControlStep::Active);
@@ -252,7 +252,7 @@ impl ChildStep {
         self.record_wait();
         Ok(result)
     }
-    pub(crate) fn advance(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<Option<Chunk>> {
+    pub(crate) fn advance(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<Option<Chunk>> {
         if self.finishing && !self.finish_signalled && self.pending.is_none() {
             self.finish_signalled = true;
             if !self.is_complete() {
@@ -505,7 +505,7 @@ impl ChildStep {
     }
     /// Observe every accepted child exit before returning an originating error.
     /// Cleanup cannot hide an independent wait or become a data-step failure.
-    pub(crate) fn retire(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<NextStep> {
+    pub(crate) fn retire(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<NextStep> {
         let failures = ctx.failure_port();
         if self
             .failures
@@ -768,7 +768,7 @@ mod tests {
     impl super::super::TransformKernel for ExitingKernel {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<StepResult> {
             unreachable!("exit fixture has no data work")
@@ -776,7 +776,7 @@ mod tests {
     }
     #[test]
     fn retirement_subscribes_then_rechecks_and_requires_join_and_successful_close() {
-        use crate::exec::pipeline::step_context::TurnWork;
+        use crate::exec::pipeline::driver_step::TurnWork;
         use crate::runtime::runtime_state::RuntimeErrorState;
         use std::{
             sync::atomic::{AtomicBool, AtomicUsize},
@@ -812,7 +812,7 @@ mod tests {
             let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+            let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
             assert!(
                 matches!(child.retire(&mut ctx).unwrap(), NextStep::Runnable),
                 "a newly installed exit watch requires a worker recheck"
@@ -911,17 +911,17 @@ mod tests {
     impl super::super::TransformKernel for HookEvents {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<StepResult> {
             unreachable!("exit-only real task fixture")
         }
     }
-    struct TaskResource {
+    struct ValueDropCount {
         values: Vec<u64>,
         drops: Arc<std::sync::atomic::AtomicUsize>,
     }
-    impl Drop for TaskResource {
+    impl Drop for ValueDropCount {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
@@ -934,7 +934,7 @@ mod tests {
     }
     struct ExitFixture {
         gate: ReleaseGate,
-        resource: std::sync::Weak<TaskResource>,
+        resource: std::sync::Weak<ValueDropCount>,
         resource_drops: Arc<std::sync::atomic::AtomicUsize>,
         begins: Arc<std::sync::atomic::AtomicUsize>,
         closes: Arc<std::sync::atomic::AtomicUsize>,
@@ -955,7 +955,7 @@ mod tests {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let task_gate = gate.clone();
         let drops = Arc::new(AtomicUsize::new(0));
-        let resource = Arc::new(TaskResource {
+        let resource = Arc::new(ValueDropCount {
             values: vec![7, 11, 19],
             drops: drops.clone(),
         });
@@ -1056,10 +1056,10 @@ mod tests {
                 None,
             );
             let mut work =
-                crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+                crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
+            let mut ctx = DriverStep::new(&failures, &mut work, &mut value_conversions);
             let first = child.retire(&mut ctx);
             if required {
                 assert!(first.unwrap_err().same_occurrence(&original));
@@ -1192,10 +1192,10 @@ mod tests {
             let (mut child, fixture) =
                 exit_child(&runtime, failures.clone(), None, None, None, Some(payload));
             let mut work =
-                crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+                crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
+            let mut ctx = DriverStep::new(&failures, &mut work, &mut value_conversions);
             assert!(matches!(
                 child.retire(&mut ctx).unwrap(),
                 NextStep::Runnable
@@ -1320,10 +1320,10 @@ mod tests {
         assert!(repeated.iter().all(|event| event.failure.is_none()));
         fixture.gate.0.add_permits(1);
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&failures, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&failures, &mut work, &mut value_conversions);
         wait_until_exit_ready(|| matches!(child.retire(&mut ctx).unwrap(), NextStep::Finished));
         assert!(fixture.joined.load(Ordering::Acquire));
         assert_eq!(fixture.resource_drops.load(Ordering::SeqCst), 1);

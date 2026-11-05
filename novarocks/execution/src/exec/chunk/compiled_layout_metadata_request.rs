@@ -35,7 +35,7 @@ use std::alloc::Layout;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompiledSchemaRequestFailure {
     Request(MetadataRequestError),
-    Projection(crate::runtime::fragment::SharedDomainFailure),
+    Projection(crate::runtime::task::SharedDomainFailure),
 }
 impl From<MetadataRequestError> for CompiledSchemaRequestFailure {
     fn from(source: MetadataRequestError) -> Self {
@@ -51,19 +51,19 @@ impl From<novarocks_functions::array_projection::ArrayProjectionFailure>
     for CompiledSchemaRequestFailure
 {
     fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
-        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(source))
+        Self::Projection(crate::runtime::task::SharedDomainFailure::new(source))
     }
 }
 impl From<layout::LayoutResourceError> for CompiledSchemaRequestFailure {
     fn from(source: layout::LayoutResourceError) -> Self {
-        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(
+        Self::Projection(crate::runtime::task::SharedDomainFailure::new(
             super::ChunkConstructionFailure::from(source),
         ))
     }
 }
 impl From<hashmap::HashMapResourceError> for CompiledSchemaRequestFailure {
     fn from(source: hashmap::HashMapResourceError) -> Self {
-        Self::Projection(crate::runtime::fragment::SharedDomainFailure::new(
+        Self::Projection(crate::runtime::task::SharedDomainFailure::new(
             super::ChunkConstructionFailure::from(source),
         ))
     }

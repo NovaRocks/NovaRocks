@@ -23,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{ArrayNormalizationStep, Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 mod paged;
@@ -74,7 +74,7 @@ impl novarocks_failure_contract::FailureProjection for JoinGatherContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::JoinGatherContract.reason(),
+            crate::runtime::task::ExecutionReason::JoinGatherContract.reason(),
         )
     }
 }
@@ -99,7 +99,7 @@ impl std::error::Error for GatherKernelFailure {
 }
 impl novarocks_failure_contract::FailureProjection for GatherKernelFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use arrow::error::ArrowError;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, reason) = match self.0 {

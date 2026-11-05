@@ -18,6 +18,7 @@
 //! Finite Native-owned observations and independent catalog fault permissions.
 
 use novarocks_execution::runtime::exchange::TestEventObserver;
+use novarocks_failpoint::observation_marker::ObservationAction;
 use novarocks_failpoint::scope::{ActionClaim, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{
     RoleProcessReceipt, StatementExecutionBinding, StatementInputNomination,
@@ -34,7 +35,7 @@ const MAX_EVENTS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
-    GrpcFragment,
+    TaskProtocol,
     Reader,
     Writer,
     CatalogMaterialization,
@@ -46,12 +47,18 @@ enum Action {
 impl Action {
     fn parse(value: &str) -> Result<Self, String> {
         Ok(match value {
-            "grpc-fragment" => Self::GrpcFragment,
-            "reader-marker" => Self::Reader,
-            "writer-marker" => Self::Writer,
-            "catalog-materialization" => Self::CatalogMaterialization,
-            "catalog-lifecycle" => Self::CatalogLifecycle,
-            "exchange-snapshot" => Self::ExchangeSnapshot,
+            value if value == ObservationAction::TaskProtocol.as_str() => Self::TaskProtocol,
+            value if value == ObservationAction::ReaderMarker.as_str() => Self::Reader,
+            value if value == ObservationAction::WriterMarker.as_str() => Self::Writer,
+            value if value == ObservationAction::CatalogMaterialization.as_str() => {
+                Self::CatalogMaterialization
+            }
+            value if value == ObservationAction::CatalogLifecycle.as_str() => {
+                Self::CatalogLifecycle
+            }
+            value if value == ObservationAction::ExchangeSnapshot.as_str() => {
+                Self::ExchangeSnapshot
+            }
             "catalog-hold" => Self::CatalogHold,
             "catalog-failure" => Self::CatalogFailure,
             _ => return Err("unknown or unsupported Native observation action".into()),
@@ -59,12 +66,12 @@ impl Action {
     }
     fn name(self) -> &'static str {
         match self {
-            Self::GrpcFragment => "grpc-fragment",
-            Self::Reader => "reader-marker",
-            Self::Writer => "writer-marker",
-            Self::CatalogMaterialization => "catalog-materialization",
-            Self::CatalogLifecycle => "catalog-lifecycle",
-            Self::ExchangeSnapshot => "exchange-snapshot",
+            Self::TaskProtocol => ObservationAction::TaskProtocol.as_str(),
+            Self::Reader => ObservationAction::ReaderMarker.as_str(),
+            Self::Writer => ObservationAction::WriterMarker.as_str(),
+            Self::CatalogMaterialization => ObservationAction::CatalogMaterialization.as_str(),
+            Self::CatalogLifecycle => ObservationAction::CatalogLifecycle.as_str(),
+            Self::ExchangeSnapshot => ObservationAction::ExchangeSnapshot.as_str(),
             Self::CatalogHold => "catalog-hold",
             Self::CatalogFailure => "catalog-failure",
         }
@@ -884,7 +891,7 @@ mod tests {
     }
 
     fn direct_grant() -> Value {
-        json!({"action":"grpc-fragment","root":"/tmp","backend_index":2,
+        json!({"action":"task-protocol","root":"/tmp","backend_index":2,
             "target_session_id":"native-be","max_events":2,
             "query_execution":{"query_id_hi":7,"query_id_lo":9,"attempt_id":1}})
     }
@@ -896,7 +903,11 @@ mod tests {
         assert!(!controls.owns_backend(BackendProcessId::new_v7()));
         assert!(
             controls
-                .observation_for("grpc-fragment", execution(2))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution(2)
+                )
                 .unwrap()
                 .is_none()
         );
@@ -904,19 +915,30 @@ mod tests {
             QueryExecutionId::new(QueryId::new(7, 10), AttemptId::new(1).unwrap()).unwrap();
         assert!(
             controls
-                .observation_for("grpc-fragment", foreign)
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    foreign
+                )
                 .unwrap()
                 .is_none()
         );
         assert!(
             controls
-                .observation_for("reader-marker", execution(1))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
+                    execution(1)
+                )
                 .unwrap()
                 .is_none()
         );
         assert!(session.role.scope().observations().is_empty());
         let observer = controls
-            .observation_for("grpc-fragment", execution(1))
+            .observation_for(
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                execution(1),
+            )
             .unwrap()
             .unwrap();
         observer.observe("NATIVE_TEST_EVENT direct-request");
@@ -934,7 +956,11 @@ mod tests {
         assert!(!observer.is_active());
         assert!(
             controls
-                .observation_for("grpc-fragment", execution(1))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution(1)
+                )
                 .unwrap()
                 .is_none()
         );
@@ -957,7 +983,7 @@ mod tests {
             assert!(session.controls().is_err());
         }
         let mut parameters = direct_grant();
-        parameters["action"] = json!("bind-grpc-fragment");
+        parameters["action"] = json!("bind-task-protocol");
         let session = Session::new(vec![parameters], SessionRole::Fe);
         assert!(session.controls().is_err());
         let session = Session::new(vec![direct_grant(), direct_grant()], SessionRole::Be);
@@ -971,7 +997,11 @@ mod tests {
         session.bind("reader-marker", execution(1), session.process());
         assert!(
             controls
-                .observation_for("writer-marker", execution(1))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::WriterMarker
+                        .as_str(),
+                    execution(1)
+                )
                 .unwrap()
                 .is_none()
         );
@@ -991,13 +1021,20 @@ mod tests {
         session.bind("reader-marker", execution(1), session.process());
         assert!(
             controls
-                .observation_for("reader-marker", execution(2))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
+                    execution(2)
+                )
                 .unwrap()
                 .is_none()
         );
         assert!(session.role.scope().observations().is_empty());
         let sink = controls
-            .observation_for("reader-marker", execution(1))
+            .observation_for(
+                novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(),
+                execution(1),
+            )
             .unwrap()
             .unwrap();
         sink.observe("NATIVE_TEST_EVENT first");
@@ -1031,7 +1068,11 @@ mod tests {
             mismatch
                 .controls()
                 .unwrap()
-                .observation_for("reader-marker", execution(1))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
+                    execution(1)
+                )
                 .unwrap()
                 .is_none()
         );
@@ -1041,7 +1082,7 @@ mod tests {
         let parameters = [1, 2]
             .into_iter()
             .map(|attempt| {
-                let mut value = grant("grpc-fragment");
+                let mut value = grant("task-protocol");
                 value["attempt_id"] = json!(attempt);
                 value
             })
@@ -1060,21 +1101,29 @@ mod tests {
             binding
                 .write_private(&attempt_binding_path(
                     &session.root,
-                    "grpc-fragment",
+                    "task-protocol",
                     2,
                     "statement-run",
                     Some(attempt),
                 ))
                 .unwrap();
             let observer = controls
-                .observation_for("grpc-fragment", execution(attempt))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution(attempt),
+                )
                 .unwrap()
                 .unwrap();
             observer.observe("NATIVE_TEST_EVENT exact-attempt");
         }
         assert!(
             controls
-                .observation_for("grpc-fragment", execution(3))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution(3)
+                )
                 .unwrap()
                 .is_none()
         );
@@ -1091,18 +1140,22 @@ mod tests {
         session.close();
         assert!(
             controls
-                .observation_for("grpc-fragment", execution(1))
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution(1)
+                )
                 .unwrap()
                 .is_none()
         );
     }
     #[test]
     fn fe_only_binds_predeclared_attempt_ordinals_of_the_same_statement() {
-        let target = Session::new(vec![grant("grpc-fragment")], SessionRole::Be);
+        let target = Session::new(vec![grant("task-protocol")], SessionRole::Be);
         let values = [1, 2]
             .into_iter()
             .map(|attempt| {
-                let mut value = grant("bind-grpc-fragment");
+                let mut value = grant("bind-task-protocol");
                 value["attempt_id"] = json!(attempt);
                 value["target_process_receipt"] = json!(target.runner.process_receipt_path());
                 value
@@ -1117,7 +1170,7 @@ mod tests {
         assert!(
             !controls
                 .publish_nominated_binding(
-                    "grpc-fragment",
+                    "task-protocol",
                     &nominated,
                     target.process(),
                     execution(3)
@@ -1132,7 +1185,7 @@ mod tests {
                 assert!(
                     controls
                         .publish_nominated_binding(
-                            "grpc-fragment",
+                            "task-protocol",
                             &nominated,
                             target.process(),
                             foreign
@@ -1144,7 +1197,7 @@ mod tests {
             assert!(
                 controls
                     .publish_nominated_binding(
-                        "grpc-fragment",
+                        "task-protocol",
                         &nominated,
                         target.process(),
                         execution(attempt)
@@ -1153,7 +1206,7 @@ mod tests {
             );
             let path = attempt_binding_path(
                 &session.root,
-                "grpc-fragment",
+                "task-protocol",
                 2,
                 "statement-run",
                 Some(attempt),
@@ -1184,11 +1237,11 @@ mod tests {
                 .count(),
             2
         );
-        let mut first = grant("grpc-fragment");
+        let mut first = grant("task-protocol");
         first["attempt_id"] = json!(1);
-        let ambiguous = Session::new(vec![grant("grpc-fragment"), first], SessionRole::Be);
+        let ambiguous = Session::new(vec![grant("task-protocol"), first], SessionRole::Be);
         assert!(ambiguous.controls().is_err());
-        let mut invalid = grant("grpc-fragment");
+        let mut invalid = grant("task-protocol");
         invalid["attempt_id"] = json!(0);
         assert!(
             Session::new(vec![invalid], SessionRole::Be)
@@ -1199,11 +1252,14 @@ mod tests {
 
     #[test]
     fn closed_session_disables_an_already_bound_observer() {
-        let mut session = Session::new(vec![grant("grpc-fragment")], SessionRole::Be);
+        let mut session = Session::new(vec![grant("task-protocol")], SessionRole::Be);
         let controls = session.controls().unwrap();
-        session.bind("grpc-fragment", execution(1), session.process());
+        session.bind("task-protocol", execution(1), session.process());
         let sink = controls
-            .observation_for("grpc-fragment", execution(1))
+            .observation_for(
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                execution(1),
+            )
             .unwrap()
             .unwrap();
         session.close();

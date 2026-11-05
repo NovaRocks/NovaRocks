@@ -21,7 +21,7 @@
 use super::ReportSlot;
 use crate::{
     actor::Actor,
-    driver::{ActorFailureProof, ActorRegistration, ActorRuntime, DriverError},
+    actor_turn::{ActorFailureProof, ActorRegistration, ActorRuntime, ActorTurnError},
     sync::Arc,
     transaction::RuntimeError,
 };
@@ -55,11 +55,11 @@ impl ReportSlot {
         runtime: &ActorRuntime<A>,
         registration: &ActorRegistration,
         consumer: ConsumerId,
-    ) -> Result<ActorReportConsumer, DriverError> {
+    ) -> Result<ActorReportConsumer, ActorTurnError> {
         runtime.validate_registration(registration)?;
         let original_scope = registration.publication_scope();
         if !Arc::ptr_eq(&self.runtime.shared, &original_scope.runtime.shared) {
-            return Err(DriverError::PublicationTargetMismatch);
+            return Err(ActorTurnError::PublicationTargetMismatch);
         }
         let state = self
             .runtime
@@ -74,7 +74,7 @@ impl ReportSlot {
                 generation: registration.initial_epoch(),
             })
         {
-            return Err(DriverError::PublicationTargetMismatch);
+            return Err(ActorTurnError::PublicationTargetMismatch);
         }
         Ok(ActorReportConsumer {
             report: self.clone(),
@@ -92,7 +92,7 @@ impl ActorReportConsumer {
     }
     /// Only this original actor's fenced failure abandons its declared leg.
     /// The old execution Scope need not exist; no financial Scope is failed.
-    pub fn abandon(&self, proof: &ActorFailureProof) -> Result<(), DriverError> {
+    pub fn abandon(&self, proof: &ActorFailureProof) -> Result<(), ActorTurnError> {
         proof.validate_consumer(&self.registration, &self.report.runtime)?;
         let mut state = self
             .report

@@ -20,9 +20,9 @@
 // private diagnostic factory remains limited to the original failure probes;
 // it cannot fund successful computation.
 use super::*;
-use crate::runtime::fragment::ExecutionFailure;
-use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::ExecutionFailure;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::{ArrayRef, Int32Array, ListArray, StructArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::Field;

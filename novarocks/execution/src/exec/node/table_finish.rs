@@ -35,7 +35,7 @@ use std::sync::Arc;
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValidator;
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
-    AllowTableWriteAggregates, TableWriteAggregateGuard,
+    AllowTableWriteAggregates, TableWriteAggregateFaultHook,
 };
 
 /// Runtime validation authority for a single Task instance of TableFinish.
@@ -43,7 +43,7 @@ pub struct TableFinishRuntimeBinding {
     pub(crate) fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     pub(crate) logical_summary: Option<LogicalSummaryRuntimeBinding>,
     #[cfg(novarocks_dev_controls)]
-    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
 }
 
 /// Exact Native input custody, separate from the pure finish declaration.
@@ -69,7 +69,7 @@ impl TableFinishRuntimeBinding {
         mut self,
         receiver_node: i32,
         sources: Arc<[novarocks_execution_contract::ExchangeSource]>,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         let unique = sources
             .iter()
             .copied()
@@ -89,7 +89,7 @@ impl TableFinishRuntimeBinding {
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
     #[cfg(novarocks_dev_controls)]
-    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateFaultHook>) -> Self {
         self.aggregate_guard = guard;
         self
     }

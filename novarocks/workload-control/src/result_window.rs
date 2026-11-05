@@ -1012,7 +1012,7 @@ impl ResultWindowAlias {
     /// are returned unchanged instead of inventing a payload lease.
     pub fn into_internal_retention(
         self,
-    ) -> Result<novarocks_resource_contract::ExistingOwnerRetentionLease, Self> {
+    ) -> Result<novarocks_resource_contract::ExistingOwnerRetentionPin, Self> {
         match self.backing {
             AliasBacking::InternalRoot { payload, .. } => Ok(payload.into_retention()),
             backing => Err(Self { backing }),

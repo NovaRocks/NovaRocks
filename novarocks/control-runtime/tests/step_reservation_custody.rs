@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, FailureSourceState},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, FailureSourceState},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -57,7 +57,7 @@ impl Actor for Reserving {
         _: Tick,
         _: InputEnvelope,
         command: u8,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     ) {
         if command == 2 {
             panic!("controlled later owner failure");
@@ -99,7 +99,7 @@ impl Actor for Reserving {
         _: ScopeId,
         _: Generation,
         _: InputEnvelope,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     ) {
         step.effect(
             EffectDescriptor {
@@ -117,8 +117,8 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     runtime: ActorRuntime<Reserving>,
-    failure: WorkLease,
-    capacity: ReservationBundle,
+    failure: WorkObligation,
+    capacity: ReservationObligation,
 }
 impl Fixture {
     fn new() -> Self {
@@ -230,7 +230,7 @@ fn a_committed_guard_cannot_disappear_when_its_input_effect_completes() {
     );
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
-        Err(DriverError::UnknownReservation)
+        Err(ActorTurnError::UnknownReservation)
     ));
     let (mut work, mut capacity) = guard.bind(WorkKind::Business).unwrap();
     work.start().unwrap();
@@ -255,7 +255,7 @@ fn an_uncommitted_step_unwinds_its_original_unbound_guards() {
     assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 0);
     assert_eq!(
         f.runtime.step_reservations(actor(), input, None, 8),
-        Err(DriverError::UnknownInput),
+        Err(ActorTurnError::UnknownInput),
         "an uncommitted step never publishes a reservation batch",
     );
     f.complete_failure(input);
@@ -272,7 +272,7 @@ fn failure_teardown_uses_the_committed_guard_without_reading_the_failed_core() {
         .0;
     assert_eq!(
         f.runtime.retire_input(actor(), earlier),
-        Err(DriverError::EffectsRemain)
+        Err(ActorTurnError::EffectsRemain)
     );
     let failed = f.command(2);
     f.runtime
@@ -280,7 +280,7 @@ fn failure_teardown_uses_the_committed_guard_without_reading_the_failed_core() {
         .unwrap();
     assert_eq!(
         f.runtime.retire_input(actor(), earlier),
-        Err(DriverError::ReservationsRemain)
+        Err(ActorTurnError::ReservationsRemain)
     );
     assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 1);
     let guard = f

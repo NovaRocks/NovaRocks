@@ -46,13 +46,13 @@ async fn info(State(state): State<InfoState>) -> Json<serde_json::Value> {
 }
 
 /// FE owns this listener's readiness, drain, failure observation and actual exit.
-pub struct TrinoServerHandle {
+pub struct TrinoListener {
     bound: SocketAddr,
     registry: Arc<crate::registry::TrinoQueryRegistry>,
     shutdown: watch::Sender<bool>,
     join: Option<JoinHandle<io::Result<()>>>,
 }
-impl TrinoServerHandle {
+impl TrinoListener {
     pub async fn bind(
         settings: &TrinoListenerSettings,
         version: String,
@@ -143,7 +143,7 @@ impl TrinoServerHandle {
         }
     }
 }
-impl Drop for TrinoServerHandle {
+impl Drop for TrinoListener {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
     }
@@ -191,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn info_uses_real_lifecycle_and_host_guard_precedes_routes() {
         let admission = FrontendServingAdmission::new();
-        let mut listener = TrinoServerHandle::bind(
+        let mut listener = TrinoListener::bind(
             &TrinoListenerSettings {
                 port: 0,
                 ..Default::default()

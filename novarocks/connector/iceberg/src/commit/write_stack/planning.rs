@@ -44,9 +44,9 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
-    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
-    IcebergEqualityDeleteRecipe, IcebergFrozenRewriteBranchInput, IcebergSealedWriteTarget,
-    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
+    IcebergFrozenRewriteBranchInput, IcebergSealedWriteTarget, IcebergSessionFacts,
+    IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId,
     IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
@@ -332,7 +332,7 @@ pub struct IcebergBranchSessionPlanInput {
 pub fn plan_branch_session(
     session_id: IcebergWriteSessionId,
     input: IcebergBranchSessionPlanInput,
-) -> Result<(IcebergCommitHandle, Vec<IcebergWriteTargetPlan>), ConnectorError> {
+) -> Result<(IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>), ConnectorError> {
     if input.branches.is_empty() {
         return Err(invalid(format!(
             "Iceberg {} write session must seal at least one branch",
@@ -445,7 +445,7 @@ pub fn plan_branch_session(
         });
     }
 
-    let handle = IcebergCommitHandle::try_new_sealed(
+    let handle = IcebergWriteCommitSession::try_new_sealed(
         session_id,
         input.table,
         input.flavor,
@@ -475,7 +475,7 @@ pub fn plan_branch_session(
 pub fn plan_write_session(
     session_id: IcebergWriteSessionId,
     input: IcebergWriteSessionPlanInput,
-) -> Result<(IcebergCommitHandle, Vec<IcebergWriteTargetPlan>), ConnectorError> {
+) -> Result<(IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>), ConnectorError> {
     let mut branches = Vec::with_capacity(1 + input.deletes.len());
     branches.push(IcebergWriteBranchPlan::Data {
         plan: input.data,

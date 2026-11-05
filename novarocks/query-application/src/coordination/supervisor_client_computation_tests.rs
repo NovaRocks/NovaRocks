@@ -185,7 +185,7 @@ mod client_computation_tests {
             _: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
-            let contexts = schedule.contexts().to_vec();
+            let participations = schedule.participations().to_vec();
             let window = self.window.clone();
             let signals = Arc::clone(&self.signals);
             let scalar_schema = self.scalar_schema.clone();
@@ -237,7 +237,7 @@ mod client_computation_tests {
                 binding.port = Arc::new(EndPort { scalar_schema });
                 Ok(ActivatedNativeAttempt::relayed_rows(
                     Active {
-                        contexts,
+                        participations,
                         signals,
                         _control: control,
                         _native_tail_window: window,
@@ -262,7 +262,7 @@ mod client_computation_tests {
     }
     #[derive(Debug)]
     struct Active {
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
         signals: Arc<Signals>,
         _control: Arc<SealPort>,
         _native_tail_window: TestWindow,
@@ -278,7 +278,7 @@ mod client_computation_tests {
             Box::pin(async move {
                 let _frame = frame;
                 let mut admissions = SuccessfulCompletionActiveOwner {
-                    contexts: self.contexts.clone(),
+                    participations: self.participations.clone(),
                 };
                 assert!(matches!(
                     admissions.run(drive, cancellation).await,
@@ -299,7 +299,7 @@ mod client_computation_tests {
                 self.signals.release_cleanup.notified().await;
                 self.signals.cleanup_exited.store(true, Ordering::SeqCst);
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }

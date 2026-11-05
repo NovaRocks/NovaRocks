@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cluster::{ClusterMode, ServerHandle};
+use crate::cluster::{ClusterMode, TestClusterOwner};
 use crate::types::{QueryMeta, SqlStep};
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,6 @@ pub(crate) fn validate_mode(meta: &QueryMeta, mode: ClusterMode) -> Result<()> {
 #[derive(Debug, Default)]
 pub(crate) struct BeLogSnapshot {
     counts: HashMap<(usize, String), usize>,
-    log_lengths: Vec<usize>,
     evidence_deadline: Option<Instant>,
     original_work_deadline: Option<Instant>,
 }
@@ -57,9 +56,9 @@ impl BeLogSnapshot {
 #[cfg(test)]
 pub(crate) fn snapshot(
     meta: &QueryMeta,
-    server_handle: &dyn ServerHandle,
+    cluster_owner: &dyn TestClusterOwner,
 ) -> Result<BeLogSnapshot> {
-    snapshot_with_deadline(meta, server_handle, step_evidence_deadline(meta), None)
+    snapshot_with_deadline(meta, cluster_owner, step_evidence_deadline(meta), None)
 }
 
 #[cfg(test)]
@@ -72,7 +71,9 @@ pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
     // joining `is_query_lifecycle_step`: they need the shared deadline the
     // post-query worker runs against, but they must not be held to the
     // retired protocol's terminal facts.
-    (meta.restart_be_after_establish_context_index.is_some()
+    (meta
+        .restart_be_after_establish_participation_index
+        .is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || is_query_lifecycle_step(meta))
     .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
@@ -89,12 +90,12 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
     // evidence and asserts task-protocol evidence would otherwise be held to
     // terminal facts that no longer have producers, and would fail for a
     // reason unrelated to whether cancellation worked.
-    meta.query_control_fragment_backend_limit.is_some() || meta.query_lifecycle_fault.is_some()
+    meta.query_lifecycle_fault.is_some()
 }
 
 pub(crate) fn snapshot_with_deadline(
     meta: &QueryMeta,
-    server_handle: &dyn ServerHandle,
+    cluster_owner: &dyn TestClusterOwner,
     evidence_deadline: Option<Instant>,
     original_work_deadline: Option<Instant>,
 ) -> Result<BeLogSnapshot> {
@@ -105,7 +106,7 @@ pub(crate) fn snapshot_with_deadline(
             ..BeLogSnapshot::default()
         });
     }
-    let be_count = server_handle.be_count();
+    let be_count = cluster_owner.be_count();
     if be_count == 0 {
         bail!("BE log evidence directives require at least one runner-owned BE");
     }
@@ -125,14 +126,11 @@ pub(crate) fn snapshot_with_deadline(
         )
         .collect::<HashSet<_>>();
     let mut counts = HashMap::new();
-    let log_lengths = (0..be_count)
-        .map(|index| server_handle.be_log_contents(index).map(|log| log.len()))
-        .collect::<Result<Vec<_>>>()?;
     for pattern in patterns {
         for index in 0..be_count {
             counts.insert(
                 (index, pattern.clone()),
-                server_handle.be_log_count(index, pattern)?,
+                cluster_owner.be_log_count(index, pattern)?,
             );
         }
     }
@@ -143,13 +141,12 @@ pub(crate) fn snapshot_with_deadline(
     if let Some(fault) = meta.query_lifecycle_fault {
         let index = fault.be_index;
         let kind = fault.kind.as_str();
-        server_handle
+        cluster_owner
             .armed_query_lifecycle_fault_token(index, kind)?
             .with_context(|| format!("BE[{index}] has no armed {kind} token"))?;
     }
     Ok(BeLogSnapshot {
         counts,
-        log_lengths,
         evidence_deadline,
         original_work_deadline,
     })
@@ -157,7 +154,7 @@ pub(crate) fn snapshot_with_deadline(
 
 fn log_delta(
     snapshot: &BeLogSnapshot,
-    server_handle: &dyn ServerHandle,
+    cluster_owner: &dyn TestClusterOwner,
     index: usize,
     pattern: &str,
 ) -> Result<usize> {
@@ -166,7 +163,7 @@ fn log_delta(
         .get(&(index, pattern.to_string()))
         .copied()
         .unwrap_or(0);
-    let after = server_handle.be_log_count(index, pattern)?;
+    let after = cluster_owner.be_log_count(index, pattern)?;
     after.checked_sub(before).ok_or_else(|| {
         anyhow::anyhow!(
             "BE log {index} count for pattern {pattern:?} decreased from {before} to {after}"
@@ -179,165 +176,9 @@ enum LogEvidenceCheck {
     Pending(String),
 }
 
-fn lifecycle_log_deltas(
-    snapshot: &BeLogSnapshot,
-    server_handle: &dyn ServerHandle,
-    endpoint_count: usize,
-) -> Result<Vec<String>> {
-    (0..endpoint_count)
-        .map(|index| {
-            let log = server_handle.be_log_contents(index)?;
-            let before = snapshot.log_lengths.get(index).copied().unwrap_or(0);
-            if log.len() < before {
-                bail!(
-                    "BE[{index}] lifecycle log length decreased from {before} to {}",
-                    log.len()
-                );
-            }
-            Ok(log[before..].to_string())
-        })
-        .collect()
-}
-
-fn execution_field(line: &str, marker: &str) -> Result<Option<String>> {
-    let Some(payload) = marker_payload(line, marker) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        marker_fields(payload, marker)?
-            .get("execution_id")
-            .with_context(|| format!("{marker} is missing execution_id"))?
-            .to_string(),
-    ))
-}
-
-fn distinct_backends_for_execution(
-    logs: &[String],
-    marker: &str,
-    execution_id: &str,
-) -> Result<HashSet<usize>> {
-    let mut result = HashSet::new();
-    for (index, log) in logs.iter().enumerate() {
-        for line in log.lines() {
-            if execution_field(line, marker)?.as_deref() == Some(execution_id) {
-                result.insert(index);
-            }
-        }
-    }
-    Ok(result)
-}
-
-fn lifecycle_evidence(
-    step: &SqlStep,
-    server_handle: &dyn ServerHandle,
-    snapshot: &BeLogSnapshot,
-    endpoint_count: usize,
-) -> Result<Option<LogEvidenceCheck>> {
-    if !is_query_lifecycle_step(&step.meta) {
-        return Ok(None);
-    }
-    // T4 deliberately creates the arm/bind/token contract before T5/T7/T9
-    // add owner markers and structured snapshot producers. Do not turn this
-    // temporary absence into a log-text assertion; T10 consumes the typed
-    // structured assertion contract instead.
-    if step.meta.query_lifecycle_fault.is_some() {
-        return Ok(None);
-    }
-    // The fragment backend limit is the only remaining lifecycle step that
-    // owns log-derived evidence.
-    let Some(limit) = step.meta.query_control_fragment_backend_limit else {
-        return Ok(None);
-    };
-    if endpoint_count != 3 {
-        bail!("query lifecycle evidence requires exactly 3 BEs, found {endpoint_count}");
-    }
-    let logs = lifecycle_log_deltas(snapshot, server_handle, endpoint_count)?;
-
-    if limit > endpoint_count {
-        bail!(
-            "query-control fragment backend limit {limit} exceeds available BE count {endpoint_count}"
-        );
-    }
-    let marker = "NOVAROCKS_QUERY_CONTROL_READY";
-    let mut by_execution = BTreeMap::<String, Vec<(usize, usize)>>::new();
-    for (index, log) in logs.iter().enumerate() {
-        for line in log.lines() {
-            let Some(execution) = execution_field(line, marker)? else {
-                continue;
-            };
-            let fields = marker_fields(marker_payload(line, marker).unwrap(), marker)?;
-            let expected = fields
-                .get("expected_fragments")
-                .context("ControlReady missing expected_fragments")?
-                .parse::<usize>()?;
-            by_execution
-                .entry(execution)
-                .or_default()
-                .push((index, expected));
-        }
-    }
-    for (execution, participants) in by_execution {
-        let participant_bes = participants
-            .iter()
-            .map(|(be, _)| *be)
-            .collect::<HashSet<_>>();
-        if participant_bes.len() != 3 {
-            continue;
-        }
-        let services = participants
-            .iter()
-            .filter_map(|(be, expected)| (*expected == 0).then_some(*be))
-            .collect::<HashSet<_>>();
-        let executors = distinct_backends_for_execution(
-            &logs,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
-            &execution,
-        )?;
-        let expected_service_only = endpoint_count.saturating_sub(limit);
-        if services.len() == expected_service_only
-            && executors.len() == limit
-            && services.is_disjoint(&executors)
-        {
-            let kind = if expected_service_only == 0 {
-                "all-executors"
-            } else {
-                "service-only"
-            };
-            return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
-                "    query_lifecycle_evidence PASS kind={kind} execution_id={execution} participants={endpoint_count} executors={limit} service_only={expected_service_only}",
-            )])));
-        }
-    }
-    Ok(Some(LogEvidenceCheck::Pending(format!(
-        "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
-        endpoint_count.saturating_sub(limit)
-    ))))
-}
-
-fn marker_payload<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-    line.find(marker)
-        .map(|position| &line[position + marker.len()..])
-}
-
-fn marker_fields<'a>(payload: &'a str, marker: &str) -> Result<HashMap<&'a str, &'a str>> {
-    let mut fields = HashMap::new();
-    for field in payload.split_whitespace() {
-        let (key, value) = field
-            .split_once('=')
-            .with_context(|| format!("malformed {marker} field {field:?}"))?;
-        if key.is_empty() || value.is_empty() {
-            bail!("malformed {marker} field {field:?}");
-        }
-        if fields.insert(key, value).is_some() {
-            bail!("duplicate {marker} field {key:?}");
-        }
-    }
-    Ok(fields)
-}
-
 fn evaluate_log_evidence(
     step: &SqlStep,
-    server_handle: &dyn ServerHandle,
+    cluster_owner: &dyn TestClusterOwner,
     snapshot: &BeLogSnapshot,
     endpoint_count: usize,
 ) -> Result<LogEvidenceCheck> {
@@ -348,7 +189,7 @@ fn evaluate_log_evidence(
         let mut total = 0usize;
         for index in 0..endpoint_count {
             total = total
-                .checked_add(log_delta(snapshot, server_handle, index, pattern)?)
+                .checked_add(log_delta(snapshot, cluster_owner, index, pattern)?)
                 .context("BE log occurrence count overflow")?;
         }
         if total == 0 {
@@ -362,7 +203,7 @@ fn evaluate_log_evidence(
         let mut total = 0usize;
         for index in 0..endpoint_count {
             total = total
-                .checked_add(log_delta(snapshot, server_handle, index, pattern)?)
+                .checked_add(log_delta(snapshot, cluster_owner, index, pattern)?)
                 .context("BE log occurrence count overflow")?;
         }
         if total != 0 {
@@ -377,7 +218,7 @@ fn evaluate_log_evidence(
         let mut total = 0usize;
         for index in 0..endpoint_count {
             total = total
-                .checked_add(log_delta(snapshot, server_handle, index, pattern)?)
+                .checked_add(log_delta(snapshot, cluster_owner, index, pattern)?)
                 .context("BE log occurrence count overflow")?;
         }
         if total < *required {
@@ -394,7 +235,7 @@ fn evaluate_log_evidence(
     for (pattern, required) in &step.meta.be_log_be_count_at_least {
         let mut actual = 0usize;
         for index in 0..endpoint_count {
-            if log_delta(snapshot, server_handle, index, pattern)? > 0 {
+            if log_delta(snapshot, cluster_owner, index, pattern)? > 0 {
                 actual += 1;
             }
         }
@@ -409,15 +250,6 @@ fn evaluate_log_evidence(
         }
     }
 
-    if let Some(check) = lifecycle_evidence(step, server_handle, snapshot, endpoint_count)? {
-        match check {
-            LogEvidenceCheck::Satisfied(lifecycle_successes) => {
-                successes.extend(lifecycle_successes)
-            }
-            LogEvidenceCheck::Pending(reason) => pending.push(reason),
-        }
-    }
-
     if pending.is_empty() {
         Ok(LogEvidenceCheck::Satisfied(successes))
     } else {
@@ -427,7 +259,7 @@ fn evaluate_log_evidence(
 
 pub(crate) fn run(
     step: &SqlStep,
-    server_handle: &dyn ServerHandle,
+    cluster_owner: &dyn TestClusterOwner,
     snapshot: &BeLogSnapshot,
     log: &mut String,
 ) -> Result<()> {
@@ -435,7 +267,7 @@ pub(crate) fn run(
         return Ok(());
     }
     if step.meta.has_be_log_directives() {
-        let be_count = server_handle.be_count();
+        let be_count = cluster_owner.be_count();
         if be_count == 0 {
             bail!("BE log evidence directives require at least one runner-owned BE");
         }
@@ -453,7 +285,7 @@ pub(crate) fn run(
         loop {
             if Instant::now() >= deadline {
                 let elapsed = started.elapsed();
-                let fe_tail = server_handle
+                let fe_tail = cluster_owner
                     .fe_log_contents()
                     .map(|contents| {
                         contents
@@ -469,7 +301,7 @@ pub(crate) fn run(
                     .unwrap_or_else(|error| format!("<read failed: {error:#}>"));
                 let be_tails = (0..be_count)
                     .map(|index| {
-                        server_handle
+                        cluster_owner
                             .be_log_contents(index)
                             .map(|contents| {
                                 contents
@@ -491,7 +323,7 @@ pub(crate) fn run(
                     LOG_EVIDENCE_POLL_INTERVAL.as_millis(),
                 );
             }
-            match evaluate_log_evidence(step, server_handle, snapshot, be_count)? {
+            match evaluate_log_evidence(step, cluster_owner, snapshot, be_count)? {
                 LogEvidenceCheck::Satisfied(successes) => {
                     for success in successes {
                         let _ = writeln!(log, "{success}");
@@ -532,7 +364,7 @@ mod tests {
         }
     }
 
-    impl ServerHandle for FakeBeLogHandle {
+    impl TestClusterOwner for FakeBeLogHandle {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -578,7 +410,9 @@ mod tests {
     #[test]
     fn native_cross_process_mode_allows_be_log_evidence() {
         let meta = QueryMeta {
-            be_log_contains: vec!["NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK".to_string()],
+            be_log_contains: vec![
+                novarocks_failpoint::observation_marker::TASK_CREATE_ACK_DROPPED.to_string(),
+            ],
             ..QueryMeta::default()
         };
 
@@ -616,9 +450,18 @@ mod tests {
 
     #[test]
     fn negative_log_directive_is_scoped_to_post_step_delta() {
-        let handle = FakeBeLogHandle::new(vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED old\n", "", ""]);
+        let handle = FakeBeLogHandle::new(vec![
+            &format!(
+                "{} old\n",
+                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
+            ),
+            "",
+            "",
+        ]);
         let step = step(QueryMeta {
-            be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
+            be_log_not_contains: vec![
+                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED.to_string(),
+            ],
             ..QueryMeta::default()
         });
         let mut log = String::new();
@@ -627,21 +470,30 @@ mod tests {
         run(&step, &handle, &before, &mut log)
             .expect("pre-step markers must not fail a step-scoped assertion");
 
-        assert!(
-            log.contains("@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\"")
-        );
+        assert!(log.contains(&format!(
+            "@be_log_not_contains PASS pattern={:?}",
+            novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
+        )));
     }
 
     #[test]
     fn negative_log_directive_rejects_post_step_marker() {
         let handle = FakeBeLogHandle::new(vec!["", "", ""]);
         let step = step(QueryMeta {
-            be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
+            be_log_not_contains: vec![
+                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED.to_string(),
+            ],
             ..QueryMeta::default()
         });
         let mut log = String::new();
         let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
-        handle.append_log(1, "NOVAROCKS_CONNECTOR_WRITER_OPENED new\n");
+        handle.append_log(
+            1,
+            &format!(
+                "{} new\n",
+                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
+            ),
+        );
 
         let error = run(&step, &handle, &before, &mut log)
             .expect_err("post-step marker must fail the negative assertion");
@@ -657,7 +509,7 @@ mod tests {
     fn post_query_process_fault_starts_the_shared_evidence_deadline_before_execution() {
         let handle = FakeBeLogHandle::new(vec!["", "", ""]);
         let meta = QueryMeta {
-            restart_be_after_establish_context_index: Some(1),
+            restart_be_after_establish_participation_index: Some(1),
             ..QueryMeta::default()
         };
 
@@ -804,24 +656,17 @@ mod tests {
 
     #[test]
     fn every_query_lifecycle_hook_receives_one_shared_deadline() {
-        for meta in [
-            QueryMeta {
-                query_control_fragment_backend_limit: Some(1),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
-                    kind: crate::types::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
-                    be_index: 0,
-                }),
-                ..QueryMeta::default()
-            },
-        ] {
-            assert!(
-                query_lifecycle_step_deadline(&meta).is_some(),
-                "lifecycle hook did not receive the shared deadline: {meta:?}"
-            );
-        }
+        let meta = QueryMeta {
+            query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
+                kind: crate::types::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+                be_index: 0,
+            }),
+            ..QueryMeta::default()
+        };
+        assert!(
+            query_lifecycle_step_deadline(&meta).is_some(),
+            "lifecycle hook did not receive the shared deadline: {meta:?}"
+        );
     }
 
     #[test]
@@ -837,54 +682,5 @@ mod tests {
             .expect_err("stale marker must not satisfy post-step evidence");
 
         assert!(error.to_string().contains("no BE log contains pattern"));
-    }
-
-    #[test]
-    fn service_only_evidence_correlates_one_execution_and_exact_backend_roles() {
-        let execution = "10:20:1";
-        let be0 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=1:1\n"
-        );
-        let be1 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=1:2\n"
-        );
-        let be2 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe expected_fragments=0\n"
-        );
-        let handle = FakeBeLogHandle::new(vec![&be0, &be1, &be2]);
-        let step = step(QueryMeta {
-            query_control_fragment_backend_limit: Some(2),
-            ..QueryMeta::default()
-        });
-        let snapshot = BeLogSnapshot::default();
-
-        let check = lifecycle_evidence(&step, &handle, &snapshot, 3)
-            .expect("evaluate evidence")
-            .expect("lifecycle check");
-
-        assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
-    }
-
-    #[test]
-    fn all_executor_evidence_accepts_each_backend_receiving_a_fragment() {
-        let execution = "10:20:1";
-        let logs = (0..3)
-            .map(|backend| {
-                format!(
-                    "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{backend} expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{backend} finst_id=1:{backend}\n"
-                )
-            })
-            .collect::<Vec<_>>();
-        let handle = FakeBeLogHandle::new(logs.iter().map(String::as_str).collect());
-        let step = step(QueryMeta {
-            query_control_fragment_backend_limit: Some(3),
-            ..QueryMeta::default()
-        });
-
-        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
-            .expect("evaluate evidence")
-            .expect("lifecycle check");
-
-        assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
     }
 }

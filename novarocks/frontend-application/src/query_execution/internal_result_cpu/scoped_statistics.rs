@@ -219,7 +219,7 @@ impl StatisticsPlanCpuJob {
 }
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorStatisticsLease, StatisticsCpuInput,
+    ConnectorError, ConnectorErrorKind, ConnectorStatisticsSession, StatisticsCpuInput,
     StatisticsCpuPort,
 };
 use std::{
@@ -337,7 +337,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorStatisticsLease,
+        lease: &ConnectorStatisticsSession,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -362,7 +362,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorStatisticsLease,
+        lease: &ConnectorStatisticsSession,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -390,7 +390,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorStatisticsLease,
+        lease: &ConnectorStatisticsSession,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -422,8 +422,8 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorStatisticsLease,
-        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        lease: &ConnectorStatisticsSession,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,

@@ -31,7 +31,7 @@ use std::time::Instant;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorProviderBindingKey;
-use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+use novarocks_spi::connector::read_stack::ConnectorReadRegistrationPin;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorCanonicalReadPoint, ConnectorError, ConnectorErrorKind,
     ConnectorExactSemanticRevision, ConnectorInstanceDescriptor, ConnectorInstanceId,
@@ -84,15 +84,12 @@ use novarocks_spi::connector::{
 /// control binding's `into_parts` boundary, so the exact registry slot lives
 /// for precisely as long as this generation's control capabilities do.
 struct GenerationOwner {
-    registration_lease: OnceLock<Arc<dyn ConnectorReadRegistrationLease>>,
+    registration_pin: OnceLock<Arc<dyn ConnectorReadRegistrationPin>>,
 }
 
 impl GenerationOwner {
-    fn install(
-        &self,
-        lease: Arc<dyn ConnectorReadRegistrationLease>,
-    ) -> Result<(), ConnectorError> {
-        self.registration_lease.set(lease).map_err(|_| {
+    fn install(&self, lease: Arc<dyn ConnectorReadRegistrationPin>) -> Result<(), ConnectorError> {
+        self.registration_pin.set(lease).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
                 "Iceberg generation read registration lease was installed twice",
@@ -127,7 +124,7 @@ impl IcebergMetadata {
             incarnation,
             runtime,
             generation_owner: Arc::new(GenerationOwner {
-                registration_lease: OnceLock::new(),
+                registration_pin: OnceLock::new(),
             }),
         }
     }
@@ -150,7 +147,7 @@ impl IcebergMetadata {
     /// and have no authority to renew or retire it.
     pub(crate) fn install_read_registration_lease(
         &self,
-        lease: Arc<dyn ConnectorReadRegistrationLease>,
+        lease: Arc<dyn ConnectorReadRegistrationPin>,
     ) -> Result<(), ConnectorError> {
         self.generation_owner.install(lease)
     }
@@ -2744,7 +2741,7 @@ mod plan_splits_pruning_tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
         ConnectorSplitPlanningMetrics,
@@ -2807,7 +2804,7 @@ mod plan_splits_pruning_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(

@@ -253,7 +253,7 @@ static PREPARATION_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| Existin
 });
 static PROJECTED_SOURCE_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| ExistingEvaluator {
     mode: Mode::Fail(SqlConstantEvaluationError::from_domain(
-        novarocks_execution::runtime::fragment::ExecutionFailure::from(
+        novarocks_execution::runtime::task::ExecutionFailure::from(
             novarocks_functions::KernelFailure::ResourceExhausted,
         ),
     )),
@@ -595,7 +595,7 @@ fn sql_fold_dependency_projected_source_keeps_identity_and_does_not_mint_control
     assert_eq!(source.failure_fact().class(), FailureClass::Resource);
     assert!(
         source
-            .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+            .downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
             .is_some()
     );
     let receipts = observer.receipts.lock().unwrap();

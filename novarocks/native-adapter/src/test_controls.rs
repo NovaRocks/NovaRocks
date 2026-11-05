@@ -17,7 +17,7 @@
 
 //! Finite Native fault grants owned by one actual role launch.
 
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskIdentity};
 use novarocks_failpoint::scope::{ActionClaim, ControlCancellation, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{
     RoleProcessReceipt, StatementExecutionBinding, StatementInputNomination, StatementTaskBinding,
@@ -274,7 +274,7 @@ pub struct NativeTestControls {
     >,
     restart: Mutex<
         HashMap<
-            novarocks_execution_contract::task_execution::identity::QueryContextRef,
+            novarocks_execution_contract::task_execution::identity::ParticipationRef,
             NativeFaultClaim,
         >,
     >,
@@ -290,7 +290,7 @@ impl NativeTestControls {
         let mut selected = None;
         for grant in self.faults.iter().filter(|grant| {
             grant.bind
-                && grant.kind == QueryLifecycleFaultKind::RestartAfterEstablishContext
+                && grant.kind == QueryLifecycleFaultKind::RestartAfterEstablishParticipation
                 && grant.statement_run_token == nomination.statement_run_token
                 && grant.handle.cancellation().is_active()
         }) {
@@ -380,7 +380,7 @@ impl NativeTestControls {
                     | "registry-hold"
                     | "preparation-hold"
                     | "prepared-failure-exit-hold"
-                    | "context-owner-panic-on-renew"
+                    | "participation-owner-panic-on-renew"
             ) {
                 let preparation =
                     matches!(action, "preparation-hold" | "prepared-failure-exit-hold");
@@ -406,7 +406,7 @@ impl NativeTestControls {
                         "frontend_process_id",
                     ]
                 };
-                if action == "context-owner-panic-on-renew" {
+                if action == "participation-owner-panic-on-renew" {
                     keys.push("trigger_operation");
                 }
                 if parameters.len() != keys.len()
@@ -468,17 +468,17 @@ impl NativeTestControls {
                 } else {
                     None
                 };
-                let trigger_operation = if action == "context-owner-panic-on-renew" {
+                let trigger_operation = if action == "participation-owner-panic-on-renew" {
                     let values = parameters["trigger_operation"]
                         .as_array()
                         .filter(|values| values.len() == 16)
-                        .ok_or("declared Context trigger operation has invalid width")?;
+                        .ok_or("declared Participation trigger operation has invalid width")?;
                     let mut bytes = [0u8; 16];
                     for (out, value) in bytes.iter_mut().zip(values) {
                         *out = value
                             .as_u64()
                             .and_then(|value| u8::try_from(value).ok())
-                            .ok_or("declared Context trigger operation has invalid bytes")?;
+                            .ok_or("declared Participation trigger operation has invalid bytes")?;
                     }
                     Some(
                         novarocks_execution_contract::TaskOperationId::try_from_bytes(bytes)
@@ -1329,30 +1329,30 @@ impl NativeTestControls {
         };
         self.claim(kind, execution, process, false)
     }
-    pub fn claim_context_hold(
+    pub fn claim_participation_hold(
         &self,
         action: &str,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         requested_token: Option<&str>,
     ) -> Result<Option<NativeHoldClaim>, String> {
-        self.claim_context_selected(action, context, requested_token, None)
+        self.claim_participation_selected(action, participation, requested_token, None)
     }
-    pub(crate) fn claim_context_owner_panic(
+    pub(crate) fn claim_participation_owner_panic(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation: novarocks_execution_contract::TaskOperationId,
     ) -> Result<Option<NativeHoldClaim>, String> {
-        self.claim_context_selected(
-            "context-owner-panic-on-renew",
-            context,
+        self.claim_participation_selected(
+            "participation-owner-panic-on-renew",
+            participation,
             None,
             Some(operation),
         )
     }
-    fn claim_context_selected(
+    fn claim_participation_selected(
         &self,
         action: &str,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         requested_token: Option<&str>,
         operation: Option<novarocks_execution_contract::TaskOperationId>,
     ) -> Result<Option<NativeHoldClaim>, String> {
@@ -1363,25 +1363,25 @@ impl NativeTestControls {
         for (index, grant) in self.holds.iter().enumerate() {
             if held_once.contains(&index)
                 || grant.action != action
-                || grant.execution != context.query_execution_id()
-                || grant.frontend != Some(context.frontend_process_id())
+                || grant.execution != participation.query_execution_id()
+                || grant.frontend != Some(participation.frontend_process_id())
                 || grant.trigger_operation != operation
                 || requested_token.is_some_and(|token| token != grant.token)
                 || grant.handle.cancellation().process()
-                    != ProcessBinding::Backend(context.backend_process_id())
+                    != ProcessBinding::Backend(participation.backend_process_id())
                 || !grant.handle.cancellation().is_active()
             {
                 continue;
             }
             let permission = grant
                 .handle
-                .claim_once(ProcessBinding::Backend(context.backend_process_id()))
+                .claim_once(ProcessBinding::Backend(participation.backend_process_id()))
                 .map_err(|error| error.to_string())?;
             held_once.insert(index);
             return Ok(Some(NativeHoldClaim {
                 token: grant.token.clone(),
                 backend_index: grant.backend_index,
-                process_id: context.backend_process_id(),
+                process_id: participation.backend_process_id(),
                 permission,
             }));
         }
@@ -1435,33 +1435,33 @@ impl NativeTestControls {
     }
     pub(crate) fn arm_restart(
         &self,
-        context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
+        participation: novarocks_execution_contract::task_execution::identity::ParticipationRef,
         claim: NativeFaultClaim,
     ) {
         self.restart
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(context, claim);
+            .insert(participation, claim);
     }
     pub(crate) fn restart_claim(
         &self,
-        context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
+        participation: novarocks_execution_contract::task_execution::identity::ParticipationRef,
     ) -> Option<NativeFaultClaim> {
         self.restart
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(&context)
+            .get(&participation)
             .filter(|claim| claim.cancellation().is_active())
             .cloned()
     }
     pub(crate) fn disarm_restart(
         &self,
-        context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
+        participation: novarocks_execution_contract::task_execution::identity::ParticipationRef,
     ) {
         self.restart
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(&context);
+            .remove(&participation);
     }
 }
 
@@ -1754,8 +1754,8 @@ pub(crate) mod tests {
             let _ = self.role.close_and_join();
         }
     }
-    pub(crate) fn context(fixture: &Controlled) -> QueryContextRef {
-        QueryContextRef::new(fixture.execution, fixture.frontend, fixture.process)
+    pub(crate) fn participation(fixture: &Controlled) -> ParticipationRef {
+        ParticipationRef::new(fixture.execution, fixture.frontend, fixture.process)
     }
     pub(crate) fn task(fixture: &Controlled, task: u32) -> TaskIdentity {
         TaskIdentity::new(
@@ -2063,7 +2063,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn retired_frozen_nomination_cannot_publish_prefer_or_spend_bind_permission() {
-        let kind = QueryLifecycleFaultKind::RestartAfterEstablishContext;
+        let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
         let fixture = controlled(kind.as_str());
         let declaration = SessionDeclaration {
             schema_version: 1,
@@ -3441,7 +3441,7 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .controls
-                .claim_context_hold("registry-hold", context(&fixture), None)
+                .claim_participation_hold("registry-hold", participation(&fixture), None)
                 .unwrap()
                 .is_none()
         );
@@ -3472,7 +3472,7 @@ pub(crate) mod tests {
             domain_grants: vec![DomainGrant {
                 domain: "native".into(),
                 grant_id: "restart-placement".into(),
-                parameters: serde_json::json!({"action":"bind-restart-after-establish-context", "root":directory.path(), "backend_index":23, "statement_run_token":"selected-work", "target_session_id":"selected-be", "target_process_receipt":receipt}),
+                parameters: serde_json::json!({"action":"bind-restart-after-establish-participation", "root":directory.path(), "backend_index":23, "statement_run_token":"selected-work", "target_session_id":"selected-be", "target_process_receipt":receipt}),
             }],
         };
         let path = directory.path().join("placement.json");
@@ -3566,7 +3566,7 @@ pub(crate) mod tests {
             domain_grants: [
                 ("bind-create-task-ack-drop", "original-input"),
                 ("bind-lease-renewal-ack-drop", "original-input"),
-                ("bind-restart-after-establish-context", "fresh-input"),
+                ("bind-restart-after-establish-participation", "fresh-input"),
             ].into_iter().enumerate().map(|(index, (action, token))| DomainGrant {
                 domain: "native".into(),
                 grant_id: format!("input-{index}"),

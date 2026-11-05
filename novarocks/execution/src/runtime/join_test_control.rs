@@ -17,7 +17,7 @@
 
 //! Explicit, development-only action loan from the Native Task host.
 //! Observation cannot install this capability or release a publication.
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 pub trait JoinBuildPublicationControl: Send + Sync {
     /// Called only at the existing sole data-publication point, outside its lock.

@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -62,7 +62,7 @@ impl Actor for TestActor {
     fn timer_input(_: Tick) {
         unreachable!("fixture has no deadline")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {}
+    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
     fn next_deadline(&self) -> Option<Tick> {
         // Controlled test scheduling between the real driver preflight and
         // its same-ledger attachment revalidation. No host callback is run.
@@ -76,7 +76,7 @@ impl Actor for TestActor {
         }
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!("fixture does not run a failing Core")
     }
 }
@@ -84,8 +84,8 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     runtime: ActorRuntime<TestActor>,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     body_exited: bool,
     captures_exited: bool,
 }
@@ -162,7 +162,7 @@ fn admitted_supervisor_attaches_after_external_close_while_ordinary_registration
         f.runtime
             .register_next(actor(), f.scope.clone(), TestActor::default(), config()),
         Err((
-            DriverError::Runtime(RuntimeError::Scope(ScopeError::Closed)),
+            ActorTurnError::Runtime(RuntimeError::Scope(ScopeError::Closed)),
             _
         ))
     ));
@@ -286,7 +286,7 @@ fn admitted_attachments_grow_without_leaving_failed_scheduler_registration_slots
             config(),
             &f.work
         ),
-        Err((DriverError::Scheduler(SchedulerError::DuplicateActor), _))
+        Err((ActorTurnError::Scheduler(SchedulerError::DuplicateActor), _))
     ));
     assert_eq!(f.scope.snapshot().unwrap(), before_duplicate);
     f.finish(&[actor(), second]);
@@ -301,7 +301,7 @@ fn admitted_attachments_grow_without_leaving_failed_scheduler_registration_slots
             config(),
             &f.work
         ),
-        Err((DriverError::Closed, _))
+        Err((ActorTurnError::Closed, _))
     ));
     assert_eq!(f.scope.snapshot().unwrap().storage, 0);
     f.finish(&[]);
@@ -337,7 +337,7 @@ fn scope_failure_between_driver_preflight_and_attachment_is_rechecked_atomically
     let refused = matches!(
         result,
         Err((
-            DriverError::Runtime(RuntimeError::Scope(ScopeError::Failed)),
+            ActorTurnError::Runtime(RuntimeError::Scope(ScopeError::Failed)),
             _
         ))
     );
@@ -365,7 +365,7 @@ fn foreign_supervisor_cannot_authorize_attachment_in_another_ledger() {
             config(),
             &b.work
         ),
-        Err((DriverError::PublicationTargetMismatch, _))
+        Err((ActorTurnError::PublicationTargetMismatch, _))
     ));
     assert_eq!(a.scope.snapshot().unwrap().storage, 0);
     assert_eq!(b.scope.snapshot().unwrap().storage, 0);

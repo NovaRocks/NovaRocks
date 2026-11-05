@@ -100,13 +100,13 @@ pub enum TaskDomainKind {
     CloseExchangeDestination,
 }
 
-/// Query-context domains, advanced only by `UpdateQueryContext`.
+/// Query-context domains, advanced only by `UpdateParticipation`.
 ///
 /// These are shared by every task of one query on one backend, so they never
 /// borrow a task as a carrier: a terminal or unknown-outcome task can no
 /// longer drag a healthy shared fact down with it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum QueryContextDomainKind {
+pub enum ParticipationDomainKind {
     CatalogBinding,
     SharedDynamicFilter,
     Credential,
@@ -591,9 +591,9 @@ impl SplitWatermark {
 
 /// Identity of a vended credential lease.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct CredentialLeaseId(u64);
+pub struct CredentialDomainId(u64);
 
-impl CredentialLeaseId {
+impl CredentialDomainId {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
@@ -603,7 +603,7 @@ impl CredentialLeaseId {
     }
 }
 
-impl fmt::Display for CredentialLeaseId {
+impl fmt::Display for CredentialDomainId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }

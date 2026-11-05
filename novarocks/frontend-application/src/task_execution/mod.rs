@@ -20,7 +20,7 @@
 //! Coordination Contract owns the facts actually shared with Query Application.
 //! This module owns Task-local classifications and the frontend runtime owners: the stage and task
 //! graph derived from the frozen static schedule, one `RemoteTask` per task,
-//! one `StageExecution` per stage, one `QueryContextOwner` per query context,
+//! one `StageExecution` per stage, one `ParticipationOwner` per query context,
 //! a bounded and fair per-backend dispatcher, and a status intake with a
 //! single serial runner.
 //!
@@ -40,9 +40,6 @@ pub(crate) mod clock;
 pub(crate) mod completion;
 pub(crate) mod completion_facts;
 pub(crate) mod conclusion;
-pub(crate) mod context_convergence;
-pub(crate) mod context_owner;
-pub(crate) mod context_state;
 pub(crate) mod creation;
 pub(crate) mod dispatch;
 pub(crate) mod domain_tracker;
@@ -54,6 +51,9 @@ pub(crate) mod intent;
 pub(crate) mod lease;
 pub(crate) mod manifest_round;
 pub(crate) mod operation;
+pub(crate) mod participation_convergence;
+pub(crate) mod participation_owner;
+pub(crate) mod participation_state;
 pub(crate) mod profile_diagnostics;
 pub(crate) mod protocol_facts;
 pub(crate) mod remote_task;

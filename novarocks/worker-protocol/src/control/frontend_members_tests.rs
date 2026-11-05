@@ -23,17 +23,17 @@ use super::{
 };
 use crate::{
     admission::AdmissionTicketConfig,
-    context::ContextEstablishmentDecision,
     control::EstablishSemanticFacts,
-    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestReplyTag},
     lease::MonotonicInstant,
+    participation::ParticipationEstablishmentDecision,
 };
 use novarocks_control_runtime_core::identity::{
     Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
 };
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, AdmissionTicketId, ContentFingerprint, CredentialEpoch,
-    CredentialLeaseId, LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState,
+    AcquireParticipationAdmissionTicket, AdmissionTicketId, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, LeaseValidFor, OperationOutcome, ParticipationRef, ParticipationState,
     TaskOperationId,
 };
 use novarocks_types::{
@@ -62,8 +62,8 @@ fn bytes(value: u64) -> [u8; 16] {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     bytes
 }
-fn context(frontend: u64, query: u64) -> QueryContextRef {
-    QueryContextRef::new(
+fn participation(frontend: u64, query: u64) -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(
             QueryId::new(
                 i64::try_from(7000 + query).unwrap(),
@@ -81,7 +81,7 @@ fn semantics() -> EstablishSemanticFacts {
         catalog: ContentFingerprint::from_bytes([1; 16]),
         shared_filter: ContentFingerprint::from_bytes([2; 16]),
         query_options: ContentFingerprint::from_bytes([3; 16]),
-        credential_lease: CredentialLeaseId::new(1),
+        credential_domain_id: CredentialDomainId::new(1),
         credential_epoch: CredentialEpoch::new(1).unwrap(),
         initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     }
@@ -122,10 +122,10 @@ impl Fixture {
             next: 1,
         }
     }
-    fn request(&mut self) -> RequestContext {
+    fn request(&mut self) -> RequestReplyTag {
         let id = self.next;
         self.next += 1;
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(id).unwrap()),
             token: InputId::new(id).unwrap(),
             operation: TaskOperationId::try_from_bytes(bytes(id)).unwrap(),
@@ -140,12 +140,12 @@ impl Fixture {
         assert!(step.charged_work() <= self.core.max_step_work());
         step
     }
-    fn acquire(&mut self, context: QueryContextRef) -> (AdmissionTicketId, ControlStep) {
+    fn acquire(&mut self, participation: ParticipationRef) -> (AdmissionTicketId, ControlStep) {
         let request = self.request();
         let ticket = AdmissionTicketId::try_from_bytes(bytes(request.token.get())).unwrap();
-        let body = AcquireQueryContextAdmissionTicket::new(
+        let body = AcquireParticipationAdmissionTicket::new(
             request.operation,
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
             NativeCompatibilityId::new([3; 32]),
             self.core.admission().capability(),
@@ -167,8 +167,8 @@ impl Fixture {
         assert_eq!(step.requests[0].request, request);
         (ticket, step)
     }
-    fn activate(&mut self, context: QueryContextRef) {
-        let (ticket, granted) = self.acquire(context);
+    fn activate(&mut self, participation: ParticipationRef) {
+        let (ticket, granted) = self.acquire(participation);
         assert!(matches!(
             &granted.requests[0].body,
             ControlReplyBody::Admission(Ok(receipt)) if receipt.ticket_id() == ticket
@@ -181,7 +181,7 @@ impl Fixture {
                 request,
                 ControlInput::Establish {
                     request: request.operation,
-                    context,
+                    participation,
                     ticket,
                     payload: PayloadId(request.token.get()),
                     semantics: semantics(),
@@ -191,20 +191,23 @@ impl Fixture {
             )
             .unwrap();
         assert!(step.effects.iter().any(|effect| matches!(
-            effect, ControlEffect::Materialize { context: original, .. } if *original == context
+            effect, ControlEffect::Materialize { participation: original, .. } if *original == participation
         )));
-        assert_eq!(self.core.route(context), QueryContextState::Establishing);
+        assert_eq!(
+            self.core.route(participation),
+            ParticipationState::Establishing
+        );
         let decided = self.event(ControlInput::EstablishmentDecided {
-            context,
-            decision: ContextEstablishmentDecision {
-                state: QueryContextState::Active,
+            participation,
+            decision: ParticipationEstablishmentDecision {
+                state: ParticipationState::Active,
                 outcome: Ok(OperationOutcome::Accepted),
-                acknowledgement: Some(crate::context::ContextAcknowledgement {
+                acknowledgement: Some(crate::participation::ParticipationAcknowledgement {
                     outcome: OperationOutcome::Accepted,
                     receipt: std::sync::Arc::new(
-                        novarocks_execution_contract::QueryContextReceipt::new(
-                            context,
-                            QueryContextState::Active,
+                        novarocks_execution_contract::ParticipationReceipt::new(
+                            participation,
+                            ParticipationState::Active,
                         )
                         .with_lease(
                             crate::lease::InstalledLease::install_initial(
@@ -222,13 +225,13 @@ impl Fixture {
         });
         assert_eq!(decided.requests.len(), 1);
         assert_eq!(decided.requests[0].request, request);
-        assert_eq!(self.core.route(context), QueryContextState::Active);
+        assert_eq!(self.core.route(participation), ParticipationState::Active);
     }
-    fn remove(&mut self, context: QueryContextRef) {
+    fn remove(&mut self, participation: ParticipationRef) {
         let close_epoch = Generation::new(3).unwrap();
         let retired = self.event(ControlInput::ExecutionRetired {
-            context,
-            retirement: crate::retention::ContextRetirementIdentity::Protocol { close_epoch },
+            participation,
+            retirement: crate::retention::ParticipationRetirementIdentity::Protocol { close_epoch },
         });
         assert_eq!(
             retired
@@ -239,39 +242,39 @@ impl Fixture {
             1
         );
         assert_eq!(
-            self.core.route(context),
-            QueryContextState::TerminalRetained
+            self.core.route(participation),
+            ParticipationState::TerminalRetained
         );
-        // The explicit fact models the original Context timer; Root does not
+        // The explicit fact models the original Participation timer; Root does not
         // manufacture H from a second TTL. No Native exit is claimed here.
         self.now += 120;
-        let due = self.event(ControlInput::ContextExpired {
-            context,
-            retirement: crate::retention::ContextRetirementIdentity::Protocol { close_epoch },
+        let due = self.event(ControlInput::ParticipationExpired {
+            participation,
+            retirement: crate::retention::ParticipationRetirementIdentity::Protocol { close_epoch },
         });
         assert!(due.effects.iter().any(|effect| matches!(
-            effect, ControlEffect::RemoveHost { context: original } if *original == context
+            effect, ControlEffect::RemoveHost { participation: original } if *original == participation
         )));
-        let removed = self.event(ControlInput::HostRemoved { context });
+        let removed = self.event(ControlInput::HostRemoved { participation });
         assert!(
             !removed
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, ControlEffect::RetireReservation(_)))
         );
-        assert_eq!(self.core.route(context), QueryContextState::Absent);
+        assert_eq!(self.core.route(participation), ParticipationState::Absent);
     }
 }
 
 #[test]
-fn sequential_frontend_churn_reclaims_actual_member_rows_after_context_expiry() {
+fn sequential_frontend_churn_reclaims_actual_member_rows_after_participation_expiry() {
     let mut f = Fixture::new();
     for query in 1..=64 {
-        let context = context(10 + query, query);
-        f.activate(context);
+        let participation = participation(10 + query, query);
+        f.activate(participation);
         assert_eq!(f.core.frontend_members.len(), 1);
         assert_eq!(f.core.directory.len(), 1);
-        f.remove(context);
+        f.remove(participation);
         assert!(f.core.frontend_members.is_empty());
         assert!(f.core.directory.is_empty());
         assert!(f.core.owners.is_empty());
@@ -283,8 +286,8 @@ fn sequential_frontend_churn_reclaims_actual_member_rows_after_context_expiry() 
 #[test]
 fn removing_one_member_preserves_its_live_sibling_and_last_removal_keeps_the_permanent_fence() {
     let mut f = Fixture::new();
-    let first = context(3, 1);
-    let second = context(3, 2);
+    let first = participation(3, 1);
+    let second = participation(3, 2);
     f.activate(first);
     f.activate(second);
     assert_eq!(f.core.frontend_members.len(), 1);
@@ -313,17 +316,17 @@ fn removing_one_member_preserves_its_live_sibling_and_last_removal_keeps_the_per
         effects
             .iter()
             .filter(|effect| matches!(effect,
-                ControlEffect::AbortContext { context, .. } if *context == second
+                ControlEffect::AbortParticipation { participation, .. } if *participation == second
             ))
             .count(),
         1
     );
-    assert_eq!(f.core.route(second), QueryContextState::Aborting);
+    assert_eq!(f.core.route(second), ParticipationState::Aborting);
     f.remove(second);
     assert!(f.core.frontend_members.is_empty());
     assert!(f.core.fenced.contains(&first.frontend_process_id()));
     let calls = f.capacity.calls;
-    let (_, refused) = f.acquire(context(3, 3));
+    let (_, refused) = f.acquire(participation(3, 3));
     assert!(matches!(
         &refused.requests[0].body,
         ControlReplyBody::Admission(Err(OperationOutcome::Gone))

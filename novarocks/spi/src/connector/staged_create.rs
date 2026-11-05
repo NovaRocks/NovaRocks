@@ -34,7 +34,7 @@ use super::{
     ConnectorDocumentManagementAdmission, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
     ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWriteLease,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWrite,
     ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MvExactPartitionField, MvExactPartitionTransform, ProviderBindingEpoch,
@@ -830,7 +830,7 @@ pub struct ConnectorStagedCreateNeededCommitted {
     pub finalization: ExternalMutationFinalization,
 }
 struct PublicationIdentity {
-    lease: ConnectorStagedCreateLease,
+    staged_session: ConnectorStagedCreateSession,
     operation: ConnectorStagedCreateOperationId,
     dispatch: ConnectorStagedCreateOperationId,
     digest: [u8; 32],
@@ -888,7 +888,7 @@ impl ConnectorStagedCreatePublicationObservation {
         receipt: &ConnectorStagedCreateReceipt,
     ) -> Result<(), ConnectorError> {
         let identity = self.identity()?;
-        identity.lease.validate_receipt(
+        identity.staged_session.validate_receipt(
             receipt,
             identity.dispatch,
             ConnectorStagedCreateReceiptPhase::Published,
@@ -1122,7 +1122,7 @@ impl ConnectorStagedCreatePublicationRecorder {
             .expect("installed original publication identity");
         let mut validation = match &raw {
             Ok(outcome) => identity
-                .lease
+                .staged_session
                 .validate_publish_outcome(identity.dispatch, outcome),
             Err(error) => Err(error.clone()),
         };
@@ -1164,9 +1164,9 @@ impl ConnectorStagedCreatePublicationRecorder {
             }
         }
         if before_dispatch && raw.is_err() {
-            identity.lease.record_after_dispatch(
+            identity.staged_session.record_after_dispatch(
                 identity.operation,
-                Some(LeaseOperationState::Unpublished {
+                Some(StagedCreateOperationState::Unpublished {
                     handle_digest: identity.digest,
                     bound_write: Some(identity.write),
                 }),
@@ -1174,25 +1174,25 @@ impl ConnectorStagedCreatePublicationRecorder {
         } else if validation.is_ok() {
             let state = match &raw {
                 Ok(ConnectorStagedCreatePublishOutcome::Applied { .. }) => {
-                    LeaseOperationState::Published
+                    StagedCreateOperationState::Published
                 }
                 Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. }) => {
-                    LeaseOperationState::PublicationUnknown {
+                    StagedCreateOperationState::PublicationUnknown {
                         evidence_digest: evidence.digest(),
                         handle_digest: identity.digest,
                         bound_write: identity.write,
                     }
                 }
-                _ => LeaseOperationState::Unpublished {
+                _ => StagedCreateOperationState::Unpublished {
                     handle_digest: identity.digest,
                     bound_write: Some(identity.write),
                 },
             };
             identity
-                .lease
+                .staged_session
                 .record_after_dispatch(identity.operation, Some(state));
         } else {
-            identity.lease.set_unknown_without_evidence(
+            identity.staged_session.set_unknown_without_evidence(
                 identity.operation,
                 Some(identity.digest),
                 Some(identity.write),
@@ -1641,14 +1641,14 @@ pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
 /// fully frozen provenance record and the provider must independently re-read
 /// both the target and sidecar before deleting one exact root.
 #[derive(Clone)]
-pub struct ConnectorUnanchoredCtasCleanupLease {
+pub struct ConnectorUnanchoredCtasCleanupSession {
     control_runtime_id: ConnectorControlRuntimeId,
     provider_binding_key: ConnectorProviderBindingKey,
     capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
-    _release: Arc<StagedCreateLeaseRelease>,
+    _release: Arc<StagedCreateReleaseGuard>,
 }
 
-impl ConnectorUnanchoredCtasCleanupLease {
+impl ConnectorUnanchoredCtasCleanupSession {
     pub async fn discover_unanchored_ctas_async(
         &self,
         warehouse_root: Arc<str>,
@@ -1765,7 +1765,7 @@ impl ConnectorUnanchoredCtasCleanupLease {
             control_runtime_id,
             provider_binding_key,
             capability,
-            _release: Arc::new(StagedCreateLeaseRelease {
+            _release: Arc::new(StagedCreateReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -1814,16 +1814,16 @@ impl ConnectorUnanchoredCtasCleanupLease {
 }
 
 #[derive(Clone)]
-pub struct ConnectorStagedCreateLease {
+pub struct ConnectorStagedCreateSession {
     control_runtime_id: ConnectorControlRuntimeId,
     provider_binding_key: ConnectorProviderBindingKey,
     capability: Arc<dyn ConnectorStagedCreate>,
-    operations: Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>,
-    _release: Arc<StagedCreateLeaseRelease>,
+    operations: Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, StagedCreateOperationState>>>,
+    _release: Arc<StagedCreateReleaseGuard>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LeaseOperationState {
+enum StagedCreateOperationState {
     Preparing,
     StageAppliedUnusable,
     Unpublished {
@@ -1863,11 +1863,11 @@ impl BoundWriteProof {
     }
 }
 
-struct StagedCreateLeaseRelease {
+struct StagedCreateReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorStagedCreateLease {
+impl ConnectorStagedCreateSession {
     /// The immutable generation owner already pinned by this exact lease.
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.provider_binding_key
@@ -1971,7 +1971,7 @@ impl ConnectorStagedCreateLease {
                     "staged-create operation ID is already reserved by this lease",
                 ));
             }
-            operations.insert(operation_id, LeaseOperationState::Preparing);
+            operations.insert(operation_id, StagedCreateOperationState::Preparing);
         }
         let original_outcome = {
             let mut original = self.capability.prepare_async(request);
@@ -2000,7 +2000,7 @@ impl ConnectorStagedCreateLease {
             Err(error) => {
                 self.record_after_dispatch(
                     operation_id,
-                    Some(LeaseOperationState::Unknown {
+                    Some(StagedCreateOperationState::Unknown {
                         handle_digest: None,
                         bound_write: None,
                     }),
@@ -2011,7 +2011,7 @@ impl ConnectorStagedCreateLease {
         if let Err(error) = self.validate_prepare_outcome(&retained_request, &outcome) {
             self.record_after_dispatch(
                 operation_id,
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: None,
                     bound_write: None,
                 }),
@@ -2020,16 +2020,16 @@ impl ConnectorStagedCreateLease {
         }
         let state = match &outcome {
             ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { .. } => {
-                Some(LeaseOperationState::StageAppliedUnusable)
+                Some(StagedCreateOperationState::StageAppliedUnusable)
             }
             ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } => {
-                Some(LeaseOperationState::Unpublished {
+                Some(StagedCreateOperationState::Unpublished {
                     handle_digest: handle.digest(),
                     bound_write: None,
                 })
             }
             ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. } => {
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: None,
                     bound_write: None,
                 })
@@ -2062,7 +2062,7 @@ impl ConnectorStagedCreateLease {
             }
         }
         let identity = PublicationIdentity {
-            lease: self.clone(),
+            staged_session: self.clone(),
             operation: request.handle.operation_id(),
             dispatch: request.operation_id,
             digest: request.handle.digest(),
@@ -2174,17 +2174,19 @@ impl ConnectorStagedCreateLease {
             return Err(error);
         }
         let state = match &outcome {
-            ConnectorStagedCreatePublishOutcome::Applied { .. } => LeaseOperationState::Published,
+            ConnectorStagedCreatePublishOutcome::Applied { .. } => {
+                StagedCreateOperationState::Published
+            }
             ConnectorStagedCreatePublishOutcome::NoOp { .. }
             | ConnectorStagedCreatePublishOutcome::Conflict { .. }
             | ConnectorStagedCreatePublishOutcome::KnownUncommitted { .. } => {
-                LeaseOperationState::Unpublished {
+                StagedCreateOperationState::Unpublished {
                     handle_digest,
                     bound_write: Some(bound_write),
                 }
             }
             ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
-                LeaseOperationState::PublicationUnknown {
+                StagedCreateOperationState::PublicationUnknown {
                     evidence_digest: evidence.digest(),
                     handle_digest,
                     bound_write,
@@ -2246,15 +2248,17 @@ impl ConnectorStagedCreateLease {
             return Err(error);
         }
         let state = match &outcome {
-            ConnectorStagedCreateAbortOutcome::Aborted { .. } => LeaseOperationState::Aborted,
+            ConnectorStagedCreateAbortOutcome::Aborted { .. } => {
+                StagedCreateOperationState::Aborted
+            }
             ConnectorStagedCreateAbortOutcome::KnownUncommitted { .. } => {
-                LeaseOperationState::Unpublished {
+                StagedCreateOperationState::Unpublished {
                     handle_digest,
                     bound_write,
                 }
             }
             ConnectorStagedCreateAbortOutcome::CommitUnknown { .. } => {
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(handle_digest),
                     bound_write,
                 }
@@ -2292,7 +2296,7 @@ impl ConnectorStagedCreateLease {
                 .lock()
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
             let prior = match operations.get(&operation_id) {
-                Some(LeaseOperationState::PublicationUnknown {
+                Some(StagedCreateOperationState::PublicationUnknown {
                     evidence_digest,
                     handle_digest,
                     bound_write,
@@ -2309,7 +2313,7 @@ impl ConnectorStagedCreateLease {
             // A concurrent caller must fail before entering the provider.
             operations.insert(
                 operation_id,
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(prior.0),
                     bound_write: Some(prior.1),
                 },
@@ -2346,7 +2350,7 @@ impl ConnectorStagedCreateLease {
                 // second adjudication after a transport failure.
                 self.record_after_dispatch(
                     operation_id,
-                    Some(LeaseOperationState::Unknown {
+                    Some(StagedCreateOperationState::Unknown {
                         handle_digest: Some(unresolved_handle_digest),
                         bound_write: Some(unresolved_bound_write),
                     }),
@@ -2361,7 +2365,7 @@ impl ConnectorStagedCreateLease {
                     dispatch_operation_id,
                     ConnectorStagedCreateReceiptPhase::Published,
                 )?;
-                LeaseOperationState::Published
+                StagedCreateOperationState::Published
             }
             ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                 evidence, ..
@@ -2371,7 +2375,7 @@ impl ConnectorStagedCreateLease {
                     dispatch_operation_id,
                     "staged-create-publish",
                 )?;
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(unresolved_handle_digest),
                     bound_write: Some(unresolved_bound_write),
                 }
@@ -2405,7 +2409,7 @@ impl ConnectorStagedCreateLease {
             provider_binding_key,
             capability,
             operations: Arc::new(Mutex::new(HashMap::new())),
-            _release: Arc::new(StagedCreateLeaseRelease {
+            _release: Arc::new(StagedCreateReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -2422,7 +2426,7 @@ impl ConnectorStagedCreateLease {
     /// Verifies that the retained staged-create effect lease and the BE
     /// writer fence came from one provider generation, without exposing that
     /// provider-generation key to FE effect orchestration.
-    pub fn matches_write_lease(&self, write_lease: &ConnectorWriteLease) -> bool {
+    pub fn matches_write_lease(&self, write_lease: &ConnectorWrite) -> bool {
         write_lease.matches_provider_binding_key(&self.provider_binding_key)
     }
 
@@ -2528,14 +2532,14 @@ impl ConnectorStagedCreateLease {
                     "staged-create operation ID is already reserved by this lease",
                 ));
             }
-            operations.insert(operation_id, LeaseOperationState::Preparing);
+            operations.insert(operation_id, StagedCreateOperationState::Preparing);
         }
         let outcome = match self.capability.prepare(request) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.record_after_dispatch(
                     operation_id,
-                    Some(LeaseOperationState::Unknown {
+                    Some(StagedCreateOperationState::Unknown {
                         handle_digest: None,
                         bound_write: None,
                     }),
@@ -2546,7 +2550,7 @@ impl ConnectorStagedCreateLease {
         if let Err(error) = self.validate_prepare_outcome(&retained_request, &outcome) {
             self.record_after_dispatch(
                 operation_id,
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: None,
                     bound_write: None,
                 }),
@@ -2555,16 +2559,16 @@ impl ConnectorStagedCreateLease {
         }
         let state = match &outcome {
             ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { .. } => {
-                Some(LeaseOperationState::StageAppliedUnusable)
+                Some(StagedCreateOperationState::StageAppliedUnusable)
             }
             ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } => {
-                Some(LeaseOperationState::Unpublished {
+                Some(StagedCreateOperationState::Unpublished {
                     handle_digest: handle.digest(),
                     bound_write: None,
                 })
             }
             ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. } => {
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: None,
                     bound_write: None,
                 })
@@ -2587,7 +2591,7 @@ impl ConnectorStagedCreateLease {
         if let Err(error) = self.capability.bind_write(handle.clone(), write) {
             self.record_after_dispatch(
                 target_operation_id,
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: Some(handle.digest()),
                     bound_write: Some(proof),
                 }),
@@ -2596,7 +2600,7 @@ impl ConnectorStagedCreateLease {
         }
         self.record_after_dispatch(
             target_operation_id,
-            Some(LeaseOperationState::Unpublished {
+            Some(StagedCreateOperationState::Unpublished {
                 handle_digest: handle.digest(),
                 bound_write: Some(proof),
             }),
@@ -2620,7 +2624,7 @@ impl ConnectorStagedCreateLease {
             Err(error) => {
                 self.record_after_dispatch(
                     target_operation_id,
-                    Some(LeaseOperationState::Unpublished {
+                    Some(StagedCreateOperationState::Unpublished {
                         handle_digest: target_handle_digest,
                         bound_write: prior_bound_write,
                     }),
@@ -2643,7 +2647,7 @@ impl ConnectorStagedCreateLease {
         }
         self.record_after_dispatch(
             target_operation_id,
-            Some(LeaseOperationState::Unpublished {
+            Some(StagedCreateOperationState::Unpublished {
                 handle_digest: target_handle_digest,
                 bound_write: prior_bound_write,
             }),
@@ -2687,17 +2691,19 @@ impl ConnectorStagedCreateLease {
             return Err(error);
         }
         let state = match &outcome {
-            ConnectorStagedCreatePublishOutcome::Applied { .. } => LeaseOperationState::Published,
+            ConnectorStagedCreatePublishOutcome::Applied { .. } => {
+                StagedCreateOperationState::Published
+            }
             ConnectorStagedCreatePublishOutcome::NoOp { .. }
             | ConnectorStagedCreatePublishOutcome::Conflict { .. }
             | ConnectorStagedCreatePublishOutcome::KnownUncommitted { .. } => {
-                LeaseOperationState::Unpublished {
+                StagedCreateOperationState::Unpublished {
                     handle_digest,
                     bound_write: Some(bound_write),
                 }
             }
             ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
-                LeaseOperationState::PublicationUnknown {
+                StagedCreateOperationState::PublicationUnknown {
                     evidence_digest: evidence.digest(),
                     handle_digest,
                     bound_write,
@@ -2720,13 +2726,13 @@ impl ConnectorStagedCreateLease {
             .lock()
             .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
         let bound_write = match operations.get(&handle.operation_id()) {
-            Some(LeaseOperationState::Unpublished {
+            Some(StagedCreateOperationState::Unpublished {
                 handle_digest,
                 bound_write,
             }) if handle_digest == &handle.digest() => *bound_write,
             Some(
-                LeaseOperationState::Unknown { .. }
-                | LeaseOperationState::PublicationUnknown { .. },
+                StagedCreateOperationState::Unknown { .. }
+                | StagedCreateOperationState::PublicationUnknown { .. },
             ) => {
                 return Err(invalid(
                     "staged table operation is unresolved; publish and abort are forbidden",
@@ -2740,7 +2746,7 @@ impl ConnectorStagedCreateLease {
         };
         operations.insert(
             handle.operation_id(),
-            LeaseOperationState::Unknown {
+            StagedCreateOperationState::Unknown {
                 handle_digest: Some(handle.digest()),
                 bound_write,
             },
@@ -2768,7 +2774,7 @@ impl ConnectorStagedCreateLease {
                 .lock()
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
             match operations.get(&target_operation_id) {
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: Some(handle_digest),
                     bound_write,
                 }) if *handle_digest == handle.digest()
@@ -2783,7 +2789,7 @@ impl ConnectorStagedCreateLease {
         if let Err(error) = self.capability.bind_write(handle.clone(), write) {
             self.record_after_dispatch(
                 target_operation_id,
-                Some(LeaseOperationState::Unknown {
+                Some(StagedCreateOperationState::Unknown {
                     handle_digest: Some(handle.digest()),
                     bound_write: Some(proof),
                 }),
@@ -2792,7 +2798,7 @@ impl ConnectorStagedCreateLease {
         }
         self.record_after_dispatch(
             target_operation_id,
-            Some(LeaseOperationState::Unpublished {
+            Some(StagedCreateOperationState::Unpublished {
                 handle_digest: handle.digest(),
                 bound_write: Some(proof),
             }),
@@ -2820,15 +2826,17 @@ impl ConnectorStagedCreateLease {
             return Err(error);
         }
         let state = match &outcome {
-            ConnectorStagedCreateAbortOutcome::Aborted { .. } => LeaseOperationState::Aborted,
+            ConnectorStagedCreateAbortOutcome::Aborted { .. } => {
+                StagedCreateOperationState::Aborted
+            }
             ConnectorStagedCreateAbortOutcome::KnownUncommitted { .. } => {
-                LeaseOperationState::Unpublished {
+                StagedCreateOperationState::Unpublished {
                     handle_digest,
                     bound_write,
                 }
             }
             ConnectorStagedCreateAbortOutcome::CommitUnknown { .. } => {
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(handle_digest),
                     bound_write,
                 }
@@ -2858,7 +2866,7 @@ impl ConnectorStagedCreateLease {
                 .lock()
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
             let prior = match operations.get(&operation_id) {
-                Some(LeaseOperationState::PublicationUnknown {
+                Some(StagedCreateOperationState::PublicationUnknown {
                     evidence_digest,
                     handle_digest,
                     bound_write,
@@ -2875,7 +2883,7 @@ impl ConnectorStagedCreateLease {
             // A concurrent caller must fail before entering the provider.
             operations.insert(
                 operation_id,
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(prior.0),
                     bound_write: Some(prior.1),
                 },
@@ -2890,7 +2898,7 @@ impl ConnectorStagedCreateLease {
                 // second adjudication after a transport failure.
                 self.record_after_dispatch(
                     operation_id,
-                    Some(LeaseOperationState::Unknown {
+                    Some(StagedCreateOperationState::Unknown {
                         handle_digest: Some(unresolved_handle_digest),
                         bound_write: Some(unresolved_bound_write),
                     }),
@@ -2905,7 +2913,7 @@ impl ConnectorStagedCreateLease {
                     dispatch_operation_id,
                     ConnectorStagedCreateReceiptPhase::Published,
                 )?;
-                LeaseOperationState::Published
+                StagedCreateOperationState::Published
             }
             ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                 evidence, ..
@@ -2915,7 +2923,7 @@ impl ConnectorStagedCreateLease {
                     dispatch_operation_id,
                     "staged-create-publish",
                 )?;
-                LeaseOperationState::Unknown {
+                StagedCreateOperationState::Unknown {
                     handle_digest: Some(unresolved_handle_digest),
                     bound_write: Some(unresolved_bound_write),
                 }
@@ -2937,27 +2945,27 @@ impl ConnectorStagedCreateLease {
             .lock()
             .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
         match operations.get(&handle.operation_id()) {
-            Some(LeaseOperationState::Unpublished { handle_digest, .. })
+            Some(StagedCreateOperationState::Unpublished { handle_digest, .. })
                 if handle_digest == &handle.digest() =>
             {
                 Ok(())
             }
             Some(
-                LeaseOperationState::Unknown { .. }
-                | LeaseOperationState::PublicationUnknown { .. },
+                StagedCreateOperationState::Unknown { .. }
+                | StagedCreateOperationState::PublicationUnknown { .. },
             ) => Err(invalid(
                 "staged table operation is unresolved; publish and abort are forbidden",
             )),
-            Some(LeaseOperationState::Published) => Err(invalid(
+            Some(StagedCreateOperationState::Published) => Err(invalid(
                 "published staged table cannot be aborted or republished",
             )),
-            Some(LeaseOperationState::Aborted) => {
+            Some(StagedCreateOperationState::Aborted) => {
                 Err(invalid("aborted staged table cannot be reused"))
             }
-            Some(LeaseOperationState::Preparing) => {
+            Some(StagedCreateOperationState::Preparing) => {
                 Err(invalid("staged table prepare is still in progress"))
             }
-            Some(LeaseOperationState::StageAppliedUnusable) => Err(invalid(
+            Some(StagedCreateOperationState::StageAppliedUnusable) => Err(invalid(
                 "staged create was applied but cannot issue a usable target; reuse is forbidden",
             )),
             _ => Err(invalid(
@@ -2987,7 +2995,7 @@ impl ConnectorStagedCreateLease {
             .operations
             .lock()
             .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
-        let Some(LeaseOperationState::Unpublished {
+        let Some(StagedCreateOperationState::Unpublished {
             handle_digest,
             bound_write,
         }) = operations.get(&handle.operation_id())
@@ -3018,7 +3026,7 @@ impl ConnectorStagedCreateLease {
     ) {
         self.record_after_dispatch(
             operation_id,
-            Some(LeaseOperationState::Unknown {
+            Some(StagedCreateOperationState::Unknown {
                 handle_digest,
                 bound_write,
             }),
@@ -3028,7 +3036,7 @@ impl ConnectorStagedCreateLease {
     fn record_after_dispatch(
         &self,
         operation_id: ConnectorStagedCreateOperationId,
-        state: Option<LeaseOperationState>,
+        state: Option<StagedCreateOperationState>,
     ) {
         // Once provider dispatch has happened, a poisoned process-local lease
         // mutex must not downgrade an authoritative typed outcome or discard
@@ -3193,7 +3201,7 @@ impl ConnectorStagedCreateLease {
     }
 }
 
-impl Drop for StagedCreateLeaseRelease {
+impl Drop for StagedCreateReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;
@@ -3244,7 +3252,7 @@ mod tests {
 
     fn original_publication_observation() -> (
         ConnectorStagedCreatePublicationRecorder,
-        ConnectorStagedCreateLease,
+        ConnectorStagedCreateSession,
         ConnectorMutationOperationId,
     ) {
         let (descriptor, incarnation) = owner();
@@ -3263,7 +3271,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -3279,7 +3287,7 @@ mod tests {
                 .0
                 .identity
                 .set(PublicationIdentity {
-                    lease: lease.clone(),
+                    staged_session: lease.clone(),
                     operation,
                     dispatch: operation,
                     digest: [7; 32],
@@ -3369,7 +3377,7 @@ mod tests {
         );
         assert!(matches!(
             lease.operations.lock().unwrap().get(&operation),
-            Some(LeaseOperationState::Published)
+            Some(StagedCreateOperationState::Published)
         ));
         observation.enter_foreign();
         assert!(observation.foreign_exit_unproven());
@@ -3477,7 +3485,7 @@ mod tests {
         assert!(
             matches!(
                 lease.operations.lock().unwrap().get(&operation),
-                Some(LeaseOperationState::Unpublished { .. })
+                Some(StagedCreateOperationState::Unpublished { .. })
             ),
             "a proved preparation refusal must not become Unknown"
         );
@@ -4043,7 +4051,7 @@ mod tests {
     /// Shared operation table a poisoning fake re-enters to simulate a lease
     /// that observes its own in-flight state.
     type SharedOperations =
-        Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>;
+        Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, StagedCreateOperationState>>>;
     type PublicationAdjudicationOverride = dyn Fn(
             ConnectorStagedCreatePublicationAdjudicationRequest,
         ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>
@@ -4197,7 +4205,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4224,7 +4232,7 @@ mod tests {
         ));
         assert!(matches!(
             lease.operations.lock().unwrap().get(&operation_id),
-            Some(LeaseOperationState::StageAppliedUnusable)
+            Some(StagedCreateOperationState::StageAppliedUnusable)
         ));
         assert!(lease.prepare(request.clone()).is_err());
         let handle = ConnectorStagedTableHandle::try_new(
@@ -4311,7 +4319,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4372,7 +4380,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4445,7 +4453,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4499,7 +4507,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4538,7 +4546,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -4578,7 +4586,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4619,7 +4627,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4660,7 +4668,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4722,7 +4730,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -4785,7 +4793,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -4800,14 +4808,14 @@ mod tests {
             panic!("poison staged-create lease state");
         }));
         let operation_id = ConnectorMutationOperationId::new();
-        lease.record_after_dispatch(operation_id, Some(LeaseOperationState::Published));
+        lease.record_after_dispatch(operation_id, Some(StagedCreateOperationState::Published));
         let operations = lease
             .operations
             .lock()
             .expect("post-dispatch recording clears poison");
         assert!(matches!(
             operations.get(&operation_id),
-            Some(LeaseOperationState::Published)
+            Some(StagedCreateOperationState::Published)
         ));
     }
 
@@ -4834,7 +4842,7 @@ mod tests {
             poison_on_abort: Mutex::new(None),
             adjudication_override: None,
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -4870,7 +4878,7 @@ mod tests {
             .expect("authoritative abort clears lease poison");
         assert!(matches!(
             operations.get(&operation_id),
-            Some(LeaseOperationState::Aborted)
+            Some(StagedCreateOperationState::Aborted)
         ));
     }
 
@@ -4897,7 +4905,7 @@ mod tests {
             poison_on_abort: Mutex::new(None),
             adjudication_override: None,
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -4980,7 +4988,7 @@ mod tests {
                 )
             })),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
@@ -4991,7 +4999,7 @@ mod tests {
         .unwrap();
         lease.operations.lock().unwrap().insert(
             target_operation_id,
-            LeaseOperationState::PublicationUnknown {
+            StagedCreateOperationState::PublicationUnknown {
                 evidence_digest: evidence.digest(),
                 handle_digest: [7; 32],
                 bound_write: BoundWriteProof {
@@ -5038,7 +5046,7 @@ mod tests {
         );
         assert!(matches!(
             lease.operations.lock().unwrap().get(&target_operation_id),
-            Some(LeaseOperationState::Published)
+            Some(StagedCreateOperationState::Published)
         ));
         assert_eq!(observations.load(Ordering::SeqCst), 1);
     }
@@ -5061,7 +5069,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -5075,7 +5083,7 @@ mod tests {
         let evidence = capability.evidence_for(dispatch_operation_id, "staged-create-publish");
         lease.operations.lock().unwrap().insert(
             target_operation_id,
-            LeaseOperationState::PublicationUnknown {
+            StagedCreateOperationState::PublicationUnknown {
                 evidence_digest: evidence.digest(),
                 handle_digest: [7; 32],
                 bound_write: BoundWriteProof {
@@ -5145,7 +5153,7 @@ mod tests {
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
-        let lease = ConnectorStagedCreateLease::new(
+        let lease = ConnectorStagedCreateSession::new(
             ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
@@ -5394,7 +5402,7 @@ mod tests {
         fn fixture(
             unknown_prepare: bool,
             drop_adjudication: bool,
-        ) -> (Arc<AsyncLifecycleCapability>, ConnectorStagedCreateLease) {
+        ) -> (Arc<AsyncLifecycleCapability>, ConnectorStagedCreateSession) {
             let (descriptor, incarnation) = owner();
             let capability = Arc::new(AsyncLifecycleCapability {
                 inner: FakeCapability {
@@ -5417,7 +5425,7 @@ mod tests {
                 observations: AtomicUsize::new(0),
                 drop_adjudication,
             });
-            let lease = ConnectorStagedCreateLease::new(
+            let lease = ConnectorStagedCreateSession::new(
                 ConnectorProviderBindingKey {
                     instance_id: descriptor.instance_id,
                     incarnation,
@@ -5583,7 +5591,7 @@ mod tests {
             assert_eq!(capability.observations.load(Ordering::SeqCst), 1);
             assert!(matches!(
                 lease.operations.lock().unwrap().get(&operation),
-                Some(LeaseOperationState::Unknown { .. })
+                Some(StagedCreateOperationState::Unknown { .. })
             ));
         }
     }

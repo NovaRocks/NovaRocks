@@ -41,11 +41,9 @@ use novarocks_proto_codec::native_rpc::{FrontendNativeLane, NativeRpcMethod};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::native_channel_identity::InlineNativeChannelIdentity;
-use crate::native_connection_key_capacity::{
-    NativeConnectionKeyCapacity, NativeConnectionKeyToken,
-};
+use crate::native_connection_key_capacity::{NativeConnectionKeyCapacity, NativeConnectionKeySlot};
 use crate::native_incoming_key_capacity::{
-    NativeIncomingKey, NativeIncomingKeyCapacity, NativeIncomingKeyToken,
+    NativeIncomingKey, NativeIncomingKeyCapacity, NativeIncomingKeySlot,
 };
 use crate::native_lane::{
     NativeLane, NativeLaneStreamGate, NativeLaneStreamPermit, NativeTransportObserver,
@@ -888,7 +886,7 @@ impl DialAdmission {
 
 struct KeyClaim {
     admission: NativeTransportAdmission,
-    token: NativeConnectionKeyToken,
+    token: NativeConnectionKeySlot,
 }
 
 impl Drop for KeyClaim {
@@ -959,11 +957,7 @@ impl NativeHandshakePermit {
 
 enum SealState {
     Open,
-    Sealed(
-        NativeIncomingKey,
-        NativeIncomingKeyToken,
-        Option<NativeLane>,
-    ),
+    Sealed(NativeIncomingKey, NativeIncomingKeySlot, Option<NativeLane>),
     Closed,
 }
 

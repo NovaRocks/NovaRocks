@@ -44,10 +44,10 @@ pub(super) fn partition_observation(cluster_size: usize) -> StatementSpec {
         observations: (0..cluster_size)
             .flat_map(|index| {
                 [
-                    (index, "grpc-fragment", None),
-                    (index, "writer-marker", None),
-                    (index, "reader-marker", None),
-                    (index, "exchange-snapshot", None),
+                    (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None),
+                    (index, novarocks_failpoint::observation_marker::ObservationAction::WriterMarker.as_str(), None),
+                    (index, novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(), None),
+                    (index, novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), None),
                 ]
             })
             .collect(),

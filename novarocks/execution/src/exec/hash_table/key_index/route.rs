@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl};
 use novarocks_type_contract::ValueTypeStorageLifetime;

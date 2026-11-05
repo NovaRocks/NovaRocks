@@ -16,8 +16,8 @@
 // under the License.
 use super::*;
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -189,7 +189,7 @@ fn native_values_first_memory_and_original_caller_refusal_have_no_allocation_tai
     let before = tracker.allocated();
     let failure = operator.prepare().unwrap_err();
     assert_eq!(failure.cause(), original.cause());
-    assert_eq!(failure.context(), original.context());
+    assert_eq!(failure.site(), original.site());
     assert_eq!(
         tracker.allocated(),
         before,

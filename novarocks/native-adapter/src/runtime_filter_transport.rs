@@ -659,10 +659,7 @@ mod tests {
             value: Some(Value::Contribution(
                 RuntimeFilterContributionRouteIdentity {
                     producer_binding_id: 17,
-                    fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-                        hi: 18,
-                        lo: 19,
-                    }),
+                    task_key: Some(novarocks_proto_models::common::UniqueId { hi: 18, lo: 19 }),
                     partition_id: 0,
                     sequence: 0,
                 },

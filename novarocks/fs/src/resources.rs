@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::{
-    FileIoRuntime, FileTaskSpawner, FsAccessResolver, ObjectStoreProviderPool, RefreshExecutor,
+    FileIoRuntime, FileIoSpawner, FsAccessResolver, ObjectStoreProviderPool, RefreshExecutor,
     RefreshPolicy, StorageAuthorityRegistry,
 };
 
@@ -32,7 +32,7 @@ use crate::{
 /// refresh runs wherever that spawner puts detached blocking work rather than on
 /// the thread that asked for material.
 struct SpawnerRefreshExecutor {
-    spawner: Arc<dyn FileTaskSpawner>,
+    spawner: Arc<dyn FileIoSpawner>,
 }
 
 impl RefreshExecutor for SpawnerRefreshExecutor {
@@ -61,7 +61,7 @@ pub struct FsAccessResources {
     storage_authority_registry: Arc<StorageAuthorityRegistry>,
     access_resolver: FsAccessResolver,
     file_runtime: Arc<dyn FileIoRuntime>,
-    file_task_spawner: Arc<dyn FileTaskSpawner>,
+    file_io_spawner: Arc<dyn FileIoSpawner>,
 }
 
 impl std::fmt::Debug for FsAccessResources {
@@ -91,14 +91,14 @@ impl FsAccessResources {
         object_store_provider_pool: Arc<ObjectStoreProviderPool>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
-        file_task_spawner: Arc<dyn FileTaskSpawner>,
+        file_io_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
         Self::new_with_refresh_spawner(
             object_store_provider_pool,
             access_resolver,
             file_runtime,
-            Arc::clone(&file_task_spawner),
-            file_task_spawner,
+            Arc::clone(&file_io_spawner),
+            file_io_spawner,
         )
     }
 
@@ -109,8 +109,8 @@ impl FsAccessResources {
         object_store_provider_pool: Arc<ObjectStoreProviderPool>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
-        file_task_spawner: Arc<dyn FileTaskSpawner>,
-        refresh_spawner: Arc<dyn FileTaskSpawner>,
+        file_io_spawner: Arc<dyn FileIoSpawner>,
+        refresh_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
         // The registry is built here rather than passed in because it must be
         // exactly as shared as the pool beside it. Its refreshes run on the
@@ -128,7 +128,7 @@ impl FsAccessResources {
             storage_authority_registry,
             access_resolver,
             file_runtime,
-            file_task_spawner,
+            file_io_spawner,
         }
     }
 
@@ -140,14 +140,14 @@ impl FsAccessResources {
     pub fn with_file_io(
         &self,
         file_runtime: Arc<dyn FileIoRuntime>,
-        file_task_spawner: Arc<dyn FileTaskSpawner>,
+        file_io_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
         Self {
             object_store_provider_pool: Arc::clone(&self.object_store_provider_pool),
             storage_authority_registry: Arc::clone(&self.storage_authority_registry),
             access_resolver: self.access_resolver.clone(),
             file_runtime,
-            file_task_spawner,
+            file_io_spawner,
         }
     }
 
@@ -171,8 +171,8 @@ impl FsAccessResources {
         &self.file_runtime
     }
 
-    pub fn file_task_spawner(&self) -> &Arc<dyn FileTaskSpawner> {
-        &self.file_task_spawner
+    pub fn file_io_spawner(&self) -> &Arc<dyn FileIoSpawner> {
+        &self.file_io_spawner
     }
 }
 
@@ -190,17 +190,17 @@ mod tests {
     use super::*;
     use crate::{
         AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
-        FileResult, FileTask, FileTaskFuture, SecretValue, StorageAuthorityId, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileIoFuture, FileIoJob, FileResult, SecretValue, StorageAuthorityId, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
 
     struct CountingSpawner {
-        inner: TokioFileTaskSpawner,
+        inner: TokioFileIoSpawner,
         refreshes: AtomicUsize,
     }
 
-    impl FileTaskSpawner for CountingSpawner {
-        fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+    impl FileIoSpawner for CountingSpawner {
+        fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
             self.inner.spawn(task)
         }
 
@@ -243,15 +243,15 @@ mod tests {
         let scan_io: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone()));
         let owner_spawner = Arc::new(CountingSpawner {
-            inner: TokioFileTaskSpawner::new(owner_runtime.handle().clone()),
+            inner: TokioFileIoSpawner::new(owner_runtime.handle().clone()),
             refreshes: AtomicUsize::new(0),
         });
         let scan_spawner = Arc::new(CountingSpawner {
-            inner: TokioFileTaskSpawner::new(scan_runtime.handle().clone()),
+            inner: TokioFileIoSpawner::new(scan_runtime.handle().clone()),
             refreshes: AtomicUsize::new(0),
         });
-        let owner_tasks: Arc<dyn FileTaskSpawner> = owner_spawner.clone();
-        let scan_tasks: Arc<dyn FileTaskSpawner> = scan_spawner.clone();
+        let owner_tasks: Arc<dyn FileIoSpawner> = owner_spawner.clone();
+        let scan_tasks: Arc<dyn FileIoSpawner> = scan_spawner.clone();
         let write = FsAccessResources::new(
             Arc::new(
                 ObjectStoreProviderPool::new(crate::ObjectStoreProviderPoolOptions::default())
@@ -264,8 +264,8 @@ mod tests {
         let read = write.with_file_io(Arc::clone(&scan_io), Arc::clone(&scan_tasks));
         assert!(Arc::ptr_eq(write.file_runtime(), &owner_io));
         assert!(Arc::ptr_eq(read.file_runtime(), &scan_io));
-        assert!(Arc::ptr_eq(write.file_task_spawner(), &owner_tasks));
-        assert!(Arc::ptr_eq(read.file_task_spawner(), &scan_tasks));
+        assert!(Arc::ptr_eq(write.file_io_spawner(), &owner_tasks));
+        assert!(Arc::ptr_eq(read.file_io_spawner(), &scan_tasks));
         assert!(!Arc::ptr_eq(write.file_runtime(), read.file_runtime()));
         assert!(Arc::ptr_eq(
             write.object_store_provider_pool(),
@@ -330,8 +330,8 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("build explicit Tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let resources = FsAccessResources::new(
             Arc::new(
                 ObjectStoreProviderPool::new(crate::ObjectStoreProviderPoolOptions::default())
@@ -339,11 +339,11 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
 
         assert!(Arc::ptr_eq(resources.file_runtime(), &file_runtime));
-        assert!(Arc::ptr_eq(resources.file_task_spawner(), &task_spawner));
+        assert!(Arc::ptr_eq(resources.file_io_spawner(), &io_spawner));
         assert_eq!(
             resources.object_store_provider_pool().options(),
             crate::ObjectStoreProviderPoolOptions::default()

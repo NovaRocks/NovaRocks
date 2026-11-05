@@ -17,7 +17,7 @@
 
 //! Where one attempt's frozen facts come from.
 //!
-//! The graph builder and the context owners ask for facts by identity; this is
+//! The graph builder and the participation owners ask for facts by identity; this is
 //! the one place that answers from what the planner and encoder already
 //! produced. Nothing here plans, schedules, or encodes: it indexes sealed
 //! output so a builder never has to know which artifact a fact came from.
@@ -27,9 +27,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::domain::{
-    CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+    CodecOwnedContent, CredentialDomainId, CredentialEpoch,
 };
-use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution::task_execution::identity::ParticipationRef;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_proto_codec::FieldPath;
 
@@ -46,9 +46,11 @@ use crate::query_execution::artifact::FragmentId;
 
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-use crate::task_execution::context_owner::{ContextEstablishFacts, ContextEstablishSource};
 use crate::task_execution::error::TaskExecutionError;
-use crate::task_execution::graph::{FragmentPlanFacts, FragmentPlanSource};
+use crate::task_execution::graph::{TaskPlanFacts, TaskPlanSource};
+use crate::task_execution::participation_owner::{
+    ParticipationEstablishFacts, ParticipationEstablishSource,
+};
 
 /// The sealed submissions of one attempt, indexed the way the graph asks.
 ///
@@ -60,11 +62,11 @@ use crate::task_execution::graph::{FragmentPlanFacts, FragmentPlanSource};
 /// the instance identity a submission names, so the two are correlated here
 /// once rather than at every lookup.
 #[derive(Debug)]
-pub struct SubmissionFragmentPlans {
-    plans: BTreeMap<(FragmentId, usize), FragmentPlanFacts>,
+pub struct SubmissionTaskPlans {
+    plans: BTreeMap<(FragmentId, usize), TaskPlanFacts>,
 }
 
-impl SubmissionFragmentPlans {
+impl SubmissionTaskPlans {
     /// Indexes sealed plans against the exact Task manifest without consulting
     /// the scheduling plan that preceded it.
     pub(crate) fn index_manifest(
@@ -74,25 +76,20 @@ impl SubmissionFragmentPlans {
         let expected = manifest
             .tasks()
             .iter()
-            .map(|task| {
-                (
-                    task.fragment_instance_id(),
-                    (task.fragment_id(), task.instance_index()),
-                )
-            })
+            .map(|task| (task.task_key(), (task.fragment_id(), task.instance_index())))
             .collect::<BTreeMap<_, _>>();
         let mut plans = BTreeMap::new();
         for submission in submissions {
-            let finst = submission.fragment_instance_id();
+            let task_key = submission.task_key();
             let fragment_id = submission.fragment_id();
-            let &(scheduled_fragment, instance_index) = expected.get(&finst).ok_or_else(|| {
+            let &(scheduled_fragment, instance_index) = expected.get(&task_key).ok_or_else(|| {
                 TaskExecutionError::Schedule(format!(
-                    "fragment {fragment_id} submission names instance {finst} absent from the Task manifest"
+                    "fragment {fragment_id} submission names instance {task_key} absent from the Task manifest"
                 ))
             })?;
             if scheduled_fragment != fragment_id {
                 return Err(TaskExecutionError::Schedule(format!(
-                    "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
+                    "manifest instance {task_key} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
                 )));
             }
             let execution = submission.execution_id();
@@ -103,7 +100,7 @@ impl SubmissionFragmentPlans {
             if plans
                 .insert(
                     (fragment_id, instance_index),
-                    FragmentPlanFacts {
+                    TaskPlanFacts {
                         fragment,
                         assignment,
                     },
@@ -126,12 +123,12 @@ impl SubmissionFragmentPlans {
     }
 }
 
-impl FragmentPlanSource for SubmissionFragmentPlans {
+impl TaskPlanSource for SubmissionTaskPlans {
     fn take_plan(
         &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
-    ) -> Result<FragmentPlanFacts, TaskExecutionError> {
+    ) -> Result<TaskPlanFacts, TaskExecutionError> {
         self.plans
             .remove(&(fragment_id, instance_index))
             .ok_or_else(|| {
@@ -144,10 +141,10 @@ impl FragmentPlanSource for SubmissionFragmentPlans {
 
 /// The credential domain every attempt installs.
 ///
-/// One query context has exactly one, so the value only has to be stable and
+/// One participation has exactly one, so the value only has to be stable and
 /// nonzero. It is the protocol's own numbering, unrelated to a vended lease's
 /// sixteen-byte storage identity.
-const ATTEMPT_CREDENTIAL_DOMAIN: CredentialLeaseId = CredentialLeaseId::new(1);
+const ATTEMPT_CREDENTIAL_DOMAIN: CredentialDomainId = CredentialDomainId::new(1);
 
 /// The shared facts one attempt establishes on every backend it scheduled.
 ///
@@ -218,7 +215,7 @@ impl AttemptEstablishFacts {
                 query_options,
             )),
             // The protocol's lease id names the attempt's credential domain,
-            // not a storage lease: a query context has exactly one such
+            // not a storage lease: a participation has exactly one such
             // domain, and each vended lease keeps its own sixteen-byte
             // identity inside the table. The refresh owner adopts this value
             // from the establish, so an install and its first rotation are
@@ -232,19 +229,19 @@ impl AttemptEstablishFacts {
     }
 }
 
-impl ContextEstablishSource for AttemptEstablishFacts {
+impl ParticipationEstablishSource for AttemptEstablishFacts {
     fn facts_for(
         &self,
-        context: QueryContextRef,
-    ) -> Result<ContextEstablishFacts, TaskExecutionError> {
-        let backend = context.backend_process_id();
+        participation: ParticipationRef,
+    ) -> Result<ParticipationEstablishFacts, TaskExecutionError> {
+        let backend = participation.backend_process_id();
         let initial_runtime_filter = self.filters.get(&backend).cloned().ok_or_else(|| {
             TaskExecutionError::Schedule(format!(
                 "backend {backend} hosts tasks but this attempt compiled no runtime filter \
                  contribution for it"
             ))
         })?;
-        Ok(ContextEstablishFacts {
+        Ok(ParticipationEstablishFacts {
             catalog_binding: Arc::clone(&self.catalog_binding),
             initial_runtime_filter,
             query_options: Arc::clone(&self.query_options),
@@ -266,7 +263,7 @@ mod tests {
 
     use crate::native::fragment_encoder::frozen::FragmentArtifact;
     use crate::query_execution::artifact::NativePlacementAssignment;
-    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::query_execution::schedule::{SchedulingPlan, TaskPlacement};
 
     const ROOT: FragmentId = 1;
     const LEAF: FragmentId = 2;
@@ -279,19 +276,19 @@ mod tests {
         .expect("a nonzero query id")
     }
 
-    fn finst(fragment_id: FragmentId, instance_index: usize) -> UniqueId {
-        crate::query_execution::artifact::fragment_instance_id_for_contract_test(
+    fn task_key(fragment_id: FragmentId, instance_index: usize) -> UniqueId {
+        crate::query_execution::artifact::task_key_for_contract_test(
             execution_id().query_id(),
             fragment_id,
             instance_index,
         )
     }
 
-    fn placement(fragment_id: FragmentId, instance_index: usize) -> FragmentInstancePlacement {
-        FragmentInstancePlacement {
+    fn placement(fragment_id: FragmentId, instance_index: usize) -> TaskPlacement {
+        TaskPlacement {
             fragment_id,
             instance_index,
-            finst_id: finst(fragment_id, instance_index),
+            task_key: task_key(fragment_id, instance_index),
             backend_idx: instance_index,
             endpoint: RuntimeEndpoint::new("127.0.0.1", 9000 + instance_index as i32)
                 .expect("a valid endpoint"),
@@ -310,7 +307,7 @@ mod tests {
         SchedulingPlan {
             root_fragment_id: ROOT,
             by_fragment,
-            root_finst_id: finst(ROOT, 0),
+            root_task_key: task_key(ROOT, 0),
             root_backend_idx: 0,
         }
     }
@@ -337,7 +334,7 @@ mod tests {
         let fragment_id = fragment.facts().fragment_id();
         ValidatedNativeSubmission::new(
             instance_index,
-            finst(fragment_id, instance_index),
+            task_key(fragment_id, instance_index),
             execution_id(),
             Arc::clone(fragment),
             NativePlacementAssignment::new(
@@ -385,7 +382,7 @@ mod tests {
         // facts out, so the index keeps no second copy of what a task owns.
         let (submissions, manifest, _) = submission_fixture(3);
         let mut plans =
-            SubmissionFragmentPlans::index_manifest(submissions, &manifest).expect("a full index");
+            SubmissionTaskPlans::index_manifest(submissions, &manifest).expect("a full index");
 
         let first = plans.take_plan(LEAF, 0).expect("instance zero");
         let second = plans.take_plan(LEAF, 1).expect("instance one");
@@ -411,7 +408,7 @@ mod tests {
         // expect.
         let (mut submissions, manifest, leaf) = submission_fixture(2);
         submissions.push(submission_of(&leaf, 7));
-        let error = SubmissionFragmentPlans::index_manifest(submissions, &manifest)
+        let error = SubmissionTaskPlans::index_manifest(submissions, &manifest)
             .expect_err("an unplaced instance is refused");
         let TaskExecutionError::Schedule(error) = error else {
             panic!("unplaced submission keeps the original schedule error category");
@@ -420,7 +417,7 @@ mod tests {
             error,
             format!(
                 "fragment {LEAF} submission names instance {} absent from the Task manifest",
-                finst(LEAF, 7),
+                task_key(LEAF, 7),
             ),
         );
     }
@@ -432,7 +429,7 @@ mod tests {
         // query would wait forever for output nobody was asked to produce.
         let (mut submissions, manifest, _) = submission_fixture(3);
         submissions.truncate(2);
-        let error = SubmissionFragmentPlans::index_manifest(submissions, &manifest)
+        let error = SubmissionTaskPlans::index_manifest(submissions, &manifest)
             .expect_err("a missing submission is refused");
         let TaskExecutionError::Schedule(error) = error else {
             panic!("missing submission keeps the original schedule error category");
@@ -445,12 +442,12 @@ mod tests {
 
     #[test]
     fn each_backend_establishes_its_own_filter_contribution() {
-        use novarocks_execution::task_execution::identity::QueryContextRef;
+        use novarocks_execution::task_execution::identity::ParticipationRef;
         use novarocks_task_codec::domain::stored_message;
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-        use crate::task_execution::context_owner::ContextEstablishSource;
+        use crate::task_execution::participation_owner::ParticipationEstablishSource;
 
         // A filter deployment gives each backend the role bindings its own
         // tasks play. Handing one backend another's contribution would install
@@ -488,8 +485,8 @@ mod tests {
 
         let frontend = FrontendProcessId::new_v7();
         for (backend, expected) in [(first, 11), (second, 22)] {
-            let context = QueryContextRef::new(execution_id(), frontend, backend);
-            let established = facts.facts_for(context).expect("a scheduled backend");
+            let participation = ParticipationRef::new(execution_id(), frontend, backend);
+            let established = facts.facts_for(participation).expect("a scheduled backend");
             let contribution = stored_message::<RuntimeFilterContribution>(
                 established.initial_runtime_filter.as_ref(),
             )
@@ -505,18 +502,18 @@ mod tests {
         // A backend that hosts tasks but compiled no contribution is a
         // disagreement between the filter compiler and the scheduler, not an
         // empty install.
-        let stranger = QueryContextRef::new(execution_id(), frontend, BackendProcessId::new_v7());
+        let stranger = ParticipationRef::new(execution_id(), frontend, BackendProcessId::new_v7());
         assert!(facts.facts_for(stranger).is_err());
     }
 
     #[test]
     fn the_credential_domain_is_frozen_into_every_establish() {
-        use novarocks_execution::task_execution::identity::QueryContextRef;
+        use novarocks_execution::task_execution::identity::ParticipationRef;
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
 
-        // Every context is established with the attempt's one credential
+        // Every participation is established with the attempt's one credential
         // domain. The refresh owner that used to read it here is gone with the
         // rotation it drove (CAD-1 C14); the domain itself still has to be
         // exactly what each establish installs.
@@ -528,11 +525,12 @@ mod tests {
             &QueryCredentialLeases::empty(),
         )
         .expect("a legal attempt");
-        let context = QueryContextRef::new(execution_id(), FrontendProcessId::new_v7(), backend);
-        let established = facts.facts_for(context).expect("its own backend");
+        let participation =
+            ParticipationRef::new(execution_id(), FrontendProcessId::new_v7(), backend);
+        let established = facts.facts_for(participation).expect("its own backend");
 
         assert_eq!(
-            established.initial_credential.lease_id(),
+            established.initial_credential.credential_domain_id(),
             ATTEMPT_CREDENTIAL_DOMAIN
         );
 

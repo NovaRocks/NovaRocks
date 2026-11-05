@@ -24,13 +24,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use super::TaskFinalInfoCollector;
-use crate::native::fragment_transport::{
+use crate::native::task_result_transport::{
     DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
 };
 use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 use crate::task_execution::status_intake::TestIntakeWake;
 use novarocks_execution_contract::{
-    DomainVersion, OperationKind, OperationOutcome, QueryContextReceipt, QueryContextState,
+    DomainVersion, OperationKind, OperationOutcome, ParticipationReceipt, ParticipationState,
     ReleaseOutcome, TaskIdentity,
 };
 
@@ -201,17 +201,17 @@ async fn pending_final_info_survives_borrowed_wait_cancel_and_stop_starting_unti
 
     // Settle the same fixture's ORIGINAL Release, rather than dropping its
     // TaskRound and treating that as remote convergence.
-    let OperationIntent::ReleaseQueryContext(request) = &release else {
+    let OperationIntent::ReleaseParticipation(request) = &release else {
         unreachable!("the original fixture selected its Release by kind")
     };
     acks.publish(OperationAcknowledgement::new(
         release.operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(
-                request.context(),
-                QueryContextState::TerminalRetained,
+            receipt: ParticipationReceipt::new(
+                request.participation(),
+                ParticipationState::TerminalRetained,
             ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,
@@ -319,17 +319,17 @@ async fn terminal_frontier_reads_each_original_task_once_and_wakes_each_ready_su
     );
     assert!(!disabled.all_terminal_observed());
     assert_eq!(*probe.started.lock().unwrap(), identities);
-    let OperationIntent::ReleaseQueryContext(request) = &release else {
+    let OperationIntent::ReleaseParticipation(request) = &release else {
         unreachable!()
     };
     acks.publish(OperationAcknowledgement::new(
         release.operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(
-                request.context(),
-                QueryContextState::TerminalRetained,
+            receipt: ParticipationReceipt::new(
+                request.participation(),
+                ParticipationState::TerminalRetained,
             ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,

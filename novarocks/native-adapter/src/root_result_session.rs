@@ -17,7 +17,7 @@
 
 //! A finite BE root producer; publication and consumption have separate owners.
 
-use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use novarocks_execution::runtime::task::{ExecutionFailure, ExecutionResult};
 use std::alloc::Layout;
 use std::mem::ManuallyDrop;
 #[cfg(test)]
@@ -28,13 +28,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
-use novarocks_execution::runtime::fragment::io::{
-    FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort, ResultWriteAdmission,
-    ResultWriteCredit, RootFailureObservation, RootInputAdmission, RootInputAuthority,
-    RootInputPermit, RootInputReservationAdmission, RootProducerState, RootResultSession,
-    RootResultWriteSpec, RootWorkExitProgress,
-};
 use novarocks_execution::runtime::observable::{Observable, ObserverSubscription};
+use novarocks_execution::runtime::task::io::{
+    ResultAbort, ResultWriteAdmission, ResultWriteCredit, RootFailureObservation,
+    RootInputAdmission, RootInputAuthority, RootInputPermit, RootInputReservationAdmission,
+    RootProducerState, RootResultSession, RootResultWriteSpec, RootWorkExitProgress, TaskIoError,
+    TaskIoErrorKind, TaskIoOperation,
+};
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_execution_contract::root_lifetime::RootRetentionClose;
 use novarocks_result_contract::{
@@ -49,7 +49,7 @@ use novarocks_worker::root_result_channel::{
 };
 
 use crate::root_producer_pool::{
-    RootCleanupPlan, RootCleanupPredecessors, RootCleanupProgress, RootExitRole,
+    RootCleanupPlan, RootCleanupPredecessors, RootCleanupProgress, RootExitOwner,
     RootProducerExitObservation, RootProducerExitStatus, RootProducerJob, RootProducerRegistration,
     RootProducerReserveFailure, RootProducerTurn, RootProducerWake, root_exit_metadata_bytes,
     weak_core_backing_bytes,
@@ -283,13 +283,13 @@ struct Input {
     scratch: Option<std::mem::ManuallyDrop<ResultWriteCredit>>,
     chunk: Option<std::mem::ManuallyDrop<novarocks_execution::exec::chunk::Chunk>>,
     _permit:
-        Option<std::mem::ManuallyDrop<novarocks_execution::runtime::fragment::io::RootInputPermit>>,
+        Option<std::mem::ManuallyDrop<novarocks_execution::runtime::task::io::RootInputPermit>>,
     retiring: bool,
     execution: InputExecution,
     exits: [InputOwnerExit; 4],
 }
 impl Input {
-    fn new(submitted: novarocks_execution::runtime::fragment::io::RootResultInput) -> Self {
+    fn new(submitted: novarocks_execution::runtime::task::io::RootResultInput) -> Self {
         let (chunk, permit) = submitted.into_cleanup_parts();
         Self {
             encoder: None,
@@ -352,9 +352,7 @@ enum InputExitAction {
     Encoder(Option<std::mem::ManuallyDrop<InputEncoder>>),
     Chunk(Option<std::mem::ManuallyDrop<novarocks_execution::exec::chunk::Chunk>>),
     Scratch(Option<std::mem::ManuallyDrop<ResultWriteCredit>>),
-    Permit(
-        Option<std::mem::ManuallyDrop<novarocks_execution::runtime::fragment::io::RootInputPermit>>,
-    ),
+    Permit(Option<std::mem::ManuallyDrop<novarocks_execution::runtime::task::io::RootInputPermit>>),
 }
 enum InputExitOutcome {
     Exited,
@@ -552,13 +550,13 @@ impl ProducerState {
 // follows the real callback and its Weak control tails through that exit.
 struct WakeBridge {
     wake: RootProducerWake,
-    driver: novarocks_execution::runtime::fragment::io::RootInputReadinessNotifier,
+    input_readiness: novarocks_execution::runtime::task::io::RootInputReadinessNotifier,
     _metadata: Arc<RootMetadataReservation>,
 }
 impl WakeBridge {
     fn notify(&self) {
         let _ = self.wake.wake_active();
-        self.driver.notify();
+        self.input_readiness.notify();
     }
 }
 
@@ -635,7 +633,7 @@ impl novarocks_worker::TaskPreparationChild for NativeRootPreparationChild {
         use novarocks_worker::TaskPreparationChildExit as Exit;
         let pool = match self
             .observation
-            .poll(RootExitRole::Preparation, &self.readiness)
+            .poll(RootExitOwner::Preparation, &self.readiness)
         {
             Ok(status) => status,
             Err(_) => return Exit::Unresolved,
@@ -674,7 +672,7 @@ impl NativeRootResultSession {
         preparation_child: &Arc<
             crate::backend_task_execution::prepared_owner::NativePreparationChild,
         >,
-    ) -> Result<Arc<Self>, FragmentIoError> {
+    ) -> Result<Arc<Self>, TaskIoError> {
         Self::try_open_prepared_with_cow_recipe(channel, pool, preparation, preparation_child, None)
     }
     pub(crate) fn try_open_prepared_with_cow_recipe(
@@ -685,7 +683,7 @@ impl NativeRootResultSession {
             crate::backend_task_execution::prepared_owner::NativePreparationChild,
         >,
         cow_recipe: Option<Arc<CowSelectionRecipe>>,
-    ) -> Result<Arc<Self>, FragmentIoError> {
+    ) -> Result<Arc<Self>, TaskIoError> {
         let control = preparation.runtime_control();
         if control.identity() != channel.spec().task
             || preparation_child.identity() != channel.spec().task
@@ -719,7 +717,7 @@ impl NativeRootResultSession {
         preparation: &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
         readiness: std::task::Waker,
         cow_recipe: Option<Arc<CowSelectionRecipe>>,
-    ) -> Result<Arc<Self>, FragmentIoError> {
+    ) -> Result<Arc<Self>, TaskIoError> {
         let contract = &channel.spec().contract;
         // Every closed internal domain has its producer codec; only a scalar
         // domain identity without its typed schema has none.
@@ -830,7 +828,7 @@ impl NativeRootResultSession {
         });
         let bridge = WakeBridge {
             wake,
-            driver: shared.authority.readiness_notifier(),
+            input_readiness: shared.authority.readiness_notifier(),
             _metadata: Arc::clone(&shared._metadata),
         };
         let subscription = shared
@@ -988,7 +986,7 @@ impl RootSessionState {
         self.channel.spec()
     }
     fn observe_terminal(&self, terminal: &'static str) {
-        crate::backend_metrics::record_fragment_result_terminal(terminal);
+        crate::backend_metrics::record_task_result_terminal(terminal);
         #[cfg(test)]
         self.terminal_observations
             .lock()
@@ -1024,10 +1022,10 @@ impl RootSessionState {
         }
     }
 
-    fn wake(&self) -> Result<(), FragmentIoError> {
+    fn wake(&self) -> Result<(), TaskIoError> {
         self.wake.wake().map_err(io_error)
     }
-    fn start(&self, state: &mut ProducerState) -> Result<(), FragmentIoError> {
+    fn start(&self, state: &mut ProducerState) -> Result<(), TaskIoError> {
         if state.producer.is_none() && !state.cleanup_started {
             state.producer = Some(self.channel.start_producer().map_err(io_error)?);
         }
@@ -1428,7 +1426,7 @@ impl RootResultSession for NativeRootResultSession {
     fn writable_observable(&self) -> Arc<Observable> {
         self.shared.authority.observable()
     }
-    fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
+    fn try_acquire_input(&self) -> Result<RootInputAdmission, TaskIoError> {
         {
             let state = self.shared.state();
             if state.failed.is_some() {
@@ -1473,8 +1471,8 @@ impl RootResultSession for NativeRootResultSession {
 
     fn submit_input(
         &self,
-        submitted: &mut Option<novarocks_execution::runtime::fragment::io::RootResultInput>,
-    ) -> Result<(), FragmentIoError> {
+        submitted: &mut Option<novarocks_execution::runtime::task::io::RootResultInput>,
+    ) -> Result<(), TaskIoError> {
         let original = submitted
             .as_ref()
             .expect("submission borrows one original input slot");
@@ -1524,7 +1522,7 @@ impl RootResultSession for NativeRootResultSession {
         drop(state);
         self.shared.wake()
     }
-    fn finish_input(&self) -> Result<(), FragmentIoError> {
+    fn finish_input(&self) -> Result<(), TaskIoError> {
         let mut state = self.shared.state();
         if state.failed.is_some() {
             return Err(io_error(RootSessionFailure::ProducerClosed));
@@ -1570,7 +1568,7 @@ impl RootResultSession for NativeRootResultSession {
         self.exit_observable.clone()
     }
     fn poll_producer_exit(&self, waker: &std::task::Waker) -> RootWorkExitProgress {
-        let pool = match self.exit.poll(RootExitRole::Runtime, waker) {
+        let pool = match self.exit.poll(RootExitOwner::Runtime, waker) {
             Ok(RootProducerExitStatus::Exited) => RootWorkExitProgress::Exited,
             Ok(RootProducerExitStatus::Pending) => RootWorkExitProgress::Pending,
             Ok(RootProducerExitStatus::Unresolved | RootProducerExitStatus::NoJobInstalled)
@@ -1786,7 +1784,7 @@ impl RootSessionState {
             }
             1 => {
                 if !self.state().completed {
-                    self.channel.close(RootRetentionClose::ContextAborted);
+                    self.channel.close(RootRetentionClose::ParticipationAborted);
                 }
             }
             2..=5 => return self.exit_input_phase(InputExitPhase::ALL[(phase - 2) as usize]),
@@ -1879,7 +1877,7 @@ fn join_root_exit_progress(
         _ => RootWorkExitProgress::Pending,
     }
 }
-fn io_error<E>(source: E) -> FragmentIoError
+fn io_error<E>(source: E) -> TaskIoError
 where
     E: std::error::Error
         + novarocks_execution_contract::failure::FailureProjection
@@ -1887,9 +1885,9 @@ where
         + Sync
         + 'static,
 {
-    FragmentIoError::from_domain(
-        FragmentIoOperation::ResultWrite,
-        FragmentIoErrorKind::Unavailable,
+    TaskIoError::from_domain(
+        TaskIoOperation::ResultWrite,
+        TaskIoErrorKind::Unavailable,
         source,
     )
 }
@@ -1923,26 +1921,27 @@ pub(crate) mod terminal_observation_tests {
     use novarocks_execution::runtime::task_control::TaskExecutionControl;
     use novarocks_execution_contract::{
         CreateTask, CreationContent, ExchangeTopology, FrozenBytes, OperationOutcome,
-        QueryContextRef, TaskCreationInput, TaskDescriptor, TaskOperationId,
+        ParticipationRef, TaskCreationInput, TaskDescriptor, TaskOperationId,
     };
     use novarocks_worker::{
-        HostRejection, PreparedTaskInstallation, QueryContextHost, ReleasedContextEvidence,
+        HostRejection, ParticipationHost, PreparedTaskInstallation, ReleasedParticipationEvidence,
         RunnableTask, SharedFactsRequest, TaskExecutionHost, TaskIngressRetirement,
-        TaskPreparationContext, TaskStatusReporter, WorkerContextReplyBody, WorkerCreateReply,
+        TaskPreparationContext, TaskStatusReporter, WorkerCreateReply,
+        WorkerParticipationReplyBody,
     };
 
-    struct RootContext;
-    impl QueryContextHost for RootContext {
+    struct RootParticipationHost;
+    impl ParticipationHost for RootParticipationHost {
         fn materialize(&self, _: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
             Ok(())
         }
-        fn release(&self, _: QueryContextRef) -> ReleasedContextEvidence {
-            ReleasedContextEvidence::none()
+        fn release(&self, _: ParticipationRef) -> ReleasedParticipationEvidence {
+            ReleasedParticipationEvidence::none()
         }
         fn advance_shared_domain(
             &self,
-            _: QueryContextRef,
-            _: &novarocks_execution_contract::QueryContextDomainUpdate,
+            _: ParticipationRef,
+            _: &novarocks_execution_contract::ParticipationDomainUpdate,
         ) -> Result<(), HostRejection> {
             unreachable!("Root fixture has no shared-domain updates")
         }
@@ -1980,9 +1979,9 @@ pub(crate) mod terminal_observation_tests {
     type RootPreparationCallback = Box<dyn for<'a> FnOnce(TaskPreparationContext<'a>) + Send>;
     struct RootCallbackHost(Mutex<Option<RootPreparationCallback>>);
     impl TaskExecutionHost for RootCallbackHost {
-        fn close_context_admission(&self, _: QueryContextRef) {}
-        fn retire_context_execution(&self, _: QueryContextRef) {}
-        fn forget_context_admission(&self, _: QueryContextRef) {}
+        fn close_participation_admission(&self, _: ParticipationRef) {}
+        fn retire_participation_execution(&self, _: ParticipationRef) {}
+        fn forget_participation_admission(&self, _: ParticipationRef) {}
         fn install_receiver(
             &self,
             _: &TaskDescriptor,
@@ -2031,7 +2030,7 @@ pub(crate) mod terminal_observation_tests {
     }
     pub(crate) struct OriginalRootNode {
         node: Mutex<Option<NativeNodeFixture>>,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
         release: Arc<(Mutex<bool>, Condvar)>,
         // The test host owns its actual born outputs until the same close
@@ -2068,7 +2067,7 @@ pub(crate) mod terminal_observation_tests {
             // of publishing Installed, so its original host must close that
             // retained output before waiting for the real preparation exit.
             for original in original_roots {
-                original.close(RootRetentionClose::ContextAborted);
+                original.close(RootRetentionClose::ParticipationAborted);
                 drop(original);
             }
             self.release_body();
@@ -2104,20 +2103,20 @@ pub(crate) mod terminal_observation_tests {
                 assert!(*guard, "the original Root preparation must be released");
             },
         )))));
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             task.query_execution_id(),
             novarocks_types::FrontendProcessId::new_v7(),
             task.backend_process_id(),
         );
         let node = NativeNodeFixture::start(
             task.backend_process_id(),
-            factory_from_host(Arc::new(RootContext)),
+            factory_from_host(Arc::new(RootParticipationHost)),
             execution,
             health,
             1,
             1,
         );
-        node.establish(context);
+        node.establish(participation);
         let descriptor = TaskDescriptor::try_new(
             task,
             novarocks_types::UniqueId::new(907, 908),
@@ -2127,7 +2126,8 @@ pub(crate) mod terminal_observation_tests {
         )
         .unwrap();
         let created = node.create(
-            CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, vec![]).unwrap(),
+            CreateTask::try_new(TaskOperationId::new_v7(), participation, descriptor, vec![])
+                .unwrap(),
             TaskCreationInput::new(
                 FrozenBytes::freeze(bytes::Bytes::from_static(&[1])),
                 Box::new(RootAssignment),
@@ -2135,7 +2135,7 @@ pub(crate) mod terminal_observation_tests {
         );
         assert!(matches!(
             created.reply(),
-            WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+            WorkerCreateReply::Participation(WorkerParticipationReplyBody::Create {
                 outcome: OperationOutcome::Accepted,
                 ..
             })
@@ -2153,7 +2153,7 @@ pub(crate) mod terminal_observation_tests {
             value,
             Arc::new(OriginalRootNode {
                 node: Mutex::new(Some(node)),
-                context,
+                participation,
                 task,
                 release,
                 original_roots: Mutex::new(Vec::new()),
@@ -2167,7 +2167,7 @@ pub(crate) mod terminal_observation_tests {
         budget: Arc<ResultRetainedBudget>,
         limits: WorkerResultRetainedLimits,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
-    ) -> Result<Arc<NativeRootResultSession>, FragmentIoError> {
+    ) -> Result<Arc<NativeRootResultSession>, TaskIoError> {
         open_root_in_preparation_with_layout(preparation, pool, spec, budget, limits, health, None)
     }
     pub(crate) fn open_root_in_preparation_with_layout(
@@ -2178,7 +2178,7 @@ pub(crate) mod terminal_observation_tests {
         limits: WorkerResultRetainedLimits,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
         root_layout: Option<&novarocks_local_program::StaticLayout>,
-    ) -> Result<Arc<NativeRootResultSession>, FragmentIoError> {
+    ) -> Result<Arc<NativeRootResultSession>, TaskIoError> {
         let child =
             crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
                 preparation,
@@ -2217,7 +2217,7 @@ pub(crate) mod terminal_observation_tests {
             match prepared {
                 Ok(recipe) => Some(recipe),
                 Err(cause) => {
-                    channel.close(RootRetentionClose::ContextAborted);
+                    channel.close(RootRetentionClose::ParticipationAborted);
                     return Err(cause);
                 }
             }
@@ -2232,7 +2232,7 @@ pub(crate) mod terminal_observation_tests {
             recipe,
         );
         if result.is_err() {
-            channel.close(RootRetentionClose::ContextAborted);
+            channel.close(RootRetentionClose::ParticipationAborted);
         }
         result
     }
@@ -2252,9 +2252,9 @@ pub(crate) mod terminal_observation_tests {
             };
             drop(
                 await_original(control.abort(
-                    novarocks_execution_contract::AbortQueryContext::new(
+                    novarocks_execution_contract::AbortParticipation::new(
                         TaskOperationId::new_v7(),
-                        self.node.context,
+                        self.node.participation,
                         cause,
                     ),
                     deadline,
@@ -2468,7 +2468,7 @@ pub(crate) mod terminal_observation_tests {
             };
             {
                 let mut submitted = Some(
-                    novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit),
+                    novarocks_execution::runtime::task::io::RootResultInput::new(chunk, permit),
                 );
                 self.session.submit_input(&mut submitted).unwrap();
                 assert!(
@@ -2560,11 +2560,9 @@ pub(crate) mod terminal_observation_tests {
             if rollback {
                 task.status()
                     .in_phase(TaskFailurePhase::Preparation)
-                    .report_failure(
-                        novarocks_execution::runtime::fragment::ExecutionFailure::from(
-                            novarocks_functions::KernelFailure::ResourceExhausted,
-                        ),
-                    );
+                    .report_failure(novarocks_execution::runtime::task::ExecutionFailure::from(
+                        novarocks_functions::KernelFailure::ResourceExhausted,
+                    ));
             } else {
                 task.cancel(CancelReason::UpstreamNoLongerNeeded);
             }
@@ -2962,9 +2960,13 @@ pub(crate) mod terminal_observation_tests {
         }
 
         let fixture = Fixture::new(false);
-        // This local encoding fixture explicitly supplies the Context owner
+        // This local encoding fixture explicitly supplies the Participation owner
         // required for the same successful handoff as production installation.
-        fixture.session.channel().mark_context_owned().unwrap();
+        fixture
+            .session
+            .channel()
+            .mark_participation_owned()
+            .unwrap();
         let metadata_before_fault = fixture
             .session
             .channel()
@@ -3071,7 +3073,7 @@ pub(crate) mod terminal_observation_tests {
         assert_eq!(fixture.observations(), ["finished"]);
         assert_eq!(
             fixture.session.producer_state(),
-            RootProducerState::ContextHeld
+            RootProducerState::ParticipationHeld
         );
         assert_eq!(fixture.session.channel().snapshot().end_sequence, Some(1));
         assert_eq!(fixture.session.channel().snapshot().consumed_through, 0);
@@ -3507,7 +3509,7 @@ pub(crate) mod terminal_observation_tests {
                 callback_health,
             )
             .unwrap();
-            session.channel().mark_context_owned().unwrap();
+            session.channel().mark_participation_owned().unwrap();
             session
         });
         node.retain_root_for_teardown(session.channel().clone());
@@ -3550,7 +3552,7 @@ pub(crate) mod terminal_observation_tests {
                 body_health,
             )
             .unwrap();
-            session.channel().mark_context_owned().unwrap();
+            session.channel().mark_participation_owned().unwrap();
             session
         });
         node.retain_root_for_teardown(session.channel().clone());
@@ -3642,9 +3644,8 @@ pub(crate) mod terminal_observation_tests {
             else {
                 panic!("the ClientRows root must admit its original input");
             };
-            let mut submitted = Some(
-                novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit),
-            );
+            let mut submitted =
+                Some(novarocks_execution::runtime::task::io::RootResultInput::new(chunk, permit));
             fixture.session.submit_input(&mut submitted).unwrap();
             assert!(submitted.is_none());
             fixture.session.finish_input().unwrap();
@@ -3724,9 +3725,8 @@ pub(crate) mod terminal_observation_tests {
             };
             let input_bytes = permit.retained_bytes();
             assert_eq!(input_bytes, if client { 192 << 20 } else { 96 << 20 });
-            let mut submitted = Some(
-                novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit),
-            );
+            let mut submitted =
+                Some(novarocks_execution::runtime::task::io::RootResultInput::new(chunk, permit));
             fixture.session.submit_input(&mut submitted).unwrap();
             assert!(
                 submitted.is_none(),
@@ -3754,7 +3754,7 @@ pub(crate) mod terminal_observation_tests {
                 Some(crate::root_producer_pool::RootProducerPoolFailure::Turn)
             );
             assert_eq!(safe.producer_exit_progress(), RootWorkExitProgress::Exited);
-            assert_eq!(safe.producer_state(), RootProducerState::ContextHeld);
+            assert_eq!(safe.producer_state(), RootProducerState::ParticipationHeld);
             assert_eq!(safe.channel().snapshot().end_sequence, Some(1));
             let safe_ownership = safe.channel().try_ownership_snapshot().unwrap().unwrap();
             assert_eq!(safe_ownership.producers_running, 0);
@@ -3835,7 +3835,7 @@ pub(crate) mod terminal_observation_tests {
         };
         let first_generation = permit.generation();
         let mut submitted =
-            Some(novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit));
+            Some(novarocks_execution::runtime::task::io::RootResultInput::new(chunk, permit));
         fixture.session.submit_input(&mut submitted).unwrap();
         assert!(submitted.is_none());
         let reactions = Arc::new(Mutex::new(Vec::with_capacity(4)));
@@ -4144,7 +4144,7 @@ pub(crate) mod terminal_observation_tests {
         };
         assert_eq!(permit.retained_bytes(), 96 << 20);
         let mut offered =
-            Some(novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, permit));
+            Some(novarocks_execution::runtime::task::io::RootResultInput::new(chunk, permit));
         fixture.session.submit_input(&mut offered).unwrap();
         assert!(offered.is_none());
         task.abort(AbortCause::PeerTaskFailed);

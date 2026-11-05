@@ -20,16 +20,16 @@
 use super::*;
 
 #[test]
-fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_effect() {
+fn a_late_participation_return_reawakens_the_original_timed_out_request_without_a_new_effect() {
     let mut f = RouteFixture::new();
     let (input, mut handle, getters, drops) = f.begin_route(op(12), 10, None);
     let runtime = f.f.runtime.clone();
 
-    // The Context has decided, but its original effect author has not handed
+    // The Participation has decided, but its original effect author has not handed
     // back the answer. Let the real Root timer settle the RPC first.
     runtime.poll_one(Tick(3)).unwrap();
     let probe = {
-        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().participation(f.f.participation).unwrap();
         let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         host.dispatch.take_ready(&runtime, 64).unwrap().unwrap()
@@ -37,9 +37,9 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     f.assert_original_probe_author(&probe, input);
     let decided_conflict = matches!(
         &probe.effect,
-        WorkerAction::Context(ContextEffect::EstablishProbed { request, result, .. })
+        WorkerAction::Participation(ParticipationEffect::EstablishProbed { request, result, .. })
             if request.token == input
-                && matches!(result, EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+                && matches!(result, EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
     let timer_selected = runtime.advance_time(Tick(10), 2).unwrap();
     runtime.poll_one(Tick(10)).unwrap();
@@ -53,10 +53,10 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     );
 
     // The already admitted author fills a different real Root input. Its
-    // Context input, captures, report and escrow retire before Root consumes
+    // Participation input, captures, report and escrow retire before Root consumes
     // that original return occurrence.
-    let context_retired = {
-        let host_address = f.f.root.service().context(f.f.context).unwrap();
+    let participation_retired = {
+        let host_address = f.f.root.service().participation(f.f.participation).unwrap();
         let mut host = host_address.lock().unwrap();
         host.handoff_establish_probe(probe).unwrap();
         host.advance_establish_route(input).unwrap()
@@ -66,9 +66,9 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
         .unwrap()
         .into_iter()
         .filter(|entry| {
-            entry.source == context_actor()
+            entry.source == participation_actor()
                 && entry.phase == InputPhase::Filled
-                && entry.role.is_some()
+                && entry.standing_input_id.is_some()
         })
         .collect();
     let return_input = returns.first().expect("actual admitted Root return").input;
@@ -93,7 +93,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     let disposal =
         f.f.root
             .take_retired_route_disposal(input)
-            .expect("actual Context exit permits the original raw disposal");
+            .expect("actual Participation exit permits the original raw disposal");
     let disposed = thread::spawn(move || disposal.run()).join().unwrap();
 
     // Drain every existing original-R signal while its callback is still only
@@ -148,7 +148,7 @@ fn a_late_context_return_reawakens_the_original_timed_out_request_without_a_new_
     assert!(decided_conflict);
     assert_eq!(timer_selected, 1);
     assert!(cancelled_original);
-    assert!(context_retired);
+    assert!(participation_retired);
     assert!(distinct_return_occurrence);
     assert!(timeout_reply && timeout_delivered);
     assert!(disposed);

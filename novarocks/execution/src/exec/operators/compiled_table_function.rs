@@ -70,13 +70,13 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 /// The producer of one output channel, in output order.
 #[derive(Clone, Copy, Debug)]
@@ -240,7 +240,7 @@ impl CompiledTableFunctionProcessorFactory {
                         .borrowed()
                         .same_physical_binding_ignoring_root_nullability_observed(
                             target.borrowed(),
-                            || Ok::<(), crate::runtime::fragment::ExecutionFailure>(()),
+                            || Ok::<(), crate::runtime::task::ExecutionFailure>(()),
                         )?
                 {
                     return Err(invalid(format!(
@@ -619,7 +619,7 @@ impl InputEncodingPolicy for CompiledTableFunctionProcessor {}
 impl TransformKernel for CompiledTableFunctionProcessor {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.alive()?;
@@ -667,7 +667,7 @@ impl TransformKernel for CompiledTableFunctionProcessor {
             }
         }
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         let Some(cursor) = self.cursor.as_ref() else {
             return Ok(StepResult::new(None, NextStep::NeedInput, 0));
@@ -701,7 +701,7 @@ impl TransformKernel for CompiledTableFunctionProcessor {
         };
         Ok(StepResult::new(Some(output), next, 0))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }

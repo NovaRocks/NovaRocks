@@ -29,8 +29,8 @@ use crate::control_runtime::{
     host_executor::{HostExecutor, HostExecutorLimits, HostSubmitError},
 };
 use novarocks_execution_contract::{
-    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    CredentialUpdate, EstablishQueryContext,
+    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, CredentialUpdate, EstablishParticipation,
 };
 use std::sync::{
     Barrier,
@@ -114,7 +114,7 @@ fn fixture() -> Fixture {
         AdmissionStorage {
             loading: Default::default(),
             accepted: Default::default(),
-            context: Default::default(),
+            participation: Default::default(),
         },
         ESTABLISH_REQUEST_STORAGE
             .checked_sub(CONTROL_REQUEST_STORAGE)
@@ -128,7 +128,7 @@ fn request(
     getter_gate: Option<Arc<Gate>>,
     drop_gate: Option<Arc<Gate>>,
     panic_drop: bool,
-) -> (EstablishQueryContext, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+) -> (EstablishParticipation, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let getters = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let content = |getter_gate, drop_gate| {
@@ -142,15 +142,15 @@ fn request(
         }) as Arc<dyn CodecOwnedContent>
     };
     (
-        EstablishQueryContext::new(
+        EstablishParticipation::new(
             operation(),
-            f.context,
+            f.participation,
             AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
             content(getter_gate, drop_gate),
             content(None, None),
             content(None, None),
             CredentialUpdate::new(
-                CredentialLeaseId::new(1),
+                CredentialDomainId::new(1),
                 CredentialEpoch::new(1).unwrap(),
                 Arc::new(Credential {
                     drops: drops.clone(),
@@ -177,7 +177,7 @@ fn host(job: EstablishIngressJob) {
     let executor = HostExecutor::start(
         HostExecutorLimits {
             jobs: one,
-            per_context: one,
+            per_group: one,
             workers: one,
         },
         |job: EstablishIngressJob| job.run(),
@@ -203,18 +203,18 @@ fn finish_rpc(
         _ => panic!("actual host projection returned"),
     };
     assert_eq!(projection.operation, operation());
-    assert_eq!(projection.context, f.context);
+    assert_eq!(projection.participation, f.participation);
     f.root
         .submit_request(
             input,
             ControlInput::Establish {
                 request: projection.operation,
-                context: projection.context,
+                participation: projection.participation,
                 ticket: projection.ticket,
                 payload: projection.payload,
                 semantics: projection.semantics,
-                // This fixture has no Context or prior grant. No credential matches
-                // are claimed; existing-context routing remains a separate test face.
+                // This fixture has no Participation or prior grant. No credential matches
+                // are claimed; existing-participation routing remains a separate test face.
                 generation: generation(),
             },
         )
@@ -287,9 +287,9 @@ fn the_original_paid_rpc_survives_a_blocked_getter_and_a_blocked_raw_destructor(
         .submit_request(
             other,
             ControlInput::Acquire {
-                request: AcquireQueryContextAdmissionTicket::new(
+                request: AcquireParticipationAdmissionTicket::new(
                     other_operation,
-                    f.context,
+                    f.participation,
                     LeaseValidFor::new(Duration::from_secs(6)).unwrap(),
                     NativeCompatibilityId::new([3; 32]),
                     f.capability,
@@ -382,7 +382,7 @@ fn a_physical_queue_refusal_returns_the_same_unstarted_job_and_can_revoke_the_or
     let executor = HostExecutor::start(
         HostExecutorLimits {
             jobs: one,
-            per_context: one,
+            per_group: one,
             workers: one,
         },
         |job: EstablishIngressJob| job.run(),
@@ -447,7 +447,7 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
     assert!(projected);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);
-    assert_eq!(disposition, ExitRolePhase::Unresolved);
+    assert_eq!(disposition, ExitCustodyPhase::Unresolved);
     assert_eq!(progress.retired, 0);
     assert_eq!(retired, 0);
     assert!(original_still_owned);
@@ -456,7 +456,7 @@ fn independent_raw_field_panics_never_unwind_through_another_field_or_return_rpc
 
 #[test]
 fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw_disposal() {
-    let context_storage = StorageNeed {
+    let participation_storage = StorageNeed {
         captures: 1,
         work: 1,
         ..StorageNeed::default()
@@ -466,7 +466,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         .unwrap()
         .resources()
         .unwrap()
-        .checked_add(&context_storage.resources().unwrap())
+        .checked_add(&participation_storage.resources().unwrap())
         .unwrap();
     let mut f = Fixture::with_control_storage(
         2,
@@ -474,7 +474,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         AdmissionStorage {
             loading: Default::default(),
             accepted: Default::default(),
-            context: context_storage.resources().unwrap(),
+            participation: participation_storage.resources().unwrap(),
         },
         additional,
     );
@@ -494,9 +494,9 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         .submit_request(
             acquire,
             ControlInput::Acquire {
-                request: AcquireQueryContextAdmissionTicket::new(
+                request: AcquireParticipationAdmissionTicket::new(
                     acquisition,
-                    f.context,
+                    f.participation,
                     LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                     NativeCompatibilityId::new([3; 32]),
                     f.capability,
@@ -555,7 +555,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
             input,
             ControlInput::Establish {
                 request: projection.operation,
-                context: projection.context,
+                participation: projection.participation,
                 ticket: projection.ticket,
                 payload: projection.payload,
                 semantics: projection.semantics,
@@ -573,15 +573,15 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
         } => *reservation,
         _ => panic!("the exact redeemed ticket elected this actual materialize effect"),
     };
-    let (mut context_work, context_capacity) = f
+    let (mut participation_work, participation_capacity) = f
         .runtime
         .take_step_reservation(&materialize, reservation)
         .unwrap()
         .bind(WorkKind::Business)
         .unwrap();
-    context_work.start().unwrap();
+    participation_work.start().unwrap();
     // The elected ticket can lend only this original R's raw captures. The
-    // admitted Context holder above is still separate; borrowing the fields
+    // admitted Participation holder above is still separate; borrowing the fields
     // does not acknowledge that holder's physical body or publish Active.
     let loan = f.root.take_materialization_source(&materialize).unwrap();
     assert!(matches!(
@@ -592,9 +592,9 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     let resume = Arc::new(Barrier::new(2));
     let borrowed_host = borrowed.clone();
     let resume_host = resume.clone();
-    let expected_context = f.context;
+    let expected_participation = f.participation;
     let host_call = thread::spawn(move || {
-        assert_eq!(loan.shared_facts().context(), expected_context);
+        assert_eq!(loan.shared_facts().participation(), expected_participation);
         borrowed_host.wait();
         resume_host.wait();
         // A borrowed host panic returns the source loan on unwind. The
@@ -627,7 +627,7 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     drop(external);
     let retired = f.root.reap_ready_requests(8).unwrap();
     let fee = f.ledger.used(Dimension::Requests.id());
-    let context_still_owned = !context_work.actual_exit_ready().unwrap();
+    let participation_still_owned = !participation_work.actual_exit_ready().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     resume.wait();
     assert!(host_call.join().unwrap());
@@ -636,15 +636,15 @@ fn timeout_while_the_original_materialize_effect_is_started_cannot_authorize_raw
     std::mem::forget((
         f,
         materialize,
-        context_work,
-        context_capacity,
+        participation_work,
+        participation_capacity,
         retained_wrong_disposal,
     ));
     assert!(is_timeout);
     assert!(refused_disposal);
     assert_eq!(retired, 0);
     assert_eq!(fee, 1);
-    assert!(context_still_owned);
+    assert!(participation_still_owned);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
 }
@@ -673,7 +673,7 @@ fn a_started_getter_can_withdraw_only_after_its_raw_child_really_exits_and_witho
             input,
             ControlInput::Establish {
                 request: projection.operation,
-                context: projection.context,
+                participation: projection.participation,
                 ticket: projection.ticket,
                 payload: projection.payload,
                 semantics: wrong,
@@ -714,15 +714,15 @@ fn an_observed_getter_panic_reports_failure_then_retires_after_the_real_raw_exit
             panic_getter,
         }) as Arc<dyn CodecOwnedContent>
     };
-    let raw = EstablishQueryContext::new(
+    let raw = EstablishParticipation::new(
         operation(),
-        f.context,
+        f.participation,
         AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
         content(true),
         content(false),
         content(false),
         CredentialUpdate::new(
-            CredentialLeaseId::new(1),
+            CredentialDomainId::new(1),
             CredentialEpoch::new(1).unwrap(),
             Arc::new(Credential {
                 drops: drops.clone(),
@@ -785,7 +785,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
 
     // Two paid R positions, one Establish aggregate (3 Work / 2 reports /
     // 2 captures), and a second actual Root's original bootstrap vector.
-    // No ticket or Context allocation is needed: both operations truly refuse.
+    // No ticket or Participation allocation is needed: both operations truly refuse.
     let additional = ESTABLISH_REQUEST_STORAGE
         .checked_sub(CONTROL_REQUEST_STORAGE)
         .unwrap()
@@ -799,7 +799,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
         AdmissionStorage {
             loading: Default::default(),
             accepted: Default::default(),
-            context: Default::default(),
+            participation: Default::default(),
         },
         additional,
     );
@@ -836,7 +836,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
             admission_storage: AdmissionStorage {
                 loading: Default::default(),
                 accepted: Default::default(),
-                context: Default::default(),
+                participation: Default::default(),
             },
         },
     )
@@ -861,7 +861,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
             input,
             ControlInput::Establish {
                 request: projection.operation,
-                context: projection.context,
+                participation: projection.participation,
                 ticket: projection.ticket,
                 payload: projection.payload,
                 semantics: projection.semantics,
@@ -876,9 +876,9 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
         .submit_request(
             foreign_input,
             ControlInput::Acquire {
-                request: AcquireQueryContextAdmissionTicket::new(
+                request: AcquireParticipationAdmissionTicket::new(
                     operation(),
-                    f.context,
+                    f.participation,
                     // The second Root's real five-second rule yields a refusal,
                     // without asking for an unpaid ticket holder.
                     LeaseValidFor::new(Duration::from_secs(6)).unwrap(),
@@ -1009,13 +1009,13 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
         original_host_turn.release(false).unwrap();
     }
     f.runtime.seal_actor(foreign_actor).unwrap();
-    for role in resources.roles.iter_mut().rev() {
+    for role in resources.metadata_resources.iter_mut().rev() {
         role.work.body_exited().unwrap();
         role.work.captures_exited().unwrap();
     }
     f.ledger.reap_scope_ready(resources.scope.id(), 32).unwrap();
     drop(f.runtime.remove_actor(foreign_actor).unwrap());
-    for role in resources.roles.iter_mut().rev() {
+    for role in resources.metadata_resources.iter_mut().rev() {
         role.capacity
             .release_quota(&role.capacity.resources().unwrap().quota)
             .unwrap();
@@ -1042,7 +1042,8 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
 }
 
 #[test]
-fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_another_context() {
+fn two_physical_ingress_workers_keep_same_participation_rpcs_serial_and_progress_another_participation()
+ {
     use crate::control_runtime::preparation::{HostFairnessGroup, QueuedPreparation};
     use std::sync::mpsc;
 
@@ -1062,11 +1063,11 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
         AdmissionStorage {
             loading: Default::default(),
             accepted: Default::default(),
-            context: Default::default(),
+            participation: Default::default(),
         },
         additional,
     );
-    let original_context = f.context;
+    let original_participation = f.participation;
     let first_gate = Gate::new();
     let second_gate = Gate::new();
     let other_gate = Gate::new();
@@ -1074,15 +1075,15 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
         request(&f, Some(first_gate.clone()), None, false);
     let (second_raw, second_getters, second_drops) =
         request(&f, Some(second_gate.clone()), None, false);
-    let other_context = QueryContextRef::new(
+    let other_participation = ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(17001, 17002), AttemptId::new(1).unwrap()).unwrap(),
-        original_context.frontend_process_id(),
-        original_context.backend_process_id(),
+        original_participation.frontend_process_id(),
+        original_participation.backend_process_id(),
     );
-    f.context = other_context;
+    f.participation = other_participation;
     let (other_raw, other_getters, other_drops) =
         request(&f, Some(other_gate.clone()), None, false);
-    f.context = original_context;
+    f.participation = original_participation;
 
     let (first_input, first_external) = admit(&mut f);
     let (second_input, second_external) = admit(&mut f);
@@ -1108,14 +1109,14 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
     let metadata_correct = keys[0] != keys[1]
         && keys[0] != keys[2]
         && keys[1] != keys[2]
-        && groups[0] == HostFairnessGroup::Context(original_context)
+        && groups[0] == HostFairnessGroup::Participation(original_participation)
         && groups[1] == groups[0]
-        && groups[2] == HostFairnessGroup::Context(other_context);
+        && groups[2] == HostFairnessGroup::Participation(other_participation);
 
     // Observe entry without blocking the test on a Barrier that the correct
     // implementation must not reach yet. Both observation threads are released
     // unconditionally, including when the old scope grouping occupies workers
-    // with the first two same-Context bodies.
+    // with the first two same-Participation bodies.
     let (release_second_tx, release_second_rx) = mpsc::channel();
     let second_observer = thread::spawn(move || {
         second_gate.entered.wait();
@@ -1135,7 +1136,7 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
             // Three actual source scopes must fit even in the old grouping,
             // so a refusal cannot masquerade as a fairness test result.
             jobs: NonZeroUsize::new(3).unwrap(),
-            per_context: NonZeroUsize::new(2).unwrap(),
+            per_group: NonZeroUsize::new(2).unwrap(),
             workers: NonZeroUsize::new(2).unwrap(),
         },
         |job: EstablishIngressJob| job.run(),
@@ -1151,7 +1152,7 @@ fn two_physical_ingress_workers_keep_same_context_rpcs_serial_and_progress_anoth
         .unwrap_or_else(|_| panic!("paid second original getter"));
     queue
         .try_submit(other)
-        .unwrap_or_else(|_| panic!("paid other-context getter"));
+        .unwrap_or_else(|_| panic!("paid other-participation getter"));
     let other_progressed = entered_other_rx
         .recv_timeout(Duration::from_secs(5))
         .is_ok();

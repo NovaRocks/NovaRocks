@@ -18,7 +18,7 @@
 //! Driver-owned contract failures and caught panic facts. Payload rendering
 //! is bounded at capture; classification never inspects the panic message.
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
 use std::{any::Any, error::Error, fmt};
 
@@ -160,7 +160,7 @@ impl From<DriverFailure> for ExecutionFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::fragment::{ExecutionFailureCause, PipelineOperation};
+    use crate::runtime::task::{ExecutionFailureCause, PipelineOperation};
     #[test]
     fn captured_panic_is_bounded_without_classifying_or_recreating_its_cause() {
         for message in ["resource exhausted".to_owned(), "界".repeat(1000)] {

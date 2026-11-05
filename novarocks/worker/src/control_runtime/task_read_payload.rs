@@ -19,7 +19,7 @@
 //! The shared cell grants no Work, reply, read admission or physical exit.
 
 use super::{dynamic_filters::TaskDynamicFilterLoan, request_endpoint::RequestNotice};
-use novarocks_control_runtime::exit_role::ExitAuthority;
+use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_execution_contract::{DomainVersion, task_execution::domain::CodecOwnedContent};
 use novarocks_worker_protocol::creation::PayloadId;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ enum State {
     Lent,
     // Keep this phase after the unique token is taken; the same R cannot
     // install another payload by returning to an apparently unused cell.
-    Returned(Option<ExitAuthority>),
+    Returned(Option<ExitObligation>),
     Unresolved,
 }
 
@@ -93,7 +93,7 @@ impl TaskReadPayloadShared {
     /// The original R custodian must first prove its external leg Ended.
     /// Only an unborrowed Ready pin can be reclaimed here. Release the pin
     /// before returning the same authority; a Lent delivery still owns it.
-    pub(super) fn take_unlent_after_external_end(&self) -> Option<ExitAuthority> {
+    pub(super) fn take_unlent_after_external_end(&self) -> Option<ExitObligation> {
         let loan = {
             let mut state = self.state.lock().expect("original Task read payload");
             if !matches!(*state, State::Ready(_)) {
@@ -113,7 +113,7 @@ impl TaskReadPayloadShared {
         self.take_returned()
     }
 
-    pub(super) fn take_returned(&self) -> Option<ExitAuthority> {
+    pub(super) fn take_returned(&self) -> Option<ExitObligation> {
         let mut state = self.state.lock().expect("original Task read payload");
         match &mut *state {
             State::Returned(authority) => authority.take(),
@@ -128,7 +128,7 @@ impl TaskReadPayloadShared {
         )
     }
 
-    fn return_original(&self, authority: ExitAuthority) {
+    fn return_original(&self, authority: ExitObligation) {
         let refused = {
             let mut state = self.state.lock().expect("original Task read payload");
             if matches!(*state, State::Lent) {

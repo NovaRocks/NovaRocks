@@ -43,7 +43,7 @@ prefetch_progress_bucket_ms = 100
 # Capacity is reserved before Task acceptance and retained for legal late frames.
 # Preparation positions and bytes cover queued/running jobs until actual exit.
 # These limits are independent of active Task/completion capacity.
-task_preparation_max_tasks_per_context = 4096
+task_preparation_max_tasks_per_participation = 4096
 task_preparation_max_tasks = 32768
 task_preparation_max_bytes = 268435456
 task_preparation_max_workers = 4

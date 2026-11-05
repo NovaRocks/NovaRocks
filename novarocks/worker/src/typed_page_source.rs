@@ -59,7 +59,7 @@ impl TypedConnectorReaderMarker {
     /// This is an observation of delivered work, not a consumption proof.
     pub(crate) fn emit_close(&self, rows_decoded: u64, batches_delivered: u64) {
         self.observation.observe(&format!(
-            "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE provider={} instance={} catalog_version={} scheduled_split_sequence_id={} rows_decoded={} batches_delivered={}",
+            "{} provider={} instance={} catalog_version={} scheduled_split_sequence_id={} rows_decoded={} batches_delivered={}", novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_CLOSE,
             self.provider_id,
             self.instance_id,
             self.catalog_version,
@@ -69,9 +69,9 @@ impl TypedConnectorReaderMarker {
         ));
     }
 
-    pub(crate) fn emit(&self, event: &str) {
+    pub(crate) fn emit(&self, marker: &str) {
         self.observation.observe(&format!(
-            "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
+            "{marker} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
             self.provider_id,
             self.instance_id,
             self.catalog_version,

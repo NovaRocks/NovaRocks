@@ -116,7 +116,7 @@ fn all_workers_can_hold_blocked_routes_without_starving_original_eager_merge_cla
     // First freeze the difficult state using the actual private K leases:
     // W original routes occupy W workers; no merge has been claimed yet.
     for worker in &mut workers {
-        let BulkClaim::Task(task) = graph.claim(&work).unwrap() else {
+        let BulkClaim::Step(task) = graph.claim(&work).unwrap() else {
             panic!("actual route lease required");
         };
         worker.retained.push(Retained {
@@ -130,12 +130,12 @@ fn all_workers_can_hold_blocked_routes_without_starving_original_eager_merge_cla
         let mut blocked = false;
         for _ in 0..100_000 {
             match retained.task.advance(1, &work).unwrap() {
-                BulkTaskAdvance::Blocked => {
+                StepAdvance::Blocked => {
                     blocked = true;
                     break;
                 }
-                BulkTaskAdvance::Progressed => {}
-                BulkTaskAdvance::Done => {
+                StepAdvance::Progressed => {}
+                StepAdvance::Done => {
                     panic!("frontier stress must block before this route completes")
                 }
             }

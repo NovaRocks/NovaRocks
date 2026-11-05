@@ -173,7 +173,7 @@ impl BackendDeliveryRouteIdentity {
 pub struct BackendProducerInstanceRouteIdentity {
     channel: BackendChannelIdentity,
     producer_binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 impl BackendProducerInstanceRouteIdentity {
@@ -184,12 +184,12 @@ impl BackendProducerInstanceRouteIdentity {
     pub const fn new(
         channel: BackendChannelIdentity,
         producer_binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     ) -> Self {
         Self {
             channel,
             producer_binding_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 
@@ -213,8 +213,8 @@ impl BackendProducerInstanceRouteIdentity {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 }
 

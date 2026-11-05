@@ -31,7 +31,7 @@ use crate::catalog_application::query_bindings::{
     QueryWriteTargetAdmission,
 };
 use novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan;
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteInputShape};
+use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorWriteInputShape};
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::dml::{
     DmlWritePlanInput, DmlWriteSinkMode, DmlWriteTarget, DmlWriteTargetField,
@@ -44,7 +44,7 @@ use novarocks_sql::planning::query_execution::{
 ///
 /// This is intentionally separate from the legacy internal compiler helper:
 /// new application entry points must not receive the private planner write
-/// contract.  The request-local binding keeps the same exact planning lease
+/// contract.  The request-local binding keeps the same exact planning pin
 /// and provider preparation through terminal planning and fragment setup.
 pub(crate) fn dml_write_plan_input_for_admitted_target(
     bindings: &QueryTableBindingStore,
@@ -53,8 +53,8 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
     input: novarocks_sql::planning::dml::ConnectorWriteInputBinding,
 ) -> Result<DmlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
-    captured.admission.exact_planning_lease().map_err(|_| {
-        "SQL write target binding is missing its admission planning lease".to_string()
+    captured.admission.exact_planning_pin().map_err(|_| {
+        "SQL write target binding is missing its admission planning pin".to_string()
     })?;
     let admission = admitted_write_target(&captured)?;
     let write_input = &admission.input;
@@ -92,14 +92,14 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
 /// the whole target set at once and handed back an opaque writer recipe plus the
 /// input shape SQL is allowed to project. So there is no per-target preparation
 /// to sign here, and none is invented -- the binding carries the sealed input
-/// shape and nothing else the provider owns. The exact planning lease is the
+/// shape and nothing else the provider owns. The exact planning pin is the
 /// same one the session was begun on, which is what keeps the generation that
 /// signed the recipe alive through planning.
 pub(crate) fn admit_session_connector_write_target(
     bindings: &QueryTableBindingStore,
     identity: FrozenConnectorScanIdentity,
     target: &ConnectorWriteTargetPlan,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
 ) -> Result<SqlTableBindingId, String> {
     let key = QueryTableBindingKey::session_write_target(
         identity.catalog(),
@@ -116,7 +116,7 @@ pub(crate) fn admit_session_connector_write_target(
                 binding,
             ),
             statistics_pin: None,
-            admission: QueryTableBindingAdmission::Exact(planning_lease),
+            admission: QueryTableBindingAdmission::Exact(planning_pin),
             source_metadata: None,
             // A terminal write target, not a read source: see the note on the
             // prepared path below.

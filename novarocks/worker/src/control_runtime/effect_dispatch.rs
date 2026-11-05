@@ -20,13 +20,15 @@
 //! after publication does not prevent the next metadata publication.
 
 use super::actors::{WorkerAction, WorkerActor};
-use novarocks_control_runtime::driver::{ActorRuntime, CompletedEffect, DriverError, EffectTicket};
+use novarocks_control_runtime::actor_turn::{
+    ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
+};
 use novarocks_control_runtime_core::{
     effect::EffectState,
     identity::{ActionId, ActorId, BatchId, InputId},
 };
-use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
-use novarocks_worker_protocol::{context::ContextEffect, control::ControlEffect};
+use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
+use novarocks_worker_protocol::{control::ControlEffect, participation::ParticipationEffect};
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,9 +42,9 @@ mod tests;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum LaneKey {
     Task(TaskIdentity),
-    Route(QueryContextRef),
+    Route(ParticipationRef),
     ControlMetadata,
-    ContextMetadata,
+    ParticipationMetadata,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Release {
@@ -67,7 +69,7 @@ enum Ready {
 }
 #[derive(Debug)]
 pub(crate) enum DispatchError {
-    Runtime(DriverError),
+    Runtime(ActorTurnError),
     OwnerFailed,
     Capacity,
     InvalidPublication,
@@ -89,8 +91,8 @@ impl std::fmt::Display for DispatchError {
     }
 }
 impl std::error::Error for DispatchError {}
-impl From<DriverError> for DispatchError {
-    fn from(error: DriverError) -> Self {
+impl From<ActorTurnError> for DispatchError {
+    fn from(error: ActorTurnError) -> Self {
         Self::Runtime(error)
     }
 }
@@ -140,10 +142,10 @@ impl EffectDispatch {
         dispatch.control = true;
         dispatch
     }
-    /// Context-to-Control metadata keeps the producing actor's order across
+    /// Participation-to-Control metadata keeps the producing actor's order across
     /// batches. Completion means the next owner accepted the neutral handoff;
     /// it never waits for a reply from that owner or for a host I/O body.
-    pub(crate) fn context(
+    pub(crate) fn participation(
         runtime: ActorRuntime<WorkerActor>,
         actor: ActorId,
         limit: usize,
@@ -178,33 +180,33 @@ impl EffectDispatch {
             return Some((LaneKey::ControlMetadata, release));
         }
         match action {
-            WorkerAction::Context(
-                ContextEffect::EstablishProbed { .. }
-                | ContextEffect::EstablishmentDecided { .. }
-                | ContextEffect::RetainContext { .. },
-            ) => Some((LaneKey::ContextMetadata, Release::Completed)),
-            WorkerAction::Context(
-                ContextEffect::PublishTask { task, .. }
-                | ContextEffect::PublishMetrics { task, .. }
-                | ContextEffect::PublishTaskConvergence { task, .. }
-                | ContextEffect::SummaryConsumed { task, .. }
-                | ContextEffect::PublishConclusion { task, .. }
-                | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task, .. }
-                | ContextEffect::SettlementBarrier { task, .. },
+            WorkerAction::Participation(
+                ParticipationEffect::EstablishProbed { .. }
+                | ParticipationEffect::EstablishmentDecided { .. }
+                | ParticipationEffect::RetainParticipation { .. },
+            ) => Some((LaneKey::ParticipationMetadata, Release::Completed)),
+            WorkerAction::Participation(
+                ParticipationEffect::PublishTask { task, .. }
+                | ParticipationEffect::PublishMetrics { task, .. }
+                | ParticipationEffect::PublishTaskConvergence { task, .. }
+                | ParticipationEffect::SummaryConsumed { task, .. }
+                | ParticipationEffect::PublishConclusion { task, .. }
+                | ParticipationEffect::RetireTask { task, .. }
+                | ParticipationEffect::FinalizeTaskExecution { task, .. }
+                | ParticipationEffect::SettlementBarrier { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Published)),
-            WorkerAction::Context(ContextEffect::PrepareReadPayload { task, .. }) => {
-                Some((LaneKey::Task(*task), Release::Completed))
-            }
+            WorkerAction::Participation(ParticipationEffect::PrepareReadPayload {
+                task, ..
+            }) => Some((LaneKey::Task(*task), Release::Completed)),
             // Only the preceding publications gate dispatch. The original
             // started stop job retains its own actual exit/capture liability.
-            WorkerAction::Context(
-                ContextEffect::StopTask { task, .. }
-                | ContextEffect::DisposeSource { task, .. }
-                | ContextEffect::EnqueuePreparation { task, .. }
-                | ContextEffect::DisposeLoadedInput { task, .. }
-                | ContextEffect::InitialPreparationReady { task, .. }
-                | ContextEffect::ApplyTaskClose { task, .. },
+            WorkerAction::Participation(
+                ParticipationEffect::StopTask { task, .. }
+                | ParticipationEffect::DisposeSource { task, .. }
+                | ParticipationEffect::EnqueuePreparation { task, .. }
+                | ParticipationEffect::DisposeLoadedInput { task, .. }
+                | ParticipationEffect::InitialPreparationReady { task, .. }
+                | ParticipationEffect::ApplyTaskClose { task, .. },
             ) => Some((LaneKey::Task(*task), Release::Started)),
             // A later RPC reply observes the same Task publication order.
             // Starting its original delivery releases only this ordering
@@ -213,9 +215,9 @@ impl EffectDispatch {
                 .task
                 .map(|task| (LaneKey::Task(task), Release::Started)),
             WorkerAction::Control {
-                effect: ControlEffect::Route { context, .. },
+                effect: ControlEffect::Route { participation, .. },
                 ..
-            } => Some((LaneKey::Route(*context), Release::Published)),
+            } => Some((LaneKey::Route(*participation), Release::Published)),
             _ => None,
         }
     }
@@ -241,7 +243,7 @@ impl EffectDispatch {
                 self.actor,
                 input,
                 None,
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             )?;
             let units = 1 + records.len();
             if units > budget - result.units {
@@ -305,7 +307,7 @@ impl EffectDispatch {
             let ticket =
                 match runtime.take_effect(self.actor, entry.effect.input, entry.effect.action) {
                     Ok(ticket) => ticket,
-                    Err(DriverError::Effect(
+                    Err(ActorTurnError::Effect(
                         novarocks_control_runtime_core::effect::EffectError::NotReady,
                     )) => {
                         self.ready.push_back(ready);
@@ -377,7 +379,7 @@ impl EffectDispatch {
             self.actor,
             ticket.input,
             None,
-            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         )? {
             if state == EffectState::Pending && descriptor.dependencies.contains(&effect.action) {
                 runtime.acknowledge_dependency(
@@ -436,7 +438,7 @@ impl EffectDispatch {
         let key = if self.control {
             LaneKey::ControlMetadata
         } else {
-            LaneKey::ContextMetadata
+            LaneKey::ParticipationMetadata
         };
         self.complete_lane(key, effect)
     }
@@ -450,7 +452,7 @@ impl EffectDispatch {
         let key = if self.control {
             LaneKey::ControlMetadata
         } else {
-            LaneKey::ContextMetadata
+            LaneKey::ParticipationMetadata
         };
         if completed.registration().actor() != self.actor {
             return Err(DispatchError::InvalidPublication);
@@ -519,7 +521,7 @@ impl EffectDispatch {
             self.actor,
             effect.input,
             None,
-            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         )? {
             if state == EffectState::Pending && descriptor.dependencies.contains(&effect.action) {
                 runtime.acknowledge_dependency(

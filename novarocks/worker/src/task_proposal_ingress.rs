@@ -23,7 +23,7 @@ use crate::control_runtime::request_ready::RequestReadySlot;
 use retirement_notice::RetirementWakes;
 
 #[cfg(test)]
-use crate::task_completion_roles::AdmittedCompletionRole;
+use crate::task_completion_set::AdmittedCompletionTransfer;
 use crate::{
     control_runtime::{
         source_custody::SourceCustody,
@@ -41,13 +41,13 @@ use novarocks_control_runtime_core::{
     completion::Consumption,
     identity::{Generation, ScopedWorkRef},
 };
-use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
+use novarocks_execution::runtime::{execution_health::ExecutionHealth, task::ExecutionFailure};
 use novarocks_execution_contract::{
     RetainedTaskSource, TaskConclusionProposal, TaskIdentity, TaskOperationId,
 };
 use novarocks_worker_protocol::{
-    context::{ContextCommand, ContextInput, TaskCloseIntent},
     lease::MonotonicInstant,
+    participation::{ParticipationCommand, ParticipationInput, TaskCloseIntent},
     proposal_summary::{CausalSegments, CutError, CutId, Diagnostic, ProposalSummary, SourceId},
 };
 use std::{
@@ -150,7 +150,7 @@ struct EventCell {
     work: Option<ScopedWorkRef>,
     phase: EventPhase,
     kind: CausalEventKind,
-    input: Option<ContextInput>,
+    input: Option<ParticipationInput>,
 }
 /// The request token comes from the actual consumed runtime envelope. A
 /// causal author retains only the original business operation and deadline.
@@ -182,7 +182,7 @@ pub(crate) struct CausalEventInput {
     pub prefix: SummaryInput,
     pub work: ScopedWorkRef,
     pub request: Option<RequestMetadata>,
-    pub event: ContextInput,
+    pub event: ParticipationInput,
 }
 pub(crate) struct TaskProposalIngress {
     state: Mutex<State>,
@@ -725,8 +725,8 @@ impl TaskProposalIngress {
     pub(crate) fn register_input_event(
         &self,
         cut: CutId,
-        input: ContextInput,
-    ) -> Result<(), (IngressError, ContextInput)> {
+        input: ParticipationInput,
+    ) -> Result<(), (IngressError, ParticipationInput)> {
         let mut retirement_wakes = RetirementWakes::default();
         let mut state = self.state.lock().expect("task proposal handoff lock");
         let Some(event) = state.cuts.get(&cut).and_then(|cell| cell.event.as_ref()) else {
@@ -735,35 +735,37 @@ impl TaskProposalIngress {
         let input_task = match (event.kind, &input) {
             (
                 CausalEventKind::Request(_),
-                ContextInput::Request(
-                    ContextCommand::Cancel { task, .. }
-                    | ContextCommand::UpdateTask { task, .. }
-                    | ContextCommand::GetFinalInfo { task }
-                    | ContextCommand::GetDynamicFilters { task, .. },
+                ParticipationInput::Request(
+                    ParticipationCommand::Cancel { task, .. }
+                    | ParticipationCommand::UpdateTask { task, .. }
+                    | ParticipationCommand::GetFinalInfo { task }
+                    | ParticipationCommand::GetDynamicFilters { task, .. },
                 ),
             ) => Some(*task),
             // This exact paid R carries a channel fact, not another request
             // admission. Keep its original Task prefix and reply identity.
-            (CausalEventKind::Request(_), ContextInput::RootEndAcknowledged { task }) => {
+            (CausalEventKind::Request(_), ParticipationInput::RootEndAcknowledged { task }) => {
                 Some(*task)
             }
             (
                 CausalEventKind::Input,
-                ContextInput::Loaded { task, .. }
-                | ContextInput::LoadedTask { task, .. }
-                | ContextInput::InstalledTask { task, .. }
-                | ContextInput::Running { task }
-                | ContextInput::Flushing { task }
-                | ContextInput::CompletionIntent { task, .. }
-                | ContextInput::CompletionExited { task }
-                | ContextInput::TerminalObservation { task, .. }
-                | ContextInput::FinishWithOutput { task, .. }
-                | ContextInput::Physical { task, .. }
-                | ContextInput::Metrics { task, .. }
-                | ContextInput::OperatorStatistics { task, .. }
-                | ContextInput::DynamicFilterPublished { task, .. },
+                ParticipationInput::Loaded { task, .. }
+                | ParticipationInput::LoadedTask { task, .. }
+                | ParticipationInput::InstalledTask { task, .. }
+                | ParticipationInput::Running { task }
+                | ParticipationInput::Flushing { task }
+                | ParticipationInput::CompletionIntent { task, .. }
+                | ParticipationInput::CompletionExited { task }
+                | ParticipationInput::TerminalObservation { task, .. }
+                | ParticipationInput::FinishWithOutput { task, .. }
+                | ParticipationInput::Physical { task, .. }
+                | ParticipationInput::Metrics { task, .. }
+                | ParticipationInput::OperatorStatistics { task, .. }
+                | ParticipationInput::DynamicFilterPublished { task, .. },
             ) => Some(*task),
-            (CausalEventKind::Input, ContextInput::TaskUpdateApplied { task, .. }) => Some(*task),
+            (CausalEventKind::Input, ParticipationInput::TaskUpdateApplied { task, .. }) => {
+                Some(*task)
+            }
             _ => None,
         };
         if event.phase != EventPhase::Reserved
@@ -920,8 +922,8 @@ impl TaskProposalIngress {
         let event = state.cuts.get_mut(&cut).unwrap().event.as_mut().unwrap();
         event.phase = EventPhase::Taken;
         let input = match kind {
-            CausalEventKind::Settlement => ContextInput::Settle { task, work },
-            CausalEventKind::ApplyClose(generation, intent) => ContextInput::ApplyTaskClose {
+            CausalEventKind::Settlement => ParticipationInput::Settle { task, work },
+            CausalEventKind::ApplyClose(generation, intent) => ParticipationInput::ApplyTaskClose {
                 task,
                 generation,
                 intent,
@@ -1095,21 +1097,24 @@ impl TaskProposalIngress {
     ) -> Result<
         (),
         (
-            novarocks_control_runtime::driver::DriverError,
+            novarocks_control_runtime::actor_turn::ActorTurnError,
             crate::control_runtime::adopted_cleanup::AdoptedCleanupEffect,
         ),
     > {
         use crate::control_runtime::actors::WorkerAction;
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         let source = match cleanup.effect() {
-            WorkerAction::Context(
-                novarocks_worker_protocol::context::ContextEffect::DisposeSource { source, .. },
+            WorkerAction::Participation(
+                novarocks_worker_protocol::participation::ParticipationEffect::DisposeSource {
+                    source,
+                    ..
+                },
             ) => *source,
-            _ => return Err((DriverError::PublicationTargetMismatch, cleanup)),
+            _ => return Err((ActorTurnError::PublicationTargetMismatch, cleanup)),
         };
         let original = match self.source_inventory(source) {
             Ok(original) => original,
-            Err(_) => return Err((DriverError::UnknownInput, cleanup)),
+            Err(_) => return Err((ActorTurnError::UnknownInput, cleanup)),
         };
         original.custody.adopt_cleanup(stage, cleanup)
     }
@@ -1128,15 +1133,15 @@ impl TaskProposalIngress {
     pub(crate) fn observe_source_core_input(
         &self,
         source: SourceId,
-        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
             crate::control_runtime::actors::WorkerActor,
         >,
-        registration: &novarocks_control_runtime::driver::ActorRegistration,
+        registration: &novarocks_control_runtime::actor_turn::ActorRegistration,
         task_source: novarocks_control_runtime_core::identity::ActorId,
         input: novarocks_control_runtime_core::identity::InputId,
-    ) -> Result<bool, novarocks_control_runtime::driver::DriverError> {
+    ) -> Result<bool, novarocks_control_runtime::actor_turn::ActorTurnError> {
         let original = self.source_inventory(source).map_err(|_| {
-            novarocks_control_runtime::driver::DriverError::PublicationTargetMismatch
+            novarocks_control_runtime::actor_turn::ActorTurnError::PublicationTargetMismatch
         })?;
         original
             .custody
@@ -1146,13 +1151,13 @@ impl TaskProposalIngress {
         &self,
         source: SourceId,
         stage: &crate::control_runtime::failure::ScopePublicationsDrained<'_>,
-        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
             crate::control_runtime::actors::WorkerActor,
         >,
-        registration: &novarocks_control_runtime::driver::ActorRegistration,
-    ) -> Result<bool, novarocks_control_runtime::driver::DriverError> {
+        registration: &novarocks_control_runtime::actor_turn::ActorRegistration,
+    ) -> Result<bool, novarocks_control_runtime::actor_turn::ActorTurnError> {
         let original = self.source_inventory(source).map_err(|_| {
-            novarocks_control_runtime::driver::DriverError::PublicationTargetMismatch
+            novarocks_control_runtime::actor_turn::ActorTurnError::PublicationTargetMismatch
         })?;
         original
             .custody
@@ -1757,8 +1762,8 @@ mod tests {
     use super::*;
     use novarocks_control_runtime::{
         completion::ReportSlot,
-        exit_role::ExitRolePhase,
-        lease::WorkLease,
+        exit_custody::ExitCustodyPhase,
+        obligation::WorkObligation,
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -1781,14 +1786,14 @@ mod tests {
         },
     };
 
-    fn reported(role: AdmittedCompletionRole) -> ReportedWork {
-        crate::control_runtime::admitted_role::adopt_reported_work(
+    fn reported(role: AdmittedCompletionTransfer) -> ReportedWork {
+        crate::control_runtime::reported_work_admission::adopt_reported_work(
             role.work,
             role.capacity,
             role.report,
         )
     }
-    fn slot(role: AdmittedCompletionRole) -> SourceSlotAdmission {
+    fn slot(role: AdmittedCompletionTransfer) -> SourceSlotAdmission {
         // The actual bound role is the only Source storage owner.
         SourceSlotAdmission::from_admitted(reported(role)).unwrap()
     }
@@ -1823,8 +1828,8 @@ mod tests {
         task: TaskIdentity,
         ledger: RuntimeLedger,
         scope: ScopeHandle,
-        parent: WorkLease,
-        capacity: novarocks_control_runtime::lease::ReservationBundle,
+        parent: WorkObligation,
+        capacity: novarocks_control_runtime::obligation::ReservationObligation,
         pending: Arc<Pending>,
         health: Arc<ExecutionHealth>,
         ingress: Arc<TaskProposalIngress>,
@@ -1876,7 +1881,7 @@ mod tests {
         fn make_role(
             scope: &ScopeHandle,
             parent: novarocks_control_runtime_core::identity::ReservationId,
-        ) -> AdmittedCompletionRole {
+        ) -> AdmittedCompletionTransfer {
             let generation = scope.gates().unwrap().generation;
             let mut guard = scope
                 .reserve_child_next(
@@ -1903,13 +1908,13 @@ mod tests {
             )
             .unwrap();
             let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-            AdmittedCompletionRole {
+            AdmittedCompletionTransfer {
                 work,
                 capacity,
                 report,
             }
         }
-        fn roles(&self) -> [AdmittedCompletionRole; 2] {
+        fn roles(&self) -> [AdmittedCompletionTransfer; 2] {
             std::array::from_fn(|_| Self::make_role(&self.scope, self.capacity.id()))
         }
         fn slot_roles(&self) -> [SourceSlotAdmission; 2] {
@@ -1922,7 +1927,7 @@ mod tests {
             self.dispose_roles(roles.map(|slot| {
                 let reported = slot.into_reported();
                 let (work, capacity, report) = reported.into_parts();
-                AdmittedCompletionRole {
+                AdmittedCompletionTransfer {
                     work,
                     capacity,
                     report,
@@ -1946,7 +1951,7 @@ mod tests {
                 .reserve_cut(cut, 0, CutSourceAdmission::Fresh(self.slot_roles()))
                 .unwrap_or_else(|_| panic!("actual paid cut"));
         }
-        fn dispose_roles<const N: usize>(&self, roles: [AdmittedCompletionRole; N]) {
+        fn dispose_roles<const N: usize>(&self, roles: [AdmittedCompletionTransfer; N]) {
             for role in roles {
                 let (custody, permit) = SourceCustody::from_admitted(
                     self.task,
@@ -1981,7 +1986,7 @@ mod tests {
             let observations = self.ingress.pair_inventory(route).unwrap();
             for observation in observations {
                 assert!(observation.custody.actual_exit_ready().unwrap());
-                if observation.custody.phase() != ExitRolePhase::Retired {
+                if observation.custody.phase() != ExitCustodyPhase::Retired {
                     if observation.source.is_some() {
                         observation.custody.report().consume(observer()).unwrap();
                     }
@@ -2274,7 +2279,7 @@ mod tests {
             .bind_event_work(cut, f.parent.reference())
             .unwrap();
         f.ingress
-            .register_input_event(cut, ContextInput::CompletionExited { task: f.task })
+            .register_input_event(cut, ParticipationInput::CompletionExited { task: f.task })
             .unwrap();
         assert!(matches!(
             f.ingress.take_next_event(false),
@@ -2302,7 +2307,7 @@ mod tests {
             event.prefix.summary.candidate_sources().collect::<Vec<_>>(),
             vec![SourceId(1)]
         );
-        assert!(matches!(event.event,ContextInput::CompletionExited{task} if task==f.task));
+        assert!(matches!(event.event,ParticipationInput::CompletionExited{task} if task==f.task));
         drop(f.ingress.take_source(SourceId(1)).unwrap());
         f.ingress.summary_consumed(Some(cut)).unwrap();
         f.ingress.observe_cut_exit(cut, true, true).unwrap();
@@ -2632,7 +2637,7 @@ mod tests {
             let retired = f.ingress.retire_cut_unclaimed(cut).unwrap();
             assert!(
                 retired.funding.custody.iter().all(|role| role.phase()
-                    == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted),
+                    == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted),
                 "cell handoff neither exits source roles nor refunds funding"
             );
             admission = CutSourceAdmission::Unclaimed(retired.pair);

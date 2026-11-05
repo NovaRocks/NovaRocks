@@ -85,7 +85,7 @@ WHERE b.flag = 'Y';
 -- @skip_result_check=true
 -- @normalize_explain_timing=true
 -- @result_contains=RuntimeFilterApply: input_rows=6000 output_rows=20
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_contains=HASH JOIN (PARTITIONED
 EXPLAIN ANALYZE
 SELECT COUNT(*) AS row_count, COALESCE(SUM(p.id), 0) AS id_sum

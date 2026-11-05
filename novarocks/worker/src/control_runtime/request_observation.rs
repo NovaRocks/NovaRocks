@@ -30,7 +30,7 @@ use std::{
 pub(crate) const REQUEST_OBSERVATION_CAPTURES: usize = 1;
 
 #[derive(Clone, Copy, Default)]
-pub(super) enum ContextObservationKind {
+pub(super) enum ParticipationObservationKind {
     #[default]
     Other,
     Renew,
@@ -167,27 +167,27 @@ pub(super) fn establish_event(
     operation: novarocks_execution_contract::TaskOperationId,
     body: &novarocks_worker_protocol::control::ControlReplyBody,
 ) -> Option<TaskProtocolEvent> {
-    let novarocks_worker_protocol::control::ControlReplyBody::Context(ack) = body else {
+    let novarocks_worker_protocol::control::ControlReplyBody::Participation(ack) = body else {
         return None;
     };
-    let receipt = crate::QueryContextOutcome::acknowledged(
+    let receipt = crate::ParticipationOutcome::acknowledged(
         operation,
         ack.outcome,
         ack.receipt.as_ref().clone(),
     );
-    TaskProtocolEvent::establish_query_context(ack.receipt.context(), &receipt)
+    TaskProtocolEvent::establish_participation(ack.receipt.participation(), &receipt)
 }
 
-pub(super) fn context_event(
+pub(super) fn participation_event(
     operation: novarocks_execution_contract::TaskOperationId,
-    kind: ContextObservationKind,
-    body: &novarocks_worker_protocol::context::ContextReplyBody,
-    result: novarocks_worker_protocol::context::RequestResult,
+    kind: ParticipationObservationKind,
+    body: &novarocks_worker_protocol::participation::ParticipationReplyBody,
+    result: novarocks_worker_protocol::participation::RequestResult,
     release_observation: Option<crate::RuntimeFilterReleaseObservation>,
 ) -> Option<TaskProtocolEvent> {
-    use novarocks_worker_protocol::context::ContextReplyBody;
+    use novarocks_worker_protocol::participation::ParticipationReplyBody;
     match body {
-        ContextReplyBody::Create { outcome, receipt } => {
+        ParticipationReplyBody::Create { outcome, receipt } => {
             let original = crate::CreateTaskOutcome::acknowledged(
                 operation,
                 *outcome,
@@ -195,41 +195,51 @@ pub(super) fn context_event(
             );
             TaskProtocolEvent::create_task(receipt.identity(), &original)
         }
-        ContextReplyBody::Context(ack) => {
-            let original = crate::QueryContextOutcome::acknowledged(
+        ParticipationReplyBody::Participation(ack) => {
+            let original = crate::ParticipationOutcome::acknowledged(
                 operation,
                 ack.outcome,
                 ack.receipt.as_ref().clone(),
             );
             match kind {
-                ContextObservationKind::Renew => ack.receipt.lease().and_then(|lease| {
-                    TaskProtocolEvent::renew_query_execution_lease(
-                        ack.receipt.context(),
+                ParticipationObservationKind::Renew => ack.receipt.lease().and_then(|lease| {
+                    TaskProtocolEvent::renew_participation_lease(
+                        ack.receipt.participation(),
                         lease.sequence(),
                         &original,
                     )
                 }),
-                ContextObservationKind::Abort => {
-                    TaskProtocolEvent::abort_query_context(ack.receipt.context(), &original)
+                ParticipationObservationKind::Abort => {
+                    TaskProtocolEvent::abort_participation(ack.receipt.participation(), &original)
                 }
-                ContextObservationKind::Other => None,
+                ParticipationObservationKind::Other => None,
             }
         }
-        ContextReplyBody::Release {
-            context,
+        ParticipationReplyBody::Release {
+            participation,
             release,
             state,
             termination_cause,
         } => {
-            let novarocks_worker_protocol::context::RequestResult::Outcome(outcome) = result else {
+            let novarocks_worker_protocol::participation::RequestResult::Outcome(outcome) = result
+            else {
                 return None;
             };
-            let original = crate::ReleaseQueryContextOutcome::acknowledged(
+            let original = crate::ReleaseParticipationOutcome::acknowledged(
                 operation,
                 outcome,
-                crate::ReleaseAcknowledgement::new(*context, *release, *state, *termination_cause),
+                crate::ReleaseAcknowledgement::new(
+                    *participation,
+                    *release,
+                    *state,
+                    *termination_cause,
+                ),
             );
-            TaskProtocolEvent::release_query_context(*context, &original, release_observation?)
+            TaskProtocolEvent::release_participation(
+                *participation,
+                &original,
+                release_observation?,
+            )
         }
         _ => None,
     }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual paid Root/Context route custody. The metadata-only Context bootstrap
+//! Actual paid Root/Participation route custody. The metadata-only Participation bootstrap
 //! never invokes Native materialization or invents a successful host result.
 mod deferred;
 mod late_return;
@@ -24,22 +24,26 @@ mod partial;
 use super::*;
 use crate::{
     control_runtime::{
-        context_host::{CONTEXT_BOOTSTRAP_STORAGE, ContextHostBinding, ContextHostRecord},
         control_internal::{CONTROL_INTERNAL_STORAGE, InternalAdvance},
         effect_dispatch::EffectRef,
         establish_ingress::{EstablishDisposalJob, EstablishIngressOutcome},
+        participation_host::{
+            PARTICIPATION_BOOTSTRAP_STORAGE, ParticipationHostBinding, ParticipationHostRecord,
+        },
     },
-    control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits},
+    control_runtime_policy::{ControlRuntimePolicy, IngressPositionLimits},
 };
-use novarocks_control_runtime::{driver::InputPhase, publication::PublishedSnapshot};
+use novarocks_control_runtime::{actor_turn::InputPhase, publication::PublishedSnapshot};
 use novarocks_execution_contract::{
-    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    CredentialUpdate, EstablishQueryContext, QueryContextState,
+    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, CredentialUpdate, EstablishParticipation, ParticipationState,
 };
 use novarocks_worker_protocol::{
-    context::{ContextConfig, ContextCore, ContextEffect, EstablishReplayResult},
     control::EstablishSemanticFacts,
     lease::LeaseBounds,
+    participation::{
+        EstablishReplayResult, ParticipationConfig, ParticipationCore, ParticipationEffect,
+    },
 };
 use std::{
     sync::{
@@ -75,7 +79,7 @@ fn op(value: u8) -> TaskOperationId {
 fn at(nanos: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_nanos(nanos))
 }
-fn context_actor() -> ActorId {
+fn participation_actor() -> ActorId {
     ActorId::new(4).unwrap()
 }
 fn semantics() -> EstablishSemanticFacts {
@@ -83,7 +87,7 @@ fn semantics() -> EstablishSemanticFacts {
         catalog: ContentFingerprint::from_bytes([1; 16]),
         shared_filter: ContentFingerprint::from_bytes([1; 16]),
         query_options: ContentFingerprint::from_bytes([1; 16]),
-        credential_lease: CredentialLeaseId::new(1),
+        credential_domain_id: CredentialDomainId::new(1),
         credential_epoch: CredentialEpoch::FIRST,
         initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     }
@@ -134,7 +138,7 @@ impl ConfidentialContent for Credential {
         panic!("no confidential bytes are projected")
     }
     fn matches(&self, _: &dyn ConfidentialContent) -> bool {
-        panic!("a mismatch or an unmaterialized Context cannot claim a material comparison")
+        panic!("a mismatch or an unmaterialized Participation cannot claim a material comparison")
     }
 }
 impl Drop for Credential {
@@ -144,7 +148,7 @@ impl Drop for Credential {
 }
 
 struct ConflictObservation {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     caller: thread::ThreadId,
     calls: AtomicUsize,
 }
@@ -157,24 +161,24 @@ impl crate::TaskProtocolObserver for ConflictObservation {
         );
         assert!(
             matches!(event,
-            crate::TaskProtocolEvent::ContextEstablishConflict { context }
-            if context == self.context),
-            "the original replay owes exactly its ContextConflict event"
+            crate::TaskProtocolEvent::ParticipationEstablishConflict { participation }
+            if participation == self.participation),
+            "the original replay owes exactly its ParticipationConflict event"
         );
         assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
     }
 }
 impl crate::TaskResultLifecycle for ConflictObservation {
     fn discard_task(&self, _: novarocks_execution_contract::TaskIdentity) {
-        panic!("this Context-only replay admitted no Task result");
+        panic!("this Participation-only replay admitted no Task result");
     }
     fn retire_task_result(&self, _: novarocks_execution_contract::TaskIdentity) {
-        panic!("this Context-only replay admitted no Task result");
+        panic!("this Participation-only replay admitted no Task result");
     }
 }
 impl crate::TaskExecutionMetrics for ConflictObservation {
     fn record_task_created(&self) {
-        panic!("this Context-only replay admitted no Task");
+        panic!("this Participation-only replay admitted no Task");
     }
 }
 
@@ -184,9 +188,9 @@ struct RouteFixture {
     creator: InputId,
     creator_handle: Option<ControlRequestHandle>,
     host_storage: StorageNeed,
-    snapshot: PublishedSnapshot<QueryContextState>,
-    removed: Option<ContextHostRecord>,
-    pending_bootstrap: Option<(EffectTicket<WorkerAction>, ContextHostBinding)>,
+    snapshot: PublishedSnapshot<ParticipationState>,
+    removed: Option<ParticipationHostRecord>,
+    pending_bootstrap: Option<(EffectTicket<WorkerAction>, ParticipationHostBinding)>,
 }
 struct RouteStarted {
     input: InputId,
@@ -200,7 +204,7 @@ impl RouteFixture {
         Self::with_geometry(2, StorageNeed::default(), false)
     }
     fn with_geometry(positions: usize, extra: StorageNeed, deferred: bool) -> Self {
-        let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+        let policy = ControlRuntimePolicy::try_new(IngressPositionLimits {
             ordinary_running: positions - 1,
             ordinary_waiting: 0,
             control_running: 1,
@@ -209,14 +213,14 @@ impl RouteFixture {
             root_read_holders: 1,
         })
         .unwrap();
-        let context_storage = CONTEXT_BOOTSTRAP_STORAGE.resources().unwrap();
-        let context = context_storage.clone();
+        let participation_storage = PARTICIPATION_BOOTSTRAP_STORAGE.resources().unwrap();
+        let participation = participation_storage.clone();
         let storage = AdmissionStorage {
             loading: policy.loading.resources().unwrap(),
             accepted: policy.accepted.resources().unwrap(),
-            // The admission port adds the real Context unit once;
+            // The admission port adds the real Participation unit once;
             // this field contains only its already funded metadata.
-            context: context_storage,
+            participation: participation_storage,
         };
         let host_storage = StorageNeed {
             inputs: 1,
@@ -225,7 +229,7 @@ impl RouteFixture {
             work: 1,
             ..StorageNeed::default()
         };
-        let mut additional = context
+        let mut additional = participation
             .checked_add(&CONTROL_INTERNAL_STORAGE.resources().unwrap())
             .unwrap()
             .checked_add(&host_storage.resources().unwrap())
@@ -249,7 +253,7 @@ impl RouteFixture {
         assert_eq!(f.root.advance_internal().unwrap(), InternalAdvance::Idle);
         let snapshot = PublishedSnapshot::new(
             &f.root.resources().scope,
-            Arc::new(QueryContextState::Absent),
+            Arc::new(ParticipationState::Absent),
         );
         let mut this = Self {
             f,
@@ -271,9 +275,9 @@ impl RouteFixture {
             .submit_request(
                 acquire,
                 ControlInput::Acquire {
-                    request: AcquireQueryContextAdmissionTicket::new(
+                    request: AcquireParticipationAdmissionTicket::new(
                         op(10),
-                        this.f.context,
+                        this.f.participation,
                         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                         NativeCompatibilityId::new([3; 32]),
                         this.f.capability,
@@ -306,7 +310,7 @@ impl RouteFixture {
                 creator,
                 ControlInput::Establish {
                     request: op(11),
-                    context: this.f.context,
+                    participation: this.f.participation,
                     ticket: this.ticket,
                     payload: PayloadId(100),
                     semantics: semantics(),
@@ -330,19 +334,19 @@ impl RouteFixture {
             } => *establishment,
             _ => panic!("the original committed Materialize"),
         };
-        let binding = ContextHostBinding {
-            actor: context_actor(),
-            core: ContextCore::new(
-                this.f.context,
+        let binding = ParticipationHostBinding {
+            actor: participation_actor(),
+            core: ParticipationCore::new(
+                this.f.participation,
                 generation(),
                 establishment,
-                ContextConfig {
+                ParticipationConfig {
                     max_tasks: 1,
                     max_creation_waiters: positions,
                     max_pending_requests: positions,
                     max_preparing: 1,
                     max_task_bytes: 1024,
-                    step_budget: ContextCore::MAX_STEP_WORK,
+                    step_budget: ParticipationCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
                     request_horizon: crate::RequestHorizon::DEFAULT,
@@ -356,13 +360,16 @@ impl RouteFixture {
         };
         this.pending_bootstrap = Some((materialize, binding));
         if !deferred {
-            this.adopt_pending_context();
+            this.adopt_pending_participation();
         }
         this
     }
-    fn adopt_pending_context(&mut self) {
+    fn adopt_pending_participation(&mut self) {
         let (materialize, binding) = self.pending_bootstrap.take().unwrap();
-        self.f.root.adopt_context(&materialize, binding).unwrap();
+        self.f
+            .root
+            .adopt_participation(&materialize, binding)
+            .unwrap();
         // Actual metadata handoff; no Native materialization job was invoked.
         self.f.complete_body(materialize);
         self.f.root.note_control_input_progress(self.creator);
@@ -420,7 +427,12 @@ impl RouteFixture {
                             assert_eq!(owner.admission(), *id);
                             owner.authorize_parent_retirement(&ticket).unwrap();
                         } else {
-                            let address = self.f.root.service().context(self.f.context).unwrap();
+                            let address = self
+                                .f
+                                .root
+                                .service()
+                                .participation(self.f.participation)
+                                .unwrap();
                             let mut owner = address.lock().unwrap();
                             assert_eq!(owner.admission(), *id);
                             owner.authorize_parent_retirement(&ticket).unwrap();
@@ -435,7 +447,7 @@ impl RouteFixture {
                             .f
                             .root
                             .service()
-                            .take_removing_context(&ticket)
+                            .take_removing_participation(&ticket)
                             .unwrap()
                             .unwrap();
                         assert!(self.removed.replace(owner).is_none());
@@ -494,15 +506,15 @@ impl RouteFixture {
                 gate,
             }) as Arc<dyn CodecOwnedContent>
         };
-        let request = EstablishQueryContext::new(
+        let request = EstablishParticipation::new(
             operation,
-            self.f.context,
+            self.f.participation,
             self.ticket,
             content(gate),
             content(None),
             content(None),
             CredentialUpdate::new(
-                CredentialLeaseId::new(1),
+                CredentialDomainId::new(1),
                 CredentialEpoch::FIRST,
                 Arc::new(Credential(drops.clone())),
             ),
@@ -524,7 +536,7 @@ impl RouteFixture {
                 input,
                 ControlInput::Establish {
                     request: projection.operation,
-                    context: projection.context,
+                    participation: projection.participation,
                     ticket: projection.ticket,
                     payload: projection.payload,
                     semantics: projection.semantics,
@@ -551,15 +563,22 @@ impl RouteFixture {
     fn probe(&mut self, input: InputId) -> EstablishReplayResult {
         self.f.runtime.poll_one(Tick(3)).unwrap();
         let runtime = self.f.runtime.clone();
-        let host_address = self.f.root.service().context(self.f.context).unwrap();
+        let host_address = self
+            .f
+            .root
+            .service()
+            .participation(self.f.participation)
+            .unwrap();
         let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         let probe = host.dispatch.take_ready(&runtime, 64).unwrap().unwrap();
         let result = match &probe.effect {
-            WorkerAction::Context(ContextEffect::EstablishProbed {
-                request, result, ..
+            WorkerAction::Participation(ParticipationEffect::EstablishProbed {
+                request,
+                result,
+                ..
             }) if request.token == input => result.clone(),
-            _ => panic!("actual Context owner probe"),
+            _ => panic!("actual Participation owner probe"),
         };
         drop(host);
         self.assert_original_probe_author(&probe, input);
@@ -595,21 +614,26 @@ impl RouteFixture {
             .f
             .runtime
             .input_header_authors(
-                context_actor(),
+                participation_actor(),
                 ticket.input,
-                2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS + 2,
+                2 * crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS + 2,
             )
             .unwrap();
         assert!(
             actual_pins.contains(&ticket.descriptor.work),
             "the original probe batch really holds that financial header"
         );
-        let address = self.f.root.service().context(self.f.context).unwrap();
+        let address = self
+            .f
+            .root
+            .service()
+            .participation(self.f.participation)
+            .unwrap();
         let mut host = address.lock().unwrap();
         assert!(route.target_matches(
             &self.f.runtime,
             host.registration(),
-            self.f.context,
+            self.f.participation,
             actor()
         ));
         assert!(Arc::ptr_eq(host.establish_route(input).unwrap(), &route));
@@ -617,7 +641,7 @@ impl RouteFixture {
         assert_ne!(
             ticket.descriptor.work.scope,
             execution_scope.id(),
-            "the hot Context scope does not fund its original R tail"
+            "the hot Participation scope does not fund its original R tail"
         );
     }
     fn finish_conflict_observation(&mut self, input: InputId) {
@@ -635,7 +659,7 @@ impl RouteFixture {
         assert_eq!(self.f.ledger.used(Dimension::Requests.id()), paid);
         assert!(self.f.root.resources().requests.contains_key(&input));
         let observed = Arc::new(ConflictObservation {
-            context: self.f.context,
+            participation: self.f.participation,
             caller: thread::current().id(),
             calls: AtomicUsize::new(0),
         });
@@ -662,27 +686,34 @@ impl RouteFixture {
                 .is_idle()
         );
     }
-    fn dispose_context_metadata(&mut self) {
+    fn dispose_participation_metadata(&mut self) {
         let runtime = self.f.runtime.clone();
         let ledger = self.f.ledger.clone();
         let root_scope = self.f.root.resources().scope.clone();
-        let host_address = self.f.root.service().context(self.f.context).unwrap();
+        let host_address = self
+            .f
+            .root
+            .service()
+            .participation(self.f.participation)
+            .unwrap();
         let mut host = host_address.lock().unwrap();
         let resources = host.resources_for_test();
         assert!(resources.routes.is_empty());
         if resources.scope.is_none() {
             return;
         }
-        runtime.close_timer_source(context_actor()).unwrap();
-        runtime.close_actor_admission(context_actor()).unwrap();
+        runtime.close_timer_source(participation_actor()).unwrap();
+        runtime
+            .close_actor_admission(participation_actor())
+            .unwrap();
         let mut other_claims = Vec::new();
         while let Some(original_host_turn) = runtime.claim_host_actor() {
             let ready = original_host_turn.actor();
-            if ready == context_actor() {
+            if ready == participation_actor() {
                 assert!(runtime.pending_batches(ready, None, 1).unwrap().is_empty());
                 original_host_turn.release(false).unwrap();
             } else {
-                // This Context's metadata exit does not require another
+                // This Participation's metadata exit does not require another
                 // actor's committed input to retire. Retain each other
                 // scheduling claim once, then restore its actual ready edge.
                 other_claims.push(original_host_turn);
@@ -693,21 +724,21 @@ impl RouteFixture {
         }
         assert!(resources.owner_control.close_for_teardown().unwrap());
         assert!(resources.internal.close_for_teardown().unwrap());
-        runtime.seal_actor(context_actor()).unwrap();
+        runtime.seal_actor(participation_actor()).unwrap();
         let scope = resources.scope.take().unwrap();
         scope.close_external().unwrap();
-        for role in resources.roles.iter_mut().rev() {
+        for role in resources.metadata_resources.iter_mut().rev() {
             role.work.body_exited().unwrap();
             role.work.captures_exited().unwrap();
         }
         ledger.reap_scope_ready(scope.id(), 32).unwrap();
-        for role in &mut resources.roles {
+        for role in &mut resources.metadata_resources {
             role.capacity
                 .release_quota(&role.capacity.resources().unwrap().quota)
                 .unwrap();
             role.capacity.finish().unwrap();
         }
-        drop(runtime.remove_actor(context_actor()).unwrap());
+        drop(runtime.remove_actor(participation_actor()).unwrap());
         resources.registered = false;
         assert!(scope.snapshot().unwrap().retirement_ready);
         ledger.remove_scope(scope.id()).unwrap();
@@ -715,16 +746,17 @@ impl RouteFixture {
     }
     fn finish_model_refusal(mut self) {
         assert!(self.f.root.resources().requests.contains_key(&self.creator));
-        self.dispose_context_metadata();
+        self.dispose_participation_metadata();
         let refusal = self.f.host_input(
             ControlInput::EstablishmentDecided {
-                context: self.f.context,
-                decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
-                    state: QueryContextState::Aborting,
-                    outcome: Ok(OperationOutcome::OwnerFailed),
-                    acknowledgement: None,
-                    decided_at: MonotonicInstant::from_origin(Duration::from_nanos(100)),
-                },
+                participation: self.f.participation,
+                decision:
+                    novarocks_worker_protocol::participation::ParticipationEstablishmentDecision {
+                        state: ParticipationState::Aborting,
+                        outcome: Ok(OperationOutcome::OwnerFailed),
+                        acknowledgement: None,
+                        decided_at: MonotonicInstant::from_origin(Duration::from_nanos(100)),
+                    },
             },
             self.host_storage,
         );
@@ -742,9 +774,9 @@ impl RouteFixture {
         assert_eq!(self.f.root.reap_ready_requests(32).unwrap(), 1);
         let retained = self.f.host_input(
             ControlInput::ExecutionRetired {
-                context: self.f.context,
+                participation: self.f.participation,
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: generation(),
                     },
             },
@@ -754,13 +786,13 @@ impl RouteFixture {
         self.drain_root();
         self.f.finish_host_input(retained);
 
-        // Expiry is reported by the original Context lifecycle, not a second
+        // Expiry is reported by the original Participation lifecycle, not a second
         // Root retention timer. This model has already removed that child.
         let expired = self.f.host_input(
-            ControlInput::ContextExpired {
-                context: self.f.context,
+            ControlInput::ParticipationExpired {
+                participation: self.f.participation,
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: generation(),
                     },
             },
@@ -771,7 +803,7 @@ impl RouteFixture {
         self.f.finish_host_input(expired);
         let removed = self.f.host_input(
             ControlInput::HostRemoved {
-                context: self.f.context,
+                participation: self.f.participation,
             },
             self.host_storage,
         );
@@ -814,7 +846,7 @@ impl RouteFixture {
             original_host_turn.release(false).unwrap();
         }
         self.f.runtime.seal_actor(actor()).unwrap();
-        for role in root_resources.roles.iter_mut().rev() {
+        for role in root_resources.metadata_resources.iter_mut().rev() {
             role.work.body_exited().unwrap();
             role.work.captures_exited().unwrap();
         }
@@ -823,7 +855,7 @@ impl RouteFixture {
             .reap_scope_ready(root_resources.scope.id(), 32)
             .unwrap();
         drop(self.f.runtime.remove_actor(actor()).unwrap());
-        for role in root_resources.roles.iter_mut().rev() {
+        for role in root_resources.metadata_resources.iter_mut().rev() {
             role.capacity
                 .release_quota(&role.capacity.resources().unwrap().quota)
                 .unwrap();
@@ -838,17 +870,17 @@ impl RouteFixture {
 }
 
 #[test]
-fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
+fn the_participation_leg_retires_before_root_consumes_its_original_routed_reply() {
     let mut f = RouteFixture::new();
     let (input, mut handle, getters, drops) = f.begin_route(op(12), 100, None);
     assert!(matches!(
         f.probe(input),
-        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict
+        EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict
     ));
     assert!(
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -860,14 +892,14 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
     assert_eq!(
         returns
             .iter()
-            .filter(|input| input.source == context_actor()
+            .filter(|input| input.source == participation_actor()
                 && input.phase == InputPhase::Filled
-                && input.role.is_some())
+                && input.standing_input_id.is_some())
             .count(),
         1
     );
-    f.dispose_context_metadata();
-    assert!(f.f.runtime.snapshot(context_actor()).is_err());
+    f.dispose_participation_metadata();
+    assert!(f.f.runtime.snapshot(participation_actor()).is_err());
     assert!(f.f.root.resources().requests.contains_key(&input));
     assert_eq!(f.f.ledger.used(Dimension::Requests.id()), 2);
     assert!(
@@ -878,7 +910,7 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
     f.f.root.index_control_effects(64).unwrap();
     let reply = f.f.root.take_control_effect(64).unwrap().unwrap();
     assert!(
-        matches!(&reply.effect,WorkerAction::ControlReply(reply) if reply.request.token==input && reply.result==RequestResult::Outcome(OperationOutcome::ContextConflict))
+        matches!(&reply.effect,WorkerAction::ControlReply(reply) if reply.request.token==input && reply.result==RequestResult::Outcome(OperationOutcome::ParticipationConflict))
     );
     let disposal =
         f.f.root
@@ -901,7 +933,7 @@ fn the_context_leg_retires_before_root_consumes_its_original_routed_reply() {
 }
 
 #[test]
-fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_exit() {
+fn a_root_timeout_cannot_dispose_raw_until_the_real_participation_leg_and_cleanup_job_exit() {
     let mut f = RouteFixture::new();
     let gate = DropGate::new();
     let (input, mut handle, getters, drops) = f.begin_route(op(11), 10, Some(gate.clone()));
@@ -930,7 +962,7 @@ fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_
     assert!(
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -939,7 +971,7 @@ fn a_root_timeout_cannot_dispose_raw_until_the_real_context_leg_and_cleanup_job_
     );
     let disposal: EstablishDisposalJob = premature_disposal
         .or_else(|| f.f.root.take_retired_route_disposal(input))
-        .expect("the same original source after actual Context retirement");
+        .expect("the same original source after actual Participation retirement");
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     let cleanup = thread::spawn(move || disposal.run());

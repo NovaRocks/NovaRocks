@@ -17,7 +17,7 @@
 
 //! Control-plane ownership for unfunded observation lanes. Tokens remain
 //! pointer-free, while this bounded registry retains lifecycle handoff access.
-use super::{LaneHandle, handle::LaneShared};
+use super::{Lane, handle::LaneShared};
 use crate::{
     account::Path,
     authority::Shared,
@@ -25,7 +25,7 @@ use crate::{
 };
 #[derive(Debug)]
 pub(crate) struct ObservationRegistry {
-    pub records: Vec<Option<LaneHandle>>,
+    pub records: Vec<Option<Lane>>,
     pub start: usize,
     pub upper: usize,
     pub cursor: usize,
@@ -51,12 +51,12 @@ pub const OBSERVATION_LANE_METADATA_BYTES: u64 = (std::mem::size_of::<LaneShared
     + 64) as u64;
 impl Shared {
     #[cfg(all(test, loom))]
-    pub(crate) fn retain_observation(&self, lane: &LaneHandle) {
+    pub(crate) fn retain_observation(&self, lane: &Lane) {
         self.retain_observations(std::slice::from_ref(lane));
     }
     /// Every shell and node already exists. A single lock publishes the full
     /// group without allocation while the caller holds its lifecycle gates.
-    pub(crate) fn retain_observations(&self, lanes: &[LaneHandle]) {
+    pub(crate) fn retain_observations(&self, lanes: &[Lane]) {
         let mut registry = self.observation_lanes.lock().unwrap();
         for lane in lanes {
             let index = lane.reference().index as usize;

@@ -28,12 +28,12 @@ use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::{
     exec::chunk::ChunkSchema,
     runtime::{
-        fragment::ExecutionFailureCause,
         preparation_memory::PreparationMemoryRefusal,
         preparation_metadata::{
             CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
         },
         query_memory::QueryMemoryBinding,
+        task::ExecutionFailureCause,
     },
 };
 use novarocks_local_compiler::{
@@ -1010,7 +1010,7 @@ fn type_tail_frozen_invoice_covers_actual_native_factory_callbacks() {
 
 #[test]
 fn accepted_original_task_source_crosses_both_compile_views_and_metadata_before_body() {
-    use novarocks_execution::runtime::fragment::ExecutionFailure;
+    use novarocks_execution::runtime::task::ExecutionFailure;
     use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
     for raw in [
         ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted),

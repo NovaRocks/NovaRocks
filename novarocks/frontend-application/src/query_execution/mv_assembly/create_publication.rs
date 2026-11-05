@@ -35,8 +35,8 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteBeginRequest, ConnectorWriteNeededReady, ConnectorWriteSessionFlavor,
 };
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreateLease,
+    ConnectorColumnDefinition, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
+    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreateSession,
     ConnectorStagedTableHandle, ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
     ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent,
     ConnectorWriteTargetRef, ExternalMutationFinalization,
@@ -60,7 +60,7 @@ pub(crate) enum CreatePublicationInput {
     Publication {
         plan: Arc<IcebergMvCreatePlan>,
         seed: Arc<MvCreateProjectionSeed>,
-        staged: ConnectorStagedCreateLease,
+        staged: ConnectorStagedCreateSession,
         handle: ConnectorStagedTableHandle,
         admission: ConnectorDocumentManagementAdmission,
         owner: DeploymentOwner,
@@ -188,8 +188,8 @@ impl EmptyCreateWrite {
     pub(crate) async fn seal(
         &mut self,
         host: &novarocks_catalog_application::ConnectorControlHost,
-        planning: &ConnectorControlPlanningLease,
-        staged: &ConnectorStagedCreateLease,
+        planning: &ConnectorControlPlanningPin,
+        staged: &ConnectorStagedCreateSession,
         handle: &ConnectorStagedTableHandle,
         request: ConnectorWriteBeginRequest,
     ) -> Result<(), ConnectorError> {

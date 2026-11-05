@@ -27,7 +27,7 @@ use crate::{
         chunk::{Chunk, ChunkBatchProjection},
         hash_table::key_index::BulkWork,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{
     array::{Array, ArrayData, BinaryViewArray, StringViewArray, make_array},

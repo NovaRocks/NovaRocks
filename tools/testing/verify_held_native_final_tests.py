@@ -110,7 +110,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
             received_digest_complete=True,captured_prefix_bytes=40,captured_prefix_sha256=[0]*32,
             declared_message_bytes=1048584,withheld_stream_credit_bytes=40,released_stream_credit_bytes=0,
             reply_fully_decoded=False,reset_requested=True,response_abandoned=True,abort_requested=True,
-            driver_exit="AbortedAndJoined")
+            connection_exit="AbortedAndJoined")
         acks=[dict(label=label,root=copy.deepcopy(root),profile=1,kind="ClientRows",wanted=None,
             consumed=1,accepted_consumed=0,outcome="AwaitTerminalControl",
             observed_from_original_prelaunch_us=us) for label,us in (("ACK1_first",350000),("ACK1_repeat",500000))]
@@ -125,7 +125,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
             actor=actor,actor_actual_join=True,mysql_actual_join=True,kill_attempted=True,kill_returned=True,
             timings_origin="the original launch_config prelaunch instant, not scene entry",protocol_started_us=1000,
             kill_started_us=200000,kill_returned_us=300000,settled_us=1000000,
-            expected_server_error_actual_source_retained=True,expected_driver_joinerror_retained=True,
+            expected_server_error_actual_source_retained=True,expected_connection_joinerror_retained=True,
             root_samples=samples,original_wire=self.wire(),same_socket_health=self.wire(True),
             failed_source_slots=[False]*8,raw_error_formatter_invoked=False,scope="synthetic component only",
             mysql_terminal_code=1317,health_before_tasks_created=[0,1,0],health_after_tasks_created=[0,2,0])
@@ -331,7 +331,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
             for value in ([True]+[0]*31,[256]+[0]*31,[0]*31,"0"*64):
                 changed=copy.deepcopy(actor);changed[key]=value
                 with self.subTest(key=key),self.assertRaises(old.VerificationFailure):held._actor_dto(changed)
-        for key in ("phase","first_failure","driver_exit"):
+        for key in ("phase","first_failure","connection_exit"):
             changed=copy.deepcopy(actor);changed[key]="unknown"
             with self.assertRaises(old.VerificationFailure):held._actor_dto(changed)
         for value in (False,True):

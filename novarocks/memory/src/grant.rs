@@ -17,14 +17,14 @@
 
 //! Explicit allocation authorization obtained before the bounded operation.
 use crate::{
-    AccountHandle, domain::FundingDomain, error::CapacityError, lane::FactToken, stock::ScopeLease,
+    Account, domain::FundingDomain, error::CapacityError, lane::FactToken, stock::FundingScope,
 };
 #[derive(Debug)]
 pub struct ExplicitGrant {
     lane: FundingDomain,
-    scope: Option<ScopeLease>,
+    scope: Option<FundingScope>,
 }
-impl AccountHandle {
+impl Account {
     pub fn request_explicit(&self, bytes: u64) -> Result<ExplicitGrant, CapacityError> {
         let lane = self.create_domain(bytes)?;
         let scope = lane.activate(bytes, 0)?;

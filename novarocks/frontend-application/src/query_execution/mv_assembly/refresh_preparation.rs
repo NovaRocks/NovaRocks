@@ -22,8 +22,8 @@
 //! target schema and contract persistence; refresh execution is gated later.
 
 pub(crate) mod async_original;
-pub(crate) mod driver;
 pub(crate) mod io_gate;
+pub(crate) mod turn_custody;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,7 +110,7 @@ pub(crate) fn validate_retained_target_identity(
 }
 
 fn execution_binding_key_for_target(
-    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
 ) -> ConnectorProviderBindingKey {
     ConnectorProviderBindingKey {
         instance_id: lease.binding().descriptor().instance_id.clone(),

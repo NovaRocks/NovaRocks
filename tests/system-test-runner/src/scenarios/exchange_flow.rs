@@ -34,7 +34,7 @@ use novarocks_cluster_harness::native_root_reply_fault::{
 };
 use novarocks_cluster_harness::{
     CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
-    QueryLifecycleStatementObservation, ServerHandle,
+    QueryLifecycleStatementObservation, TestClusterOwner,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -656,8 +656,8 @@ impl Scenario for ExchangeFlow {
                 observations: (0..cluster_size)
                     .flat_map(|index| {
                         [
-                            (index, "grpc-fragment", Some(1)),
-                            (index, "exchange-snapshot", Some(1)),
+                            (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(1)),
+                            (index, novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), Some(1)),
                         ]
                     })
                     .collect(),
@@ -1097,7 +1097,8 @@ fn bind_candidate(
                 }
                 let Some(binding) = context.handle().selected_native_observation_binding(
                     index,
-                    "grpc-fragment",
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
                     &job.selected.token,
                     Some(1),
                 )?
@@ -1111,7 +1112,8 @@ fn bind_candidate(
                 );
                 let snapshot = context.handle().selected_native_observation_binding(
                     index,
-                    "exchange-snapshot",
+                    novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot
+                        .as_str(),
                     &job.selected.token,
                     Some(1),
                 )?;
@@ -1218,8 +1220,8 @@ fn parked(
     context: &mut ScenarioContext,
     candidate: &ExchangeFaultCandidate,
 ) -> Result<Option<Park>> {
-    let finst = candidate.target.stream().destination_fragment_instance_id();
-    let identity = format!("finst={:?}", Some((finst.high(), finst.low())));
+    let task_key = candidate.target.stream().destination_task_key();
+    let identity = format!("task_key={:?}", Some((task_key.high(), task_key.low())));
     let source = format!(
         "source_name=\"EXCHANGE_SOURCE (id={})\"",
         candidate.target.stream().destination_node().get()
@@ -1233,7 +1235,7 @@ fn parked(
 fn driver_wakes(text: &str, identity: &str) -> Result<BTreeMap<(i32, u64), (u64, u64)>> {
     let mut wakes = BTreeMap::new();
     for line in text.lines().filter(|line| {
-        line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT")
+        line.contains(novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT)
             && line.contains(identity)
             && line.contains("event=driver_wake ")
     }) {
@@ -1255,10 +1257,10 @@ fn current_park(text: &str, identity: &str, source: &str) -> Result<Option<Park>
     // its park line. Pair by the actual epoch, never by log arrival order.
     let wakes = driver_wakes(text, identity)?;
     let mut latest = None;
-    for line in text
-        .lines()
-        .filter(|line| line.contains("NOVAROCKS_EXCHANGE_SNAPSHOT") && line.contains(identity))
-    {
+    for line in text.lines().filter(|line| {
+        line.contains(novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT)
+            && line.contains(identity)
+    }) {
         if line.contains("event=driver_park ")
             && line.contains(source)
             && line.contains("reason=InputEmpty ")
@@ -1402,8 +1404,8 @@ fn require_wake(
     candidate: &ExchangeFaultCandidate,
     park: &Park,
 ) -> Result<()> {
-    let finst = candidate.target.stream().destination_fragment_instance_id();
-    let identity = format!("finst={:?}", Some((finst.high(), finst.low())));
+    let task_key = candidate.target.stream().destination_task_key();
+    let identity = format!("task_key={:?}", Some((task_key.high(), task_key.low())));
     let text = context
         .handle()
         .be_stdout_contents(candidate.backend_index, usize::MAX)?;
@@ -2018,10 +2020,16 @@ mod tests {
 
     #[test]
     fn source_park_parser_preserves_actual_driver_generation_and_epoch() {
-        let identity = "finst=Some((11, 22))";
+        let identity = "task_key=Some((11, 22))";
         let source = "source_name=\"EXCHANGE_SOURCE (id=6)\"";
-        let park = "NOVAROCKS_EXCHANGE_SNAPSHOT event=driver_park finst=Some((11, 22)) driver_id=9 reason=InputEmpty frozen_generation=7 current_generation=7 block_epoch=41 source_name=\"EXCHANGE_SOURCE (id=6)\"\n";
-        let wake = "NOVAROCKS_EXCHANGE_SNAPSHOT event=driver_wake finst=Some((11, 22)) driver_id=9 blocked_generation=7 current_generation=8 block_epoch=41\n";
+        let park = &*format!(
+            "{} event=driver_park task_key=Some((11, 22)) driver_id=9 reason=InputEmpty frozen_generation=7 current_generation=7 block_epoch=41 source_name=\"EXCHANGE_SOURCE (id=6)\"\n",
+            novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT
+        );
+        let wake = &*format!(
+            "{} event=driver_wake task_key=Some((11, 22)) driver_id=9 blocked_generation=7 current_generation=8 block_epoch=41\n",
+            novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT
+        );
         let actual = current_park(park, identity, source).unwrap().unwrap();
         assert_eq!((actual.driver, actual.epoch, actual.generation), (9, 41, 7));
         assert!(

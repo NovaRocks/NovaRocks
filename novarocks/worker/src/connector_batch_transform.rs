@@ -30,7 +30,5 @@ pub trait ConnectorBatchTransform: Send + Sync {
         &self,
         chunk: novarocks_execution::exec::chunk::Chunk,
         factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<
-        novarocks_execution::exec::chunk::Chunk,
-    >;
+    ) -> novarocks_execution::runtime::task::ExecutionResult<novarocks_execution::exec::chunk::Chunk>;
 }

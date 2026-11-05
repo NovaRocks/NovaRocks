@@ -32,7 +32,7 @@ mod startup_isolation;
 
 pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
-    ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
+    ManagementEntrance, ManagementEntranceObligation, ManagementEntranceTicket, ManagementRequest,
     MvCurrentManagementAdmission, MvDropManagementObservation, MvManagementPhase,
     SlotChangeConvergence,
 };

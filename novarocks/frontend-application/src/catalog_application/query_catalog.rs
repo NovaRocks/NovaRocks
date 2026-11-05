@@ -115,7 +115,7 @@ pub struct ConnectorQueryTableMaterialization {
     pub read_selector: novarocks_spi::connector::ConnectorReadSelector,
     pub sql_planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts,
     pub statistics_pin: Option<crate::connector::backend::ResolvedTableStatisticsPin>,
-    pub planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
 }
 
 pub fn load_connector_table_materialization_with_lease(
@@ -182,17 +182,17 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
 
     let instance_id = ConnectorInstanceId::parse(catalog)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
-    let planning_lease = controls
+    let planning_pin = controls
         .acquire_current(&instance_id)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     // The query-wide collector is attached at admitted query preparation, but
-    // only this exact planning lease knows which durable catalog generation a
+    // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
     // the lease so a multi-catalog query cannot misattribute a vended seed.
     let context = if context.vended_credential_lease_sink().is_some() {
         context
             .with_vended_credential_lease_collection(
-                planning_lease
+                planning_pin
                     .binding()
                     .catalog_properties()
                     .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
@@ -202,7 +202,7 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
     } else {
         context
     };
-    let metadata = planning_lease
+    let metadata = planning_pin
         .binding()
         .metadata()
         .load_frontend_table(ConnectorTableRequest {
@@ -218,7 +218,7 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
         // incident: render the vocabulary the rest of the engine already
         // recognizes instead of leaking the provider's own wording.
         .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
-    connector_table_materialization_for_resolution(metadata, planning_lease, resolution)
+    connector_table_materialization_for_resolution(metadata, planning_pin, resolution)
         .map_err(CatalogResolutionError::failed)
 }
 
@@ -236,17 +236,17 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
 
     let instance_id = ConnectorInstanceId::parse(catalog)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
-    let planning_lease = controls
+    let planning_pin = controls
         .acquire_current(&instance_id)
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     // The query-wide collector is attached at admitted query preparation, but
-    // only this exact planning lease knows which durable catalog generation a
+    // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
     // the lease so a multi-catalog query cannot misattribute a vended seed.
     let context = if context.vended_credential_lease_sink().is_some() {
         context
             .with_vended_credential_lease_collection(
-                planning_lease
+                planning_pin
                     .binding()
                     .catalog_properties()
                     .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
@@ -257,7 +257,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
         context
     };
     let metadata = crate::connector::schema_creation::load_frontend_table_async(
-        planning_lease.binding().metadata().as_ref(),
+        planning_pin.binding().metadata().as_ref(),
         ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -273,7 +273,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
     // incident: render the vocabulary the rest of the engine already
     // recognizes instead of leaking the provider's own wording.
     .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
-    connector_table_materialization_for_resolution(metadata, planning_lease, resolution)
+    connector_table_materialization_for_resolution(metadata, planning_pin, resolution)
         .map_err(CatalogResolutionError::failed)
 }
 
@@ -294,11 +294,11 @@ fn connector_table_resolution_error(
 /// Callers must never bind a Historical schema and accidentally read Current.
 fn connector_table_materialization_for_resolution(
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     resolution: novarocks_spi::connector::ConnectorTableResolution,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
     let mut materialization =
-        connector_table_materialization_from_metadata(metadata, planning_lease)?;
+        connector_table_materialization_from_metadata(metadata, planning_pin)?;
     if let novarocks_spi::connector::ConnectorTableResolution::HistoricalSnapshot(snapshot) =
         resolution
     {
@@ -310,7 +310,7 @@ fn connector_table_materialization_for_resolution(
 
 pub fn connector_table_materialization_from_metadata(
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
     use novarocks_spi::connector::{ConnectorTableColumnRole, ConnectorTableColumnVisibility};
 
@@ -347,7 +347,7 @@ pub fn connector_table_materialization_from_metadata(
                 data_version,
             },
         );
-    let catalog_handle = planning_lease
+    let catalog_handle = planning_pin
         .binding()
         .catalog_handle()
         .map_err(|error| error.to_string())?
@@ -367,7 +367,7 @@ pub fn connector_table_materialization_from_metadata(
         read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
         sql_planning_facts: metadata.planning_facts.clone(),
         statistics_pin,
-        planning_lease,
+        planning_pin,
     })
 }
 

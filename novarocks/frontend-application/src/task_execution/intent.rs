@@ -31,11 +31,11 @@ use novarocks_coordination_contract::MonotonicInstant;
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
-    AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
-    EstablishQueryContext, OperationKind, OperationOutcome, OperationShape,
-    QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate, QueryContextReceipt,
-    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    AbortParticipation, AcquireParticipationAdmissionTicket, CancelTask, CreateTaskReceipt,
+    EstablishParticipation, OperationKind, OperationOutcome, OperationShape,
+    ParticipationAdmissionTicketReceipt, ParticipationDomainUpdate, ParticipationReceipt,
+    QuiesceParticipation, QuiesceParticipationReceipt, ReleaseOutcome, ReleaseParticipation,
+    TaskDomainUpdate, TaskOperationId, UpdateParticipation, UpdateTask, UpdateTaskReceipt,
     status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
@@ -52,19 +52,19 @@ pub const OPERATION_FIXED_BYTES: usize = 256;
 /// One immutable request an owner has decided to make.
 #[derive(Clone, Debug)]
 pub enum OperationIntent {
-    AcquireQueryContextAdmissionTicket(AcquireQueryContextAdmissionTicket),
+    AcquireParticipationAdmissionTicket(AcquireParticipationAdmissionTicket),
     /// The exact allocation authorized by the logical-execution actor and
     /// transferred to Native transport.
-    EstablishQueryContext(Arc<EstablishQueryContext>),
+    EstablishParticipation(Arc<EstablishParticipation>),
     /// One task's create, holding its frozen parts. Every send of the create
     /// holds the same parts.
     CreateTask(super::creation::CreateTaskIntent),
     UpdateTask(Arc<UpdateTask>),
-    UpdateQueryContext(Arc<UpdateQueryContext>),
+    UpdateParticipation(Arc<UpdateParticipation>),
     CancelTask(CancelTask),
-    QuiesceQueryContext(QuiesceQueryContext),
-    AbortQueryContext(AbortQueryContext),
-    ReleaseQueryContext(ReleaseQueryContext),
+    QuiesceParticipation(QuiesceParticipation),
+    AbortParticipation(AbortParticipation),
+    ReleaseParticipation(ReleaseParticipation),
     #[cfg(test)]
     FetchTaskDynamicFilters(FetchTaskDynamicFilters),
 }
@@ -72,15 +72,15 @@ pub enum OperationIntent {
 impl OperationIntent {
     pub fn kind(&self) -> OperationKind {
         match self {
-            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().kind(),
-            Self::EstablishQueryContext(request) => request.envelope().kind(),
+            Self::AcquireParticipationAdmissionTicket(request) => request.envelope().kind(),
+            Self::EstablishParticipation(request) => request.envelope().kind(),
             Self::CreateTask(request) => request.envelope().kind(),
             Self::UpdateTask(request) => request.envelope().kind(),
-            Self::UpdateQueryContext(request) => request.envelope().kind(),
+            Self::UpdateParticipation(request) => request.envelope().kind(),
             Self::CancelTask(request) => request.envelope().kind(),
-            Self::QuiesceQueryContext(request) => request.envelope().kind(),
-            Self::AbortQueryContext(request) => request.envelope().kind(),
-            Self::ReleaseQueryContext(request) => request.envelope().kind(),
+            Self::QuiesceParticipation(request) => request.envelope().kind(),
+            Self::AbortParticipation(request) => request.envelope().kind(),
+            Self::ReleaseParticipation(request) => request.envelope().kind(),
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.envelope().kind(),
         }
@@ -88,15 +88,15 @@ impl OperationIntent {
 
     pub fn operation_id(&self) -> TaskOperationId {
         match self {
-            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().operation_id(),
-            Self::EstablishQueryContext(request) => request.envelope().operation_id(),
+            Self::AcquireParticipationAdmissionTicket(request) => request.envelope().operation_id(),
+            Self::EstablishParticipation(request) => request.envelope().operation_id(),
             Self::CreateTask(request) => request.envelope().operation_id(),
             Self::UpdateTask(request) => request.envelope().operation_id(),
-            Self::UpdateQueryContext(request) => request.envelope().operation_id(),
+            Self::UpdateParticipation(request) => request.envelope().operation_id(),
             Self::CancelTask(request) => request.envelope().operation_id(),
-            Self::QuiesceQueryContext(request) => request.envelope().operation_id(),
-            Self::AbortQueryContext(request) => request.envelope().operation_id(),
-            Self::ReleaseQueryContext(request) => request.envelope().operation_id(),
+            Self::QuiesceParticipation(request) => request.envelope().operation_id(),
+            Self::AbortParticipation(request) => request.envelope().operation_id(),
+            Self::ReleaseParticipation(request) => request.envelope().operation_id(),
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.envelope().operation_id(),
         }
@@ -108,17 +108,17 @@ impl OperationIntent {
 
     pub fn shape(&self) -> OperationShape {
         match self {
-            Self::AcquireQueryContextAdmissionTicket(_) => {
-                OperationShape::AcquireQueryContextAdmissionTicket
+            Self::AcquireParticipationAdmissionTicket(_) => {
+                OperationShape::AcquireParticipationAdmissionTicket
             }
-            Self::EstablishQueryContext(_) => OperationShape::EstablishQueryContext,
+            Self::EstablishParticipation(_) => OperationShape::EstablishParticipation,
             Self::CreateTask(_) => OperationShape::CreateTask,
             Self::UpdateTask(_) => OperationShape::UpdateTask,
-            Self::UpdateQueryContext(request) => request.shape(),
+            Self::UpdateParticipation(request) => request.shape(),
             Self::CancelTask(_) => OperationShape::CancelTask,
-            Self::QuiesceQueryContext(_) => OperationShape::QuiesceQueryContext,
-            Self::AbortQueryContext(_) => OperationShape::AbortQueryContext,
-            Self::ReleaseQueryContext(_) => OperationShape::ReleaseQueryContext,
+            Self::QuiesceParticipation(_) => OperationShape::QuiesceParticipation,
+            Self::AbortParticipation(_) => OperationShape::AbortParticipation,
+            Self::ReleaseParticipation(_) => OperationShape::ReleaseParticipation,
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(_) => OperationShape::FetchTaskDynamicFilters,
         }
@@ -149,17 +149,17 @@ impl OperationIntent {
         std::time::Duration,
     ) {
         let wait = match self {
-            Self::AcquireQueryContextAdmissionTicket(request) => {
+            Self::AcquireParticipationAdmissionTicket(request) => {
                 request.envelope().max_wait().get()
             }
-            Self::EstablishQueryContext(request) => request.envelope().max_wait().get(),
+            Self::EstablishParticipation(request) => request.envelope().max_wait().get(),
             Self::CreateTask(request) => request.envelope().max_wait().get(),
             Self::UpdateTask(request) => request.envelope().max_wait().get(),
-            Self::UpdateQueryContext(request) => request.envelope().max_wait().get(),
+            Self::UpdateParticipation(request) => request.envelope().max_wait().get(),
             Self::CancelTask(request) => request.envelope().max_wait().get(),
-            Self::QuiesceQueryContext(request) => request.envelope().max_wait().get(),
-            Self::AbortQueryContext(request) => request.envelope().max_wait().get(),
-            Self::ReleaseQueryContext(request) => request.envelope().max_wait().get(),
+            Self::QuiesceParticipation(request) => request.envelope().max_wait().get(),
+            Self::AbortParticipation(request) => request.envelope().max_wait().get(),
+            Self::ReleaseParticipation(request) => request.envelope().max_wait().get(),
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(_) => std::time::Duration::ZERO,
         };
@@ -174,17 +174,17 @@ impl OperationIntent {
     /// The backend process this request is addressed to.
     pub fn backend_process_id(&self) -> BackendProcessId {
         match self {
-            Self::AcquireQueryContextAdmissionTicket(request) => {
-                request.context().backend_process_id()
+            Self::AcquireParticipationAdmissionTicket(request) => {
+                request.participation().backend_process_id()
             }
-            Self::EstablishQueryContext(request) => request.context().backend_process_id(),
+            Self::EstablishParticipation(request) => request.participation().backend_process_id(),
             Self::CreateTask(request) => request.identity().backend_process_id(),
             Self::UpdateTask(request) => request.identity().backend_process_id(),
-            Self::UpdateQueryContext(request) => request.context().backend_process_id(),
+            Self::UpdateParticipation(request) => request.participation().backend_process_id(),
             Self::CancelTask(request) => request.identity().backend_process_id(),
-            Self::QuiesceQueryContext(request) => request.context().backend_process_id(),
-            Self::AbortQueryContext(request) => request.context().backend_process_id(),
-            Self::ReleaseQueryContext(request) => request.context().backend_process_id(),
+            Self::QuiesceParticipation(request) => request.participation().backend_process_id(),
+            Self::AbortParticipation(request) => request.participation().backend_process_id(),
+            Self::ReleaseParticipation(request) => request.participation().backend_process_id(),
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.identity().backend_process_id(),
         }
@@ -193,8 +193,8 @@ impl OperationIntent {
     /// What this request occupies in a bounded frontend queue.
     pub fn queued_bytes(&self) -> usize {
         let payload = match self {
-            Self::AcquireQueryContextAdmissionTicket(_) => 0,
-            Self::EstablishQueryContext(request) => {
+            Self::AcquireParticipationAdmissionTicket(_) => 0,
+            Self::EstablishParticipation(request) => {
                 request.catalog_binding().encoded_len()
                     + request.initial_runtime_filter().encoded_len()
                     + request.query_options().encoded_len()
@@ -208,19 +208,19 @@ impl OperationIntent {
                 .iter()
                 .map(task_domain_bytes)
                 .sum::<usize>(),
-            Self::UpdateQueryContext(request) => match request.as_ref() {
-                UpdateQueryContext::Establish(_) => {
+            Self::UpdateParticipation(request) => match request.as_ref() {
+                UpdateParticipation::Establish(_) => {
                     unreachable!("Establish must use its exact actor-owned intent variant")
                 }
-                UpdateQueryContext::AdvanceDomain(request) => {
-                    context_domain_bytes(request.domain())
+                UpdateParticipation::AdvanceDomain(request) => {
+                    participation_domain_bytes(request.domain())
                 }
-                UpdateQueryContext::RenewLease(_) => 0,
+                UpdateParticipation::RenewLease(_) => 0,
             },
             Self::CancelTask(_)
-            | Self::QuiesceQueryContext(_)
-            | Self::AbortQueryContext(_)
-            | Self::ReleaseQueryContext(_) => 0,
+            | Self::QuiesceParticipation(_)
+            | Self::AbortParticipation(_)
+            | Self::ReleaseParticipation(_) => 0,
             #[cfg(test)]
             Self::FetchTaskDynamicFilters(_) => 0,
         };
@@ -255,11 +255,11 @@ fn task_domain_requires_control(domain: &TaskDomainUpdate) -> bool {
     matches!(domain, TaskDomainUpdate::CloseExchangeDestination { .. })
 }
 
-fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
+fn participation_domain_bytes(domain: &ParticipationDomainUpdate) -> usize {
     match domain {
-        QueryContextDomainUpdate::CatalogBinding { payload, .. }
-        | QueryContextDomainUpdate::SharedDynamicFilter { payload, .. } => payload.encoded_len(),
-        QueryContextDomainUpdate::Credential(update) => update.material().encoded_len(),
+        ParticipationDomainUpdate::CatalogBinding { payload, .. }
+        | ParticipationDomainUpdate::SharedDynamicFilter { payload, .. } => payload.encoded_len(),
+        ParticipationDomainUpdate::Credential(update) => update.material().encoded_len(),
     }
 }
 
@@ -267,7 +267,7 @@ fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
 ///
 /// This carries only the frozen target identity and bounded size/class facts,
 /// not an attempt-owned request. Producers reserve before mutating a
-/// `RemoteTask` or context owner, so one slow target cannot bypass process
+/// `RemoteTask` or participation owner, so one slow target cannot bypass process
 /// admission by entering a different attempt's queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TaskOperationQueueRequest {
@@ -416,13 +416,13 @@ pub enum AckPayload {
     /// The outcome carries no receipt, either because the operation kind has
     /// none or because it failed closed.
     None,
-    AdmissionTicket(QueryContextAdmissionTicketReceipt),
+    AdmissionTicket(ParticipationAdmissionTicketReceipt),
     Create(Box<CreateTaskReceipt>),
     Update(UpdateTaskReceipt),
-    Context(QueryContextReceipt),
-    Quiesce(QuiesceQueryContextReceipt),
+    Participation(ParticipationReceipt),
+    Quiesce(QuiesceParticipationReceipt),
     Release {
-        receipt: QueryContextReceipt,
+        receipt: ParticipationReceipt,
         outcome: ReleaseOutcome,
         /// The releasing backend's sealed runtime-filter observation.
         ///
@@ -932,7 +932,7 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     fn native_input_retention(
         &self,
     ) -> Result<
-        Option<novarocks_resource_contract::ExistingOwnerRetentionLease>,
+        Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
         novarocks_workload_control::WorkError,
     > {
         Ok(None)

@@ -22,7 +22,7 @@ use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
-use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::{Value, json};
 use std::path::Path;

@@ -19,7 +19,7 @@
 // writer, exact Theta requests, compiler, recorder and independent wire oracle.
 mod logical_finish_graph {
     use super::*;
-    use crate::runtime::fragment::io::ExchangeReceiverKey;
+    use crate::runtime::task::io::ExchangeReceiverKey;
     use novarocks_physical_plan as p;
     use novarocks_spi::connector::write_stack::RootRowKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -212,10 +212,10 @@ mod logical_finish_graph {
     impl ExchangeFrameTransmitter for CountFrames {
         fn deliver_unit(
             &self,
-            frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+            frame: crate::runtime::task::io::exchange_unit::ExchangeUnitFrame,
             stop: tokio_util::sync::CancellationToken,
-            activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-            done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+            activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+            done: crate::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
         ) {
             let data = !frame.receiver.payload.is_empty();
             self.loopback.deliver_unit(frame, stop, activity, done);
@@ -226,9 +226,9 @@ mod logical_finish_graph {
         fn register_unit_demands(
             &self,
             destination: RuntimeEndpoint,
-            entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+            entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
             stop: tokio_util::sync::CancellationToken,
-            done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+            done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
         ) {
             self.loopback
                 .register_unit_demands(destination, entries, stop, done)
@@ -237,7 +237,7 @@ mod logical_finish_graph {
             &self,
             destination: RuntimeEndpoint,
             stream: novarocks_execution_contract::ExchangeStreamIdentity,
-            wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+            wake: crate::runtime::task::io::exchange_unit::ExchangeGrantWake,
         ) -> Result<(), novarocks_failure_contract::FailureFact> {
             self.loopback.watch_unit_facts(destination, stream, wake)
         }
@@ -308,11 +308,11 @@ mod logical_finish_graph {
             );
         }
         let summary_key = ExchangeReceiverKey {
-            fragment_instance_id: FINISH_FINST,
+            task_key: FINISH_FINST,
             node_id: summary_node,
         };
         let writer_key = ExchangeReceiverKey {
-            fragment_instance_id: FINISH_FINST,
+            task_key: FINISH_FINST,
             node_id: i32::try_from(compiled.receiver.get()).unwrap(),
         };
         let summary_stream = fixture.stream(SUMMARY_FINST, FINISH_FINST, summary_node, 0);
@@ -336,9 +336,9 @@ mod logical_finish_graph {
         let writer_sink = fixture
             .sink(
                 &compiled.writer,
-                &FragmentSinkAssignment::StreamDestinations {
+                &TaskSinkAssignment::StreamDestinations {
                     destinations: vec![
-                        FragmentDestination::new(
+                        TaskDestination::new(
                             FINISH_FINST,
                             RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
                             WRITER_FINST,
@@ -371,7 +371,7 @@ mod logical_finish_graph {
             None,
             writer_dop as i32,
             Arc::clone(&state),
-            Arc::new(NoopFragmentEventSink),
+            Arc::new(NoopTaskEventSink),
         )
         .unwrap()
         .start();
@@ -429,19 +429,19 @@ mod logical_finish_graph {
                 &summary_control,
             )
             .unwrap();
-            let demand = crate::runtime::fragment::io::exchange_unit::ExchangeUnitDemand {
-                sequence: crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
+            let demand = crate::runtime::task::io::exchange_unit::ExchangeUnitDemand {
+                sequence: crate::runtime::task::io::exchange_unit::ExchangeUnitSequence::FIRST,
                 wire_bytes: payload.len() as u64,
             };
-            port.register_unit_demand(summary_key, crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry { stream: summary_stream, operation: crate::runtime::fragment::io::exchange_unit::ExchangeDemandOperation::Register(demand) }).unwrap();
+            port.register_unit_demand(summary_key, crate::runtime::task::io::exchange_unit::ExchangeDemandEntry { stream: summary_stream, operation: crate::runtime::task::io::exchange_unit::ExchangeDemandOperation::Register(demand) }).unwrap();
             port.receive_unit(
                 summary_key,
-                crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+                crate::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame {
                     stream: summary_stream,
                     sender_count: 1,
                     sender_id: 0,
                     backend_number: 0,
-                    item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::Unit {
+                    item: crate::runtime::task::io::exchange_unit::ExchangeUnitItem::Unit {
                         demand,
                         end_after_unit: true,
                     },
@@ -463,7 +463,7 @@ mod logical_finish_graph {
                     .unwrap(),
             )
             .unwrap();
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let finish_original = fixture.state(FINISH_FINST);
         let finish_state = Arc::new(RuntimeState::new(
             Some(crate::runtime::query_options::QueryOptions {
@@ -489,7 +489,7 @@ mod logical_finish_graph {
             None,
             finish_dop as i32,
             finish_state,
-            Arc::new(NoopFragmentEventSink),
+            Arc::new(NoopTaskEventSink),
         )
         .unwrap();
         assert_eq!(

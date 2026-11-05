@@ -51,13 +51,13 @@ mod split_failure_tests {
     async fn normal_convergence_observes_original_split_failure_once_then_really_closes() {
         let (mut round, _original_status, _original_acks) =
             crate::task_execution::tests::strict_split_failure_convergence_round_fixture();
-        let contexts = round
+        let participations = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
             .collect::<Vec<_>>();
-        let execution = contexts[0].query_execution_id();
+        let execution = participations[0].query_execution_id();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let mut executors =
@@ -163,10 +163,10 @@ mod split_failure_tests {
 
         // Remote exit remains an independent positive fact from each original
         // covered owner; the split failure supplies no process/exit evidence.
-        for context in contexts {
-            publish_exit(&mut round, context);
+        for participation in participations {
+            publish_exit(&mut round, participation);
         }
-        assert!(owner.observed_contexts(&round).is_some());
+        assert!(owner.observed_participations(&round).is_some());
         let next = owner
             .step(
                 &mut round,

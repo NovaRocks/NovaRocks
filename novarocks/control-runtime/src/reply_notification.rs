@@ -22,8 +22,8 @@
 
 use crate::{
     actor::Actor,
-    driver::{ActorRegistration, ActorRuntime, DriverError},
-    lease::WorkLease,
+    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError},
+    obligation::WorkObligation,
     sync::{Arc, Mutex},
 };
 use novarocks_control_runtime_core::{
@@ -41,7 +41,7 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyNotificationError {
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     WrongWorkScope,
     WorkNotLive,
     ObserverEnded,
@@ -53,7 +53,7 @@ pub enum ReplyNotificationFailure {
     ExternalUnwind,
     AbandonedJob,
     OwnerLost,
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplyNotificationSnapshot {
@@ -119,7 +119,7 @@ impl<A: Actor> Shared<A> {
             self.state
                 .lock()
                 .expect("original reply notification state")
-                .fail(ReplyNotificationFailure::Driver(error));
+                .fail(ReplyNotificationFailure::ActorTurn(error));
         }
     }
     fn retain_panic(&self, payload: Box<dyn Any + Send>) {
@@ -192,11 +192,11 @@ impl<A: Actor> ReplyNotification<A> {
     pub fn for_admitted_work(
         runtime: &ActorRuntime<A>,
         registration: &ActorRegistration,
-        work: &WorkLease,
+        work: &WorkObligation,
     ) -> Result<(Self, ReplyObserver<A>), ReplyNotificationError> {
         runtime
             .validate_work_author(registration, work)
-            .map_err(ReplyNotificationError::Driver)?;
+            .map_err(ReplyNotificationError::ActorTurn)?;
         {
             let state = work
                 .scope()

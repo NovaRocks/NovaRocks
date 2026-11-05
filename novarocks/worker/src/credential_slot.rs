@@ -40,7 +40,7 @@ use crate::HostRejection;
 
 /// The announced scopes of one Worker query context.
 #[derive(Default)]
-pub struct QueryContextCredentialSlot {
+pub struct ParticipationCredentialSlot {
     state: RwLock<CredentialSlotState>,
 }
 
@@ -50,18 +50,18 @@ struct CredentialSlotState {
     leases: BTreeMap<CredentialLeaseId, CredentialLeaseDescriptor>,
 }
 
-impl fmt::Debug for QueryContextCredentialSlot {
+impl fmt::Debug for ParticipationCredentialSlot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.read().unwrap_or_else(|error| error.into_inner());
         formatter
-            .debug_struct("QueryContextCredentialSlot")
+            .debug_struct("ParticipationCredentialSlot")
             .field("closed", &state.closed)
             .field("lease_count", &state.leases.len())
             .finish()
     }
 }
 
-impl QueryContextCredentialSlot {
+impl ParticipationCredentialSlot {
     pub fn new() -> Self {
         Self::default()
     }
@@ -126,9 +126,8 @@ impl QueryContextCredentialSlot {
         drop(previous);
     }
 
-    /// Resolves one process-local vended S3 target by exact catalog owner,
-    /// unexpired lease, and longest matching scope prefix.
-    /// Selects the announced scope that authorizes one location.
+    /// Resolves one process-local vended S3 target by exact catalog owner and
+    /// the longest announced scope prefix that authorizes the location.
     ///
     /// No expiry filter: an announcement names a scope and an acquisition path,
     /// neither of which expires. The coordinator's own material may well have
@@ -190,7 +189,7 @@ impl QueryContextCredentialSlot {
     }
 }
 
-impl ConnectorStorageResolver for QueryContextCredentialSlot {
+impl ConnectorStorageResolver for ParticipationCredentialSlot {
     fn resolve_vended_s3(
         &self,
         request: &StorageAccessRequest,
@@ -249,7 +248,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use super::QueryContextCredentialSlot;
+    use super::ParticipationCredentialSlot;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
         CredentialLeaseId, CredentialLeaseProvider, CredentialRenewalPath,
@@ -323,7 +322,7 @@ mod tests {
 
     #[test]
     fn close_withdraws_every_announcement_and_refuses_future_rotations_for_this_instance() {
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[
             lease(1, 1, &["s3://bucket/a"]),
             lease(2, 1, &["s3://bucket/b"]),
@@ -342,14 +341,14 @@ mod tests {
         );
         assert_closed(slot.install(&[]).expect_err("empty install cannot reopen"));
 
-        let other = QueryContextCredentialSlot::new();
+        let other = ParticipationCredentialSlot::new();
         other.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
         assert!(other.resolve_vended_s3(&request("s3://bucket/a/x")).is_ok());
     }
 
     #[test]
     fn clear_allows_replacement_while_open_and_does_not_reopen_after_close() {
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
         slot.clear();
         slot.clear();
@@ -371,7 +370,7 @@ mod tests {
     #[test]
     fn a_real_install_close_race_always_ends_closed_without_an_announcement() {
         for _ in 0..16 {
-            let slot = Arc::new(QueryContextCredentialSlot::new());
+            let slot = Arc::new(ParticipationCredentialSlot::new());
             slot.install(&[lease(1, 1, &["s3://bucket/a"])]).unwrap();
             let start = Arc::new(Barrier::new(3));
             let installer = {
@@ -415,7 +414,7 @@ mod tests {
         // The path reaches the consumer through the selection, not through a
         // second lookup: a node that had to re-derive it could disagree with
         // the lease it is actually holding (CAD-1 D1).
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[
             announcing_lease(
                 1,
@@ -451,7 +450,7 @@ mod tests {
     fn an_execution_node_selection_carries_no_material() {
         // CAD-1 D1 made material stop travelling. A selection that still handed
         // one over would mean something on this node was seeded after all.
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[lease(1, 1, &["s3://bucket/a"])])
             .expect("install");
 
@@ -475,7 +474,7 @@ mod tests {
         // CAD-1 acceptance 11: the coordinator's own material is long expired
         // by the time this node reads, and that says nothing about whether this
         // node may still acquire. A selection must still be made.
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[announcing_lease(
             1,
             1,
@@ -489,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_rotation_replaces_the_whole_table_in_one_move() {
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[
             lease(1, 1, &["s3://bucket/a"]),
             lease(2, 1, &["s3://bucket/b"]),
@@ -505,7 +504,7 @@ mod tests {
 
     #[test]
     fn longest_matching_prefix_wins_and_foreign_location_is_refused() {
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[
             lease(1, 1, &["s3://bucket"]),
             lease(2, 1, &["s3://bucket/deep/nested"]),
@@ -527,7 +526,7 @@ mod tests {
 
     #[test]
     fn refused_rotation_leaves_the_installed_table_serving() {
-        let slot = QueryContextCredentialSlot::new();
+        let slot = ParticipationCredentialSlot::new();
         slot.install(&[lease(1, 1, &["s3://bucket/a"])])
             .expect("install");
         let rejection = slot

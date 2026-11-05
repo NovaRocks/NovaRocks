@@ -36,15 +36,15 @@ use novarocks_spi::connector::write_stack::{
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::exec::chunk::{ChunkBatchProjection, ChunkMemoryLease, TransferredChunkBytes};
+use crate::exec::chunk::{ChunkBatchProjection, ChunkMemoryCharge, TransferredChunkBytes};
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::writer_failure::{WriterCommandOperation, WriterFailure};
 use crate::runtime::execution_services::IoExecutor;
-use crate::runtime::fragment::connector_failure::{ConnectorCallFailure, ConnectorOperation};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_execution_contract::status::SafeDetail;
 use novarocks_failure_contract::BoundedDetail;
 use novarocks_failure_contract::ResourceDimension;
@@ -484,7 +484,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         &self,
         batch: RecordBatch,
         retained_bytes: usize,
-        inherited_accounting: Option<ChunkMemoryLease>,
+        inherited_accounting: Option<ChunkMemoryCharge>,
         connector_retained_bytes: usize,
         additional_bytes: usize,
     ) -> ExecutionResult<()> {
@@ -502,7 +502,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         &self,
         rows: usize,
         retained_bytes: usize,
-        inherited_accounting: Option<ChunkMemoryLease>,
+        inherited_accounting: Option<ChunkMemoryCharge>,
         connector_retained_bytes: usize,
         additional_bytes: usize,
     ) -> ExecutionResult<AsyncWriterReservation<O>> {
@@ -595,7 +595,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         let tracker = queue_tracker.or_else(|| {
             inherited_accounting
                 .as_ref()
-                .and_then(ChunkMemoryLease::tracker)
+                .and_then(ChunkMemoryCharge::tracker)
         });
         let shared_projected_bytes = retained_bytes - additional_bytes;
         let transferred_accounting = match inherited_accounting.as_ref() {
@@ -1809,7 +1809,7 @@ pub(crate) mod tests {
     };
     use novarocks_spi::connector::{
         CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
-        ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+        ConnectorReservationBackend, ConnectorResourceCheckpoint, ConnectorResourceClass,
         ConnectorResourceLedger,
     };
 
@@ -1881,7 +1881,7 @@ pub(crate) mod tests {
             &self,
             class: ConnectorResourceClass,
             bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+        ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
             assert_eq!(class, ConnectorResourceClass::ReaderOutput);
             let bytes = i64::try_from(bytes).map_err(|_| {
                 ConnectorError::new(
@@ -1896,19 +1896,19 @@ pub(crate) mod tests {
                     error,
                 ));
             }
-            Ok(Box::new(TrackerLease {
+            Ok(Box::new(TrackerReservation {
                 tracker: Arc::clone(&self.tracker),
                 bytes,
             }))
         }
     }
 
-    struct TrackerLease {
+    struct TrackerReservation {
         tracker: Arc<MemTracker>,
         bytes: i64,
     }
 
-    impl ConnectorResourceLease for TrackerLease {
+    impl ConnectorReservationBackend for TrackerReservation {
         fn bytes(&self) -> u64 {
             u64::try_from(self.bytes).expect("non-negative test reservation")
         }
@@ -1950,7 +1950,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl Drop for TrackerLease {
+    impl Drop for TrackerReservation {
         fn drop(&mut self) {
             self.tracker.release(self.bytes);
         }
@@ -2149,7 +2149,7 @@ pub(crate) mod tests {
             Err(error) => error,
         };
         assert!(
-            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+            matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(cause)
             if matches!(cause.cause(), WriterFailure::QueueCapacity {
                 dimension: ResourceDimension::Positions, incoming: 1, live: usize::MAX, limit: usize::MAX,
             }))
@@ -2211,7 +2211,7 @@ pub(crate) mod tests {
     }
 
     fn is_missing_terminal(error: &ExecutionFailure) -> bool {
-        matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+        matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(cause)
             if matches!(cause.cause(), WriterFailure::MissingTerminalOutcome))
     }
 
@@ -2624,7 +2624,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 error.cause(),
-                crate::runtime::fragment::ExecutionFailureCause::MemoryAccounting(
+                crate::runtime::task::ExecutionFailureCause::MemoryAccounting(
                     crate::runtime::mem_tracker::MemoryAccountingFailure::Limit(_)
                 )
             ),
@@ -2720,8 +2720,8 @@ pub(crate) mod tests {
             inner: TrackerLedger,
             drops: Arc<AtomicUsize>,
         }
-        struct CountedLease {
-            inner: Box<dyn ConnectorResourceLease>,
+        struct CountedReservation {
+            inner: Box<dyn ConnectorReservationBackend>,
             drops: Arc<AtomicUsize>,
         }
         impl ConnectorResourceLedger for CountedLedger {
@@ -2732,14 +2732,14 @@ pub(crate) mod tests {
                 &self,
                 class: ConnectorResourceClass,
                 bytes: u64,
-            ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-                Ok(Box::new(CountedLease {
+            ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
+                Ok(Box::new(CountedReservation {
                     inner: self.inner.try_reserve(class, bytes)?,
                     drops: self.drops.clone(),
                 }))
             }
         }
-        impl ConnectorResourceLease for CountedLease {
+        impl ConnectorReservationBackend for CountedReservation {
             fn bytes(&self) -> u64 {
                 self.inner.bytes()
             }
@@ -2750,7 +2750,7 @@ pub(crate) mod tests {
                 self.inner.shrink_to(bytes)
             }
         }
-        impl Drop for CountedLease {
+        impl Drop for CountedReservation {
             fn drop(&mut self) {
                 self.drops.fetch_add(1, Ordering::SeqCst);
             }
@@ -3291,7 +3291,7 @@ pub(crate) mod tests {
             .enqueue_with_accounting(input, retained_bytes, accounting, reserved_bytes, 0)
             .expect_err("terminal writer must reject connector-owned input");
         assert!(
-            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+            matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(cause)
             if matches!(cause.cause(), WriterFailure::AfterTerminal { operation: WriterCommandOperation::Append })),
             "{error:?}"
         );
@@ -3391,7 +3391,7 @@ pub(crate) mod tests {
             .enqueue_with_accounting(input, bytes, Some(lease.clone()), bytes, 0)
             .expect_err("terminal writer must reject append");
         assert!(
-            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+            matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(cause)
             if matches!(cause.cause(), WriterFailure::AfterTerminal { operation: WriterCommandOperation::Append })),
             "{error:?}"
         );
@@ -3451,7 +3451,7 @@ pub(crate) mod tests {
             .enqueue_with_accounting(input, bytes, accounting, bytes, 0)
             .expect_err("full writer mailbox must reject append");
         assert!(
-            matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+            matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(cause)
             if matches!(cause.cause(), WriterFailure::MailboxFull { operation: WriterCommandOperation::Append })),
             "{error:?}"
         );
@@ -3560,7 +3560,7 @@ pub(crate) mod tests {
                 let ExitObservation {progress:ExitProgress::Unresolved(_),failure:Some(ExitFailure::Required(error)),..} = owner.observe_actor_exit() else {
                     panic!("an unqualified installed actor's failed join has no body proof");
                 };
-                assert!(matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(source)
+                assert!(matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Writer(source)
                     if matches!(source.cause(), WriterFailure::Panicked { .. }) == panic));
                 for _ in 0..3 {
                     let observed = owner.observe_actor_exit();
@@ -4086,7 +4086,7 @@ pub(crate) mod tests {
             checked_accepted_rows(u64::MAX, 1)
                 .expect_err("overflow")
                 .cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::Writer(
+            &crate::runtime::task::ExecutionFailureCause::Writer(
                 WriterFailure::AcceptedRowsOverflow {
                     current: u64::MAX,
                     incoming: 1
@@ -4123,7 +4123,7 @@ pub(crate) mod tests {
         assert!(!owner.shared.frame_exited.load(Ordering::Acquire));
         let original = owner.shared.abort_failure.lock().unwrap().clone().unwrap();
         assert!(
-            matches!(original.cause(), crate::runtime::fragment::ExecutionFailureCause::Connector(source)
+            matches!(original.cause(), crate::runtime::task::ExecutionFailureCause::Connector(source)
             if source.operation() == ConnectorOperation::AbortWriter)
         );
         assert!(matches!(
@@ -4953,7 +4953,7 @@ pub(crate) mod tests {
             Ok(_) => panic!("unknown actor cannot fund new input"),
         };
         assert!(
-            matches!(refusal.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(source) if matches!(source.cause(), WriterFailure::ExitUnresolved))
+            matches!(refusal.cause(), crate::runtime::task::ExecutionFailureCause::Writer(source) if matches!(source.cause(), WriterFailure::ExitUnresolved))
         );
         use novarocks_failure_contract::{
             FailureClass, FailureFact, FailureProjection, FailureReason, domain,
@@ -5089,7 +5089,7 @@ pub(crate) mod tests {
             catalog: CatalogHandle,
         }
         impl ProviderWriteRuntime for Runtime {
-            type CommitHandle = ();
+            type CommitSession = ();
             type WriterHandle = ();
             type CommitFragment = Fragment;
             fn descriptor(&self) -> &ConnectorInstanceDescriptor {

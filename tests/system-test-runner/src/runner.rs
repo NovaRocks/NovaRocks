@@ -7,7 +7,7 @@ use crate::scenario::{
 use crate::scenario_settlement::ScenarioSettlement;
 use crate::scenarios;
 use anyhow::{Context, Result, bail};
-use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
+use novarocks_cluster_harness::{CrossProcessCluster, CrossProcessClusterOptions};
 use std::fs;
 
 pub fn run(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
@@ -570,7 +570,7 @@ fn run_one_inner(
             );
             Ok(())
         };
-    let handle = CrossProcessServerHandle::launch_with_fixture_budget(
+    let handle = CrossProcessCluster::launch_with_fixture_budget(
         cluster_options,
         test_sessions,
         launch_config.native_fault_proxies,

@@ -28,7 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, ResourceDimension, ResourceFacts,
     ResourceScope,
@@ -143,10 +143,10 @@ use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
 use novarocks_types::SlotId;
 
@@ -562,7 +562,7 @@ impl AssertNumRowsProcessorKernel {
             *seen_keys = None;
         }
     }
-    fn observe_keyed(&mut self, chunk: &Chunk, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn observe_keyed(&mut self, chunk: &Chunk, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         let RuntimeAssertNumRowsMode::PerKeyAtMostOne {
             key_slots,
             key_labels,
@@ -836,7 +836,7 @@ impl InputEncodingPolicy for AssertNumRowsProcessorKernel {
 impl TransformKernel for AssertNumRowsProcessorKernel {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -844,7 +844,7 @@ impl TransformKernel for AssertNumRowsProcessorKernel {
         self.observe_keyed(&chunk, ctx)?;
         Ok(StepResult::new(Some(chunk), NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.mode.check_final()?;
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }
@@ -926,7 +926,7 @@ mod tests {
         desired: Option<usize>,
         assertion: Assertion,
         chunks: &[usize],
-    ) -> crate::runtime::fragment::ExecutionFailure {
+    ) -> crate::runtime::task::ExecutionFailure {
         let rt = RuntimeState::default();
         let mut op = Transform::hydrating(AssertNumRowsProcessorKernel {
             name: "test".to_string(),

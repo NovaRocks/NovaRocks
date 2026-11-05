@@ -123,7 +123,7 @@ fn held_statistics_binding(provider: Arc<HeldStatisticsReader>) -> QueryTableBin
         data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap(),
     });
     binding.admission =
-        QueryTableBindingAdmission::Exact(ConnectorControlPlanningLease::new(control, || {}));
+        QueryTableBindingAdmission::Exact(ConnectorControlPlanningPin::new(control, || {}));
     binding
 }
 

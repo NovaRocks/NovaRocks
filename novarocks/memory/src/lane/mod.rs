@@ -27,7 +27,7 @@ pub use shards::{CoverageGap, LaneShards, ShardSnapshot, ShardsSnapshot};
 pub mod slot;
 pub mod store;
 pub mod token;
-pub use handle::{FactToken, LaneHandle};
+pub use handle::{FactToken, Lane};
 pub use owner::RecordOwner;
 /// Frozen requested-size boundary, shared by wrappers, helpers and fact routing.
 pub const ATTRIBUTION_THRESHOLD_BYTES: usize = 512;
@@ -35,7 +35,7 @@ pub use record::{LaneRecord, LifetimeState, ProductionState, RecordSnapshot, Res
 pub use slot::{SLOT_QUANTUM_BYTES, SlotCore};
 #[cfg(not(loom))]
 pub use store::global_store;
-pub use store::{CoverageError, MAX_RECORDS, RecordStore, StoreHandle, UNATTRIBUTED_SHARDS};
+pub use store::{CoverageError, MAX_RECORDS, RecordStore, RecordStorePin, UNATTRIBUTED_SHARDS};
 pub use token::RecordRef;
 pub const LANE_SHARDS: usize = if cfg!(loom) { 2 } else { 16 };
 pub use store::{
@@ -46,7 +46,7 @@ mod tests {
     use super::*;
     #[test]
     fn bounded_store_and_generation_reuse() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 4);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 4);
         let first = store
             .acquire(
                 1,
@@ -97,7 +97,7 @@ mod tests {
     }
     #[test]
     fn draining_waits_for_negative_count_and_slot_pin_to_converge() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 42,
@@ -126,7 +126,7 @@ mod tests {
     }
     #[test]
     fn quantum_flush_and_direct_path_publish_real_counts() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 1,
@@ -171,7 +171,7 @@ mod tests {
     }
     #[test]
     fn owned_store_outlives_owner_and_last_allocation() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 7,

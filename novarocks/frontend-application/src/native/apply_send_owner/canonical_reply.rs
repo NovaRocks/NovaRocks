@@ -242,7 +242,7 @@ impl OriginalReplyPublisher {
     pub(crate) fn protocol_tail(
         &self,
     ) -> Result<
-        novarocks_resource_contract::ExistingOwnerRetentionLease,
+        novarocks_resource_contract::ExistingOwnerRetentionPin,
         novarocks_resource_contract::RetentionPinError,
     > {
         self.backing
@@ -349,11 +349,11 @@ impl OriginalNativeAcceptance {
 }
 /// A single short publication lease. No poll, callback, or foreign destructor
 /// executes under Core. Loaned remains a live original record during the call.
-struct NativeRowLease<'a> {
+struct NativeRowLoan<'a> {
     slot: &'a ApplySlot,
     original: Option<OriginalRecord>,
 }
-impl Drop for NativeRowLease<'_> {
+impl Drop for NativeRowLoan<'_> {
     fn drop(&mut self) {
         if let Some(original) = self.original.take() {
             let mut state = self
@@ -370,7 +370,7 @@ impl Drop for NativeRowLease<'_> {
     }
 }
 impl ApplySlot {
-    fn native_row(&self) -> Result<NativeRowLease<'_>, novarocks_workload_control::WorkError> {
+    fn native_row(&self) -> Result<NativeRowLoan<'_>, novarocks_workload_control::WorkError> {
         use novarocks_workload_control::WorkError;
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
         let record = state.records[self.index]
@@ -394,7 +394,7 @@ impl ApplySlot {
             },
         );
         drop(state);
-        Ok(NativeRowLease {
+        Ok(NativeRowLoan {
             slot: self,
             original: Some(original),
         })

@@ -55,7 +55,7 @@ struct MarkerProvider {
 }
 
 impl ProviderWriteRuntime for MarkerProvider {
-    type CommitHandle = ();
+    type CommitSession = ();
     type WriterHandle = ();
     type CommitFragment = ();
 

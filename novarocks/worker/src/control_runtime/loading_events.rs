@@ -26,7 +26,7 @@ use super::{
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitRoleError, ExitRolePhase},
+    exit_custody::{ExitCustodyError, ExitCustodyPhase},
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{
@@ -35,8 +35,8 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution_contract::{OperationOutcome, TaskIdentity};
 use novarocks_worker_protocol::{
-    context::{ContextInput, PhysicalFact},
     creation::AdmissionRefusal,
+    participation::{ParticipationInput, PhysicalFact},
     proposal_summary::CutId,
 };
 use std::{
@@ -67,11 +67,11 @@ enum ReturnPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoadingEventError {
     Causal(CausalError),
-    Role(ExitRoleError),
+    Role(ExitCustodyError),
     Report(RuntimeError),
     LoadedRejected,
     ExitRejected,
-    StartRefused(ExitRoleError),
+    StartRefused(ExitCustodyError),
     Unresolved,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,12 +79,12 @@ pub(crate) enum LoadingEventOutcome {
     Loaded,
     Canceled,
     Rejected,
-    StartRefused(ExitRoleError),
+    StartRefused(ExitCustodyError),
     Unresolved,
 }
 #[derive(Clone, Copy)]
 enum Fault {
-    StartRefused(ExitRoleError),
+    StartRefused(ExitCustodyError),
     Unresolved,
 }
 struct State {
@@ -93,7 +93,7 @@ struct State {
     returns: [ReturnPhase; 2],
     // Exactly the two original authors can refuse a neutral handoff. Losing
     // their owner cannot drop or reinterpret those exact returned payloads.
-    rejected: [Option<ManuallyDrop<ContextInput>>; 2],
+    rejected: [Option<ManuallyDrop<ParticipationInput>>; 2],
     fault: Option<Fault>,
     failed: bool,
 }
@@ -109,7 +109,7 @@ pub(crate) struct LoadingFailureProgress {
     pub progressed: bool,
     pub retired: bool,
     pub author_return: Option<LoadingAuthorReturn>,
-    pub rejected: [Option<ContextInput>; 2],
+    pub rejected: [Option<ParticipationInput>; 2],
 }
 #[derive(Clone)]
 pub(crate) struct LoadingEvents(Arc<Custody>);
@@ -305,13 +305,18 @@ impl LoadingEvents {
                 .expect("the original loading sender"),
         )
     }
-    fn send(&self, index: usize, input: ContextInput) -> bool {
+    fn send(&self, index: usize, input: ParticipationInput) -> bool {
         let sender = self
             .take_sender(index)
             .expect("one handoff per original author");
         self.send_taken(index, sender, input)
     }
-    fn send_taken(&self, index: usize, sender: TaskCausalSender, input: ContextInput) -> bool {
+    fn send_taken(
+        &self,
+        index: usize,
+        sender: TaskCausalSender,
+        input: ParticipationInput,
+    ) -> bool {
         let mut sending = AuthorSending {
             events: self.clone(),
             active: true,
@@ -343,7 +348,7 @@ impl LoadingEvents {
             } => {
                 if self.send(
                     LOADED,
-                    ContextInput::LoadedTask {
+                    ParticipationInput::LoadedTask {
                         task: self.0.task,
                         result: *result,
                         shape,
@@ -361,10 +366,10 @@ impl LoadingEvents {
                 // including LeaseExpired; no successful measurement is guessed.
                 if self.send(
                     LOADED,
-                    ContextInput::Loaded {
+                    ParticipationInput::Loaded {
                         task: self.0.task,
                         result: Err(AdmissionRefusal::Verdict(
-                            OperationOutcome::ContextTerminalReceipt,
+                            OperationOutcome::ParticipationTerminalReceipt,
                         )),
                     },
                 ) {
@@ -436,7 +441,7 @@ impl LoadingEvents {
             .loader
             .ready_for_exit()
             .map_err(LoadingEventError::Role)?;
-        if ready && phase != ExitRolePhase::Retired {
+        if ready && phase != ExitCustodyPhase::Retired {
             let observer = ConsumerId::new(2).unwrap();
             if self
                 .0
@@ -454,7 +459,7 @@ impl LoadingEvents {
             }
         }
         self.known_fault()?;
-        if !ready || phase == ExitRolePhase::Retired {
+        if !ready || phase == ExitCustodyPhase::Retired {
             return Ok(None);
         }
         let (loaded, exit) = {
@@ -472,7 +477,7 @@ impl LoadingEvents {
         self.send_taken(
             EXITED,
             sender,
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: self.0.task,
                 fact: PhysicalFact::LoaderExited,
             },
@@ -487,7 +492,7 @@ impl LoadingEvents {
         inbox: &mut TaskCausalInbox,
     ) -> Result<bool, LoadingEventError> {
         self.known_fault()?;
-        if self.0.loader.phase() == ExitRolePhase::Retired {
+        if self.0.loader.phase() == ExitCustodyPhase::Retired {
             self.release_retention();
             return Ok(self.is_retired());
         }
@@ -530,7 +535,7 @@ impl LoadingEvents {
     /// Transfers the precise refused neutral values to the real failure
     /// custodian. This grants neither Core consumption nor physical exit and
     /// deliberately leaves the original author phases Rejected.
-    pub(crate) fn take_rejected(&self) -> [Option<ContextInput>; 2] {
+    pub(crate) fn take_rejected(&self) -> [Option<ParticipationInput>; 2] {
         let mut state = self.0.state.lock().expect("original loading event custody");
         std::array::from_fn(|index| state.rejected[index].take().map(ManuallyDrop::into_inner))
     }
@@ -567,7 +572,7 @@ impl LoadingEvents {
                 });
             }
         }
-        if self.0.loader.phase() != ExitRolePhase::Retired {
+        if self.0.loader.phase() != ExitCustodyPhase::Retired {
             let core = ConsumerId::new(1).unwrap();
             if self
                 .0
@@ -641,7 +646,7 @@ impl LoadingEvents {
         }
         progress.rejected = self.take_rejected();
         progress.progressed |= progress.rejected.iter().any(Option::is_some);
-        if self.0.loader.phase() != ExitRolePhase::Retired {
+        if self.0.loader.phase() != ExitCustodyPhase::Retired {
             let observer = ConsumerId::new(2).unwrap();
             if self
                 .0
@@ -670,7 +675,7 @@ impl LoadingEvents {
         Ok(progress)
     }
     pub(crate) fn is_retired(&self) -> bool {
-        if self.0.loader.phase() != ExitRolePhase::Retired {
+        if self.0.loader.phase() != ExitCustodyPhase::Retired {
             return false;
         }
         let state = self.0.state.lock().expect("original loading event custody");
@@ -757,7 +762,7 @@ mod tests {
         task_publication::commit_task_projection,
     };
     use crate::task_proposal_ingress::RetiredCut;
-    use novarocks_control_runtime::driver::{DriverError, InputPhase};
+    use novarocks_control_runtime::actor_turn::{ActorTurnError, InputPhase};
     use novarocks_control_runtime_core::{
         identity::{ActorId, InputId, Tick},
         mailbox::InputClass,
@@ -767,8 +772,8 @@ mod tests {
         TaskDescriptor,
     };
     use novarocks_types::UniqueId;
-    use novarocks_worker_protocol::context::ContextCommand;
-    use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
+    use novarocks_worker_protocol::participation::ParticipationCommand;
+    use novarocks_worker_protocol::{creation::PayloadId, participation::ParticipationEffect};
     use std::{any::Any, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
     #[derive(Debug)]
@@ -836,7 +841,10 @@ mod tests {
             .begin_causal_loader(payload)
             .unwrap_or_else(|_| panic!("the original paid loading authors"));
         assert_eq!(
-            f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
+            f.runtime
+                .standing_input_inventory(actor(), None, 32)
+                .unwrap()
+                .len(),
             4,
             "two real causal authors, each with its original prefix and event input"
         );
@@ -844,7 +852,7 @@ mod tests {
         assert_eq!(job.queue_key(), (loader.scope_id(), loader.work_id().work));
         (f, host, job, getters, drops)
     }
-    fn world(f: &mut Fixture, command: ContextInput) -> Vec<WorkerAction> {
+    fn world(f: &mut Fixture, command: ParticipationInput) -> Vec<WorkerAction> {
         let input = f.send(command, None, InputClass::Lifecycle, 2);
         committed_world_input(f, input)
     }
@@ -903,15 +911,15 @@ mod tests {
         dispose_pair(f, host, retired);
         assert_eq!(
             host.causal().observe_effects_exited(cut),
-            Err(CausalError::UnknownRole),
+            Err(CausalError::MissingCutCustody),
             "a removed original role is an error, never inferred exit"
         );
     }
     fn retire_unused_disposal(
         f: &Fixture,
-        role: &crate::control_runtime::task_disposal::TaskDisposalRole,
+        role: &crate::control_runtime::task_disposal::TaskDisposalCustody,
     ) {
-        // The original never-issued cleanup role is a Context lifetime child.
+        // The original never-issued cleanup role is a Participation lifetime child.
         // Dropping its Arc cannot replace unused-author withdrawal and reaping.
         let mut retired = false;
         for _ in 0..64 {
@@ -948,7 +956,7 @@ mod tests {
                 .unwrap();
             remainder.finish().unwrap();
         }
-        if let Some(mut storage) = resources.accepted_role_storage.take() {
+        if let Some(mut storage) = resources.accepted_completion_storage.take() {
             // No accepted lifecycle input was issued by this component teardown.
             // Return the same unused storage after its original preparation exit.
             assert!(storage.resources().unwrap().quota.is_empty());
@@ -999,7 +1007,7 @@ mod tests {
     }
     fn cancel_from_core(f: &mut Fixture, host: &TaskHostRecord) {
         let input = f.send(
-            ContextInput::Request(ContextCommand::Abort {
+            ParticipationInput::Request(ParticipationCommand::Abort {
                 cause: AbortCause::LeaseExpired,
             }),
             Some(operation(7)),
@@ -1007,34 +1015,34 @@ mod tests {
             2,
         );
         let outputs = committed_world_input(f, input);
-        assert!(
-            outputs
-                .iter()
-                .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
-        );
-        let outputs = world(f, ContextInput::NextInternal);
+        assert!(outputs.iter().any(|effect| matches!(
+            effect,
+            WorkerAction::Participation(ParticipationEffect::WakeInternal)
+        )));
+        let outputs = world(f, ParticipationInput::NextInternal);
         let epoch = outputs
             .iter()
             .find_map(|effect| match effect {
-                WorkerAction::Context(ContextEffect::ApplyTaskClose { generation, .. }) => {
-                    Some(*generation)
-                }
+                WorkerAction::Participation(ParticipationEffect::ApplyTaskClose {
+                    generation,
+                    ..
+                }) => Some(*generation),
                 _ => None,
             })
             .unwrap();
         let outputs = world(
             f,
-            ContextInput::ApplyTaskClose {
+            ParticipationInput::ApplyTaskClose {
                 task: host.port().identity(),
                 generation: epoch,
-                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                     novarocks_execution_contract::AbortCause::LeaseExpired,
                 ),
             },
         );
         assert!(outputs.iter().any(|effect| matches!(
             effect,
-            WorkerAction::Context(ContextEffect::CancelLoader { .. })
+            WorkerAction::Participation(ParticipationEffect::CancelLoader { .. })
         )));
         host.loader().unwrap().cancel();
     }
@@ -1141,12 +1149,15 @@ mod tests {
             .retire_after_exit(exit.cut, CausalSourceRetirement::Unclaimed)
             .err()
             .expect("the original exit receipt stays until the loader report really retires");
-        assert_eq!(refusal.error, CausalError::Driver(DriverError::RoleBusy));
+        assert_eq!(
+            refusal.error,
+            CausalError::ActorTurn(ActorTurnError::StandingInputBusy)
+        );
         assert!(
             !host.observe_loading_exit_report().unwrap(),
             "report retirement alone cannot consume the held author token"
         );
-        assert_eq!(loader.phase(), ExitRolePhase::Retired);
+        assert_eq!(loader.phase(), ExitCustodyPhase::Retired);
         let missing_return = host
             .causal()
             .retire_after_exit(exit.cut, refusal.retirement)
@@ -1171,7 +1182,7 @@ mod tests {
         dispose_pair(f, host, retired);
         assert_eq!(
             host.causal().observe_effects_exited(exit.cut),
-            Err(CausalError::UnknownRole)
+            Err(CausalError::MissingCutCustody)
         );
     }
     #[test]
@@ -1229,13 +1240,16 @@ mod tests {
             .retire_after_exit(loaded.cut, CausalSourceRetirement::Unclaimed)
             .err()
             .expect("the original live batch cannot retire its causal role");
-        assert_eq!(premature.error, CausalError::Driver(DriverError::RoleBusy));
+        assert_eq!(
+            premature.error,
+            CausalError::ActorTurn(ActorTurnError::StandingInputBusy)
+        );
         let mut dispatch = EffectDispatch::new(actor(), 15);
         dispatch.index_committed(&f.runtime, 32).unwrap();
         let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
         assert!(matches!(
             publication.effect,
-            WorkerAction::Context(ContextEffect::PublishTask { .. })
+            WorkerAction::Participation(ParticipationEffect::PublishTask { .. })
         ));
         assert!(
             !host.causal().observe_effects_exited(loaded.cut).unwrap(),
@@ -1251,14 +1265,19 @@ mod tests {
         let wake = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
         assert!(matches!(
             &wake.effect,
-            WorkerAction::Context(ContextEffect::WakeInternal)
+            WorkerAction::Participation(ParticipationEffect::WakeInternal)
         ));
-        let initial = f.send(ContextInput::NextInternal, None, InputClass::Lifecycle, 2);
+        let initial = f.send(
+            ParticipationInput::NextInternal,
+            None,
+            InputClass::Lifecycle,
+            2,
+        );
         f.runtime.effect_completed(wake).unwrap();
         let preparation = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
         assert!(matches!(
             &preparation.effect,
-            WorkerAction::Context(ContextEffect::EnqueuePreparation {
+            WorkerAction::Participation(ParticipationEffect::EnqueuePreparation {
                 task,
                 initial_pending: true,
                 ..
@@ -1284,7 +1303,7 @@ mod tests {
         // original preparation stays dormant until that actual plan arrives.
         let initial_effects = committed_world_input(&mut f, initial);
         let [
-            WorkerAction::Context(ContextEffect::InitialPreparationReady {
+            WorkerAction::Participation(ParticipationEffect::InitialPreparationReady {
                 task,
                 progressions,
                 refusal,
@@ -1317,7 +1336,7 @@ mod tests {
         dispose_pair(&f, &host, retired); // no loader/report hold on InputLoaded
         assert_eq!(
             host.causal().observe_effects_exited(loaded.cut),
-            Err(CausalError::UnknownRole)
+            Err(CausalError::MissingCutCustody)
         );
         assert!(host.loader().unwrap().ready_for_exit().unwrap());
         commit_exit(&mut f, &mut host);
@@ -1335,7 +1354,7 @@ mod tests {
         // not a fake Native install. Their exact Core inputs commit separately.
         world(
             &mut f,
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: host.port().identity(),
                 fact: PhysicalFact::PreparationBodyExited,
             },
@@ -1348,7 +1367,7 @@ mod tests {
             .unwrap();
         world(
             &mut f,
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: host.port().identity(),
                 fact: PhysicalFact::PreparationExited,
             },
@@ -1438,8 +1457,8 @@ mod tests {
             effect,
             WorkerAction::Reply(reply)
                 if matches!(reply.body.as_ref(),
-                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
-                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                    novarocks_worker_protocol::participation::ParticipationReplyBody::Verdict(
+                        novarocks_worker_protocol::participation::RequestResult::Outcome(
                             OperationOutcome::LeaseExpired)))
         )));
         assert!(!host.observe_loading_exit().unwrap());
@@ -1512,7 +1531,7 @@ mod tests {
             host.observe_loading_exit(),
             Err(LoadingEventError::Unresolved)
         );
-        assert_eq!(host.loader().unwrap().phase(), ExitRolePhase::Unresolved);
+        assert_eq!(host.loader().unwrap().phase(), ExitCustodyPhase::Unresolved);
         assert!(host.loader().unwrap().take_input_disposal().is_none());
         assert!(host.causal().deliver_next().unwrap().is_none());
         let resources = host.into_resources();
@@ -1548,7 +1567,7 @@ mod tests {
         let [loaded, exit] = events.take_rejected();
         assert!(exit.is_none());
         assert!(
-            matches!(loaded, Some(ContextInput::LoadedTask { task, result: Ok(_), .. }) if task == resources.port.identity())
+            matches!(loaded, Some(ParticipationInput::LoadedTask { task, result: Ok(_), .. }) if task == resources.port.identity())
         );
         assert!(events.take_rejected().iter().all(Option::is_none));
         assert_eq!(
@@ -1650,7 +1669,7 @@ mod tests {
         let [loaded, rejected_exit] = origin.take_rejected();
         assert!(loaded.is_none());
         assert!(
-            matches!(rejected_exit, Some(ContextInput::Physical { task, fact: PhysicalFact::LoaderExited }) if task == host.port().identity())
+            matches!(rejected_exit, Some(ParticipationInput::Physical { task, fact: PhysicalFact::LoaderExited }) if task == host.port().identity())
         );
         assert_eq!(
             host.publish_loading_exit().err(),

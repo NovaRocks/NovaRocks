@@ -53,7 +53,7 @@ pub(crate) fn admit_table_execute_scan_binding(
     read: QueryRewriteGroupRead,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(table_execute_binding_key(identity), |binding| {
-        let planning_lease = read.planning_lease.clone();
+        let planning_pin = read.planning_pin.clone();
         Ok(QueryTableBinding {
             resolved: table_execute_resolved_analyzer_table(
                 identity,
@@ -61,7 +61,7 @@ pub(crate) fn admit_table_execute_scan_binding(
                 binding,
             ),
             statistics_pin: None,
-            admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
+            admission: QueryTableBindingAdmission::FrozenRead(planning_pin),
             source_metadata: None,
             scan_materialization: None,
             mv_target_read: None,

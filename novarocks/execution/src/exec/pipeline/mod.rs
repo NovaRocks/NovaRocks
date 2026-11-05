@@ -34,13 +34,14 @@ pub mod distribution;
 pub mod driver;
 pub(crate) mod driver_failure;
 pub mod executor;
-pub mod fragment_context;
 pub mod global_driver_executor;
 pub mod input;
 mod instance;
+pub mod task_context;
 #[cfg(test)]
 pub(crate) use instance::OperatorInstance;
 mod driver_retirement;
+pub mod driver_step;
 pub mod operator;
 mod operator_exit;
 pub mod operator_factory;
@@ -52,7 +53,6 @@ pub mod pipeline;
 pub mod schedule;
 pub mod shape;
 pub mod step;
-pub mod step_context;
 pub mod writer_failure;
 
 #[cfg(test)]

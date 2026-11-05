@@ -17,7 +17,7 @@
 
 //! Teardown is evidence of actual executor exit, never a timeout or task label.
 use crate::{
-    account::{AccountHandle, Path, node_publish},
+    account::{Account, Path, node_publish},
     domain::FundingDomain,
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,7 @@ impl TeardownEvidence<'_> {
         Ok(())
     }
 }
-impl AccountHandle {
+impl Account {
     // Design: ADR-0197 (docs/adr/ADR-0197-observation-owner-shards-and-coverage-shadow.md)
     pub fn retire(
         &self,
@@ -183,7 +183,7 @@ impl AccountHandle {
     }
 }
 impl FundingDomain {
-    fn transfer_residual(&self, retiring: &AccountHandle) -> (u64, u64, u64) {
+    fn transfer_residual(&self, retiring: &Account) -> (u64, u64, u64) {
         loop {
             let source = self.affiliation();
             let path = Path::new(&source);

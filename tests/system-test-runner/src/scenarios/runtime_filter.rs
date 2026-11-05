@@ -24,7 +24,7 @@ use novarocks_cluster_harness::{
     NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
     RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
     RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalRollup,
-    RuntimeFilterTerminalTotals, RuntimeFilterTerminalTotalsTelemetry, ServerHandle,
+    RuntimeFilterTerminalTotals, RuntimeFilterTerminalTotalsTelemetry, TestClusterOwner,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -38,29 +38,34 @@ const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop";
 const ACK_DROP_RENDEZVOUS_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop-rendezvous";
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
+const NATIVE_QUERY_ACTIVE_TASKS_RESOURCE: &str = "native_query_active_tasks";
 
 /// The task protocol's terminal acknowledgement loss: the split delivery that
 /// closed a plan node was applied and only its answer is dropped.
 const TASK_UPDATE_TERMINAL_ACK_DROP: &str = "task-update-terminal-ack-drop";
-const TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER: &str = "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED";
+const TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER: &str =
+    novarocks_failpoint::observation_marker::TASK_UPDATE_TERMINAL_ACK_DROPPED;
 /// The replay verdict the resend must reach: the same splits recognised again,
 /// not assigned twice.
-const TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE";
+const TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER: &str =
+    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_DUPLICATE;
 /// Delivery of a client cancellation to a backend.
-const TASK_CONTEXT_ABORT_APPLIED_MARKER: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+const PARTICIPATION_ABORT_APPLIED_MARKER: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ABORT_APPLIED;
 /// A task was admitted and is running on this backend.
-const TASK_CREATE_APPLIED_MARKER: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+const TASK_CREATE_APPLIED_MARKER: &str =
+    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
 /// The three dynamic-filter feedback perturbations, each emitted by the task
 /// carrier at the publication it perturbed. They are asserted alongside every
 /// client-visible outcome below: a fault whose claim did not move emits
 /// nothing, and a case that only reads the client's side cannot tell that
 /// apart from the fault firing.
 const TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER: &str =
-    "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT";
-const TASK_FEEDBACK_UNAVAILABLE_MARKER: &str = "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE";
+    novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT;
+const TASK_FEEDBACK_UNAVAILABLE_MARKER: &str =
+    novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE;
 const TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER: &str =
-    "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT";
+    novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -489,12 +494,12 @@ fn run_accepted_after_ack_drop(
 /// facts of this attempt rather than a race against the kill.
 ///
 /// The cancellation half is delivery, not the client's error: a client error is
-/// also what a timeout looks like. `NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED` is the
+/// also what a timeout looks like. `NOVAROCKS_PARTICIPATION_ABORT_APPLIED` is the
 /// only evidence that KILL QUERY reached the backends.
 ///
 /// What is deliberately not asserted here: the retired protocol's complete
 /// per-participant Runtime Filter terminal rollup. On the task path a backend's
-/// sealed Runtime Filter observation rides `ReleaseQueryContextAck`, and release
+/// sealed Runtime Filter observation rides `ReleaseParticipationAck`, and release
 /// requires an `Active` context — an aborted one never releases, so the
 /// frontend refuses the rollup as incomplete rather than summing the backends
 /// that did answer. `runtime-filter/accepted-after-ack-drop` keeps that rollup
@@ -514,7 +519,7 @@ fn run_cancel_with_terminal_ack_replay(
     let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
     let ack_dropped_baseline = be_marker_counts(context, TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER)?;
     let duplicate_baseline = be_marker_counts(context, TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER)?;
-    let abort_baseline = be_marker_counts(context, TASK_CONTEXT_ABORT_APPLIED_MARKER)?;
+    let abort_baseline = be_marker_counts(context, PARTICIPATION_ABORT_APPLIED_MARKER)?;
 
     let query = runtime_filter_blocking_query(&tables);
     let mut target_connection = mysql_actor::connect_until(
@@ -577,7 +582,7 @@ fn run_cancel_with_terminal_ack_replay(
     // for two would assert a placement the task graph no longer has.
     await_backends_advanced(
         context,
-        TASK_CONTEXT_ABORT_APPLIED_MARKER,
+        PARTICIPATION_ABORT_APPLIED_MARKER,
         &abort_baseline,
         1,
     )?;
@@ -854,7 +859,16 @@ fn retry_spec() -> StatementSpec {
         faults: (0..3)
             .map(|i| (i, ACK_DROP_RENDEZVOUS_FAULT_KIND))
             .collect(),
-        observations: (0..3).map(|i| (i, "grpc-fragment", None)).collect(),
+        observations: (0..3)
+            .map(|i| {
+                (
+                    i,
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    None,
+                )
+            })
+            .collect(),
     }
 }
 fn cancel_spec() -> StatementSpec {
@@ -864,7 +878,22 @@ fn cancel_spec() -> StatementSpec {
         sql: runtime_filter_blocking_query(&runtime_filter_tables("cancel")),
         faults,
         observations: (0..3)
-            .flat_map(|i| [(i, "grpc-fragment", None), (i, "reader-marker", None)])
+            .flat_map(|i| {
+                [
+                    (
+                        i,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    ),
+                    (
+                        i,
+                        novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                            .as_str(),
+                        None,
+                    ),
+                ]
+            })
             .collect(),
     }
 }
@@ -1436,12 +1465,12 @@ fn task_query_activity_observed(
             .any(|(current, baseline)| {
                 current
                     .resources
-                    .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
+                    .get(NATIVE_QUERY_ACTIVE_TASKS_RESOURCE)
                     .copied()
                     .unwrap_or_default()
                     > baseline
                         .resources
-                        .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
+                        .get(NATIVE_QUERY_ACTIVE_TASKS_RESOURCE)
                         .copied()
                         .unwrap_or_default()
             });

@@ -31,7 +31,7 @@ use novarocks_query_application::{
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorOperationControl, ConnectorOperationControlView,
     ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, ConnectorRequestContext,
-    ConnectorStatisticsLease, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorStatisticsSession, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution, OriginalResultCheckClass as Class,
     OriginalResultCheckError as ScopeFailure, StatisticsCpuPort, StatisticsEvidence,
     StatisticsReadOriginal,
@@ -63,8 +63,8 @@ struct StatisticsReadAction {
     origin: ResultWindowAlias,
     scope: novarocks_workload_control::WorkScope,
     // This exact generation is kept from pure target resolution through close.
-    planning: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
-    lease: Option<ConnectorStatisticsLease>,
+    planning: Option<novarocks_spi::connector::ConnectorControlPlanningPin>,
+    statistics_session: Option<ConnectorStatisticsSession>,
     target: application::StatisticsTableTarget,
     context: Option<ConnectorRequestContext>,
     blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
@@ -141,11 +141,11 @@ impl FrontendStatisticsApplicationPort {
             )
         })?;
         let origin = capacity.try_window_alias().map_err(fail)?;
-        let planning = self.target_resolver.planning_lease(&target)?;
-        let lease = planning
+        let planning = self.target_resolver.planning_pin(&target)?;
+        let statistics_session = planning
             .derive_statistics_lease()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
-        let profile = lease
+        let profile = statistics_session
             .collection_io_profile()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
         // The same action's inline declaration is responsibility only.
@@ -159,7 +159,7 @@ impl FrontendStatisticsApplicationPort {
             origin,
             scope: capacity.scope().clone(),
             planning: Some(planning),
-            lease: Some(lease),
+            statistics_session: Some(statistics_session),
             target,
             context: Some(context),
             blocking: self.blocking.clone(),
@@ -188,7 +188,7 @@ impl StatisticsReadAction {
             .statistics_read_cpu_ports(
                 self.origin_scope(),
                 self.origin.clone(),
-                self.lease.as_ref().unwrap(),
+                self.statistics_session.as_ref().unwrap(),
                 self.planning.as_ref().unwrap(),
                 self.cancellation.clone(),
                 self.runtime.clone(),
@@ -212,7 +212,7 @@ impl StatisticsReadAction {
             context: self.context.as_ref().unwrap().clone(),
         };
         self.source = Some(
-            self.lease
+            self.statistics_session
                 .as_ref()
                 .unwrap()
                 .prepare_scoped_read(request, ConnectorOriginalResultScope::from_original(check))
@@ -362,7 +362,7 @@ impl GovernedStatementAction for StatisticsReadAction {
                 origin: self.origin.clone(),
                 scope: self.scope.clone(),
                 planning: self.planning.take(),
-                lease: self.lease.take(),
+                statistics_session: self.statistics_session.take(),
                 target: std::mem::replace(
                     &mut self.target,
                     application::StatisticsTableTarget {
@@ -403,7 +403,11 @@ impl StatisticsReadAction {
         }
         // The same MIO and original source remain in this residual while
         // lease/context destructors run. A panic cannot refund their payload.
-        drop((self.context.take(), self.lease.take(), self.planning.take()));
+        drop((
+            self.context.take(),
+            self.statistics_session.take(),
+            self.planning.take(),
+        ));
         Ok(())
     }
 }

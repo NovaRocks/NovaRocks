@@ -42,9 +42,9 @@ impl OperationWaitCaps {
     /// Returns the effective wait for one operation.
     pub fn clamp(self, kind: OperationKind, requested: MaxWait) -> Duration {
         let cap = match kind {
-            OperationKind::AcquireQueryContextAdmissionTicket
+            OperationKind::AcquireParticipationAdmissionTicket
             | OperationKind::CreateTask
-            | OperationKind::UpdateQueryContext => self.create,
+            | OperationKind::UpdateParticipation => self.create,
             _ => self.update,
         };
         requested.get().min(cap)

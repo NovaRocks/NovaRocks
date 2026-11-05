@@ -237,7 +237,7 @@ async fn project_binding_statistics_for_metrics_async(
             reason: "resolved table does not expose connector statistics".to_string(),
         });
     };
-    let planning_lease = match binding.admission.exact_planning_lease() {
+    let planning_pin = match binding.admission.exact_planning_pin() {
         Ok(lease) => lease,
         Err(_) => {
             return Ok(fatal_statistics_evidence(
@@ -247,7 +247,7 @@ async fn project_binding_statistics_for_metrics_async(
             ));
         }
     };
-    let control_binding = planning_lease.binding();
+    let control_binding = planning_pin.binding();
     if control_binding.descriptor().instance_id != *pin.table.owner() {
         return Ok(fatal_statistics_evidence(
             binding_id,
@@ -435,7 +435,7 @@ mod unified_tests {
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+        ConnectorControlBinding, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
         ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorMetadata, ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext,
         ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorStatistics,
@@ -667,7 +667,7 @@ mod unified_tests {
             )
             .expect("statistics fixture control binding"),
         );
-        let planning_lease = ConnectorControlPlanningLease::new(control, || {});
+        let planning_pin = ConnectorControlPlanningPin::new(control, || {});
         let mut binding = local_binding("ice.main", "db", "orders", 73);
         binding.statistics_pin = Some(crate::connector::backend::ResolvedTableStatisticsPin {
             table: ConnectorTableHandle::try_new(
@@ -678,7 +678,7 @@ mod unified_tests {
             data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))
                 .expect("data version"),
         });
-        binding.admission = QueryTableBindingAdmission::Exact(planning_lease);
+        binding.admission = QueryTableBindingAdmission::Exact(planning_pin);
         binding
     }
 

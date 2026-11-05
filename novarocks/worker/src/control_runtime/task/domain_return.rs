@@ -21,7 +21,7 @@
 use super::*;
 pub(crate) struct DomainReturnRefusal {
     pub error: CausalError,
-    pub role: AdmittedCompletionRole,
+    pub completion_transfer: AdmittedCompletionTransfer,
     pub admission: CutSourceAdmission,
 }
 impl TaskHostRecord {
@@ -39,26 +39,26 @@ impl TaskHostRecord {
     }
     pub(crate) fn bind_domain_return(
         &mut self,
-        role: AdmittedCompletionRole,
+        completion_transfer: AdmittedCompletionTransfer,
         admission: CutSourceAdmission,
     ) -> Result<(CausalInputCustody, InputAuthor), DomainReturnRefusal> {
-        let (cut, sender) =
-            match self
-                .resources
-                .causal
-                .admit_input(&role.work, 1, self.pending.clone(), admission)
-            {
-                Ok(original) => original,
-                Err(refusal) => {
-                    return Err(DomainReturnRefusal {
-                        error: refusal.error,
-                        role,
-                        admission: refusal.admission,
-                    });
-                }
-            };
+        let (cut, sender) = match self.resources.causal.admit_input(
+            &completion_transfer.work,
+            1,
+            self.pending.clone(),
+            admission,
+        ) {
+            Ok(original) => original,
+            Err(refusal) => {
+                return Err(DomainReturnRefusal {
+                    error: refusal.error,
+                    completion_transfer,
+                    admission: refusal.admission,
+                });
+            }
+        };
         Ok(CausalInputCustody::from_admitted(
-            role,
+            completion_transfer,
             &mut self.resources.causal,
             cut,
             sender,

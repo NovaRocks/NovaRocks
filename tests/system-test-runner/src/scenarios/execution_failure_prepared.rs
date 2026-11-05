@@ -29,7 +29,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, ServerHandle};
+use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, TestClusterOwner};
 use novarocks_execution_contract::{
     failure::{FailureClass, FailureEvidence, domain},
     task_execution::status::{
@@ -58,10 +58,14 @@ const HEALTHY_SQL: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 1) t OR
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(AcceptedPreparedFailureDelayedExit::default()),
-        Box::new(context_owner_panic::ContextOwnerPanicIsolation::default()),
-        Box::new(context_owner_panic::ContextOwnerPanicIsolation::with_prepared_holder()),
-        Box::new(context_owner_panic::RetainedContextOwnerPanicIsolation::default()),
-        Box::new(context_owner_panic::RetainedContextOwnerPanicIsolation::with_expiry()),
+        Box::new(participation_owner_panic::ParticipationOwnerPanicIsolation::default()),
+        Box::new(
+            participation_owner_panic::ParticipationOwnerPanicIsolation::with_prepared_holder(),
+        ),
+        Box::new(participation_owner_panic::RetainedParticipationOwnerPanicIsolation::default()),
+        Box::new(
+            participation_owner_panic::RetainedParticipationOwnerPanicIsolation::with_expiry(),
+        ),
     ]
 }
 #[derive(Default)]
@@ -102,7 +106,7 @@ impl Scenario for AcceptedPreparedFailureDelayedExit {
     fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
         launch.config_overlay.fe = Some("[runtime]\ntask_dispatch_create_permits = 2\n".into());
-        launch.config_overlay.be = Some("[runtime]\ntask_preparation_max_tasks_per_context = 2\ntask_preparation_max_tasks = 3\ntask_preparation_max_bytes = 67108864\ntask_preparation_max_workers = 1\n".into());
+        launch.config_overlay.be = Some("[runtime]\ntask_preparation_max_tasks_per_participation = 2\ntask_preparation_max_tasks = 3\ntask_preparation_max_bytes = 67108864\ntask_preparation_max_workers = 1\n".into());
         Ok(launch)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -163,9 +167,9 @@ impl Scenario for AcceptedPreparedFailureDelayedExit {
                 Err(error) => cleanup_failures.push(error),
             }
             match owner.release_when_ready(context) {
-                Ok(proto::ReleaseQueryContextOutcome::Released) => {}
+                Ok(proto::ReleaseParticipationOutcome::Released) => {}
                 Ok(other) => cleanup_failures.push(anyhow::anyhow!(
-                    "prepared scenario context release did not complete: {other:?}"
+                    "prepared scenario participation release did not complete: {other:?}"
                 )),
                 Err(error) => cleanup_failures.push(error),
             }
@@ -223,9 +227,9 @@ fn exercise(
     write_artifact(context, "prepared-failing-covered.json", &before.json())?;
     let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
     ensure!(
-        charged.context_positions == 1
+        charged.participation_positions == 1
             && charged.bytes > 0
-            && charged.context_limit == 2
+            && charged.participation_limit == 2
             && charged.position_limit == 3
             && charged.worker_limit == 1
             && charged.byte_limit == 67108864,
@@ -240,7 +244,7 @@ fn exercise(
         context,
         "prepared-held-ledger.json",
         &json!({
-            "positions": charged.positions, "context_positions": charged.context_positions,
+            "positions": charged.positions, "participation_positions": charged.participation_positions,
             "bytes": charged.bytes, "workers": charged.workers, "queued": charged.queued,
             "active_fragments": active_fragments(&retained, 0)?,
         }),
@@ -278,7 +282,7 @@ fn exercise(
     );
     let after_sibling = await_snapshot_at(context, 0, 1, 0, 0)?;
     ensure!(
-        after_sibling.bytes == charged.bytes && after_sibling.context_positions == 1,
+        after_sibling.bytes == charged.bytes && after_sibling.participation_positions == 1,
         "healthy sibling returned the held kernel's preparation charges"
     );
     let still_retained = await_retained_fragment(context, baseline)?;
@@ -287,7 +291,7 @@ fn exercise(
         "prepared-held-after-health.json",
         &json!({
             "covered": still_held.json(), "positions": after_sibling.positions,
-            "context_positions": after_sibling.context_positions, "bytes": after_sibling.bytes,
+            "participation_positions": after_sibling.participation_positions, "bytes": after_sibling.bytes,
             "active_fragments": active_fragments(&still_retained, 0)?, "healthy_rows": rows,
         }),
     )?;
@@ -315,7 +319,7 @@ fn exercise(
         context,
         "prepared-exit-returned-charges.json",
         &json!({
-            "positions": released.positions, "context_positions": released.context_positions,
+            "positions": released.positions, "participation_positions": released.participation_positions,
             "bytes": released.bytes, "workers": released.workers, "queued": released.queued,
             "active_fragments": active_fragments(&exited_resources, 0)?,
         }),
@@ -405,7 +409,7 @@ fn observe_prepared_status(
         FieldPath::root("prepared_expected"),
     )?;
     let request = proto::SubscribeTaskStatusRequest {
-        query_context: Some(session.context_under(session.frontend, 1)),
+        participation: Some(session.participation_under(session.frontend, 1)),
         generation: 1,
         required_identities: vec![expected_wire],
         ..Default::default()
@@ -424,7 +428,7 @@ fn observe_prepared_status(
         })
         .await
         .context("original prepared subscription connect deadline expired")??;
-        let driver = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         let result = tokio::time::timeout_at(deadline.into(), async {
             sender = sender.ready().await?;
             let headers = http::Request::builder()
@@ -555,7 +559,7 @@ fn observe_prepared_status(
                         | CoveredStatusStreamFact::TaskConvergenceUnchanged(_) => bail!(
                             "required zero-cursor prepared Task evidence was absent or reclaimed"
                         ),
-                        CoveredStatusStreamFact::ContextConvergence(_)
+                        CoveredStatusStreamFact::ParticipationConvergence(_)
                         | CoveredStatusStreamFact::Quiesce(_) => {}
                     }
                 }
@@ -568,16 +572,16 @@ fn observe_prepared_status(
         .await
         .context("original prepared status/cut deadline expired")
         .and_then(|result| result);
-        driver.abort();
-        let joined = driver.await;
+        connection_job.abort();
+        let joined = connection_job.await;
         let cleanup = match joined {
             Ok(Ok(())) => Ok(()),
             Err(error) if error.is_cancelled() => Ok(()),
             Ok(Err(error)) => Err(anyhow::anyhow!(
-                "prepared subscription original H2 driver exit failed: {error}"
+                "prepared subscription original H2 connection job exit failed: {error}"
             )),
             Err(error) => Err(anyhow::anyhow!(
-                "prepared subscription original H2 driver panicked: {error}"
+                "prepared subscription original H2 connection job panicked: {error}"
             )),
         };
         match (result, cleanup) {
@@ -675,8 +679,13 @@ fn await_explicit_release(
     token: &str,
 ) -> Result<()> {
     let expected = format!(
-        "NOVAROCKS_PREPARED_FAILURE_EXIT_RELEASED backend={} execution_id={}:{}:1 stage=1 task={} token={} reason=release",
-        session.backend, session.query_id.hi, session.query_id.lo, create.task_id, token
+        "{} backend={} execution_id={}:{}:1 stage=1 task={} token={} reason=release",
+        novarocks_failpoint::observation_marker::PREPARED_FAILURE_EXIT_RELEASED,
+        session.backend,
+        session.query_id.hi,
+        session.query_id.lo,
+        create.task_id,
+        token
     );
     loop {
         let log = context.handle().be_log_contents(session.index)?;
@@ -702,7 +711,7 @@ fn active_fragments(snapshot: &QueryExecutionResourceSnapshot, index: usize) -> 
     );
     backend
         .resources
-        .get("native_query_active_fragments")
+        .get("native_query_active_tasks")
         .copied()
         .context("actual active-fragment measurement is unavailable")
 }
@@ -735,15 +744,15 @@ fn hex(bytes: &[u8]) -> String {
 
 // S8 is a separate owner oracle. The existing prepared-failure scenario above
 // remains unchanged: a typed host failure is not a Context actor panic.
-mod context_owner_panic {
+mod participation_owner_panic {
     use super::*;
     use crate::scenarios::native_compatibility::{
         RawUnaryResponse, only_successful_receipt, raw_operation_envelope, raw_unary_response,
     };
     use crate::scenarios::native_creation::{await_installed, outcome};
 
-    const OWNER_ACTION: &str = "context-owner-panic-on-renew";
-    const REMOVED: &str = "Worker Context execution custody retired";
+    const OWNER_ACTION: &str = "participation-owner-panic-on-renew";
+    const REMOVED: &str = "Worker Participation execution custody retired";
 
     fn owner_launch_config(root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
@@ -751,18 +760,18 @@ mod context_owner_panic {
         // source or a replacement cleanup command.
         let log = root.join("owner-application-log");
         launch.config_overlay.be = Some(format!(
-            "sys_log_dir = {:?}\nlog_filter = \"info,novarocks_native_adapter::backend_application=debug,novarocks_worker::control_runtime::node_bootstrap=debug,novarocks_worker::control_runtime::node=debug,novarocks_worker::control_runtime::task=debug,novarocks_worker::control_runtime::context_host::requests=debug,novarocks_worker::control_runtime::causal=debug,novarocks_worker::control_runtime::context_host::task_driver=debug,novarocks_worker::control_runtime::context_host::teardown=debug,novarocks_worker::control_runtime::context_host::failure=debug,novarocks_worker::control_runtime::process_control::rejected_ingress=debug\"\n",
+            "sys_log_dir = {:?}\nlog_filter = \"info,novarocks_native_adapter::backend_application=debug,novarocks_worker::control_runtime::node_bootstrap=debug,novarocks_worker::control_runtime::node=debug,novarocks_worker::control_runtime::task=debug,novarocks_worker::control_runtime::participation_host::requests=debug,novarocks_worker::control_runtime::causal=debug,novarocks_worker::control_runtime::participation_host::task_io=debug,novarocks_worker::control_runtime::participation_host::teardown=debug,novarocks_worker::control_runtime::participation_host::failure=debug,novarocks_worker::control_runtime::process_control::rejected_ingress=debug\"\n",
             log.to_string_lossy(),
         ));
         Ok(launch)
     }
 
     #[derive(Default)]
-    pub(super) struct ContextOwnerPanicIsolation {
+    pub(super) struct ParticipationOwnerPanicIsolation {
         intent: DirectIntentOwner,
         held_prepared: bool,
     }
-    impl ContextOwnerPanicIsolation {
+    impl ParticipationOwnerPanicIsolation {
         pub(super) fn with_prepared_holder() -> Self {
             Self {
                 intent: DirectIntentOwner::default(),
@@ -770,7 +779,7 @@ mod context_owner_panic {
             }
         }
     }
-    impl Scenario for ContextOwnerPanicIsolation {
+    impl Scenario for ParticipationOwnerPanicIsolation {
         fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
             super::super::declarations::for_module(
                 "execution_failure_prepared",
@@ -781,9 +790,9 @@ mod context_owner_panic {
         }
         fn name(&self) -> &'static str {
             if self.held_prepared {
-                "execution-failure/context-owner-panic-held-prepared-isolation"
+                "execution-failure/participation-owner-panic-held-prepared-isolation"
             } else {
-                "execution-failure/context-owner-panic-isolation"
+                "execution-failure/participation-owner-panic-isolation"
             }
         }
         fn is_explicit_stage(&self) -> bool {
@@ -800,7 +809,7 @@ mod context_owner_panic {
         {
             ensure!(
                 cluster_size == 3,
-                "Context isolation requires native 1FE+3BE"
+                "Participation isolation requires native 1FE+3BE"
             );
             if self.held_prepared {
                 return Ok(Some(self.intent.freeze_actions(
@@ -828,7 +837,7 @@ mod context_owner_panic {
         fn run(&self, context: &mut ScenarioContext) -> Result<()> {
             ensure!(
                 context.handle().be_count() == 3,
-                "Context isolation requires native 1FE+3BE"
+                "Participation isolation requires native 1FE+3BE"
             );
             let intent = self.intent.get()?;
             ensure!(
@@ -864,7 +873,7 @@ mod context_owner_panic {
                 nominal_failure(&before.status)?;
                 let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
                 ensure!(
-                    charged.bytes > 0 && charged.context_positions == 1,
+                    charged.bytes > 0 && charged.participation_positions == 1,
                     "the original prepared holder lost its physical charges: {charged:?}"
                 );
                 await_retained_fragment(context, &baseline)?;
@@ -877,11 +886,11 @@ mod context_owner_panic {
                         "scope":"real prepared kernel/charges remain live; does not prove an old Stop/DisposeSource ticket is pending"
                     }),
                 )?;
-                context.action("the existing exact prepared-failure-exit gate retained the real original kernel, covered Failing with no actual-stop and nonzero preparation charges before the Context actor panic; no old cleanup-ticket phase is inferred");
+                context.action("the existing exact prepared-failure-exit gate retained the real original kernel, covered Failing with no actual-stop and nonzero preparation charges before the Participation actor panic; no old cleanup-ticket phase is inferred");
                 Some(charged.bytes)
             } else {
                 await_installed(context, &failed, &receiver)?;
-                context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Context failure");
+                context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Participation failure");
                 None
             };
 
@@ -890,7 +899,7 @@ mod context_owner_panic {
                 &failed,
                 raw_operation_envelope(15_000),
                 1,
-                "unselected same-Context Renew",
+                "unselected same-Participation Renew",
             )?;
             ensure!(
                 outcome(&normal)? == proto::TaskOperationOutcome::Accepted,
@@ -909,7 +918,7 @@ mod context_owner_panic {
                 &failed,
                 envelope,
                 2,
-                "declared original Context owner panic",
+                "declared original Participation owner panic",
             )?;
             ensure!(
                 outcome(&receipt)? == proto::TaskOperationOutcome::OwnerFailed,
@@ -918,11 +927,11 @@ mod context_owner_panic {
             ensure!(
                 context
                     .handle()
-                    .be_log_count(0, "declared Context owner panic context=")?
+                    .be_log_count(0, "declared Participation owner panic participation=")?
                     == 1,
                 "the original actor turn did not report exactly one declared panic"
             );
-            context.action("unselected same-Context Renew remained normal; the exact declared operation panicked inside its original Context Actor turn and Common returned OwnerFailed through that same R");
+            context.action("unselected same-Participation Renew remained normal; the exact declared operation panicked inside its original Participation Actor turn and Common returned OwnerFailed through that same R");
 
             let mut healthy = RawCreate::values(&sibling, 2);
             healthy.pipeline_dop = 1;
@@ -941,7 +950,7 @@ mod context_owner_panic {
             let rows: Vec<i64> = connection.run(|connection| {
                 connection
                     .query(HEALTHY_SQL)
-                    .context("healthy public SQL after actual Context owner failure")
+                    .context("healthy public SQL after actual Participation owner failure")
             })?;
             ensure!(
                 rows == [1, 1],
@@ -949,20 +958,21 @@ mod context_owner_panic {
             );
             ensure!(
                 context.recheck_live_process_launch_identities()? == processes,
-                "owner failure replaced a role process instead of isolating its Context"
+                "owner failure replaced a role process instead of isolating its Participation"
             );
             ensure!(
-                sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
-                "the independent same-BE Context did not really release"
+                sibling.release_when_ready(context)?
+                    == proto::ReleaseParticipationOutcome::Released,
+                "the independent same-BE Participation did not really release"
             );
-            context.action("an independent Context on the SAME BE Finished and actually stopped, public SQL returned exact rows, and its original Release completed without replacing a role");
+            context.action("an independent Participation on the SAME BE Finished and actually stopped, public SQL returned exact rows, and its original Release completed without replacing a role");
 
             if let Some(gate) = &mut prepared_gate {
                 // This is still the exact un-released physical holder. Do not
                 // mistake logical OwnerFailed or the missing Core for its exit.
                 let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
                 ensure!(
-                    Some(charged.bytes) == held_bytes && charged.context_positions == 1,
+                    Some(charged.bytes) == held_bytes && charged.participation_positions == 1,
                     "owner failure or sibling progress prematurely refunded the prepared holder: {charged:?}"
                 );
                 await_retained_fragment(context, &baseline)?;
@@ -1003,7 +1013,8 @@ mod context_owner_panic {
                     Ok(log) => log,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
                     Err(error) => {
-                        return Err(error).context("read original Context removal writer output");
+                        return Err(error)
+                            .context("read original Participation removal writer output");
                     }
                 };
                 if let Some(line) = log.lines().find(|line| {
@@ -1021,7 +1032,7 @@ mod context_owner_panic {
                 }
                 thread::sleep(
                     context
-                        .remaining("wait original failed Context Scope removal")?
+                        .remaining("wait original failed Participation Scope removal")?
                         .min(Duration::from_millis(50)),
                 );
             }
@@ -1036,7 +1047,7 @@ mod context_owner_panic {
             await_installed(context, &recovered, &replacement)?;
             ensure!(
                 recovered.release_when_ready(context)?
-                    == proto::ReleaseQueryContextOutcome::Released,
+                    == proto::ReleaseParticipationOutcome::Released,
                 "recovered receiver did not complete its real normal release"
             );
             await_resource_convergence(context, &baseline)?;
@@ -1047,7 +1058,7 @@ mod context_owner_panic {
             ensure!(
                 context
                     .handle()
-                    .be_log_count(0, "declared Context owner panic context=")?
+                    .be_log_count(0, "declared Participation owner panic participation=")?
                     == 1,
                 "the once-grant produced another actor panic"
             );
@@ -1063,16 +1074,16 @@ mod context_owner_panic {
                     "final_required_audit":"original FE+3BE monitor Finals all raw0; no lifetime expiry/owner loss; actual Node joins and cluster/fixture cleanup. Scenario return alone is insufficient."
                 }),
             )?;
-            context.action("the original failed Context Scope physically disappeared, original physical resources converged, and a fresh receiver was Accepted, Installed, then normally Released; final four raw exits remain independently required");
+            context.action("the original failed Participation Scope physically disappeared, original physical resources converged, and a fresh receiver was Accepted, Installed, then normally Released; final four raw exits remain independently required");
             Ok(())
         }
     }
     #[derive(Default)]
-    pub(super) struct RetainedContextOwnerPanicIsolation {
+    pub(super) struct RetainedParticipationOwnerPanicIsolation {
         intent: DirectIntentOwner,
         with_expiry: bool,
     }
-    impl RetainedContextOwnerPanicIsolation {
+    impl RetainedParticipationOwnerPanicIsolation {
         pub(super) fn with_expiry() -> Self {
             Self {
                 intent: DirectIntentOwner::default(),
@@ -1080,7 +1091,7 @@ mod context_owner_panic {
             }
         }
     }
-    impl Scenario for RetainedContextOwnerPanicIsolation {
+    impl Scenario for RetainedParticipationOwnerPanicIsolation {
         fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
             super::super::declarations::for_module(
                 "execution_failure_prepared",
@@ -1091,9 +1102,9 @@ mod context_owner_panic {
         }
         fn name(&self) -> &'static str {
             if self.with_expiry {
-                "execution-failure/context-owner-panic-retained-expiry"
+                "execution-failure/participation-owner-panic-retained-expiry"
             } else {
-                "execution-failure/context-owner-panic-retained-isolation"
+                "execution-failure/participation-owner-panic-retained-isolation"
             }
         }
         fn is_explicit_stage(&self) -> bool {
@@ -1110,7 +1121,7 @@ mod context_owner_panic {
         {
             ensure!(
                 cluster_size == 3,
-                "retained Context isolation requires native 1FE+3BE"
+                "retained Participation isolation requires native 1FE+3BE"
             );
             Ok(Some(self.intent.freeze(
                 OWNER_ACTION,
@@ -1128,7 +1139,7 @@ mod context_owner_panic {
         fn run(&self, context: &mut ScenarioContext) -> Result<()> {
             ensure!(
                 context.handle().be_count() == 3,
-                "retained Context isolation requires native 1FE+3BE"
+                "retained Participation isolation requires native 1FE+3BE"
             );
             let intent = self.intent.get()?;
             ensure!(
@@ -1156,21 +1167,21 @@ mod context_owner_panic {
             )?;
             ensure!(
                 retained.release_when_ready(context)?
-                    == proto::ReleaseQueryContextOutcome::Released,
-                "the original completed Context did not normally release before its cold panic"
+                    == proto::ReleaseParticipationOutcome::Released,
+                "the original completed Participation did not normally release before its cold panic"
             );
             let retired_line = loop {
                 let lines = execution_retirement_lines(context, &retained)?;
                 ensure!(
                     lines.len() <= 1,
-                    "the original Context retired execution custody more than once"
+                    "the original Participation retired execution custody more than once"
                 );
                 if let Some(line) = lines.into_iter().next() {
                     break line;
                 }
                 thread::sleep(
                     context
-                        .remaining("observe original released Context execution retirement")?
+                        .remaining("observe original released Participation execution retirement")?
                         .min(Duration::from_millis(50)),
                 );
             };
@@ -1181,16 +1192,16 @@ mod context_owner_panic {
                 &retained,
                 raw_operation_envelope(15_000),
                 1,
-                "unselected original retained Context Renew",
+                "unselected original retained Participation Renew",
             )?;
             ensure!(
-                outcome(&normal)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
-                "the normally released retained Context changed its terminal decision: {normal:?}"
+                outcome(&normal)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt,
+                "the normally released retained Participation changed its terminal decision: {normal:?}"
             );
             ensure!(
                 context
                     .handle()
-                    .be_log_count(0, "declared Context owner panic context=")?
+                    .be_log_count(0, "declared Participation owner panic participation=")?
                     == 0,
                 "an unselected operation panicked the retained actor"
             );
@@ -1201,11 +1212,11 @@ mod context_owner_panic {
                     "original_execution_scope_retirement_line":retired_line,
                     "normal_task_finished_and_actual_stopped":true,
                     "normal_release":"Released",
-                    "unselected_retained_renew":"ContextTerminalReceipt",
+                    "unselected_retained_renew":"ParticipationTerminalReceipt",
                     "resources_returned_to_baseline":true
                 }),
             )?;
-            context.action("the original Task normally Finished and actually stopped, its Context returned Released, the original application writer recorded execution-Scope retirement, resources converged, and the same retained route answered an unselected Renew with its terminal receipt");
+            context.action("the original Task normally Finished and actually stopped, its Participation returned Released, the original application writer recorded execution-Scope retirement, resources converged, and the same retained route answered an unselected Renew with its terminal receipt");
 
             let trigger = intent
                 .holds
@@ -1220,7 +1231,7 @@ mod context_owner_panic {
                 &retained,
                 envelope,
                 2,
-                "declared original retained Context owner panic",
+                "declared original retained Participation owner panic",
             )?;
             ensure!(
                 outcome(&failed)? == proto::TaskOperationOutcome::OwnerFailed,
@@ -1229,7 +1240,7 @@ mod context_owner_panic {
             ensure!(
                 context
                     .handle()
-                    .be_log_count(0, "declared Context owner panic context=")?
+                    .be_log_count(0, "declared Participation owner panic participation=")?
                     == 1,
                 "the retained actor did not report exactly one declared original panic"
             );
@@ -1237,11 +1248,11 @@ mod context_owner_panic {
                 &retained,
                 raw_operation_envelope(15_000),
                 3,
-                "fresh control request after retained Context owner failure",
+                "fresh control request after retained Participation owner failure",
             )?;
             ensure!(
                 outcome(&fresh)? == proto::TaskOperationOutcome::OwnerFailed,
-                "fresh failed-Context control request lost its typed OwnerFailed verdict: {fresh:?}"
+                "fresh failed-Participation control request lost its typed OwnerFailed verdict: {fresh:?}"
             );
             let rich_ingress = exercise_fresh_failed_rich_ingress(context, &retained, &completed)?;
             let healthy = &intent.queries[1];
@@ -1254,7 +1265,7 @@ mod context_owner_panic {
             intent.verify_backend(0, sibling.backend)?;
             ensure!(
                 sibling.backend == retained.backend,
-                "the recovery Context moved to another BE process"
+                "the recovery Participation moved to another BE process"
             );
             let mut task = RawCreate::values(&sibling, 2);
             task.pipeline_dop = 1;
@@ -1266,8 +1277,9 @@ mod context_owner_panic {
                 proto::TaskState::Finished,
             )?;
             ensure!(
-                sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
-                "the same-BE sibling Context did not normally release after the cold panic"
+                sibling.release_when_ready(context)?
+                    == proto::ReleaseParticipationOutcome::Released,
+                "the same-BE sibling Participation did not normally release after the cold panic"
             );
             let connection = mysql_actor::connect_until(
                 context.mysql_user(),
@@ -1277,7 +1289,7 @@ mod context_owner_panic {
             let rows: Vec<i64> = connection.run(|connection| {
                 connection
                     .query(HEALTHY_SQL)
-                    .context("healthy SQL after retained Context panic")
+                    .context("healthy SQL after retained Participation panic")
             })?;
             ensure!(
                 rows == [1, 1],
@@ -1294,7 +1306,7 @@ mod context_owner_panic {
                 Instant::now(),
             )?;
             let expiry = if self.with_expiry {
-                Some(await_retained_context_expiry(context)?)
+                Some(await_retained_participation_expiry(context)?)
             } else {
                 None
             };
@@ -1310,11 +1322,11 @@ mod context_owner_panic {
             ensure!(
                 context
                     .handle()
-                    .be_log_count(0, "declared Context owner panic context=")?
+                    .be_log_count(0, "declared Participation owner panic participation=")?
                     == 1,
                 "the consumed cold grant caused another actor panic"
             );
-            context.action("the exact retained-Context Renew panicked its original actor and its original admitted R received OwnerFailed; another Context on that same BE and public SQL completed normally, resources converged, original role identities stayed fixed, and the original execution-retirement record remained unique");
+            context.action("the exact retained-Participation Renew panicked its original actor and its original admitted R received OwnerFailed; another Participation on that same BE and public SQL completed normally, resources converged, original role identities stayed fixed, and the original execution-retirement record remained unique");
             // The short variant exercises process-close cleanup. The expiry
             // variant first observes the real directory empty under the same
             // process; neither changes H or invents a RetentionOrigin reading.
@@ -1327,8 +1339,8 @@ mod context_owner_panic {
                 &json!({
                     "original_execution_scope_retirement_line":retired_line,
                     "cold_original_R_owner_failed":true,
-                    "fresh_failed_context_renew_owner_failed":true,
-                    "fresh_failed_context_rich_ingress":rich_ingress,
+                    "fresh_failed_participation_renew_owner_failed":true,
+                    "fresh_failed_participation_rich_ingress":rich_ingress,
                     "failed_owner_inventory_converged_before_shutdown":true,
                     "same_BE_sibling_finished_actual_stopped_and_released":true,
                     "healthy_rows":rows,
@@ -1338,7 +1350,7 @@ mod context_owner_panic {
                     "explicit_original_cluster_shutdown_joined":true,
                     "horizon_directory_expiry":expiry,
                     "horizon_expiry_and_normal_close_forget":if self.with_expiry {
-                        "Observed backend0 available context_records reach zero before shutdown with no new work; exact original-origin non-restart and individual normal-close forget are not directly observed by this counter"
+                        "Observed backend0 available participation_records reach zero before shutdown with no new work; exact original-origin non-restart and individual normal-close forget are not directly observed by this counter"
                     } else {
                         "NOT_PROVED: no exact original RetentionOrigin Native read surface; this scene exercises real process-close cleanup without waiting for H"
                     },
@@ -1367,23 +1379,23 @@ mod context_owner_panic {
             .establish_request
             .as_ref()
             .context("retained session lost its original Establish")?;
-        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(proto::task_operation::Operation::UpdateParticipation(update)) =
             establish.operation.as_ref()
         else {
-            bail!("original Establish is not a query-context update");
+            bail!("original Establish is not a participation update");
         };
-        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+        let Some(proto::update_participation_request::Command::Establish(establish)) =
             update.command.as_ref()
         else {
-            bail!("original query-context update is not Establish");
+            bail!("original participation update is not Establish");
         };
-        let original_context = establish
-            .query_context
+        let original_participation = establish
+            .participation
             .as_ref()
-            .context("original Establish lost its exact Context")?;
+            .context("original Establish lost its exact Participation")?;
         ensure!(
-            original_context == &completed.context,
-            "completed Task disagrees with the original established Context"
+            original_participation == &completed.participation,
+            "completed Task disagrees with the original established Participation"
         );
         let mut credential = establish
             .initial_credential
@@ -1394,7 +1406,7 @@ mod context_owner_panic {
             .checked_add(1)
             .context("original credential epoch cannot advance")?;
         let credential_shape = json!({
-            "lease_id":credential.lease_id,
+            "credential_domain_id":credential.credential_domain_id,
             "previous_epoch":previous_epoch,
             "requested_epoch":credential.epoch,
             "descriptor_count":credential.descriptors.len(),
@@ -1424,18 +1436,18 @@ mod context_owner_panic {
                 },
             ),
             (
-                "context_domain",
+                "participation_domain",
                 proto::TaskOperation {
                     envelope: Some(raw_operation_envelope(15_000)),
-                    operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-                        proto::UpdateQueryContextRequest {
+                    operation: Some(proto::task_operation::Operation::UpdateParticipation(
+                        proto::UpdateParticipationRequest {
                             command: Some(
-                                proto::update_query_context_request::Command::AdvanceDomain(
-                                    proto::AdvanceQueryContextDomainRequest {
-                                        query_context: Some(original_context.clone()),
-                                        domain: Some(proto::QueryContextDomainUpdate {
+                                proto::update_participation_request::Command::AdvanceDomain(
+                                    proto::AdvanceParticipationDomainRequest {
+                                        participation: Some(original_participation.clone()),
+                                        domain: Some(proto::ParticipationDomainUpdate {
                                             domain: Some(
-                                                proto::query_context_domain_update::Domain::Credential(
+                                                proto::participation_domain_update::Domain::Credential(
                                                     credential,
                                                 ),
                                             ),
@@ -1448,11 +1460,11 @@ mod context_owner_panic {
                 },
             ),
         ];
-        let neutral_context = novarocks_task_codec::identity::decode_query_context_ref(
-            original_context,
-            FieldPath::root("retained_failed_rich_context"),
+        let neutral_participation = novarocks_task_codec::identity::decode_participation_ref(
+            original_participation,
+            FieldPath::root("retained_failed_rich_participation"),
         )?;
-        let context_field = format!("context={neutral_context:?}");
+        let participation_field = format!("participation={neutral_participation:?}");
         let mut operation_ids = std::collections::BTreeSet::new();
         let mut evidence = Vec::new();
         for (kind, request) in requests {
@@ -1472,7 +1484,7 @@ mod context_owner_panic {
             );
             let artifact = format!("retained-owner-fresh-rich-{kind}.json");
             let mut item = json!({
-                "kind":kind,"operation":operation,"context":format!("{neutral_context:?}"),
+                "kind":kind,"operation":operation,"participation":format!("{neutral_participation:?}"),
                 "phase":"original request prepared; response not yet observed",
                 "wire_legality":match kind {
                     "create"=>"RawCreate::values frozen package for a fresh Task identity",
@@ -1483,23 +1495,23 @@ mod context_owner_panic {
             write_artifact(context, &artifact, &item)?;
             let receipt = retained.apply(
                 request,
-                &format!("fresh {kind} after retained Context owner failure"),
+                &format!("fresh {kind} after retained Participation owner failure"),
             )?;
             ensure!(
                 outcome(&receipt)? == proto::TaskOperationOutcome::OwnerFailed,
-                "fresh failed-Context {kind} did not reach its typed OwnerFailed verdict: {receipt:?}"
+                "fresh failed-Participation {kind} did not reach its typed OwnerFailed verdict: {receipt:?}"
             );
             item["phase"] = json!("OwnerFailed observed; original physical cleanup pending");
             item["outcome"] = json!("OwnerFailed");
             write_artifact(context, &artifact, &item)?;
             let cleanup =
-                await_rejected_ingress_retirement(context, &context_field, &operation, kind)?;
+                await_rejected_ingress_retirement(context, &participation_field, &operation, kind)?;
             item["phase"] = json!("same original cleanup disposed and retired");
             item["cleanup"] = cleanup;
             write_artifact(context, &artifact, &item)?;
             evidence.push(item);
         }
-        context.action("three fresh wire/codec-legal rich requests reached Worker after the retained Context failed and each returned OwnerFailed; each original operation recorded positive disposal and retirement of the same scoped cleanup Work, before the healthy same-BE sibling");
+        context.action("three fresh wire/codec-legal rich requests reached Worker after the retained Participation failed and each returned OwnerFailed; each original operation recorded positive disposal and retirement of the same scoped cleanup Work, before the healthy same-BE sibling");
         Ok(json!({
             "requests":evidence,"credential_shape":credential_shape,
             "native_handler_body_frame_and_marker_exit":"NOT_PROVED by cleanup log lines; independent original role/transport exit audit required",
@@ -1509,7 +1521,7 @@ mod context_owner_panic {
 
     fn await_rejected_ingress_retirement(
         context: &ScenarioContext,
-        context_field: &str,
+        participation_field: &str,
         operation: &str,
         kind: &str,
     ) -> Result<Value> {
@@ -1534,7 +1546,7 @@ mod context_owner_panic {
                 log.lines()
                     .filter(|line| {
                         line.contains(marker)
-                            && line.contains(context_field)
+                            && line.contains(participation_field)
                             && line.contains(&operation_field)
                             && line.contains(&kind_field)
                     })
@@ -1543,7 +1555,7 @@ mod context_owner_panic {
             let disposed = matching(DISPOSED);
             let retired = matching(RETIRED);
             let observation = json!({
-                "operation":operation,"kind":kind,"context_field":context_field,
+                "operation":operation,"kind":kind,"participation_field":participation_field,
                 "disposed_lines":disposed,"retired_lines":retired,
                 "scope":"Worker cleanup facts; Native handler/marker exit remains independent"
             });
@@ -1562,7 +1574,7 @@ mod context_owner_panic {
                     "rich-ingress disposal and retirement changed their actual scoped Work"
                 );
                 return Ok(json!({
-                    "operation":operation,"kind":kind,"context_field":context_field,
+                    "operation":operation,"kind":kind,"participation_field":participation_field,
                     "scoped_work":original_work,"disposed_line":disposed,"retired_line":retired,
                     "body_frame_and_native_marker_exit":"separate from these Worker cleanup facts"
                 }));
@@ -1594,7 +1606,7 @@ mod context_owner_panic {
         Ok(work)
     }
 
-    fn await_retained_context_expiry(context: &mut ScenarioContext) -> Result<Value> {
+    fn await_retained_participation_expiry(context: &mut ScenarioContext) -> Result<Value> {
         use crate::scenarios::result_delivery_support::metric;
 
         let port = context
@@ -1668,7 +1680,7 @@ mod context_owner_panic {
                         Some(metric(
                             rows,
                             "novarocks_backend_execution_quiescence",
-                            &[("resource", "context_records")],
+                            &[("resource", "participation_records")],
                         )?)
                     } else {
                         ensure!(
@@ -1680,7 +1692,7 @@ mod context_owner_panic {
                     };
                 samples.push(json!({
                     "sample":sample_tag,"snapshot_available":available,
-                    "context_records":records,
+                    "participation_records":records,
                     "request_started_after_micros":started.duration_since(epoch).as_micros(),
                     "request_finished_after_micros":epoch.elapsed().as_micros(),
                     "since_previous_request_start_micros":since_previous
@@ -1708,8 +1720,8 @@ mod context_owner_panic {
             "backend_index":0,"url":url,"elapsed_micros":epoch.elapsed().as_micros(),
             "poll_interval_millis":500,"original_scenario_deadline_unchanged":true,
             "snapshot_family":"novarocks_backend_execution_quiescence",
-            "resource":"context_records","observed_nonempty_retained_directory":saw_positive,
-            "all_original_backend0_context_records_removed_before_shutdown":outcome.is_ok(),
+            "resource":"participation_records","observed_nonempty_retained_directory":saw_positive,
+            "all_original_backend0_participation_records_removed_before_shutdown":outcome.is_ok(),
             "error":outcome.as_ref().err().map(|error| format!("{error:#}")),
             "samples":samples,
             "scope_exit":"independently witnessed earlier by the original execution-retirement event",
@@ -1722,7 +1734,7 @@ mod context_owner_panic {
             &evidence,
         )?;
         outcome?;
-        context.action("with all original work already converged and no new work issued, available backend0 context_records decreased from a positive actual directory inventory to zero before shutdown; every HTTP body, status and actual sampling interval was preserved");
+        context.action("with all original work already converged and no new work issued, available backend0 participation_records decreased from a positive actual directory inventory to zero before shutdown; every HTTP body, status and actual sampling interval was preserved");
         Ok(evidence)
     }
 
@@ -1737,7 +1749,8 @@ mod context_owner_panic {
             Ok(log) => log,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => {
-                return Err(error).context("read original retained Context retirement writer");
+                return Err(error)
+                    .context("read original retained Participation retirement writer");
             }
         };
         let high = format!("query_high={}", session.query_id.hi);
@@ -1768,9 +1781,9 @@ mod context_owner_panic {
                 operations: vec![proto::TaskControlOperation {
                     envelope: Some(envelope),
                     control: Some(proto::task_control_operation::Control::RenewLease(
-                        proto::RenewQueryExecutionLeaseRequest {
-                            query_context: Some(session.context_under(session.frontend, 1)),
-                            lease: Some(proto::QueryExecutionLeaseGrant {
+                        proto::RenewParticipationLeaseRequest {
+                            participation: Some(session.participation_under(session.frontend, 1)),
+                            lease: Some(proto::ParticipationLeaseGrant {
                                 sequence,
                                 valid_for_millis: 30_000,
                             }),

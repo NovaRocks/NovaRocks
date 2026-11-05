@@ -24,9 +24,9 @@ use novarocks_query_application::{
     api::StatementNativeHealthFailure, cancellation::QueryCancellationView,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorProcessLocalPayload, ConnectorRequestContext, ConnectorTableObjectBinding,
-    ConnectorTableObjectCaptureRequest, ProviderMetadataCpuPort,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorProcessLocalPayload,
+    ConnectorRequestContext, ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest,
+    ProviderMetadataCpuPort,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkError, WorkScope};
 use std::{
@@ -110,7 +110,7 @@ impl CurrentProjectionMetadataCpu {
     }
     pub(crate) fn port_for(
         &self,
-        lease: &ConnectorControlPlanningLease,
+        lease: &ConnectorControlPlanningPin,
     ) -> Result<Arc<dyn ProviderMetadataCpuPort>, WorkError> {
         let window = self.window.try_clone()?;
         match &self.control {
@@ -171,7 +171,7 @@ impl CaptureFailure {
 type Raw = Result<(ConnectorTableObjectBinding, Option<i64>), ConnectorError>;
 type CaptureFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct Inputs {
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     port: Arc<dyn ProviderMetadataCpuPort>,
     request: ConnectorTableObjectCaptureRequest,
 }
@@ -248,12 +248,12 @@ impl CurrentMetadataCapture {
     }
     fn install(
         self: &Arc<Self>,
-        lease: &ConnectorControlPlanningLease,
+        lease: &ConnectorControlPlanningPin,
         port: Arc<dyn ProviderMetadataCpuPort>,
         request: ConnectorTableObjectCaptureRequest,
     ) -> Result<(), ConnectorError> {
         let inputs = Arc::new(Inputs {
-            lease: lease.clone(),
+            planning_pin: lease.clone(),
             port,
             request,
         });
@@ -274,7 +274,7 @@ impl CurrentMetadataCapture {
                 owner: None,
             };
             let mut original = original_inputs
-                .lease
+                .planning_pin
                 .binding()
                 .metadata()
                 .capture_table_object_with_snapshot_cpu_in(
@@ -385,7 +385,7 @@ impl CurrentMetadataCapture {
     }
     pub(crate) async fn capture(
         self: &Arc<Self>,
-        lease: &ConnectorControlPlanningLease,
+        lease: &ConnectorControlPlanningPin,
         factory: &CurrentProjectionMetadataCpu,
         mut request: ConnectorTableObjectCaptureRequest,
     ) -> Result<ConnectorTableObjectBinding, CaptureFailure> {

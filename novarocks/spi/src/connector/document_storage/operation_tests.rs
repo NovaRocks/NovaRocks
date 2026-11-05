@@ -174,7 +174,7 @@ fn lease_with(
     observation: Option<Arc<dyn ConnectorDocumentStorageObservation>>,
     management: Option<Arc<dyn ConnectorDocumentStorageManagement>>,
     drops: Arc<AtomicUsize>,
-) -> ConnectorDocumentStorageLease {
+) -> ConnectorDocumentStorage {
     let descriptor = descriptor();
     let binding = ConnectorDocumentStorageBinding::try_new(
         descriptor.clone(),
@@ -183,7 +183,7 @@ fn lease_with(
         management,
     )
     .unwrap();
-    ConnectorDocumentStorageLease::new(
+    ConnectorDocumentStorage::new(
         descriptor,
         ConnectorControlRuntimeId::new(),
         request().owner.incarnation,

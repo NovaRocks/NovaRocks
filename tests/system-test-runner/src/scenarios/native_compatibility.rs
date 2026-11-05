@@ -28,7 +28,7 @@ use bytes::Bytes;
 use compatibility_sql_intent::{CompatibilityIntent, CompatibilitySql};
 use h2::client;
 use http::{Request, header};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
 use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
@@ -253,7 +253,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             .parse::<BackendProcessId>()
             .context("parse target backend process identity")?;
         let native_compatibility_id = decode_hex_32(&target.native_compatibility_id)?;
-        let query_context = raw_query_context(backend);
+        let target_participation = raw_participation(backend);
         let endpoint = context.handle().native_be_endpoint(0)?;
         let mode = context.handle().native_trust_mode();
         let connector = context.handle().native_probe_connector(endpoint, mode)?;
@@ -281,7 +281,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &connector,
             &authorization,
             vec![raw_acquire_admission_ticket(
-                query_context.clone(),
+                target_participation.clone(),
                 native_compatibility_id,
                 admission_epoch_capability.clone(),
             )],
@@ -294,13 +294,13 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 == Ok(proto::TaskOperationOutcome::Accepted),
             "admission ticket acquisition must be accepted, got {acquisition_receipt:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+        let Some(proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(ticket)) =
             receipt_verdict(&acquisition_receipt)?.ack.clone()
         else {
             anyhow::bail!("accepted admission acquisition omitted its ticket acknowledgement");
         };
         ensure!(
-            ticket.query_context.as_ref() == Some(&query_context)
+            ticket.participation.as_ref() == Some(&target_participation)
                 && ticket.valid_for_millis == 10_000,
             "admission ticket acknowledgement does not bind the exact raw request: {ticket:?}"
         );
@@ -339,7 +339,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         );
         let establish_applied_before = context
             .handle()
-            .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?;
+            .be_log_count(0, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)?;
 
         for (label, compatibility_id) in [
             ("missing", None),
@@ -350,7 +350,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 &connector,
                 &authorization,
                 vec![raw_establish(
-                    query_context.clone(),
+                    target_participation.clone(),
                     admission_ticket_id.clone(),
                     compatibility_id,
                 )],
@@ -377,7 +377,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &connector,
             &authorization,
             vec![raw_establish(
-                query_context.clone(),
+                target_participation.clone(),
                 admission_ticket_id.clone(),
                 Some(foreign.to_vec()),
             )],
@@ -396,7 +396,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         ensure!(
             context
                 .handle()
-                .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?
+                .be_log_count(0, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)?
                 == establish_applied_before,
             "foreign Establish must not emit an applied marker"
         );
@@ -404,7 +404,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let create_response = raw_apply_task_operations(
             &connector,
             &authorization,
-            vec![raw_create_task(query_context.clone())],
+            vec![raw_create_task(target_participation.clone())],
             context.deadline(),
         )?;
         let create_receipt =
@@ -421,7 +421,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         ensure!(
             context
                 .handle()
-                .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?
+                .be_log_count(0, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)?
                 == establish_applied_before,
             "refused CreateTask must not establish the context"
         );
@@ -445,7 +445,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &connector,
             &authorization,
             vec![raw_acquire_admission_ticket(
-                query_context.clone(),
+                target_participation.clone(),
                 native_compatibility_id,
                 admission_epoch_capability,
             )],
@@ -458,7 +458,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 == Ok(proto::TaskOperationOutcome::Accepted),
             "renewed admission ticket acquisition must be accepted, got {renewed_receipt:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(renewed_ticket)) =
+        let Some(proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(renewed_ticket)) =
             receipt_verdict(&renewed_receipt)?.ack.clone()
         else {
             anyhow::bail!("renewed admission acquisition omitted its ticket acknowledgement");
@@ -471,7 +471,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &connector,
             &authorization,
             vec![raw_establish(
-                query_context,
+                target_participation,
                 renewed_ticket_id,
                 Some(native_compatibility_id.to_vec()),
             )],
@@ -486,14 +486,14 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         ensure!(
             matches!(
                 receipt_verdict(&matching_receipt)?.ack.clone(),
-                Some(proto::task_operation_verdict::Ack::QueryContext(_))
+                Some(proto::task_operation_verdict::Ack::Participation(_))
             ),
             "accepted matching Establish must carry a query-context acknowledgement"
         );
         ensure!(
             context
                 .handle()
-                .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?
+                .be_log_count(0, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)?
                 == establish_applied_before + 1,
             "matching Establish must emit exactly one applied marker"
         );
@@ -723,7 +723,7 @@ impl Scenario for OtherIslandHardCut {
         compatibility_sql_intent::run_baselines(context, &self.intent, BASELINE_QUERY, &[0, 1])?;
         context
             .handle()
-            .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
+            .assert_be_log(2, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)
             .expect_err("OtherIsland BE must never be given a query context by the FE");
         assert_other_island_admission_cut(context, primary_compatibility_id)?;
         assert_raw_ingress_hard_cuts(context)?;
@@ -887,7 +887,7 @@ impl Scenario for TargetIslandCutover {
             context.action("target island became ready before source drain; new query went to target while source attempt completed locally");
             Ok(())
         });
-        let cleanup = ServerHandle::shutdown(&mut target);
+        let cleanup = TestClusterOwner::shutdown(&mut target);
         compatibility_sql_intent::combine(result, cleanup)
     }
 }
@@ -1069,7 +1069,7 @@ fn assert_other_island_admission_cut(
         &connector,
         &authorization,
         vec![raw_acquire_admission_ticket(
-            raw_query_context(backend),
+            raw_participation(backend),
             primary_compatibility_id,
             admission_epoch_capability,
         )],
@@ -1091,7 +1091,7 @@ fn assert_other_island_admission_cut(
     );
     context
         .handle()
-        .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
+        .assert_be_log(2, super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED)
         .expect_err("rejected OtherIsland admission must not establish a query context");
     context.action("OtherIsland BE rejected the exact primary compatibility identity before ticket reservation or query-context establishment");
     Ok(())
@@ -1198,8 +1198,8 @@ pub(super) fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     Ok(decoded)
 }
 
-pub(super) fn raw_query_context(backend: BackendProcessId) -> proto::QueryContextRef {
-    proto::QueryContextRef {
+pub(super) fn raw_participation(backend: BackendProcessId) -> proto::ParticipationRef {
+    proto::ParticipationRef {
         query_execution_id: Some(proto::QueryExecutionId {
             query_id: Some(common::UniqueId { hi: 91, lo: 92 }),
             attempt_id: 1,
@@ -1230,25 +1230,25 @@ fn raw_query_options() -> proto::QueryOptions {
 }
 
 pub(super) fn raw_establish(
-    query_context: proto::QueryContextRef,
+    target_participation: proto::ParticipationRef,
     admission_ticket_id: proto::AdmissionTicketId,
     native_compatibility_id: Option<Vec<u8>>,
 ) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(raw_operation_envelope(15_000)),
-        operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-            proto::UpdateQueryContextRequest {
-                command: Some(proto::update_query_context_request::Command::Establish(
-                    proto::EstablishQueryContextRequest {
-                        query_context: Some(query_context),
+        operation: Some(proto::task_operation::Operation::UpdateParticipation(
+            proto::UpdateParticipationRequest {
+                command: Some(proto::update_participation_request::Command::Establish(
+                    proto::EstablishParticipationRequest {
+                        participation: Some(target_participation),
                         catalog_set: Some(Default::default()),
                         initial_runtime_filter: Some(Default::default()),
-                        initial_credential: Some(proto::QueryContextCredentialDomain {
-                            lease_id: 1,
+                        initial_credential: Some(proto::ParticipationCredentialDomain {
+                            credential_domain_id: 1,
                             epoch: 1,
                             descriptors: Vec::new(),
                         }),
-                        initial_lease: Some(proto::QueryExecutionLeaseGrant {
+                        initial_lease: Some(proto::ParticipationLeaseGrant {
                             sequence: 0,
                             valid_for_millis: 30_000,
                         }),
@@ -1264,16 +1264,16 @@ pub(super) fn raw_establish(
 }
 
 pub(super) fn raw_acquire_admission_ticket(
-    query_context: proto::QueryContextRef,
+    target_participation: proto::ParticipationRef,
     native_compatibility_id: [u8; 32],
     admission_epoch_capability: proto::AdmissionEpochCapability,
 ) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(raw_operation_envelope(15_000)),
         operation: Some(
-            proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
-                proto::AcquireQueryContextAdmissionTicketRequest {
-                    query_context: Some(query_context),
+            proto::task_operation::Operation::AcquireParticipationAdmissionTicket(
+                proto::AcquireParticipationAdmissionTicketRequest {
+                    participation: Some(target_participation),
                     valid_for_millis: 10_000,
                     native_compatibility_id: Some(proto::NativeCompatibilityId {
                         value: native_compatibility_id.to_vec(),
@@ -1285,15 +1285,15 @@ pub(super) fn raw_acquire_admission_ticket(
     }
 }
 
-fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperation {
-    let execution = query_context
+fn raw_create_task(target_participation: proto::ParticipationRef) -> proto::TaskOperation {
+    let execution = target_participation
         .query_execution_id
         .expect("raw query context carries an execution identity");
-    let backend = query_context
+    let backend = target_participation
         .backend_process_id
         .clone()
         .expect("raw query context carries a backend identity");
-    let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
+    let task_key = common::UniqueId { hi: 93, lo: 94 };
     let frozen_fragment = super::native_creation::compiled_fragment(
         1,
         2,
@@ -1307,7 +1307,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
     // ranges and the sink bindings. This root task has no scan and no sink
     // edge, so its assignment is just its ordinal.
     let creation_metadata = proto::CreationMetadata {
-        query_context: Some(query_context),
+        participation: Some(target_participation),
         descriptor: Some(proto::TaskDescriptor {
             identity: Some(proto::TaskIdentity {
                 query_execution_id: Some(execution),
@@ -1315,7 +1315,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
                 task_id: 1,
                 backend_process_id: Some(backend),
             }),
-            fragment_instance_id: Some(fragment_instance_id),
+            task_key: Some(task_key),
             pipeline_dop: 2,
             split_plan_nodes: Vec::new(),
             topology: Some(Default::default()),
@@ -1453,7 +1453,7 @@ pub(super) fn raw_unary_response<M: Message, R: Message + Default>(
 pub(super) struct RawUnaryConnection {
     runtime: Arc<tokio::runtime::Runtime>,
     sender: Option<client::SendRequest<Bytes>>,
-    driver: Option<tokio::task::JoinHandle<Result<(), h2::Error>>>,
+    connection_job: Option<tokio::task::JoinHandle<Result<(), h2::Error>>>,
     close_failure: Option<String>,
     original_deadline: Option<std::time::Instant>,
 }
@@ -1486,10 +1486,10 @@ impl RawUnaryConnection {
         let connect = async {
             let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
             let (sender, connection) = client::handshake(stream).await?;
-            let driver = tokio::spawn(connection);
-            Ok::<_, anyhow::Error>((sender, driver))
+            let connection_job = tokio::spawn(connection);
+            Ok::<_, anyhow::Error>((sender, connection_job))
         };
-        let (sender, driver) = runtime.block_on(async {
+        let (sender, connection_job) = runtime.block_on(async {
             match deadline {
                 Some(deadline) => {
                     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), connect)
@@ -1502,7 +1502,7 @@ impl RawUnaryConnection {
         let mut connection = Self {
             runtime,
             sender: Some(sender),
-            driver: Some(driver),
+            connection_job: Some(connection_job),
             close_failure: None,
             original_deadline: deadline,
         };
@@ -1526,19 +1526,19 @@ impl RawUnaryConnection {
     }
 
     /// Cancellation is explicit and joined: dropping a task handle alone would
-    /// detach the IO driver and leave a physical closing generation alive.
+    /// detach the IO connection job and leave a physical closing generation alive.
     pub(super) fn close(&mut self) -> Result<()> {
         drop(self.sender.take());
-        if let Some(driver) = self.driver.take() {
-            driver.abort();
-            let failure = match self.runtime.block_on(driver) {
+        if let Some(connection_job) = self.connection_job.take() {
+            connection_job.abort();
+            let failure = match self.runtime.block_on(connection_job) {
                 Ok(Ok(())) => None,
                 Err(error) if error.is_cancelled() => None,
                 Ok(Err(error)) => Some(format!(
-                    "original raw Native H2 driver failed during actual join: {error}"
+                    "original raw Native H2 connection job failed during actual join: {error}"
                 )),
                 Err(error) => Some(format!(
-                    "original raw Native H2 driver panicked during actual join: {error}"
+                    "original raw Native H2 connection job panicked during actual join: {error}"
                 )),
             };
             if failure.is_some() {
@@ -1799,18 +1799,18 @@ fn wait_for_eligible_count(context: &mut ScenarioContext, expected: usize) -> Re
 #[cfg(test)]
 mod tests {
     #[test]
-    fn raw_driver_actual_exit_retains_failure_and_panic_across_repeated_close() {
+    fn raw_connection_job_actual_exit_retains_failure_and_panic_across_repeated_close() {
         let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
         for panic in [false, true] {
-            let driver = runtime.spawn(async move {
+            let connection_job = runtime.spawn(async move {
                 if panic {
-                    panic!("intentional raw driver regression panic");
+                    panic!("intentional raw connection job regression panic");
                 }
                 Err(h2::Error::from(h2::Reason::INTERNAL_ERROR))
             });
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while !driver.is_finished() {
+                    while !connection_job.is_finished() {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -1820,13 +1820,13 @@ mod tests {
             let mut connection = RawUnaryConnection {
                 runtime: Arc::clone(&runtime),
                 sender: None,
-                driver: Some(driver),
+                connection_job: Some(connection_job),
                 close_failure: None,
                 original_deadline: Some(Instant::now() + Duration::from_secs(2)),
             };
             let original = connection.close().unwrap_err().to_string();
             assert!(original.contains(if panic { "panicked" } else { "failed" }));
-            assert!(connection.driver.is_none());
+            assert!(connection.connection_job.is_none());
             assert_eq!(connection.close().unwrap_err().to_string(), original);
             let combined = combine_raw_cleanup::<()>(
                 Err(anyhow::anyhow!("original RPC failed")),
@@ -1838,18 +1838,18 @@ mod tests {
         }
     }
     #[test]
-    fn raw_driver_cancellation_is_actually_joined_and_has_no_failure_verdict() {
+    fn raw_connection_job_cancellation_is_actually_joined_and_has_no_failure_verdict() {
         let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
-        let driver = runtime.spawn(std::future::pending::<Result<(), h2::Error>>());
+        let connection_job = runtime.spawn(std::future::pending::<Result<(), h2::Error>>());
         let mut connection = RawUnaryConnection {
             runtime,
             sender: None,
-            driver: Some(driver),
+            connection_job: Some(connection_job),
             close_failure: None,
             original_deadline: Some(Instant::now() + Duration::from_secs(2)),
         };
         connection.close().unwrap();
-        assert!(connection.driver.is_none());
+        assert!(connection.connection_job.is_none());
         connection.close().unwrap();
     }
 

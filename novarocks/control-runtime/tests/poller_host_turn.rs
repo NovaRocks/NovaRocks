@@ -18,9 +18,11 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorHostTurn, ActorRegistration, ActorRuntime, Clock, DriverError, PollerPool},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{
+        ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, Clock, PollerPool,
+    },
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -53,7 +55,7 @@ impl Actor for OriginalActor {
     fn timer_input(_: Tick) -> usize {
         unreachable!("these actors have no deadline")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, value: usize, _: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, value: usize, _: &mut ActorStep<'_, ()>) {
         let completed = self.calls.fetch_add(value, Ordering::SeqCst) + value;
         if completed == self.target
             && let Some(notice) = self.completed.take()
@@ -64,7 +66,7 @@ impl Actor for OriginalActor {
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!("the original actor does not panic")
     }
 }
@@ -114,8 +116,8 @@ struct Fixture {
     runtime: ActorRuntime<OriginalActor>,
     scope: ScopeHandle,
     registration: ActorRegistration,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     inputs: Vec<InputId>,
     calls: Arc<AtomicUsize>,
     retired: bool,
@@ -194,7 +196,7 @@ impl Fixture {
         self.inputs.retain(|input| {
             match self.runtime.retire_input(self.registration.actor(), *input) {
                 Ok(()) => false,
-                Err(DriverError::InputStillQueued) => true,
+                Err(ActorTurnError::InputStillQueued) => true,
                 Err(_) => {
                     valid = false;
                     true

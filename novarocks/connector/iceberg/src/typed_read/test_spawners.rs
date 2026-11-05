@@ -22,19 +22,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use novarocks_fs::{
-    FileRangeScope, FileRangeService, FileReadContext, FileResult, FileTask, FileTaskFuture,
-    FileTaskSpawner,
+    FileIoFuture, FileIoJob, FileIoSpawner, FileRangeScope, FileRangeService, FileReadContext,
+    FileResult,
 };
 use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
 
 /// Holds every spawned file task until the test adds a permit for it.
-pub(crate) struct GatedTaskSpawner {
+pub(crate) struct GatedFileIoSpawner {
     pub(crate) handle: tokio::runtime::Handle,
     pub(crate) gate: Arc<tokio::sync::Semaphore>,
     pub(crate) started: AtomicUsize,
 }
 
-impl GatedTaskSpawner {
+impl GatedFileIoSpawner {
     /// A spawner that holds every task until [`Self::release`] lets it run.
     pub(crate) fn closed(handle: tokio::runtime::Handle) -> Arc<Self> {
         Arc::new(Self {
@@ -53,11 +53,11 @@ impl GatedTaskSpawner {
     }
 }
 
-impl FileTaskSpawner for GatedTaskSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+impl FileIoSpawner for GatedFileIoSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let gate = Arc::clone(&self.gate);
-        Ok(FileTask::new(self.handle.spawn(async move {
+        Ok(FileIoJob::new(self.handle.spawn(async move {
             gate.acquire_owned().await.expect("gate").forget();
             task.await;
         })))
@@ -69,15 +69,15 @@ impl FileTaskSpawner for GatedTaskSpawner {
 }
 
 /// Runs every spawned file task at once, counting them.
-pub(crate) struct CountingTaskSpawner {
+pub(crate) struct CountingFileIoSpawner {
     pub(crate) handle: tokio::runtime::Handle,
     pub(crate) spawned: AtomicUsize,
 }
 
-impl FileTaskSpawner for CountingTaskSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+impl FileIoSpawner for CountingFileIoSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         self.spawned.fetch_add(1, Ordering::SeqCst);
-        Ok(FileTask::new(self.handle.spawn(task)))
+        Ok(FileIoJob::new(self.handle.spawn(task)))
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -90,11 +90,11 @@ impl FileTaskSpawner for CountingTaskSpawner {
 /// source's operations.
 pub(crate) fn route_reads_through(
     context: &mut FileReadContext,
-    spawner: Arc<dyn FileTaskSpawner>,
+    spawner: Arc<dyn FileIoSpawner>,
     handle: tokio::runtime::Handle,
 ) -> ConnectorSourceOperations {
     let operations = ConnectorSourceOperations::new();
-    context.task_spawner = Arc::clone(&spawner);
+    context.io_spawner = Arc::clone(&spawner);
     context.range = Some(
         FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),

@@ -54,5 +54,5 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
 /// Core-local scheduling metric. Topology accounting is performed by the
 /// frontend-owned port at the composition boundary.
 pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
-    crate::metrics::observe_fragments_scheduled(fragment_count);
+    crate::metrics::observe_tasks_scheduled(fragment_count);
 }

@@ -45,21 +45,23 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{
-    QueryLifecycleStructuredSnapshot, RuntimeFilterTerminalRollup, ServerHandle,
+    QueryLifecycleStructuredSnapshot, RuntimeFilterTerminalRollup, TestClusterOwner,
 };
 
 use crate::scenario::ScenarioContext;
 
 /// A backend applied a frontend's request to establish this attempt's query
-/// context. This is the successor of the retired `NOVAROCKS_QUERY_INIT_APPLIED`:
+/// participation. This is the successor of the retired `NOVAROCKS_QUERY_INIT_APPLIED`:
 /// the point at which a backend admits an attempt's identity and agrees to hold
 /// resources for it.
-pub const CONTEXT_ESTABLISH_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED";
+pub const PARTICIPATION_ESTABLISH_APPLIED: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_APPLIED;
 
-/// A backend moved its context out of `Active` on the frontend's release, which
+/// A backend moved its participation out of `Active` on the frontend's release, which
 /// is the operation that carries its sealed observation back. This is the
 /// successor of the retired per-participant terminal proof.
-pub const RELEASE_APPLIED: &str = "NOVAROCKS_TASK_RELEASE_APPLIED";
+pub const RELEASE_APPLIED: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_RELEASE_APPLIED;
 
 /// Backend markers are written by an asynchronous log pump, so a marker the
 /// frontend has already accounted for can be a few milliseconds behind the
@@ -69,7 +71,7 @@ const MARKER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Which backends' own logs carry `marker` for exactly this execution.
 ///
 /// The execution identity is matched with a trailing space because every
-/// context-scoped marker prints further `key=value` words after it: without the
+/// participation-scoped marker prints further `key=value` words after it: without the
 /// separator, attempt 1 of a query would also match attempt 11 of the same
 /// query.
 ///
@@ -104,7 +106,7 @@ pub fn backends_with_marker(
 ///
 /// * The frontend's rollup is `Available`. On the task path that is not a
 ///   statement about runtime filters -- `publish_task_round_convergence`
-///   chooses `Available` exactly when every query context the attempt placed
+///   chooses `Available` exactly when every participation the attempt placed
 ///   answered its release, and `Unavailable(TerminalOutcomesIncomplete)`
 ///   otherwise. It is therefore the frontend's own successor of "every
 ///   participant produced a terminal outcome", and it holds no count.
@@ -116,10 +118,10 @@ pub fn backends_with_marker(
 ///
 /// # Why no expected backend count
 ///
-/// A query context exists only where the scheduler placed a task, so the
+/// A participation exists only where the scheduler placed a task, so the
 /// number of participating backends is a property of the plan and of the
 /// splits, never of the cluster size. Measured on a real 1FE+3BE run, 285 of
-/// 1289 executions established exactly one context and every one of those had
+/// 1289 executions established exactly one participation and every one of those had
 /// no split assignment at all -- which is precisely the shape of the constant
 /// queries these scenarios issue. An assertion pinned at "all three backends"
 /// would therefore be asserting the scheduler's current choice. Scenarios that
@@ -155,13 +157,14 @@ pub fn assert_query_completed_across_boundary(
             snapshot.runtime_filter,
             RuntimeFilterTerminalRollup::Available { .. }
         ),
-        "{subject} attempt {execution_id} did not report every placed query context as \
+        "{subject} attempt {execution_id} did not report every placed participation as \
          released: {:?}",
         snapshot.runtime_filter
     );
 
     loop {
-        let established = backends_with_marker(context, CONTEXT_ESTABLISH_APPLIED, &execution_id)?;
+        let established =
+            backends_with_marker(context, PARTICIPATION_ESTABLISH_APPLIED, &execution_id)?;
         let released = backends_with_marker(context, RELEASE_APPLIED, &execution_id)?;
         if !established.is_empty() && released == established {
             return Ok(established);

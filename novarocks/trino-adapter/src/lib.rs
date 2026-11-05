@@ -21,7 +21,7 @@ mod host;
 mod server;
 mod settings;
 mod update_type;
-pub use server::TrinoServerHandle;
+pub use server::TrinoListener;
 pub use settings::TrinoListenerSettings;
 
 mod body;

@@ -74,7 +74,7 @@ pub(in crate::exec::runtime_filter) enum RuntimeInFilterValues {
 }
 
 impl RuntimeInFilterValues {
-    fn new(data_type: &DataType) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    fn new(data_type: &DataType) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         match data_type {
             DataType::Int8 => Ok(Self::Int8(HashSet::new())),
             DataType::Int16 => Ok(Self::Int16(HashSet::new())),
@@ -168,7 +168,7 @@ impl RuntimeInFilterValues {
     fn insert_array(
         &mut self,
         array: &ArrayRef,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         match self {
             RuntimeInFilterValues::Int8(values) => {
                 let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
@@ -439,7 +439,7 @@ impl RuntimeInFilterValues {
         &self,
         array: &ArrayRef,
         row: usize,
-    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<bool, crate::runtime::task::ExecutionFailure> {
         match self {
             RuntimeInFilterValues::Int8(values) => {
                 let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
@@ -620,7 +620,7 @@ impl RuntimeInFilterValues {
     fn merge_from(
         &mut self,
         other: &RuntimeInFilterValues,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         match (self, other) {
             (RuntimeInFilterValues::Int8(lhs), RuntimeInFilterValues::Int8(rhs)) => {
                 lhs.extend(rhs.iter().copied());
@@ -720,7 +720,7 @@ impl RuntimeInFilterValues {
         &self,
     ) -> Result<
         Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
-        crate::runtime::fragment::ExecutionFailure,
+        crate::runtime::task::ExecutionFailure,
     > {
         match self {
             RuntimeInFilterValues::Int8(values) => Ok(min_max_i32(
@@ -775,14 +775,13 @@ impl RuntimeInFilterValues {
             RuntimeInFilterValues::TimestampSecond(values)
             | RuntimeInFilterValues::TimestampMillisecond(values)
             | RuntimeInFilterValues::TimestampMicrosecond(values) => {
-                let map_unit =
-                    |v: &i64| -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
-                        timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
-                            crate::exec::runtime_filter::failure::contract(
-                                "runtime in-filter timestamp conversion overflow",
-                            )
-                        })
-                    };
+                let map_unit = |v: &i64| -> Result<i64, crate::runtime::task::ExecutionFailure> {
+                    timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime in-filter timestamp conversion overflow",
+                        )
+                    })
+                };
                 let mut converted = Vec::with_capacity(values.len());
                 for v in values {
                     converted.push(map_unit(v)?);
@@ -861,7 +860,7 @@ impl RuntimeInFilterValues {
     fn scan_predicate_values(
         &self,
         max_values: usize,
-    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::task::ExecutionFailure> {
         if max_values == 0 {
             return Ok(None);
         }
@@ -949,7 +948,7 @@ fn bounded_values<T, F>(
     values: &HashSet<T>,
     max_values: usize,
     convert: F,
-) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure>
+) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::task::ExecutionFailure>
 where
     T: Eq + std::hash::Hash,
     F: Fn(&T) -> MinMaxPredicateValue,
@@ -1136,7 +1135,7 @@ impl RuntimeInFilter {
         filter_id: i32,
         slot_id: SlotId,
         data_type: &DataType,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let values = RuntimeInFilterValues::new(data_type)?;
         Ok(Self {
             filter_id,
@@ -1161,7 +1160,7 @@ impl RuntimeInFilter {
         &self,
     ) -> Result<
         Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
-        crate::runtime::fragment::ExecutionFailure,
+        crate::runtime::task::ExecutionFailure,
     > {
         self.values.min_max_predicate_values()
     }
@@ -1169,7 +1168,7 @@ impl RuntimeInFilter {
     pub fn scan_predicate_values(
         &self,
         max_values: usize,
-    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Vec<MinMaxPredicateValue>>, crate::runtime::task::ExecutionFailure> {
         self.values.scan_predicate_values(max_values)
     }
 
@@ -1181,7 +1180,7 @@ impl RuntimeInFilter {
         &self,
         array: &ArrayRef,
         row: usize,
-    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<bool, crate::runtime::task::ExecutionFailure> {
         self.values.contains(array, row)
     }
 }
@@ -1192,7 +1191,7 @@ impl RuntimeInFilter {
         filter_id: i32,
         slot_id: novarocks_types::SlotId,
         data_type: &arrow::datatypes::DataType,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         Ok(Self {
             filter_id,
             slot_id,
@@ -1203,7 +1202,7 @@ impl RuntimeInFilter {
     pub fn insert_array_for_test(
         &mut self,
         array: &arrow::array::ArrayRef,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         self.values.insert_array(array)
     }
 }
@@ -1212,7 +1211,7 @@ impl RuntimeInFilter {
     pub fn merge_from(
         &mut self,
         other: &RuntimeInFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.slot_id != other.slot_id {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime in-filter metadata mismatch",
@@ -1244,7 +1243,7 @@ impl RuntimeInFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }

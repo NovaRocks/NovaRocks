@@ -67,17 +67,17 @@ pub(crate) async fn prepare_iceberg_write_async(
     target_ref: &str,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.provider_id.as_str(), "iceberg");
     let context =
-        crate::connector::context_for_planning_lease(&planning_lease, connector_context.clone())?;
+        crate::connector::context_for_planning_pin(&planning_pin, connector_context.clone())?;
     let metadata = crate::connector::schema_creation::load_frontend_table_async(
-        planning_lease.binding().metadata().as_ref(),
+        planning_pin.binding().metadata().as_ref(),
         novarocks_spi::connector::ConnectorTableRequest {
             table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: planning_lease.binding().descriptor().instance_id.clone(),
+                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(target.namespace.as_str()),
                 table: Arc::from(target.table.as_str()),
             },
@@ -88,7 +88,7 @@ pub(crate) async fn prepare_iceberg_write_async(
     .await
     .map_err(|error| error.to_string())?;
     let write_target =
-        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_lease);
+        crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_pin);
     let write_lease = write_target.derive_write_lease()?;
     let source_control =
         crate::query_execution::planning::sql_compile_control_from_connector_request(
@@ -136,8 +136,8 @@ pub(crate) async fn prepare_iceberg_write_async(
         bind_iceberg_session_write_input(target, &write_target, &write_session)?;
     // Preserve the original RefHead observation and branch validation order.
     // The write session retains its provider-sealed base independently.
-    let facts = crate::connector::metadata_read_reference_facts_with_planning_lease_async(
-        write_target.lease().clone(),
+    let facts = crate::connector::metadata_read_reference_facts_with_planning_pin_async(
+        write_target.planning_pin().clone(),
         connector_context.clone(),
         write_target.identity().namespace.as_ref(),
         write_target.identity().table.as_ref(),
@@ -203,7 +203,7 @@ fn bind_iceberg_session_write_input(
             target.table.clone(),
         ),
         session_target,
-        write_target.lease().clone(),
+        write_target.planning_pin().clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),
@@ -377,7 +377,7 @@ struct FrozenIcebergWriteSemanticBinding {
 /// Admit the complete provider-declared input before shaping INSERT source
 /// expressions. This opens no write session and performs no external effect.
 pub(crate) fn build_iceberg_write_plan(
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    write_lease: &novarocks_spi::connector::ConnectorWrite,
     target_ref: &str,
     intent: ConnectorWriteIntent,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1712,8 +1712,8 @@ mod tests {
 mod provider_admission_before_shaping_tests {
     use super::*;
     use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorWriteControl,
-        ConnectorWriteLease, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+        ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorWrite,
+        ConnectorWriteControl, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
         ProviderBindingEpoch,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1783,7 +1783,7 @@ mod provider_admission_before_shaping_tests {
             calls: AtomicUsize::new(0),
             failure,
         });
-        let lease = ConnectorWriteLease::new(control.key.clone(), control.clone(), || {}).unwrap();
+        let lease = ConnectorWrite::new(control.key.clone(), control.clone(), || {}).unwrap();
         let stop = novarocks_spi::connector::ConnectorStopOwner::default();
         let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(60),

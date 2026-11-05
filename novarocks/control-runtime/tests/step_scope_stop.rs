@@ -18,10 +18,10 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, FailureSourceState, InputPhase},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, FailureSourceState, InputPhase},
     history::HistoryCapture,
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -69,7 +69,7 @@ impl Actor for Controller {
         _: Tick,
         _: InputEnvelope,
         command: Command,
-        step: &mut StepContext<'_, ()>,
+        step: &mut ActorStep<'_, ()>,
     ) {
         if !matches!(command, Command::Continue) {
             step.stop_producing();
@@ -97,7 +97,7 @@ impl Actor for Controller {
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
 }
 fn actor() -> ActorId {
     ActorId::new(1).unwrap()
@@ -112,8 +112,8 @@ fn resources(n: u64) -> ResourceVector {
     ResourceVector::new([(dimension(), n)]).unwrap()
 }
 struct Admitted {
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
 }
 impl Admitted {
     fn reserve(scope: &ScopeHandle, kind: WorkKind) -> Self {

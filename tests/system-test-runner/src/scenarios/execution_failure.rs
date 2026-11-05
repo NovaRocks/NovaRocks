@@ -27,7 +27,7 @@ use crate::scenarios::{
 };
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{
-    QueryLifecycleStatementObservation, QueryLifecycleStructuredSnapshot, ServerHandle,
+    QueryLifecycleStatementObservation, QueryLifecycleStructuredSnapshot, TestClusterOwner,
 };
 use novarocks_execution_contract::failure::{
     FailureClass, FailureEvidence, FailureFact, ResourceDimension, domain,
@@ -81,7 +81,7 @@ impl Scenario for ResourceRecoveryPolicy {
             faults: vec![],
             observations: (0..BACKENDS)
                 .flat_map(|index| {
-                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                    [1, 2].map(move |attempt| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(attempt)))
                 })
                 .collect(),
         };
@@ -89,7 +89,14 @@ impl Scenario for ResourceRecoveryPolicy {
             sql: sql.into(),
             faults: vec![],
             observations: (0..BACKENDS)
-                .map(|index| (index, "grpc-fragment", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         Ok(Some(self.intent.freeze(
@@ -239,13 +246,13 @@ fn run_rejection_body(
     for index in 0..BACKENDS {
         let first = context.handle().selected_native_observation_binding(
             index,
-            "grpc-fragment",
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
             &resource.token,
             Some(1),
         )?;
         let replacement = context.handle().selected_native_observation_binding(
             index,
-            "grpc-fragment",
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
             &resource.token,
             Some(2),
         )?;
@@ -465,7 +472,7 @@ fn assert_resource_terminal(terminal: &QueryLifecycleStructuredSnapshot) -> Resu
         "unknown tracker measurements were invented: {resource:?}"
     );
     ensure!(
-        terminal.worker_contexts_converged,
+        terminal.worker_participations_converged,
         "selected attempt did not obtain actual Worker context convergence"
     );
     Ok(())
@@ -476,7 +483,7 @@ fn assert_healthy_terminal(terminal: &QueryLifecycleStructuredSnapshot) -> Resul
         terminal.execution_id.is_some()
             && terminal.attempt_id == 1
             && terminal.failure_fact.is_none()
-            && terminal.worker_contexts_converged,
+            && terminal.worker_participations_converged,
         "healthy continuity query did not finish and actually converge: {terminal:?}"
     );
     Ok(())
@@ -515,7 +522,7 @@ fn terminal_json(terminal: &QueryLifecycleStructuredSnapshot) -> Value {
         "process_namespace": terminal.process_namespace,
         "local_sequence": terminal.local_sequence,
         "attempt_id": terminal.attempt_id,
-        "worker_contexts_converged": terminal.worker_contexts_converged,
+        "worker_participations_converged": terminal.worker_participations_converged,
         "failure_fact": terminal.failure_fact.map(fact_json),
         "failure_detail": terminal.failure_detail,
         "failure_site": terminal.failure_site.as_ref().map(|site| format!("{site:?}")),

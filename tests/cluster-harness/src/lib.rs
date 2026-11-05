@@ -218,7 +218,7 @@ struct LifecycleConvergenceWireSnapshot {
     #[serde(default)]
     failure_site: Option<serde_json::Value>,
     #[serde(default)]
-    worker_contexts_converged: bool,
+    worker_participations_converged: bool,
     runtime_filter: RuntimeFilterTerminalRollupWire,
 }
 
@@ -278,7 +278,7 @@ struct RuntimeFilterChannelWire {
 struct RuntimeFilterProducerStreamWire {
     channel_binding_id: u32,
     channel_id: u32,
-    producer_fragment_instance_id: Option<RuntimeFilterUniqueIdWire>,
+    producer_task_key: Option<RuntimeFilterUniqueIdWire>,
     partition_id: u32,
     latest_accepted_sequence: Option<u64>,
     accepted_count: u64,
@@ -308,7 +308,7 @@ struct RuntimeFilterConsumerWire {
     channel_binding_id: u32,
     channel_id: u32,
     consumer_binding_id: u32,
-    fragment_instance_id: Option<RuntimeFilterUniqueIdWire>,
+    task_key: Option<RuntimeFilterUniqueIdWire>,
     latest_delivered_logical_version: Option<u64>,
     latest_applied_logical_version: Option<u64>,
     subscription_terminal: String,
@@ -449,7 +449,7 @@ fn decode_query_lifecycle_structured_snapshot(
             .failure_site
             .map(decode_observed_failure_site)
             .transpose()?,
-        worker_contexts_converged: wire.worker_contexts_converged,
+        worker_participations_converged: wire.worker_participations_converged,
         runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
     }))
 }
@@ -1121,7 +1121,7 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub failure_fact: Option<novarocks_execution_contract::failure::FailureFact>,
     pub failure_detail: Option<String>,
     pub failure_site: Option<QueryLifecycleFailureSite>,
-    pub worker_contexts_converged: bool,
+    pub worker_participations_converged: bool,
     /// The FE-normalized Runtime Filter terminal read model. This is a
     /// query-scoped immutable projection, never a process counter or log
     /// rendering.
@@ -1140,7 +1140,7 @@ pub enum QueryLifecycleFailureSite {
         identity: novarocks_execution_contract::TaskIdentity,
     },
     Operation {
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
         operation_id: novarocks_execution_contract::TaskOperationId,
         kind: String,
     },
@@ -1175,7 +1175,7 @@ fn decode_observed_failure_site(value: serde_json::Value) -> Result<QueryLifecyc
     use novarocks_execution_contract::TaskFailurePhase;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::novarocks as pb;
-    use novarocks_task_codec::identity::{decode_query_context_ref, decode_task_identity};
+    use novarocks_task_codec::identity::{decode_participation_ref, decode_task_identity};
     use prost::Message;
     let path = FieldPath::root("observed_failure_site");
     let bytes = |field: &str| -> Result<Vec<u8>> {
@@ -1215,8 +1215,8 @@ fn decode_observed_failure_site(value: serde_json::Value) -> Result<QueryLifecyc
                 identity: task("identity")?,
             },
             "operation" => {
-                let context = decode_query_context_ref(
-                    &pb::QueryContextRef::decode(bytes("context")?.as_slice())?,
+                let participation = decode_participation_ref(
+                    &pb::ParticipationRef::decode(bytes("participation")?.as_slice())?,
                     path,
                 )?;
                 let operation_id = novarocks_execution_contract::TaskOperationId::try_from_bytes(
@@ -1231,14 +1231,14 @@ fn decode_observed_failure_site(value: serde_json::Value) -> Result<QueryLifecyc
                 use novarocks_execution_contract::operation::OperationKind as K;
                 ensure!(
                     [
-                        K::AcquireQueryContextAdmissionTicket,
+                        K::AcquireParticipationAdmissionTicket,
                         K::CreateTask,
                         K::UpdateTask,
-                        K::UpdateQueryContext,
+                        K::UpdateParticipation,
                         K::CancelTask,
-                        K::AbortQueryContext,
-                        K::QuiesceQueryContext,
-                        K::ReleaseQueryContext,
+                        K::AbortParticipation,
+                        K::QuiesceParticipation,
+                        K::ReleaseParticipation,
                         K::FetchTaskDynamicFilters,
                         K::GetFinalTaskInfo
                     ]
@@ -1247,7 +1247,7 @@ fn decode_observed_failure_site(value: serde_json::Value) -> Result<QueryLifecyc
                     "unknown observed operation kind"
                 );
                 QueryLifecycleFailureSite::Operation {
-                    context,
+                    participation,
                     operation_id,
                     kind: kind.to_owned(),
                 }
@@ -1408,7 +1408,7 @@ pub enum RuntimeFilterChannelTerminalState {
 pub struct RuntimeFilterProducerStreamTerminalDetail {
     pub channel_binding_id: u32,
     pub channel_id: u32,
-    pub producer_fragment_instance_id: Option<RuntimeFilterUniqueId>,
+    pub producer_task_key: Option<RuntimeFilterUniqueId>,
     pub partition_id: u32,
     pub latest_accepted_sequence: Option<u64>,
     pub accepted_count: u64,
@@ -1438,7 +1438,7 @@ pub struct RuntimeFilterConsumerTerminalDetail {
     pub channel_binding_id: u32,
     pub channel_id: u32,
     pub consumer_binding_id: u32,
-    pub fragment_instance_id: Option<RuntimeFilterUniqueId>,
+    pub task_key: Option<RuntimeFilterUniqueId>,
     pub latest_delivered_logical_version: Option<u64>,
     pub latest_applied_logical_version: Option<u64>,
     pub subscription_terminal: RuntimeFilterSubscriptionTerminal,
@@ -1578,8 +1578,8 @@ fn decode_runtime_filter_participant(
                         Ok(RuntimeFilterProducerStreamTerminalDetail {
                             channel_binding_id: stream.channel_binding_id,
                             channel_id: stream.channel_id,
-                            producer_fragment_instance_id: stream
-                                .producer_fragment_instance_id
+                            producer_task_key: stream
+                                .producer_task_key
                                 .map(runtime_filter_unique_id)
                                 .transpose()?,
                             partition_id: stream.partition_id,
@@ -1704,10 +1704,7 @@ fn decode_runtime_filter_consumer(
         channel_binding_id: wire.channel_binding_id,
         channel_id: wire.channel_id,
         consumer_binding_id: wire.consumer_binding_id,
-        fragment_instance_id: wire
-            .fragment_instance_id
-            .map(runtime_filter_unique_id)
-            .transpose()?,
+        task_key: wire.task_key.map(runtime_filter_unique_id).transpose()?,
         latest_delivered_logical_version: wire.latest_delivered_logical_version,
         latest_applied_logical_version: wire.latest_applied_logical_version,
         subscription_terminal,
@@ -1915,11 +1912,11 @@ const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_termina
 const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 4] = [
     "native_query_contexts_active",
     "native_query_contexts_second_chance",
-    "native_query_active_fragments",
-    "catalog_query_leases",
+    "native_query_active_tasks",
+    "catalog_query_pins",
 ];
 
-const QUERY_EXECUTION_RESOURCE_CATALOG_HANDLE_LEASE: &str = "catalog_handle_leases";
+const QUERY_EXECUTION_RESOURCE_CATALOG_HANDLE_LEASE: &str = "catalog_handle_pins";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendResourceSnapshot {
@@ -2245,7 +2242,7 @@ fn get_frontend_management(
 }
 
 const FRONTEND_METRIC_FAMILIES: [&str; 10] = [
-    "novarocks_fragment_scheduled_total",
+    "novarocks_task_scheduled_total",
     "novarocks_heartbeat_rtt_seconds",
     "novarocks_backend_registry_entries",
     "novarocks_backend_announce_lease_valid",
@@ -2686,7 +2683,9 @@ fn bounded_utf8_tail(contents: &str, max_bytes: usize) -> String {
     contents[start..].to_string()
 }
 
-pub trait ServerHandle: Send {
+/// The original test deployment owner. The cross-process implementation
+/// shuts down its FE and BE processes on Drop.
+pub trait TestClusterOwner: Send {
     fn actual_build_information_evidence(&self) -> Result<Option<serde_json::Value>> {
         Ok(None)
     }
@@ -3040,11 +3039,6 @@ pub trait ServerHandle: Send {
         bail!(
             "BE lifecycle phase kill release is unsupported by this server mode (phase={})",
             phase.as_str()
-        )
-    }
-    fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
-        bail!(
-            "query-control fragment backend limit is unsupported by this server mode (limit={limit})"
         )
     }
     fn be_count(&self) -> usize {
@@ -3462,10 +3456,6 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, kind)
     }
 
-    fn fragment_backend_limit_path(&self) -> PathBuf {
-        self.root.join("fragment-backend-limit.trigger")
-    }
-
     fn kill_query_at_phase_path(&self, phase: QueryLifecyclePhase) -> PathBuf {
         self.root
             .join(format!("kill-query-at-{}.trigger", phase.as_str()))
@@ -3480,23 +3470,15 @@ impl QueryLifecycleFaultFiles {
     }
 
     fn publish_terminal_ack_drop(&self, index: usize) -> Result<String> {
-        self.publish(self.terminal_ack_drop_path(index)?, index, None)
+        self.publish(self.terminal_ack_drop_path(index)?, index)
     }
 
     fn publish_terminal_snapshot_conflict(&self, index: usize) -> Result<String> {
-        self.publish(self.terminal_snapshot_conflict_path(index)?, index, None)
+        self.publish(self.terminal_snapshot_conflict_path(index)?, index)
     }
 
     fn publish_rfo_8r2_fault(&self, index: usize, kind: &'static str) -> Result<String> {
-        self.publish(self.rfo_8r2_fault_path(index, kind)?, index, None)
-    }
-
-    fn publish_fragment_backend_limit(&self, limit: usize) -> Result<String> {
-        self.publish(
-            self.fragment_backend_limit_path(),
-            self.be_count,
-            Some(limit),
-        )
+        self.publish(self.rfo_8r2_fault_path(index, kind)?, index)
     }
 
     fn publish_kill_query_at_phase(&self, phase: QueryLifecyclePhase) -> Result<String> {
@@ -3526,12 +3508,9 @@ impl QueryLifecycleFaultFiles {
         )
     }
 
-    fn publish(&self, path: PathBuf, identity: usize, value: Option<usize>) -> Result<String> {
+    fn publish(&self, path: PathBuf, identity: usize) -> Result<String> {
         let token = next_fragment_failure_token(identity);
-        let contents = match value {
-            Some(value) => format!("{token}\n{value}\n"),
-            None => format!("token={token}\nbackend_index={identity}\n"),
-        };
+        let contents = format!("token={token}\nbackend_index={identity}\n");
         publish_query_lifecycle_fault_token(&path, &token, contents.as_bytes())?;
         Ok(token)
     }
@@ -3636,7 +3615,7 @@ impl Drop for CleanupFaultFiles {
     }
 }
 
-pub struct CrossProcessServerHandle {
+pub struct CrossProcessCluster {
     target_host: String,
     target_port: u16,
     mysql_user: String,
@@ -3796,7 +3775,7 @@ impl Drop for RuntimeDirGuard {
     }
 }
 
-impl CrossProcessServerHandle {
+impl CrossProcessCluster {
     fn statement_observation_control(
         &self,
         operation: &str,
@@ -4266,7 +4245,10 @@ impl CrossProcessServerHandle {
                 role: "fe",
                 identity_role: "fe",
                 config_path: &fe_config_path,
-                marker: "NOVAROCKS_READY mysql_port=",
+                marker: &format!(
+                    "{} mysql_port=",
+                    novarocks_failpoint::observation_marker::READY
+                ),
                 startup_timeout: capped_role_startup_timeout(
                     startup_timeout,
                     test_sessions.as_ref(),
@@ -4315,7 +4297,7 @@ impl CrossProcessServerHandle {
                     role: "be",
                     identity_role: &identity_role,
                     config_path: be_config_path,
-                    marker: "NOVAROCKS_READY role=be",
+                    marker: &format!("{} role=be", novarocks_failpoint::observation_marker::READY),
                     startup_timeout: capped_role_startup_timeout(
                         startup_timeout,
                         test_sessions.as_ref(),
@@ -4835,7 +4817,7 @@ impl CrossProcessServerHandle {
     /// their announcements rather than from anything the destroyed store held;
     /// the barrier therefore converges without the store contributing to it.
     pub fn wipe_fe_state_store_and_restart_until(&mut self, deadline: Instant) -> Result<()> {
-        ServerHandle::kill_fe(self)
+        TestClusterOwner::kill_fe(self)
             .context("stop cross-process FE before destroying its durable state store")?;
         let removed = remove_fe_state_store(&self.runtime_dir, &self.fe_config_path)
             .context("destroy cross-process FE durable state store")?;
@@ -4847,7 +4829,7 @@ impl CrossProcessServerHandle {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
         );
-        ServerHandle::restart_fe_until(self, deadline)
+        TestClusterOwner::restart_fe_until(self, deadline)
             .context("restart cross-process FE against an empty durable state store")
     }
 
@@ -4903,7 +4885,7 @@ impl CrossProcessServerHandle {
         }
         self.be_binaries[index] = binary;
         self.expected_eligible_backend_count = expected_eligible_backend_count;
-        ServerHandle::restart_be_until(self, index, deadline)
+        TestClusterOwner::restart_be_until(self, index, deadline)
     }
 
     /// Begin a BE SIGTERM drain without synchronously reaping the process.
@@ -5185,7 +5167,7 @@ impl CrossProcessServerHandle {
     }
 }
 
-impl CrossProcessServerHandle {
+impl CrossProcessCluster {
     fn restart_frontend_until(
         &mut self,
         deadline: Instant,
@@ -5221,7 +5203,10 @@ impl CrossProcessServerHandle {
             after_exit()
                 .context("after the original frontend exit, before its successor launch")?;
         }
-        let marker = "NOVAROCKS_READY mysql_port=";
+        let marker = &*format!(
+            "{} mysql_port=",
+            novarocks_failpoint::observation_marker::READY
+        );
         let binary = self.test_sessions.as_ref().map_or_else(
             || Ok(self.fe_binary.clone()),
             |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &self.fe_binary),
@@ -5291,9 +5276,9 @@ impl CrossProcessServerHandle {
     }
 }
 
-impl ServerHandle for CrossProcessServerHandle {
+impl TestClusterOwner for CrossProcessCluster {
     fn retain_runtime_artifacts(&mut self) {
-        CrossProcessServerHandle::retain_runtime_artifacts(self);
+        CrossProcessCluster::retain_runtime_artifacts(self);
     }
 
     fn actual_build_information_evidence(&self) -> Result<Option<serde_json::Value>> {
@@ -5345,7 +5330,7 @@ impl ServerHandle for CrossProcessServerHandle {
     fn process_resource_identities(
         &self,
     ) -> Result<Option<process_resources::ClusterProcessIdentities>> {
-        CrossProcessServerHandle::process_resource_identities(self).map(Some)
+        CrossProcessCluster::process_resource_identities(self).map(Some)
     }
 
     fn supports_fault_injection(&self) -> bool {
@@ -5808,25 +5793,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .with_context(|| format!("release BE kill lifecycle phase barrier {}", phase.as_str()))
     }
 
-    fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
-        if !(1..=self.be_processes.len()).contains(&limit) {
-            bail!(
-                "query-control fragment backend limit {limit} is outside 1..={}",
-                self.be_processes.len()
-            );
-        }
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_fragment_backend_limit(limit)?;
-        println!(
-            "armed query-control fragment backend limit={limit} token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .fragment_backend_limit_path()
-                .display()
-        );
-        Ok(())
-    }
-
     fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
@@ -6128,7 +6094,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 anyhow::anyhow!("missing config path for cross-process BE[{index}] during restart")
             })?
             .clone();
-        let marker = "NOVAROCKS_READY role=be";
+        let marker = &*format!("{} role=be", novarocks_failpoint::observation_marker::READY);
         let binary = self
             .be_binaries
             .get(index)
@@ -6363,7 +6329,7 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 }
 
-impl Drop for CrossProcessServerHandle {
+impl Drop for CrossProcessCluster {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -7339,7 +7305,7 @@ mod tests {
                         "producer_streams": [{
                             "channel_binding_id": 1,
                             "channel_id": 2,
-                            "producer_fragment_instance_id": { "high": 9, "low": 10 },
+                            "producer_task_key": { "high": 9, "low": 10 },
                             "partition_id": 3,
                             "latest_accepted_sequence": 0,
                             "accepted_count": 1,
@@ -7365,7 +7331,7 @@ mod tests {
                             "channel_binding_id": 1,
                             "channel_id": 2,
                             "consumer_binding_id": 5,
-                            "fragment_instance_id": { "high": 19, "low": 20 },
+                            "task_key": { "high": 19, "low": 20 },
                             "latest_delivered_logical_version": 3,
                             "latest_applied_logical_version": 3,
                             "subscription_terminal": "QUERY_TERMINAL_RUNTIME_FILTER_SUBSCRIPTION_TERMINAL_V1_COMPLETED",
@@ -7426,7 +7392,7 @@ mod tests {
         );
         value["failure_detail"] = serde_json::json!("original bounded author detail");
         value["failure_site"] = serde_json::json!({"kind":"coordinator"});
-        value["worker_contexts_converged"] = serde_json::json!(true);
+        value["worker_participations_converged"] = serde_json::json!(true);
         let observed = decode_lifecycle_debug_json(value.clone());
         assert_eq!(observed.failure_fact, Some(fact));
         assert_eq!(
@@ -7437,7 +7403,7 @@ mod tests {
             observed.failure_detail.as_deref(),
             Some("original bounded author detail")
         );
-        assert!(observed.worker_contexts_converged);
+        assert!(observed.worker_participations_converged);
         for field in ["failure_fact", "failure_detail", "failure_site"] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
@@ -8588,7 +8554,7 @@ mod tests {
             config_overlay,
             native_trust_fixture: NativeTrustFixture::default(),
         };
-        let mut cluster = CrossProcessServerHandle::launch_with_native_fault_proxies(
+        let mut cluster = CrossProcessCluster::launch_with_native_fault_proxies(
             options,
             CrossProcessNativeFaultProxyConfig {
                 backend_retained_byte_limits: BTreeMap::from([(1, 64 * 1024)]),
@@ -8632,11 +8598,11 @@ mod tests {
         assert_eq!(cluster.process_ids().backends, before.backends);
         control.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
         control.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
-        ServerHandle::restart_be(&mut cluster, 1)?;
+        TestClusterOwner::restart_be(&mut cluster, 1)?;
         assert_ne!(cluster.process_ids().backends[1], before.backends[1]);
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
         assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
-        ServerHandle::restart_fe(&mut cluster)?;
+        TestClusterOwner::restart_fe(&mut cluster)?;
         assert_ne!(cluster.process_ids().frontend, before.frontend);
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
         assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
@@ -9367,7 +9333,7 @@ static_file_path = "catalogs.toml"
         let metrics = concat!(
             "novarocks_backend_query_execution_resources{resource=\"stage_active_builders\"} 7\n",
             "novarocks_backend_query_execution_resources{resource=\"stage_encoded_bytes\"} 11\n",
-            "novarocks_backend_query_execution_resources{resource=\"native_query_active_fragments\"} 3\n",
+            "novarocks_backend_query_execution_resources{resource=\"native_query_active_tasks\"} 3\n",
         );
         assert_eq!(
             prometheus_labeled_gauge(
@@ -9384,7 +9350,7 @@ static_file_path = "catalogs.toml"
                 metrics,
                 QUERY_EXECUTION_RESOURCE_METRIC,
                 "resource",
-                "native_query_active_fragments"
+                "native_query_active_tasks"
             )
             .expect("read exact native fragment activity sample"),
             3.0
@@ -9657,7 +9623,7 @@ static_file_path = "catalogs.toml"
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
-                resources: BTreeMap::from([("catalog_query_leases".to_string(), 1.0)]),
+                resources: BTreeMap::from([("catalog_query_pins".to_string(), 1.0)]),
             }],
         };
         let released = QueryExecutionResourceSnapshot {
@@ -9665,7 +9631,7 @@ static_file_path = "catalogs.toml"
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
-                resources: BTreeMap::from([("catalog_query_leases".to_string(), 0.0)]),
+                resources: BTreeMap::from([("catalog_query_pins".to_string(), 0.0)]),
             }],
         };
 

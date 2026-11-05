@@ -53,11 +53,11 @@ pub fn decode_stream(
     ExchangeStreamIdentity::try_new(
         ExchangeSource::new(
             source,
-            UniqueId::new(value.source_finst_id_hi, value.source_finst_id_lo),
+            UniqueId::new(value.source_task_key_hi, value.source_task_key_lo),
             value.sender_ordinal,
         ),
         destination,
-        UniqueId::new(value.destination_finst_id_hi, value.destination_finst_id_lo),
+        UniqueId::new(value.destination_task_key_hi, value.destination_task_key_lo),
         FragmentNodeId::new(value.destination_node_id),
     )
     .map_err(|error| invalid(path, error.to_string()))
@@ -66,12 +66,12 @@ pub fn decode_stream(
 pub fn encode_stream(value: ExchangeStreamIdentity) -> wire::ExchangeStreamIdentity {
     wire::ExchangeStreamIdentity {
         source_task: Some(encode_task_identity(value.source().task())),
-        source_finst_id_hi: value.source().fragment_instance_id().high(),
-        source_finst_id_lo: value.source().fragment_instance_id().low(),
+        source_task_key_hi: value.source().task_key().high(),
+        source_task_key_lo: value.source().task_key().low(),
         sender_ordinal: value.source().sender_ordinal(),
         destination_task: Some(encode_task_identity(value.destination())),
-        destination_finst_id_hi: value.destination_fragment_instance_id().high(),
-        destination_finst_id_lo: value.destination_fragment_instance_id().low(),
+        destination_task_key_hi: value.destination_task_key().high(),
+        destination_task_key_lo: value.destination_task_key().low(),
         destination_node_id: value.destination_node().get(),
     }
 }
@@ -101,11 +101,11 @@ pub fn decode_normal_close(
         path.field("destination_task"),
     )?;
     if destination != expected.destination()
-        || value.destination_finst_id_hi != expected.destination_fragment_instance_id().high()
-        || value.destination_finst_id_lo != expected.destination_fragment_instance_id().low()
+        || value.destination_task_key_hi != expected.destination_task_key().high()
+        || value.destination_task_key_lo != expected.destination_task_key().low()
         || value.destination_node_id != expected.destination_node().get()
-        || value.source_finst_id_hi != expected.source().fragment_instance_id().high()
-        || value.source_finst_id_lo != expected.source().fragment_instance_id().low()
+        || value.source_task_key_hi != expected.source().task_key().high()
+        || value.source_task_key_lo != expected.source().task_key().low()
         || value.sender_ordinal != expected.source().sender_ordinal()
         || expected_sender_count == 0
         || value.sender_count != expected_sender_count
@@ -147,11 +147,11 @@ pub fn encode_normal_close(
     let stream = value.stream;
     wire::ExchangeNormalClosed {
         destination_task: Some(encode_task_identity(stream.destination())),
-        destination_finst_id_hi: stream.destination_fragment_instance_id().high(),
-        destination_finst_id_lo: stream.destination_fragment_instance_id().low(),
+        destination_task_key_hi: stream.destination_task_key().high(),
+        destination_task_key_lo: stream.destination_task_key().low(),
         destination_node_id: stream.destination_node().get(),
-        source_finst_id_hi: stream.source().fragment_instance_id().high(),
-        source_finst_id_lo: stream.source().fragment_instance_id().low(),
+        source_task_key_hi: stream.source().task_key().high(),
+        source_task_key_lo: stream.source().task_key().low(),
         sender_ordinal: stream.source().sender_ordinal(),
         sender_count,
         disposition: Some(match value.disposition {

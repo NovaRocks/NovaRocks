@@ -19,7 +19,7 @@
 use crate::builtin::aggregate_ds_hll_failure::{
     DsHllFailureSink, DsHllInputContext, DsHllInputDetail, DsHllInputRecipe,
 };
-use crate::datasketches_hll::{HllHandle, HllTargetType};
+use crate::datasketches_hll::{HllAccumulator, HllTargetType};
 use crate::datasketches_hll_failure::HllObservation;
 #[derive(Clone, Copy, Debug)]
 pub enum DsHllRetainedOperation {
@@ -31,7 +31,7 @@ pub enum DsHllRetainedOperation {
 impl DsHllRetainedOperation {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Create => "reserve ds_hll handle creation",
+            Self::Create => "reserve ds_hll accumulator creation",
             Self::Payload => "reserve ds_hll payload initialization",
             Self::Update => "reserve ds_hll update",
             Self::Merge => "reserve ds_hll merge",
@@ -60,84 +60,94 @@ pub trait DsHllRetainedPort<F: DsHllFailureSink> {
     ) -> Result<(), F::Error>;
 }
 pub fn hll_heap_bytes(current: usize) -> usize {
-    current.saturating_sub(std::mem::size_of::<HllHandle>())
+    current.saturating_sub(std::mem::size_of::<HllAccumulator>())
 }
-pub fn ensure_handle<'a, F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
-    handle: &'a mut Option<HllHandle>,
+pub fn ensure_accumulator<'a, F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
+    accumulator: &'a mut Option<HllAccumulator>,
     charge: &mut R,
     log_k: u8,
     target: HllTargetType,
     sink: &mut F,
-) -> Result<&'a mut HllHandle, F::Error> {
-    if handle.is_none() {
-        let preflight = HllHandle::new_allocation_preflight_with_failure(log_k, target, sink)?;
+) -> Result<&'a mut HllAccumulator, F::Error> {
+    if accumulator.is_none() {
+        let preflight = HllAccumulator::new_allocation_preflight_with_failure(log_k, target, sink)?;
         let mut reservation = charge.reserve(
             preflight.bounds().operation_peak_bytes,
             DsHllRetainedOperation::Create,
             sink,
         )?;
-        let (new_handle, outcome) =
-            HllHandle::new_under_reservation_with_failure(&preflight, &reservation, sink)?;
+        let (new_accumulator, outcome) =
+            HllAccumulator::new_under_reservation_with_failure(&preflight, &reservation, sink)?;
         charge.reconcile(
             hll_heap_bytes(outcome.current_bytes),
             &mut reservation,
             sink,
         )?;
-        *handle = Some(new_handle);
+        *accumulator = Some(new_accumulator);
         // Retained transfer precedes the first post-mutation control observation.
         sink.observe(HllObservation::OpaqueBoundary)?;
     }
-    Ok(handle.as_mut().expect("ds_hll handle initialized"))
+    Ok(accumulator
+        .as_mut()
+        .expect("ds_hll accumulator initialized"))
 }
-pub fn ensure_handle_from_payload<'a, F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
-    handle: &'a mut Option<HllHandle>,
+pub fn ensure_accumulator_from_payload<'a, F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
+    accumulator: &'a mut Option<HllAccumulator>,
     charge: &mut R,
     payload: &[u8],
     sink: &mut F,
-) -> Result<&'a mut HllHandle, F::Error> {
-    if handle.is_none() {
-        let preflight = HllHandle::from_payload_allocation_preflight_with_failure(payload, sink)?;
+) -> Result<&'a mut HllAccumulator, F::Error> {
+    if accumulator.is_none() {
+        let preflight =
+            HllAccumulator::from_payload_allocation_preflight_with_failure(payload, sink)?;
         let mut reservation = charge.reserve(
             preflight.bounds().operation_peak_bytes + charge.payload_error_headroom(preflight),
             DsHllRetainedOperation::Payload,
             sink,
         )?;
-        let (new_handle, outcome) = HllHandle::from_payload_under_reservation_with_failure(
-            payload,
-            &preflight,
-            &reservation,
-            sink,
-        )?;
+        let (new_accumulator, outcome) =
+            HllAccumulator::from_payload_under_reservation_with_failure(
+                payload,
+                &preflight,
+                &reservation,
+                sink,
+            )?;
         charge.reconcile(
             hll_heap_bytes(outcome.current_bytes),
             &mut reservation,
             sink,
         )?;
-        *handle = Some(new_handle);
+        *accumulator = Some(new_accumulator);
         sink.observe(HllObservation::OpaqueBoundary)?;
     }
-    Ok(handle.as_mut().expect("ds_hll handle initialized"))
+    Ok(accumulator
+        .as_mut()
+        .expect("ds_hll accumulator initialized"))
 }
 pub fn update_hash<F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
-    handle: &mut Option<HllHandle>,
+    accumulator: &mut Option<HllAccumulator>,
     charge: &mut R,
     hash: u64,
     sink: &mut F,
 ) -> Result<(), F::Error> {
-    let handle = handle.as_mut().ok_or_else(|| {
+    let accumulator = accumulator.as_mut().ok_or_else(|| {
         sink.input(DsHllInputRecipe {
             context: DsHllInputContext::CountDistinct,
             detail: DsHllInputDetail::Uninitialized,
         })
     })?;
-    let preflight = handle.update_hash_allocation_preflight_with_failure(sink)?;
+    let preflight = accumulator.update_hash_allocation_preflight_with_failure(sink)?;
     let mut reservation = charge.reserve(
         preflight.bounds().additional_headroom_bytes(),
         DsHllRetainedOperation::Update,
         sink,
     )?;
-    let outcome =
-        handle.update_hash_under_reservation_with_failure(hash, &preflight, &reservation, sink)?;
+    let outcome = accumulator.update_hash_under_reservation_with_failure(
+        hash,
+        &preflight,
+        &reservation,
+        sink,
+    )?;
     charge.reconcile(
         hll_heap_bytes(outcome.current_bytes),
         &mut reservation,
@@ -147,23 +157,25 @@ pub fn update_hash<F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
     Ok(())
 }
 pub fn merge_payload<F: DsHllFailureSink, R: DsHllRetainedPort<F>>(
-    handle: &mut Option<HllHandle>,
+    accumulator: &mut Option<HllAccumulator>,
     charge: &mut R,
     payload: &[u8],
     sink: &mut F,
 ) -> Result<(), F::Error> {
-    if handle.is_none() {
-        ensure_handle_from_payload(handle, charge, payload, sink)?;
+    if accumulator.is_none() {
+        ensure_accumulator_from_payload(accumulator, charge, payload, sink)?;
         return Ok(());
     }
-    let handle = handle.as_mut().expect("ds_hll handle initialized");
-    let preflight = handle.merge_payload_allocation_preflight_with_failure(payload, sink)?;
+    let accumulator = accumulator
+        .as_mut()
+        .expect("ds_hll accumulator initialized");
+    let preflight = accumulator.merge_payload_allocation_preflight_with_failure(payload, sink)?;
     let mut reservation = charge.reserve(
         preflight.bounds().additional_headroom_bytes() + charge.payload_error_headroom(preflight),
         DsHllRetainedOperation::Merge,
         sink,
     )?;
-    let outcome = handle.merge_payload_under_reservation_with_failure(
+    let outcome = accumulator.merge_payload_under_reservation_with_failure(
         payload,
         &preflight,
         &reservation,

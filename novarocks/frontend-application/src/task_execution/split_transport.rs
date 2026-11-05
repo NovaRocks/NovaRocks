@@ -216,7 +216,7 @@ impl SplitDeliveryBridge {
     pub(crate) fn for_graph(graph: &TaskGraph) -> Arc<Self> {
         Self::with_tasks(
             graph.execution_id(),
-            super::split_domain::task_kernel_index(graph),
+            super::split_domain::task_key_index(graph),
         )
     }
 
@@ -546,25 +546,22 @@ impl TaskUpdateTransport for SplitDeliveryBridge {
                 self.execution_id, execution_id
             )));
         }
-        if request.fragment_instance_id() != target.fragment_instance_id {
+        if request.task_key() != target.task_key {
             return Err(TaskUpdateTransportError::fatal(format!(
                 "split delivery request {:x}:{:x} does not match target {:x}:{:x}",
-                request.fragment_instance_id().high(),
-                request.fragment_instance_id().low(),
-                target.fragment_instance_id.high(),
-                target.fragment_instance_id.low(),
+                request.task_key().high(),
+                request.task_key().low(),
+                target.task_key.high(),
+                target.task_key.low(),
             )));
         }
-        let task = *self
-            .tasks
-            .get(&target.fragment_instance_id)
-            .ok_or_else(|| {
-                TaskUpdateTransportError::fatal(format!(
-                    "fragment instance {:x}:{:x} is not a task of this attempt",
-                    target.fragment_instance_id.high(),
-                    target.fragment_instance_id.low(),
-                ))
-            })?;
+        let task = *self.tasks.get(&target.task_key).ok_or_else(|| {
+            TaskUpdateTransportError::fatal(format!(
+                "fragment instance {:x}:{:x} is not a task of this attempt",
+                target.task_key.high(),
+                target.task_key.low(),
+            ))
+        })?;
         let update = task_update(request).map_err(TaskUpdateTransportError::fatal)?;
 
         let mut state = self.lock();
@@ -907,7 +904,7 @@ mod tests {
     fn target() -> AssignmentTarget {
         AssignmentTarget {
             backend_idx: 2,
-            fragment_instance_id: FINST,
+            task_key: FINST,
         }
     }
 
@@ -1485,7 +1482,7 @@ mod tests {
     fn a_request_for_another_fragment_is_refused_before_task_lookup() {
         let bridge = bridge();
         let mut wrong_target = target();
-        wrong_target.fragment_instance_id = UniqueId::new(31, 41);
+        wrong_target.task_key = UniqueId::new(31, 41);
 
         let error = bridge
             .begin(execution_id(), &wrong_target, &terminal_request(true))

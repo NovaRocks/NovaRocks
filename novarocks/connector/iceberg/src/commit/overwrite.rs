@@ -531,7 +531,7 @@ mod tests {
     };
     use crate::iceberg::table::Table;
     use crate::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         ConnectorRequestContext, ConnectorStopOwner, ConnectorWriteOperationId,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -544,7 +544,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }
 
@@ -1014,7 +1014,7 @@ pub(crate) mod preparer_tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
+                Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime.clone())),
             );
             let catalog_runtime = match activity {
                 Some(activity) => {

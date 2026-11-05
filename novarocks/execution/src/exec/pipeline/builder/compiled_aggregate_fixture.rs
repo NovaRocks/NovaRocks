@@ -69,23 +69,21 @@ use novarocks_types::UniqueId;
 use super::family_fixture::{FixtureControl, constant_policy};
 use crate::exec::chunk::Chunk;
 use crate::exec::fragment::program::FragmentNodeId;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::{TaskDestination, RuntimeEndpoint};
 use crate::runtime::exchange::online_unit;
-use crate::runtime::fragment::exchange::{
+use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
-use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
+use crate::runtime::task::instance::{
+    ExchangeInputAssignment, ExchangeInputAssignments, TaskSinkAssignment,
 };
-use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, ExchangeReceiverPort, NoopFragmentEventSink,
-};
-use crate::runtime::fragment::sink::materialize_compiled_sink;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{ExchangeFrameTransmitter, ExchangeReceiverPort, NoopTaskEventSink};
+use crate::runtime::task::sink::materialize_compiled_sink;
 
 /// The frozen decimal policy every fixture call authors explicitly.
 pub(crate) const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportError;
@@ -560,7 +558,7 @@ fn freeze(
     catalog: &PureEngineFunctionCatalog,
     parameters: &SemanticParameters,
 ) -> (PhysicalRootUses, FrozenFragmentCalls) {
-    let expression_roots = crate::runtime::fragment::scan::compiled_fixture::root_uses(fragment);
+    let expression_roots = crate::runtime::task::scan::compiled_fixture::root_uses(fragment);
     let expression_domain = EvaluationDomainId::new(0);
     let uses = expression_roots
         .flow()
@@ -937,14 +935,14 @@ impl PreparedUnitRecording {
 
 /// Delivers every encoded frame to the receiver port and counts the rows sent.
 pub(crate) struct LoopbackTransmitter {
-    unit: Arc<crate::runtime::fragment::io::exchange::test_support::UnitLoopback>,
+    unit: Arc<crate::runtime::task::io::exchange::test_support::UnitLoopback>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), usize>>,
     recordings: Mutex<BTreeMap<(UniqueId, i32), Arc<PreparedUnitRecording>>>,
 }
 
 impl LoopbackTransmitter {
     pub(crate) fn new(
-        unit: Arc<crate::runtime::fragment::io::exchange::test_support::UnitLoopback>,
+        unit: Arc<crate::runtime::task::io::exchange::test_support::UnitLoopback>,
     ) -> Arc<Self> {
         Arc::new(Self {
             unit,
@@ -966,16 +964,16 @@ impl LoopbackTransmitter {
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
     fn deliver_unit(
         &self,
-        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        frame: crate::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         stop: tokio_util::sync::CancellationToken,
-        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
         let carried = if frame.receiver.payload.is_empty() {
             0
         } else {
             let key = (
-                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.source().task_key(),
                 frame.receiver.stream.destination_node().get(),
             );
             let recording = self
@@ -996,8 +994,8 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
             .lock()
             .unwrap()
             .entry((
-                frame.receiver.stream.source().fragment_instance_id(),
-                frame.receiver.stream.destination_fragment_instance_id(),
+                frame.receiver.stream.source().task_key(),
+                frame.receiver.stream.destination_task_key(),
             ))
             .or_default() += carried;
         self.unit.deliver_unit(frame, stop, activity, done);
@@ -1005,9 +1003,9 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
     fn register_unit_demands(
         &self,
         destination: RuntimeEndpoint,
-        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
             .register_unit_demands(destination, entries, stop, done)
@@ -1016,7 +1014,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         &self,
         destination: RuntimeEndpoint,
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        wake: crate::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_failure_contract::FailureFact> {
         self.unit.watch_unit_facts(destination, stream, wake)
     }
@@ -1067,7 +1065,7 @@ pub(crate) fn try_run(
 /// Run a stream-connected instance on the same runtime and original Task as
 /// its frozen receiver roster and loopback transport.
 pub(crate) fn try_run_in_fixture(
-    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    fixture: &crate::runtime::task::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1087,7 +1085,7 @@ pub(crate) fn try_run_in_fixture(
 /// The same original local execution lane with an explicit declared query
 /// tracker. This is test input wiring, not a new source, control or executor.
 pub(crate) fn try_run_with_tracker(
-    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    fixture: &crate::runtime::task::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1117,7 +1115,7 @@ pub(crate) fn try_run_with_tracker(
 }
 /// Run the original compiled pipeline with this instance's exact scan operations.
 pub(crate) fn try_run_with_scans(
-    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    fixture: &crate::runtime::task::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1151,12 +1149,12 @@ fn try_run_in(
         sink,
         bindings,
         scans,
-        crate::runtime::fragment::CompiledWriterBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
         Some((instance.high(), instance.low())),
         None,
         dop,
         state,
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .map_err(|error| error.to_string())?
     .start();
@@ -1173,7 +1171,7 @@ fn try_run_in(
 /// The single receiver of `program`, registered for `instance` with
 /// `senders` expected senders.
 pub(crate) fn register(
-    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    fixture: &crate::runtime::task::io::exchange::test_support::Fixture,
     program: &LocalProgram,
     instance: UniqueId,
     sources: &[UniqueId],
@@ -1212,8 +1210,8 @@ pub(crate) fn destination(
     sender: UniqueId,
     ordinal: u32,
     count: u32,
-) -> FragmentDestination {
-    FragmentDestination::new(
+) -> TaskDestination {
+    TaskDestination::new(
         instance,
         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         sender,
@@ -1224,10 +1222,10 @@ pub(crate) fn destination(
 }
 
 pub(crate) fn stream_sink(
-    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    fixture: &crate::runtime::task::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     instance: UniqueId,
-    destinations: Vec<FragmentDestination>,
+    destinations: Vec<TaskDestination>,
     transmitter: &Arc<LoopbackTransmitter>,
 ) -> Box<dyn OperatorFactory> {
     let (node, recording) = PreparedUnitRecording::new(program, fixture.creation(instance));
@@ -1243,7 +1241,7 @@ pub(crate) fn stream_sink(
     fixture
         .sink(
             program,
-            &FragmentSinkAssignment::StreamDestinations {
+            &TaskSinkAssignment::StreamDestinations {
                 destinations,
                 sender_id: None,
             },
@@ -1258,13 +1256,13 @@ pub(crate) fn stream_sink(
 pub(crate) fn result_sink(
     program: &Arc<LocalProgram>,
     instance: UniqueId,
-    output: &ResultSinkHandle,
+    output: &ResultSinkBuffer,
 ) -> Box<dyn OperatorFactory> {
     materialize_compiled_sink(
         program,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         instance,
-        crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+        crate::runtime::task::io::exchange::discard_exchange_transmitter(),
         Some(Box::new(ResultSinkFactory::new(output.clone()))),
         None,
     )

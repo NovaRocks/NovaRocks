@@ -18,9 +18,9 @@
 use super::RuntimeKernelControl;
 use super::runtime_kernel_memory::*;
 use crate::runtime::execution_runtime::test_execution_runtime;
-use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
 use crate::runtime::query_memory::QueryMemoryBinding;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::runtime_state::{RuntimeStateInputs, build_runtime_state};
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
 use novarocks_memory::attribution::{AttributingAllocator, binding};
@@ -95,7 +95,7 @@ fn by_runtime_memory_ready_actual_task_state_installs_exact_account_without_gran
     let state = build_runtime_state(RuntimeStateInputs {
         query_options: None,
         query_id: Some(execution().query_id()),
-        fragment_instance_id: None,
+        task_key: None,
         backend_num: None,
         mem_tracker: None,
         runtime_filter_session: None,

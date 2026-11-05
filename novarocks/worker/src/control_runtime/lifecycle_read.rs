@@ -20,7 +20,7 @@
 
 use crate::task_port::{TaskNeutralObservation, TaskRuntimePort};
 use novarocks_control_runtime::{
-    lease::WorkLease,
+    obligation::WorkObligation,
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::identity::WorkId;
@@ -40,7 +40,7 @@ pub enum TaskReadError {
     Runtime(RuntimeError),
 }
 
-/// A read-only binding outlives executable Work and may be retained by context
+/// A read-only binding outlives executable Work and may be retained by participation
 /// feedback/statistics observers. Its live owner is weak; its sealed value is
 /// neutral and owns neither source, runtime, callback nor capacity authority.
 pub(crate) struct TaskReadBinding {
@@ -78,11 +78,11 @@ impl TaskReadBinding {
 /// The exact original Task lifetime Work, kept with its observation issuer.
 /// A foreign Work with numerically equal IDs cannot authorize the read handoff.
 pub(crate) struct TaskLifetime {
-    work: WorkLease,
+    work: WorkObligation,
     read: Arc<TaskReadBinding>,
 }
 impl TaskLifetime {
-    pub(crate) fn from_admitted(work: WorkLease, port: &Arc<TaskRuntimePort>) -> Self {
+    pub(crate) fn from_admitted(work: WorkObligation, port: &Arc<TaskRuntimePort>) -> Self {
         Self {
             work,
             read: Arc::new(TaskReadBinding {
@@ -97,12 +97,12 @@ impl TaskLifetime {
     }
     pub(crate) fn retirement_observer(
         &self,
-    ) -> novarocks_control_runtime::lease::WorkRetirementObserver {
+    ) -> novarocks_control_runtime::obligation::WorkRetirementObserver {
         self.work.retirement_observer()
     }
     /// Borrow this owner's unique admitted Work; numeric identity alone does
     /// not grant child admission or authorize position transfer.
-    pub(crate) fn work(&self) -> &WorkLease {
+    pub(crate) fn work(&self) -> &WorkObligation {
         &self.work
     }
     pub(crate) const fn id(&self) -> WorkId {
@@ -181,7 +181,7 @@ impl TaskLifetime {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_worker_protocol::context::ContextCommand;
+    use novarocks_worker_protocol::participation::ParticipationCommand;
     mod reporter;
     use super::super::actors::{WorkerAction, WorkerActor};
     use super::super::task_publication::commit_task_projection;
@@ -189,17 +189,17 @@ mod tests {
     use crate::{
         control_admission::{AdmissionStorage, Dimension},
         control_runtime::{
-            actors::{ContextActor, ContextMessage, RequestMetadata, WorkerMessage},
+            actors::{ParticipationActor, ParticipationMessage, RequestMetadata, WorkerMessage},
             effect_dispatch::EffectDispatch,
             task::{TaskHostBinding, TaskHostRecord, TaskHostResources},
         },
         task_port::TaskPendingNotice,
         task_proposal_ingress::{PairRoute, TaskProposalIngress},
     };
-    use novarocks_control_runtime::driver::{ActorRuntime, EffectTicket, InputPhase};
+    use novarocks_control_runtime::actor_turn::{ActorRuntime, EffectTicket, InputPhase};
     use novarocks_control_runtime::{
         actor::ActorConfig,
-        lease::{ReservationBundle, WorkLease},
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -212,18 +212,18 @@ mod tests {
     };
     use novarocks_execution::runtime::execution_health::ExecutionHealth;
     use novarocks_execution_contract::{
-        QueryContextRef, SafeDetail, TaskConclusionProposal, TaskFailurePhase, TaskIdentity,
+        ParticipationRef, SafeDetail, TaskConclusionProposal, TaskFailurePhase, TaskIdentity,
         TaskOperationId,
         failure::{FailureClass, FailureFact, FailureProjection},
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-    use novarocks_worker_protocol::context::{ContextEffect, PhysicalFact};
+    use novarocks_worker_protocol::participation::{ParticipationEffect, PhysicalFact};
     use novarocks_worker_protocol::{
-        context::{ContextConfig, ContextCore, ContextInput},
         creation::{CreationCost, PayloadId},
         lease::{LeaseBounds, MonotonicInstant},
+        participation::{ParticipationConfig, ParticipationCore, ParticipationInput},
         proposal_summary::{Diagnostic, ProposalSummary, SourceId},
     };
     use std::{
@@ -252,18 +252,18 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
-        registration: novarocks_control_runtime::driver::ActorRegistration,
+        registration: novarocks_control_runtime::actor_turn::ActorRegistration,
         port: Option<Arc<TaskRuntimePort>>,
         host: Option<TaskHostRecord>,
         host_port: Option<Arc<TaskRuntimePort>>,
         causal: Option<super::super::causal::TaskCausalInbox>,
         sources_retired: bool,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         // Exact SourceIds from the actual prefix, observed Committed before
         // its input record is retired. No failed-owner receipt is fabricated.
         core_consumed: Mutex<BTreeMap<SourceId, InputId>>,
-        roles: Vec<(WorkLease, ReservationBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
+        obligation_pairs: Vec<(WorkObligation, ReservationObligation)>,
+        jobs: BTreeMap<ReservationId, (WorkObligation, ReservationObligation)>,
         dispatch: EffectDispatch,
         finalization: Option<EffectTicket<WorkerAction>>,
         pending_inputs: BTreeSet<InputId>,
@@ -279,7 +279,7 @@ mod tests {
                 .unwrap(),
             );
             let scope = ledger.open_scope_next(None, generation()).unwrap();
-            let mut roles = Vec::new();
+            let mut obligation_pairs = Vec::new();
             for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
                 .into_iter()
                 .enumerate()
@@ -287,7 +287,7 @@ mod tests {
                 let (mut work, capacity) = scope
                     .reserve_next(
                         generation(),
-                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
+                        novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ParticipationActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }),
                         kind,
                         WorkAdmission::External,
                     )
@@ -297,32 +297,32 @@ mod tests {
                 if kind != WorkKind::Cleanup {
                     work.start().unwrap();
                 }
-                roles.push((work, capacity));
+                obligation_pairs.push((work, capacity));
             }
-            let context = QueryContextRef::new(
+            let participation = ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(551, 552), AttemptId::new(1).unwrap()).unwrap(),
                 FrontendProcessId::new_v7(),
                 BackendProcessId::new_v7(),
             );
             let task = TaskIdentity::new(
-                context.query_execution_id(),
+                participation.query_execution_id(),
                 StageId::new(1).unwrap(),
                 TaskId::new(1).unwrap(),
-                context.backend_process_id(),
+                participation.backend_process_id(),
             );
-            let config = ContextConfig {
+            let config = ParticipationConfig {
                 request_horizon: crate::RequestHorizon::DEFAULT,
                 max_tasks: 1,
                 max_creation_waiters: 2,
                 max_pending_requests: 4,
                 max_preparing: 1,
                 max_task_bytes: 100,
-                step_budget: ContextCore::MAX_STEP_WORK,
+                step_budget: ParticipationCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
             };
-            let core = ContextCore::new(
-                context,
+            let core = ParticipationCore::new(
+                participation,
                 generation(),
                 crate::control_runtime::actors::tests::initial_establishment(),
                 config,
@@ -332,31 +332,31 @@ mod tests {
             let registration = runtime.register_supervised_bound(
                     actor(),
                     scope.clone(),
-                    WorkerActor::Context(Box::new(ContextActor::new(
+                    WorkerActor::Participation(Box::new(ParticipationActor::new(
                         core,
                         scope.clone(),
                         AdmissionStorage {
-                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
-                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressRoleLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
-                            context: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
+                            loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressPositionLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).loading.resources().unwrap(),
+                            accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(crate::control_runtime_policy::IngressPositionLimits { ordinary_running: 1, ordinary_waiting: 0, control_running: 1, control_waiting: 0, max_batch_items: 1, root_read_holders: 1 }).unwrap()).accepted.resources().unwrap(),
+                            participation: novarocks_control_runtime_core::capacity::ReservationResources::work_only(),
                         },
-                        roles[1].0.reference(),
-                        roles[2].0.reference(),
+                        obligation_pairs[1].0.reference(),
+                        obligation_pairs[2].0.reference(),
                     ))),
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
                         max_effects_per_step:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         max_dependencies_per_effect:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
-                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
-                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+                        turn_budget: crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
+                        max_step_work: crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
                     },
-                    &roles[0].0,
+                    &obligation_pairs[0].0,
                 )
                 .unwrap_or_else(|(error, _)| panic!("actual actor admission: {error:?}"));
-            let dispatch = EffectDispatch::context(runtime.clone(), actor(), 64);
+            let dispatch = EffectDispatch::participation(runtime.clone(), actor(), 64);
             let mut f = Self {
                 ledger,
                 scope,
@@ -367,9 +367,9 @@ mod tests {
                 host_port: None,
                 causal: None,
                 sources_retired: false,
-                context,
+                participation,
                 core_consumed: Mutex::new(BTreeMap::new()),
-                roles,
+                obligation_pairs,
                 jobs: BTreeMap::new(),
                 dispatch,
                 finalization: None,
@@ -377,20 +377,20 @@ mod tests {
             };
             for (command, request) in [
                 (
-                    ContextInput::MaterializationFinished {
+                    ParticipationInput::MaterializationFinished {
                         result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
                     },
                     None,
                 ),
                 (
-                    ContextInput::Request(ContextCommand::Create {
+                    ParticipationInput::Request(ParticipationCommand::Create {
                         task,
                         payload: PayloadId(1),
                     }),
                     Some(operation(1)),
                 ),
                 (
-                    ContextInput::Loaded {
+                    ParticipationInput::Loaded {
                         task,
                         result: Ok(CreationCost {
                             input_retained_bytes: 1,
@@ -400,7 +400,7 @@ mod tests {
                     },
                     None,
                 ),
-                (ContextInput::Installed { task }, None),
+                (ParticipationInput::Installed { task }, None),
             ] {
                 let input = f.send(command, request);
                 f.drain();
@@ -413,9 +413,11 @@ mod tests {
                 .as_ref()
                 .expect("the actual LoadInput elected this Task")
         }
-        fn send(&self, command: ContextInput, request: Option<TaskOperationId>) -> InputId {
+        fn send(&self, command: ParticipationInput, request: Option<TaskOperationId>) -> InputId {
             let sources: Vec<_> = match &command {
-                ContextInput::Summary { summary, .. } => summary.candidate_sources().collect(),
+                ParticipationInput::Summary { summary, .. } => {
+                    summary.candidate_sources().collect()
+                }
                 _ => Vec::new(),
             };
             let input = self
@@ -424,17 +426,19 @@ mod tests {
                     &self.registration,
                     ActorId::new(2).unwrap(),
                     InputClass::Lifecycle,
-                    &self.roles[2].0,
+                    &self.obligation_pairs[2].0,
                 )
                 .unwrap()
-                .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.reference(),
-                    command,
-                    request: request.map(|operation| RequestMetadata {
-                        operation,
-                        deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
-                    }),
-                }))
+                .fill(WorkerMessage::Participation(
+                    ParticipationMessage::Command {
+                        work: self.obligation_pairs[2].0.reference(),
+                        command,
+                        request: request.map(|operation| RequestMetadata {
+                            operation,
+                            deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
+                        }),
+                    },
+                ))
                 .unwrap();
             self.runtime.poll_one(Tick(1)).unwrap();
             if !sources.is_empty() {
@@ -499,32 +503,32 @@ mod tests {
             while let Some(ticket) = self.next() {
                 if matches!(
                     &ticket.effect,
-                    WorkerAction::Context(ContextEffect::FinalizeTaskExecution { .. })
+                    WorkerAction::Participation(ParticipationEffect::FinalizeTaskExecution { .. })
                 ) {
                     assert!(self.finalization.replace(ticket).is_none());
                     continue;
                 }
                 let publication = matches!(
                     ticket.effect,
-                    WorkerAction::Context(
-                        ContextEffect::PublishTask { .. }
-                            | ContextEffect::PublishMetrics { .. }
-                            | ContextEffect::PublishTaskConvergence { .. }
-                            | ContextEffect::SummaryConsumed { .. }
-                            | ContextEffect::PublishConclusion { .. }
-                            | ContextEffect::RetireTask { .. }
+                    WorkerAction::Participation(
+                        ParticipationEffect::PublishTask { .. }
+                            | ParticipationEffect::PublishMetrics { .. }
+                            | ParticipationEffect::PublishTaskConvergence { .. }
+                            | ParticipationEffect::SummaryConsumed { .. }
+                            | ParticipationEffect::PublishConclusion { .. }
+                            | ParticipationEffect::RetireTask { .. }
                     )
                 );
                 if publication {
                     self.commit(&ticket);
                 }
                 match &ticket.effect {
-                    WorkerAction::Context(ContextEffect::LoadInput { .. }) => {
+                    WorkerAction::Participation(ParticipationEffect::LoadInput { .. }) => {
                         let host = TaskHostRecord::adopt_loading(
                             &self.runtime,
                             &ticket,
                             &TaskHostBinding {
-                                context: self.context,
+                                participation: self.participation,
                                 task_source: ActorId::new(2).unwrap(),
                                 protocol_generation: generation(),
                                 max_cuts: 4,
@@ -532,13 +536,13 @@ mod tests {
                                 pending: Arc::new(Pending),
                                 health: Arc::new(ExecutionHealth::default()),
                             },
-                            &self.roles[0].0,
+                            &self.obligation_pairs[0].0,
                         )
                         .unwrap();
                         assert!(self.port.replace(host.port()).is_none());
                         assert!(self.host.replace(host).is_none());
                     }
-                    WorkerAction::Context(ContextEffect::EnqueuePreparation {
+                    WorkerAction::Participation(ParticipationEffect::EnqueuePreparation {
                         reservation,
                         ..
                     }) => {
@@ -557,10 +561,10 @@ mod tests {
                 }
                 let completion = matches!(
                     &ticket.effect,
-                    WorkerAction::Context(
-                        ContextEffect::EstablishProbed { .. }
-                            | ContextEffect::EstablishmentDecided { .. }
-                            | ContextEffect::RetainContext { .. }
+                    WorkerAction::Participation(
+                        ParticipationEffect::EstablishProbed { .. }
+                            | ParticipationEffect::EstablishmentDecided { .. }
+                            | ParticipationEffect::RetainParticipation { .. }
                     )
                 );
                 let reference = super::super::effect_dispatch::EffectRef {
@@ -674,7 +678,7 @@ mod tests {
             drop(causal);
             drop(self.host_port.take());
             drop(self.port.take());
-            for (mut work, mut capacity) in self.roles.drain(..) {
+            for (mut work, mut capacity) in self.obligation_pairs.drain(..) {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(self.scope.id(), 64).unwrap();
@@ -695,7 +699,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn command(&mut self, command: ContextInput) {
+        fn command(&mut self, command: ParticipationInput) {
             let input = self.send(command, None);
             assert!(self.pending_inputs.insert(input));
             self.drain();
@@ -708,7 +712,12 @@ mod tests {
                 .copied()
                 .filter(|input| {
                     self.runtime
-                        .effect_inventory(actor(), *input, None, ContextActor::MAX_STEP_ACTIONS)
+                        .effect_inventory(
+                            actor(),
+                            *input,
+                            None,
+                            ParticipationActor::MAX_STEP_ACTIONS,
+                        )
                         .unwrap()
                         .iter()
                         .all(|(_, state)| *state == EffectState::Completed)
@@ -719,7 +728,7 @@ mod tests {
                 assert!(self.pending_inputs.remove(&input));
             }
         }
-        fn lifetime(&mut self) -> (TaskLifetime, ReservationBundle) {
+        fn lifetime(&mut self) -> (TaskLifetime, ReservationObligation) {
             let original_work_count = self.scope.snapshot().unwrap().work;
             let TaskHostResources {
                 lifetime,
@@ -733,7 +742,7 @@ mod tests {
                 pending_loading,
                 preparation,
                 preparation_remainder,
-                accepted_role_storage,
+                accepted_completion_storage,
                 pending_preparation_adoption,
                 mut source_partials,
                 completion,
@@ -801,7 +810,7 @@ mod tests {
             );
             // The actual Host inventory has moved out and every partial
             // issuer retired above; future unused roles cannot be issued again.
-            if let Some(mut original) = accepted_role_storage {
+            if let Some(mut original) = accepted_completion_storage {
                 assert!(original.resources().unwrap().quota.is_empty());
                 original.finish().unwrap();
             }
@@ -810,11 +819,11 @@ mod tests {
         }
         fn retire_task(&mut self) {
             let task = self.port().identity();
-            self.command(ContextInput::CompletionIntent {
+            self.command(ParticipationInput::CompletionIntent {
                 task,
                 completed_output: Some(novarocks_execution_contract::TaskOutputFacts::new(true)),
             });
-            self.command(ContextInput::CompletionExited { task });
+            self.command(ParticipationInput::CompletionExited { task });
             for fact in [
                 PhysicalFact::LoaderExited,
                 PhysicalFact::PreparationBodyExited,
@@ -822,7 +831,7 @@ mod tests {
                 PhysicalFact::OutputReleased,
                 PhysicalFact::RootIdle,
             ] {
-                self.command(ContextInput::Physical { task, fact });
+                self.command(ParticipationInput::Physical { task, fact });
             }
             assert!(
                 self.finalization.is_some(),
@@ -831,7 +840,7 @@ mod tests {
         }
         fn publish_ingress(&mut self) {
             let input = self.port().ingress().take_next_summary().unwrap();
-            self.command(ContextInput::Summary {
+            self.command(ParticipationInput::Summary {
                 task: self.port().identity(),
                 generation: generation(),
                 cut: input.cut,
@@ -845,7 +854,7 @@ mod tests {
             // authority and leaves its accepted status unchanged.
             assert!(self.finalization.is_none());
             let input = self.send(
-                ContextInput::Summary {
+                ParticipationInput::Summary {
                     task: self.port().identity(),
                     generation: generation(),
                     cut: None,
@@ -856,7 +865,7 @@ mod tests {
             let ticket = self.next().unwrap();
             assert!(matches!(
                 &ticket.effect,
-                WorkerAction::Context(ContextEffect::SummaryConsumed { .. })
+                WorkerAction::Participation(ParticipationEffect::SummaryConsumed { .. })
             ));
             self.commit_source_detachment(ticket);
             self.drain();
@@ -885,7 +894,7 @@ mod tests {
                 .take()
                 .expect("the original Core finalization");
             assert!(
-                matches!(&ticket.effect, WorkerAction::Context(ContextEffect::FinalizeTaskExecution { task, .. }) if *task == self.port().identity())
+                matches!(&ticket.effect, WorkerAction::Participation(ParticipationEffect::FinalizeTaskExecution { task, .. }) if *task == self.port().identity())
             );
             self.commit_source_detachment(ticket);
             self.drain();
@@ -897,7 +906,7 @@ mod tests {
     fn exit_lifetime(
         f: &mut Fixture,
         lifetime: &mut TaskLifetime,
-        capacity: &mut ReservationBundle,
+        capacity: &mut ReservationObligation,
     ) {
         f.port().retire_execution_port();
         f.retire_sources();
@@ -934,7 +943,7 @@ mod tests {
             Err(TaskReadError::WorkStillLive)
         ));
         f.port().submit(TaskConclusionProposal::Failed {
-            cause: novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+            cause: novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                 novarocks_functions::KernelFailure::Internal(
                     novarocks_functions::KernelDiagnostic::new(
                         "original lifecycle source remains held",
@@ -1003,7 +1012,7 @@ mod tests {
             detail: SafeDetail::truncating("actual final neutral diagnostic"),
             cleanup: true,
         });
-        f.command(ContextInput::Summary {
+        f.command(ParticipationInput::Summary {
             task: f.port().identity(),
             generation: generation(),
             cut: None,
@@ -1191,7 +1200,7 @@ mod tests {
         let observer = lifetime.observation();
         let drops = Arc::new(AtomicUsize::new(0));
         f.port().submit(TaskConclusionProposal::Failed {
-            cause: novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+            cause: novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                 OriginalSource {
                     observation: Arc::downgrade(&observer),
                     drops: drops.clone(),
@@ -1261,7 +1270,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let disposal_thread = Arc::new(Mutex::new(None));
         f.port().submit(TaskConclusionProposal::Failed {
-            cause: novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(Source {
+            cause: novarocks_execution::runtime::task::ExecutionFailure::from_domain(Source {
                 drops: drops.clone(),
                 disposal_thread: disposal_thread.clone(),
             }),

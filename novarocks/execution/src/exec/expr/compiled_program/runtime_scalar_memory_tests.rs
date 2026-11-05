@@ -20,12 +20,12 @@ use super::*;
 use crate::exec::expr::test_support::HarnessControl as Control;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
-    fragment::ExecutionFailureCause,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
+    task::ExecutionFailureCause,
 };
 use arrow::{
     array::{BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},

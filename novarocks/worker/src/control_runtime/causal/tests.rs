@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact request envelopes run through the real Context actor and original
+//! Exact request envelopes run through the real Participation actor and original
 //! causal positions. This component fixture has no Native callback or I/O body.
 
 use super::*;
@@ -23,10 +23,11 @@ use crate::control_runtime::actors::{
     WorkerAction,
     tests::{Fixture, actor, generation, operation, task},
 };
-use crate::task_completion_roles::AdmittedCompletionRole;
+use crate::task_completion_set::AdmittedCompletionTransfer;
 use crate::task_proposal_ingress::{CutSourceAdmission, RetiredCut};
 use novarocks_control_runtime::{
-    completion::ReportSlot, driver::Clock, lease::ReservationBundle, transaction::ScopeHandle,
+    actor_turn::Clock, completion::ReportSlot, obligation::ReservationObligation,
+    transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
     capacity::ResourceVector,
@@ -38,11 +39,11 @@ use novarocks_execution_contract::{
     AbortCause, CancelReason, OperationOutcome, TaskConclusion, TaskConclusionProposal,
     TerminationDetail,
 };
-use novarocks_worker_protocol::context::ContextCommand;
+use novarocks_worker_protocol::participation::ParticipationCommand;
 use novarocks_worker_protocol::{
-    context::{ContextEffect, RequestResult},
     creation::{CreationCost, PayloadId},
     lease::MonotonicInstant,
+    participation::{ParticipationEffect, RequestResult},
 };
 use std::{
     sync::{
@@ -57,7 +58,7 @@ impl TaskPendingNotice for Pending {
     fn pending(&self) {}
 }
 
-fn source_role(scope: &ScopeHandle, parent: ReservationId) -> AdmittedCompletionRole {
+fn source_role(scope: &ScopeHandle, parent: ReservationId) -> AdmittedCompletionTransfer {
     let g = scope.gates().unwrap().generation;
     let mut admitted = scope
         .reserve_child_next(
@@ -92,7 +93,7 @@ fn source_role(scope: &ScopeHandle, parent: ReservationId) -> AdmittedCompletion
     )
     .unwrap();
     let (work, capacity) = admitted.bind(WorkKind::Cleanup).unwrap();
-    AdmittedCompletionRole {
+    AdmittedCompletionTransfer {
         work,
         capacity,
         report,
@@ -105,7 +106,7 @@ fn model_source_slot(
 ) -> crate::control_runtime::source_positions::SourceSlotAdmission {
     let admitted = source_role(scope, parent);
     crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
-        crate::control_runtime::admitted_role::adopt_reported_work(
+        crate::control_runtime::reported_work_admission::adopt_reported_work(
             admitted.work,
             admitted.capacity,
             admitted.report,
@@ -119,8 +120,8 @@ struct Harness {
     ingress: Arc<TaskProposalIngress>,
     inbox: Arc<Mutex<TaskCausalInbox>>,
     parent: ReservationId,
-    author: WorkLease,
-    capacity: ReservationBundle,
+    author: WorkObligation,
+    capacity: ReservationObligation,
     author_exited: bool,
 }
 impl Harness {
@@ -128,7 +129,7 @@ impl Harness {
         let mut fixture = Fixture::new();
         let task = task(fixture.identity, 1);
         let create = fixture.send(
-            ContextInput::Request(ContextCommand::Create {
+            ParticipationInput::Request(ParticipationCommand::Create {
                 task,
                 payload: PayloadId(1),
             }),
@@ -141,14 +142,14 @@ impl Harness {
             .drain(create)
             .iter()
             .find_map(|effect| match effect {
-                WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => {
-                    Some(*reservation)
-                }
+                WorkerAction::Participation(ParticipationEffect::LoadInput {
+                    reservation, ..
+                }) => Some(*reservation),
                 _ => None,
             })
             .expect("the actual LoadInput adopted the original Task lifetime");
         let loaded = fixture.send(
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -195,7 +196,8 @@ impl Harness {
                         captures: 0,
                         inputs: 2,
                         batches: 2,
-                        effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        effects: 2
+                            * crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         replies: 1,
                         ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
                     },
@@ -371,7 +373,7 @@ fn control_request_waits_for_its_actual_prefix_and_replies_to_its_event_token() 
         .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
     assert!(handoff.transferred && handoff.discarded.is_none() && handoff.error.is_none());
     sender
-        .send_input(ContextInput::Request(ContextCommand::Cancel {
+        .send_input(ParticipationInput::Request(ParticipationCommand::Cancel {
             task: h.task,
             reason: CancelReason::UpstreamNoLongerNeeded,
         }))
@@ -391,10 +393,10 @@ fn control_request_waits_for_its_actual_prefix_and_replies_to_its_event_token() 
     );
     drop(clock);
     let effects = h.retire(delivery);
-    assert!(effects.iter().any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::PublishConclusion { conclusion, .. }) if *conclusion == TaskConclusion::Terminated(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)))));
+    assert!(effects.iter().any(|effect| matches!(effect, WorkerAction::Participation(ParticipationEffect::PublishConclusion { conclusion, .. }) if *conclusion == TaskConclusion::Terminated(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)))));
     assert!(!effects.iter().any(|effect| matches!(
         effect,
-        WorkerAction::Context(ContextEffect::PublishConclusion {
+        WorkerAction::Participation(ParticipationEffect::PublishConclusion {
             conclusion: TaskConclusion::Terminated(TerminationDetail::Canceled(_)),
             ..
         })
@@ -427,9 +429,9 @@ fn ordinary_request_uses_its_frozen_deadline_and_actual_event_token() {
     };
     let (_, sender) = h.admit(request, InputClass::Ordinary);
     sender
-        .send_input(ContextInput::Request(ContextCommand::GetFinalInfo {
-            task: h.task,
-        }))
+        .send_input(ParticipationInput::Request(
+            ParticipationCommand::GetFinalInfo { task: h.task },
+        ))
         .unwrap();
     let delivery = h.inbox.lock().unwrap().deliver_next().unwrap().unwrap();
     assert!(delivery.prefix.is_none());
@@ -458,7 +460,7 @@ fn ordinary_request_uses_its_frozen_deadline_and_actual_event_token() {
 // Work retirement observers across the attempted admission.
 fn check_admission_refusal(
     h: &Harness,
-    author: &WorkLease,
+    author: &WorkObligation,
     class: InputClass,
     expected: CausalError,
 ) {
@@ -550,14 +552,14 @@ fn mismatched_request_bodies_return_the_original_input_without_sealing_the_cut()
         let actor_before = h.fixture.runtime.snapshot(actor()).unwrap();
         let wrong_task = task(h.fixture.identity, 2);
         let input = match mismatch {
-            0 => ContextInput::Request(ContextCommand::Cancel {
+            0 => ParticipationInput::Request(ParticipationCommand::Cancel {
                 task: wrong_task,
                 reason: CancelReason::UpstreamNoLongerNeeded,
             }),
-            1 => ContextInput::Request(ContextCommand::Release),
-            2 => ContextInput::Running { task: h.task },
-            3 => ContextInput::Tick,
-            4 => ContextInput::Request(ContextCommand::Create {
+            1 => ParticipationInput::Request(ParticipationCommand::Release),
+            2 => ParticipationInput::Running { task: h.task },
+            3 => ParticipationInput::Tick,
+            4 => ParticipationInput::Request(ParticipationCommand::Create {
                 task: h.task,
                 payload: PayloadId(777),
             }),
@@ -565,14 +567,17 @@ fn mismatched_request_bodies_return_the_original_input_without_sealing_the_cut()
         };
         let returned = sender.send_input(input).unwrap_err();
         match (mismatch, returned) {
-            (0, ContextInput::Request(ContextCommand::Cancel { task: id, reason })) => {
+            (0, ParticipationInput::Request(ParticipationCommand::Cancel { task: id, reason })) => {
                 assert_eq!(id, wrong_task);
                 assert_eq!(reason, CancelReason::UpstreamNoLongerNeeded);
             }
-            (1, ContextInput::Request(ContextCommand::Release)) => {}
-            (2, ContextInput::Running { task: id }) => assert_eq!(id, h.task),
-            (3, ContextInput::Tick) => {}
-            (4, ContextInput::Request(ContextCommand::Create { task: id, payload })) => {
+            (1, ParticipationInput::Request(ParticipationCommand::Release)) => {}
+            (2, ParticipationInput::Running { task: id }) => assert_eq!(id, h.task),
+            (3, ParticipationInput::Tick) => {}
+            (
+                4,
+                ParticipationInput::Request(ParticipationCommand::Create { task: id, payload }),
+            ) => {
                 assert_eq!(id, h.task);
                 assert_eq!(payload, PayloadId(777));
             }
@@ -602,7 +607,7 @@ fn exercise_foreign_author() {
     let scope = ledger.open_scope_next(None, generation()).unwrap();
     let mut authors = Vec::new();
     // Real original Works intentionally reach the same numeric ID; no explicit
-    // fabricated identity or foreign Root numeric Work can authorize Context.
+    // fabricated identity or foreign Root numeric Work can authorize Participation.
     for _ in 0..h.author.id().get() {
         let (mut work, capacity) = scope
             .reserve_next(
@@ -624,7 +629,7 @@ fn exercise_foreign_author() {
         &h,
         author,
         InputClass::Control,
-        CausalError::Driver(DriverError::InputAuthorMismatch),
+        CausalError::ActorTurn(ActorTurnError::InputAuthorMismatch),
     );
     for (mut work, mut capacity) in authors {
         work.body_exited().unwrap();
@@ -642,7 +647,7 @@ fn exercise_foreign_author() {
 }
 
 #[test]
-fn a_foreign_ledger_with_the_same_scope_and_work_numbers_cannot_author_a_context_request() {
+fn a_foreign_ledger_with_the_same_scope_and_work_numbers_cannot_author_a_participation_request() {
     exercise_foreign_author();
 }
 

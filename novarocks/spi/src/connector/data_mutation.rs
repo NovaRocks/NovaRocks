@@ -964,31 +964,31 @@ pub trait ConnectorDataMutationResolver: Send + Sync {
     fn acquire_current_data_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError>;
+    ) -> Result<ConnectorDataMutationSession, ConnectorError>;
 
     fn acquire_exact_data_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError>;
+    ) -> Result<ConnectorDataMutationSession, ConnectorError>;
 }
 
 #[derive(Clone)]
-pub struct ConnectorDataMutationLease {
+pub struct ConnectorDataMutationSession {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
     provider_binding_key: ConnectorProviderBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     mutation: Arc<dyn ConnectorDataMutation>,
-    _release: Arc<DataMutationLeaseRelease>,
+    _release: Arc<DataMutationReleaseGuard>,
 }
 
-impl ConnectorDataMutationLease {}
+impl ConnectorDataMutationSession {}
 
-struct DataMutationLeaseRelease {
+struct DataMutationReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorDataMutationLease {
+impl ConnectorDataMutationSession {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1016,7 +1016,7 @@ impl ConnectorDataMutationLease {
             provider_binding_key,
             metadata,
             mutation,
-            _release: Arc::new(DataMutationLeaseRelease {
+            _release: Arc::new(DataMutationReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -1227,7 +1227,7 @@ impl ConnectorDataMutationLease {
     }
 }
 
-impl Drop for DataMutationLeaseRelease {
+impl Drop for DataMutationReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;

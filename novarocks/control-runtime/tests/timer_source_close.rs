@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, InputRole, TimerSourceState},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, StandingInputObligation, TimerSourceState},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -57,9 +57,9 @@ struct Fixture<A: Actor> {
     runtime: ActorRuntime<A>,
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    work: WorkLease,
-    capacity: ReservationBundle,
-    roles: Vec<InputRole<A>>,
+    work: WorkObligation,
+    capacity: ReservationObligation,
+    input_obligations: Vec<StandingInputObligation<A>>,
 }
 impl<A: Actor> Fixture<A> {
     fn new(value: A) -> Self {
@@ -86,15 +86,15 @@ impl<A: Actor> Fixture<A> {
             scope,
             work,
             capacity,
-            roles: vec![],
+            input_obligations: vec![],
         }
     }
     fn role(&mut self) {
-        self.roles.push(
+        self.input_obligations.push(
             self.runtime
                 .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Control)
                 .unwrap()
-                .into_role()
+                .into_standing_input()
                 .unwrap(),
         );
     }
@@ -107,7 +107,7 @@ impl<A: Actor> Fixture<A> {
         for input in self.runtime.input_inventory(actor(), None, 4).unwrap() {
             self.runtime.retire_input(actor(), input.input).unwrap();
         }
-        for role in &mut self.roles {
+        for role in &mut self.input_obligations {
             role.close_after_exit().unwrap();
         }
         while let Some(original_host_turn) = self.runtime.claim_host_actor() {
@@ -171,7 +171,7 @@ impl Actor for SelectedActor {
         _now: Tick,
         _input: InputEnvelope,
         _value: (),
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
     fn next_deadline(&self) -> Option<Tick> {
@@ -181,7 +181,7 @@ impl Actor for SelectedActor {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
@@ -223,7 +223,7 @@ impl Actor for ReturningDeadline {
         _now: Tick,
         _input: InputEnvelope,
         _value: (),
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
         self.pause.enter();
         self.deadline = Some(Tick(10));
@@ -235,7 +235,7 @@ impl Actor for ReturningDeadline {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
@@ -247,7 +247,7 @@ fn source_close_prevents_an_already_started_core_turn_from_rearming_its_deadline
         deadline: None,
     });
     f.role();
-    let input = f.roles[0].fill(()).unwrap();
+    let input = f.input_obligations[0].fill(()).unwrap();
     let running = f.runtime.clone();
     let poller = std::thread::spawn(move || running.poll_one(Tick(1)).unwrap());
     pause.wait_entered();
@@ -255,7 +255,7 @@ fn source_close_prevents_an_already_started_core_turn_from_rearming_its_deadline
     pause.release();
     let did_run = poller.join().unwrap();
     let deadline = f.runtime.next_deadline();
-    let still_in_flight = f.roles[0].in_flight().unwrap();
+    let still_in_flight = f.input_obligations[0].in_flight().unwrap();
     let filled = f.runtime.advance_time(Tick(10), 1).unwrap();
     // A real extra Tick under the old rule is drained by finish as well.
     let fee = f.ledger.used(dimension());
@@ -281,7 +281,7 @@ impl Actor for PlainActor {
         _now: Tick,
         _input: InputEnvelope,
         value: u64,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
         self.seen.push(value);
     }
@@ -292,7 +292,7 @@ impl Actor for PlainActor {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
@@ -308,12 +308,12 @@ fn source_close_keeps_a_filled_tick_pending_until_actual_retirement_and_roles_st
     let filled = f.runtime.advance_time(Tick(1), 1).unwrap();
     let timer = f.runtime.input_inventory(actor(), None, 1).unwrap()[0].input;
     let closed = f.runtime.close_timer_source(actor()).unwrap();
-    let role_input = f.roles[0].fill(7).unwrap();
+    let role_input = f.input_obligations[0].fill(7).unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
     let after_core = f.runtime.timer_source_state(actor()).unwrap();
     f.runtime.retire_input(actor(), timer).unwrap();
     let after_retirement = f.runtime.timer_source_state(actor()).unwrap();
-    let role_still_live = f.roles[0].in_flight().unwrap();
+    let role_still_live = f.input_obligations[0].in_flight().unwrap();
     f.runtime.retire_input(actor(), role_input).unwrap();
     let repeated = f.runtime.close_timer_source(actor()).unwrap();
     let work_still_live = !f.work.actual_exit_ready().unwrap();

@@ -29,9 +29,9 @@ use loom::{
     thread,
 };
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::ActorRuntime,
     completion::ReportSlot,
-    driver::ActorRuntime,
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
@@ -229,7 +229,7 @@ impl Actor for Counter {
         _now: Tick,
         _input: InputEnvelope,
         value: u64,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
         self.seen.push(value);
     }
@@ -240,7 +240,7 @@ impl Actor for Counter {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
@@ -365,7 +365,7 @@ impl Actor for SnapshotActor {
         _now: Tick,
         _input: InputEnvelope,
         _value: (),
-        step: &mut StepContext<'_, ()>,
+        step: &mut ActorStep<'_, ()>,
     ) {
         step.effect(
             novarocks_control_runtime_core::effect::EffectDescriptor {
@@ -385,14 +385,14 @@ impl Actor for SnapshotActor {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
 #[test]
 fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preemptions() {
     model(|| {
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         use novarocks_control_runtime::publication::PublishedSnapshot;
         let ledger = RuntimeLedger::new(resources(1));
         let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
@@ -449,7 +449,7 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
                         assert_eq!(*old, 0);
                         true
                     }
-                    Err((DriverError::FailurePublicationRequired, value)) => {
+                    Err((ActorTurnError::FailurePublicationRequired, value)) => {
                         assert_eq!(*value, 1);
                         false
                     }
@@ -532,7 +532,7 @@ fn snapshot_commit_and_scope_failure_have_one_publication_order_with_two_preempt
 fn prepaid_role_fill_and_retirement_have_one_reuse_order_after_close_with_two_preemptions() {
     model(|| {
         use loom::sync::Mutex;
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         let ledger = RuntimeLedger::new(resources(1));
         let scope = ledger.open_scope(sid(1), None, generation()).unwrap();
         let runtime = ActorRuntime::new();
@@ -553,30 +553,32 @@ fn prepaid_role_fill_and_retirement_have_one_reuse_order_after_close_with_two_pr
                 config,
             )
             .unwrap_or_else(|_| panic!("register actor"));
-        let role = runtime
+        let input_obligation = runtime
             .reserve_input(aid(1), aid(2), InputClass::Ordinary)
             .unwrap()
-            .into_role()
+            .into_standing_input()
             .unwrap();
-        let first = role.fill(1).unwrap();
+        let first = input_obligation.fill(1).unwrap();
         runtime.poll_one(Tick(1)).unwrap();
         runtime.close_admission();
-        let role = Arc::new(Mutex::new(role));
-        let writer_role = role.clone();
+        let input_obligation = Arc::new(Mutex::new(input_obligation));
+        let writer_input_obligation = input_obligation.clone();
         let retire_runtime = runtime.clone();
-        let writer = thread::spawn(move || writer_role.lock().unwrap().fill(2));
+        let writer = thread::spawn(move || writer_input_obligation.lock().unwrap().fill(2));
         let retire = thread::spawn(move || retire_runtime.retire_input(aid(1), first).unwrap());
         let filled = writer.join().unwrap();
         retire.join().unwrap();
         let second = match filled {
             Ok(input) => input,
-            Err((DriverError::RoleBusy, value)) => role.lock().unwrap().fill(value).unwrap(),
+            Err((ActorTurnError::StandingInputBusy, value)) => {
+                input_obligation.lock().unwrap().fill(value).unwrap()
+            }
             Err((error, _)) => panic!("unexpected role fill: {error}"),
         };
         assert!(second > first);
         runtime.poll_one(Tick(2)).unwrap();
         runtime.retire_input(aid(1), second).unwrap();
-        role.lock().unwrap().close_after_exit().unwrap();
+        input_obligation.lock().unwrap().close_after_exit().unwrap();
         scope.close_external().unwrap();
         for _ in 0..3 {
             runtime.poll_one(Tick(2)).unwrap();
@@ -644,7 +646,7 @@ fn concurrent_id_selection_and_admission_never_reorder_the_owner_watermark() {
 #[test]
 fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preemptions() {
     model(|| {
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         let ledger = RuntimeLedger::new(resources(0));
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         let runtime = ActorRuntime::new();
@@ -668,7 +670,7 @@ fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preempti
         let producer = thread::spawn(move || {
             match admitting.reserve_input(aid(1), aid(2), InputClass::Ordinary) {
                 Ok(permit) => permit.revoke_unused().unwrap(),
-                Err(DriverError::Closed | DriverError::UnknownActor) => (),
+                Err(ActorTurnError::Closed | ActorTurnError::UnknownActor) => (),
                 Err(error) => panic!("unexpected admission result: {error:?}"),
             }
         });
@@ -677,7 +679,7 @@ fn input_reservation_racing_removal_cannot_reopen_a_stale_node_with_two_preempti
         producer.join().unwrap();
         let actor = match removal.join().unwrap() {
             Ok(actor) => actor,
-            Err(DriverError::ActorNotRetired) => runtime.remove_actor(aid(1)).unwrap(),
+            Err(ActorTurnError::ActorNotRetired) => runtime.remove_actor(aid(1)).unwrap(),
             Err(error) => panic!("unexpected retirement result: {error:?}"),
         };
         assert!(actor.seen.is_empty());
@@ -749,7 +751,7 @@ impl Actor for ClosingTimerActor {
         _now: Tick,
         _input: InputEnvelope,
         _value: (),
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
         self.seen += 1;
         thread::yield_now();
@@ -761,14 +763,14 @@ impl Actor for ClosingTimerActor {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
     }
 }
 #[test]
 fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptions() {
     model(|| {
-        use novarocks_control_runtime::driver::TimerSourceState;
+        use novarocks_control_runtime::actor_turn::TimerSourceState;
         let ledger = RuntimeLedger::new(resources(1));
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, mut capacity) = scope
@@ -798,10 +800,10 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
                 },
             )
             .unwrap_or_else(|_| panic!("actual timer actor registration"));
-        let mut role = runtime
+        let mut input_obligation = runtime
             .reserve_input(aid(1), aid(2), InputClass::Control)
             .unwrap()
-            .into_role()
+            .into_standing_input()
             .unwrap();
         let advancing = runtime.clone();
         let producer = thread::spawn(move || advancing.advance_time(Tick(1), 1).unwrap());
@@ -823,10 +825,10 @@ fn timer_source_close_and_advance_preserve_real_pending_input_with_two_preemptio
         scope.close_external().unwrap();
         runtime.close_actor_admission(aid(1)).unwrap();
         runtime.close_admission();
-        let next = role.fill(()).unwrap();
+        let next = input_obligation.fill(()).unwrap();
         runtime.poll_one(Tick(2)).unwrap();
         runtime.retire_input(aid(1), next).unwrap();
-        role.close_after_exit().unwrap();
+        input_obligation.close_after_exit().unwrap();
         while let Some(original_host_turn) = runtime.claim_host_actor() {
             original_host_turn.release(false).unwrap();
         }
@@ -944,7 +946,7 @@ fn split_next_and_reserve_next_share_the_production_identity_transaction() {
 #[test]
 fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction() {
     model(|| {
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         let ledger = RuntimeLedger::new(resources(1));
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         let (mut work, mut capacity) = scope
@@ -1014,7 +1016,7 @@ fn admitted_neutral_input_and_scope_failure_share_the_actual_author_transaction(
             .unwrap();
         capacity.finish().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
-        assert!(matches!(result, Ok(()) | Err(DriverError::ActorFailed)));
+        assert!(matches!(result, Ok(()) | Err(ActorTurnError::ActorFailed)));
         assert_eq!(inputs, 0);
         assert_eq!(actual_work, 1);
         assert_eq!(committed, [1, 1]);
@@ -1048,7 +1050,7 @@ impl Actor for EffectForwardActor {
         _: Tick,
         _: InputEnvelope,
         value: Self::Input,
-        step: &mut StepContext<'_, ()>,
+        step: &mut ActorStep<'_, ()>,
     ) {
         match value {
             EffectForwardInput::Emit => step
@@ -1068,13 +1070,13 @@ impl Actor for EffectForwardActor {
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
 }
 struct EffectForwardOwner {
     actor: ActorId,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
-    work: novarocks_control_runtime::lease::WorkLease,
-    capacity: novarocks_control_runtime::lease::ReservationBundle,
+    work: novarocks_control_runtime::obligation::WorkObligation,
+    capacity: novarocks_control_runtime::obligation::ReservationObligation,
 }
 struct EffectForwardFixture {
     ledger: RuntimeLedger,
@@ -1130,7 +1132,7 @@ impl EffectForwardFixture {
             owners,
         }
     }
-    fn ticket(&self, actor: ActorId) -> novarocks_control_runtime::driver::EffectTicket<()> {
+    fn ticket(&self, actor: ActorId) -> novarocks_control_runtime::actor_turn::EffectTicket<()> {
         let input = self
             .runtime
             .reserve_input(actor, actor, InputClass::Ordinary)
@@ -1142,23 +1144,23 @@ impl EffectForwardFixture {
             .take_effect(actor, input, ActionId::new(1).unwrap())
             .unwrap()
     }
-    fn role(
+    fn reserve_input_obligation(
         &self,
         target: ActorId,
         source: ActorId,
-    ) -> novarocks_control_runtime::driver::InputRole<EffectForwardActor> {
+    ) -> novarocks_control_runtime::actor_turn::StandingInputObligation<EffectForwardActor> {
         self.runtime
             .reserve_input(target, source, InputClass::Control)
             .unwrap()
-            .into_role()
+            .into_standing_input()
             .unwrap()
     }
     fn finish(
         mut self,
-        tickets: Vec<novarocks_control_runtime::driver::EffectTicket<()>>,
-        mut roles: Vec<(
+        tickets: Vec<novarocks_control_runtime::actor_turn::EffectTicket<()>>,
+        mut input_obligations: Vec<(
             ActorId,
-            novarocks_control_runtime::driver::InputRole<EffectForwardActor>,
+            novarocks_control_runtime::actor_turn::StandingInputObligation<EffectForwardActor>,
         )>,
     ) -> Vec<Vec<u64>> {
         for ticket in tickets {
@@ -1168,14 +1170,14 @@ impl EffectForwardFixture {
         }
         // Scheduler order is independent of this owner vector. Drain the real
         // callback queues before retiring any of their exact input receipts.
-        for _ in 0..roles.len() {
+        for _ in 0..input_obligations.len() {
             self.runtime.poll_one(Tick(2)).unwrap();
         }
-        for (target, role) in &mut roles {
-            if let Some(input) = role.in_flight().unwrap() {
+        for (target, input_obligation) in &mut input_obligations {
+            if let Some(input) = input_obligation.in_flight().unwrap() {
                 self.runtime.retire_input(*target, input).unwrap();
             }
-            role.close_after_exit().unwrap();
+            input_obligation.close_after_exit().unwrap();
         }
         for owner in &mut self.owners {
             self.runtime.close_actor_admission(owner.actor).unwrap();
@@ -1204,10 +1206,10 @@ impl EffectForwardFixture {
 #[test]
 fn effect_input_forwarding_and_source_failure_have_one_ledger_order_with_two_preemptions() {
     model(|| {
-        use novarocks_control_runtime::driver::DriverError;
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
         let f = EffectForwardFixture::new();
         let ticket = f.ticket(aid(1));
-        let role = f.role(aid(2), aid(1));
+        let input_obligation = f.reserve_input_obligation(aid(2), aid(1));
         // Existing positions can drain, without admitting a new role or Work.
         f.owners[1].scope.close_external().unwrap();
         f.owners[1].scope.request_stop().unwrap();
@@ -1215,20 +1217,24 @@ fn effect_input_forwarding_and_source_failure_have_one_ledger_order_with_two_pre
         f.runtime.close_admission();
         let producing = f.runtime.clone();
         let forward = thread::spawn(move || {
-            let result = producing.fill_from_effect(&ticket, &role, EffectForwardInput::Value(53));
-            (ticket, role, result)
+            let result = producing.fill_from_effect(
+                &ticket,
+                &input_obligation,
+                EffectForwardInput::Value(53),
+            );
+            (ticket, input_obligation, result)
         });
         let source = f.owners[0].scope.clone();
         let fail = thread::spawn(move || source.fail().unwrap());
-        let (ticket, role, result) = forward.join().unwrap();
+        let (ticket, input_obligation, result) = forward.join().unwrap();
         fail.join().unwrap();
-        let receipt = role.in_flight().unwrap();
+        let receipt = input_obligation.in_flight().unwrap();
         let current_ticket = f.runtime.validate_effect_ticket(&ticket);
         let paid = [
             f.ledger.used(DimensionId::new(1).unwrap()),
             f.ledger.used(DimensionId::new(2).unwrap()),
         ];
-        let seen = f.finish(vec![ticket], vec![(aid(2), role)]);
+        let seen = f.finish(vec![ticket], vec![(aid(2), input_obligation)]);
         // Both branches preserve the same neutral value: it is either in the
         // actual target actor or returned in the original refusal, never lost.
         match result {
@@ -1236,14 +1242,17 @@ fn effect_input_forwarding_and_source_failure_have_one_ledger_order_with_two_pre
                 assert_eq!(receipt, Some(input));
                 assert_eq!(seen, vec![vec![], vec![53]]);
             }
-            Err((DriverError::FailurePublicationRequired, EffectForwardInput::Value(value))) => {
+            Err((ActorTurnError::FailurePublicationRequired, EffectForwardInput::Value(value))) => {
                 assert_eq!(value, 53);
                 assert_eq!(receipt, None);
                 assert_eq!(seen, vec![vec![], vec![]]);
             }
             other => panic!("unexpected actual forwarding order: {other:?}"),
         }
-        assert_eq!(current_ticket, Err(DriverError::FailurePublicationRequired));
+        assert_eq!(
+            current_ticket,
+            Err(ActorTurnError::FailurePublicationRequired)
+        );
         assert_eq!(paid, [2, 2]);
     });
 }
@@ -1254,8 +1263,8 @@ fn opposite_effect_input_forwards_share_actor_lock_order_with_two_preemptions() 
         let f = EffectForwardFixture::new();
         let first_ticket = f.ticket(aid(1));
         let second_ticket = f.ticket(aid(2));
-        let to_second = f.role(aid(2), aid(1));
-        let to_first = f.role(aid(1), aid(2));
+        let to_second = f.reserve_input_obligation(aid(2), aid(1));
+        let to_first = f.reserve_input_obligation(aid(1), aid(2));
         let first_runtime = f.runtime.clone();
         let first = thread::spawn(move || {
             let result = first_runtime.fill_from_effect(
@@ -1308,7 +1317,7 @@ mod staged_scope_stop_model {
         type Input = ();
         type Effect = ();
         fn timer_input(_: Tick) {}
-        fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), step: &mut StepContext<'_, ()>) {
+        fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), step: &mut ActorStep<'_, ()>) {
             step.stop_producing();
             step.effect(
                 EffectDescriptor {
@@ -1324,7 +1333,7 @@ mod staged_scope_stop_model {
         fn next_deadline(&self) -> Option<Tick> {
             None
         }
-        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
     }
 
     #[test]
@@ -1333,9 +1342,9 @@ mod staged_scope_stop_model {
             let history = HistoryCapture::new(256);
             let ledger = RuntimeLedger::with_history(resources(3), history.clone());
             let scope = ledger.open_scope_next(None, generation()).unwrap();
-            let mut roles = Vec::with_capacity(3);
+            let mut obligation_pairs = Vec::with_capacity(3);
             for kind in [WorkKind::Settlement, WorkKind::Business, WorkKind::Cleanup] {
-                roles.push(
+                obligation_pairs.push(
                     scope
                         .reserve_next(
                             generation(),
@@ -1348,9 +1357,9 @@ mod staged_scope_stop_model {
                         .unwrap(),
                 );
             }
-            let (mut metadata, mut metadata_capacity) = roles.remove(0);
-            let (business, mut business_capacity) = roles.remove(0);
-            let (mut cleanup, mut cleanup_capacity) = roles.remove(0);
+            let (mut metadata, mut metadata_capacity) = obligation_pairs.remove(0);
+            let (business, mut business_capacity) = obligation_pairs.remove(0);
+            let (mut cleanup, mut cleanup_capacity) = obligation_pairs.remove(0);
             let business_id = business.id();
             metadata.start().unwrap();
             let runtime = ActorRuntime::with_history(history.clone());
@@ -1461,7 +1470,7 @@ mod staged_scope_stop_model {
             assert_eq!(gates.generation, generation());
             assert_eq!(
                 custody.phase,
-                novarocks_control_runtime::driver::InputPhase::Committed
+                novarocks_control_runtime::actor_turn::InputPhase::Committed
             );
             assert_eq!(cleanup_started, Ok(()));
             assert!(!business_exited);

@@ -48,11 +48,11 @@ use novarocks_type_contract::{
 };
 
 use crate::exec::chunk::{Chunk, OutputColumnMetadata};
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
-use crate::runtime::fragment::io::NoopFragmentEventSink;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::NoopTaskEventSink;
 
 pub(crate) struct FixtureControl;
 impl PureCompileControl for FixtureControl {
@@ -385,7 +385,7 @@ fn try_run_in(
         })),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     let prepared = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
@@ -395,7 +395,7 @@ fn try_run_in(
         None,
         dop,
         state,
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .map_err(|error| error.to_string())?;
     let running = prepared.start();

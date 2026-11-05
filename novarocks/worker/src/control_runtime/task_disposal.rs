@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One preadmitted Context-child Cleanup role covers the original Task's
+//! One preadmitted Participation-child Cleanup role covers the original Task's
 //! physical payload destruction and observer invocation. It is a sibling of
 //! TaskLifetime, so its unstarted body never obstructs the Task's read seal.
 
@@ -25,9 +25,9 @@ use super::{
 };
 use crate::{control_runtime_policy::StorageNeed, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, DriverError, EffectTicket},
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::WorkRetirementObserver,
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::WorkRetirementObserver,
     reported_work::{ReportedWork, ReportedWorkBindingError},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -42,7 +42,7 @@ use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity, TaskState,
     failure::{FailureClass, FailureFact},
 };
-use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
+use novarocks_worker_protocol::{creation::PayloadId, participation::ParticipationEffect};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const TASK_DISPOSAL_STORAGE: StorageNeed = StorageNeed {
@@ -70,8 +70,8 @@ pub(crate) enum TaskDisposalOrigin {
 #[derive(Debug)]
 pub(crate) enum TaskDisposalError {
     Runtime(RuntimeError),
-    Driver(DriverError),
-    Exit(ExitRoleError),
+    ActorTurn(ActorTurnError),
+    Exit(ExitCustodyError),
     WrongOwner,
     WrongStorage,
     StorageBinding(ReportedWorkBindingError),
@@ -81,7 +81,7 @@ impl std::fmt::Display for TaskDisposalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => write!(f, "Task disposal runtime failure: {error}"),
-            Self::Driver(error) => write!(f, "Task disposal driver failure: {error}"),
+            Self::ActorTurn(error) => write!(f, "Task disposal driver failure: {error}"),
             Self::Exit(error) => write!(f, "Task disposal exit failure: {error}"),
             Self::WrongOwner => f.write_str("Task disposal has a different original owner"),
             Self::WrongStorage => {
@@ -98,7 +98,7 @@ impl std::error::Error for TaskDisposalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Exit(error) => Some(error),
             Self::StorageBinding(error) => Some(error),
             _ => None,
@@ -111,13 +111,13 @@ impl From<RuntimeError> for TaskDisposalError {
         Self::Runtime(e)
     }
 }
-impl From<DriverError> for TaskDisposalError {
-    fn from(e: DriverError) -> Self {
-        Self::Driver(e)
+impl From<ActorTurnError> for TaskDisposalError {
+    fn from(e: ActorTurnError) -> Self {
+        Self::ActorTurn(e)
     }
 }
-impl From<ExitRoleError> for TaskDisposalError {
-    fn from(e: ExitRoleError) -> Self {
+impl From<ExitCustodyError> for TaskDisposalError {
+    fn from(e: ExitCustodyError) -> Self {
         Self::Exit(e)
     }
 }
@@ -138,7 +138,7 @@ enum Handoff {
 }
 struct State {
     handoff: Handoff,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 struct Custody {
     task: TaskIdentity,
@@ -146,7 +146,7 @@ struct Custody {
     runtime: ActorRuntime<WorkerActor>,
     scope: ScopeHandle,
     work: WorkId,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: novarocks_control_runtime::completion::ReportSlot,
     retirement: WorkRetirementObserver,
     state: Mutex<State>,
@@ -160,7 +160,7 @@ pub(crate) struct TaskDisposalBinding {
     pub pending: Arc<dyn TaskPendingNotice>,
     pub health: Arc<ExecutionHealth>,
 }
-pub(crate) struct TaskDisposalRole(Arc<Custody>);
+pub(crate) struct TaskDisposalCustody(Arc<Custody>);
 #[must_use]
 pub(crate) struct TaskDisposalAuthorization {
     owner: Arc<Custody>,
@@ -174,16 +174,16 @@ impl TaskDisposalAuthorization {
 }
 #[must_use]
 pub(crate) struct TaskDisposalJob {
-    owner: TaskDisposalRole,
+    owner: TaskDisposalCustody,
     origin: TaskDisposalOrigin,
     permission: Permission,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 pub(crate) struct TaskDisposalAdmissionRefusal {
     pub _original_error: TaskDisposalError,
     pub _original_work: ReportedWork,
 }
-impl TaskDisposalRole {
+impl TaskDisposalCustody {
     pub(crate) fn from_admitted(
         binding: TaskDisposalBinding,
         original: ReportedWork,
@@ -223,14 +223,14 @@ impl TaskDisposalRole {
         let work = original.work().id();
         let retirement = original.work().retirement_observer();
         let report = original.report().clone();
-        let (role, authority) = ExitRole::from_admitted(original);
+        let (exit_custody, authority) = ExitCustody::from_admitted(original);
         Ok(Self(Arc::new(Custody {
             task,
             actor,
             runtime,
             scope,
             work,
-            role,
+            exit_custody,
             report,
             retirement,
             state: Mutex::new(State {
@@ -250,7 +250,7 @@ impl TaskDisposalRole {
     ) -> Result<TaskDisposalAuthorization, TaskDisposalError> {
         self.0.runtime.validate_effect_ticket(ticket)?;
         let origin = match &ticket.effect {
-            WorkerAction::Context(ContextEffect::RetireTask {
+            WorkerAction::Participation(ParticipationEffect::RetireTask {
                 task,
                 state,
                 payload,
@@ -328,7 +328,7 @@ impl TaskDisposalRole {
         let authority = state.authority.take();
         state.handoff = Handoff::Issued;
         Ok(TaskDisposalJob {
-            owner: TaskDisposalRole(self.0.clone()),
+            owner: TaskDisposalCustody(self.0.clone()),
             origin: authorization.origin,
             permission: authorization.permission,
             authority,
@@ -336,13 +336,13 @@ impl TaskDisposalRole {
     }
     pub(crate) fn actual_call_exited(&self) -> bool {
         matches!(
-            self.0.role.phase(),
-            ExitRolePhase::Exited | ExitRolePhase::Retired
-        ) && self.0.role.body_exited()
-            && self.0.role.captures_exited()
+            self.0.exit_custody.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+        ) && self.0.exit_custody.body_exited()
+            && self.0.exit_custody.captures_exited()
     }
     pub(crate) fn is_retired(&self) -> bool {
-        self.0.role.phase() == ExitRolePhase::Retired && self.0.retirement.is_retired()
+        self.0.exit_custody.phase() == ExitCustodyPhase::Retired && self.0.retirement.is_retired()
     }
     pub(crate) fn advance_retirement(
         &self,
@@ -352,7 +352,7 @@ impl TaskDisposalRole {
         if !self.actual_call_exited() {
             return Ok(false);
         }
-        if self.0.role.phase() != ExitRolePhase::Retired {
+        if self.0.exit_custody.phase() != ExitCustodyPhase::Retired {
             let observer = ConsumerId::new(2).unwrap();
             let withdrawn = self
                 .0
@@ -365,9 +365,9 @@ impl TaskDisposalRole {
                 self.0.report.consume(observer)?;
                 progress = true;
             }
-            let before = self.0.role.phase();
-            self.0.role.try_retire()?;
-            progress |= before != self.0.role.phase();
+            let before = self.0.exit_custody.phase();
+            self.0.exit_custody.try_retire()?;
+            progress |= before != self.0.exit_custody.phase();
         }
         progress |= ledger.reap_scope_ready(self.0.scope.id(), 1)? != 0;
         Ok(progress)
@@ -425,7 +425,7 @@ impl TaskDisposalJob {
         if matches!(self.permission, Permission::Normal(_))
             && matches!(
                 started,
-                Err(ExitRoleError::Runtime(RuntimeError::Scope(
+                Err(ExitCustodyError::Runtime(RuntimeError::Scope(
                     ScopeError::GenerationMismatch
                 )))
             )

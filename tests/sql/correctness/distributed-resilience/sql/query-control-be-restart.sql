@@ -20,7 +20,7 @@
 -- A backend replaced after it admitted this attempt must come back as a new
 -- process that has restored nothing, and the query must still be answered.
 --
--- Migrated onto the task protocol. `EstablishQueryContext` is the task
+-- Migrated onto the task protocol. `EstablishParticipation` is the task
 -- protocol's first per-backend admission point, so it is where the retired
 -- applied-Init rendezvous moves to: the backend installs the context,
 -- publishes a token-scoped marker, and waits for the harness to replace that
@@ -56,12 +56,12 @@ INSERT INTO ${case_db}.be_restart VALUES (2, 3);
 INSERT INTO ${case_db}.be_restart VALUES (3, 3);
 
 -- query 5
--- @restart_be_after_establish_context_index=1
+-- @restart_be_after_establish_participation_index=1
 -- @native_observation_attempts=1,2
 -- Each attempt has its own finite observation grants; the successor cannot
 -- reuse the first attempt's already-consumed binding grant.
--- @be_log_count_at_least=NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED,1
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
+-- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_OBSERVED,1
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
 SELECT COUNT(*)
 FROM ${case_db}.be_restart
 WHERE sleep(delay_s);

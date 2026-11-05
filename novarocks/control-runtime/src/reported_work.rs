@@ -19,7 +19,7 @@
 
 use crate::{
     completion::ReportSlot,
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
 };
 
 /// Rejection of mismatched original ownership, not an admission or exit fact.
@@ -49,8 +49,8 @@ impl std::error::Error for ReportedWorkBindingError {}
 #[must_use = "A refused binding still owns its Work, capacity and report"]
 pub struct ReportedWorkRefusal {
     pub error: ReportedWorkBindingError,
-    pub work: WorkLease,
-    pub capacity: ReservationBundle,
+    pub work: WorkObligation,
+    pub capacity: ReservationObligation,
     pub report: ReportSlot,
 }
 impl std::fmt::Debug for ReportedWorkRefusal {
@@ -69,8 +69,8 @@ impl std::fmt::Debug for ReportedWorkRefusal {
 /// custodian can accept them again. This object signs no new responsibility.
 #[must_use = "The original reported Work must reach its owner or be returned intact"]
 pub struct ReportedWork {
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     report: ReportSlot,
 }
 impl std::fmt::Debug for ReportedWork {
@@ -89,8 +89,8 @@ impl ReportedWork {
     /// previously admitted ownership. No self pin, authority or credit is
     /// created on refusal, and no foreign callback or destructor runs here.
     pub fn try_new(
-        mut work: WorkLease,
-        mut capacity: ReservationBundle,
+        mut work: WorkObligation,
+        mut capacity: ReservationObligation,
         report: ReportSlot,
     ) -> Result<Self, ReportedWorkRefusal> {
         if let Err(error) = capacity.validate_reported_work_binding(&work, &report) {
@@ -129,8 +129,8 @@ impl ReportedWork {
     /// Only the same-ledger atomic role constructor has already performed all
     /// real Work/header/report/capture bindings before exposing these owners.
     pub(crate) fn from_committed(
-        work: WorkLease,
-        capacity: ReservationBundle,
+        work: WorkObligation,
+        capacity: ReservationObligation,
         report: ReportSlot,
     ) -> Self {
         Self {
@@ -219,13 +219,13 @@ impl ReportedWork {
     {
         self.work.header_readiness_registration()
     }
-    pub fn work(&self) -> &WorkLease {
+    pub fn work(&self) -> &WorkObligation {
         &self.work
     }
     pub fn report(&self) -> &ReportSlot {
         &self.report
     }
-    pub fn into_parts(self) -> (WorkLease, ReservationBundle, ReportSlot) {
+    pub fn into_parts(self) -> (WorkObligation, ReservationObligation, ReportSlot) {
         (self.work, self.capacity, self.report)
     }
 }

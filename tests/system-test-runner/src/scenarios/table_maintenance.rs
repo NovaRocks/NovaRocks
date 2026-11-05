@@ -6,7 +6,7 @@ use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::{
-    ServerHandle,
+    TestClusterOwner,
     test_sessions::{ClusterTestSessionPlan, RoleLaunchReference, RoleSlot},
 };
 use novarocks_failpoint::{

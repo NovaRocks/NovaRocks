@@ -424,11 +424,11 @@ mod tests {
     #[test]
     fn every_borrowed_active_check_preserves_the_first_caller_refusal() {
         let (array, value) = required_struct(vec![1, 0], Some(vec![false, true]));
-        let original = crate::runtime::fragment::ExecutionFailure::from(
+        let original = crate::runtime::task::ExecutionFailure::from(
             novarocks_functions::KernelFailure::Cancelled,
         );
         let mut calls = 0;
-        validate_required_dictionary_children::<crate::runtime::fragment::ExecutionFailure, _>(
+        validate_required_dictionary_children::<crate::runtime::task::ExecutionFailure, _>(
             &array,
             &TypedValueBinding::try_new(
                 value.clone(),
@@ -444,27 +444,25 @@ mod tests {
         assert!(calls > 2);
         for stop in 1..=calls {
             let mut observed = 0;
-            let error = validate_required_dictionary_children::<
-                crate::runtime::fragment::ExecutionFailure,
-                _,
-            >(
-                &array,
-                &TypedValueBinding::try_new(
-                    value.clone(),
-                    ValueLayout::try_new(array.data_type(), ValueTypeStorageLifetime::pure())
-                        .unwrap(),
+            let error =
+                validate_required_dictionary_children::<crate::runtime::task::ExecutionFailure, _>(
+                    &array,
+                    &TypedValueBinding::try_new(
+                        value.clone(),
+                        ValueLayout::try_new(array.data_type(), ValueTypeStorageLifetime::pure())
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    &mut |_| {
+                        observed += 1;
+                        if observed == stop {
+                            Err(original.clone())
+                        } else {
+                            Ok(())
+                        }
+                    },
                 )
-                .unwrap(),
-                &mut |_| {
-                    observed += 1;
-                    if observed == stop {
-                        Err(original.clone())
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-            .unwrap_err();
+                .unwrap_err();
             assert_eq!(error, original);
             assert_eq!(observed, stop);
         }

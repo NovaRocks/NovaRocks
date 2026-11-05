@@ -19,7 +19,7 @@
 //! waiting; live requests and Context execution retain their actual custody.
 
 use super::{ControlInternalError, KINDS, ProcessControlOwner, RuntimeError, WorkerActor};
-use novarocks_control_runtime::driver::{ActorHostTurn, DriverError, TimerSourceState};
+use novarocks_control_runtime::actor_turn::{ActorHostTurn, ActorTurnError, TimerSourceState};
 
 #[derive(Default)]
 pub(super) struct ProcessControlTeardown {
@@ -36,7 +36,7 @@ pub(crate) enum RootDrainError {
     RootFailed,
     WrongOwner,
     Runtime(RuntimeError),
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Internal(ControlInternalError),
 }
 impl std::fmt::Display for RootDrainError {
@@ -53,7 +53,7 @@ impl std::fmt::Display for RootDrainError {
             Self::Runtime(error) => {
                 write!(f, "Process control drain runtime operation failed: {error}")
             }
-            Self::Driver(error) => {
+            Self::ActorTurn(error) => {
                 write!(f, "Process control drain actor operation failed: {error}")
             }
             Self::Internal(error) => {
@@ -66,7 +66,7 @@ impl std::error::Error for RootDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Internal(error) => Some(error),
             Self::NotDraining | Self::InventoryPending | Self::RootFailed | Self::WrongOwner => {
                 None
@@ -124,7 +124,7 @@ impl ProcessControlOwner {
             .map_err(RootDrainError::Runtime)?;
         self.runtime()
             .close_actor_admission(self.actor)
-            .map_err(RootDrainError::Driver)?;
+            .map_err(RootDrainError::ActorTurn)?;
         self.resources
             .internal
             .as_mut()
@@ -134,7 +134,7 @@ impl ProcessControlOwner {
         self.resources.teardown.draining = true;
         self.runtime()
             .notify_host_actor(&self.registration)
-            .map_err(RootDrainError::Driver)?;
+            .map_err(RootDrainError::ActorTurn)?;
         Ok(())
     }
 
@@ -157,7 +157,7 @@ impl ProcessControlOwner {
         self.resources.teardown.ingress_closed = true;
         self.runtime()
             .notify_host_actor(&self.registration)
-            .map_err(RootDrainError::Driver)
+            .map_err(RootDrainError::ActorTurn)
     }
 
     /// The Node must first empty its original removed-Context parent rows.
@@ -176,7 +176,7 @@ impl ProcessControlOwner {
         let snapshot = self
             .runtime()
             .snapshot(self.actor)
-            .map_err(RootDrainError::Driver)?;
+            .map_err(RootDrainError::ActorTurn)?;
         if snapshot.failed {
             return Err(RootDrainError::RootFailed);
         }
@@ -206,26 +206,26 @@ impl ProcessControlOwner {
         // deadline now. An already filled Tick still has its real batch.
         self.runtime()
             .close_timer_source(self.actor)
-            .map_err(RootDrainError::Driver)?;
+            .map_err(RootDrainError::ActorTurn)?;
         if let Some(input) = self
             .runtime()
             .pending_timer_input(self.actor)
-            .map_err(RootDrainError::Driver)?
+            .map_err(RootDrainError::ActorTurn)?
         {
             match self.runtime().retire_input(self.actor, input) {
                 Ok(()) => {}
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => return Ok(progress),
-                Err(error) => return Err(RootDrainError::Driver(error)),
+                Err(error) => return Err(RootDrainError::ActorTurn(error)),
             }
         }
         if self
             .runtime()
             .timer_source_state(self.actor)
-            .map_err(RootDrainError::Driver)?
+            .map_err(RootDrainError::ActorTurn)?
             != TimerSourceState::ClosedDrained
         {
             return Ok(progress);
@@ -243,10 +243,10 @@ impl ProcessControlOwner {
         let snapshot = self
             .runtime()
             .snapshot(self.actor)
-            .map_err(RootDrainError::Driver)?;
+            .map_err(RootDrainError::ActorTurn)?;
         if snapshot.external_open
             || snapshot.inputs != 0
-            || snapshot.roles != 0
+            || snapshot.standing_inputs != 0
             || snapshot.batches != 0
             || !self.resources.dispatch.is_empty()
         {
@@ -256,14 +256,18 @@ impl ProcessControlOwner {
         // Every producer which could borrow them has actually closed above.
         let ledger = self.ledger().clone();
         let scope = self.resources.scope.clone();
-        for index in (0..self.resources.roles.len()).rev() {
-            let role = &mut self.resources.roles[index];
-            if role.capacity.is_released() {
+        for index in (0..self.resources.metadata_resources.len()).rev() {
+            let metadata_resource = &mut self.resources.metadata_resources[index];
+            if metadata_resource.capacity.is_released() {
                 continue;
             }
             if !self.resources.teardown.local_exit_observed[index] {
-                role.work.body_exited().map_err(RootDrainError::Runtime)?;
-                role.work
+                metadata_resource
+                    .work
+                    .body_exited()
+                    .map_err(RootDrainError::Runtime)?;
+                metadata_resource
+                    .work
                     .captures_exited()
                     .map_err(RootDrainError::Runtime)?;
                 self.resources.teardown.local_exit_observed[index] = true;
@@ -271,11 +275,14 @@ impl ProcessControlOwner {
             ledger
                 .reap_scope_ready(scope.id(), 1)
                 .map_err(RootDrainError::Runtime)?;
-            if !role.work.retirement_observer().is_retired() {
+            if !metadata_resource.work.retirement_observer().is_retired() {
                 progress.runnable = true;
                 return Ok(progress);
             }
-            role.capacity.finish().map_err(RootDrainError::Runtime)?;
+            metadata_resource
+                .capacity
+                .finish()
+                .map_err(RootDrainError::Runtime)?;
         }
         // Child-scope links can be the last genuine ready headers after their
         // actual parent owners moved out. Do not confuse work>0 with readiness.
@@ -318,7 +325,7 @@ impl ProcessControlOwner {
         let actor = turn
             .retire_actor()
             .map_err(|(error, turn)| RootDrainRefusal::BeforeActor {
-                error: RootDrainError::Driver(error),
+                error: RootDrainError::ActorTurn(error),
                 turn,
             })?;
         self.resources.registered = false;

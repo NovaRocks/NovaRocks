@@ -22,7 +22,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, QueryContextAdmissionTicketReceipt, QueryContextRef,
+    AcquireParticipationAdmissionTicket, ParticipationAdmissionTicketReceipt, ParticipationRef,
     TaskOperationId,
 };
 use novarocks_types::identity::QueryExecutionId;
@@ -71,8 +71,8 @@ impl ReplacementQualificationIdentity {
 pub struct ReplacementQualificationRequest {
     operation_id: TaskOperationId,
     identity: ReplacementQualificationIdentity,
-    failed_contexts: Arc<[QueryContextRef]>,
-    replacement_contexts: Arc<[QueryContextRef]>,
+    failed_participations: Arc<[ParticipationRef]>,
+    replacement_participations: Arc<[ParticipationRef]>,
     issued_at: MonotonicInstant,
     conservative_expiry: MonotonicInstant,
     absolute_expiry: std::time::Instant,
@@ -82,8 +82,8 @@ pub struct ReplacementQualificationRequest {
 impl ReplacementQualificationRequest {
     pub(crate) fn new(
         identity: ReplacementQualificationIdentity,
-        failed_contexts: Arc<[QueryContextRef]>,
-        replacement_contexts: Arc<[QueryContextRef]>,
+        failed_participations: Arc<[ParticipationRef]>,
+        replacement_participations: Arc<[ParticipationRef]>,
         issued_at: MonotonicInstant,
         conservative_expiry: MonotonicInstant,
         native_actions: Option<
@@ -96,8 +96,8 @@ impl ReplacementQualificationRequest {
         Self {
             operation_id: TaskOperationId::new_v7(),
             identity,
-            failed_contexts,
-            replacement_contexts,
+            failed_participations,
+            replacement_participations,
             issued_at,
             conservative_expiry,
             absolute_expiry,
@@ -122,11 +122,11 @@ impl ReplacementQualificationRequest {
     pub const fn identity(&self) -> ReplacementQualificationIdentity {
         self.identity
     }
-    pub fn failed_contexts(&self) -> &[QueryContextRef] {
-        self.failed_contexts.as_ref()
+    pub fn failed_participations(&self) -> &[ParticipationRef] {
+        self.failed_participations.as_ref()
     }
-    pub fn replacement_contexts(&self) -> &[QueryContextRef] {
-        self.replacement_contexts.as_ref()
+    pub fn replacement_participations(&self) -> &[ParticipationRef] {
+        self.replacement_participations.as_ref()
     }
     pub const fn issued_at(&self) -> MonotonicInstant {
         self.issued_at
@@ -145,33 +145,33 @@ impl ReplacementQualificationRequest {
 
 #[derive(Debug)]
 pub struct QualifiedWorkerAdmission {
-    request: AcquireQueryContextAdmissionTicket,
-    receipt: QueryContextAdmissionTicketReceipt,
+    request: AcquireParticipationAdmissionTicket,
+    receipt: ParticipationAdmissionTicketReceipt,
 }
 
 impl QualifiedWorkerAdmission {
     pub fn try_new(
         replacement: QueryExecutionId,
-        request: AcquireQueryContextAdmissionTicket,
-        receipt: QueryContextAdmissionTicketReceipt,
+        request: AcquireParticipationAdmissionTicket,
+        receipt: ParticipationAdmissionTicketReceipt,
     ) -> Result<Self, ReplacementQualificationFailure> {
-        if request.context() != receipt.context()
+        if request.participation() != receipt.participation()
             || request.valid_for() != receipt.valid_for()
-            || request.context().query_execution_id() != replacement
+            || request.participation().query_execution_id() != replacement
         {
             return Err(ReplacementQualificationFailure::InvalidReservation);
         }
         Ok(Self { request, receipt })
     }
 
-    pub(crate) const fn request(&self) -> AcquireQueryContextAdmissionTicket {
+    pub(crate) const fn request(&self) -> AcquireParticipationAdmissionTicket {
         self.request
     }
-    pub const fn receipt(&self) -> QueryContextAdmissionTicketReceipt {
+    pub const fn receipt(&self) -> ParticipationAdmissionTicketReceipt {
         self.receipt
     }
-    pub const fn context(&self) -> QueryContextRef {
-        self.request.context()
+    pub const fn participation(&self) -> ParticipationRef {
+        self.request.participation()
     }
 
     fn copy_for_actor(&self) -> Self {
@@ -187,16 +187,16 @@ impl QualifiedWorkerAdmission {
 /// value carries neither the Acquire operation nor ownership of the ticket.
 #[derive(Debug)]
 pub struct ReplacementWorkerAdmissionEvidence {
-    context: QueryContextRef,
-    receipt: QueryContextAdmissionTicketReceipt,
+    participation: ParticipationRef,
+    receipt: ParticipationAdmissionTicketReceipt,
 }
 
 impl ReplacementWorkerAdmissionEvidence {
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
-    pub const fn receipt(&self) -> QueryContextAdmissionTicketReceipt {
+    pub const fn receipt(&self) -> ParticipationAdmissionTicketReceipt {
         self.receipt
     }
 }
@@ -214,7 +214,7 @@ pub trait AttemptIsolationReservation: fmt::Debug + Send {
     /// Borrows the exact admission evidence owned by this reservation. The
     /// slice cannot outlive or be separated from the cleanup owner.
     fn admissions(&self) -> &[QualifiedWorkerAdmission];
-    /// Proves that every exact reachable failed context is closed to new
+    /// Proves that every exact reachable failed participation is closed to new
     /// admission and work, its old eligibility is revoked, its registry usage
     /// remains owned as last-known/current-unknown residual accounting, and
     /// every candidate admission belongs to the exact isolated successor.
@@ -224,7 +224,7 @@ pub trait AttemptIsolationReservation: fmt::Debug + Send {
     /// release for the failed attempt.
     fn validate_binding(
         &self,
-        failed_contexts: &[QueryContextRef],
+        failed_participations: &[ParticipationRef],
     ) -> Result<(), ReplacementQualificationFailure>;
     fn activate(
         self: Box<Self>,
@@ -293,12 +293,12 @@ impl QualifiedReplacementReservation {
             return Err(ReplacementQualificationFailure::InvalidReservation);
         }
         let admissions = reservation.admissions();
-        let expected: BTreeSet<_> = request.replacement_contexts.iter().copied().collect();
+        let expected: BTreeSet<_> = request.replacement_participations.iter().copied().collect();
         let actual: BTreeSet<_> = admissions
             .iter()
-            .map(QualifiedWorkerAdmission::context)
+            .map(QualifiedWorkerAdmission::participation)
             .collect();
-        if expected.len() != request.replacement_contexts.len()
+        if expected.len() != request.replacement_participations.len()
             || actual.len() != admissions.len()
             || expected != actual
             || reservation.topology_revision() == 0
@@ -306,7 +306,7 @@ impl QualifiedReplacementReservation {
             reservation.abandon();
             return Err(ReplacementQualificationFailure::InvalidReservation);
         }
-        if let Err(error) = reservation.validate_binding(request.failed_contexts()) {
+        if let Err(error) = reservation.validate_binding(request.failed_participations()) {
             reservation.abandon();
             return Err(error);
         }
@@ -420,7 +420,7 @@ impl ActiveReplacementResources {
             admissions
                 .iter()
                 .map(|admission| ReplacementWorkerAdmissionEvidence {
-                    context: admission.context(),
+                    participation: admission.participation(),
                     receipt: admission.receipt(),
                 })
                 .collect::<Vec<_>>()

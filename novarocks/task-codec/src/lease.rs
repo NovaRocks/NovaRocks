@@ -58,7 +58,7 @@ impl LeaseGrant {
 
 /// Decodes a lease grant.
 pub fn decode_lease_grant(
-    src: &novarocks::QueryExecutionLeaseGrant,
+    src: &novarocks::ParticipationLeaseGrant,
     path: FieldPath,
 ) -> Result<LeaseGrant, ProtocolError> {
     let valid_for = decode_duration_millis(
@@ -71,8 +71,8 @@ pub fn decode_lease_grant(
     Ok(LeaseGrant::new(LeaseSequence::new(src.sequence), valid_for))
 }
 
-pub fn encode_lease_grant(value: LeaseGrant) -> novarocks::QueryExecutionLeaseGrant {
-    novarocks::QueryExecutionLeaseGrant {
+pub fn encode_lease_grant(value: LeaseGrant) -> novarocks::ParticipationLeaseGrant {
+    novarocks::ParticipationLeaseGrant {
         sequence: value.sequence().get(),
         valid_for_millis: value.valid_for().get().as_millis() as u64,
     }
@@ -83,7 +83,7 @@ pub fn encode_lease_grant(value: LeaseGrant) -> novarocks::QueryExecutionLeaseGr
 /// The effective duration is the only one a frontend may schedule from, so it
 /// is validated as strictly as the requested one.
 pub fn decode_lease_receipt(
-    src: &novarocks::QueryExecutionLeaseReceipt,
+    src: &novarocks::ParticipationLeaseReceipt,
     path: FieldPath,
 ) -> Result<LeaseReceipt, ProtocolError> {
     let requested = decode_duration_millis(
@@ -115,8 +115,8 @@ pub fn decode_lease_receipt(
     ))
 }
 
-pub fn encode_lease_receipt(value: LeaseReceipt) -> novarocks::QueryExecutionLeaseReceipt {
-    novarocks::QueryExecutionLeaseReceipt {
+pub fn encode_lease_receipt(value: LeaseReceipt) -> novarocks::ParticipationLeaseReceipt {
+    novarocks::ParticipationLeaseReceipt {
         sequence: value.sequence().get(),
         requested_valid_for_millis: value.requested_valid_for().get().as_millis() as u64,
         effective_valid_for_millis: value.effective_valid_for().as_millis() as u64,

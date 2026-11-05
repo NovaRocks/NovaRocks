@@ -25,7 +25,7 @@ use std::{future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use novarocks_execution_contract::root_result::RootResultRead;
 use novarocks_execution_contract::{
-    QueryContextRef, ResultPacketSequence, TaskIdentity, TaskState, TaskStatus,
+    ParticipationRef, ResultPacketSequence, TaskIdentity, TaskState, TaskStatus,
 };
 use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{CancellationReason, CancellationView, WorkError, WorkScope};
@@ -39,7 +39,7 @@ use super::{
     LogicalConclusion, LogicalExecutionActor, LogicalExecutionActorError, ReplacementQualification,
     RootResultObserver, RootTerminalFailure, RunningAttemptHandoffError, RunningAttemptPermit,
 };
-use novarocks_coordination_contract::{AttemptFailureClass, ResultContextWithdrawal};
+use novarocks_coordination_contract::{AttemptFailureClass, ResultParticipationWithdrawal};
 
 pub(crate) struct NativeAttemptTerminalSender {
     sender: Option<oneshot::Sender<NativeAttemptTerminal>>,
@@ -136,7 +136,7 @@ impl RootResultFetchFailure {
             || self.input().topology_requirement(),
             |witness| {
                 NativeAttemptTopologyRequirement::ExcludeProcess(
-                    witness.context().backend_process_id(),
+                    witness.participation().backend_process_id(),
                 )
             },
         )
@@ -213,7 +213,7 @@ impl AcceptedRootControlRequest {
     pub fn accept(
         self,
         sender: AcceptedRootStatusSender,
-        withdrawals: Vec<ResultContextWithdrawal>,
+        withdrawals: Vec<ResultParticipationWithdrawal>,
     ) -> Result<(), QueryExecutionError> {
         if self.terminal_control_root().is_some() {
             let error = contract_error("terminal control request cannot seal success");
@@ -235,7 +235,7 @@ enum AcceptedRootProjection {
     Observation(Box<AcceptedRootObservation>),
     SuccessSealed {
         status: Box<TaskStatus>,
-        withdrawals: Vec<ResultContextWithdrawal>,
+        withdrawals: Vec<ResultParticipationWithdrawal>,
     },
 }
 
@@ -398,7 +398,7 @@ impl AcceptedRootStatusSender {
     /// immediately preceding observation.
     fn seal_success(
         self,
-        withdrawals: Vec<ResultContextWithdrawal>,
+        withdrawals: Vec<ResultParticipationWithdrawal>,
     ) -> Result<(), QueryExecutionError> {
         let status = match self.sender.borrow().as_ref() {
             Some(AcceptedRootProjection::Observation(observation))
@@ -416,8 +416,8 @@ impl AcceptedRootStatusSender {
         if withdrawals.iter().any(|fact| {
             fact.root() != self.root
                 || fact.activation().execution() != self.root.query_execution_id()
-                || fact.context().query_execution_id() != self.root.query_execution_id()
-                || fact.context().backend_process_id() == self.root.backend_process_id()
+                || fact.participation().query_execution_id() != self.root.query_execution_id()
+                || fact.participation().backend_process_id() == self.root.backend_process_id()
         }) {
             return Err(contract_error(
                 "root seal contains a foreign result-demand withdrawal",
@@ -565,7 +565,7 @@ impl ResultPumpDecision {
         self,
         actor: &LogicalExecutionActor,
         replacement: QueryExecutionId,
-        replacement_contexts: Vec<QueryContextRef>,
+        replacement_participations: Vec<ParticipationRef>,
     ) -> Result<(ReplacementQualification, QueryExecutionError), LogicalExecutionActorError> {
         let class = self.failure.class();
         let permit = self.permit;
@@ -576,7 +576,7 @@ impl ResultPumpDecision {
                 self.failure.error().clone(),
                 self.failure.pre_ready_replacement().cloned(),
                 replacement,
-                replacement_contexts,
+                replacement_participations,
             )
             .await?;
         drop(self.observer);
@@ -634,7 +634,7 @@ struct PumpRuntime {
     cancellation: CancellationView,
     root_finished: bool,
     success_sealed: bool,
-    result_withdrawals: Vec<ResultContextWithdrawal>,
+    result_withdrawals: Vec<ResultParticipationWithdrawal>,
     native_completed: bool,
     pending_root_failure: Option<TaskStatus>,
 }
@@ -3710,7 +3710,7 @@ mod tests {
     #[tokio::test]
     async fn native_terminal_keeps_exact_replacement_witness_through_real_root_pump() {
         for kind in [
-            novarocks_execution_contract::OperationKind::UpdateQueryContext,
+            novarocks_execution_contract::OperationKind::UpdateParticipation,
             novarocks_execution_contract::OperationKind::CreateTask,
         ] {
             let (
@@ -3727,13 +3727,13 @@ mod tests {
             ) = relay_harness(79).await;
             let (_sender, statuses) = accepted_root_status_projection(root);
             let port = ScriptedRootPort::new(Vec::new());
-            let context = QueryContextRef::new(
+            let participation = ParticipationRef::new(
                 root.query_execution_id(),
                 novarocks_types::FrontendProcessId::new_v7(),
                 root.backend_process_id(),
             );
             let (input, witness, native) =
-                crate::api::pre_ready_identity_refusal_test_fixture_for_kind(context, kind);
+                crate::api::pre_ready_identity_refusal_test_fixture_for_kind(participation, kind);
             let (terminal_sender, terminal) = native_attempt_terminal_channel();
             terminal_sender.publish(NativeAttemptTerminal::Failed(native));
             let error = tokio::time::timeout(

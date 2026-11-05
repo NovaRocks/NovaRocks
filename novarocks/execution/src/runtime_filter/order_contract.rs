@@ -77,7 +77,7 @@ impl Eq for RuntimeOrderContractRef {}
 mod tests {
     use super::*;
     use crate::{
-        runtime::{fragment::ExecutionFailureCause, mem_tracker::MemTracker},
+        runtime::{mem_tracker::MemTracker, task::ExecutionFailureCause},
         runtime_filter::{
             contribution::{RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection},
             owned::OrderedTopNAllocationHost,

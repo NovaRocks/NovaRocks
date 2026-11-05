@@ -136,7 +136,7 @@ impl SplitAssignmentStop {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AssignmentTarget {
     pub(crate) backend_idx: usize,
-    pub(crate) fragment_instance_id: UniqueId,
+    pub(crate) task_key: UniqueId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,13 +259,13 @@ impl From<SplitAssignmentError> for SplitAssignmentDriverError {
     }
 }
 
-/// A driver-owned split source, closed exactly once when the round ends.
-pub(crate) struct SplitSourceHandle {
+/// Per-scan completion state in the original split-assignment driver.
+pub(crate) struct SplitSourceState {
     scan: ScanNodeKey,
     finished: bool,
 }
 
-impl SplitSourceHandle {
+impl SplitSourceState {
     pub(crate) const fn scan(&self) -> ScanNodeKey {
         self.scan
     }
@@ -318,7 +318,7 @@ pub(crate) struct SplitAssignmentDriver {
     tasks: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
     sequences: BTreeMap<AssignmentTarget, PlanNodeAssignmentState>,
     task_state: BTreeMap<AssignmentTarget, TaskState>,
-    sources: Vec<SplitSourceHandle>,
+    sources: Vec<SplitSourceState>,
     closed: bool,
     /// Splits the backends reported as still queued, above which the driver
     /// stops pulling new batches.
@@ -351,7 +351,7 @@ impl SplitAssignmentDriver {
         }
         let sources = tasks
             .keys()
-            .map(|scan| SplitSourceHandle {
+            .map(|scan| SplitSourceState {
                 scan: *scan,
                 finished: false,
             })
@@ -387,7 +387,7 @@ impl SplitAssignmentDriver {
         self.sources
             .iter()
             .find(|source| source.scan() == scan)
-            .is_some_and(SplitSourceHandle::is_finished)
+            .is_some_and(SplitSourceState::is_finished)
     }
 
     /// Whether every task is currently at or above its queue ceiling, so the
@@ -633,8 +633,8 @@ impl SplitAssignmentDriver {
                     }
                     tracing::debug!(
                         backend_idx = current.target.backend_idx,
-                        attempt_hi = current.request.fragment_instance_id().high(),
-                        attempt_lo = current.request.fragment_instance_id().low(),
+                        attempt_hi = current.request.task_key().high(),
+                        attempt_lo = current.request.task_key().low(),
                         elapsed_ms = started.elapsed().as_millis(),
                         error_kind = "retryable_network",
                         "retrying task update after unknown outcome"
@@ -691,7 +691,7 @@ impl SplitAssignmentDriver {
                 })?,
             )?;
             let request = super::super::connector_domain::TaskUpdateRequest::new(
-                target.fragment_instance_id,
+                target.task_key,
                 vec![assignment],
             );
 
@@ -811,8 +811,8 @@ impl SplitAssignmentDriver {
                     let wait = backoff.min(remaining);
                     tracing::debug!(
                         backend_idx = target.backend_idx,
-                        attempt_hi = request.fragment_instance_id().high(),
-                        attempt_lo = request.fragment_instance_id().low(),
+                        attempt_hi = request.task_key().high(),
+                        attempt_lo = request.task_key().low(),
                         elapsed_ms = started.elapsed().as_millis(),
                         error_kind = "retryable_network",
                         "retrying task update after unknown outcome"
@@ -932,7 +932,7 @@ mod tests {
     fn target() -> AssignmentTarget {
         AssignmentTarget {
             backend_idx: 7,
-            fragment_instance_id: UniqueId::new(8, 9),
+            task_key: UniqueId::new(8, 9),
         }
     }
 
@@ -982,7 +982,7 @@ mod tests {
             stop,
         );
         let target = target();
-        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let request = TaskUpdateRequest::new(target.task_key, Vec::new());
 
         assert!(matches!(
             driver.send_until_confirmed(&target, &request),
@@ -1013,7 +1013,7 @@ mod tests {
             stop,
         );
         let target = target();
-        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let request = TaskUpdateRequest::new(target.task_key, Vec::new());
 
         let error = driver
             .send_until_confirmed(&target, &request)
@@ -1045,7 +1045,7 @@ mod tests {
             stop,
         );
         let target = target();
-        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let request = TaskUpdateRequest::new(target.task_key, Vec::new());
 
         let error = driver
             .send_until_confirmed(&target, &request)
@@ -1073,7 +1073,7 @@ mod tests {
             stop,
         );
         let target = target();
-        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let request = TaskUpdateRequest::new(target.task_key, Vec::new());
         let started = Instant::now();
 
         let error = driver

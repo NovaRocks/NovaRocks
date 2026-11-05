@@ -21,8 +21,8 @@ use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFact
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
 use crate::exec::pipeline::step::{NextStep, StepResult};
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionResult;
 use arrow::array::ArrayRef;
 use novarocks_local_program::StaticValues;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ impl TypedValuesSourceFactory {
     pub(crate) fn try_new(
         values: StaticValues,
         node_id: i32,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         if !values.layout().is_typed() || values.batch_projection().is_none() {
             return Err(crate::exec::fragment::error::node_construction_failure(
                 "native Values require the original complete guarded batch",
@@ -105,7 +105,7 @@ impl SourceKernel for TypedValuesSource {
     }
     fn poll_output(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         let source = self.values.batch_projection().ok_or_else(|| {
             ConstructionFailure::InvalidSource("native Values batch disappeared".into())

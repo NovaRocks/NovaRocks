@@ -613,7 +613,7 @@ pub fn decode_current_keyed_documents(
     })
 }
 pub fn observe_current_keyed_documents(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
     budget: PersistenceDecodeBudget,
 ) -> Result<MvKeyedObservedCurrentDocuments, MvDocumentError> {
@@ -769,7 +769,7 @@ pub struct StoredKeyedMvProjection {
 }
 
 pub fn observe_current_keyed_documents_with_management(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
     budget: PersistenceDecodeBudget,
     entrance: &crate::management::ManagementEntrance,
@@ -787,7 +787,7 @@ pub fn observe_current_keyed_documents_with_management(
 }
 
 pub async fn observe_current_keyed_documents_with_management_async(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
     budget: PersistenceDecodeBudget,
     entrance: &crate::management::ManagementEntrance,
@@ -806,7 +806,7 @@ pub async fn observe_current_keyed_documents_with_management_async(
 }
 
 pub(crate) fn observe_current_keyed_view_with_management(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
     entrance: &crate::management::ManagementEntrance,
 ) -> Result<(KeyedDocumentView, crate::management::SlotChangeConvergence), MvDocumentError> {
@@ -828,7 +828,7 @@ pub(crate) fn observe_current_keyed_view_with_management(
 }
 
 pub(crate) async fn observe_current_keyed_view_with_management_async(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
     entrance: &crate::management::ManagementEntrance,
 ) -> Result<(KeyedDocumentView, crate::management::SlotChangeConvergence), MvDocumentError> {

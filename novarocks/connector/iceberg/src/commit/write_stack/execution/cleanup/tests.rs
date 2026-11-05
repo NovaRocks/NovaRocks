@@ -16,7 +16,7 @@
 //! Original journal/files and control projection; no external service required.
 use super::*;
 use novarocks_fs::{
-    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogVersion, ConnectorInstanceId,
@@ -35,7 +35,7 @@ fn binding(config: Option<ObjectStoreConfig>) -> IcebergReadBinding {
         config,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime)),
+        Arc::new(TokioFileIoSpawner::new(runtime)),
     )
 }
 fn request(deadline: Instant, stop: &ConnectorStopOwner) -> ConnectorRequestContext {

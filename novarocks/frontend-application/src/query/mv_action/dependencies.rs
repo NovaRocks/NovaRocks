@@ -29,8 +29,8 @@ use crate::query_execution::{
         async_original::{
             MvRefreshDependencyGraphInput, MvRefreshPreparationOriginal, MvRefreshPreparationOutput,
         },
-        driver::{MvRefreshTurnCustody, MvTurnFailure},
         io_gate::{MvRefreshPreparationIo, MvRefreshPreparationServices},
+        turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
     },
 };
 use crate::task_execution::status_intake::StatusIntakeWake;
@@ -48,7 +48,7 @@ use std::{
 
 pub(super) struct DependencyPreparation {
     input: Arc<CommandInput>,
-    driver: Option<MvRefreshTurnCustody>,
+    turn: Option<MvRefreshTurnCustody>,
     raw: Option<Result<MvRefreshPreparationOutput, MvApplicationError>>,
     steps: Option<Vec<StepRequest>>,
     failure: Option<MvPhaseFailure>,
@@ -68,7 +68,7 @@ impl DependencyPreparation {
     ) -> Result<Self, QueryServiceError> {
         let mut result = Self {
             input,
-            driver: None,
+            turn: None,
             raw: None,
             steps: None,
             failure: None,
@@ -155,7 +155,7 @@ impl DependencyPreparation {
                     },
                     gate.clone(),
                 );
-                let mut driver = MvRefreshTurnCustody::new(
+                let mut turn = MvRefreshTurnCustody::new(
                     gate,
                     cpu,
                     positive.scope().clone(),
@@ -167,10 +167,10 @@ impl DependencyPreparation {
                 // The same gate was used to construct both original objects;
                 // no worker or Provider future has been polled yet.
                 assert!(
-                    driver.install_preparation(source).is_ok(),
+                    turn.install_preparation(source).is_ok(),
                     "same original MV dependency gate"
                 );
-                result.driver = Some(driver);
+                result.turn = Some(turn);
             }
         }
         Ok(result)
@@ -181,7 +181,7 @@ impl DependencyPreparation {
             .clone()
             .or_else(|| self.busy.then(|| self.exit_unproven.clone()))
             .or_else(|| {
-                self.driver
+                self.turn
                     .as_ref()
                     .and_then(MvRefreshTurnCustody::local_health_failure)
             })
@@ -214,11 +214,11 @@ impl DependencyPreparation {
             .into()));
         }
         if self.steps.is_none() {
-            let driver = self
-                .driver
+            let turn = self
+                .turn
                 .as_mut()
-                .expect("Refresh owns its original graph driver");
-            match driver.poll_ready(cx) {
+                .expect("Refresh owns its original preparation turn");
+            match turn.poll_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(MvTurnFailure::Health(health))) => {
                     self.health = Some(health);
@@ -236,9 +236,9 @@ impl DependencyPreparation {
                 }
                 Poll::Ready(Ok(())) => {}
             }
-            // The driver has received the actual CPU marker AND footer. Move
+            // The preparation turn has received the actual CPU marker AND footer. Move
             // the original result into this stable field before retiring it.
-            if !driver.preparation_original().take_result_in(&mut self.raw) {
+            if !turn.preparation_original().take_result_in(&mut self.raw) {
                 self.health = Some(self.exit_unproven.clone());
                 return Poll::Pending;
             }
@@ -273,7 +273,7 @@ impl DependencyPreparation {
                 self.health = Some(self.exit_unproven.clone());
                 return Poll::Pending;
             }
-            if driver.retire_transferred().is_err() {
+            if turn.retire_transferred().is_err() {
                 self.health = Some(self.exit_unproven.clone());
                 return Poll::Pending;
             }
@@ -293,8 +293,8 @@ impl DependencyPreparation {
             return Poll::Ready(Err(health));
         }
         self.busy = true;
-        let polled = match self.driver.as_mut() {
-            Some(driver) => driver.poll_closed(cx),
+        let polled = match self.turn.as_mut() {
+            Some(turn) => turn.poll_closed(cx),
             None => Poll::Ready(Ok(())),
         };
         if let Poll::Ready(Err(health)) = &polled {

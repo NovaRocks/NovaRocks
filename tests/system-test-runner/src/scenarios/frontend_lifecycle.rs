@@ -2,7 +2,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{CrossProcessConfigOverlay, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessConfigOverlay, TestClusterOwner};
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
@@ -302,7 +302,7 @@ impl Scenario for BlueGreenSessionCutover {
             .launch_peer_cluster("green", static_snapshot_launch_config(&green_snapshot))
             .context("launch green 1FE+3BE cluster")?;
         let result = run_blue_green_cutover(context, &mut green);
-        let cleanup = ServerHandle::shutdown(&mut green).context("stop green cluster");
+        let cleanup = TestClusterOwner::shutdown(&mut green).context("stop green cluster");
         match (result, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) => Err(error),
@@ -621,7 +621,7 @@ fn write_rest_static_snapshot(snapshot: &Path, instance_id: &str) -> Result<()> 
 
 fn run_blue_green_cutover(
     context: &mut ScenarioContext,
-    green: &mut novarocks_cluster_harness::CrossProcessServerHandle,
+    green: &mut novarocks_cluster_harness::CrossProcessCluster,
 ) -> Result<()> {
     ensure!(
         green.be_count() == REQUIRED_BACKENDS,

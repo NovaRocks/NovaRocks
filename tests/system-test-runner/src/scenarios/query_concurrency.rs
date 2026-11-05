@@ -32,7 +32,7 @@ use novarocks_cluster_harness::process_resources::{
 };
 use novarocks_cluster_harness::{
     CrossProcessConfigOverlay, CrossProcessNativeFaultProxyConfig, QueryExecutionResourceSnapshot,
-    ServerHandle,
+    TestClusterOwner,
     native_fault_proxy::{NativeFaultProxyControl, ProxyDirection, ProxyMode},
 };
 use serde::Deserialize;
@@ -77,7 +77,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(WarehouseAdmission),
         Box::new(TerminalReleasesSlot::default()),
         Box::new(RemoteCleanupRetires::default()),
-        Box::new(LateWorkLeaseExpiry::default()),
+        Box::new(LateParticipationLeaseExpiry::default()),
     ]
 }
 
@@ -164,7 +164,14 @@ impl Scenario for TerminalReleasesSlot {
             sql: HELD_QUERY.into(),
             faults: vec![],
             observations: (0..REQUIRED_BACKENDS)
-                .map(|index| (index, "grpc-fragment", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         Ok(Some(self.intent.freeze(
@@ -282,7 +289,14 @@ impl Scenario for RemoteCleanupRetires {
             sql: HELD_QUERY.into(),
             faults: vec![],
             observations: (0..REQUIRED_BACKENDS)
-                .map(|index| (index, "grpc-fragment", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         Ok(Some(self.intent.freeze(
@@ -353,11 +367,11 @@ impl Scenario for RemoteCleanupRetires {
 /// FE must not renew that work: the last valid Worker lease remains the final
 /// authority and eventually releases the real local resources.
 #[derive(Default)]
-struct LateWorkLeaseExpiry {
+struct LateParticipationLeaseExpiry {
     intent: SqlIntentOwner,
 }
 
-impl Scenario for LateWorkLeaseExpiry {
+impl Scenario for LateParticipationLeaseExpiry {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
             "query_concurrency",
@@ -368,7 +382,7 @@ impl Scenario for LateWorkLeaseExpiry {
     }
 
     fn name(&self) -> &'static str {
-        "query-concurrency/late-work-lease-expiry"
+        "query-concurrency/late-participation-lease-expiry"
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -387,7 +401,14 @@ impl Scenario for LateWorkLeaseExpiry {
             sql: HELD_QUERY.into(),
             faults: vec![],
             observations: (0..REQUIRED_BACKENDS)
-                .map(|index| (index, "grpc-fragment", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         Ok(Some(self.intent.freeze(
@@ -477,8 +498,8 @@ impl Scenario for QueryConcurrency {
                      waiting_limit = {WAITING_LIMIT}\n\
                      control_inflight_limit = {CONCURRENCY_LIMIT}\n\
                      control_ready_limit = {CONTROL_READY_LIMIT}\n\
-                     logical_context_admission_issue_capacity = {CONCURRENCY_LIMIT}\n\
-                     logical_context_establish_capacity = {CONCURRENCY_LIMIT}\n"
+                     logical_participation_admission_issue_capacity = {CONCURRENCY_LIMIT}\n\
+                     logical_participation_establish_capacity = {CONCURRENCY_LIMIT}\n"
                 )),
                 // One cooperative driver per BE keeps the production 1FE+3BE
                 // boundary while ensuring this is a queue/credit test, not a
@@ -891,8 +912,8 @@ fn fault_launch_config(concurrency_limit: usize, cleanup_timeout_ms: u64) -> Sce
                  waiting_limit = {WAITING_LIMIT}\n\
                  control_inflight_limit = {concurrency_limit}\n\
                  control_ready_limit = {CONTROL_READY_LIMIT}\n\
-                 logical_context_admission_issue_capacity = {concurrency_limit}\n\
-                 logical_context_establish_capacity = {concurrency_limit}\n\
+                 logical_participation_admission_issue_capacity = {concurrency_limit}\n\
+                 logical_participation_establish_capacity = {concurrency_limit}\n\
                  logical_remote_cleanup_timeout_ms = {cleanup_timeout_ms}\n"
             )),
             be: Some(
@@ -963,9 +984,10 @@ fn await_resource_convergence(
 fn task_create_counts(context: &mut ScenarioContext) -> Result<Vec<usize>> {
     (0..context.handle().be_count())
         .map(|index| {
-            context
-                .handle()
-                .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+            context.handle().be_log_count(
+                index,
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
+            )
         })
         .collect()
 }
@@ -979,7 +1001,7 @@ fn await_fresh_task_create(
         for (index, count) in before.iter().copied().enumerate() {
             let Some(binding) = context.handle().selected_native_observation_binding(
                 index,
-                "grpc-fragment",
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
                 &selected.token,
                 None,
             )?
@@ -990,7 +1012,7 @@ fn await_fresh_task_create(
             let mut total = 0;
             let mut exact = false;
             for line in log.lines() {
-                if line.contains("NOVAROCKS_TASK_CREATE_APPLIED") {
+                if line.contains(novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED) {
                     total += 1;
                     if total > count && created_for(line, &binding)? {
                         exact = true;

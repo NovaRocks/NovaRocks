@@ -20,8 +20,8 @@
 //! A two-preemption model of the actual cleanup-body/publication gate.
 use loom::{sync::Arc, thread};
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, FailureSourceState, InputPhase},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, FailureSourceState, InputPhase},
     publication::PublishedSnapshot,
     transaction::RuntimeLedger,
 };
@@ -43,7 +43,7 @@ impl Actor for Failing {
         _now: Tick,
         _input: InputEnvelope,
         _value: (),
-        _step: &mut StepContext<'_, ()>,
+        _step: &mut ActorStep<'_, ()>,
     ) {
         panic!("controlled failure");
     }
@@ -54,7 +54,7 @@ impl Actor for Failing {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        step: &mut StepContext<'_, ()>,
+        step: &mut ActorStep<'_, ()>,
     ) {
         step.effect(
             EffectDescriptor {
@@ -156,7 +156,7 @@ fn actual_cleanup_body_exit_and_actual_snapshot_swap_have_one_gate_order() {
                 assert_eq!(*old, 0);
                 assert_eq!(*target.read(), 1);
             }
-            Err((DriverError::FailureWorkInactive, rejected)) => {
+            Err((ActorTurnError::FailureWorkInactive, rejected)) => {
                 assert_eq!(*rejected, 1);
                 assert_eq!(*target.read(), 0);
             }

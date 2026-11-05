@@ -40,7 +40,7 @@ use novarocks_value_arrays::{
 
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 
 use super::hash::canonical_f64_bits;

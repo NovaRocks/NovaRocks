@@ -462,7 +462,7 @@ impl MvCandidateReader {
     }
     pub(crate) fn observe_current(
         &self,
-        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorage,
         request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
     ) -> Result<
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
@@ -476,7 +476,7 @@ impl MvCandidateReader {
     /// Legacy MV preparation still renders at its pre-Action String boundary.
     pub(crate) async fn observe_current_async(
         &self,
-        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorage,
         request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
     ) -> Result<
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
@@ -489,7 +489,7 @@ impl MvCandidateReader {
 
     pub(crate) async fn observe_current_application_async(
         &self,
-        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorage,
         request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
     ) -> Result<
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,

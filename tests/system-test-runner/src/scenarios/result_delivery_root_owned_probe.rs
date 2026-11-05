@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Opt-in same strict probe with original driver retained outside timeout.
+//! Opt-in same strict probe with original connection job retained outside timeout.
 use super::*;
 
 pub(crate) fn probe_owned(
@@ -88,7 +88,7 @@ pub(crate) fn probe_owned(
         .enable_all()
         .build()?;
     // The actual original handle is outside the timed future on every path.
-    let mut original_driver = None;
+    let mut original_connection_job = None;
     let outcome = runtime.block_on(async {
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
             let stream = connector
@@ -99,7 +99,7 @@ pub(crate) fn probe_owned(
             let (mut sender, connection) = client::handshake(stream)
                 .await
                 .context("handshake root probe HTTP/2")?;
-            original_driver = Some(tokio::spawn(connection));
+            original_connection_job = Some(tokio::spawn(connection));
             let request = Request::builder()
                 .method("POST")
                 .uri(ROOT_PATH)
@@ -148,7 +148,7 @@ pub(crate) fn probe_owned(
         .await
         .context("absolute root protocol probe deadline exceeded")?
     });
-    let cleanup = runtime.block_on(settle_original_driver(&mut original_driver));
+    let cleanup = runtime.block_on(settle_original_connection(&mut original_connection_job));
     let (frame, status) = assemble_probe_outcome(outcome, cleanup, deadline)?;
     ensure!(
         status == ProbeStatus::Success,
@@ -201,7 +201,7 @@ pub(crate) fn probe_owned(
 }
 
 // Private assembly only: preserve the original three-slot order and check
-// the same absolute clock after the actual original driver has been joined.
+// the same absolute clock after the actual original connection job has been joined.
 fn assemble_probe_outcome<T>(
     outcome: Result<T>,
     cleanup: Result<()>,
@@ -248,7 +248,7 @@ impl std::error::Error for OwnedProbeFailure {
     }
 }
 
-async fn settle_original_driver(
+async fn settle_original_connection(
     original: &mut Option<tokio::task::JoinHandle<std::result::Result<(), h2::Error>>>,
 ) -> Result<()> {
     if let Some(handle) = original.as_mut() {
@@ -277,13 +277,13 @@ mod tests {
             Ok::<(), h2::Error>(())
         }));
         started_rx.await.unwrap();
-        settle_original_driver(&mut original).await.unwrap();
+        settle_original_connection(&mut original).await.unwrap();
         assert!(original.is_none());
     }
     #[tokio::test]
     async fn original_panic_is_retained_instead_of_discarded_as_abort() {
         let mut original = Some(tokio::spawn(async {
-            panic!("original component driver panic");
+            panic!("original connection job panic");
             #[allow(unreachable_code)]
             Ok::<(), h2::Error>(())
         }));
@@ -294,7 +294,7 @@ mod tests {
             }
         })
         .await;
-        let result = settle_original_driver(&mut original).await;
+        let result = settle_original_connection(&mut original).await;
         assert!(observed_exit.is_ok());
         let error = result.unwrap_err();
         assert!(
@@ -348,7 +348,7 @@ mod extra_tests {
         let wait = tokio::time::timeout_at(deadline.into(), original.as_mut().unwrap()).await;
         let retained_id = original.as_ref().map(tokio::task::JoinHandle::id);
         let not_exited_before_cleanup = !exited.load(Ordering::SeqCst);
-        let cleanup = settle_original_driver(&mut original).await;
+        let cleanup = settle_original_connection(&mut original).await;
         let no_original_after_join = original.is_none();
         let actual_exit_after_join = exited.load(Ordering::SeqCst);
         let primary = match wait {
@@ -393,9 +393,9 @@ mod extra_tests {
     impl std::error::Error for FormatCanary {}
 
     #[tokio::test]
-    async fn actual_tcp_h2_driver_error_and_primary_sources_survive_fixed_assembly() {
+    async fn actual_tcp_h2_connection_error_and_primary_sources_survive_fixed_assembly() {
         // Only the original h2 Connection future is spawned. The peer socket
-        // remains owned by this parent; no wrapping or peer-driver task exists.
+        // remains owned by this parent; no wrapping or peer connection job exists.
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut original = None;
         let operation = tokio::time::timeout_at(deadline.into(), async {
@@ -418,7 +418,7 @@ mod extra_tests {
         })
         .await;
         // A timeout/read/write failure still aborts and awaits the SAME handle.
-        let cleanup = settle_original_driver(&mut original).await;
+        let cleanup = settle_original_connection(&mut original).await;
         let actually_joined = original.is_none();
         // Cleanup precedes every assertion and actual-source extraction.
         assert!(
@@ -428,11 +428,11 @@ mod extra_tests {
         assert!(actually_joined);
         let cleanup = match cleanup {
             Err(error) => error,
-            Ok(()) => panic!("actual malformed frame must produce an h2 driver error"),
+            Ok(()) => panic!("actual malformed frame must produce an h2 connection error"),
         };
         let original_h2 = cleanup
             .downcast_ref::<h2::Error>()
-            .expect("actual driver h2 error");
+            .expect("actual h2 connection error");
         let h2_address = original_h2 as *const h2::Error;
         assert!(!original_h2.is_io());
         assert!(original_h2.is_go_away() && original_h2.is_library());
@@ -531,7 +531,7 @@ mod extra_tests {
         })
         .await;
         let retained_id = original.as_ref().map(tokio::task::JoinHandle::id);
-        let cleanup = settle_original_driver(&mut original).await;
+        let cleanup = settle_original_connection(&mut original).await;
         let failure = assemble_probe_outcome(Ok(7_u8), cleanup, deadline);
         // Even an observation timeout/panic path is settled before assertions.
         assert!(elapsed.is_err() && released && observed_completion.is_ok());

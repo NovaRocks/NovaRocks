@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use novarocks_spi::connector::MvCreatedTargetObservation as SpiCreatedTargetObservation;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
     MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
     MvObservedPartitionSpec as SpiObservedPartitionSpec,
@@ -130,7 +130,7 @@ impl MvSourceSchemaObservation {
 
 pub(crate) fn observe_source_schema(
     observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<MvSourceSchemaObservation, ConnectorError> {
@@ -587,7 +587,7 @@ impl MvMaintenanceMetadataObservation {
 
 pub(crate) fn observe_schema_validation(
     observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, ConnectorError> {
@@ -599,7 +599,7 @@ pub(crate) fn observe_schema_validation(
 
 pub(crate) fn observe_refresh_base(
     observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<MvRefreshBaseObservation, ConnectorError> {
@@ -611,7 +611,7 @@ pub(crate) fn observe_refresh_base(
 
 pub(crate) fn observe_refresh_target(
     observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<MvRefreshTargetObservation, ConnectorError> {
@@ -623,7 +623,7 @@ pub(crate) fn observe_refresh_target(
 
 pub(crate) fn observe_maintenance_metadata(
     observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {

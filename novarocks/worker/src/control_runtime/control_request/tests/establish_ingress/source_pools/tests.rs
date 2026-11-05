@@ -121,7 +121,7 @@ fn only_the_original_root_source_pools_can_take_getter_and_disposal_jobs() {
     assert!(getter_refused && getter_untouched && disposal_refused && disposal_untouched);
     assert!(matches!(
         phase,
-        ExitRolePhase::Exited | ExitRolePhase::Retired
+        ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
     ));
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 4);

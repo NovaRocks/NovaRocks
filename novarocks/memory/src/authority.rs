@@ -18,7 +18,7 @@
 //! Process assembly and the unique, non-cloneable capacity writer.
 use crate::sync::{Arc, AtomicU64, Mutex, Ordering, Weak};
 use crate::{
-    account::{Account, AccountHandle, TopUpPolicy},
+    account::{Account, AccountState, TopUpPolicy},
     error::{CapacityError, ConfigError, MetadataRegistryLabel},
     ids::{AccountKind, ConfigVersion, ExternalRef},
     policy::LimitDimension,
@@ -95,7 +95,7 @@ impl AuthorityConfig {
 }
 #[derive(Debug)]
 pub(crate) struct Shared {
-    pub record_store: crate::lane::StoreHandle,
+    pub record_store: crate::lane::RecordStorePin,
     pub observation_lanes: Mutex<crate::lane::registry::ObservationRegistry>,
     pub ceiling: u64,
     pub top_up: TopUpPolicy,
@@ -121,17 +121,17 @@ pub(crate) struct Shared {
 pub struct MemoryAuthority {
     config: AuthorityConfig,
     pub(crate) shared: Arc<Shared>,
-    root: AccountHandle,
-    control: OnceLock<AccountHandle>,
+    root: Account,
+    control: OnceLock<Account>,
 }
 impl MemoryAuthority {
     pub fn new(config: AuthorityConfig) -> Result<Self, ConfigError> {
         config.validate()?;
         let shared = Arc::new(Shared {
             #[cfg(not(loom))]
-            record_store: crate::lane::StoreHandle::Global,
+            record_store: crate::lane::RecordStorePin::Global,
             #[cfg(loom)]
-            record_store: crate::lane::StoreHandle::owned(256),
+            record_store: crate::lane::RecordStorePin::owned(256),
             observation_lanes: Mutex::new(crate::lane::registry::ObservationRegistry::new(
                 if cfg!(loom) {
                     256
@@ -171,7 +171,7 @@ impl MemoryAuthority {
             storage_bytes: AtomicU64::new(0),
             maintenance: Mutex::new(crate::maintenance::MaintenanceState::default()),
         });
-        let root = AccountHandle::new_root(shared.clone());
+        let root = Account::new_root(shared.clone());
         shared.accounts.lock().unwrap().records[0] = Some(Arc::downgrade(&root.0));
         root.0.slot.store(0, Ordering::Relaxed);
         // Index backing is allocated once and belongs to storage, not to an
@@ -187,7 +187,7 @@ impl MemoryAuthority {
             }
             + {
                 let registry = shared.accounts.lock().unwrap();
-                (registry.records.capacity() * std::mem::size_of::<Option<Weak<Account>>>()
+                (registry.records.capacity() * std::mem::size_of::<Option<Weak<AccountState>>>()
                     + registry.free_slots.capacity() * std::mem::size_of::<usize>())
                     as u64
             };
@@ -214,7 +214,7 @@ impl MemoryAuthority {
     /// S1 observation storage is diagnostic metadata, independent of funding C.
     pub fn observation_metadata_bytes(&self) -> u64 {
         let registry = self.shared.observation_lanes.lock().unwrap();
-        (registry.records.capacity() * std::mem::size_of::<Option<crate::LaneHandle>>()) as u64
+        (registry.records.capacity() * std::mem::size_of::<Option<crate::Lane>>()) as u64
             + registry.occupied as u64 * crate::lane::OBSERVATION_LANE_METADATA_BYTES
     }
     /// Bound one original maintenance pass by the actual immutable index
@@ -235,7 +235,7 @@ impl MemoryAuthority {
     pub fn config_version(&self) -> ConfigVersion {
         ConfigVersion::new(self.shared.capacity_revision.load(Ordering::Acquire))
     }
-    pub const fn root(&self) -> &AccountHandle {
+    pub const fn root(&self) -> &Account {
         &self.root
     }
     pub fn capacity_bytes(&self) -> u64 {
@@ -258,12 +258,12 @@ impl MemoryAuthority {
         &self,
         kind: AccountKind,
         external: ExternalRef,
-    ) -> Result<AccountHandle, CapacityError> {
+    ) -> Result<Account, CapacityError> {
         self.root.create_child(kind, external)
     }
     /// Precommit the floor before admitting work. Duplicate or late assembly
     /// is an error; a policy number alone never backs control traffic.
-    pub fn install_control_branch(&self, bytes: u64) -> Result<&AccountHandle, CapacityError> {
+    pub fn install_control_branch(&self, bytes: u64) -> Result<&Account, CapacityError> {
         let _assembly = self.shared.assembly.lock().unwrap();
         if self.control.get().is_some() || self.live_accounts() != 1 {
             return Err(CapacityError::Invalid {
@@ -288,7 +288,7 @@ impl MemoryAuthority {
             })?;
         Ok(self.control.get().unwrap())
     }
-    pub fn control_branch(&self) -> Option<&AccountHandle> {
+    pub fn control_branch(&self) -> Option<&Account> {
         self.control.get()
     }
     pub fn take_capacity_writer(&self) -> Result<CapacityWriter, CapacityError> {
@@ -319,7 +319,7 @@ impl MemoryAuthority {
 }
 #[derive(Debug)]
 pub struct CapacityWriter {
-    root: AccountHandle,
+    root: Account,
 }
 impl CapacityWriter {
     pub fn set_capacity(&mut self, target: u64) -> Result<u64, CapacityError> {
@@ -355,14 +355,14 @@ impl Shared {
                 detail: "memory identity space exhausted",
             })
     }
-    pub(crate) fn account_list(&self) -> Vec<AccountHandle> {
+    pub(crate) fn account_list(&self) -> Vec<Account> {
         let mut list = Vec::with_capacity(self.max_accounts as usize);
         let registry = self.accounts.lock().unwrap();
         list.extend(
             registry
                 .records
                 .iter()
-                .filter_map(|a| a.as_ref().and_then(|a| a.upgrade()).map(AccountHandle)),
+                .filter_map(|a| a.as_ref().and_then(|a| a.upgrade()).map(Account)),
         );
         list
     }
@@ -370,7 +370,7 @@ impl Shared {
 
 #[derive(Debug)]
 pub(crate) struct AccountRegistry {
-    pub records: Vec<Option<Weak<Account>>>,
+    pub records: Vec<Option<Weak<AccountState>>>,
     pub free_slots: Vec<usize>,
     pub upper: usize,
 }

@@ -18,7 +18,7 @@
 //! Complete bindings, encoding provenance and construction storage stay explicit.
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
@@ -81,14 +81,14 @@ impl novarocks_failure_contract::FailureProjection for IdentityInputFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::FinalIdentityInput.reason(),
+            crate::runtime::task::ExecutionReason::FinalIdentityInput.reason(),
         )
     }
 }
 fn identity_input_failure(
     detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(IdentityInputFailure(
+) -> crate::runtime::task::ExecutionFailure {
+    crate::runtime::task::ExecutionFailure::from_domain(IdentityInputFailure(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
     ))
 }
@@ -273,11 +273,11 @@ pub(crate) fn validate_final_result_identity_input_source(
             let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 actual_slot.typed_binding().clone(),
             )
-            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 target.typed_binding().clone(),
             )
-            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             if !actual.fits_value_type(&expected) {
                 return Err(identity_input_failure(
                     "typed final result input semantics differ from output semantics",
@@ -449,13 +449,13 @@ fn project_binding_fits(
         source.clone_observed(work)?,
     )
     .map_err(|source| {
-        ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+        ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(source))
     })?;
     let target = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
         target.clone_observed(work)?,
     )
     .map_err(|source| {
-        ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(source))
+        ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(source))
     })?;
     source.fits_physical_binding_observed(&target, work)
 }
@@ -687,7 +687,7 @@ mod tests {
         .unwrap();
         let rows = array.len();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(
@@ -1335,13 +1335,13 @@ mod tests {
         )
         .unwrap();
         let compute = source_slot
-            .with_slot_id_typed_observed::<crate::runtime::fragment::ExecutionFailure>(
+            .with_slot_id_typed_observed::<crate::runtime::task::ExecutionFailure>(
                 SlotId::new(3),
                 || Ok(()),
             )
             .unwrap();
         let duplicate = source_slot
-            .with_slot_id_typed_observed::<crate::runtime::fragment::ExecutionFailure>(
+            .with_slot_id_typed_observed::<crate::runtime::task::ExecutionFailure>(
                 SlotId::new(4),
                 || Ok(()),
             )
@@ -1368,7 +1368,7 @@ mod tests {
             let array: ArrayRef = Arc::new(StringArray::from(values));
             let rows = array.len();
             let input = Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 Arc::new(
@@ -1507,7 +1507,7 @@ mod owned_project_tests {
                 self.work_at_refusal
                     .store(self.work.load(Ordering::SeqCst), Ordering::SeqCst);
                 return Err(ConstructionFailure::from(
-                    crate::runtime::fragment::ExecutionFailure::from(
+                    crate::runtime::task::ExecutionFailure::from(
                         novarocks_functions::KernelFailure::DeadlineExceeded,
                     ),
                 ));
@@ -1593,7 +1593,7 @@ mod owned_project_tests {
         )
         .unwrap();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(
@@ -1631,7 +1631,7 @@ mod owned_project_tests {
         .unwrap_err();
         assert_eq!(
             failure.cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::Kernel(
+            &crate::runtime::task::ExecutionFailureCause::Kernel(
                 novarocks_functions::KernelFailure::DeadlineExceeded
             )
         );

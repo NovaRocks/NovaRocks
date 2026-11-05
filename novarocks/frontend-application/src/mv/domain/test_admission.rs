@@ -32,10 +32,9 @@ use novarocks_spi::connector::document_storage::{
     ConnectorDocumentStorageManagement,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectId, LakePublicationId,
-    ProviderBindingEpoch,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorMutationOperationId, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableObjectId, LakePublicationId, ProviderBindingEpoch,
 };
 
 pub(super) fn catalog_properties(
@@ -108,7 +107,7 @@ pub(crate) fn publication_admission(
     .with_catalog_properties(catalog_properties(&instance_id))
     .and_then(|binding| binding.try_with_document_storage(Some(documents)))
     .expect("test control binding");
-    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+    let lease = ConnectorControlPlanningPin::new(Arc::new(binding), || {})
         .derive_document_storage_lease()
         .expect("test document storage lease");
     let context = ConnectorRequestContext::try_new(

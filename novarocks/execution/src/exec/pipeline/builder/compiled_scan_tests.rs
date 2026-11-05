@@ -27,17 +27,17 @@ use novarocks_local_program::LocalProgram;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::node::scan::ScanOp;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::{
     PreparedPipelineExecution, prepare_compiled_program_pipeline_execution_with_profiler,
 };
-use crate::runtime::fragment::ExecutionResult;
-use crate::runtime::fragment::io::NoopFragmentEventSink;
-use crate::runtime::fragment::scan::compiled_fixture::{
+use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionResult;
+use crate::runtime::task::io::NoopTaskEventSink;
+use crate::runtime::task::scan::compiled_fixture::{
     FixtureScanOp, SCAN_NODE, rows, scan_chunk, scan_program,
 };
-use crate::runtime::runtime_state::RuntimeState;
 
 /// The scripted `(v0, v1)` rows, across a nonempty, an empty and a second
 /// nonempty chunk.
@@ -80,7 +80,7 @@ fn bound(op: &Arc<FixtureScanOp>) -> ScanBindings {
 fn prepare(
     program: &Arc<LocalProgram>,
     bindings: ScanBindings,
-    output: &ResultSinkHandle,
+    output: &ResultSinkBuffer,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let state = Arc::new(RuntimeState::for_local_execution(
         None,
@@ -100,17 +100,17 @@ fn prepare(
         Box::new(ResultSinkFactory::new(output.clone())),
         ExchangeBindings::default(),
         bindings,
-        crate::runtime::fragment::CompiledWriterBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
         None,
         None,
         dop,
         state,
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
 }
 
 fn refusal(program: &Arc<LocalProgram>, bindings: ScanBindings) -> String {
-    match prepare(program, bindings, &ResultSinkHandle::new()) {
+    match prepare(program, bindings, &ResultSinkBuffer::new()) {
         Ok(_) => panic!("compiled scan preparation must be refused"),
         Err(error) => error.to_string(),
     }
@@ -124,7 +124,7 @@ fn a_compiled_scan_runs_its_residual_and_projection_against_the_oracle() {
         for residual in [true, false] {
             let program = scan_program(dop, residual);
             let op = FixtureScanOp::new(input(&program), false);
-            let output = ResultSinkHandle::new();
+            let output = ResultSinkBuffer::new();
             let prepared = prepare(&program, bound(&op), &output)
                 .unwrap_or_else(|error| panic!("dop {dop} residual {residual}: {error}"));
             prepared.start().join().expect("the compiled scan runs");
@@ -176,12 +176,12 @@ fn compiled_scan_bindings_cover_exactly_the_compiled_scans() {
 fn an_aborted_compiled_scan_reaches_its_parked_reader() {
     let program = scan_program(1, true);
     let op = FixtureScanOp::new(vec![scan_chunk(&program, &[8], &[80])], true);
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let running = prepare(&program, bound(&op), &output)
         .expect("compiled scan prepares")
         .start();
-    let cancellation: crate::runtime::fragment::ExecutionFailure =
-        crate::runtime::fragment::FragmentCancelReason::new("aborted by the test").into();
+    let cancellation: crate::runtime::task::ExecutionFailure =
+        crate::runtime::task::TaskCancelDetail::new("aborted by the test").into();
     running.cancel(cancellation.clone());
     assert!(
         running

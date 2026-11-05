@@ -304,8 +304,8 @@ mod tests {
 
     use arrow::array::Array;
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use novarocks_spi::connector::read_stack::{ConnectorSourceOperations, SplitWeight};
 
@@ -315,7 +315,7 @@ mod tests {
         IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
     };
     use crate::typed_read::table_execute::IcebergRewritePositionDeleteFilesSplitParams;
-    use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
+    use crate::typed_read::test_spawners::{GatedFileIoSpawner, route_reads_through};
     use crate::typed_read::test_streams::DrivenStream;
 
     use super::*;
@@ -348,10 +348,10 @@ mod tests {
         }
 
         /// Routes the fixture's reads through a range service whose file
-        /// tasks wait for [`GatedTaskSpawner::release`]; returns the task
+        /// tasks wait for [`GatedFileIoSpawner::release`]; returns the task
         /// source's operations.
-        fn gate_reads(&mut self) -> (Arc<GatedTaskSpawner>, ConnectorSourceOperations) {
-            let spawner = GatedTaskSpawner::closed(self.runtime.handle().clone());
+        fn gate_reads(&mut self) -> (Arc<GatedFileIoSpawner>, ConnectorSourceOperations) {
+            let spawner = GatedFileIoSpawner::closed(self.runtime.handle().clone());
             let operations = route_reads_through(
                 &mut self.context,
                 spawner.clone(),
@@ -423,19 +423,19 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: file_runtime,
-            task_spawner,
+            io_spawner,
             range: None,
         };
         let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS

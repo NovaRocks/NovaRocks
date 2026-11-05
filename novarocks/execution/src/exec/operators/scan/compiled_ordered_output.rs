@@ -25,14 +25,14 @@ use crate::exec::operators::compiled_expression::{
     CompiledFilterBody, CompiledFilterProcessorFactory, RuntimeKernelControl,
 };
 use crate::exec::operators::runtime_filter::{
-    CompiledOrderedScanDriver, CompiledOrderedScanFactory,
+    CompiledOrderedScanEvaluator, CompiledOrderedScanFactory,
 };
 use crate::exec::pipeline::operator::InputConstructionFactory;
-use crate::runtime::fragment::ExecutionResult;
-use crate::runtime::fragment::io::FragmentEventSink;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionResult;
+use crate::runtime::task::io::TaskEventSink;
 use crate::runtime_filter::OrderedTopNAllocationHost;
 use arrow::array::{Array, BooleanArray};
 use novarocks_functions::KernelFailure;
@@ -47,8 +47,8 @@ pub(in crate::exec::operators::scan) struct CompiledOrderedOutputFactory {
     pub control: RuntimeKernelControl,
 }
 impl CompiledOrderedOutputFactory {
-    pub(super) fn for_driver(&self) -> CompiledOrderedOutputDriver {
-        CompiledOrderedOutputDriver {
+    pub(super) fn for_driver(&self) -> CompiledOrderedOutputEvaluator {
+        CompiledOrderedOutputEvaluator {
             ordered: self.ordered.for_driver(),
             residual: self.residual.as_ref().map(|factory| factory.create_body()),
             host: self.host.clone(),
@@ -56,13 +56,13 @@ impl CompiledOrderedOutputFactory {
         }
     }
 }
-pub(in crate::exec::operators::scan) struct CompiledOrderedOutputDriver {
-    ordered: CompiledOrderedScanDriver,
+pub(in crate::exec::operators::scan) struct CompiledOrderedOutputEvaluator {
+    ordered: CompiledOrderedScanEvaluator,
     residual: Option<CompiledFilterBody>,
     host: OrderedTopNAllocationHost,
     control: RuntimeKernelControl,
 }
-impl CompiledOrderedOutputDriver {
+impl CompiledOrderedOutputEvaluator {
     pub(super) fn bind_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.ordered.bind_mem_tracker(tracker);
@@ -79,7 +79,7 @@ impl CompiledOrderedOutputDriver {
         &mut self,
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
-        sink: &Arc<dyn FragmentEventSink>,
+        sink: &Arc<dyn TaskEventSink>,
     ) -> ExecutionResult<Option<Chunk>> {
         let chunk = if let Some(residual) = &mut self.residual {
             let rows = chunk.len();

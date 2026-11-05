@@ -38,12 +38,12 @@ pub(crate) mod task_creation;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
 pub use process_memory::FrontendProcessMemoryObservation;
 
-static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+static TASK_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
-        "novarocks_fragment_scheduled_total",
+        "novarocks_task_scheduled_total",
         "Total number of plan fragment instances scheduled to backends.",
     ))
-    .expect("register novarocks_fragment_scheduled_total")
+    .expect("register novarocks_task_scheduled_total")
 });
 
 static HEARTBEAT_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
@@ -315,7 +315,7 @@ impl FrontendMetricsRegistry {
         refresh_frontend_gauges();
         let registry = Registry::new();
         for collector in [
-            Box::new(FRAGMENT_SCHEDULED_TOTAL.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(TASK_SCHEDULED_TOTAL.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(HEARTBEAT_RTT_SECONDS.clone()),
             Box::new(BACKEND_REGISTRY_ENTRIES.clone()),
             Box::new(BACKEND_ANNOUNCE_LEASE_VALID.clone()),
@@ -383,8 +383,8 @@ impl FrontendMetricsRegistry {
     }
 }
 
-pub(crate) fn observe_fragments_scheduled(count: usize) {
-    Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc_by(count as u64);
+pub(crate) fn observe_tasks_scheduled(count: usize) {
+    Lazy::force(&TASK_SCHEDULED_TOTAL).inc_by(count as u64);
 }
 
 /// Record an FE-owned backend heartbeat observation without coupling the
@@ -632,7 +632,7 @@ pub(crate) fn render_metrics_json(registry: &FrontendMetricsRegistry) -> Result<
     serde_json::to_string(&rows).map_err(|e| format!("encode metrics json failed: {e}"))
 }
 fn refresh_frontend_gauges() {
-    Lazy::force(&FRAGMENT_SCHEDULED_TOTAL);
+    Lazy::force(&TASK_SCHEDULED_TOTAL);
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
     Lazy::force(&BACKEND_REGISTRY_ENTRIES);
     Lazy::force(&BACKEND_ANNOUNCE_LEASE_VALID);
@@ -725,12 +725,12 @@ mod tests {
 
     #[test]
     fn rendered_metrics_include_cluster_core_names() {
-        observe_fragments_scheduled(1);
+        observe_tasks_scheduled(1);
         observe_backend_heartbeat_rtt(Duration::from_millis(5));
 
         let registry = frontend_registry();
         let body = render_metrics(registry.as_ref()).expect("render metrics");
-        assert!(body.contains("novarocks_fragment_scheduled_total"));
+        assert!(body.contains("novarocks_task_scheduled_total"));
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_backend_registry_entries"));
         assert!(body.contains("novarocks_backend_eligible"));
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn rendered_json_metrics_are_fe_metrics_compatible_array() {
-        observe_fragments_scheduled(1);
+        observe_tasks_scheduled(1);
         let registry = frontend_registry();
         let body = render_metrics_json(registry.as_ref()).expect("render json metrics");
         let value: serde_json::Value = serde_json::from_str(&body).expect("parse json metrics");
@@ -824,7 +824,7 @@ mod tests {
             row.get("tags")
                 .and_then(|tags| tags.get("metric"))
                 .and_then(serde_json::Value::as_str)
-                == Some("novarocks_fragment_scheduled_total")
+                == Some("novarocks_task_scheduled_total")
         }));
     }
 

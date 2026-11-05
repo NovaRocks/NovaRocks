@@ -306,17 +306,17 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::query_execution::schedule::FragmentInstancePlacement;
+    use crate::query_execution::schedule::TaskPlacement;
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_types::SlotId;
     use novarocks_types::UniqueId;
 
-    fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
-        FragmentInstancePlacement {
+    fn placement(fragment_id: FragmentId, instance_lo: i64) -> TaskPlacement {
+        TaskPlacement {
             fragment_id,
             instance_index: 0,
-            finst_id: UniqueId::new(92_000, instance_lo),
+            task_key: UniqueId::new(92_000, instance_lo),
             backend_idx: 0,
             endpoint: RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
@@ -338,7 +338,7 @@ mod tests {
         let empty = SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(3, Vec::new()), (7, vec![placement(7, 7)])]),
-            root_finst_id: UniqueId::new(92_000, 7),
+            root_task_key: UniqueId::new(92_000, 7),
             root_backend_idx: 0,
         };
         assert!(
@@ -350,7 +350,7 @@ mod tests {
         let drift = SchedulingPlan {
             root_fragment_id: 7,
             by_fragment: BTreeMap::from([(7, vec![placement(8, 7)])]),
-            root_finst_id: UniqueId::new(92_000, 7),
+            root_task_key: UniqueId::new(92_000, 7),
             root_backend_idx: 0,
         };
         let error =

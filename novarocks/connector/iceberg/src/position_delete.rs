@@ -383,8 +383,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use parquet::arrow::ArrowWriter;
 
@@ -396,7 +396,7 @@ mod tests {
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
             range: None,
         }
     }
@@ -852,13 +852,13 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
         let access = binding
             .resolve_access(&format!(
@@ -870,7 +870,7 @@ mod tests {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(1)),
             runtime: file_runtime,
-            task_spawner,
+            io_spawner,
             range: None,
         };
         let spec = IcebergDeleteFileSpec {

@@ -28,14 +28,14 @@ use crate::{
     exec::{
         chunk::Chunk,
         pipeline::{
+            driver_step::DriverStep,
             input::PreparedInput,
             operator::{InputConstructionFactory, InputEncodingPolicy, Operator},
             operator_factory::OperatorFactory,
             shape::fanout::{Fanout, FanoutRouter, RouteStep},
-            step_context::StepContext,
         },
     },
-    runtime::{fragment::ExecutionResult, observable::Observable},
+    runtime::{observable::Observable, task::ExecutionResult},
 };
 use arrow::{
     array::{Array, Int8Array},
@@ -150,7 +150,7 @@ impl FanoutRouter for ChangeRouter {
         &mut self,
         input: PreparedInput,
         _: &dyn InputConstructionFactory,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<ChangeCursor> {
         let input = input.into_uncovered_chunk()?;
         let ordinal = *input
@@ -216,7 +216,7 @@ impl FanoutRouter for ChangeRouter {
         &mut self,
         cursor: &mut ChangeCursor,
         factory: &dyn InputConstructionFactory,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<RouteStep> {
         let Some(route) = self.routes.get(cursor.next) else {
             return Ok(RouteStep::Finished);
@@ -261,7 +261,7 @@ impl FanoutRouter for ChangeRouter {
     fn requires_branch_drain(&self, _: usize) -> bool {
         true
     }
-    fn input_exhausted(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn input_exhausted(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         ctx.checkpoint()?;
         if !self.exhausted {
             self.contributor
@@ -315,7 +315,7 @@ mod tests {
     }
     impl InputEncodingPolicy for Recorder {}
     impl SinkKernel for Recorder {
-        fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
             Ok(if self.withdrawn.load(Ordering::Acquire) {
                 ControlStep::Withdrawn
             } else {
@@ -324,7 +324,7 @@ mod tests {
         }
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             self.rows.lock().unwrap().extend(
@@ -506,11 +506,11 @@ mod tests {
         prepare(operator.as_mut(), &state);
         let errors = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 1);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 1);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
         assert!(
             operator
-                .poll_control(&mut StepContext::new(&errors, &mut work, &mut conversions))
+                .poll_control(&mut DriverStep::new(&errors, &mut work, &mut conversions))
                 .is_err()
         );
     }

@@ -247,7 +247,7 @@ fn dropping_unused_authority_waits_for_the_original_holders_real_exit() {
         "authority revocation is not an exit report"
     );
     assert_eq!(
-        f.slot.unused_role_exited().unwrap(),
+        f.slot.unused_holder_exited().unwrap(),
         InvocationResult::Exited
     );
     drain(&f);
@@ -355,7 +355,7 @@ fn callback_panic_keeps_original_payload_work_and_capacity_after_external_handle
     assert_eq!(
         ledger.unresolved_work(),
         vec![unknown],
-        "unknown exit is diagnosed while its actual WorkLease stays in retained custody"
+        "unknown exit is diagnosed while its actual WorkObligation stays in retained custody"
     );
     assert_eq!(ledger.used(dimension()), 1);
     assert!(!scope.snapshot().unwrap().join_ready);
@@ -384,7 +384,7 @@ fn rejected_barrier_input_is_returned_and_disposed_without_a_custody_lock() {
     drop(original);
     assert_eq!(disposed.load(Ordering::SeqCst), 1);
     drop(f.token.take().unwrap());
-    f.slot.unused_role_exited().unwrap();
+    f.slot.unused_holder_exited().unwrap();
     drain(&f);
 }
 
@@ -409,7 +409,7 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
         identity::{ReservationId, WorkId},
     };
     // One budget retains the parent record; two budgets reap it before the
-    // retained real WorkLease asks whether its actual family has exited.
+    // retained real WorkObligation asks whether its actual family has exited.
     for reaping_budget in [1, 2] {
         let resources = ResourceVector::new([(dimension(), 1)]).unwrap();
         let ledger = RuntimeLedger::new(ResourceVector::new([(dimension(), 2)]).unwrap());

@@ -237,20 +237,20 @@ impl PlanNodeAssignmentState {
 /// fixed assignments rather than rebuilding their sequence space.
 #[derive(Clone, Debug)]
 pub(crate) struct TaskUpdateRequest {
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     assignments: Vec<SplitAssignment>,
 }
 
 impl TaskUpdateRequest {
-    pub(crate) fn new(fragment_instance_id: UniqueId, assignments: Vec<SplitAssignment>) -> Self {
+    pub(crate) fn new(task_key: UniqueId, assignments: Vec<SplitAssignment>) -> Self {
         Self {
-            fragment_instance_id,
+            task_key,
             assignments,
         }
     }
 
-    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub(crate) const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub(crate) fn assignments(&self) -> &[SplitAssignment] {

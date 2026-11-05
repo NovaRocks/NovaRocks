@@ -223,7 +223,7 @@ impl RuntimeMembershipFilter {
     pub fn filter_chunk(
         &self,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if chunk.is_empty() {
             return Ok(Some(chunk));
         }
@@ -238,7 +238,7 @@ impl RuntimeMembershipFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if chunk.is_empty() {
             return Ok(Some(chunk));
         }
@@ -292,7 +292,7 @@ impl RuntimeMembershipFilter {
     pub fn merge_from(
         &mut self,
         other: &RuntimeMembershipFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         match (self, other) {
             (RuntimeMembershipFilter::Bloom(lhs), RuntimeMembershipFilter::Bloom(rhs)) => {
                 lhs.merge_from(rhs)
@@ -313,14 +313,14 @@ impl RuntimeMembershipFilter {
     pub fn merge_min_max_from(
         &mut self,
         other: &RuntimeMembershipFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         self.min_max_mut().merge_from(other.min_max())
     }
 
     pub fn merge_membership_from(
         &mut self,
         other: &RuntimeMembershipFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         match (self, other) {
             (RuntimeMembershipFilter::Bloom(lhs), RuntimeMembershipFilter::Bloom(rhs)) => {
                 lhs.merge_from(rhs)

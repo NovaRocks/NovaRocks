@@ -31,8 +31,8 @@ mod count_handoff_tests {
             QueryExecutionRequest,
         },
         coordination::{
-            AbortQueryContextEffectAdmission, AbortQueryContextEffectPort,
-            AbortQueryContextIssueIdentity, LogicalExecutionRowsConfig,
+            AbortParticipationEffectAdmission, AbortParticipationEffectPort,
+            AbortParticipationIssueIdentity, LogicalExecutionRowsConfig,
             LogicalExecutionSupervisorConfig,
         },
         execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
@@ -113,15 +113,15 @@ mod count_handoff_tests {
     // The held preparation never binds a backend or starts a context. Any
     // Abort reservation would contradict this fixture's actual execution.
     #[derive(Debug)]
-    struct NoContextAborts(tokio::sync::watch::Sender<u64>);
-    impl AbortQueryContextEffectPort for NoContextAborts {
+    struct NoParticipationAborts(tokio::sync::watch::Sender<u64>);
+    impl AbortParticipationEffectPort for NoParticipationAborts {
         fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
             self.0.subscribe()
         }
         fn try_reserve(
             &self,
-            _: AbortQueryContextIssueIdentity,
-        ) -> AbortQueryContextEffectAdmission {
+            _: AbortParticipationIssueIdentity,
+        ) -> AbortParticipationEffectAdmission {
             panic!("unbound preparation cannot request a context Abort")
         }
     }
@@ -169,7 +169,7 @@ mod count_handoff_tests {
         let (capacity, _) = tokio::sync::watch::channel(0);
         QueryExecutionRequest::bind_native(
             description,
-            Arc::new(NoContextAborts(capacity)),
+            Arc::new(NoParticipationAborts(capacity)),
             None,
             HeldOriginalPreparation(gate),
         )

@@ -20,9 +20,9 @@
 //! source, tracked factory and original filter creator execute synchronously.
 use super::*;
 use crate::exec::operators::runtime_filter::{
-    CompiledOrderedScanDriver, CompiledOrderedScanFactory,
+    CompiledOrderedScanEvaluator, CompiledOrderedScanFactory,
 };
-use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
+use crate::runtime::task::io::{TaskEvent, TaskEventSink};
 use crate::runtime_filter::evaluator::{
     RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterControlledQueryError,
     RuntimeFilterControlledScalarQuery, RuntimeFilterScalarRef,
@@ -156,7 +156,7 @@ impl rf::RuntimeFilterSession for ScanSession {
         &self,
         _: rf::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterProducerHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterProducer>,
         rf::RuntimeFilterContractViolation,
     > {
         panic!("consumer-only session")
@@ -165,7 +165,7 @@ impl rf::RuntimeFilterSession for ScanSession {
         &self,
         _: rf::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterFinalDomainCompletionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterFinalDomainCompletion>,
         rf::RuntimeFilterContractViolation,
     > {
         panic!("consumer-only session")
@@ -174,7 +174,7 @@ impl rf::RuntimeFilterSession for ScanSession {
         &self,
         request: rf::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionPin>,
         rf::RuntimeFilterContractViolation,
     > {
         assert_eq!(
@@ -185,7 +185,7 @@ impl rf::RuntimeFilterSession for ScanSession {
         self.requests.lock().unwrap().push(request);
         match self.mode {
             Bind::Live => Ok(rf::RuntimeFilterBindOutcome::Bound(
-                rf::RuntimeFilterSubscriptionHandle::Live(self.cursor.clone()),
+                rf::RuntimeFilterSubscriptionPin::Live(self.cursor.clone()),
             )),
             Bind::Unavailable => Ok(rf::RuntimeFilterBindOutcome::Unavailable(
                 rf::UnavailableReason::ResourceLimit,
@@ -195,16 +195,16 @@ impl rf::RuntimeFilterSession for ScanSession {
                 "fixture session is closed",
             )),
             Bind::Blocking => Ok(rf::RuntimeFilterBindOutcome::Bound(
-                rf::RuntimeFilterSubscriptionHandle::Blocking(Arc::new(Blocking)),
+                rf::RuntimeFilterSubscriptionPin::Blocking(Arc::new(Blocking)),
             )),
         }
     }
 }
 #[derive(Default)]
 struct Effects(Mutex<Vec<rf::RuntimeFilterRowEffect>>);
-impl FragmentEventSink for Effects {
-    fn record(&self, event: FragmentEvent) {
-        let FragmentEvent::RuntimeFilterRowEffect(effect) = event else {
+impl TaskEventSink for Effects {
+    fn record(&self, event: TaskEvent) {
+        let TaskEvent::RuntimeFilterRowEffect(effect) = event else {
             panic!("unexpected component event")
         };
         self.0.lock().unwrap().push(effect);
@@ -218,7 +218,7 @@ struct Consumer {
     _host: rf::OrderedTopNAllocationHost,
     _control: RuntimeKernelControl,
     _factory: CompiledOrderedScanFactory,
-    driver: CompiledOrderedScanDriver,
+    evaluator: CompiledOrderedScanEvaluator,
     session: Arc<ScanSession>,
     effects: Arc<Effects>,
 }
@@ -297,9 +297,9 @@ impl Consumer {
             &control,
         )
         .unwrap();
-        let mut driver = factory.for_driver();
-        driver.bind_mem_tracker(tracker.clone());
-        driver.bind_construction_factory(creation.clone());
+        let mut evaluator = factory.for_driver();
+        evaluator.bind_mem_tracker(tracker.clone());
+        evaluator.bind_construction_factory(creation.clone());
         Self {
             fixture,
             tracker,
@@ -308,7 +308,7 @@ impl Consumer {
             _host: host,
             _control: control,
             _factory: factory,
-            driver,
+            evaluator,
             session,
             effects: Arc::new(Effects::default()),
         }
@@ -330,11 +330,11 @@ impl Consumer {
     }
     fn bind(&mut self) {
         self.tracker.install_limit_once(64 << 20).unwrap();
-        self.driver.bind(&self.state).unwrap();
+        self.evaluator.bind(&self.state).unwrap();
     }
-    fn apply(&mut self) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
-        let sink: Arc<dyn FragmentEventSink> = self.effects.clone();
-        self.driver.apply(self.fixture.input.clone(), &sink)
+    fn apply(&mut self) -> crate::runtime::task::ExecutionResult<Option<Chunk>> {
+        let sink: Arc<dyn TaskEventSink> = self.effects.clone();
+        self.evaluator.apply(self.fixture.input.clone(), &sink)
     }
     fn finish(self) {
         let tracker = self.tracker.clone();
@@ -363,7 +363,7 @@ fn rows(output: &Chunk) {
         vec![Some(10), Some(7), Some(2), Some(1)]
     );
 }
-fn contract_error(error: &crate::runtime::fragment::ExecutionFailure, detail: &str) {
+fn contract_error(error: &crate::runtime::task::ExecutionFailure, detail: &str) {
     assert!(
         matches!(error.cause(), ExecutionFailureCause::RuntimeFilter(rf::RuntimeFilterFailure::Contract(cause)) if cause.kind() == rf::RuntimeFilterContractViolationKind::ContractMismatch && cause.detail() == detail),
         "{error:?}"
@@ -516,7 +516,7 @@ fn compiled_ordered_scan_terminal_without_artifact_unavailable_and_closed_pass_t
 #[test]
 fn compiled_ordered_scan_refuses_invalid_subscription_binding_and_digest_with_first_cause() {
     let mut c = Consumer::new(Bind::Blocking);
-    let error = c.driver.bind(&c.state).unwrap_err();
+    let error = c.evaluator.bind(&c.state).unwrap_err();
     contract_error(
         &error,
         "compiled ordered Scan received a non-live subscription",
@@ -524,7 +524,10 @@ fn compiled_ordered_scan_refuses_invalid_subscription_binding_and_digest_with_fi
     c.state
         .error_state()
         .set_error(KernelFailure::DeadlineExceeded);
-    assert_eq!(c.driver.bind(&c.state).unwrap_err().cause(), error.cause());
+    assert_eq!(
+        c.evaluator.bind(&c.state).unwrap_err().cause(),
+        error.cause()
+    );
     assert_eq!(c.apply().unwrap_err().cause(), error.cause());
     assert!(c.effects.0.lock().unwrap().is_empty());
     c.finish();
@@ -601,7 +604,7 @@ fn compiled_ordered_scan_query_failure_publishes_no_effect_and_real_bind_refusal
     c.tracker
         .install_limit_once(before.checked_add(1).unwrap())
         .unwrap();
-    let error = c.driver.bind(&c.state).unwrap_err();
+    let error = c.evaluator.bind(&c.state).unwrap_err();
     assert_eq!(
         error.cause(),
         &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
@@ -612,7 +615,10 @@ fn compiled_ordered_scan_query_failure_publishes_no_effect_and_real_bind_refusal
         "failed driver slots refund before the first subscription"
     );
     assert!(c.session.requests.lock().unwrap().is_empty());
-    assert_eq!(c.driver.bind(&c.state).unwrap_err().cause(), error.cause());
+    assert_eq!(
+        c.evaluator.bind(&c.state).unwrap_err().cause(),
+        error.cause()
+    );
     c.finish();
 }
 

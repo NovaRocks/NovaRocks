@@ -2077,7 +2077,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::ConnectorRequestScope;
     use serde::{Deserialize, Serialize};
 
@@ -2212,7 +2212,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let rebuilt = cached
             .reacquired_request_scoped(binding, sdk_runtime.iceberg_runtime().clone())
@@ -2305,7 +2305,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let control = IcebergMetadataResources::new(binding, runtime.handle().clone());
         let generation = IcebergMetadataContext::try_new(
@@ -2347,7 +2347,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let context = IcebergMetadataContext::try_new(
             IcebergCatalogControlState::new(configuration),

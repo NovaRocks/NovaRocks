@@ -84,8 +84,8 @@ fn limits(
     jobs_per_request: usize,
 ) -> Option<HostExecutorLimits> {
     // At most one job per admitted R in each pool, plus N physical tails that
-    // can outlive logical retirement. All R may name one Context, so neither
-    // context count nor cumulative Task T is a valid per-group bound here.
+    // can outlive logical retirement. All R may name one Participation, so neither
+    // participation count nor cumulative Task T is a valid per-group bound here.
     let bound = NonZeroUsize::new(
         requests
             .get()
@@ -94,7 +94,7 @@ fn limits(
     )?;
     Some(HostExecutorLimits {
         jobs: bound,
-        per_context: bound,
+        per_group: bound,
         workers,
     })
 }

@@ -22,11 +22,11 @@
 //! panic=abort or hidden double panics inside a foreign destructor.
 
 use crate::runtime::{
-    fragment::{
-        ExecutionFailure, ExecutionReason,
-        io::{FragmentEvent, FragmentEventSink},
-    },
     runtime_state::RuntimeErrorState,
+    task::{
+        ExecutionFailure, ExecutionReason,
+        io::{TaskEvent, TaskEventSink},
+    },
 };
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use std::{
@@ -115,7 +115,7 @@ impl ProgressEndpoint {
             control,
         }
     }
-    pub(super) fn record(&mut self, sink: &dyn FragmentEventSink, event: FragmentEvent) {
+    pub(super) fn record(&mut self, sink: &dyn TaskEventSink, event: TaskEvent) {
         if self.disabled {
             return;
         }
@@ -126,7 +126,7 @@ impl ProgressEndpoint {
     }
     /// The driver invokes this only for its original progress holder. An
     /// unresolved work capsule instead retains that same holder without Drop.
-    pub(super) fn retire(&mut self, sink: Arc<dyn FragmentEventSink>) {
+    pub(super) fn retire(&mut self, sink: Arc<dyn TaskEventSink>) {
         self.disabled = true;
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(sink))) {
             self.custody
@@ -138,7 +138,7 @@ impl ProgressEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::fragment::io::FragmentProgress;
+    use crate::runtime::task::io::TaskProgress;
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Opaque {
         drops: Arc<AtomicUsize>,
@@ -157,8 +157,8 @@ mod tests {
         call_panic: bool,
         drop_panic: bool,
     }
-    impl FragmentEventSink for Sink {
-        fn record(&self, _: FragmentEvent) {
+    impl TaskEventSink for Sink {
+        fn record(&self, _: TaskEvent) {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.call_panic {
                 std::panic::panic_any(Opaque {
@@ -179,8 +179,8 @@ mod tests {
             }
         }
     }
-    fn event() -> FragmentEvent {
-        FragmentEvent::Progress(FragmentProgress::new(
+    fn event() -> TaskEvent {
+        TaskEvent::Progress(TaskProgress::new(
             novarocks_types::UniqueId::new(77, 88),
             1,
             2,
@@ -195,7 +195,7 @@ mod tests {
         let payload_drops = Arc::new(AtomicUsize::new(0));
         let data = Arc::new(vec![7u8; 4096]);
         let weak = Arc::downgrade(&data);
-        let sink: Arc<dyn FragmentEventSink> = Arc::new(Sink {
+        let sink: Arc<dyn TaskEventSink> = Arc::new(Sink {
             calls: calls.clone(),
             drops: drops.clone(),
             payload_drops,
@@ -223,7 +223,7 @@ mod tests {
             let payload_drops = Arc::new(AtomicUsize::new(0));
             let data = Arc::new(vec![9u8; 4096]);
             let weak = Arc::downgrade(&data);
-            let sink: Arc<dyn FragmentEventSink> = Arc::new(Sink {
+            let sink: Arc<dyn TaskEventSink> = Arc::new(Sink {
                 calls: calls.clone(),
                 drops: drops.clone(),
                 payload_drops: payload_drops.clone(),

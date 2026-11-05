@@ -697,7 +697,7 @@ impl novarocks_failure_contract::FailureProjection for DecodeExtentFailure {
     }
 }
 fn extent(dimension: DecodeExtent, required: u128, limit: u64) -> ExchangeFailure {
-    ExchangeFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+    ExchangeFailure::Source(crate::runtime::task::SharedDomainFailure::new(
         DecodeExtentFailure {
             dimension,
             required,

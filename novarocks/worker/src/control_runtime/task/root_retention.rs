@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The Context's unique retained Root. Task execution holds only a Weak view;
-//! read aliases and payload credit stay here through real Context disposal.
+//! The Participation's unique retained Root. Task execution holds only a Weak view;
+//! read aliases and payload credit stay here through real Participation disposal.
 use super::TaskRootReadError;
-use crate::control_runtime::context_host::task_driver::TaskRootWake;
+use crate::control_runtime::participation_host::task_io::TaskRootWake;
 use crate::root_result_channel::{RootChannelRead, RootResultChannel};
 use novarocks_control_runtime::transaction::ScopeHandle;
 use novarocks_execution_contract::{
-    QueryContextRef, TaskIdentity, root_lifetime::RootRetentionClose, root_result::RootResultRead,
+    ParticipationRef, TaskIdentity, root_lifetime::RootRetentionClose, root_result::RootResultRead,
 };
 use std::{
     any::Any,
@@ -41,19 +41,19 @@ struct State {
 }
 pub(crate) struct RootRetentionCustody {
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     scope: ScopeHandle,
     wake: Arc<TaskRootWake>,
     state: Mutex<State>,
 }
-/// Unique actual owner token, moved into the original Context's finite slot.
-pub(crate) struct RootContextRetention {
+/// Unique actual owner token, moved into the original Participation's finite slot.
+pub(crate) struct RootParticipationRetention {
     custody: Arc<RootRetentionCustody>,
 }
-impl RootContextRetention {
+impl RootParticipationRetention {
     pub(super) fn from_installed(
         task: TaskIdentity,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         scope: ScopeHandle,
         wake: Arc<TaskRootWake>,
         root: Arc<RootResultChannel>,
@@ -66,7 +66,7 @@ impl RootContextRetention {
         Self {
             custody: Arc::new(RootRetentionCustody {
                 identity: task,
-                context,
+                participation,
                 scope,
                 wake,
                 state: Mutex::new(State {
@@ -85,8 +85,8 @@ impl RootContextRetention {
     pub(crate) fn identity(&self) -> TaskIdentity {
         self.custody.identity
     }
-    pub(crate) fn context(&self) -> QueryContextRef {
-        self.custody.context
+    pub(crate) fn participation(&self) -> ParticipationRef {
+        self.custody.participation
     }
     pub(crate) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
         self.custody.scope.same_scope(scope)
@@ -96,19 +96,19 @@ impl RootContextRetention {
             .custody
             .state
             .lock()
-            .expect("original Context Root handoff");
+            .expect("original Participation Root handoff");
         let root = state.root.as_ref().ok_or(TaskRootReadError::NoRoot)?;
-        // A real Context seal may have won installation; preserve that closed
+        // A real Participation seal may have won installation; preserve that closed
         // channel without reopening reads or manufacturing an End.
         if !root.is_closed() {
-            root.mark_context_owned()
+            root.mark_participation_owned()
                 .map_err(TaskRootReadError::Channel)?;
         }
         state.adopted = true;
         Ok(())
     }
     pub(crate) fn task_retired(&self) {
-        self.custody.wake.retain_by_context();
+        self.custody.wake.retain_by_participation();
     }
     pub(crate) fn begin_original_root_read(
         &self,
@@ -124,7 +124,7 @@ impl RootContextRetention {
             .custody
             .state
             .lock()
-            .expect("original Context Root route");
+            .expect("original Participation Root route");
         if !state.adopted {
             return Err(TaskRootReadError::OwnerNotReady);
         }
@@ -150,12 +150,12 @@ impl RootContextRetention {
             .custody
             .state
             .lock()
-            .expect("original Context Root disposal")
+            .expect("original Participation Root disposal")
             .root
             .take();
         drop(root.map(ManuallyDrop::into_inner));
     }
-    pub(crate) fn prepare_seal_for_context(
+    pub(crate) fn prepare_seal_for_participation(
         &self,
         reason: RootRetentionClose,
     ) -> Result<RetainedRootSealPreparation, RetainedRootSealError> {
@@ -163,7 +163,7 @@ impl RootContextRetention {
             .custody
             .state
             .lock()
-            .expect("original Context Root seal");
+            .expect("original Participation Root seal");
         if state.panic.is_some() {
             return Err(RetainedRootSealError::Panicked);
         }
@@ -197,7 +197,7 @@ impl RootRetentionCustody {
         &self,
         read: &RootResultRead,
     ) -> Result<RootChannelRead, TaskRootReadError> {
-        let state = self.state.lock().expect("original Context Root read");
+        let state = self.state.lock().expect("original Participation Root read");
         if !state.adopted {
             return Err(TaskRootReadError::OwnerNotReady);
         }
@@ -209,7 +209,7 @@ impl RootRetentionCustody {
             .map_err(TaskRootReadError::Channel)
     }
     fn physical_idle(&self) -> bool {
-        let state = self.state.lock().expect("original Context Root idle");
+        let state = self.state.lock().expect("original Participation Root idle");
         state.seal_body_done
             && state.panic.is_none()
             && state
@@ -228,7 +228,7 @@ pub(crate) enum RetainedRootSealPreparation {
     Pending,
     Job(RetainedRootSeal),
 }
-#[must_use = "The original Context Seal ticket owns this physical capture"]
+#[must_use = "The original Participation Seal ticket owns this physical capture"]
 pub(crate) struct RetainedRootSeal {
     owner: ManuallyDrop<Arc<RootRetentionCustody>>,
 }

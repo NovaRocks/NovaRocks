@@ -30,7 +30,7 @@ use std::task::Waker;
 use std::thread::{self, JoinHandle, Thread, ThreadId};
 
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
-use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_execution_contract::failure::FailureProjection;
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 
@@ -100,11 +100,11 @@ pub(crate) enum RootProducerExitStatus {
     Unresolved,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RootExitRole {
+pub(crate) enum RootExitOwner {
     Preparation,
     Runtime,
 }
-impl RootExitRole {
+impl RootExitOwner {
     fn index(self) -> usize {
         match self {
             Self::Preparation => 0,
@@ -158,7 +158,7 @@ impl RootProducerExitObservation {
     /// Same-role polling is serial and cannot replace an existing factory.
     pub(crate) fn poll(
         &self,
-        role: RootExitRole,
+        role: RootExitOwner,
         waker: &Waker,
     ) -> Result<RootProducerExitStatus, RootExitWatchError> {
         let index = role.index();
@@ -1696,7 +1696,7 @@ mod tests {
         }
     }
     fn prefix_channel() -> Arc<novarocks_worker::root_result_channel::RootResultChannel> {
-        use novarocks_execution::runtime::fragment::io::RootResultWriteSpec;
+        use novarocks_execution::runtime::task::io::RootResultWriteSpec;
         use novarocks_execution_contract::TaskIdentity;
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
         use novarocks_types::{
@@ -2348,7 +2348,7 @@ mod tests {
         let pw = metadata_waker(prep.clone());
         let rw = metadata_waker(runtime.clone());
         assert_eq!(
-            exit.poll(RootExitRole::Preparation, &pw).unwrap(),
+            exit.poll(RootExitOwner::Preparation, &pw).unwrap(),
             RootProducerExitStatus::Pending
         );
         for _ in 0
@@ -2356,7 +2356,7 @@ mod tests {
                 .root_maximum_root_drivers
         {
             assert_eq!(
-                exit.poll(RootExitRole::Runtime, &rw).unwrap(),
+                exit.poll(RootExitOwner::Runtime, &rw).unwrap(),
                 RootProducerExitStatus::Pending
             );
         }
@@ -2367,7 +2367,7 @@ mod tests {
         assert_eq!(prep.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.load(Ordering::SeqCst), 1);
         assert_eq!(
-            exit.poll(RootExitRole::Runtime, &rw).unwrap(),
+            exit.poll(RootExitOwner::Runtime, &rw).unwrap(),
             RootProducerExitStatus::Exited
         );
     }
@@ -2387,9 +2387,9 @@ mod tests {
         let exit = registration.exit_observation();
         let first = metadata_waker(Arc::new(AtomicUsize::new(0)));
         let second = metadata_waker(Arc::new(AtomicUsize::new(0)));
-        exit.poll(RootExitRole::Runtime, &first).unwrap();
+        exit.poll(RootExitOwner::Runtime, &first).unwrap();
         assert_eq!(
-            exit.poll(RootExitRole::Runtime, &second),
+            exit.poll(RootExitOwner::Runtime, &second),
             Err(RootExitWatchError::DifferentWaker)
         );
         registration.wake().unwrap();
@@ -2427,7 +2427,7 @@ mod tests {
             calls: calls.clone(),
             panic_payload: Some((primary.clone(), secondary.clone())),
         }));
-        exit.poll(RootExitRole::Runtime, &waker).unwrap();
+        exit.poll(RootExitOwner::Runtime, &waker).unwrap();
         registration.wake().unwrap();
         let shutdown = pool.shutdown();
         assert!(shutdown.is_err());

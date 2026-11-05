@@ -19,7 +19,7 @@
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
 use super::analytic_failure;
 use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;

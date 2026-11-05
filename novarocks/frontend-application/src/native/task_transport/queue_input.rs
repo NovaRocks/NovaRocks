@@ -20,7 +20,7 @@ use super::*;
 use crate::task_execution::intent::{
     TaskOperationQueuePermit, TaskOperationQueuePreparation, TaskOperationQueueRequest,
 };
-use novarocks_resource_contract::ExistingOwnerRetentionLease;
+use novarocks_resource_contract::ExistingOwnerRetentionPin;
 use novarocks_workload_control::{
     WorkError,
     joint_admission::{JointLane, NativeQueuedInputGrant, NativeQueuedInputQuote},
@@ -60,7 +60,7 @@ impl TaskOperationQueuePermit for NativeInputQueuePermit {
     fn native_dispatch_input(&self) -> Option<&NativeQueuedInputGrant> {
         self.input.as_ref()
     }
-    fn native_input_retention(&self) -> Result<Option<ExistingOwnerRetentionLease>, WorkError> {
+    fn native_input_retention(&self) -> Result<Option<ExistingOwnerRetentionPin>, WorkError> {
         self.input
             .as_ref()
             .ok_or(WorkError::Released)?

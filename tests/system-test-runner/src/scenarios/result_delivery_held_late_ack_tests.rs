@@ -84,7 +84,7 @@ fn genuine_w2_quiet_and_sealed_positive_holder_have_distinct_facts() {
     assert!(!roots_match(&roots(true, true), 1, false, true).unwrap());
 }
 #[test]
-fn zero_census_or_released_context_never_substitutes_for_sealed_holder() {
+fn zero_census_or_released_participation_never_substitutes_for_sealed_holder() {
     let mut roots = roots(true, true);
     roots[1].values_mut().for_each(|value| *value = 0);
     assert!(!roots_match(&roots, 1, true, true).unwrap());

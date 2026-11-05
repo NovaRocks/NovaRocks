@@ -31,10 +31,10 @@ use crate::{
     task_port::{TaskPendingNotice, TaskRuntimePort},
 };
 use novarocks_control_runtime::{
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, EffectTicket},
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::WorkRetirementObserver,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::WorkRetirementObserver,
     owned_return::{OwnedReturnReader, OwnedReturnSender},
     reported_work::{ReportedWork, ReportedWorkBindingError},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
@@ -46,7 +46,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{TaskFailurePhase, TaskIdentity};
-use novarocks_worker_protocol::context::ContextEffect;
+use novarocks_worker_protocol::participation::ParticipationEffect;
 use std::{
     any::Any,
     mem::ManuallyDrop,
@@ -80,7 +80,7 @@ pub(crate) enum TaskHostCallOutcome {
     CleanupRefused,
     /// A cleanup invocation or capture failed to establish actual exit.
     CleanupUnresolved,
-    StartRefused(ExitRoleError),
+    StartRefused(ExitCustodyError),
 }
 
 impl std::fmt::Display for TaskHostCallOutcome {
@@ -98,8 +98,8 @@ impl std::fmt::Display for TaskHostCallOutcome {
 #[derive(Debug)]
 pub(crate) enum TaskHostCallError {
     Runtime(RuntimeError),
-    Driver(DriverError),
-    Exit(ExitRoleError),
+    ActorTurn(ActorTurnError),
+    Exit(ExitCustodyError),
     WrongScope,
     WrongTask,
     WrongStorage,
@@ -117,7 +117,7 @@ impl std::fmt::Display for TaskHostCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => write!(f, "Task host call runtime failure: {error}"),
-            Self::Driver(error) => write!(f, "Task host call driver failure: {error}"),
+            Self::ActorTurn(error) => write!(f, "Task host call driver failure: {error}"),
             Self::Exit(error) => write!(f, "Task host call exit failure: {error}"),
             Self::WrongScope => f.write_str("Task host call has a different original scope"),
             Self::WrongTask => f.write_str("Task host call names a different Task"),
@@ -150,7 +150,7 @@ impl std::error::Error for TaskHostCallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Exit(error) => Some(error),
             Self::StorageBinding(error) => Some(error),
             _ => None,
@@ -163,13 +163,13 @@ impl From<RuntimeError> for TaskHostCallError {
         Self::Runtime(error)
     }
 }
-impl From<DriverError> for TaskHostCallError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
+impl From<ActorTurnError> for TaskHostCallError {
+    fn from(error: ActorTurnError) -> Self {
+        Self::ActorTurn(error)
     }
 }
-impl From<ExitRoleError> for TaskHostCallError {
-    fn from(error: ExitRoleError) -> Self {
+impl From<ExitCustodyError> for TaskHostCallError {
+    fn from(error: ExitCustodyError) -> Self {
         Self::Exit(error)
     }
 }
@@ -216,7 +216,7 @@ struct ExecutionRetirementCall {
 }
 struct State {
     port: Option<Weak<TaskRuntimePort>>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     sender: Option<OwnedReturnSender<TaskHostCallOutcome>>,
     reader: OwnedReturnReader<TaskHostCallOutcome>,
     returned: Option<TaskHostCallOutcome>,
@@ -237,7 +237,7 @@ struct Custody {
     work: WorkId,
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
     retirement: WorkRetirementObserver,
     state: Mutex<State>,
@@ -250,7 +250,7 @@ pub(crate) struct TaskHostCall(Arc<Custody>);
 pub(crate) struct TaskHostCallJob {
     owner: TaskHostCall,
     start: StartPermission,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     sender: Option<OwnedReturnSender<TaskHostCallOutcome>>,
 }
 #[derive(Clone, Copy)]
@@ -305,7 +305,7 @@ impl TaskHostCall {
                 });
             }
         };
-        let (role, authority) = ExitRole::from_admitted(original);
+        let (exit_custody, authority) = ExitCustody::from_admitted(original);
         let shared = Arc::new(Custody {
             kind: owner.kind,
             runtime: owner.runtime,
@@ -315,7 +315,7 @@ impl TaskHostCall {
             work,
             pending: owner.pending,
             health: owner.health,
-            role,
+            exit_custody,
             report,
             retirement,
             state: Mutex::new(State {
@@ -375,17 +375,17 @@ impl TaskHostCall {
         self.0.kind
     }
     #[cfg(test)]
-    pub(crate) fn phase(&self) -> ExitRolePhase {
-        self.0.role.phase()
+    pub(crate) fn phase(&self) -> ExitCustodyPhase {
+        self.0.exit_custody.phase()
     }
     /// Positive observation of this original synchronous host call and its
     /// port capture, independent of its return reader/report consumers/reaper.
     pub(crate) fn actual_call_exited(&self) -> bool {
         matches!(
-            self.0.role.phase(),
-            ExitRolePhase::Exited | ExitRolePhase::Retired
-        ) && self.0.role.body_exited()
-            && self.0.role.captures_exited()
+            self.0.exit_custody.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+        ) && self.0.exit_custody.body_exited()
+            && self.0.exit_custody.captures_exited()
     }
     pub(crate) fn is_retired(&self) -> bool {
         self.0.state.lock().expect("host-call retirement").retired
@@ -436,7 +436,7 @@ impl TaskHostCall {
     ) -> Result<TaskHostCallJob, TaskHostCallError> {
         if self.0.kind != TaskHostCallKind::RetireBorrowing
             || ticket.actor != self.0.actor
-            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::RetireTask {task,..} | ContextEffect::FinalizeTaskExecution {task,..}) if *task==self.0.task)
+            || !matches!(&ticket.effect, WorkerAction::Participation(ParticipationEffect::RetireTask {task,..} | ParticipationEffect::FinalizeTaskExecution {task,..}) if *task==self.0.task)
             || !exited.matches(self.0.task, &self.0.scope)
         {
             return Err(TaskHostCallError::WrongTask);
@@ -453,7 +453,7 @@ impl TaskHostCall {
     ) -> Result<TaskHostCallJob, (TaskHostCallError, EffectTicket<WorkerAction>)> {
         let effect = match AdoptedCleanupEffect::from_normal(&self.0.runtime, ticket, notice) {
             Ok(effect) => effect,
-            Err((error, ticket)) => return Err((TaskHostCallError::Driver(error), ticket)),
+            Err((error, ticket)) => return Err((TaskHostCallError::ActorTurn(error), ticket)),
         };
         let job = match self.take_stop_effect_job(effect.ticket()) {
             Ok(job) => job,
@@ -473,12 +473,12 @@ impl TaskHostCall {
     ) -> Result<(), (TaskHostCallError, AdoptedCleanupEffect)> {
         if self.0.kind != TaskHostCallKind::Stop
             || effect.is_completed()
-            || !matches!(effect.effect(), WorkerAction::Context(ContextEffect::StopTask { task, .. }) if *task == self.0.task)
+            || !matches!(effect.effect(), WorkerAction::Participation(ParticipationEffect::StopTask { task, .. }) if *task == self.0.task)
         {
             return Err((TaskHostCallError::WrongTask, effect));
         }
         if let Err(error) = effect.validate_scope(stage, &self.0.scope) {
-            return Err((TaskHostCallError::Driver(error), effect));
+            return Err((TaskHostCallError::ActorTurn(error), effect));
         }
         {
             let state = self.0.state.lock().expect("original failed Stop ticket");
@@ -491,7 +491,7 @@ impl TaskHostCall {
         }
         if self.actual_call_exited() {
             if let Err(error) = effect.complete() {
-                return Err((TaskHostCallError::Driver(error), effect));
+                return Err((TaskHostCallError::ActorTurn(error), effect));
             }
             return Ok(());
         }
@@ -530,7 +530,7 @@ impl TaskHostCall {
                     .expect("refused original Stop completion");
                 assert!(state.effect.is_none(), "one original Stop completion owner");
                 state.effect = Some(effect);
-                Err(TaskHostCallError::Driver(error))
+                Err(TaskHostCallError::ActorTurn(error))
             }
         }
     }
@@ -540,7 +540,7 @@ impl TaskHostCall {
     ) -> Result<TaskHostCallJob, TaskHostCallError> {
         if self.0.kind != TaskHostCallKind::Stop
             || ticket.actor != self.0.actor
-            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::StopTask { task, .. }) if *task == self.0.task)
+            || !matches!(&ticket.effect, WorkerAction::Participation(ParticipationEffect::StopTask { task, .. }) if *task == self.0.task)
         {
             return Err(TaskHostCallError::WrongTask);
         }
@@ -662,8 +662,8 @@ impl TaskHostCall {
         if !matches!(returned, Some(TaskHostCallOutcome::Completed)) {
             return Ok(false);
         }
-        if self.0.role.phase() != ExitRolePhase::Exited
-            && self.0.role.phase() != ExitRolePhase::Retired
+        if self.0.exit_custody.phase() != ExitCustodyPhase::Exited
+            && self.0.exit_custody.phase() != ExitCustodyPhase::Retired
         {
             return Ok(false);
         }
@@ -680,7 +680,9 @@ impl TaskHostCall {
         if self.is_retired() {
             return Ok(true);
         }
-        if self.0.role.phase() != ExitRolePhase::Retired && !self.0.role.try_retire()? {
+        if self.0.exit_custody.phase() != ExitCustodyPhase::Retired
+            && !self.0.exit_custody.try_retire()?
+        {
             return Ok(false);
         }
         if !self.0.retirement.is_retired() {
@@ -854,7 +856,7 @@ impl TaskHostCallJob {
         if matches!(self.start, StartPermission::Normal(_))
             && matches!(
                 started,
-                Err(ExitRoleError::Runtime(RuntimeError::Scope(
+                Err(ExitCustodyError::Runtime(RuntimeError::Scope(
                     ScopeError::GenerationMismatch
                 )))
             )

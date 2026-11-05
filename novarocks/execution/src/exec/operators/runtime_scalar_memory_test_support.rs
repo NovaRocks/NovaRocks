@@ -22,16 +22,16 @@ use super::{RuntimeKernelControl, evaluate_all};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::runtime::{
     execution_runtime::ExecutionRuntime,
-    fragment::{
-        ExecutionResult,
-        runtime_state::{RuntimeStateInputs, build_runtime_state},
-    },
     kernel_memory::KernelMemoryJournal,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
         RuntimeScalarEvaluationFailure, RuntimeScalarMemoryJournal, RuntimeScalarMemoryScope,
         RuntimeScalarOperationScope,
+    },
+    task::{
+        ExecutionResult,
+        runtime_state::{RuntimeStateInputs, build_runtime_state},
     },
 };
 use arrow::{array::ArrayRef, record_batch::RecordBatch};
@@ -51,7 +51,7 @@ fn task_state(
     build_runtime_state(RuntimeStateInputs {
         query_options: None,
         query_id: Some(task.query_execution_id().query_id()),
-        fragment_instance_id: None,
+        task_key: None,
         backend_num: None,
         mem_tracker: None,
         runtime_filter_session: None,
@@ -314,7 +314,7 @@ impl RuntimeScalarWrapperForTest {
     }
 }
 
-fn fixture_failure(detail: &str) -> crate::runtime::fragment::ExecutionFailure {
+fn fixture_failure(detail: &str) -> crate::runtime::task::ExecutionFailure {
     novarocks_functions::KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
         detail,
     ))

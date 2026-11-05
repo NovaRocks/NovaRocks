@@ -30,7 +30,7 @@ use crate::query_execution::artifact::NativePlacementAssignment;
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::task_execution::{
-    ExchangeEdgeId, PlanNodeId, QueryContextRef, StageRef, TaskIdentity,
+    ExchangeEdgeId, ParticipationRef, PlanNodeId, StageRef, TaskIdentity,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::UniqueId;
@@ -48,7 +48,7 @@ use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestB
 /// The frozen fragment is shared by every instance of its fragment; only the
 /// assignment is this instance's own.
 #[derive(Debug)]
-pub struct FragmentPlanFacts {
+pub struct TaskPlanFacts {
     pub(crate) fragment: Arc<FragmentArtifact>,
     pub(crate) assignment: NativePlacementAssignment,
 }
@@ -113,7 +113,7 @@ fn bind_sink_edges(
 /// shares its frozen fragment, while its assignment carries that instance's
 /// own ordinal, width and initial scan ranges. The graph binds sink branches
 /// to edges only after it has minted the edges.
-pub trait FragmentPlanSource {
+pub trait TaskPlanSource {
     /// Control-owner tests may supply neutral graph targets independently of
     /// an executable package. This hook never exists in production: real task
     /// creation always binds exactly the checked package's own sink facts.
@@ -131,7 +131,7 @@ pub trait FragmentPlanSource {
         &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
-    ) -> Result<FragmentPlanFacts, TaskExecutionError>;
+    ) -> Result<TaskPlanFacts, TaskExecutionError>;
 }
 
 /// Immutable per-task facts, ids only.
@@ -142,11 +142,11 @@ pub trait FragmentPlanSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskNode {
     identity: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     fragment_id: FragmentId,
     #[cfg(test)]
     instance_index: usize,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     split_plan_nodes: Vec<PlanNodeId>,
 }
 
@@ -155,8 +155,8 @@ impl TaskNode {
         self.identity
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn task_id(&self) -> TaskId {
@@ -178,8 +178,8 @@ impl TaskNode {
 
     /// The execution kernel's key for this task, taken from the frozen
     /// schedule rather than derived again.
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     /// The plan nodes of this task that accept split assignments.
@@ -272,7 +272,7 @@ pub struct TaskGraph {
     stages: BTreeMap<StageId, StageNode>,
     edges: BTreeMap<ExchangeEdgeId, EdgeNode>,
     producer_stages: BTreeMap<StageId, BTreeSet<StageId>>,
-    contexts: BTreeSet<QueryContextRef>,
+    participations: BTreeSet<ParticipationRef>,
     seeds: BTreeMap<TaskId, TaskCreationSeed>,
 }
 
@@ -322,10 +322,10 @@ impl TaskGraph {
             .copied()
     }
 
-    /// Every query context this attempt establishes: exactly one per backend
+    /// Every participation this attempt establishes: exactly one per backend
     /// process carrying at least one task.
-    pub fn contexts(&self) -> impl ExactSizeIterator<Item = &QueryContextRef> + '_ {
-        self.contexts.iter()
+    pub fn participations(&self) -> impl ExactSizeIterator<Item = &ParticipationRef> + '_ {
+        self.participations.iter()
     }
 
     /// Takes the creation seeds out so each one is owned by exactly one task
@@ -398,11 +398,11 @@ fn bind_creation_seed(
     stage_of_fragment: &BTreeMap<FragmentId, StageId>,
     sink_bindings: &mut BTreeMap<StageId, Arc<[ExchangeEdgeId]>>,
     node: &TaskNode,
-    facts: FragmentPlanFacts,
+    facts: TaskPlanFacts,
     transport_budget: TransportBudget,
     #[cfg(test)] control_topology_targets: Option<&[StaticSinkTarget]>,
 ) -> Result<TaskCreationSeed, TaskExecutionError> {
-    let FragmentPlanFacts {
+    let TaskPlanFacts {
         fragment,
         assignment,
     } = facts;
@@ -448,8 +448,8 @@ fn bind_creation_seed(
         sink_edges,
         TaskCreationFacts {
             identity: node.identity,
-            context: node.context,
-            kernel_key: node.fragment_instance_id,
+            participation: node.participation,
+            task_key: node.task_key,
             pipeline_dop: assignment.pipeline_dop(),
             split_plan_nodes: node.split_plan_nodes.clone(),
             instance_ordinal: assignment.instance_ordinal(),
@@ -461,60 +461,63 @@ fn bind_creation_seed(
 /// Builds the Task protocol graph from the exact application-bound manifest.
 ///
 /// This path mints no identity and consults no
-/// scheduling plan. Every Task, context, endpoint, edge id, and sender ordinal
+/// scheduling plan. Every Task, participation, endpoint, edge id, and sender ordinal
 /// is projected from the manifest that already joined the actor schedule to
 /// its originating topology snapshot.
 pub(crate) fn build_task_graph_from_manifest(
     manifest: &TaskManifestBinding,
-    plans: &mut dyn FragmentPlanSource,
+    plans: &mut dyn TaskPlanSource,
     transport_budget: TransportBudget,
 ) -> Result<TaskGraph, TaskExecutionError> {
     let frontend_process_id = manifest
-        .contexts()
+        .participations()
         .first()
-        .ok_or_else(|| TaskExecutionError::Schedule("attempt manifest has no context".to_owned()))?
-        .context()
+        .ok_or_else(|| {
+            TaskExecutionError::Schedule("attempt manifest has no participation".to_owned())
+        })?
+        .participation()
         .frontend_process_id();
     let mut endpoints_by_process = BTreeMap::new();
-    let mut contexts = BTreeSet::new();
-    for context in manifest.contexts() {
-        if context.context().query_execution_id() != manifest.execution()
-            || context.context().frontend_process_id() != frontend_process_id
-            || context.context().backend_process_id() != context.backend().process_id()
+    let mut participations = BTreeSet::new();
+    for participation in manifest.participations() {
+        if participation.participation().query_execution_id() != manifest.execution()
+            || participation.participation().frontend_process_id() != frontend_process_id
+            || participation.participation().backend_process_id()
+                != participation.backend().process_id()
         {
             return Err(TaskExecutionError::Schedule(format!(
-                "attempt manifest context {} disagrees with its execution or backend binding",
-                context.context()
+                "attempt manifest participation {} disagrees with its execution or backend binding",
+                participation.participation()
             )));
         }
         if endpoints_by_process
             .insert(
-                context.backend().process_id(),
-                context.backend().endpoint().clone(),
+                participation.backend().process_id(),
+                participation.backend().endpoint().clone(),
             )
             .is_some()
         {
             return Err(TaskExecutionError::Schedule(format!(
                 "attempt manifest repeats backend process {}",
-                context.backend().process_id()
+                participation.backend().process_id()
             )));
         }
-        contexts.insert(context.context());
+        participations.insert(participation.participation());
     }
 
     let mut tasks = BTreeMap::<TaskId, TaskNode>::new();
     let mut tasks_by_identity = BTreeMap::<TaskIdentity, TaskId>::new();
     let mut stage_fragments = BTreeMap::<StageId, FragmentId>::new();
     let mut kernel_keys = BTreeMap::<UniqueId, TaskId>::new();
-    let mut context_task_counts = BTreeMap::<QueryContextRef, usize>::new();
+    let mut participation_task_counts = BTreeMap::<ParticipationRef, usize>::new();
     for task in manifest.tasks() {
         let identity = task.identity();
         if identity.query_execution_id() != manifest.execution()
-            || identity.backend_process_id() != task.context().backend_process_id()
-            || !contexts.contains(&task.context())
+            || identity.backend_process_id() != task.participation().backend_process_id()
+            || !participations.contains(&task.participation())
         {
             return Err(TaskExecutionError::Schedule(format!(
-                "attempt manifest task {identity} disagrees with its execution or context"
+                "attempt manifest task {identity} disagrees with its execution or participation"
             )));
         }
         match stage_fragments.insert(identity.stage_id(), task.fragment_id()) {
@@ -527,21 +530,23 @@ pub(crate) fn build_task_graph_from_manifest(
             }
             _ => {}
         }
-        let count = context_task_counts.entry(task.context()).or_default();
+        let count = participation_task_counts
+            .entry(task.participation())
+            .or_default();
         *count += 1;
-        if *count > transport_budget.max_tasks_per_context() {
-            return Err(CapacityBound::TasksPerContext {
-                limit: transport_budget.max_tasks_per_context(),
+        if *count > transport_budget.max_tasks_per_participation() {
+            return Err(CapacityBound::TasksPerParticipation {
+                limit: transport_budget.max_tasks_per_participation(),
             }
             .into());
         }
         if kernel_keys
-            .insert(task.fragment_instance_id(), identity.task_id())
+            .insert(task.task_key(), identity.task_id())
             .is_some()
         {
             return Err(TaskExecutionError::Schedule(format!(
                 "attempt manifest repeats fragment instance {}",
-                task.fragment_instance_id()
+                task.task_key()
             )));
         }
         let split_plan_nodes = task
@@ -554,11 +559,11 @@ pub(crate) fn build_task_graph_from_manifest(
             .collect::<Result<Vec<_>, _>>()?;
         let node = TaskNode {
             identity,
-            context: task.context(),
+            participation: task.participation(),
             fragment_id: task.fragment_id(),
             #[cfg(test)]
             instance_index: task.instance_index(),
-            fragment_instance_id: task.fragment_instance_id(),
+            task_key: task.task_key(),
             split_plan_nodes,
         };
         if tasks.insert(identity.task_id(), node).is_some()
@@ -608,7 +613,7 @@ pub(crate) fn build_task_graph_from_manifest(
             })?;
             producers.push(EdgeProducer::new(
                 producer.task(),
-                tasks[&producer_task].fragment_instance_id,
+                tasks[&producer_task].task_key,
                 producer.sender_ordinal(),
             ));
         }
@@ -629,7 +634,7 @@ pub(crate) fn build_task_graph_from_manifest(
                 })?;
             destinations.push(EdgeDestination::new(
                 *destination,
-                tasks[&task_id].fragment_instance_id,
+                tasks[&task_id].task_key,
                 endpoint.clone(),
             ));
         }
@@ -733,7 +738,7 @@ pub(crate) fn build_task_graph_from_manifest(
         stages,
         edges,
         producer_stages,
-        contexts,
+        participations,
         seeds,
     })
 }

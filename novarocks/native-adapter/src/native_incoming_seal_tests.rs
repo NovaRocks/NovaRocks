@@ -140,7 +140,7 @@ impl Fixture {
         let (sender, connection) = bounded(h2::client::handshake(stream)).await.unwrap();
         Client {
             sender,
-            driver: tokio::spawn(connection),
+            connection_job: tokio::spawn(connection),
         }
     }
 
@@ -162,7 +162,7 @@ impl Fixture {
 
 struct Client {
     sender: h2::client::SendRequest<Bytes>,
-    driver: tokio::task::JoinHandle<Result<(), h2::Error>>,
+    connection_job: tokio::task::JoinHandle<Result<(), h2::Error>>,
 }
 
 impl Client {
@@ -195,7 +195,7 @@ impl Client {
 
     async fn closed(self) {
         drop(self.sender);
-        let _ = bounded(self.driver).await;
+        let _ = bounded(self.connection_job).await;
     }
 }
 

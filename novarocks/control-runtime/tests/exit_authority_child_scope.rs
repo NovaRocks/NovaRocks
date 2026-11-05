@@ -19,8 +19,8 @@
 
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::StepGuard,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::StepRegistration,
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -43,8 +43,8 @@ fn paid() -> ResourceVector {
 struct Parent {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     report: ReportSlot,
     consumer: ConsumerId,
 }
@@ -78,18 +78,19 @@ impl Parent {
             [(consumer, ConsumerKind::Observer)],
         )
         .unwrap();
-        let (role, authority) =
-            ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+        let (exit_custody, authority) = ExitCustody::from_admitted(
+            ReportedWork::try_new(work, capacity, report.clone()).unwrap(),
+        );
         Self {
             ledger,
             scope,
-            role,
+            exit_custody,
             authority: Some(authority),
             report,
             consumer,
         }
     }
-    fn finish_child(&self, child: ScopeHandle, root: StepGuard, kind: WorkKind) {
+    fn finish_child(&self, child: ScopeHandle, root: StepRegistration, kind: WorkKind) {
         let (mut work, mut capacity) = root.bind(kind).unwrap();
         // This actual neutral test holder never captured a foreign body.
         child.close_external().unwrap();
@@ -113,7 +114,7 @@ impl Parent {
         {
             self.report.consume(self.consumer).unwrap();
         }
-        assert!(self.role.try_retire().unwrap());
+        assert!(self.exit_custody.try_retire().unwrap());
         self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap();
         self.scope.close_external().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
@@ -141,14 +142,14 @@ fn original_parent_exit_and_report_ack_cannot_return_fee_before_its_real_child_s
         let held_before = f.ledger.used(dimension());
         f.authority.take().unwrap().exited().unwrap();
         f.report.consume(f.consumer).unwrap();
-        let phase = f.role.phase();
-        let physical_parent = f.role.body_exited() && f.role.captures_exited();
-        let ready_while_child = f.role.actual_exit_ready().unwrap();
-        let retired_while_child = f.role.try_retire().unwrap();
+        let phase = f.exit_custody.phase();
+        let physical_parent = f.exit_custody.body_exited() && f.exit_custody.captures_exited();
+        let ready_while_child = f.exit_custody.actual_exit_ready().unwrap();
+        let retired_while_child = f.exit_custody.try_retire().unwrap();
         let held_after = f.ledger.used(dimension());
         f.finish_child(child, root, WorkKind::Business);
         f.finish();
-        assert_eq!(phase, ExitRolePhase::Exited);
+        assert_eq!(phase, ExitCustodyPhase::Exited);
         assert!(physical_parent);
         assert!(!ready_while_child);
         assert!(!retired_while_child);
@@ -224,7 +225,7 @@ fn original_authority_derives_after_external_close_but_not_new_business_after_st
     assert!(inherited_closed);
     assert_eq!(
         error,
-        Some(ExitRoleError::Runtime(RuntimeError::Scope(
+        Some(ExitCustodyError::Runtime(RuntimeError::Scope(
             ScopeError::Stopped
         )))
     );

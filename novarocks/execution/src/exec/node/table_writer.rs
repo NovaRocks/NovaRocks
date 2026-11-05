@@ -38,7 +38,7 @@ use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
-    AllowTableWriteAggregates, TableWriteAggregateGuard,
+    AllowTableWriteAggregates, TableWriteAggregateFaultHook,
 };
 
 /// The attempt-local facts every driver of one `TableWriter` shares.
@@ -51,7 +51,7 @@ use crate::exec::node::table_write_relation::{
 pub struct TableWriterPhysicalContextTemplate {
     execution_query_id: [u8; 16],
     execution_attempt_id: u64,
-    fragment_instance_id: [u8; 16],
+    task_key: [u8; 16],
     writer_ordinal: u32,
 }
 
@@ -59,13 +59,13 @@ impl TableWriterPhysicalContextTemplate {
     pub const fn new(
         execution_query_id: [u8; 16],
         execution_attempt_id: u64,
-        fragment_instance_id: [u8; 16],
+        task_key: [u8; 16],
         writer_ordinal: u32,
     ) -> Self {
         Self {
             execution_query_id,
             execution_attempt_id,
-            fragment_instance_id,
+            task_key,
             writer_ordinal,
         }
     }
@@ -75,7 +75,7 @@ impl TableWriterPhysicalContextTemplate {
         ConnectorWriterPhysicalContext::new(
             self.execution_query_id,
             self.execution_attempt_id,
-            self.fragment_instance_id,
+            self.task_key,
             driver_id,
             self.writer_ordinal,
         )
@@ -91,10 +91,10 @@ impl TableWriterPhysicalContextTemplate {
 pub(crate) fn validate_writer_projection_requiredness(
     schema: &arrow::datatypes::Schema,
     columns: &[arrow::array::ArrayRef],
-) -> crate::runtime::fragment::ExecutionResult<()> {
+) -> crate::runtime::task::ExecutionResult<()> {
     for (ordinal, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
         if !field.is_nullable() && column.null_count() > 0 {
-            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
                 WriterRequiredValue {
                     column: ordinal,
                     row: (0..column.len()).find(|row| column.is_null(*row)),
@@ -125,7 +125,7 @@ impl novarocks_failure_contract::FailureProjection for WriterRequiredValue {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Data,
-            crate::runtime::fragment::ExecutionReason::WriterRequiredValue.reason(),
+            crate::runtime::task::ExecutionReason::WriterRequiredValue.reason(),
         )
     }
 }
@@ -148,8 +148,7 @@ mod required_value_source_properties {
                 .unwrap_err();
         assert_eq!(failure.failure_fact().class(), FailureClass::Data);
         assert_eq!(failure.failure_fact().reason().code(), 498);
-        let crate::runtime::fragment::ExecutionFailureCause::Domain(source) = failure.cause()
-        else {
+        let crate::runtime::task::ExecutionFailureCause::Domain(source) = failure.cause() else {
             panic!("writer value owner required")
         };
         let source = source.downcast_ref::<WriterRequiredValue>().unwrap();
@@ -174,7 +173,7 @@ pub struct TableWriterRuntimeBinding {
     pub(crate) request_context: ConnectorRequestContext,
     pub(crate) fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     #[cfg(novarocks_dev_controls)]
-    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
 }
 
 impl TableWriterRuntimeBinding {
@@ -208,7 +207,7 @@ impl TableWriterRuntimeBinding {
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
     #[cfg(novarocks_dev_controls)]
-    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateFaultHook>) -> Self {
         self.aggregate_guard = guard;
         self
     }
@@ -227,7 +226,7 @@ mod runtime_projection_tests {
 
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::operator::ConstructionFailure;
-    use crate::runtime::fragment::ExecutionFailure;
+    use crate::runtime::task::ExecutionFailure;
     use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
     use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};

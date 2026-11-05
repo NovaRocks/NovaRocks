@@ -42,7 +42,7 @@ use crate::connector::{CatalogHandle, ConnectorError, ConnectorRequestContext};
 pub struct ConnectorWriterPhysicalContext {
     execution_query_id: [u8; 16],
     execution_attempt_id: u64,
-    fragment_instance_id: [u8; 16],
+    task_key: [u8; 16],
     driver_id: u32,
     writer_ordinal: u32,
 }
@@ -51,14 +51,14 @@ impl ConnectorWriterPhysicalContext {
     pub const fn new(
         execution_query_id: [u8; 16],
         execution_attempt_id: u64,
-        fragment_instance_id: [u8; 16],
+        task_key: [u8; 16],
         driver_id: u32,
         writer_ordinal: u32,
     ) -> Self {
         Self {
             execution_query_id,
             execution_attempt_id,
-            fragment_instance_id,
+            task_key,
             driver_id,
             writer_ordinal,
         }
@@ -72,8 +72,8 @@ impl ConnectorWriterPhysicalContext {
         self.execution_attempt_id
     }
 
-    pub const fn fragment_instance_id(&self) -> [u8; 16] {
-        self.fragment_instance_id
+    pub const fn task_key(&self) -> [u8; 16] {
+        self.task_key
     }
 
     pub const fn driver_id(&self) -> u32 {
@@ -127,7 +127,7 @@ pub trait ConnectorBatchWriter: Send {
 /// The backend-local write capability of one exact catalog generation.
 ///
 /// It can open writers and nothing else. There is deliberately no begin,
-/// finish, abort, or reconcile here: a backend never holds a commit handle and
+/// finish, abort, or reconcile here: a backend never holds a commit session and
 /// never mutates catalog metadata.
 #[async_trait::async_trait]
 pub trait ConnectorWriteExecution: Send + Sync {

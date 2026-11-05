@@ -25,10 +25,10 @@
 use std::collections::BTreeSet;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use novarocks_query_application::api::{
     BackendProcessObservation, BackendProcessObservationService, NativeActiveConvergenceClosure,
-    NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeContextConvergence,
+    NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeParticipationConvergence,
     StatementNativeHealthFailure,
 };
 
@@ -38,17 +38,20 @@ use super::split_transport::SplitDeliveryBridge;
 
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// The process identity is an indivisible component of the frozen context.
+/// The process identity is an indivisible component of the frozen participation.
 /// Its original endpoint is retained only to observe exact process replacement.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeAttemptConvergenceTarget {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     endpoint: RuntimeEndpoint,
 }
 
 impl NativeAttemptConvergenceTarget {
-    pub(crate) fn new(context: QueryContextRef, endpoint: RuntimeEndpoint) -> Self {
-        Self { context, endpoint }
+    pub(crate) fn new(participation: ParticipationRef, endpoint: RuntimeEndpoint) -> Self {
+        Self {
+            participation,
+            endpoint,
+        }
     }
 }
 
@@ -66,7 +69,7 @@ pub(crate) enum NativeAttemptConvergenceStep {
 }
 
 /// Role-local convergence policy over the original TaskRound's facts.
-/// Task/context lifecycle, operation replay and first cause stay in TaskRound.
+/// Task/participation lifecycle, operation replay and first cause stay in TaskRound.
 pub(crate) struct NativeAttemptConvergenceOwner {
     source: BackendProcessObservationService,
     targets: Box<[NativeAttemptConvergenceTarget]>,
@@ -89,14 +92,14 @@ impl NativeAttemptConvergenceOwner {
         let expected = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
             .collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
         for target in &targets {
-            if !actual.insert(target.context) {
+            if !actual.insert(target.participation) {
                 return Err(TaskExecutionError::Schedule(
-                    "Native convergence repeats a frozen query context".to_owned(),
+                    "Native convergence repeats a frozen participation".to_owned(),
                 ));
             }
         }
@@ -176,7 +179,7 @@ impl NativeAttemptConvergenceOwner {
         let target = self
             .targets
             .iter()
-            .find(|target| target.context.backend_process_id() == backend)?;
+            .find(|target| target.participation.backend_process_id() == backend)?;
         match self
             .source
             .observe_process_at_endpoint(backend, &target.endpoint)
@@ -193,35 +196,42 @@ impl NativeAttemptConvergenceOwner {
     /// Read only facts already accepted by the original covered owner, plus
     /// exact process replacement at the original endpoint. Unobservable is
     /// never success. Normal drain must also consume its original Release ACK.
-    pub(crate) fn observed_contexts(
+    pub(crate) fn observed_participations(
         &self,
         round: &TaskRound,
-    ) -> Option<Box<[NativeContextConvergence]>> {
+    ) -> Option<Box<[NativeParticipationConvergence]>> {
         let mode = self.mode?;
         let mut convergence = Vec::with_capacity(self.targets.len());
         for target in &self.targets {
             if round
                 .execution()
-                .context_convergence_receipt(target.context)
+                .participation_convergence_receipt(target.participation)
                 .is_some()
                 && (mode == NativeAttemptConvergenceMode::Cleanup
                     || round
                         .execution()
-                        .owner(target.context)
+                        .owner(target.participation)
                         .is_some_and(|owner| owner.is_released()))
             {
-                convergence.push(NativeContextConvergence::worker_stopped_and_context_fenced(
-                    target.context,
+                convergence.push(
+                    NativeParticipationConvergence::worker_stopped_and_participation_fenced(
+                        target.participation,
+                    ),
+                );
+                continue;
+            }
+            if round
+                .execution()
+                .participation_never_established(target.participation)
+            {
+                convergence.push(NativeParticipationConvergence::never_established(
+                    target.participation,
                 ));
                 continue;
             }
-            if round.execution().context_never_established(target.context) {
-                convergence.push(NativeContextConvergence::never_established(target.context));
-                continue;
-            }
-            if self.process_replaced(target.context.backend_process_id()) {
-                convergence.push(NativeContextConvergence::worker_process_replaced(
-                    target.context,
+            if self.process_replaced(target.participation.backend_process_id()) {
+                convergence.push(NativeParticipationConvergence::worker_process_replaced(
+                    target.participation,
                 ));
             } else {
                 return None;
@@ -268,7 +278,7 @@ impl NativeAttemptConvergenceOwner {
             self.begin(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
             return Err(TaskExecutionError::SplitAssignment(error));
         }
-        if round.pumps_closed() && self.observed_contexts(round).is_some() {
+        if round.pumps_closed() && self.observed_participations(round).is_some() {
             return Ok(NativeAttemptConvergenceStep::Ready);
         }
         let advanced = if self.mode == Some(NativeAttemptConvergenceMode::Normal)
@@ -386,7 +396,7 @@ impl NativeAttemptConvergenceOwner {
     }
 
     /// Closes the SAME unstarted round without obtaining a remote budget.
-    /// Every frozen context must still have its original never-issued proof;
+    /// Every frozen participation must still have its original never-issued proof;
     /// local jobs/diagnostics nevertheless have to actually close and join.
     pub(crate) async fn drive_unstarted(
         &mut self,
@@ -433,12 +443,12 @@ impl NativeAttemptConvergenceOwner {
                 // Reuse the original positive-fact author, then check the
                 // exact nonempty frozen set; None/empty/remote timeout is not proof.
                 let facts = self
-                    .observed_contexts(round)
+                    .observed_participations(round)
                     .ok_or_else(|| self.unstarted_failure())?;
                 if facts.len() != self.targets.len()
                     || facts.iter().zip(self.targets.iter()).any(|(fact, target)| {
-                        fact.context() != target.context
-                            || fact.kind() != novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+                        fact.participation() != target.participation
+                            || fact.kind() != novarocks_query_application::api::NativeParticipationConvergenceKind::NeverEstablished
                     })
                 {
                     return Err(self.unstarted_failure());
@@ -474,10 +484,11 @@ impl NativeAttemptConvergenceOwner {
             return Err(original.clone());
         }
         if self.targets.is_empty()
-            || self
-                .targets
-                .iter()
-                .any(|target| !round.execution().context_never_established(target.context))
+            || self.targets.iter().any(|target| {
+                !round
+                    .execution()
+                    .participation_never_established(target.participation)
+            })
         {
             return Err(self.unstarted_failure());
         }
@@ -486,7 +497,7 @@ impl NativeAttemptConvergenceOwner {
 
     fn unstarted_failure(&mut self) -> StatementNativeHealthFailure {
         self.retain_unstarted_failure(
-            "Native dormant cleanup requires every exact context to be never established",
+            "Native dormant cleanup requires every exact participation to be never established",
             "the original unstarted round lost its exact never-established proof",
         )
     }
@@ -555,13 +566,17 @@ impl NativeAttemptConvergenceOwner {
         }
         // A budget bounds further waiting; it cannot erase positive facts
         // already accepted by the original covered/Release owners.
-        if let Some(contexts) = self.observed_contexts(round) {
+        if let Some(participations) = self.observed_participations(round) {
             self.remote_closure = Some(NativeActiveConvergenceClosure::Evidence(
-                NativeAttemptConvergence::contexts(contexts),
+                NativeAttemptConvergence::participations(participations),
             ));
         } else if std::time::Instant::now() >= deadline {
             self.remote_closure = Some(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                exact_contexts: self.targets.iter().map(|target| target.context).collect(),
+                exact_participations: self
+                    .targets
+                    .iter()
+                    .map(|target| target.participation)
+                    .collect(),
             });
         }
     }
@@ -620,9 +635,9 @@ mod tests {
     use super::super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
     use super::super::status_intake::{ObservationFrame, ObservationIntakeEntry};
     use novarocks_execution_contract::{
-        OperationKind, OperationOutcome, QueryContextConvergenceReceipt,
-        QueryContextConvergenceState, QueryContextConvergenceVersion, QueryContextReceipt,
-        QueryContextState, ReleaseOutcome,
+        OperationKind, OperationOutcome, ParticipationConvergenceReceipt,
+        ParticipationConvergenceState, ParticipationConvergenceVersion, ParticipationReceipt,
+        ParticipationState, ReleaseOutcome,
     };
     use novarocks_query_application::api::{BackendProcessObservationPort, BackendTopologyError};
     use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
@@ -639,19 +654,19 @@ mod tests {
         }
     }
 
-    fn publish_exit(round: &mut TaskRound, context: QueryContextRef) {
+    fn publish_exit(round: &mut TaskRound, participation: ParticipationRef) {
         round
             .execution_mut()
             .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
-                    context,
+                    participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
-                        fact: CoveredStatusStreamFact::ContextConvergence(
-                            QueryContextConvergenceReceipt::new(
-                                context,
-                                QueryContextConvergenceVersion::FIRST,
-                                QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                        fact: CoveredStatusStreamFact::ParticipationConvergence(
+                            ParticipationConvergenceReceipt::new(
+                                participation,
+                                ParticipationConvergenceVersion::FIRST,
+                                ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
                             ),
                         ),
                         source_revision: None,
@@ -662,19 +677,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_convergence_rejects_missing_duplicate_and_foreign_context_targets() {
+    fn shared_convergence_rejects_missing_duplicate_and_foreign_participation_targets() {
         let (round, _) = super::super::tests::manifest_terminal_regression_fixture();
-        let contexts = round
+        let participations = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
             .collect::<Vec<_>>();
-        let targets = contexts
+        let targets = participations
             .iter()
-            .map(|&context| {
+            .map(|&participation| {
                 NativeAttemptConvergenceTarget::new(
-                    context,
+                    participation,
                     RuntimeEndpoint::new("127.0.0.1", 1).unwrap(),
                 )
             })
@@ -699,9 +714,9 @@ mod tests {
             NativeAttemptConvergenceOwner::new(&round, Arc::new(OriginalProcess), missing).is_err()
         );
         let mut foreign = targets;
-        foreign[0].context = QueryContextRef::new(
-            contexts[0].query_execution_id(),
-            contexts[0].frontend_process_id(),
+        foreign[0].participation = ParticipationRef::new(
+            participations[0].query_execution_id(),
+            participations[0].frontend_process_id(),
             novarocks_types::BackendProcessId::new_v7(),
         );
         assert!(
@@ -717,28 +732,28 @@ mod tests {
             // gate, NativeAttemptDrive or replacement WorkOwner is constructed.
             let (mut round, acks, release) =
                 super::super::tests::manifest_normal_release_ack_regression_fixture();
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
             let mut convergence = NativeAttemptConvergenceOwner::new(
                 &round,
                 Arc::new(OriginalProcess),
                 vec![NativeAttemptConvergenceTarget::new(
-                    context,
+                    participation,
                     RuntimeEndpoint::new("127.0.0.1", 1).unwrap(),
                 )],
             )
             .unwrap();
-            let OperationIntent::ReleaseQueryContext(request) = &release else {
+            let OperationIntent::ReleaseParticipation(request) = &release else {
                 unreachable!()
             };
             let ack = OperationAcknowledgement::new(
                 release.operation_id(),
-                OperationKind::ReleaseQueryContext,
+                OperationKind::ReleaseParticipation,
                 OperationOutcome::Accepted,
                 AckPayload::Release {
-                    receipt: QueryContextReceipt::new(
-                        request.context(),
-                        QueryContextState::TerminalRetained,
+                    receipt: ParticipationReceipt::new(
+                        request.participation(),
+                        ParticipationState::TerminalRetained,
                     ),
                     outcome: ReleaseOutcome::Released,
                     runtime_filter: Some(expected.clone()),
@@ -749,9 +764,9 @@ mod tests {
                 &split_delivery,
                 NativeAttemptConvergenceMode::Normal,
             );
-            assert!(convergence.observed_contexts(&round).is_none());
+            assert!(convergence.observed_participations(&round).is_none());
             if covered_first {
-                publish_exit(&mut round, context);
+                publish_exit(&mut round, participation);
                 assert!(matches!(
                     convergence
                         .step(
@@ -785,9 +800,15 @@ mod tests {
                         .unwrap(),
                     NativeAttemptConvergenceStep::Pending { .. }
                 ));
-                assert!(round.execution().owner(context).unwrap().is_released());
-                assert!(!round.execution().worker_contexts_stopped());
-                publish_exit(&mut round, context);
+                assert!(
+                    round
+                        .execution()
+                        .owner(participation)
+                        .unwrap()
+                        .is_released()
+                );
+                assert!(!round.execution().worker_participations_stopped());
+                publish_exit(&mut round, participation);
             }
             let NativeAttemptConvergenceStep::Ready = convergence
                 .step(
@@ -804,7 +825,7 @@ mod tests {
             assert!(contribution.is_complete());
             assert_eq!(
                 contribution.contributions(),
-                &[(context.backend_process_id(), expected.clone())]
+                &[(participation.backend_process_id(), expected.clone())]
             );
         }
     }
@@ -812,13 +833,13 @@ mod tests {
     #[test]
     fn statement_bridge_shared_step_does_not_turn_abort_closure_into_actual_exit() {
         let (mut round, _acks) = super::super::tests::manifest_terminal_regression_fixture();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let mut convergence = NativeAttemptConvergenceOwner::new(
             &round,
             Arc::new(OriginalProcess),
             vec![NativeAttemptConvergenceTarget::new(
-                context,
+                participation,
                 RuntimeEndpoint::new("127.0.0.1", 1).unwrap(),
             )],
         )
@@ -830,10 +851,16 @@ mod tests {
         );
         round
             .execution_mut()
-            .observe_actor_abort_context_closed(context)
+            .observe_actor_abort_participation_closed(participation)
             .unwrap();
-        assert!(round.execution().owner(context).unwrap().is_released());
-        assert!(convergence.observed_contexts(&round).is_none());
+        assert!(
+            round
+                .execution()
+                .owner(participation)
+                .unwrap()
+                .is_released()
+        );
+        assert!(convergence.observed_participations(&round).is_none());
         assert!(matches!(
             convergence
                 .step(
@@ -845,8 +872,8 @@ mod tests {
                 .unwrap(),
             NativeAttemptConvergenceStep::Pending { .. }
         ));
-        assert!(!round.execution().worker_contexts_stopped());
-        publish_exit(&mut round, context);
+        assert!(!round.execution().worker_participations_stopped());
+        publish_exit(&mut round, participation);
         assert!(matches!(
             convergence
                 .step(
@@ -858,7 +885,7 @@ mod tests {
                 .unwrap(),
             NativeAttemptConvergenceStep::Ready
         ));
-        assert!(round.execution().worker_contexts_stopped());
+        assert!(round.execution().worker_participations_stopped());
     }
 
     struct OriginalCloseResource(Arc<std::sync::atomic::AtomicBool>);
@@ -949,10 +976,10 @@ mod tests {
             round
                 .execution()
                 .graph()
-                .contexts()
-                .map(|&context| {
+                .participations()
+                .map(|&participation| {
                     NativeAttemptConvergenceTarget::new(
-                        context,
+                        participation,
                         RuntimeEndpoint::new("127.0.0.1", 1).unwrap(),
                     )
                 })
@@ -966,7 +993,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (mut round, _) = super::super::tests::manifest_terminal_regression_fixture();
         let (entry, release, dropped) = install_gated_close(&mut round);
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let mut owner = original_convergence(&round);
         owner.begin(
@@ -977,8 +1004,8 @@ mod tests {
         entry
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        publish_exit(&mut round, context);
-        assert!(owner.observed_contexts(&round).is_some());
+        publish_exit(&mut round, participation);
+        assert!(owner.observed_participations(&round).is_some());
         let pending = matches!(
             owner
                 .step(
@@ -1027,7 +1054,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (mut round, _) = super::super::tests::manifest_terminal_regression_fixture();
         let (entry, release, dropped) = install_gated_close(&mut round);
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let mut owner = original_convergence(&round);
         let notify = tokio::sync::Notify::new();
@@ -1088,7 +1115,7 @@ mod tests {
         .is_err();
         // Evidence arriving after the original deadline must not turn an
         // await-drop/re-entry into a fresh remote tracking budget.
-        publish_exit(&mut round, context);
+        publish_exit(&mut round, participation);
         release.send(()).unwrap();
         let closure = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1116,8 +1143,10 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert!(round.pumps_closed());
         match closure {
-            NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts } => {
-                assert_eq!(exact_contexts.as_ref(), &[context])
+            NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            } => {
+                assert_eq!(exact_participations.as_ref(), &[participation])
             }
             NativeActiveConvergenceClosure::Evidence(_) => {
                 panic!("late evidence cannot refresh the original remote deadline")
@@ -1129,7 +1158,7 @@ mod tests {
     fn expired_remote_budget_keeps_original_accepted_exit_and_release_evidence() {
         let (mut round, acks, release) =
             super::super::tests::manifest_normal_release_ack_regression_fixture();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let mut owner = original_convergence(&round);
         owner.begin(
@@ -1138,17 +1167,17 @@ mod tests {
             NativeAttemptConvergenceMode::Normal,
         );
         let contribution = super::super::tests::fixture_runtime_filter_contribution();
-        let OperationIntent::ReleaseQueryContext(request) = &release else {
+        let OperationIntent::ReleaseParticipation(request) = &release else {
             unreachable!("the original fixture selects its exact Release")
         };
         acks.publish(OperationAcknowledgement::new(
             release.operation_id(),
-            OperationKind::ReleaseQueryContext,
+            OperationKind::ReleaseParticipation,
             OperationOutcome::Accepted,
             AckPayload::Release {
-                receipt: QueryContextReceipt::new(
-                    request.context(),
-                    QueryContextState::TerminalRetained,
+                receipt: ParticipationReceipt::new(
+                    request.participation(),
+                    ParticipationState::TerminalRetained,
                 ),
                 outcome: ReleaseOutcome::Released,
                 runtime_filter: Some(contribution.clone()),
@@ -1157,10 +1186,10 @@ mod tests {
         round
             .turn()
             .expect("the original Release acknowledgement settles");
-        publish_exit(&mut round, context);
+        publish_exit(&mut round, participation);
         assert!(round.attempt_drained());
         assert!(
-            owner.observed_contexts(&round).is_some(),
+            owner.observed_participations(&round).is_some(),
             "positive original facts precede the expired request"
         );
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -1171,14 +1200,16 @@ mod tests {
             .clone()
             .expect("already accepted evidence");
         match closure {
-            NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Contexts(
-                contexts,
+            NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(
+                participations,
             )) => {
                 assert_eq!(
-                    contexts.as_ref(),
-                    &[NativeContextConvergence::worker_stopped_and_context_fenced(
-                        context
-                    )]
+                    participations.as_ref(),
+                    &[
+                        NativeParticipationConvergence::worker_stopped_and_participation_fenced(
+                            participation
+                        )
+                    ]
                 );
             }
             other => panic!("an expired wait must not erase original positive facts: {other:?}"),
@@ -1195,7 +1226,7 @@ mod tests {
         assert!(contributions.is_complete());
         assert_eq!(
             contributions.contributions(),
-            &[(context.backend_process_id(), contribution)]
+            &[(participation.backend_process_id(), contribution)]
         );
     }
 

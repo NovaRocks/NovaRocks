@@ -72,7 +72,7 @@ LIMIT 2;
 
 -- @skip_result_check=true
 -- @normalize_explain_timing=true
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_contains=AggregateTopNKey
 EXPLAIN ANALYZE
 SELECT k, SUM(v) AS total

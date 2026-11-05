@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::control_runtime::process_control::RootRequestAdvanceError;
+use crate::control_runtime::process_control::ControlRequestAdvanceError;
 
 fn advance_until(
     f: &mut Fixture,
@@ -64,7 +64,7 @@ fn original_ready_turn_submits_getter_return_and_disposes_rejected_source_before
     let wrong_owner = matches!(
         f.root
             .advance_ready_requests(foreign_pools.handles.as_ref().unwrap(), None, 8),
-        Err(RootRequestAdvanceError::WrongOwner)
+        Err(ControlRequestAdvanceError::WrongOwner)
     );
     let untouched = tests::original_fees(&f) == fees && getters.load(Ordering::SeqCst) == 0;
     let submitted = advance_until(&mut f, &handles, |f| {
@@ -209,7 +209,7 @@ fn a_cancelled_original_return_keeps_authority_for_actual_withdrawal_and_cleanup
         .unwrap();
     job.cancel_before_start();
     let observed = matches!(f.root.advance_ready_requests(&handles, None, 8),
-        Err(RootRequestAdvanceError::Request { input: actual, error: RequestIoError::Observed(EstablishIngressOutcome::CancelledBeforeStart) }) if actual == input);
+        Err(ControlRequestAdvanceError::Request { input: actual, error: RequestIoError::Observed(EstablishIngressOutcome::CancelledBeforeStart) }) if actual == input);
     let cached = matches!(
         f.root.resources().requests[&input].ingress_outcome,
         Some(EstablishIngressOutcome::CancelledBeforeStart)

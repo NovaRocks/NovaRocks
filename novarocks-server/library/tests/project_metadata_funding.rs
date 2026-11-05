@@ -500,8 +500,8 @@ fn functions() -> PureEngineFunctionCatalog {
 #[test]
 fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
-        preparation_metadata::PreparationMetadataFailure,
+        preparation_memory::PreparationMemoryRefusal,
+        preparation_metadata::PreparationMetadataFailure, task::ExecutionFailureCause,
     };
     use novarocks_native_adapter::backend_task_execution::node_test_support::PreparationStop;
     let _ = novarocks_server_application::memory_observation::snapshot();
@@ -567,8 +567,8 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
 #[test]
 fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_body() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
-        preparation_metadata::PreparationMetadataFailure,
+        preparation_memory::PreparationMemoryRefusal,
+        preparation_metadata::PreparationMetadataFailure, task::ExecutionFailureCause,
     };
     let _ = novarocks_server_application::memory_observation::snapshot();
     const TOTAL: u64 = 2 << 20;

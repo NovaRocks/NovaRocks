@@ -24,7 +24,7 @@ use super::contribution::{
 };
 use super::{AggregateTopNBoundaryError, RuntimeFilterContractViolation};
 use crate::exec::operators::OwnedTopNBoundaryError;
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

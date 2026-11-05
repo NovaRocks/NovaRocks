@@ -23,7 +23,7 @@ mod diagnostic_exit_tests {
     use std::task::Poll;
     use std::time::Duration;
 
-    use crate::native::fragment_transport::{
+    use crate::native::task_result_transport::{
         DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
     };
     use crate::task_execution::profile_diagnostics::TaskFinalInfoCollector;
@@ -90,7 +90,7 @@ mod diagnostic_exit_tests {
     async fn original_final_info_wait_yields_after_remote_ready(expire_before_release: bool) {
         let (mut round, acks, release) =
             crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let mut owner = original_convergence(&round);
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -160,17 +160,17 @@ mod diagnostic_exit_tests {
 
         // Settle the exact original Release and covered physical-exit evidence.
         // Neither is substituted by a wall-clock delay or a dropped TaskRound.
-        let OperationIntent::ReleaseQueryContext(request) = &release else {
+        let OperationIntent::ReleaseParticipation(request) = &release else {
             unreachable!("the fixture selects its exact Release")
         };
         acks.publish(OperationAcknowledgement::new(
             release.operation_id(),
-            OperationKind::ReleaseQueryContext,
+            OperationKind::ReleaseParticipation,
             OperationOutcome::Accepted,
             AckPayload::Release {
-                receipt: QueryContextReceipt::new(
-                    request.context(),
-                    QueryContextState::TerminalRetained,
+                receipt: ParticipationReceipt::new(
+                    request.participation(),
+                    ParticipationState::TerminalRetained,
                 ),
                 outcome: ReleaseOutcome::Released,
                 runtime_filter: Some(
@@ -179,7 +179,7 @@ mod diagnostic_exit_tests {
             },
         ));
         round.turn().expect("the original Release ACK settles");
-        publish_exit(&mut round, context);
+        publish_exit(&mut round, participation);
         owner.begin(
             &mut round,
             &split_delivery,
@@ -187,7 +187,7 @@ mod diagnostic_exit_tests {
         );
         assert!(round.attempt_drained());
         assert!(round.pumps_closed());
-        assert!(owner.observed_contexts(&round).is_some());
+        assert!(owner.observed_participations(&round).is_some());
         assert!(!collector.is_closed());
         assert!(probe.completed.lock().unwrap().is_empty());
         assert!(probe.dropped.lock().unwrap().is_empty());
@@ -266,8 +266,8 @@ mod diagnostic_exit_tests {
         if expire_before_release {
             assert_eq!(owner.remote_deadline, Some(first_deadline));
             match closure {
-                NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts } => {
-                    assert_eq!(exact_contexts.as_ref(), &[context]);
+                NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } => {
+                    assert_eq!(exact_participations.as_ref(), &[participation]);
                 }
                 other => panic!("reentry replaced the first remote disposition: {other:?}"),
             }

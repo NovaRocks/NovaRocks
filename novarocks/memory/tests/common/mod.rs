@@ -25,7 +25,7 @@ pub fn authority(bytes: u64) -> MemoryAuthority {
     config.top_up = TopUpPolicy::uniform(1024);
     MemoryAuthority::new(config).unwrap()
 }
-pub fn work(a: &MemoryAuthority) -> AccountHandle {
+pub fn work(a: &MemoryAuthority) -> Account {
     a.create_account(AccountKind::Work, ExternalRef::NONE)
         .unwrap()
 }

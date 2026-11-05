@@ -18,8 +18,8 @@
 //! Installed preparation capability for ordinary consumer shapes.
 
 use super::{
-    AcceptedInput, AdmissionNext, InputPreparation, InputPreparationFailure, PreparationStep,
-    RawInput, StepContext, TransformKernel,
+    AcceptedInput, AdmissionNext, DriverStep, InputPreparation, InputPreparationFailure,
+    PreparationStep, RawInput, TransformKernel,
 };
 use crate::exec::pipeline::operator::{
     DictionaryCarrierStats, InputConstructionFactory, InputEncodingPolicy,
@@ -27,8 +27,8 @@ use crate::exec::pipeline::operator::{
 };
 use crate::runtime::profile::{CounterRef, OperatorProfiles};
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult},
     mem_tracker::MemTracker,
+    task::{ExecutionFailure, ExecutionResult},
 };
 use std::sync::Arc;
 
@@ -82,7 +82,7 @@ impl std::fmt::Display for ReceiverContractFailure {
 impl std::error::Error for ReceiverContractFailure {}
 impl novarocks_failure_contract::FailureProjection for ReceiverContractFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::RootGrant => ExecutionReason::ReceiverUnexpectedRootGrant,
@@ -108,7 +108,7 @@ impl HydrateInput {
     }
     pub(crate) fn prepare_accepted<K: InputEncodingPolicy + ?Sized>(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         kernel: &K,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -145,7 +145,7 @@ impl HydrateInput {
 impl<K: InputEncodingPolicy + TransformKernel> InputPreparation<K> for HydrateInput {
     fn admission(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: &RawInput,
         kernel: &K,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -157,7 +157,7 @@ impl<K: InputEncodingPolicy + TransformKernel> InputPreparation<K> for HydrateIn
     }
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         kernel: &K,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -186,7 +186,7 @@ pub(crate) struct RootInputTarget {
 impl InputPreparation<RootInputTarget> for RootInputPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         raw: &RawInput,
         target: &RootInputTarget,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -205,7 +205,7 @@ impl InputPreparation<RootInputTarget> for RootInputPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: AcceptedInput,
         _: &RootInputTarget,
     ) -> Result<PreparationStep, InputPreparationFailure> {

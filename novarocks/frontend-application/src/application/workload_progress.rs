@@ -68,7 +68,7 @@ impl DriverCustody {
                 .take()
         }
         .expect("the unique deadline worker owns the original driver turn");
-        let mut lease = DriverLease {
+        let mut lease = DriverLoan {
             custody: self,
             driver: Some(driver),
         };
@@ -77,11 +77,11 @@ impl DriverCustody {
         result
     }
 }
-struct DriverLease<'a> {
+struct DriverLoan<'a> {
     custody: &'a DriverCustody,
     driver: Option<Box<JointProgressDriver>>,
 }
-impl Drop for DriverLease<'_> {
+impl Drop for DriverLoan<'_> {
     fn drop(&mut self) {
         let driver = self
             .driver

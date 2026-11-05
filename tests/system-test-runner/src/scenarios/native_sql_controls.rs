@@ -20,7 +20,7 @@
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{
-    QueryLifecycleStatementObservation, ServerHandle,
+    QueryLifecycleStatementObservation, TestClusterOwner,
     test_sessions::{ClusterTestSessionPlan, RoleLaunchReference, RoleSlot},
 };
 use novarocks_failpoint::session::DomainGrant;
@@ -526,7 +526,18 @@ mod tests {
         let binary = std::env::current_exe().unwrap();
         let owner = SqlIntentOwner::default();
         let mut statement = spec("SELECT 1");
-        statement.observations = vec![(0, "grpc-fragment", Some(1)), (0, "grpc-fragment", Some(2))];
+        statement.observations = vec![
+            (
+                0,
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                Some(1),
+            ),
+            (
+                0,
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                Some(2),
+            ),
+        ];
         let plan = owner
             .freeze(vec![statement], &[0, 1, 2], 3, &binary, deadline())
             .unwrap();
@@ -559,7 +570,18 @@ mod tests {
         drop(frozen);
         let owner = SqlIntentOwner::default();
         let mut mixed = spec("SELECT 1");
-        mixed.observations = vec![(0, "grpc-fragment", None), (0, "grpc-fragment", Some(2))];
+        mixed.observations = vec![
+            (
+                0,
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                None,
+            ),
+            (
+                0,
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                Some(2),
+            ),
+        ];
         assert!(
             owner
                 .freeze(vec![mixed], &[], 3, &binary, deadline())
@@ -580,7 +602,7 @@ mod tests {
                 let mut statement = spec("SELECT 1");
                 let observations = (maximum - at * 3).min(3);
                 statement.observations = (0..observations)
-                    .map(|index| (index, "grpc-fragment", None))
+                    .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
                     .collect();
                 statement
             })

@@ -26,8 +26,8 @@ use novarocks_query_application::{
     preparation::{FinalPlanRuntimeAccess, ReadAccessSink},
 };
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteLease, ConnectorInstanceDescriptor, ConnectorRequestContext,
-    ProviderBindingEpoch, RewriteCpuInput, RewriteCpuPort, RewritePlanCpuSource,
+    ConnectorInstanceDescriptor, ConnectorRequestContext, ProviderBindingEpoch, RewriteCpuInput,
+    RewriteCpuPort, RewritePlanCpuSource, SharedConnectorDistributedRewrite,
 };
 use std::sync::Mutex;
 
@@ -40,14 +40,14 @@ type CompileResult<T> = Result<T, novarocks_sql::compiler::SqlCompileError>;
 enum OriginalInput {
     BeginRequest {
         plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
-        lease: ConnectorDistributedRewriteLease,
+        rewrite: SharedConnectorDistributedRewrite,
         table: novarocks_spi::connector::ConnectorTableIdentity,
         context: ConnectorRequestContext,
         capture: novarocks_spi::connector::ConnectorOriginalResultScope,
     },
     Seal {
         plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
-        lease: ConnectorDistributedRewriteLease,
+        rewrite: SharedConnectorDistributedRewrite,
         write: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     },
     Finalize {
@@ -116,18 +116,18 @@ impl Drop for CpuLoan<'_> {
 impl RewriteCohortCpuOriginal {
     pub(crate) fn begin_request_original(
         plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
-        lease: ConnectorDistributedRewriteLease,
+        rewrite: SharedConnectorDistributedRewrite,
         table: novarocks_spi::connector::ConnectorTableIdentity,
         context: ConnectorRequestContext,
         capture: novarocks_spi::connector::ConnectorOriginalResultScope,
     ) -> Arc<Self> {
         Arc::new(Self {
-            descriptor: lease.descriptor().clone(),
-            incarnation: lease.incarnation(),
+            descriptor: rewrite.descriptor().clone(),
+            incarnation: rewrite.incarnation(),
             body: Mutex::new(Some(CpuBody {
                 input: OriginalInput::BeginRequest {
                     plan,
-                    lease,
+                    rewrite,
                     table,
                     context,
                     capture,
@@ -167,14 +167,18 @@ impl RewriteCohortCpuOriginal {
     }
     pub(crate) fn seal_original(
         plan: Arc<novarocks_spi::connector::ConnectorDistributedRewritePlan>,
-        lease: ConnectorDistributedRewriteLease,
+        rewrite: SharedConnectorDistributedRewrite,
         write: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            descriptor: lease.descriptor().clone(),
-            incarnation: lease.incarnation(),
+            descriptor: rewrite.descriptor().clone(),
+            incarnation: rewrite.incarnation(),
             body: Mutex::new(Some(CpuBody {
-                input: OriginalInput::Seal { plan, lease, write },
+                input: OriginalInput::Seal {
+                    plan,
+                    rewrite,
+                    write,
+                },
                 started: false,
                 result: None,
             })),
@@ -185,8 +189,8 @@ impl RewriteCohortCpuOriginal {
         receipt: novarocks_spi::connector::ConnectorWriteReceipt,
     ) -> Arc<Self> {
         Arc::new(Self {
-            descriptor: session.lease().descriptor().clone(),
-            incarnation: session.lease().incarnation(),
+            descriptor: session.rewrite().descriptor().clone(),
+            incarnation: session.rewrite().incarnation(),
             body: Mutex::new(Some(CpuBody {
                 input: OriginalInput::Finalize { session, receipt },
                 started: false,
@@ -259,17 +263,17 @@ impl RewritePlanCpuSource for RewriteCohortCpuOriginal {
         assert!(!body.started, "one original Rewrite CPU invocation");
         body.started = true;
         body.result = Some(match &body.input {
-            OriginalInput::BeginRequest {plan,lease,table,context,capture} => (|| {
+            OriginalInput::BeginRequest {plan,rewrite,table,context,capture} => (|| {
                 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession as Session;
                 capture.check_active().map_err(|e| novarocks_sql::compiler::SqlCompileError::from(
                     novarocks_type_contract::CompileControlError::from_domain(e)))?;
-                let properties=lease.planning_lease().binding().catalog_properties().map_err(original_provider_error)?.clone();
+                let properties=rewrite.planning_pin().binding().catalog_properties().map_err(original_provider_error)?.clone();
                 let context=crate::query_execution::write_session::context_for_write_begin(context.clone(),&properties).map_err(original_provider_error)?;
                 let request=Session::original_begin_request_from_identity(plan,table,context).map_err(novarocks_sql::compiler::SqlCompileError::from)?;
                 Ok(OriginalOutput::BeginRequest{request,properties})
             })(),
-            OriginalInput::Seal { plan, lease, write } =>
-                crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession::from_original_session(plan.clone(),lease.clone(),write.clone())
+            OriginalInput::Seal { plan, rewrite, write } =>
+                crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession::from_original_session(plan.clone(),rewrite.clone(),write.clone())
                     .map(OriginalOutput::Sealed).map_err(original_provider_error),
             OriginalInput::Finalize { session, receipt } => session.finalize_committed(receipt)
                 .map(OriginalOutput::Finalized).map_err(original_provider_error),
@@ -379,7 +383,7 @@ pub(crate) async fn prepare_original_cohort_in(
     engine: &RequestScopedMaintenanceEngine,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
-    lease: &ConnectorDistributedRewriteLease,
+    rewrite: &SharedConnectorDistributedRewrite,
     cpu: &dyn RewriteCpuPort,
     provider: &FrontendCompletionCustody,
     completion: CompletionFactOwners,
@@ -390,8 +394,8 @@ pub(crate) async fn prepare_original_cohort_in(
     }
     custody.started = true;
     let original = Arc::new(RewriteCohortCpuOriginal {
-        descriptor: lease.descriptor().clone(),
-        incarnation: lease.incarnation(),
+        descriptor: rewrite.descriptor().clone(),
+        incarnation: rewrite.incarnation(),
         body: Mutex::new(Some(CpuBody {
             input: OriginalInput::Recipe {
                 session: session.clone(),
@@ -469,8 +473,8 @@ pub(crate) async fn prepare_original_cohort_in(
     // The unique access moves into another ORIGINAL stable Source, which the
     // Action retains outside the CPU input alias and every borrowed future.
     let original = Arc::new(RewriteCohortCpuOriginal {
-        descriptor: lease.descriptor().clone(),
-        incarnation: lease.incarnation(),
+        descriptor: rewrite.descriptor().clone(),
+        incarnation: rewrite.incarnation(),
         body: Mutex::new(Some(CpuBody {
             input: OriginalInput::Freeze {
                 recipe: recipe.clone(),

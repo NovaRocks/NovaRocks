@@ -21,8 +21,8 @@
 use std::sync::{Arc, Mutex};
 
 use novarocks_fs::{
-    BoundFile, FileCancellation, FileRangeBinding, FileRangeClass, FileRangeControl,
-    FileRangeStart, FileReadContext, FileReadRange, FileTask, PreparedFileInput,
+    BoundFile, FileCancellation, FileIoJob, FileRangeBinding, FileRangeClass, FileRangeControl,
+    FileRangeStart, FileReadContext, FileReadRange, PreparedFileInput,
 };
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
@@ -127,11 +127,11 @@ enum WatcherPhase {
 }
 struct WatcherSlot {
     phase: WatcherPhase,
-    task: Option<std::mem::ManuallyDrop<FileTask>>,
+    task: Option<std::mem::ManuallyDrop<FileIoJob>>,
     ticket: Option<
         std::mem::ManuallyDrop<novarocks_spi::connector::read_stack::ConnectorOperationTicket>,
     >,
-    body: Option<std::mem::ManuallyDrop<novarocks_fs::FileTaskFuture>>,
+    body: Option<std::mem::ManuallyDrop<novarocks_fs::FileIoFuture>>,
     spawn_error: Option<std::mem::ManuallyDrop<novarocks_fs::FileError>>,
     join_error: Option<std::mem::ManuallyDrop<tokio::task::JoinError>>,
     // Spawn/cause projection and error-holder Drop are separate once roles.
@@ -218,13 +218,13 @@ impl Drop for WatcherTicketLoan<'_> {
     }
 }
 
-// FileTask polling borrows the original named role without holding its
+// FileIoJob polling borrows the original named role without holding its
 // state mutex. Cancellation/unwind returns the same handle to that role.
-struct WatcherTaskLoan<'a> {
+struct WatcherJobLoan<'a> {
     original: &'a Shared,
-    task: Option<std::mem::ManuallyDrop<FileTask>>,
+    task: Option<std::mem::ManuallyDrop<FileIoJob>>,
 }
-impl Drop for WatcherTaskLoan<'_> {
+impl Drop for WatcherJobLoan<'_> {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             let mut slot = self.original.watcher_lock();
@@ -309,7 +309,7 @@ impl Shared {
             slot.outcome = ConnectorPreparationExit::Exited;
             (slot.task.take(), slot.ticket.take())
         };
-        // poll_drain already consumed the completed join. This FileTask is
+        // poll_drain already consumed the completed join. This FileIoJob is
         // inert nominal metadata; its Drop can no longer abort a future.
         drop(task.map(std::mem::ManuallyDrop::into_inner));
         {
@@ -325,8 +325,8 @@ impl Shared {
     }
     fn spawn_watcher(
         &self,
-        spawner: &dyn novarocks_fs::FileTaskSpawner,
-        body: novarocks_fs::FileTaskFuture,
+        spawner: &dyn novarocks_fs::FileIoSpawner,
+        body: novarocks_fs::FileIoFuture,
     ) {
         {
             let mut slot = self.watcher_lock();
@@ -395,7 +395,7 @@ impl Shared {
                 }));
                 match disposed {
                     Ok(()) => {
-                        // Production TokioFileTaskSpawner returns a handle.
+                        // Production TokioFileIoSpawner returns a handle.
                         // A supported spawner's Err promises no delivered job
                         // and completed destruction of its supplied future.
                         let mut state = self.lock();
@@ -426,7 +426,7 @@ impl Shared {
                 _ => return std::task::Poll::Pending,
             }
             slot.phase = WatcherPhase::Polling;
-            WatcherTaskLoan {
+            WatcherJobLoan {
                 original: self,
                 task: slot.task.take(),
             }
@@ -436,7 +436,7 @@ impl Shared {
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loan.task
                 .as_mut()
-                .expect("original installed FileTask")
+                .expect("original installed FileIoJob")
                 .poll_drain(&mut cx)
         }));
         let joined = match polled {
@@ -1129,7 +1129,7 @@ impl PreparedRangeCandidate {
                     }
                 });
                 self.shared
-                    .spawn_watcher(self.context.task_spawner.as_ref(), body);
+                    .spawn_watcher(self.context.io_spawner.as_ref(), body);
                 Ok(ConnectorPreparationProgress::Pending)
             }
         }
@@ -1160,8 +1160,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_fs::{
-        FileIdentity, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
-        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        FileIdentity, FileIoRuntime, FileIoSpawner, FileRangeScope, FileRangeService,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_spi::connector::StorageAccessDomainId;
 
@@ -1183,13 +1183,13 @@ mod tests {
         let file = access
             .bind(0, FileIdentity::new(location, 16, None))
             .expect("bind input");
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current()));
         let service = FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
             tokio::runtime::Handle::current(),
         );
         let context = FileReadContext {
@@ -1197,7 +1197,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current()))
                 as Arc<dyn FileIoRuntime>,
-            task_spawner,
+            io_spawner,
             range: Some(service.bind(
                 FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
@@ -1254,7 +1254,7 @@ mod tests {
     fn start_owned_test_watcher(
         shared: &Arc<Shared>,
         operations: &novarocks_spi::connector::read_stack::ConnectorSourceOperations,
-        body: novarocks_fs::FileTaskFuture,
+        body: novarocks_fs::FileIoFuture,
     ) {
         {
             let mut state = shared.lock();
@@ -1267,7 +1267,7 @@ mod tests {
                 .expect("watcher admission"),
         );
         shared.spawn_watcher(
-            &TokioFileTaskSpawner::new(tokio::runtime::Handle::current()),
+            &TokioFileIoSpawner::new(tokio::runtime::Handle::current()),
             body,
         );
     }
@@ -1377,7 +1377,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actual_input_and_original_join_survive_reclaim_tail_and_cancelled_waiter() {
-        use super::super::test_spawners::{CountingTaskSpawner, route_reads_through};
+        use super::super::test_spawners::{CountingFileIoSpawner, route_reads_through};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("prepared-input");
@@ -1392,7 +1392,7 @@ mod tests {
             .expect("access")
             .bind(0, FileIdentity::new(location, 16, None))
             .expect("file");
-        let spawner = Arc::new(CountingTaskSpawner {
+        let spawner = Arc::new(CountingFileIoSpawner {
             handle: tokio::runtime::Handle::current(),
             spawned: AtomicUsize::new(0),
         });
@@ -1400,7 +1400,7 @@ mod tests {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
-            task_spawner: spawner.clone(),
+            io_spawner: spawner.clone(),
             range: None,
         };
         let operations = route_reads_through(
@@ -1634,8 +1634,8 @@ mod tests {
         drops: Arc<std::sync::atomic::AtomicUsize>,
         payload_drops: Arc<std::sync::atomic::AtomicUsize>,
     }
-    impl FileTaskSpawner for RejectWatcherSpawner {
-        fn spawn(&self, task: novarocks_fs::FileTaskFuture) -> novarocks_fs::FileResult<FileTask> {
+    impl FileIoSpawner for RejectWatcherSpawner {
+        fn spawn(&self, task: novarocks_fs::FileIoFuture) -> novarocks_fs::FileResult<FileIoJob> {
             // This exact spawner delivers no job and returns only after the
             // future and its real captures have been destructed normally.
             drop(task);
@@ -1771,7 +1771,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_and_reclaim_between_result_observation_and_commit_do_not_resurrect_real_input() {
-        use super::super::test_spawners::{CountingTaskSpawner, route_reads_through};
+        use super::super::test_spawners::{CountingFileIoSpawner, route_reads_through};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         for stop in [false, true] {
             let directory = tempfile::tempdir().expect("real input directory");
@@ -1787,7 +1787,7 @@ mod tests {
                 .expect("access")
                 .bind(0, FileIdentity::new(location, 16, None))
                 .expect("file");
-            let spawner = Arc::new(CountingTaskSpawner {
+            let spawner = Arc::new(CountingFileIoSpawner {
                 handle: tokio::runtime::Handle::current(),
                 spawned: AtomicUsize::new(0),
             });
@@ -1795,7 +1795,7 @@ mod tests {
                 cancellation: FileCancellation::new(),
                 deadline: Some(Instant::now() + Duration::from_secs(10)),
                 runtime: Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
-                task_spawner: spawner.clone(),
+                io_spawner: spawner.clone(),
                 range: None,
             };
             let operations =

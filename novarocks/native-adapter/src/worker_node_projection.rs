@@ -53,7 +53,9 @@ fn stream_fact(fact: &Fact) -> CoveredStatusStreamFact {
         Fact::TaskConvergenceUnchanged(value) => {
             CoveredStatusStreamFact::TaskConvergenceUnchanged(*value)
         }
-        Fact::ContextConvergence(value) => CoveredStatusStreamFact::ContextConvergence(*value),
+        Fact::ParticipationConvergence(value) => {
+            CoveredStatusStreamFact::ParticipationConvergence(*value)
+        }
         Fact::Quiesce(value) => CoveredStatusStreamFact::Quiesce(value.as_ref().clone()),
     }
 }

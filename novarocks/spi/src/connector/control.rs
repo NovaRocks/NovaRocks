@@ -22,16 +22,15 @@ use super::{
     ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
-    ConnectorDistributedRewriteResolver, ConnectorDocumentStorageBinding,
-    ConnectorDocumentStorageLease, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorProviderBinding, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
-    ConnectorStagedCreateLease, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
-    ConnectorWriteLease, ProviderBindingEpoch,
+    ConnectorDistributedRewriteResolver, ConnectorDocumentStorage, ConnectorDocumentStorageBinding,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateSession,
+    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorStatisticsSession,
+    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupSession,
+    ConnectorViewMetadata, ConnectorWrite, ConnectorWriteControl, ProviderBindingEpoch,
 };
 
 type CatalogHandleInstaller = dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync;
@@ -894,7 +893,7 @@ pub trait ConnectorControlResolver: Send + Sync {
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError>;
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError>;
 }
 
 /// Lifecycle port owned by the frontend composition root. Core may register
@@ -917,23 +916,23 @@ pub trait ConnectorControlRegistry:
 /// completes the execution-binding barrier. The opaque release action is
 /// frontend-owned and is never part of a wire contract.
 #[derive(Clone)]
-pub struct ConnectorControlPlanningLease {
+pub struct ConnectorControlPlanningPin {
     binding: Arc<ConnectorControlBinding>,
-    _release: Arc<PlanningLeaseRelease>,
+    _release: Arc<PlanningReleaseGuard>,
 }
 
-struct PlanningLeaseRelease {
+struct PlanningReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorControlPlanningLease {
+impl ConnectorControlPlanningPin {
     pub fn new(
         binding: Arc<ConnectorControlBinding>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Self {
         Self {
             binding,
-            _release: Arc::new(PlanningLeaseRelease {
+            _release: Arc::new(PlanningReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         }
@@ -956,7 +955,7 @@ impl ConnectorControlPlanningLease {
     /// not acquire whichever incarnation happens to be current at execution
     /// time. Retaining this lease inside the derived writer lease keeps the
     /// generation alive through staging without a second registry lookup.
-    pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, ConnectorError> {
+    pub fn derive_write_lease(&self) -> Result<ConnectorWrite, ConnectorError> {
         let write = self.binding.write().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -967,14 +966,14 @@ impl ConnectorControlPlanningLease {
         let provider_id = self.binding.descriptor().provider_id.clone();
         let catalog_properties = self.binding.catalog_properties()?.clone();
         let key = write.binding_key().clone();
-        let retained_planning_lease = self.clone();
-        ConnectorWriteLease::new_with_execution_distribution(
+        let retained_planning_pin = self.clone();
+        ConnectorWrite::new_with_execution_distribution(
             self.control_runtime_id(),
             key,
             write,
             provider_id,
             distribution,
-            move || drop(retained_planning_lease),
+            move || drop(retained_planning_pin),
         )
         .and_then(|lease| lease.with_catalog_properties(catalog_properties))
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
@@ -985,8 +984,8 @@ impl ConnectorControlPlanningLease {
     /// Statistics collection first asks the provider to pin a data version and
     /// then executes a normal connector read.  Both operations must therefore
     /// be fenced by the same generation; acquiring a new statistics or
-    /// planning lease between them could silently mix provider incarnations.
-    pub fn derive_statistics_lease(&self) -> Result<ConnectorStatisticsLease, ConnectorError> {
+    /// planning pin between them could silently mix provider incarnations.
+    pub fn derive_statistics_lease(&self) -> Result<ConnectorStatisticsSession, ConnectorError> {
         let statistics = self.binding.statistics().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -995,9 +994,9 @@ impl ConnectorControlPlanningLease {
         })?;
         let descriptor = self.binding.descriptor().clone();
         let incarnation = self.binding.incarnation();
-        let retained_planning_lease = self.clone();
-        ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
-            drop(retained_planning_lease)
+        let retained_planning_pin = self.clone();
+        ConnectorStatisticsSession::new(descriptor, incarnation, statistics, move || {
+            drop(retained_planning_pin)
         })
     }
 
@@ -1006,7 +1005,7 @@ impl ConnectorControlPlanningLease {
     /// observation and a later management decision.
     pub fn derive_document_storage_lease(
         &self,
-    ) -> Result<ConnectorDocumentStorageLease, ConnectorError> {
+    ) -> Result<ConnectorDocumentStorage, ConnectorError> {
         let document_storage = self.binding.document_storage().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -1016,14 +1015,14 @@ impl ConnectorControlPlanningLease {
         let descriptor = self.binding.descriptor().clone();
         let incarnation = self.binding.incarnation();
         let catalog_handle = self.binding.catalog_handle()?.clone();
-        let retained_planning_lease = self.clone();
-        ConnectorDocumentStorageLease::new(
+        let retained_planning_pin = self.clone();
+        ConnectorDocumentStorage::new(
             descriptor,
             self.control_runtime_id(),
             incarnation,
             catalog_handle,
             document_storage,
-            move || drop(retained_planning_lease),
+            move || drop(retained_planning_pin),
         )
     }
 
@@ -1031,11 +1030,11 @@ impl ConnectorControlPlanningLease {
     ///
     /// CREATE-adjacent operations which first inspect or prepare against a
     /// binding must not reacquire whichever mutation generation is current
-    /// later. Keeping the parent planning lease alive makes the mutation and
+    /// later. Keeping the parent planning pin alive makes the mutation and
     /// any subsequent writer lease generation-identical by construction.
     pub fn derive_mutation_lease(
         &self,
-    ) -> Result<super::ConnectorCatalogMutationLease, ConnectorError> {
+    ) -> Result<super::ConnectorCatalogMutationSession, ConnectorError> {
         let mutation = self.binding.mutation().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -1045,20 +1044,22 @@ impl ConnectorControlPlanningLease {
         let descriptor = self.binding.descriptor().clone();
         let control_runtime_id = self.binding.control_runtime_id();
         let provider_incarnation = self.binding.incarnation();
-        let retained_planning_lease = self.clone();
-        super::ConnectorCatalogMutationLease::new(
+        let retained_planning_pin = self.clone();
+        super::ConnectorCatalogMutationSession::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
             mutation,
-            move || drop(retained_planning_lease),
+            move || drop(retained_planning_pin),
         )
     }
 
     /// Derive the exact-generation atomic staged-publication capability.
     /// Unsupported providers fail before any source execution or external
     /// create/write side effect.
-    pub fn derive_staged_create_lease(&self) -> Result<ConnectorStagedCreateLease, ConnectorError> {
+    pub fn derive_staged_create_lease(
+        &self,
+    ) -> Result<ConnectorStagedCreateSession, ConnectorError> {
         let capability = self.binding.staged_create().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -1068,13 +1069,13 @@ impl ConnectorControlPlanningLease {
         let descriptor = self.binding.descriptor().clone();
         let control_runtime_id = self.binding.control_runtime_id();
         let provider_incarnation = self.binding.incarnation();
-        let retained_planning_lease = self.clone();
-        ConnectorStagedCreateLease::new_with_control_runtime(
+        let retained_planning_pin = self.clone();
+        ConnectorStagedCreateSession::new_with_control_runtime(
             descriptor,
             control_runtime_id,
             provider_incarnation,
             capability,
-            move || drop(retained_planning_lease),
+            move || drop(retained_planning_pin),
         )
     }
 
@@ -1083,7 +1084,7 @@ impl ConnectorControlPlanningLease {
     /// retired connector generation cannot use a newer catalog's warehouse.
     pub fn derive_unanchored_ctas_cleanup_lease(
         &self,
-    ) -> Result<ConnectorUnanchoredCtasCleanupLease, ConnectorError> {
+    ) -> Result<ConnectorUnanchoredCtasCleanupSession, ConnectorError> {
         let capability = self
             .binding
             .unanchored_ctas_cleanup()
@@ -1097,18 +1098,18 @@ impl ConnectorControlPlanningLease {
         let descriptor = self.binding.descriptor().clone();
         let control_runtime_id = self.binding.control_runtime_id();
         let provider_incarnation = self.binding.incarnation();
-        let retained_planning_lease = self.clone();
-        ConnectorUnanchoredCtasCleanupLease::new_with_control_runtime(
+        let retained_planning_pin = self.clone();
+        ConnectorUnanchoredCtasCleanupSession::new_with_control_runtime(
             descriptor,
             control_runtime_id,
             provider_incarnation,
             capability,
-            move || drop(retained_planning_lease),
+            move || drop(retained_planning_pin),
         )
     }
 }
 
-impl Drop for PlanningLeaseRelease {
+impl Drop for PlanningReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;

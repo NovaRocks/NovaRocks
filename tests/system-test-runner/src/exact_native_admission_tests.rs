@@ -80,8 +80,9 @@ fn root_nested_unknown_fields_and_clock_capacity_changes_are_rejected() {
 #[test]
 fn actual_build_record_is_one_exact_feature_line_with_independent_full_commit() {
     let revision = "1".repeat(40);
-    let valid =
-        format!("{IDENTITY_PREFIX}{revision} build_identity={revision} exact_mysql_write=true\n");
+    let valid = format!(
+        "{IDENTITY_PREFIX} commit={revision} build_identity={revision} exact_mysql_write=true\n"
+    );
     assert_eq!(
         server_identity(valid.as_bytes(), &revision).unwrap(),
         revision

@@ -31,7 +31,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 pub use novarocks_workload_control::CancellationView;
 use novarocks_workload_control::WorkId;
@@ -40,7 +40,7 @@ use super::ExecutionSchedulingFacts;
 use super::{QueryExecutionError, QueryExecutionErrorKind, StatementNativeHealthFailure};
 use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::coordination::{
-    AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
+    AbortParticipationEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
     ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
@@ -133,7 +133,7 @@ pub enum NativeAttemptTopologyRequirement {
 
 /// Independent exact process-replacement evidence retained beside an original
 /// pre-ready Establish or Create refusal. Native must have correlated a real
-/// Worker IdentityMismatch with its original operation and Task/context; QA
+/// Worker IdentityMismatch with its original operation and Task/participation; QA
 /// retains the parent Establish and current recovery policy. The producer must
 /// also observe a different process at its frozen endpoint within the ORIGINAL
 /// observation horizon. This value does not claim
@@ -147,7 +147,7 @@ pub struct PreReadyProcessReplacementWitness {
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreReadyProcessReplacementFacts {
-    context: novarocks_execution_contract::QueryContextRef,
+    participation: novarocks_execution_contract::ParticipationRef,
     operation_id: novarocks_execution_contract::TaskOperationId,
     kind: novarocks_execution_contract::OperationKind,
     replacement: BackendProcessId,
@@ -156,23 +156,24 @@ struct PreReadyProcessReplacementFacts {
 impl PreReadyProcessReplacementWitness {
     pub fn try_new(
         input: &crate::execution_error::ExecutionFailureInput,
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
         operation_id: novarocks_execution_contract::TaskOperationId,
         replacement: BackendProcessId,
     ) -> Result<Self, &'static str> {
-        let Some((original_context, original_operation, kind)) = Self::refusal_operation(input)
+        let Some((original_participation, original_operation, kind)) =
+            Self::refusal_operation(input)
         else {
             return Err("pre-ready replacement evidence has no exact original refusal");
         };
-        if original_context != context
+        if original_participation != participation
             || original_operation != operation_id
-            || replacement == context.backend_process_id()
+            || replacement == participation.backend_process_id()
         {
             return Err("pre-ready replacement evidence does not match its original refusal");
         }
         Ok(Self {
             facts: Arc::new(PreReadyProcessReplacementFacts {
-                context,
+                participation,
                 operation_id,
                 kind,
                 replacement,
@@ -183,7 +184,7 @@ impl PreReadyProcessReplacementWitness {
     pub(crate) fn refusal_operation(
         input: &crate::execution_error::ExecutionFailureInput,
     ) -> Option<(
-        QueryContextRef,
+        ParticipationRef,
         novarocks_execution_contract::TaskOperationId,
         novarocks_execution_contract::OperationKind,
     )> {
@@ -200,15 +201,15 @@ impl PreReadyProcessReplacementWitness {
         }
         match input.site() {
             ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id,
-                kind: kind @ (OperationKind::UpdateQueryContext | OperationKind::CreateTask),
-            } => Some((context, operation_id, kind)),
+                kind: kind @ (OperationKind::UpdateParticipation | OperationKind::CreateTask),
+            } => Some((participation, operation_id, kind)),
             _ => None,
         }
     }
-    pub fn context(&self) -> novarocks_execution_contract::QueryContextRef {
-        self.facts.context
+    pub fn participation(&self) -> novarocks_execution_contract::ParticipationRef {
+        self.facts.participation
     }
     pub fn operation_id(&self) -> novarocks_execution_contract::TaskOperationId {
         self.facts.operation_id
@@ -223,7 +224,7 @@ impl PreReadyProcessReplacementWitness {
         input.fact() == self.facts.refusal_fact
             && input.site()
                 == (crate::execution_error::ExecutionFailureSite::Operation {
-                    context: self.facts.context,
+                    participation: self.facts.participation,
                     operation_id: self.facts.operation_id,
                     kind: self.facts.kind,
                 })
@@ -269,7 +270,7 @@ impl NativeAttemptPreparationFailure {
             || self.input().topology_requirement(),
             |witness| {
                 NativeAttemptTopologyRequirement::ExcludeProcess(
-                    witness.context().backend_process_id(),
+                    witness.participation().backend_process_id(),
                 )
             },
         )
@@ -357,7 +358,7 @@ pub trait LogicalExecutionNativePort: fmt::Debug + Send + Sync + 'static {
 /// ```
 pub struct NativeLogicalExecutionSeed {
     plan: crate::api::PlanSeal,
-    aborts: Arc<dyn AbortQueryContextEffectPort>,
+    aborts: Arc<dyn AbortParticipationEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Box<dyn NativeAttemptPreparationPort>,
 }
@@ -377,7 +378,7 @@ impl NativeLogicalExecutionSeed {
     /// substitute a caller-declared plan seal.
     pub(crate) fn issue(
         plan: crate::api::PlanSeal,
-        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
@@ -431,72 +432,74 @@ pub type NativeAttemptRunFuture<'a> =
 pub type NativeAttemptConvergenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send + 'a>>;
 
-/// Positive evidence which closes one exact active query context.
+/// Positive evidence which closes one exact active participation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeContextConvergence {
-    context: QueryContextRef,
-    kind: NativeContextConvergenceKind,
+pub struct NativeParticipationConvergence {
+    participation: ParticipationRef,
+    kind: NativeParticipationConvergenceKind,
 }
 
-impl NativeContextConvergence {
-    pub const fn never_established(context: QueryContextRef) -> Self {
+impl NativeParticipationConvergence {
+    pub const fn never_established(participation: ParticipationRef) -> Self {
         Self {
-            context,
-            kind: NativeContextConvergenceKind::NeverEstablished,
+            participation,
+            kind: NativeParticipationConvergenceKind::NeverEstablished,
         }
     }
 
-    pub const fn worker_stopped_and_context_fenced(context: QueryContextRef) -> Self {
+    pub const fn worker_stopped_and_participation_fenced(participation: ParticipationRef) -> Self {
         Self {
-            context,
-            kind: NativeContextConvergenceKind::WorkerStoppedAndContextFenced,
+            participation,
+            kind: NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced,
         }
     }
 
-    pub const fn worker_process_replaced(context: QueryContextRef) -> Self {
+    pub const fn worker_process_replaced(participation: ParticipationRef) -> Self {
         Self {
-            context,
-            kind: NativeContextConvergenceKind::WorkerProcessReplaced,
+            participation,
+            kind: NativeParticipationConvergenceKind::WorkerProcessReplaced,
         }
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
-    pub const fn kind(self) -> NativeContextConvergenceKind {
+    pub const fn kind(self) -> NativeParticipationConvergenceKind {
         self.kind
     }
 }
 
-/// Why the residual responsibility for one exact context may be retired.
+/// Why the residual responsibility for one exact participation may be retired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeContextConvergenceKind {
+pub enum NativeParticipationConvergenceKind {
     NeverEstablished,
-    WorkerStoppedAndContextFenced,
+    WorkerStoppedAndParticipationFenced,
     WorkerProcessReplaced,
 }
 
 /// Closed convergence facts returned by an active Native owner.
 ///
 /// `AllWorkersStoppedAndContextsFenced` is the compact form for owners which
-/// positively observed the whole attempt drain. The per-context form is used
+/// positively observed the whole attempt drain. The per-participation form is used
 /// when an exact process replacement closes only part of an attempt. An
-/// never-established context has no Worker task or context responsibility.
+/// never-established participation has no Worker task or participation responsibility.
 /// An unobservable Worker is deliberately not representable as convergence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAttemptConvergence {
-    AllWorkersStoppedAndContextsFenced,
-    Contexts(Box<[NativeContextConvergence]>),
+    AllWorkersStoppedAndParticipationsFenced,
+    Participations(Box<[NativeParticipationConvergence]>),
 }
 
 impl NativeAttemptConvergence {
-    pub const fn all_workers_stopped_and_contexts_fenced() -> Self {
-        Self::AllWorkersStoppedAndContextsFenced
+    pub const fn all_workers_stopped_and_participations_fenced() -> Self {
+        Self::AllWorkersStoppedAndParticipationsFenced
     }
 
-    pub fn contexts(contexts: impl Into<Box<[NativeContextConvergence]>>) -> Self {
-        Self::Contexts(contexts.into())
+    pub fn participations(
+        participations: impl Into<Box<[NativeParticipationConvergence]>>,
+    ) -> Self {
+        Self::Participations(participations.into())
     }
 }
 
@@ -560,7 +563,7 @@ impl NativeActiveConvergenceRequest {
 pub enum NativeActiveConvergenceClosure {
     Evidence(NativeAttemptConvergence),
     RemoteTrackingEnded {
-        exact_contexts: Box<[QueryContextRef]>,
+        exact_participations: Box<[ParticipationRef]>,
     },
 }
 
@@ -990,7 +993,7 @@ impl LogicalNativeOpenRequest {
 #[derive(Debug)]
 pub struct LogicalNativeSession {
     ticket: Arc<LogicalNativeTicket>,
-    aborts: Arc<dyn AbortQueryContextEffectPort>,
+    aborts: Arc<dyn AbortParticipationEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Option<NativeAttemptPreparationState>,
     pending_work: Option<NativeAttemptPreparationWork>,
@@ -1195,7 +1198,7 @@ impl LogicalNativeSession {
         Ok(prepared)
     }
 
-    pub(crate) fn abort_effect_port(&self) -> Arc<dyn AbortQueryContextEffectPort> {
+    pub(crate) fn abort_effect_port(&self) -> Arc<dyn AbortParticipationEffectPort> {
         Arc::clone(&self.aborts)
     }
 
@@ -1301,7 +1304,7 @@ impl NativeAttemptPreparationRequest {
     }
 
     /// Consumes this exact prepare ticket and seals Native-owned scheduling
-    /// inputs. Query Application alone derives the context and Task manifest.
+    /// inputs. Query Application alone derives the participation and Task manifest.
     pub fn bind(
         self,
         scheduling: ExecutionSchedulingFacts,
@@ -1721,7 +1724,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -1800,7 +1803,7 @@ mod tests {
 
     fn seed_for_description(
         description: &FrozenExecutionDescription,
-        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> NativeLogicalExecutionSeed {
@@ -2629,21 +2632,21 @@ mod tests {
 /// Shared typed fixture for the QA carrier, pump, and recovery boundary tests.
 #[cfg(test)]
 pub(crate) fn pre_ready_identity_refusal_test_fixture(
-    context: novarocks_execution_contract::QueryContextRef,
+    participation: novarocks_execution_contract::ParticipationRef,
 ) -> (
     crate::execution_error::ExecutionFailureInput,
     PreReadyProcessReplacementWitness,
     NativeAttemptPreparationFailure,
 ) {
     pre_ready_identity_refusal_test_fixture_for_kind(
-        context,
-        novarocks_execution_contract::OperationKind::UpdateQueryContext,
+        participation,
+        novarocks_execution_contract::OperationKind::UpdateParticipation,
     )
 }
 
 #[cfg(test)]
 pub(crate) fn pre_ready_identity_refusal_test_fixture_for_kind(
-    context: novarocks_execution_contract::QueryContextRef,
+    participation: novarocks_execution_contract::ParticipationRef,
     kind: novarocks_execution_contract::OperationKind,
 ) -> (
     crate::execution_error::ExecutionFailureInput,
@@ -2663,14 +2666,14 @@ pub(crate) fn pre_ready_identity_refusal_test_fixture_for_kind(
         ),
         SafeDetail::truncating("backend process id mismatch"),
         ExecutionFailureSite::Operation {
-            context,
+            participation,
             operation_id,
             kind,
         },
     );
     let witness = PreReadyProcessReplacementWitness::try_new(
         &input,
-        context,
+        participation,
         operation_id,
         BackendProcessId::new_v7(),
     )
@@ -2691,38 +2694,38 @@ mod pre_ready_replacement_evidence_tests {
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         use novarocks_execution_contract::{
-            QueryContextRef, SafeDetail, failure::FailureProjection,
+            ParticipationRef, SafeDetail, failure::FailureProjection,
         };
         use novarocks_types::{AttemptId, FrontendProcessId, QueryId};
         let execution =
             QueryExecutionId::new(QueryId::new(29, 31), AttemptId::new(1).unwrap()).unwrap();
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
-        let (input, witness, failure) = pre_ready_identity_refusal_test_fixture(context);
+        let (input, witness, failure) = pre_ready_identity_refusal_test_fixture(participation);
         assert_eq!(failure.input(), &input);
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         assert_eq!(failure.error().execution_failure(), Some(&input));
         assert_eq!(failure.pre_ready_replacement(), Some(&witness));
         assert_eq!(
             failure.topology_requirement(),
-            NativeAttemptTopologyRequirement::ExcludeProcess(context.backend_process_id())
+            NativeAttemptTopologyRequirement::ExcludeProcess(participation.backend_process_id())
         );
         assert!(
             PreReadyProcessReplacementWitness::try_new(
                 &input,
-                context,
+                participation,
                 witness.operation_id(),
-                context.backend_process_id()
+                participation.backend_process_id()
             )
             .is_err()
         );
         assert!(
             PreReadyProcessReplacementWitness::try_new(
                 &input,
-                context,
+                participation,
                 novarocks_execution_contract::TaskOperationId::new_v7(),
                 witness.replacement_process()
             )
@@ -2732,13 +2735,13 @@ mod pre_ready_replacement_evidence_tests {
             input.fact(),
             input.detail().clone(),
             ExecutionFailureSite::Backend {
-                process: context.backend_process_id(),
+                process: participation.backend_process_id(),
             },
         );
         assert!(
             PreReadyProcessReplacementWitness::try_new(
                 &foreign,
-                context,
+                participation,
                 witness.operation_id(),
                 witness.replacement_process()
             )
@@ -2761,32 +2764,38 @@ mod pre_ready_replacement_evidence_tests {
     #[test]
     fn create_replacement_witness_preserves_kind_and_rejects_cross_kind_input() {
         use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
-        use novarocks_execution_contract::{OperationKind, QueryContextRef};
+        use novarocks_execution_contract::{OperationKind, ParticipationRef};
         let execution = QueryExecutionId::new(
             novarocks_types::QueryId::new(29, 33),
             novarocks_types::AttemptId::new(1).unwrap(),
         )
         .unwrap();
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution,
             novarocks_types::FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
-        let (input, witness, failure) =
-            pre_ready_identity_refusal_test_fixture_for_kind(context, OperationKind::CreateTask);
+        let (input, witness, failure) = pre_ready_identity_refusal_test_fixture_for_kind(
+            participation,
+            OperationKind::CreateTask,
+        );
         assert_eq!(failure.input(), &input);
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         assert_eq!(
             PreReadyProcessReplacementWitness::refusal_operation(&input),
-            Some((context, witness.operation_id(), OperationKind::CreateTask))
+            Some((
+                participation,
+                witness.operation_id(),
+                OperationKind::CreateTask
+            ))
         );
         let other = ExecutionFailureInput::new(
             input.fact(),
             input.detail().clone(),
             ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id: witness.operation_id(),
-                kind: OperationKind::UpdateQueryContext,
+                kind: OperationKind::UpdateParticipation,
             },
         );
         assert!(!witness.matches_input(&other));
@@ -2794,7 +2803,7 @@ mod pre_ready_replacement_evidence_tests {
             input.fact(),
             input.detail().clone(),
             ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id: witness.operation_id(),
                 kind: OperationKind::UpdateTask,
             },
@@ -2802,7 +2811,7 @@ mod pre_ready_replacement_evidence_tests {
         assert!(
             PreReadyProcessReplacementWitness::try_new(
                 &unrelated,
-                context,
+                participation,
                 witness.operation_id(),
                 witness.replacement_process()
             )

@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_native_trust::NativeEndpointConnector;
 use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
@@ -65,10 +65,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Normal context fencing and release are small control operations.
 const CONTROL_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations";
 
-const CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
-const CREATE_IDEMPOTENT: &str = "NOVAROCKS_TASK_CREATE_IDEMPOTENT";
-const CREATE_ACK_DROPPED: &str = "NOVAROCKS_TASK_CREATE_ACK_DROPPED";
-const LEASE_RENEWED: &str = "NOVAROCKS_TASK_LEASE_RENEWED";
+const CREATE_APPLIED: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
+const CREATE_IDEMPOTENT: &str = novarocks_failpoint::observation_marker::TASK_CREATE_IDEMPOTENT;
+const CREATE_ACK_DROPPED: &str = novarocks_failpoint::observation_marker::TASK_CREATE_ACK_DROPPED;
+const LEASE_RENEWED: &str = novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_RENEWED;
 
 const STATIC_FRAGMENTS_FROZEN: &str = "novarocks_task_static_fragments_frozen_total";
 const STATIC_FRAGMENTS_RETAINED: &str = "novarocks_task_static_fragments_retained";
@@ -176,14 +176,15 @@ impl Scenario for FrozenReplayAndMembership {
             outcome(&active)? == proto::TaskOperationOutcome::Idempotent,
             "the unchanged active Establish must be idempotent: {active:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContext(active_ack)) =
+        let Some(proto::task_operation_verdict::Ack::Participation(active_ack)) =
             receipt_verdict(&active)?.ack.as_ref()
         else {
             bail!("active Establish replay lost its typed Context acknowledgement: {active:?}");
         };
         ensure!(
-            active_ack.query_context.as_ref() == Some(&session.context_under(session.frontend, 1))
-                && active_ack.state == proto::QueryContextState::Active as i32,
+            active_ack.participation.as_ref()
+                == Some(&session.participation_under(session.frontend, 1))
+                && active_ack.state == proto::ParticipationState::Active as i32,
             "active Establish replay changed the actual Context: {active_ack:?}"
         );
         let current_credential = session.advance_original_credential_epoch()?;
@@ -196,17 +197,18 @@ impl Scenario for FrozenReplayAndMembership {
             "unchanged original Establish after actual credential advance",
         )?;
         ensure!(
-            outcome(&stale)? == proto::TaskOperationOutcome::ContextConflict,
+            outcome(&stale)? == proto::TaskOperationOutcome::ParticipationConflict,
             "the old original Establish must conflict with the advanced current credential: {stale:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContext(stale_ack)) =
+        let Some(proto::task_operation_verdict::Ack::Participation(stale_ack)) =
             receipt_verdict(&stale)?.ack.as_ref()
         else {
             bail!("conflicting original Establish lost its current Context receipt: {stale:?}");
         };
         ensure!(
-            stale_ack.query_context.as_ref() == Some(&session.context_under(session.frontend, 1))
-                && stale_ack.state == proto::QueryContextState::Active as i32,
+            stale_ack.participation.as_ref()
+                == Some(&session.participation_under(session.frontend, 1))
+                && stale_ack.state == proto::ParticipationState::Active as i32,
             "conflicting original Establish changed the active Context: {stale_ack:?}"
         );
         ensure!(
@@ -222,15 +224,15 @@ impl Scenario for FrozenReplayAndMembership {
                 "original_operation_preserved": true,
                 "active_replay": "Idempotent",
                 "credential_advance": "Apply",
-                "current_credential_lease": current_credential.lease_id,
+                "current_credential_lease": current_credential.credential_domain_id,
                 "current_credential_epoch": current_credential.epoch,
-                "unchanged_original_replay_after_advance": "ContextConflict",
+                "unchanged_original_replay_after_advance": "ParticipationConflict",
                 "carrier_evidence": "distinct RPC submissions; Worker issues carrier identities",
                 "comparison_evidence": "active Pure Idempotent requires the actual current-credential comparison; no independent M or getter counter",
                 "material_omitted": true,
             }))?,
         )?;
-        context.action("the unchanged active Establish replay returned Idempotent; an actual same-lease credential advance returned Apply, and replaying the untouched original operation then returned ContextConflict; the original snapshot and all later Create bodies remain unchanged");
+        context.action("the unchanged active Establish replay returned Idempotent; an actual same-lease credential advance returned Apply, and replaying the untouched original operation then returned ParticipationConflict; the original snapshot and all later Create bodies remain unchanged");
 
         // The winner.
         let first = RawCreate::values(&session, 1);
@@ -288,9 +290,10 @@ impl Scenario for FrozenReplayAndMembership {
 
         // Another scope never reads this identity's receipt.
         let mut foreign_frontend = first.clone();
-        foreign_frontend.context = session.context_under(FrontendProcessId::new_v7(), 1);
+        foreign_frontend.participation =
+            session.participation_under(FrontendProcessId::new_v7(), 1);
         let mut next_attempt = first.clone();
-        next_attempt.context = session.context_under(session.frontend, 2);
+        next_attempt.participation = session.participation_under(session.frontend, 2);
         let mut foreign_backend = first.clone();
         let stranger = BackendProcessId::new_v7();
         foreign_backend.backend_override = Some(stranger);
@@ -341,7 +344,12 @@ impl Scenario for FrozenReplayAndMembership {
             context,
             "the failed preparation's terminal marker",
             2,
-            |context| session.marker_count(context, "NOVAROCKS_TASK_TERMINAL_RETAINED"),
+            |context| {
+                session.marker_count(
+                    context,
+                    novarocks_failpoint::observation_marker::TASK_TERMINAL_RETAINED,
+                )
+            },
         )?;
         let mut legal = refused.clone();
         legal.initial_domains.clear();
@@ -503,12 +511,16 @@ impl RawBackendSession {
             establish_request: None,
             query_id,
         };
-        let query_context = session.context_under(session.frontend, 1);
+        let target_participation = session.participation_under(session.frontend, 1);
         let acquisition = session.apply(
-            raw_acquire_admission_ticket(query_context.clone(), compatibility, admission_epoch),
+            raw_acquire_admission_ticket(
+                target_participation.clone(),
+                compatibility,
+                admission_epoch,
+            ),
             "admission ticket acquisition",
         )?;
-        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+        let Some(proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(ticket)) =
             receipt_verdict(&acquisition)?.ack.clone()
         else {
             bail!("admission acquisition was not granted: {:?}", acquisition);
@@ -516,7 +528,8 @@ impl RawBackendSession {
         let ticket = ticket
             .ticket_id
             .context("the admission acknowledgement omitted its ticket id")?;
-        let establish_request = raw_establish(query_context, ticket, Some(compatibility.to_vec()));
+        let establish_request =
+            raw_establish(target_participation, ticket, Some(compatibility.to_vec()));
         let establish = session.apply(establish_request.clone(), "Establish")?;
         session.establish_request = Some(establish_request);
         ensure!(
@@ -529,27 +542,27 @@ impl RawBackendSession {
     /// Advance exactly the original empty-storage credential domain through
     /// the real Native operation. Keep the frozen Establish replay source
     /// immutable; existing RawCreate carries no context credential epoch.
-    fn advance_original_credential_epoch(&self) -> Result<proto::QueryContextCredentialDomain> {
+    fn advance_original_credential_epoch(&self) -> Result<proto::ParticipationCredentialDomain> {
         let operation = self
             .establish_request
             .as_ref()
             .context("the raw session lost its original Establish")?;
-        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(proto::task_operation::Operation::UpdateParticipation(update)) =
             &operation.operation
         else {
             bail!("the original operation is not a query-context update")
         };
-        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+        let Some(proto::update_participation_request::Command::Establish(establish)) =
             &update.command
         else {
             bail!("the original query-context update is not Establish")
         };
-        let query_context = establish
-            .query_context
+        let target_participation = establish
+            .participation
             .clone()
             .context("the original Establish omitted its exact Context")?;
         ensure!(
-            query_context == self.context_under(self.frontend, 1),
+            target_participation == self.participation_under(self.frontend, 1),
             "the original Establish belongs to a different Context"
         );
         let mut credential = establish
@@ -567,14 +580,14 @@ impl RawBackendSession {
         let receipt = self.apply(
             proto::TaskOperation {
                 envelope: Some(raw_operation_envelope(15_000)),
-                operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-                    proto::UpdateQueryContextRequest {
-                        command: Some(proto::update_query_context_request::Command::AdvanceDomain(
-                            proto::AdvanceQueryContextDomainRequest {
-                                query_context: Some(query_context.clone()),
-                                domain: Some(proto::QueryContextDomainUpdate {
+                operation: Some(proto::task_operation::Operation::UpdateParticipation(
+                    proto::UpdateParticipationRequest {
+                        command: Some(proto::update_participation_request::Command::AdvanceDomain(
+                            proto::AdvanceParticipationDomainRequest {
+                                participation: Some(target_participation.clone()),
+                                domain: Some(proto::ParticipationDomainUpdate {
                                     domain: Some(
-                                        proto::query_context_domain_update::Domain::Credential(
+                                        proto::participation_domain_update::Domain::Credential(
                                             credential.clone(),
                                         ),
                                     ),
@@ -590,14 +603,14 @@ impl RawBackendSession {
             outcome(&receipt)? == proto::TaskOperationOutcome::Accepted,
             "the exact next credential epoch was not accepted: {receipt:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+        let Some(proto::task_operation_verdict::Ack::Participation(ack)) =
             receipt_verdict(&receipt)?.ack.as_ref()
         else {
             bail!("credential advance omitted its typed Context acknowledgement: {receipt:?}");
         };
         ensure!(
-            ack.query_context.as_ref() == Some(&query_context)
-                && ack.state == proto::QueryContextState::Active as i32
+            ack.participation.as_ref() == Some(&target_participation)
+                && ack.state == proto::ParticipationState::Active as i32
                 && ack.accepted_domains.len() == 1,
             "credential advance changed the exact active Context or receipt cardinality: {ack:?}"
         );
@@ -605,20 +618,20 @@ impl RawBackendSession {
         ensure!(
             domain.progression == proto::AcceptedDomainProgression::Apply as i32
                 && matches!(domain.receipt.as_ref(),
-                Some(proto::query_context_domain_receipt::Receipt::Credential(current))
-                if current.lease_id == credential.lease_id && current.accepted_epoch == credential.epoch),
+                Some(proto::participation_domain_receipt::Receipt::Credential(current))
+                if current.credential_domain_id == credential.credential_domain_id && current.accepted_epoch == credential.epoch),
             "credential advance did not attest the same lease and actual next epoch Apply: {domain:?}"
         );
         Ok(credential)
     }
 
     /// This session's query context, under `frontend` and `attempt`.
-    pub(super) fn context_under(
+    pub(super) fn participation_under(
         &self,
         frontend: FrontendProcessId,
         attempt: u64,
-    ) -> proto::QueryContextRef {
-        proto::QueryContextRef {
+    ) -> proto::ParticipationRef {
+        proto::ParticipationRef {
             query_execution_id: Some(proto::QueryExecutionId {
                 query_id: Some(self.query_id),
                 attempt_id: attempt,
@@ -663,7 +676,7 @@ impl RawBackendSession {
     pub(super) fn release_when_ready(
         &self,
         context: &mut ScenarioContext,
-    ) -> Result<proto::ReleaseQueryContextOutcome> {
+    ) -> Result<proto::ReleaseParticipationOutcome> {
         let quiesce: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
             &self.control_connector,
             CONTROL_PATH,
@@ -671,17 +684,19 @@ impl RawBackendSession {
             proto::ApplyTaskControlOperationsRequest {
                 operations: vec![proto::TaskControlOperation {
                     envelope: Some(raw_operation_envelope(999)),
-                    control: Some(proto::task_control_operation::Control::QuiesceQueryContext(
-                        proto::QuiesceQueryContextRequest {
-                            query_context: Some(self.context_under(self.frontend, 1)),
-                        },
-                    )),
+                    control: Some(
+                        proto::task_control_operation::Control::QuiesceParticipation(
+                            proto::QuiesceParticipationRequest {
+                                participation: Some(self.participation_under(self.frontend, 1)),
+                            },
+                        ),
+                    ),
                 }],
             },
             self.original_deadline,
         )?;
-        let receipt = only_successful_receipt(quiesce, "QuiesceQueryContext")?;
-        let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(fence)) =
+        let receipt = only_successful_receipt(quiesce, "QuiesceParticipation")?;
+        let Some(proto::task_operation_verdict::Ack::QuiesceParticipation(fence)) =
             receipt_verdict(&receipt)?.ack.clone()
         else {
             bail!("normal context fence returned no Quiesce acknowledgement: {receipt:?}");
@@ -704,9 +719,11 @@ impl RawBackendSession {
                         operations: vec![proto::TaskControlOperation {
                             envelope: Some(raw_operation_envelope(1_000)),
                             control: Some(
-                                proto::task_control_operation::Control::ReleaseQueryContext(
-                                    proto::ReleaseQueryContextRequest {
-                                        query_context: Some(self.context_under(self.frontend, 1)),
+                                proto::task_control_operation::Control::ReleaseParticipation(
+                                    proto::ReleaseParticipationRequest {
+                                        participation: Some(
+                                            self.participation_under(self.frontend, 1),
+                                        ),
                                     },
                                 ),
                             ),
@@ -714,15 +731,15 @@ impl RawBackendSession {
                     },
                     self.original_deadline,
                 )?;
-            let receipt = only_successful_receipt(response, "ReleaseQueryContext")?;
-            let Some(proto::task_operation_verdict::Ack::ReleaseQueryContext(ack)) =
+            let receipt = only_successful_receipt(response, "ReleaseParticipation")?;
+            let Some(proto::task_operation_verdict::Ack::ReleaseParticipation(ack)) =
                 receipt_verdict(&receipt)?.ack.clone()
             else {
                 bail!("the release returned no release acknowledgement: {receipt:?}");
             };
-            let released = proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
+            let released = proto::ReleaseParticipationOutcome::try_from(ack.outcome)
                 .context("decode the release outcome")?;
-            if released != proto::ReleaseQueryContextOutcome::NotReady {
+            if released != proto::ReleaseParticipationOutcome::NotReady {
                 return Ok(released);
             }
             let remaining = context.remaining("release the raw query context")?;
@@ -1041,7 +1058,7 @@ pub(super) fn compiled_fragment(
 /// fact and keep the identity.
 #[derive(Clone)]
 pub(super) struct RawCreate {
-    pub(super) context: proto::QueryContextRef,
+    pub(super) participation: proto::ParticipationRef,
     pub(super) task_id: u32,
     pub(super) backend_override: Option<BackendProcessId>,
     pub(super) kernel_key_low: i64,
@@ -1059,7 +1076,7 @@ impl RawCreate {
     /// frozen for exactly its own parallelism.
     pub(super) fn values(session: &RawBackendSession, task_id: u32) -> Self {
         Self {
-            context: session.context_under(session.frontend, 1),
+            participation: session.participation_under(session.frontend, 1),
             task_id,
             backend_override: None,
             kernel_key_low: session
@@ -1081,19 +1098,19 @@ impl RawCreate {
         use prost::Message;
 
         let execution = self
-            .context
+            .participation
             .query_execution_id
             .expect("a raw context carries its execution");
-        let mut context = self.context.clone();
+        let mut participation = self.participation.clone();
         let backend = match self.backend_override {
             Some(backend) => {
                 let backend = proto::BackendProcessId {
                     value: backend.to_bytes().to_vec(),
                 };
-                context.backend_process_id = Some(backend.clone());
+                participation.backend_process_id = Some(backend.clone());
                 backend
             }
-            None => context
+            None => participation
                 .backend_process_id
                 .clone()
                 .expect("a raw context carries its backend"),
@@ -1106,7 +1123,7 @@ impl RawCreate {
             &[],
         );
         let metadata = proto::CreationMetadata {
-            query_context: Some(context),
+            participation: Some(participation),
             descriptor: Some(proto::TaskDescriptor {
                 identity: Some(proto::TaskIdentity {
                     query_execution_id: Some(execution),
@@ -1114,7 +1131,7 @@ impl RawCreate {
                     task_id: self.task_id,
                     backend_process_id: Some(backend),
                 }),
-                fragment_instance_id: Some(common::UniqueId {
+                task_key: Some(common::UniqueId {
                     hi: 0x5b,
                     lo: self.kernel_key_low,
                 }),
@@ -1136,9 +1153,9 @@ impl RawCreate {
                                         .map(|process| proto::BackendProcessId {
                                             value: process.to_bytes().to_vec(),
                                         })
-                                        .or_else(|| self.context.backend_process_id.clone()),
+                                        .or_else(|| self.participation.backend_process_id.clone()),
                                 }),
-                                fragment_instance_id: Some(common::UniqueId {
+                                task_key: Some(common::UniqueId {
                                     hi: 0x5c,
                                     lo: self.kernel_key_low,
                                 }),
@@ -1275,9 +1292,14 @@ fn creation_statement(sql: &str, attempts: &[u64], fault: Option<&'static str>) 
         }),
         observations: (0..REQUIRED_BACKENDS)
             .flat_map(|index| {
-                attempts
-                    .iter()
-                    .map(move |&attempt| (index, "grpc-fragment", Some(attempt)))
+                attempts.iter().map(move |&attempt| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        Some(attempt),
+                    )
+                })
             })
             .collect(),
     }
@@ -1966,21 +1988,15 @@ fn exchange_probe(
     let stream = proto::ExchangeStreamIdentity {
         source_task: source.task.clone(),
         destination_task: descriptor.identity.clone(),
-        source_finst_id_hi: source
-            .fragment_instance_id
-            .context("probe source omits kernel")?
-            .hi,
-        source_finst_id_lo: source
-            .fragment_instance_id
-            .context("probe source omits kernel")?
-            .lo,
+        source_task_key_hi: source.task_key.context("probe source omits kernel")?.hi,
+        source_task_key_lo: source.task_key.context("probe source omits kernel")?.lo,
         sender_ordinal: source.sender_ordinal,
-        destination_finst_id_hi: descriptor
-            .fragment_instance_id
+        destination_task_key_hi: descriptor
+            .task_key
             .context("probe destination omits kernel")?
             .hi,
-        destination_finst_id_lo: descriptor
-            .fragment_instance_id
+        destination_task_key_lo: descriptor
+            .task_key
             .context("probe destination omits kernel")?
             .lo,
         destination_node_id: inbound.destination_node_id,
@@ -2169,7 +2185,7 @@ impl Scenario for AcceptedPreparationControlRaces {
         );
         let replay_fence = quiesce_session(&session)?;
         ensure!(
-            replay_fence.query_context == fence.query_context
+            replay_fence.participation == fence.participation
                 && replay_fence.fence_version == fence.fence_version
                 && replay_fence.accepted_tasks == expected,
             "Quiesce replay changed its cut or membership: {fence:?} -> {replay_fence:?}"
@@ -2179,7 +2195,7 @@ impl Scenario for AcceptedPreparationControlRaces {
         let late = receiver(4);
         let rejected = session.apply(late.operation(), "late Create after Quiesce")?;
         ensure!(
-            outcome(&rejected)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+            outcome(&rejected)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt
                 && receipt_verdict(&rejected)?.ack.is_none(),
             "Quiesce admitted a late identity: {rejected:?}"
         );
@@ -2198,30 +2214,30 @@ impl Scenario for AcceptedPreparationControlRaces {
                 ),
                 "duplicate Establish reopened admission: {duplicate:?}"
             );
-            if let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+            if let Some(proto::task_operation_verdict::Ack::Participation(ack)) =
                 receipt_verdict(&duplicate)?.ack.clone()
             {
                 ensure!(
-                    ack.state != proto::QueryContextState::Active as i32
-                        && ack.state != proto::QueryContextState::Establishing as i32,
+                    ack.state != proto::ParticipationState::Active as i32
+                        && ack.state != proto::ParticipationState::Establishing as i32,
                     "duplicate Establish returned an open Context: {ack:?}"
                 );
             }
             let rejected =
                 session.apply(late.operation(), "late Create after duplicate Establish")?;
             ensure!(
-                outcome(&rejected)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+                outcome(&rejected)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt
                     && receipt_verdict(&rejected)?.ack.is_none(),
                 "duplicate Establish revived late Create: {rejected:?}"
             );
         }
-        context.action("late Create returned ContextTerminalReceipt; two original Establish replays left the Context fenced and could not reopen admission");
+        context.action("late Create returned ParticipationTerminalReceipt; two original Establish replays left the Participation fenced and could not reopen admission");
         observe_terminal_stop_and_fence(context, &session, &fence, &expected)?;
         reject_invalid_covered_subscriptions(context, &session, &expected)?;
         let released = session.release_when_ready(context)?;
         ensure!(
-            released == proto::ReleaseQueryContextOutcome::Released,
-            "normally fenced Context did not release: {released:?}"
+            released == proto::ReleaseParticipationOutcome::Released,
+            "normally fenced Participation did not release: {released:?}"
         );
         let late_establish = session.apply(
             session
@@ -2231,12 +2247,12 @@ impl Scenario for AcceptedPreparationControlRaces {
             "original Establish after normal Release",
         )?;
         ensure!(
-            outcome(&late_establish)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
+            outcome(&late_establish)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt,
             "late Establish revived a released Context: {late_establish:?}"
         );
         let late_create = session.apply(late.operation(), "late Create after normal Release")?;
         ensure!(
-            outcome(&late_create)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+            outcome(&late_create)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt
                 && receipt_verdict(&late_create)?.ack.is_none(),
             "late Create revived a released Context: {late_create:?}"
         );
@@ -2253,10 +2269,10 @@ impl Scenario for AcceptedPreparationControlRaces {
 
 pub(super) fn raw_create_identity(create: &RawCreate) -> proto::TaskIdentity {
     proto::TaskIdentity {
-        query_execution_id: create.context.query_execution_id,
+        query_execution_id: create.participation.query_execution_id,
         stage_id: 1,
         task_id: create.task_id,
-        backend_process_id: create.context.backend_process_id.clone(),
+        backend_process_id: create.participation.backend_process_id.clone(),
     }
 }
 
@@ -2283,16 +2299,16 @@ pub(super) fn session_control(
 
 pub(super) fn quiesce_session(
     session: &RawBackendSession,
-) -> Result<proto::QuiesceQueryContextAck> {
+) -> Result<proto::QuiesceParticipationAck> {
     let receipt = session_control(
         session,
-        proto::task_control_operation::Control::QuiesceQueryContext(
-            proto::QuiesceQueryContextRequest {
-                query_context: Some(session.context_under(session.frontend, 1)),
+        proto::task_control_operation::Control::QuiesceParticipation(
+            proto::QuiesceParticipationRequest {
+                participation: Some(session.participation_under(session.frontend, 1)),
             },
         ),
     )?;
-    let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(ack)) =
+    let Some(proto::task_operation_verdict::Ack::QuiesceParticipation(ack)) =
         receipt_verdict(&receipt)?.ack.clone()
     else {
         bail!("Quiesce omitted the exact fence acknowledgement: {receipt:?}");
@@ -2309,9 +2325,9 @@ fn reject_invalid_covered_subscriptions(
     identities: &[proto::TaskIdentity],
 ) -> Result<()> {
     use prost::Message;
-    let query_context = session.context_under(session.frontend, 1);
+    let target_participation = session.participation_under(session.frontend, 1);
     let base = proto::SubscribeTaskStatusRequest {
-        query_context: Some(query_context.clone()),
+        participation: Some(target_participation.clone()),
         generation: 1,
         required_identities: identities.to_vec(),
         ..Default::default()
@@ -2319,7 +2335,7 @@ fn reject_invalid_covered_subscriptions(
     let mut missing_generation = base.clone();
     missing_generation.generation = 0;
     let cursor_only = proto::SubscribeTaskStatusRequest {
-        query_context: Some(query_context.clone()),
+        participation: Some(target_participation.clone()),
         ..Default::default()
     };
     let mut future_task = base.clone();
@@ -2327,22 +2343,24 @@ fn reject_invalid_covered_subscriptions(
         identity: Some(identities[0].clone()),
         current_version: u64::MAX,
     }];
-    let mut future_context = base.clone();
-    future_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
-        query_context: Some(query_context),
-        current_version: u64::MAX,
-    });
-    let mut foreign_context = base;
-    foreign_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
-        query_context: Some(session.context_under(session.frontend, 2)),
-        current_version: 0,
-    });
+    let mut future_participation = base.clone();
+    future_participation.participation_convergence_cursor =
+        Some(proto::ParticipationConvergenceCursor {
+            participation: Some(target_participation),
+            current_version: u64::MAX,
+        });
+    let mut foreign_participation = base;
+    foreign_participation.participation_convergence_cursor =
+        Some(proto::ParticipationConvergenceCursor {
+            participation: Some(session.participation_under(session.frontend, 2)),
+            current_version: 0,
+        });
     let requests = [
         ("missing generation", missing_generation),
         ("cursor-only legacy mode", cursor_only),
         ("future Task convergence cursor", future_task),
-        ("future Context convergence cursor", future_context),
-        ("cross-Context convergence cursor", foreign_context),
+        ("future Context convergence cursor", future_participation),
+        ("cross-Context convergence cursor", foreign_participation),
     ];
     let connector = session.connector.clone();
     let authorization = session.authorization.clone();
@@ -2352,7 +2370,7 @@ fn reject_invalid_covered_subscriptions(
             for (name, request) in requests {
                 let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
                 let (mut sender, connection) = h2::client::handshake(stream).await?;
-                let driver = tokio::spawn(connection);
+                let connection_job = tokio::spawn(connection);
                 let result = async {
                     let headers = http::Request::builder()
                         .method("POST")
@@ -2404,8 +2422,8 @@ fn reject_invalid_covered_subscriptions(
                     anyhow::Ok(())
                 }
                 .await;
-                driver.abort();
-                let _ = driver.await;
+                connection_job.abort();
+                let _ = connection_job.await;
                 result?;
             }
             anyhow::Ok(())
@@ -2425,7 +2443,7 @@ fn reject_invalid_covered_subscriptions(
 pub(super) fn observe_terminal_stop_and_fence(
     context: &mut ScenarioContext,
     session: &RawBackendSession,
-    fence: &proto::QuiesceQueryContextAck,
+    fence: &proto::QuiesceParticipationAck,
     identities: &[proto::TaskIdentity],
 ) -> Result<()> {
     observe_terminal_stop_and_fence_with_failure(
@@ -2441,7 +2459,7 @@ pub(super) fn observe_terminal_stop_and_fence(
 pub(super) fn observe_all_canceled_and_stopped(
     context: &mut ScenarioContext,
     session: &RawBackendSession,
-    fence: &proto::QuiesceQueryContextAck,
+    fence: &proto::QuiesceParticipationAck,
     identities: &[proto::TaskIdentity],
 ) -> Result<()> {
     observe_terminal_stop_and_fence_with_failure(
@@ -2474,7 +2492,7 @@ pub(super) fn observe_task_terminal_and_stopped(
 fn observe_terminal_stop_and_fence_with_failure(
     context: &mut ScenarioContext,
     session: &RawBackendSession,
-    fence: Option<&proto::QuiesceQueryContextAck>,
+    fence: Option<&proto::QuiesceParticipationAck>,
     identities: &[proto::TaskIdentity],
     first_is_failed: bool,
     expected_states: Option<Vec<i32>>,
@@ -2485,7 +2503,7 @@ fn observe_terminal_stop_and_fence_with_failure(
     let expected = identities.to_vec();
     let fence = fence.cloned();
     let request = proto::SubscribeTaskStatusRequest {
-        query_context: Some(session.context_under(session.frontend, 1)),
+        participation: Some(session.participation_under(session.frontend, 1)),
         generation: 1,
         required_identities: expected.clone(),
         ..Default::default()
@@ -2495,7 +2513,7 @@ fn observe_terminal_stop_and_fence_with_failure(
         tokio::time::timeout(budget, async move {
             let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
             let (mut sender, connection) = h2::client::handshake(stream).await?;
-            let driver = tokio::spawn(connection);
+            let connection_job = tokio::spawn(connection);
             let result = async {
                 let request_headers = http::Request::builder().method("POST")
                     .uri("/novarocks.NovaRocksGrpc/SubscribeTaskStatus")
@@ -2548,7 +2566,7 @@ fn observe_terminal_stop_and_fence_with_failure(
                             }
                             proto::task_status_stream_event::Event::Quiesce(receipt) => {
                                 if let Some(fence) = &fence {
-                                    ensure!(receipt.query_context == fence.query_context && receipt.fence_version == fence.fence_version && receipt.accepted_tasks == expected, "covered Quiesce changed the exact fence: {receipt:?}");
+                                    ensure!(receipt.participation == fence.participation && receipt.fence_version == fence.fence_version && receipt.accepted_tasks == expected, "covered Quiesce changed the exact fence: {receipt:?}");
                                     fence_seen = true;
                                 }
                             }
@@ -2565,14 +2583,14 @@ fn observe_terminal_stop_and_fence_with_failure(
                             proto::task_status_stream_event::Event::TaskGone(receipt) => bail!("required terminal/stop evidence was reclaimed: {receipt:?}"),
                             proto::task_status_stream_event::Event::TaskUnknown(receipt) => bail!("required accepted identity was unknown: {receipt:?}"),
                             proto::task_status_stream_event::Event::TaskStatusUnchanged(_) | proto::task_status_stream_event::Event::TaskConvergenceUnchanged(_) => bail!("zero-cursor probe unexpectedly received Unchanged"),
-                            proto::task_status_stream_event::Event::ContextConvergence(_) => {}
+                            proto::task_status_stream_event::Event::ParticipationConvergence(_) => {}
                         }
                     }
                 }
                 bail!("covered stream ended before exact terminal/stop/fence evidence; trailers={:?}", body.trailers().await?)
             }.await;
-            driver.abort();
-            let _ = driver.await;
+            connection_job.abort();
+            let _ = connection_job.await;
             result
         }).await.context("covered terminal/actual-stop probe exhausted its scenario deadline")?
     })
@@ -2645,7 +2663,8 @@ mod finite_sql_authorization_tests {
             (0..3)
                 .flat_map(|index| [1, 2].map(move |attempt| (
                     index,
-                    "grpc-fragment",
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
                     Some(attempt)
                 )))
                 .collect::<Vec<_>>()

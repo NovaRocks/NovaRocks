@@ -26,8 +26,8 @@ mod common;
 
 fn sample_exchange_key(node_id: i32) -> ExchangeKey {
     ExchangeKey {
-        finst_id_hi: 42,
-        finst_id_lo: 24,
+        task_key_hi: 42,
+        task_key_lo: 24,
         node_id,
     }
 }
@@ -36,7 +36,7 @@ fn sample_exchange_key(node_id: i32) -> ExchangeKey {
 fn test_runtime_module_structure() {
     let key = sample_exchange_key(1);
     let registry = ExecutionExchangeRegistry::default();
-    registry.cancel_fragment(key.finst_id_hi, key.finst_id_lo);
+    registry.cancel_task(key.task_key_hi, key.task_key_lo);
 }
 
 #[test]

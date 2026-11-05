@@ -24,8 +24,10 @@ pub fn emit_task_fetch_marker(
         return Err("task fetch observation names another backend process".into());
     }
     if should_emit_typed_fetch_marker(status, packet_seq, eos)
-        && let Some(observer) =
-            controls.observation_for("grpc-fragment", identity.query_execution_id())?
+        && let Some(observer) = controls.observation_for(
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+            identity.query_execution_id(),
+        )?
     {
         observer.observe(&typed_fetch_marker(
             identity,
@@ -67,9 +69,10 @@ pub fn emit_root_read_marker(
     if !controls.owns_backend(identity.backend_process_id()) {
         return Err("root read observation names another backend process".into());
     }
-    if let Some(observer) =
-        controls.observation_for("grpc-fragment", identity.query_execution_id())?
-    {
+    if let Some(observer) = controls.observation_for(
+        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+        identity.query_execution_id(),
+    )? {
         observer.observe(&typed_fetch_marker(
             identity,
             status,
@@ -115,7 +118,8 @@ fn typed_fetch_marker(
         identity.backend_process_id(),
     );
     format!(
-        "NOVAROCKS_GRPC_FETCH_TYPED {identity} status={} packet_seq={packet_seq} eos={eos} payload_bytes={payload_bytes}",
+        "{} {identity} status={} packet_seq={packet_seq} eos={eos} payload_bytes={payload_bytes}",
+        novarocks_failpoint::observation_marker::GRPC_FETCH_TYPED,
         status as i32,
     )
 }

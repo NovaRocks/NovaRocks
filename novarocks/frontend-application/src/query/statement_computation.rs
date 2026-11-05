@@ -36,7 +36,7 @@ use crate::query_execution::{
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     api::{
-        ComputationReadyToken, ExecutionHandle, ReservedExecutionIdentity,
+        ComputationReadyToken, ExecutionOutputObligation, ReservedExecutionIdentity,
         StatementNativeHealthFailure,
     },
     session_control::GovernedActionContext,
@@ -447,7 +447,7 @@ pub(crate) struct StatementComputation<A: StatementComputationAssembly> {
     computation: Option<PreparedLogicalComputation>,
     output: Option<A::Output>,
     original: OriginalComputationStart,
-    execution: Option<Result<ExecutionHandle, QueryExecutionError>>,
+    execution: Option<Result<ExecutionOutputObligation, QueryExecutionError>>,
     ready: Option<<A::Output as StatementComputationOutput>::Ready>,
     exit_receipt: Option<
         Result<novarocks_query_application::api::LogicalExecutionExitReceipt, QueryExecutionError>,

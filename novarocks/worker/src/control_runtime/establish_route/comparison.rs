@@ -19,9 +19,9 @@
 
 use super::*;
 use crate::control_runtime::{
-    context_host::failure::ScopePublicationsDrained,
-    context_host_jobs::ContextDomainInstance,
     establish_ingress::EstablishMaterializationLoan,
+    participation_host::failure::ScopePublicationsDrained,
+    participation_host_jobs::ParticipationDomainInstance,
     preparation::{HostFairnessGroup, QueuedPreparation},
 };
 use std::{
@@ -31,9 +31,9 @@ use std::{
 };
 
 pub(super) struct Capture {
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     source: Option<EstablishMaterializationLoan>,
-    instance: Option<ContextDomainInstance>,
+    instance: Option<ParticipationDomainInstance>,
 }
 pub(super) enum ComparisonState {
     Idle,
@@ -64,7 +64,7 @@ impl QueuedPreparation for EstablishComparisonJob {
         &self,
         _: novarocks_control_runtime_core::identity::ScopeId,
     ) -> HostFairnessGroup {
-        HostFairnessGroup::Context(self.route.context)
+        HostFairnessGroup::Participation(self.route.participation)
     }
 }
 impl EstablishComparisonJob {
@@ -83,7 +83,7 @@ impl EstablishComparisonJob {
             let cancelled = {
                 let leg = self
                     .route
-                    .context_leg
+                    .participation_leg
                     .lock()
                     .expect("original comparison start");
                 leg.cancelled || self.route.runtime.snapshot(self.route.actor)?.failed
@@ -96,7 +96,7 @@ impl EstablishComparisonJob {
                     original
                         .instance
                         .as_mut()
-                        .expect("original Context instance")
+                        .expect("original Participation instance")
                         .compare_establish_on_host(
                             original
                                 .source
@@ -113,7 +113,7 @@ impl EstablishComparisonJob {
             capture
                 .instance
                 .as_mut()
-                .expect("original Context instance")
+                .expect("original Participation instance")
                 .finish_on_host();
             drop(capture.instance.take());
             drop(capture.source.take());
@@ -127,7 +127,7 @@ impl EstablishComparisonJob {
                     .expect("same original route authority");
                 let mut leg = self
                     .route
-                    .context_leg
+                    .participation_leg
                     .lock()
                     .expect("original comparison return");
                 assert!(matches!(leg.comparison, ComparisonState::InFlight));
@@ -158,7 +158,7 @@ impl EstablishComparisonJob {
         drop(capture.authority.take());
         let mut leg = self
             .route
-            .context_leg
+            .participation_leg
             .lock()
             .expect("original unresolved comparison");
         assert!(matches!(leg.comparison, ComparisonState::InFlight));
@@ -179,39 +179,44 @@ impl Drop for EstablishComparisonJob {
 impl EstablishRouteCustody {
     pub(crate) fn bind_host_jobs(
         &self,
-        jobs: Option<ContextHostJobs>,
+        jobs: Option<ParticipationHostJobs>,
         execution_scope: &ScopeHandle,
-        context_notice: ContextReadyNotice,
+        participation_notice: ParticipationReadyNotice,
     ) -> Result<(), EstablishRouteError> {
         let mut leg = self
-            .context_leg
+            .participation_leg
             .lock()
-            .expect("original route Context binding");
+            .expect("original route Participation binding");
         if !matches!(leg.phase, ProbePhase::Constructing) || leg.scope.is_none() || leg.bound {
             return Err(EstablishRouteError::WrongPhase);
         }
         if let Some(jobs) = &jobs
-            && !jobs.belongs_to_context(&self.runtime, self.actor, self.context, execution_scope)
+            && !jobs.belongs_to_participation(
+                &self.runtime,
+                self.actor,
+                self.participation,
+                execution_scope,
+            )
         {
             return Err(EstablishRouteError::WrongOwner);
         }
-        if !context_notice.matches_registration(&self.runtime, &self.registration)
-            || context_notice.context() != self.context
+        if !participation_notice.matches_registration(&self.runtime, &self.registration)
+            || participation_notice.participation() != self.participation
         {
             return Err(EstablishRouteError::WrongOwner);
         }
         leg.jobs = jobs;
-        leg.context_notice = Some(context_notice);
+        leg.participation_notice = Some(participation_notice);
         leg.bound = true;
         Ok(())
     }
     pub(crate) fn notify_progress(&self) {
         self.notice.notify();
         let notice = self
-            .context_leg
+            .participation_leg
             .lock()
             .expect("original route progress notice")
-            .context_notice
+            .participation_notice
             .clone();
         if let Some(notice) = notice {
             // A host claim alone cannot reopen a completed finite route
@@ -219,18 +224,22 @@ impl EstablishRouteCustody {
             notice.notify();
             return;
         }
-        // A never-bound route has no Context inventory row or revision.
+        // A never-bound route has no Participation inventory row or revision.
         match self.runtime.notify_host_actor(&self.registration) {
-            Ok(()) | Err(DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch) => {}
+            Ok(())
+            | Err(ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch) => {}
             Err(_) => std::process::abort(),
         }
     }
     /// Only a real Core comparison request can move this route's one authority.
-    /// No Work, report, reply, raw input or Context instance is recreated.
+    /// No Work, report, reply, raw input or Participation instance is recreated.
     pub(crate) fn take_comparison_job(
         self: &Arc<Self>,
     ) -> Result<Option<EstablishComparisonJob>, EstablishRouteError> {
-        let mut leg = self.context_leg.lock().expect("original routed comparison");
+        let mut leg = self
+            .participation_leg
+            .lock()
+            .expect("original routed comparison");
         if leg.cancelled
             || !matches!(
                 leg.phase,
@@ -281,10 +290,10 @@ impl EstablishRouteCustody {
             }))),
         }))
     }
-    /// The Context lane retries only an actual M decision or physical return.
+    /// The Participation lane retries only an actual M decision or physical return.
     pub(crate) fn advance_replay(&self) -> Result<(), EstablishRouteError> {
         let mut leg = self
-            .context_leg
+            .participation_leg
             .lock()
             .expect("original replay continuation");
         if leg.cancelled || self.runtime.snapshot(self.actor)?.failed {
@@ -302,13 +311,13 @@ impl EstablishRouteCustody {
                 ) && leg
                     .jobs
                     .as_ref()
-                    .is_some_and(ContextHostJobs::actual_establishment_decided) =>
+                    .is_some_and(ParticipationHostJobs::actual_establishment_decided) =>
             {
                 None
             }
             _ => return Ok(()),
         };
-        if !self.retire_context_input(&mut leg)? {
+        if !self.retire_participation_input(&mut leg)? {
             return Ok(());
         }
         leg.comparison = ComparisonState::Idle;
@@ -316,7 +325,7 @@ impl EstablishRouteCustody {
     }
     pub(crate) fn return_comparison_failure(&self) -> Result<(), EstablishRouteError> {
         let mut leg = self
-            .context_leg
+            .participation_leg
             .lock()
             .expect("original comparison failure verdict");
         if !matches!(leg.comparison, ComparisonState::Unresolved { .. })
@@ -328,7 +337,7 @@ impl EstablishRouteCustody {
         }
         self.fill_owner_failed(&mut leg)
     }
-    fn fill_owner_failed(&self, leg: &mut ContextLeg) -> Result<(), EstablishRouteError> {
+    fn fill_owner_failed(&self, leg: &mut ParticipationLeg) -> Result<(), EstablishRouteError> {
         let root = self
             .root_leg
             .lock()
@@ -342,12 +351,12 @@ impl EstablishRouteCustody {
                     work: self.root_author.work(),
                     request: None,
                     command: ControlInput::RoutedEstablishOwnerFailed {
-                        context: self.context,
+                        participation: self.participation,
                         request: self.request.request,
                     },
                 }),
             )
-            .map_err(|(error, _)| EstablishRouteError::Driver(error))?;
+            .map_err(|(error, _)| EstablishRouteError::ActorTurn(error))?;
         leg.owner_failed_returned = true;
         leg.cancelled = true;
         Ok(())
@@ -357,12 +366,12 @@ impl EstablishRouteCustody {
         stage: &ScopePublicationsDrained<'_>,
     ) -> Result<(), EstablishRouteError> {
         let mut leg = self
-            .context_leg
+            .participation_leg
             .lock()
-            .expect("original failed Context route");
+            .expect("original failed Participation route");
         stage
             .validate(&self.runtime, self.actor)
-            .map_err(EstablishRouteError::Driver)?;
+            .map_err(EstablishRouteError::ActorTurn)?;
         if !leg.owner_failed_returned
             && !leg.cancelled
             && !matches!(leg.phase, ProbePhase::Finished)

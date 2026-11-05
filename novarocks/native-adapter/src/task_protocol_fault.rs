@@ -34,7 +34,7 @@
 //! [`task_execution_failure_injected`] fails a task that was admitted and
 //! started, which is the only way to observe the attempt-wide stand-down one
 //! participant's failure must cause; and
-//! [`restart_after_establish_context`] holds an applied establish open so the
+//! [`restart_after_establish_participation`] holds an applied establish open so the
 //! harness can replace that exact backend process, which is a process loss
 //! rather than a lost message. Neither fabricates a success and neither skips
 //! the operation it follows.
@@ -65,7 +65,7 @@
 //! Two deliberately do not, and both are cases where the frontend's *own*
 //! replay is what the fault has to survive. [`lease_renewal_stopped`] must
 //! refuse every renewal or the lease never expires, and
-//! [`restart_after_establish_context`] must withhold every establish of its
+//! [`restart_after_establish_participation`] must withhold every establish of its
 //! attempt or the replay's idempotent answer closes the pre-ready window the
 //! case exists to observe. Both therefore match the arming without consuming
 //! it, and both are scoped to one exact attempt and one exact backend process,
@@ -82,7 +82,7 @@ use std::{
 };
 
 use crate::test_controls::{NativeFaultClaim, NativeTestControls};
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_models::novarocks as proto;
@@ -120,11 +120,11 @@ fn claim_batch_hold(
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     for operation in operations {
-        if let novarocks_task_codec::operation::DecodedOperation::AcquireQueryContextAdmissionTicket(
+        if let novarocks_task_codec::operation::DecodedOperation::AcquireParticipationAdmissionTicket(
             request,
         ) = operation
             && let Some(claim) = controls
-                .claim_context_hold(action, request.context(), token)
+                .claim_participation_hold(action, request.participation(), token)
                 .map_err(tonic::Status::failed_precondition)?
         {
             return Ok(Some(claim));
@@ -288,21 +288,21 @@ fn read_release_with_end(
     Err("Native hold session closed or original deadline elapsed".into())
 }
 
-/// Drops the acknowledgement of one applied `EstablishQueryContext`.
-pub fn establish_context_ack_dropped(
+/// Drops the acknowledgement of one applied `EstablishParticipation`.
+pub fn establish_participation_ack_dropped(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
     if outcome != OperationOutcome::Accepted {
         return Ok(());
     }
-    drop_context_ack(
+    drop_participation_ack(
         controls,
-        QueryLifecycleFaultKind::EstablishContextAckDrop,
-        "NOVAROCKS_TASK_ESTABLISH_CONTEXT_ACK_DROPPED",
-        "runner-owned EstablishQueryContext acknowledgement dropped after the context was installed",
-        context,
+        QueryLifecycleFaultKind::EstablishParticipationAckDrop,
+        novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_ACK_DROPPED,
+        "runner-owned EstablishParticipation acknowledgement dropped after the participation was installed",
+        participation,
     )
 }
 
@@ -385,24 +385,23 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskExecutionF
         )
     }
 }
-pub fn injected_task_execution_failure() -> novarocks_execution::runtime::fragment::ExecutionFailure
-{
-    novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+pub fn injected_task_execution_failure() -> novarocks_execution::runtime::task::ExecutionFailure {
+    novarocks_execution::runtime::task::ExecutionFailure::from_domain(
         TaskExecutionFaultFailure::Injected,
     )
 }
 pub(crate) fn injected_prepared_task_failure()
--> novarocks_execution::runtime::fragment::ExecutionFailure {
-    novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+-> novarocks_execution::runtime::task::ExecutionFailure {
+    novarocks_execution::runtime::task::ExecutionFailure::from_domain(
         TaskExecutionFaultFailure::PreparedExitInjected,
     )
 }
 pub fn record_task_execution_failure(
     identity: TaskIdentity,
     scope: &NativeFaultClaim,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+) -> novarocks_execution::runtime::task::ExecutionResult<()> {
     scope.record_hit().map_err(|detail| {
-        novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+        novarocks_execution::runtime::task::ExecutionFailure::from_domain(
             TaskExecutionFaultFailure::Evidence(
                 novarocks_execution_contract::failure::BoundedDetail::truncating(&detail),
             ),
@@ -410,7 +409,8 @@ pub fn record_task_execution_failure(
     })?;
     let execution = identity.query_execution_id();
     eprintln!(
-        "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        "{} execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_INJECTED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -422,7 +422,7 @@ pub fn record_task_execution_failure(
     Ok(())
 }
 
-/// Holds one applied `EstablishQueryContext` open until this process is gone.
+/// Holds one applied `EstablishParticipation` open until this process is gone.
 ///
 /// The context is installed before the wait begins, so the process the harness
 /// replaces is one that really did admit this attempt. Without the wait a
@@ -439,10 +439,10 @@ pub fn record_task_execution_failure(
 ///
 /// The hold has to cover every establish of this attempt, not just the one it
 /// started on, and the protocol guarantees there will be more. The frontend
-/// requests `MaxWait::DEFAULT_CREATE` (15 s) for an `UpdateQueryContext` while
+/// requests `MaxWait::DEFAULT_CREATE` (15 s) for an `UpdateParticipation` while
 /// this rendezvous waits up to 30 s, so a hold that outlasts the frontend's own
 /// wait is the normal case: the operation times out client-side and
-/// `QueryContextOwner` replays the exact same request.
+/// `ParticipationOwner` replays the exact same request.
 ///
 /// That replay reaches a process whose context is already installed, so the
 /// registry answers `Idempotent` -- and `is_applied()` counts `Idempotent`, so
@@ -465,43 +465,44 @@ pub fn record_task_execution_failure(
 /// recording the hold only after the establish returns would let that waiter
 /// reserve a task in the narrow gate-open interval before this handler publishes
 /// its marker.
-pub fn arm_restart_after_establish_context(
+pub fn arm_restart_after_establish_participation(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> Result<(), tonic::Status> {
-    let execution = context.query_execution_id();
+    let execution = participation.query_execution_id();
     let Some(scope) = match_persistent(
         controls,
-        QueryLifecycleFaultKind::RestartAfterEstablishContext,
+        QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
         execution,
-        context.backend_process_id(),
+        participation.backend_process_id(),
     )?
     else {
         return Ok(());
     };
-    controls.arm_restart(context, scope);
+    controls.arm_restart(participation, scope);
     Ok(())
 }
 
-pub fn restart_after_establish_context(
+pub fn restart_after_establish_participation(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
     if !matches!(
         outcome,
         OperationOutcome::Accepted | OperationOutcome::Idempotent
     ) {
-        controls.disarm_restart(context);
+        controls.disarm_restart(participation);
         return Ok(());
     }
-    let execution = context.query_execution_id();
-    let Some(scope) = controls.restart_claim(context) else {
+    let execution = participation.query_execution_id();
+    let Some(scope) = controls.restart_claim(participation) else {
         return Ok(());
     };
     if outcome == OperationOutcome::Accepted {
         eprintln!(
-            "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED execution_id={}:{}:{} backend_index={} process_id={} token={}",
+            "{} execution_id={}:{}:{} backend_index={} process_id={} token={}",
+            novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_OBSERVED,
             execution.query_id().high(),
             execution.query_id().low(),
             execution.attempt_id().get(),
@@ -513,7 +514,7 @@ pub fn restart_after_establish_context(
     notify_runner_of_restart_after_establish(&scope)?;
     wait_for_runner_owned_restart(&scope);
     if outcome == OperationOutcome::Accepted {
-        controls.disarm_restart(context);
+        controls.disarm_restart(participation);
     }
     Ok(())
 }
@@ -529,22 +530,22 @@ pub fn restart_after_establish_context(
 /// scoped to the exact context and exists only while the accepted establish is
 /// parked, so it neither changes normal admission nor broadens the fault to
 /// other attempts.
-pub fn restart_after_establish_context_holds_task_creation(
+pub fn restart_after_establish_participation_holds_task_creation(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> bool {
-    controls.restart_claim(context).is_some()
+    controls.restart_claim(participation).is_some()
 }
 
 /// Waits for the exact runner-owned restart that holds this context's task
 /// creation. The scope was validated when the accepted establish armed the
 /// hold, so the registry can call this at its linearization point without
 /// re-reading fault configuration while it owns its lock.
-pub fn wait_for_restart_after_establish_context(
+pub fn wait_for_restart_after_establish_participation(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) {
-    if let Some(scope) = controls.restart_claim(context) {
+    if let Some(scope) = controls.restart_claim(participation) {
         wait_for_runner_owned_restart(&scope);
     }
 }
@@ -553,12 +554,12 @@ pub fn wait_for_restart_after_establish_context(
 pub struct RestartAfterEstablishTaskCreationGate(pub std::sync::Arc<NativeTestControls>);
 
 impl novarocks_worker::TaskCreationGate for RestartAfterEstablishTaskCreationGate {
-    fn holds_task_creation(&self, context: QueryContextRef) -> bool {
-        restart_after_establish_context_holds_task_creation(&self.0, context)
+    fn holds_task_creation(&self, participation: ParticipationRef) -> bool {
+        restart_after_establish_participation_holds_task_creation(&self.0, participation)
     }
 
-    fn wait_for_task_creation_release(&self, context: QueryContextRef) {
-        wait_for_restart_after_establish_context(&self.0, context);
+    fn wait_for_task_creation_release(&self, participation: ParticipationRef) {
+        wait_for_restart_after_establish_participation(&self.0, participation);
     }
 }
 
@@ -576,7 +577,7 @@ fn wait_for_runner_owned_restart(scope: &NativeFaultClaim) {
     let release = novarocks_failpoint::trigger_path(
         root,
         scope.backend_index,
-        QueryLifecycleFaultKind::RestartAfterEstablishContext,
+        QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
     )
     .with_extension("release");
     let deadline = std::time::Instant::now() + RESTART_WAIT;
@@ -652,18 +653,18 @@ fn notify_runner_of_restart_after_establish(scope: &NativeFaultClaim) -> Result<
 /// Drops the acknowledgement of one applied lease renewal.
 pub fn lease_renewal_ack_dropped(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
     if outcome != OperationOutcome::Accepted {
         return Ok(());
     }
-    drop_context_ack(
+    drop_participation_ack(
         controls,
         QueryLifecycleFaultKind::LeaseRenewalAckDrop,
-        "NOVAROCKS_TASK_LEASE_RENEWAL_ACK_DROPPED",
+        novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_RENEWAL_ACK_DROPPED,
         "runner-owned lease renewal acknowledgement dropped after the lease was extended",
-        context,
+        participation,
     )
 }
 
@@ -678,23 +679,24 @@ pub fn lease_renewal_ack_dropped(
 /// through and keep the lease alive.
 pub fn lease_renewal_stopped(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> Result<bool, tonic::Status> {
     let Some(scope) = match_persistent(
         controls,
         QueryLifecycleFaultKind::LeaseRenewalStop,
-        context.query_execution_id(),
-        context.backend_process_id(),
+        participation.query_execution_id(),
+        participation.backend_process_id(),
     )?
     else {
         return Ok(false);
     };
-    let execution = context.query_execution_id();
+    let execution = participation.query_execution_id();
     scope
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_LEASE_RENEWAL_STOPPED execution_id={}:{}:{} backend_index={} token={}",
+        "{} execution_id={}:{}:{} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_RENEWAL_STOPPED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -746,7 +748,8 @@ pub fn task_update_terminal_ack_dropped(
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+        "{} execution_id={}:{}:{} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_UPDATE_TERMINAL_ACK_DROPPED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -843,7 +846,8 @@ pub fn create_task_before_worker_hold(
             .record_hit()
             .map_err(tonic::Status::failed_precondition)?;
         eprintln!(
-            "NOVAROCKS_TASK_CREATE_BEFORE_WORKER_HELD {}",
+            "{} {}",
+            novarocks_failpoint::observation_marker::TASK_CREATE_BEFORE_WORKER_HELD,
             payload.trim_end()
         );
         read_release_with_end(&mut stream, &scope.cancellation(), deadline, false, || {
@@ -875,7 +879,8 @@ pub fn create_task_ack_dropped(
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_CREATE_ACK_DROPPED execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        "{} execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_CREATE_ACK_DROPPED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -946,7 +951,8 @@ pub fn create_task_rejected_after_apply(
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        "{} execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_CREATE_REJECTED_AFTER_APPLY,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -1023,7 +1029,8 @@ pub fn create_task_receipt_foreign_task(
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK execution_id={}:{}:{} stage={} task={} foreign_task={foreign_task_id} backend_index={} token={}",
+        "{} execution_id={}:{}:{} stage={} task={} foreign_task={foreign_task_id} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_CREATE_RECEIPT_FOREIGN_TASK,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -1092,7 +1099,8 @@ pub fn task_status_foreign_process(
         return;
     }
     eprintln!(
-        "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS execution_id={}:{}:{} stage={} task={} backend={} foreign_backend={foreign} backend_index={} token={}",
+        "{} execution_id={}:{}:{} stage={} task={} backend={} foreign_backend={foreign} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_STATUS_FOREIGN_PROCESS,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -1126,7 +1134,7 @@ fn wire_status_identity(
             answer.identity.as_mut()
         }
         proto::task_status_stream_event::Event::TaskUnknown(answer) => answer.identity.as_mut(),
-        proto::task_status_stream_event::Event::ContextConvergence(_)
+        proto::task_status_stream_event::Event::ParticipationConvergence(_)
         | proto::task_status_stream_event::Event::Quiesce(_)
         | proto::task_status_stream_event::Event::CatchUpComplete(_)
         | proto::task_status_stream_event::Event::Bookmark(_) => None,
@@ -1152,7 +1160,7 @@ pub fn corrupt_feedback_contract_digest(
     claim_feedback_perturbation(
         controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
-        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT",
+        novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT,
         carrier,
     )
 }
@@ -1167,7 +1175,7 @@ pub fn force_feedback_unavailable(controls: &NativeTestControls, carrier: TaskId
     claim_feedback_perturbation(
         controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
-        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE",
+        novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE,
         carrier,
     )
 }
@@ -1197,7 +1205,7 @@ pub fn forge_feedback_foreign_attempt(
     claim_feedback_perturbation(
         controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
-        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT",
+        novarocks_failpoint::observation_marker::TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT,
         carrier,
     )
 }
@@ -1256,14 +1264,14 @@ fn claim_feedback_perturbation(
 /// carried.
 pub fn task_status_subscription_dropped(
     controls: &NativeTestControls,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> Result<bool, tonic::Status> {
-    let execution = context.query_execution_id();
+    let execution = participation.query_execution_id();
     let Some(scope) = claim(
         controls,
         QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
         execution,
-        context.backend_process_id(),
+        participation.backend_process_id(),
     )?
     else {
         return Ok(false);
@@ -1272,7 +1280,8 @@ pub fn task_status_subscription_dropped(
         .record_hit()
         .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
-        "NOVAROCKS_TASK_STATUS_SUBSCRIPTION_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+        "{} execution_id={}:{}:{} backend_index={} token={}",
+        novarocks_failpoint::observation_marker::TASK_STATUS_SUBSCRIPTION_DROPPED,
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -1282,15 +1291,21 @@ pub fn task_status_subscription_dropped(
     Ok(true)
 }
 
-fn drop_context_ack(
+fn drop_participation_ack(
     controls: &NativeTestControls,
     kind: QueryLifecycleFaultKind,
     marker: &str,
     detail: &'static str,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) -> Result<(), tonic::Status> {
-    let execution = context.query_execution_id();
-    let Some(scope) = claim(controls, kind, execution, context.backend_process_id())? else {
+    let execution = participation.query_execution_id();
+    let Some(scope) = claim(
+        controls,
+        kind,
+        execution,
+        participation.backend_process_id(),
+    )?
+    else {
         return Ok(());
     };
     scope
@@ -1365,7 +1380,7 @@ pub fn hold_native_task_preparation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_controls::tests::{bind_fixture, context, controlled, end_fixture, task};
+    use crate::test_controls::tests::{bind_fixture, controlled, end_fixture, participation, task};
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1485,7 +1500,11 @@ mod tests {
         // to the attempted action rather than a process-global registry.
         let claim = fixture
             .controls
-            .claim_context_hold("ingress-hold", context(&fixture), Some(&fixture.token))
+            .claim_participation_hold(
+                "ingress-hold",
+                participation(&fixture),
+                Some(&fixture.token),
+            )
             .unwrap()
             .unwrap();
         let path = novarocks_failpoint::native_ingress_hold_socket_path(&claim.token).unwrap();
@@ -1543,8 +1562,8 @@ mod tests {
     }
     #[test]
     fn restart_after_establish_hold_is_exact_and_released_with_its_establish() {
-        let fixture = controlled("restart-after-establish-context");
-        let kind = QueryLifecycleFaultKind::RestartAfterEstablishContext;
+        let fixture = controlled("restart-after-establish-participation");
+        let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
         novarocks_failpoint::target_binding::StatementExecutionBinding::new(
             "native-tests".into(),
             fixture.token.clone(),
@@ -1560,23 +1579,23 @@ mod tests {
             &fixture.token,
         ))
         .unwrap();
-        let exact = context(&fixture);
-        let other = QueryContextRef::new(
+        let exact = participation(&fixture);
+        let other = ParticipationRef::new(
             fixture.execution,
             fixture.frontend,
             BackendProcessId::new_v7(),
         );
-        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
-        assert!(restart_after_establish_context_holds_task_creation(
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
+        assert!(restart_after_establish_participation_holds_task_creation(
             &fixture.controls,
             exact
         ));
-        assert!(!restart_after_establish_context_holds_task_creation(
+        assert!(!restart_after_establish_participation_holds_task_creation(
             &fixture.controls,
             other
         ));
         fixture.controls.disarm_restart(exact);
-        assert!(!restart_after_establish_context_holds_task_creation(
+        assert!(!restart_after_establish_participation_holds_task_creation(
             &fixture.controls,
             exact
         ));

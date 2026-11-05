@@ -59,11 +59,11 @@ impl<I: Send, T> OriginalCall<T> for OriginalInput<I, T> {
     }
 }
 type Call<T> = Box<dyn OriginalCall<T>>;
-struct CallLease<'a, T: Send + 'static> {
+struct ConnectorCallLoan<'a, T: Send + 'static> {
     header: &'a Header<T>,
     call: Option<Call<T>>,
 }
-impl<T: Send + 'static> Drop for CallLease<'_, T> {
+impl<T: Send + 'static> Drop for ConnectorCallLoan<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.header.poisoned.store(true, Ordering::Release);
@@ -96,7 +96,7 @@ fn make_work<T: Send + 'static>(header: Arc<Header<T>>) -> impl FnOnce() + Send 
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .expect("original Connector call runs once");
-        let mut lease = CallLease {
+        let mut lease = ConnectorCallLoan {
             header: &header,
             call: Some(call),
         };

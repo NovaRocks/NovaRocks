@@ -18,21 +18,21 @@
 //! SQL suites reuse the same proxy and service control modules independently.
 
 use crate::isolated_iceberg_rest::IsolatedIcebergRestFixture;
-use crate::publication_catalog::{FixtureControl, FixtureHandle};
+use crate::publication_catalog::{FixtureControl, PublicationCatalogFixture};
 use crate::publication_service::Control;
 use anyhow::{Context, Result};
 use std::path::Path;
 
 pub struct PublicationFixture {
     rest: IsolatedIcebergRestFixture,
-    proxy: FixtureHandle,
+    proxy: PublicationCatalogFixture,
     service: Control,
 }
 impl PublicationFixture {
     pub fn start(root: &Path) -> Result<Self> {
         let (rest, uri) = IsolatedIcebergRestFixture::start_with_publication_hook(root)?;
         let service = Control::new(uri)?;
-        let proxy = FixtureHandle::start(rest.endpoints().rest_uri.clone())?;
+        let proxy = PublicationCatalogFixture::start(rest.endpoints().rest_uri.clone())?;
         Ok(Self {
             rest,
             proxy,

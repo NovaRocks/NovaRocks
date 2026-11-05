@@ -716,7 +716,7 @@ impl fmt::Display for OrderedTupleError {
 impl Error for OrderedTupleError {}
 impl novarocks_failure_contract::FailureProjection for OrderedTupleError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let reason = match self {
             Self::ArityMismatch => ExecutionReason::FilterOrderedTupleArity,
             Self::TypeMismatch => ExecutionReason::FilterOrderedTupleType,
@@ -1667,7 +1667,7 @@ impl Error for MembershipContributionEncodingError {
 }
 impl novarocks_failure_contract::FailureProjection for MembershipContributionEncodingError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::ContractViolation { kind, .. } => return kind.failure_fact(),
@@ -3196,7 +3196,7 @@ fn type_description(value: &DataType) -> novarocks_failure_contract::BoundedDeta
 }
 impl novarocks_failure_contract::FailureProjection for ContributionCodecError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
             RepresentationLayout, domain,
@@ -3252,7 +3252,7 @@ mod failure_source_tests {
         assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(
             error.failure_fact().reason(),
-            crate::runtime::fragment::ExecutionReason::FilterMembershipType.reason()
+            crate::runtime::task::ExecutionReason::FilterMembershipType.reason()
         );
         assert!(error.to_string().contains("expected Struct"));
     }

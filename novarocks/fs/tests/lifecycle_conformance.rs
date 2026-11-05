@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_fs::{
-    FileBytesFuture, FileCancellation, FileErrorKind, FileFormat, FileIoRuntime, FileProjection,
-    FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future, open_file_reader,
+    FileBytesFuture, FileCancellation, FileErrorKind, FileFormat, FileIoFuture, FileIoJob,
+    FileIoRuntime, FileIoSpawner, FileProjection, FileResult, FileU64Future, open_file_reader,
 };
 
 use common::Fixture;
@@ -86,9 +86,9 @@ impl FileIoRuntime for ControlledIo {
     }
 }
 
-impl FileTaskSpawner for ControlledIo {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
-        Ok(FileTask::new(self.runtime.spawn(task)))
+impl FileIoSpawner for ControlledIo {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
+        Ok(FileIoJob::new(self.runtime.spawn(task)))
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -99,9 +99,9 @@ impl FileTaskSpawner for ControlledIo {
 fn install_controlled_io(request: &mut novarocks_fs::FileReadRequest) -> Arc<ControlledIo> {
     let io = ControlledIo::new(request.context.cancellation.clone());
     let runtime: Arc<dyn FileIoRuntime> = io.clone();
-    let task_spawner: Arc<dyn FileTaskSpawner> = io.clone();
+    let io_spawner: Arc<dyn FileIoSpawner> = io.clone();
     request.context.runtime = runtime;
-    request.context.task_spawner = task_spawner;
+    request.context.io_spawner = io_spawner;
     io
 }
 

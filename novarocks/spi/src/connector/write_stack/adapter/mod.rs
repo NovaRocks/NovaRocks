@@ -29,7 +29,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::connector::write_stack::runtime::{
-    ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitHandle,
+    ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitSession,
     ConnectorWriterHandle, OpaqueWritePayload,
 };
 use crate::connector::{
@@ -39,7 +39,7 @@ use crate::connector::{
 /// One provider's concrete write domain, bound to one exact catalog generation.
 pub trait ProviderWriteRuntime: Send + Sync + 'static {
     /// The provider's frontend-only write transaction or session.
-    type CommitHandle: Debug + Send + Sync + 'static;
+    type CommitSession: Debug + Send + Sync + 'static;
     /// The provider's immutable logical write recipe. It is `Clone` because one
     /// logical target is copied to every physical writer placement.
     type WriterHandle: Clone + Debug + Send + Sync + 'static;
@@ -82,9 +82,9 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
         &self.binding
     }
 
-    /// Wrap a provider commit handle. The result never leaves the frontend.
-    pub fn wrap_commit_handle(&self, commit: P::CommitHandle) -> ConnectorWriteCommitHandle {
-        ConnectorWriteCommitHandle::from_parts(
+    /// Wrap a provider commit session. The result never leaves the frontend.
+    pub fn wrap_commit_session(&self, commit: P::CommitSession) -> ConnectorWriteCommitSession {
+        ConnectorWriteCommitSession::from_parts(
             self.binding.clone(),
             OpaqueWritePayload::new(commit),
         )
@@ -116,12 +116,12 @@ impl<P: ProviderWriteRuntime> WriteRuntimeAdapter<P> {
         )
     }
 
-    /// Recover a provider commit handle only through this adapter's exact
+    /// Recover a provider commit session only through this adapter's exact
     /// binding.
-    pub fn commit_handle<'a>(
+    pub fn commit_session<'a>(
         &self,
-        handle: &'a ConnectorWriteCommitHandle,
-    ) -> Result<&'a P::CommitHandle, ConnectorError> {
+        handle: &'a ConnectorWriteCommitSession,
+    ) -> Result<&'a P::CommitSession, ConnectorError> {
         if handle.binding() != &self.binding {
             return Err(binding_error());
         }
@@ -206,7 +206,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for FakeProvider {
-        type CommitHandle = FakeCommit;
+        type CommitSession = FakeCommit;
         type WriterHandle = FakeWriterHandle;
         type CommitFragment = FakeCommitFragment;
 
@@ -225,7 +225,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for OtherProvider {
-        type CommitHandle = FakeCommit;
+        type CommitSession = FakeCommit;
         type WriterHandle = OtherWriterHandle;
         type CommitFragment = FakeCommitFragment;
 
@@ -256,7 +256,7 @@ mod tests {
     }
     struct TrackedProvider(Arc<FakeProvider>);
     impl ProviderWriteRuntime for TrackedProvider {
-        type CommitHandle = FakeCommit;
+        type CommitSession = FakeCommit;
         type WriterHandle = FakeWriterHandle;
         type CommitFragment = TrackedFragment;
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -299,12 +299,12 @@ mod tests {
     #[test]
     fn wrapped_write_values_round_trip_through_their_own_adapter() {
         let adapter = WriteRuntimeAdapter::new(FakeProvider::new("unit", 1));
-        let commit = adapter.wrap_commit_handle(FakeCommit(7));
+        let commit = adapter.wrap_commit_session(FakeCommit(7));
         let handle = adapter.wrap_writer_handle(FakeWriterHandle(8));
         let fragment = adapter.wrap_commit_fragment(FakeCommitFragment(9));
 
         assert_eq!(
-            adapter.commit_handle(&commit).expect("commit"),
+            adapter.commit_session(&commit).expect("commit"),
             &FakeCommit(7)
         );
         assert_eq!(
@@ -352,11 +352,11 @@ mod tests {
     fn another_catalog_cannot_recover_a_value() {
         let mine = WriteRuntimeAdapter::new(FakeProvider::new("unit", 1));
         let theirs = WriteRuntimeAdapter::new(FakeProvider::new("other", 1));
-        let commit = mine.wrap_commit_handle(FakeCommit(5));
+        let commit = mine.wrap_commit_session(FakeCommit(5));
 
         assert_eq!(
             theirs
-                .commit_handle(&commit)
+                .commit_session(&commit)
                 .expect_err("foreign catalog")
                 .kind(),
             ConnectorErrorKind::InvalidRequest

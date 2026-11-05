@@ -28,7 +28,7 @@ use novarocks_mv_application::{
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
-    process_runtime::{MvBackgroundRuntime, MvBackgroundStop, MvBackgroundTasks},
+    process_runtime::{MvBackgroundJobs, MvBackgroundRuntime, MvBackgroundStop},
     service::MvKeyedProductService,
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
@@ -207,7 +207,7 @@ fn start_background_workers(
         Arc::new(MvBackgroundHealth(dependencies.execution.client.clone())),
         interval,
         maintenance_interval,
-        MvBackgroundTasks::new(
+        MvBackgroundJobs::new(
             Box::new(move |stop, maintenance_wakeup_tx| {
                 Box::pin(scheduler.clone().run(stop, maintenance_wakeup_tx))
             }),

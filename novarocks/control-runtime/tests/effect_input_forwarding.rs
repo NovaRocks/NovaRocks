@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, EffectTicket, InputPhase, InputRole},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket, InputPhase, StandingInputObligation},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -48,7 +48,7 @@ impl Actor for Neutral {
     fn timer_input(_: Tick) -> Input {
         unreachable!("no timer in this fixture")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, input: Input, step: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, input: Input, step: &mut ActorStep<'_, ()>) {
         match input {
             Input::Emit => step
                 .effect(
@@ -67,7 +67,7 @@ impl Actor for Neutral {
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
 }
 fn id(value: u64) -> ActorId {
     ActorId::new(value).unwrap()
@@ -85,8 +85,8 @@ struct Owner {
     actor: ActorId,
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
 }
 impl Owner {
     fn register(runtime: &ActorRuntime<Neutral>, actor: ActorId, ledger: RuntimeLedger) -> Self {
@@ -135,7 +135,7 @@ struct Fixture {
     source: ActorId,
     target: ActorId,
     source_input: InputId,
-    role: Option<InputRole<Neutral>>,
+    input_obligation: Option<StandingInputObligation<Neutral>>,
 }
 impl Fixture {
     fn new(
@@ -164,7 +164,7 @@ impl Fixture {
                 InputClass::Control,
             )
             .unwrap()
-            .into_role()
+            .into_standing_input()
             .unwrap();
         let source_input = runtime
             .reserve_input(source, source, InputClass::Ordinary)
@@ -182,13 +182,13 @@ impl Fixture {
                 source,
                 target,
                 source_input,
-                role: Some(role),
+                input_obligation: Some(role),
             },
             ticket,
         )
     }
-    fn role(&self) -> &InputRole<Neutral> {
-        self.role.as_ref().unwrap()
+    fn role(&self) -> &StandingInputObligation<Neutral> {
+        self.input_obligation.as_ref().unwrap()
     }
     fn target_scope(&self) -> &ScopeHandle {
         &self
@@ -203,7 +203,7 @@ impl Fixture {
         self.runtime
             .retire_input(self.source, self.source_input)
             .unwrap();
-        if let Some(mut role) = self.role.take() {
+        if let Some(mut role) = self.input_obligation.take() {
             if let Some(input) = role.in_flight().unwrap() {
                 self.runtime.poll_one(Tick(2)).unwrap();
                 self.runtime.retire_input(self.target, input).unwrap();
@@ -239,9 +239,9 @@ impl Fixture {
     }
 }
 fn returned_same(
-    result: Result<InputId, (DriverError, Input)>,
+    result: Result<InputId, (ActorTurnError, Input)>,
     expected: &Arc<u64>,
-) -> DriverError {
+) -> ActorTurnError {
     let (error, returned) = result.unwrap_err();
     match returned {
         Input::Value(actual) => assert!(Arc::ptr_eq(&actual, expected)),
@@ -280,7 +280,7 @@ fn forwarding_uses_paid_roles_during_drain_in_both_lock_orders_and_the_same_acto
         assert_eq!(ticket_unchanged, Ok(()));
         assert_eq!(custody.source, id(source));
         assert_eq!(custody.phase, InputPhase::Filled);
-        assert_eq!(busy_error, DriverError::RoleBusy);
+        assert_eq!(busy_error, ActorTurnError::StandingInputBusy);
         assert_eq!(
             received.iter().flatten().copied().collect::<Vec<_>>(),
             vec![41]
@@ -308,16 +308,16 @@ fn foreign_runtime_and_same_number_foreign_ticket_keep_the_original_value() {
         left.role().in_flight().unwrap().is_none() && right.role().in_flight().unwrap().is_none();
     left.finish(left_ticket);
     right.finish(right_ticket);
-    assert_eq!(target_error, DriverError::PublicationTargetMismatch);
-    assert_eq!(ticket_error, DriverError::EffectTicketOriginMismatch);
+    assert_eq!(target_error, ActorTurnError::PublicationTargetMismatch);
+    assert_eq!(ticket_error, ActorTurnError::EffectTicketOriginMismatch);
     assert!(unused);
 }
 
 #[test]
 fn one_runtime_cannot_forward_between_independent_ledgers_or_a_different_declared_source() {
     for (separate, source, expected) in [
-        (true, None, DriverError::PublicationTargetMismatch),
-        (false, Some(9), DriverError::InputAuthorMismatch),
+        (true, None, ActorTurnError::PublicationTargetMismatch),
+        (false, Some(9), ActorTurnError::InputAuthorMismatch),
     ] {
         let (f, ticket) = Fixture::new(1, 2, separate, source);
         let value = Arc::new(43);
@@ -345,7 +345,7 @@ fn prior_source_failure_rejects_the_original_generation_without_consuming_its_ti
     );
     let unused = f.role().in_flight().unwrap().is_none();
     f.finish(ticket);
-    assert_eq!(error, DriverError::FailurePublicationRequired);
+    assert_eq!(error, ActorTurnError::FailurePublicationRequired);
     assert!(unused);
 }
 
@@ -357,7 +357,7 @@ fn target_failure_and_a_closed_original_role_preserve_the_value() {
         if failed {
             f.target_scope().fail().unwrap();
         } else {
-            let mut role = f.role.take().unwrap();
+            let mut role = f.input_obligation.take().unwrap();
             role.close_after_exit().unwrap();
             closed_role = Some(role);
         }
@@ -372,9 +372,9 @@ fn target_failure_and_a_closed_original_role_preserve_the_value() {
         assert_eq!(
             error,
             if failed {
-                DriverError::ActorFailed
+                ActorTurnError::ActorFailed
             } else {
-                DriverError::UnknownRole
+                ActorTurnError::UnknownStandingInput
             }
         );
     }
@@ -407,7 +407,7 @@ fn forwarding_and_source_failure_share_one_actual_ledger_order() {
         }
         Err((error, Input::Value(original))) => {
             assert!(Arc::ptr_eq(&original, &value));
-            assert_eq!(error, DriverError::FailurePublicationRequired);
+            assert_eq!(error, ActorTurnError::FailurePublicationRequired);
             false
         }
         Err((_, Input::Emit)) => panic!("the original value cannot change shape"),
@@ -425,7 +425,7 @@ fn opposite_actor_forwards_use_one_lock_order_and_both_threads_join() {
         .runtime
         .reserve_input(f.source, f.target, InputClass::Control)
         .unwrap()
-        .into_role()
+        .into_standing_input()
         .unwrap();
     let other_input = f
         .runtime

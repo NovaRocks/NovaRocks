@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
     CrossProcessNativeFaultProxyConfig, QueryExecutionResourceSnapshot,
-    QueryLifecycleStructuredSnapshot, ServerHandle,
+    QueryLifecycleStructuredSnapshot, TestClusterOwner,
     native_fault_proxy::{ProxyDirection, ProxyMode},
 };
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
@@ -40,7 +40,14 @@ fn observed_statement(sql: &str) -> StatementSpec {
         sql: sql.into(),
         faults: vec![],
         observations: (0..REQUIRED_BACKENDS)
-            .map(|index| (index, "grpc-fragment", None))
+            .map(|index| {
+                (
+                    index,
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    None,
+                )
+            })
             .collect(),
     }
 }
@@ -132,9 +139,10 @@ impl Scenario for LiveBackendPartition {
         let baseline = resource_snapshot(context)?;
         let create_counts = (0..context.handle().be_count())
             .map(|index| {
-                context
-                    .handle()
-                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+                context.handle().be_log_count(
+                    index,
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -450,7 +458,7 @@ impl DistributedBaseline {
         if primary.is_err() {
             peer.retain_runtime_artifacts();
         }
-        let cleanup = ServerHandle::shutdown(&mut peer);
+        let cleanup = TestClusterOwner::shutdown(&mut peer);
         match (primary, cleanup) {
             (Ok(()), Ok(())) => {
                 context.action("binary baseline peer roles actually stopped and reaped");
@@ -696,7 +704,7 @@ impl Scenario for NoEffectReadAfterBackendExit {
             faults: vec![],
             observations: (0..REQUIRED_BACKENDS)
                 .flat_map(|index| {
-                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                    [1, 2].map(move |attempt| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(attempt)))
                 })
                 .collect(),
         };
@@ -714,9 +722,10 @@ impl Scenario for NoEffectReadAfterBackendExit {
         let baseline = resource_snapshot(context)?;
         let create_counts = (0..context.handle().be_count())
             .map(|index| {
-                context
-                    .handle()
-                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+                context.handle().be_log_count(
+                    index,
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -888,7 +897,7 @@ impl Scenario for Nid2CreateRejected {
             &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "create-task-rejected-after-apply",
-                marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
+                marker: novarocks_failpoint::observation_marker::TASK_CREATE_REJECTED_AFTER_APPLY,
                 subject: "a CreateTask rejection answered after the task was admitted",
                 expected_failure_fact: None,
                 error_fragments: &[
@@ -979,7 +988,7 @@ impl Scenario for Nid2CreateReceiptForeignTask {
             &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "create-task-receipt-foreign-task",
-                marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
+                marker: novarocks_failpoint::observation_marker::TASK_CREATE_RECEIPT_FOREIGN_TASK,
                 subject: "a CreateTask acknowledgement naming a task the request never addressed",
                 // A foreign Accepted receipt is refused by the frontend
                 // decoder, not a Worker InvalidStateOrRequest verdict. Keep
@@ -1072,7 +1081,7 @@ impl Scenario for Nid2ForeignStatusProcess {
             &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "task-status-foreign-process",
-                marker: "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS",
+                marker: novarocks_failpoint::observation_marker::TASK_STATUS_FOREIGN_PROCESS,
                 subject: "a task status event naming a backend process other than its own",
                 // QueryFailureReason::PreparationProtocol is the SEP-1
                 // projection of a fatal non-transport participant violation.
@@ -1252,7 +1261,10 @@ pub(super) fn await_fresh_task_create(
         for (index, baseline) in baseline_counts.iter().copied().enumerate() {
             let current = context
                 .handle()
-                .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+                .be_log_count(
+                    index,
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
+                )
                 .with_context(|| format!("read TaskCreate evidence from BE[{index}]"))?;
             if current > baseline {
                 return Ok(index);
@@ -1481,7 +1493,7 @@ fn assert_process_attribution_diagnostics(
         .context("attribution diagnostics require at least one snapshot")?;
     let namespace = format!("0x{:016x}", snapshot.process_namespace);
     let namespace_field = format!("query_process_namespace={namespace}");
-    let startup_message = "NOVAROCKS_QUERY_PROCESS_NAMESPACE";
+    let startup_message = novarocks_failpoint::observation_marker::QUERY_PROCESS_NAMESPACE;
     let startup_count = context.handle().fe_log_count(startup_message)?;
     ensure!(
         startup_count == 1,

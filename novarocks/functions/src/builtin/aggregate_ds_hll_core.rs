@@ -18,7 +18,7 @@
 //! Original DS HLL aggregate computation over explicit state/allocator access.
 use crate::aggregate_scalar::ScalarStateAllocator;
 use crate::builtin::aggregate_ds_hll_failure::*;
-use crate::datasketches_hll::{HllHandle, HllTargetType};
+use crate::datasketches_hll::{HllAccumulator, HllTargetType};
 use crate::datasketches_hll_failure::HllObservation;
 use crate::percentile_input::payload_bytes_at_with_failure;
 use crate::sketch_hash::prehash_array_value_with_failure;
@@ -40,8 +40,8 @@ pub enum DsHllUpdateMode {
 pub trait DsHllStorage {
     type Allocator: ScalarStateAllocator;
     fn allocator(&self) -> Self::Allocator;
-    fn handle(&self) -> Option<&HllHandle>;
-    fn ensure_handle(
+    fn accumulator(&self) -> Option<&HllAccumulator>;
+    fn ensure_accumulator(
         &mut self,
         log_k: u8,
         target: HllTargetType,
@@ -76,8 +76,8 @@ pub trait DsHllStateReadAccess {
 pub trait TypedDsHllStorage<F: DsHllFailureSink> {
     type Allocator: ScalarStateAllocator;
     fn allocator(&self) -> Self::Allocator;
-    fn handle(&self) -> Option<&HllHandle>;
-    fn ensure_handle(
+    fn accumulator(&self) -> Option<&HllAccumulator>;
+    fn ensure_accumulator(
         &mut self,
         log_k: u8,
         target: HllTargetType,
@@ -91,16 +91,16 @@ impl<T: DsHllStorage> TypedDsHllStorage<RawDsHllFailure> for T {
     fn allocator(&self) -> Self::Allocator {
         DsHllStorage::allocator(self)
     }
-    fn handle(&self) -> Option<&HllHandle> {
-        DsHllStorage::handle(self)
+    fn accumulator(&self) -> Option<&HllAccumulator> {
+        DsHllStorage::accumulator(self)
     }
-    fn ensure_handle(
+    fn ensure_accumulator(
         &mut self,
         log_k: u8,
         target: HllTargetType,
         _: &mut RawDsHllFailure,
     ) -> Result<(), DsHllAggregateFailure> {
-        DsHllStorage::ensure_handle(self, log_k, target)
+        DsHllStorage::ensure_accumulator(self, log_k, target)
     }
     fn update_hash(
         &mut self,
@@ -358,7 +358,7 @@ pub fn update_hash_channels_at<F: DsHllFailureSink, S: TypedDsHllStateAccess<F>>
         return Ok(());
     };
     access.with_state(ordinal, |state| {
-        state.ensure_handle(lg_k, target_type, sink)?;
+        state.ensure_accumulator(lg_k, target_type, sink)?;
         state.update_hash(hash, sink)
     })
 }
@@ -380,7 +380,7 @@ fn update_from_raw_array_with_sink<F: DsHllFailureSink, S: TypedDsHllStateAccess
             continue;
         };
         access.with_state(ordinal, |state| {
-            state.ensure_handle(log_k, target_type, sink)?;
+            state.ensure_accumulator(log_k, target_type, sink)?;
             state.update_hash(hash, sink)
         })?;
     }
@@ -593,7 +593,11 @@ pub fn update_nonstruct_batch_with_sink<F: DsHllFailureSink, S: TypedDsHllStateA
 pub trait DsHllEmissionPort<F: DsHllFailureSink> {
     type Payload: AsRef<[u8]>;
     fn empty_payload(&mut self, sink: &mut F) -> Result<Self::Payload, F::Error>;
-    fn serialize(&mut self, handle: &HllHandle, sink: &mut F) -> Result<Self::Payload, F::Error>;
+    fn serialize(
+        &mut self,
+        accumulator: &HllAccumulator,
+        sink: &mut F,
+    ) -> Result<Self::Payload, F::Error>;
     fn clone_empty(
         &mut self,
         empty: &Self::Payload,
@@ -605,28 +609,28 @@ pub trait DsHllEmissionStates {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn handle(&self, ordinal: usize) -> Option<&HllHandle>;
+    fn accumulator(&self, ordinal: usize) -> Option<&HllAccumulator>;
 }
 impl<S: DsHllStateReadAccess> DsHllEmissionStates for S {
     fn len(&self) -> usize {
         DsHllStateReadAccess::len(self)
     }
-    fn handle(&self, ordinal: usize) -> Option<&HllHandle> {
-        DsHllStorage::handle(self.state(ordinal))
+    fn accumulator(&self, ordinal: usize) -> Option<&HllAccumulator> {
+        DsHllStorage::accumulator(self.state(ordinal))
     }
 }
 struct RawEmission;
 impl DsHllEmissionPort<RawDsHllFailure> for RawEmission {
     type Payload = Vec<u8>;
     fn empty_payload(&mut self, _: &mut RawDsHllFailure) -> Result<Vec<u8>, DsHllAggregateFailure> {
-        Ok(HllHandle::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?)
+        Ok(HllAccumulator::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?)
     }
     fn serialize(
         &mut self,
-        handle: &HllHandle,
+        accumulator: &HllAccumulator,
         _: &mut RawDsHllFailure,
     ) -> Result<Vec<u8>, DsHllAggregateFailure> {
-        Ok(handle.serialize()?)
+        Ok(accumulator.serialize()?)
     }
     fn clone_empty(
         &mut self,
@@ -663,8 +667,8 @@ pub fn build_array_with_sink<
             let mut extent = DsHllOutputTally::default();
             for ordinal in 0..access.len() {
                 sink.observe(HllObservation::Step)?;
-                let payload = match access.handle(ordinal) {
-                    Some(handle) => port.serialize(handle, sink)?,
+                let payload = match access.accumulator(ordinal) {
+                    Some(accumulator) => port.serialize(accumulator, sink)?,
                     None => port.clone_empty(&empty_payload, sink)?,
                 };
                 extent
@@ -687,8 +691,8 @@ pub fn build_array_with_sink<
             for ordinal in 0..access.len() {
                 sink.observe(HllObservation::Step)?;
                 let value = access
-                    .handle(ordinal)
-                    .map(|handle| handle.estimate_with_failure(sink))
+                    .accumulator(ordinal)
+                    .map(|accumulator| accumulator.estimate_with_failure(sink))
                     .transpose()?
                     .unwrap_or(0);
                 let grows = builder.len() == builder.capacity();

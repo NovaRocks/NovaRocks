@@ -76,7 +76,7 @@ pub(crate) fn known_input_layouts_for_composition(
         one_control_run: array::<proto::TaskControlOperation>(items)?,
         reply_ids: array::<TaskOperationId>(items)?,
         reply_headers: array::<ReceiptHeader>(items)?,
-        establishes: array::<(TaskOperationId, QueryContextRef)>(items)?,
+        establishes: array::<(TaskOperationId, ParticipationRef)>(items)?,
     })
 }
 

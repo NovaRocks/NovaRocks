@@ -255,28 +255,28 @@ impl<C> AcceptedTaskConclusion<C> {
 pub type SettledContinuation<C> =
     Box<dyn FnOnce(Option<Arc<AcceptedTaskConclusion<C>>>) + Send + 'static>;
 
-/// Opaque, single-use authority issued with an admitted lifecycle role.
+/// Opaque, single-use authority issued with admitted lifecycle work.
 /// The issuer keeps its bounded storage and work responsibility until actual
 /// callback/capture exit and every required completion consumer retires.
 ///
 /// This is public so the application owner can implement it across crates.
 /// An Execution consumer receives a permit; cloning a Task port grants no
-/// authority to construct another admitted role.
+/// authority to construct another settlement reservation.
 pub trait SettlementCapability<C>: Send
 where
     C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
 {
-    /// Transfers the continuation into the role's existing prepaid custody.
+    /// Transfers the continuation into the existing prepaid custody.
     /// The implementation must not wait for the protocol owner to advance.
     fn register(self: Box<Self>, continuation: SettledContinuation<C>);
     /// Withdraws an unused registration authority. This is not evidence that
-    /// the bound role, its captures or its other reports have actually exited.
+    /// the bound work, its captures or its other reports have actually exited.
     fn revoke_unused(self: Box<Self>);
 }
 
 /// Moving this value is the only way to register one settlement continuation.
 /// It intentionally implements neither Clone nor a factory on a Task handle.
-#[must_use = "An admitted role must consume or revoke its settlement authority"]
+#[must_use = "Admitted work must consume or revoke its settlement authority"]
 pub struct SettlementPermit<C>
 where
     C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
@@ -288,9 +288,9 @@ impl<C> SettlementPermit<C>
 where
     C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
 {
-    /// Called only by the role admission owner after reserving its complete
+    /// Called only by the settlement admission owner after reserving its complete
     /// storage/work vector. This factory creates no capacity on its own.
-    pub fn from_admitted_role(
+    pub fn from_admitted_reservation(
         identity: TaskIdentity,
         capability: Box<dyn SettlementCapability<C>>,
     ) -> Self {
@@ -301,7 +301,7 @@ where
     }
     /// Taskless execution can have an admitted local finisher without
     /// manufacturing a distributed Task identity or depending on Worker.
-    pub fn from_admitted_local_role(capability: Box<dyn SettlementCapability<C>>) -> Self {
+    pub fn from_admitted_local_reservation(capability: Box<dyn SettlementCapability<C>>) -> Self {
         Self {
             identity: None,
             capability: Some(capability),
@@ -709,7 +709,7 @@ mod source_ownership_tests {
         let registered = Arc::new(AtomicUsize::new(0));
         let revoked = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let permit = SettlementPermit::from_admitted_role(
+        let permit = SettlementPermit::from_admitted_reservation(
             receipt(TaskConclusion::Succeeded).identity(),
             Box::new(CapabilityProbe {
                 registered: registered.clone(),
@@ -729,7 +729,7 @@ mod source_ownership_tests {
     fn unused_settlement_permit_revokes_registration_authority_once() {
         let registered = Arc::new(AtomicUsize::new(0));
         let revoked = Arc::new(AtomicUsize::new(0));
-        let permit = SettlementPermit::from_admitted_role(
+        let permit = SettlementPermit::from_admitted_reservation(
             receipt(TaskConclusion::Succeeded).identity(),
             Box::new(CapabilityProbe {
                 registered: registered.clone(),
@@ -744,7 +744,7 @@ mod source_ownership_tests {
     fn local_settlement_authority_never_manufactures_a_task_identity() {
         let registered = Arc::new(AtomicUsize::new(0));
         let revoked = Arc::new(AtomicUsize::new(0));
-        let permit = SettlementPermit::from_admitted_local_role(Box::new(CapabilityProbe {
+        let permit = SettlementPermit::from_admitted_local_reservation(Box::new(CapabilityProbe {
             registered: registered.clone(),
             revoked: revoked.clone(),
         }));

@@ -20,7 +20,7 @@
 //! Three values live here, and each one owns its cross-field validation in its
 //! constructor so an invalid value cannot be built at all:
 //!
-//! * [`IcebergCommitHandle`] is the frontend-only write session. It carries the
+//! * [`IcebergWriteCommitSession`] is the frontend-only write session. It carries the
 //!   sealed logical target set, the frozen table/ref/base facts, and the single
 //!   terminal state a commit may reach.
 //! * [`IcebergWriterHandle`] is one logical write recipe. It carries table
@@ -1719,7 +1719,7 @@ impl std::fmt::Display for IcebergWriteSessionId {
 /// Its terminal state lives behind a mutex because the neutral contract borrows
 /// the handle on every terminal call.
 #[derive(Debug)]
-pub struct IcebergCommitHandle {
+pub struct IcebergWriteCommitSession {
     session_id: IcebergWriteSessionId,
     table: IcebergWriteTableFacts,
     flavor: IcebergWriteFlavor,
@@ -1875,7 +1875,7 @@ pub enum IcebergWriteSessionState {
     },
 }
 
-impl IcebergCommitHandle {
+impl IcebergWriteCommitSession {
     pub(crate) const fn fixed_backing_bytes() -> usize {
         std::mem::size_of::<Self>()
     }
@@ -2971,7 +2971,7 @@ mod tests {
             )
         };
         assert!(
-            IcebergCommitHandle::try_new(
+            IcebergWriteCommitSession::try_new(
                 IcebergWriteSessionId::new(),
                 table_facts(),
                 IcebergWriteFlavor::RowMutationDeletionVector,
@@ -2985,7 +2985,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            IcebergCommitHandle::try_new(
+            IcebergWriteCommitSession::try_new(
                 IcebergWriteSessionId::new(),
                 table_facts(),
                 IcebergWriteFlavor::RowMutationDeletionVector,
@@ -3000,7 +3000,7 @@ mod tests {
             "a repeated branch makes the delete route ambiguous"
         );
         assert!(
-            IcebergCommitHandle::try_new(
+            IcebergWriteCommitSession::try_new(
                 IcebergWriteSessionId::new(),
                 table_facts(),
                 IcebergWriteFlavor::Append,
@@ -3015,7 +3015,7 @@ mod tests {
             "an append flavor does not own a deletion-vector branch"
         );
         assert!(
-            IcebergCommitHandle::try_new(
+            IcebergWriteCommitSession::try_new(
                 IcebergWriteSessionId::new(),
                 table_facts(),
                 IcebergWriteFlavor::Append,
@@ -3030,7 +3030,7 @@ mod tests {
 
     #[test]
     fn a_session_allows_exactly_one_commit_attempt() {
-        let handle = IcebergCommitHandle::try_new(
+        let handle = IcebergWriteCommitSession::try_new(
             IcebergWriteSessionId::new(),
             table_facts(),
             IcebergWriteFlavor::Append,

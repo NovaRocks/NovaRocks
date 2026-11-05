@@ -20,7 +20,7 @@
 //! carrier validation/hydration/rendering. No driver does those operations.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 #[cfg(test)]
 use crate::exec::pipeline::operator::ExitProgress;
@@ -33,6 +33,7 @@ use novarocks_execution_contract::native_result_support::NativeResultSupportGeom
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::RawInput,
     operator::{ExitObservation, FinishWatch, Operator},
     shape::{
@@ -40,14 +41,13 @@ use crate::exec::pipeline::{
         StepOperator,
     },
     step::{AdmissionNext, InputResult, NextStep, StepResult, UpstreamPull, WaitFact, WaitReason},
-    step_context::StepContext,
-};
-use crate::runtime::fragment::io::{
-    ResultAbort, RootInputAdmission, RootInputPermit, RootProducerState, RootResultInput,
-    RootResultSession, RootWorkExitProgress,
 };
 use crate::runtime::observable::Observable;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{
+    ResultAbort, RootInputAdmission, RootInputPermit, RootProducerState, RootResultInput,
+    RootResultSession, RootWorkExitProgress,
+};
 #[cfg(test)]
 use arrow::datatypes::DataType;
 #[cfg(test)]
@@ -227,7 +227,7 @@ struct RootResultSink {
     exit_waker: Waker,
     remaining: Arc<AtomicI32>,
     next: NextStep,
-    failure: Option<crate::runtime::fragment::ExecutionFailure>,
+    failure: Option<crate::runtime::task::ExecutionFailure>,
     activated: bool,
     finishing: bool,
     contributed: bool,
@@ -285,7 +285,7 @@ impl std::error::Error for RootReceiverFailure {
 }
 impl novarocks_failure_contract::FailureProjection for RootReceiverFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         if matches!(self, Self::MetadataExtent) {
             return FailureFact::new(
@@ -316,7 +316,7 @@ impl novarocks_failure_contract::FailureProjection for RootReceiverFailure {
         FailureFact::new(class, code.reason())
     }
 }
-impl From<RootReceiverFailure> for crate::runtime::fragment::ExecutionFailure {
+impl From<RootReceiverFailure> for crate::runtime::task::ExecutionFailure {
     fn from(cause: RootReceiverFailure) -> Self {
         Self::from_domain(cause)
     }
@@ -334,7 +334,7 @@ impl RootResultSink {
         if self.input_panic_custody[phase].is_none() {
             self.input_panic_custody[phase] = Some(payload);
         }
-        let cause: crate::runtime::fragment::ExecutionFailure = if phase == 0 {
+        let cause: crate::runtime::task::ExecutionFailure = if phase == 0 {
             RootReceiverFailure::InputChunkDropPanicked.into()
         } else {
             RootReceiverFailure::InputPermitDropPanicked.into()
@@ -418,7 +418,7 @@ impl RootResultSink {
         operation_stopped: bool,
     ) -> ExecutionResult<RootObservation> {
         if !self.valid_dop {
-            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
                 RootReceiverFailure::InvalidDop,
             ));
         }
@@ -454,8 +454,8 @@ impl RootResultSink {
     }
     fn host_failure(
         &mut self,
-        ctx: &StepContext<'_>,
-        error: crate::runtime::fragment::ExecutionFailure,
+        ctx: &DriverStep<'_>,
+        error: crate::runtime::task::ExecutionFailure,
     ) -> ExecutionResult<StepResult> {
         use novarocks_failure_contract::{FailureEvidence, FailureProjection};
         if error.failure_fact().evidence() != FailureEvidence::StopObservation {
@@ -468,13 +468,13 @@ impl RootResultSink {
     }
     fn fail(
         &mut self,
-        ctx: &StepContext<'_>,
-        error: crate::runtime::fragment::ExecutionFailure,
-    ) -> crate::runtime::fragment::ExecutionFailure {
+        ctx: &DriverStep<'_>,
+        error: crate::runtime::task::ExecutionFailure,
+    ) -> crate::runtime::task::ExecutionFailure {
         ctx.report_failure(error.clone());
         self.failure.get_or_insert(error).clone()
     }
-    fn finish_step(&mut self, ctx: &StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish_step(&mut self, ctx: &DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let RootObservation::AwaitOwner(wait) =
             self.observe_producer(ctx.failure_port(), false)?
         {
@@ -489,7 +489,7 @@ impl RootResultSink {
                     old.checked_sub(1).filter(|next| *next >= 0)
                 })
                 .map_err(|_| {
-                    crate::runtime::fragment::ExecutionFailure::from_domain(
+                    crate::runtime::task::ExecutionFailure::from_domain(
                         RootReceiverFailure::FinishUnderflow,
                     )
                 })?;
@@ -504,7 +504,7 @@ impl RootResultSink {
         }
         self.next = match self.observe_producer(ctx.failure_port(), false)? {
             RootObservation::AwaitOwner(wait) => NextStep::Wait(wait),
-            RootObservation::Ready(RootProducerState::ContextHeld) => NextStep::Finished,
+            RootObservation::Ready(RootProducerState::ParticipationHeld) => NextStep::Finished,
             RootObservation::Ready(_) => NextStep::Wait(WaitFact {
                 reason: WaitReason::Finish,
                 observable,
@@ -514,7 +514,7 @@ impl RootResultSink {
         };
         Ok(StepResult::new(None, self.next.clone(), 0))
     }
-    fn submit_pending(&mut self, ctx: &StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn submit_pending(&mut self, ctx: &DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let RootObservation::AwaitOwner(wait) =
             self.observe_producer(ctx.failure_port(), false)?
         {
@@ -624,7 +624,7 @@ impl StepOperator for RootResultSink {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.session.writable_observable())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if self.cancelled {
             return Ok(ControlStep::Active);
         }
@@ -638,12 +638,12 @@ impl StepOperator for RootResultSink {
         }
         Ok(ControlStep::Active)
     }
-    fn reserve_upstream(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<UpstreamPull> {
+    fn reserve_upstream(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<UpstreamPull> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
         if !self.activated {
-            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
                 RootReceiverFailure::NotActivated,
             ));
         }
@@ -680,14 +680,14 @@ impl StepOperator for RootResultSink {
             },
         }
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
             return InputResult::Rejected { input, failure };
         }
         if !self.activated {
             return InputResult::Rejected {
                 input,
-                failure: crate::runtime::fragment::ExecutionFailure::from_domain(
+                failure: crate::runtime::task::ExecutionFailure::from_domain(
                     RootReceiverFailure::NotActivated,
                 ),
             };
@@ -706,7 +706,7 @@ impl StepOperator for RootResultSink {
         if self.finishing || self.cancelled || matches!(self.next, NextStep::Finished) {
             return InputResult::Rejected {
                 input,
-                failure: crate::runtime::fragment::ExecutionFailure::from_domain(
+                failure: crate::runtime::task::ExecutionFailure::from_domain(
                     RootReceiverFailure::InputAfterFinish,
                 ),
             };
@@ -726,12 +726,12 @@ impl StepOperator for RootResultSink {
         }
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
         if !self.activated {
-            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            return Err(crate::runtime::task::ExecutionFailure::from_domain(
                 RootReceiverFailure::NotActivated,
             ));
         }
@@ -765,7 +765,7 @@ impl StepOperator for RootResultSink {
             Err(error) => Err(self.fail(ctx, error)),
         }
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -788,9 +788,9 @@ mod tests {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
-    use crate::runtime::fragment::io::{
-        FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultWriteCredit,
-        RootFailureObservation, RootInputAuthority, RootResultWriteSpec,
+    use crate::runtime::task::io::{
+        ResultWriteCredit, RootFailureObservation, RootInputAuthority, RootResultWriteSpec,
+        TaskIoError, TaskIoErrorKind, TaskIoOperation,
     };
     use arrow::array::Int32Array;
     use novarocks_execution_contract::TaskIdentity;
@@ -818,8 +818,8 @@ mod tests {
         released_live_backing: Arc<AtomicBool>,
         panic_in_state: AtomicBool,
         panic_in_submit: AtomicBool,
-        reject_before_take: Mutex<Option<FragmentIoError>>,
-        error_after_take: Mutex<Option<FragmentIoError>>,
+        reject_before_take: Mutex<Option<TaskIoError>>,
+        error_after_take: Mutex<Option<TaskIoError>>,
         stop_race: AtomicUsize,
     }
     impl Session {
@@ -868,12 +868,12 @@ mod tests {
                 drop(chunk);
                 assert_eq!(
                     permit.retire(),
-                    crate::runtime::fragment::io::RootWorkExitProgress::Exited
+                    crate::runtime::task::io::RootWorkExitProgress::Exited
                 );
             }
         }
         fn fail(&self, owner: &crate::runtime::runtime_state::RuntimeErrorState) {
-            let original: crate::runtime::fragment::ExecutionFailure =
+            let original: crate::runtime::task::ExecutionFailure =
                 novarocks_functions::KernelFailure::Internal(
                     novarocks_functions::KernelDiagnostic::new("root producer failed"),
                 )
@@ -883,16 +883,16 @@ mod tests {
             owner.set_error(original);
             self.writable_observable().notify_observers();
         }
-        fn stop_at(&self, point: usize) -> Result<(), FragmentIoError> {
+        fn stop_at(&self, point: usize) -> Result<(), TaskIoError> {
             if self
                 .stop_race
                 .compare_exchange(point, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 *self.state.lock().unwrap() = RootProducerState::AwaitTerminalControl;
-                return Err(FragmentIoError::from_domain(
-                    FragmentIoOperation::ResultWrite,
-                    FragmentIoErrorKind::Cancelled,
+                return Err(TaskIoError::from_domain(
+                    TaskIoOperation::ResultWrite,
+                    TaskIoErrorKind::Cancelled,
                     RootRaceStop,
                 ));
             }
@@ -905,7 +905,7 @@ mod tests {
                 *state,
                 RootProducerState::Failed(_) | RootProducerState::AwaitTerminalControl
             ) {
-                *state = RootProducerState::ContextHeld;
+                *state = RootProducerState::ParticipationHeld;
             }
             drop(state);
             self.exited.store(true, Ordering::Release);
@@ -920,12 +920,11 @@ mod tests {
         fn spec(&self) -> &RootResultWriteSpec {
             &self.spec
         }
-        fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
+        fn try_acquire_input(&self) -> Result<RootInputAdmission, TaskIoError> {
             self.acquisitions.fetch_add(1, Ordering::AcqRel);
             self.stop_at(1)?;
-            let crate::runtime::fragment::io::RootInputReservationAdmission::Granted(
-                mut reservation,
-            ) = self.authority.try_reserve()?
+            let crate::runtime::task::io::RootInputReservationAdmission::Granted(mut reservation) =
+                self.authority.try_reserve()?
             else {
                 return Ok(RootInputAdmission::Blocked);
             };
@@ -954,10 +953,7 @@ mod tests {
         fn writable_observable(&self) -> Arc<Observable> {
             self.authority.observable()
         }
-        fn submit_input(
-            &self,
-            submitted: &mut Option<RootResultInput>,
-        ) -> Result<(), FragmentIoError> {
+        fn submit_input(&self, submitted: &mut Option<RootResultInput>) -> Result<(), TaskIoError> {
             assert!(
                 !self.panic_in_submit.load(Ordering::SeqCst),
                 "host entry panic before inspection"
@@ -966,9 +962,9 @@ mod tests {
                 .as_ref()
                 .expect("the caller retains its original slot");
             if !self.authority.owns_original(original.permit()) {
-                return Err(FragmentIoError::new(
-                    FragmentIoOperation::ResultWrite,
-                    FragmentIoErrorKind::InvalidResponse,
+                return Err(TaskIoError::new(
+                    TaskIoOperation::ResultWrite,
+                    TaskIoErrorKind::InvalidResponse,
                     "foreign root input grant",
                 ));
             }
@@ -987,7 +983,7 @@ mod tests {
             }
             Ok(())
         }
-        fn finish_input(&self) -> Result<(), FragmentIoError> {
+        fn finish_input(&self) -> Result<(), TaskIoError> {
             self.finishes.fetch_add(1, Ordering::SeqCst);
             self.stop_at(4)?;
             *self.state.lock().unwrap() = RootProducerState::Finishing;
@@ -1039,7 +1035,7 @@ mod tests {
     impl novarocks_failure_contract::FailureProjection for RootRaceStop {
         fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
             novarocks_failure_contract::FailureFact::stop_observation(
-                crate::runtime::fragment::ExecutionReason::TaskControlObservedStop.reason(),
+                crate::runtime::task::ExecutionReason::TaskControlObservedStop.reason(),
             )
         }
     }
@@ -1051,12 +1047,12 @@ mod tests {
         factory
     }
     fn with_context<T>(
-        action: impl FnOnce(&mut StepContext<'_>) -> ExecutionResult<T>,
+        action: impl FnOnce(&mut DriverStep<'_>) -> ExecutionResult<T>,
     ) -> ExecutionResult<T> {
         let control = crate::runtime::runtime_state::RuntimeErrorState::default();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1191,8 +1187,8 @@ mod tests {
     #[test]
     fn sixty_four_root_drivers_use_real_scheduler_through_full_finish_and_actual_exit() {
         use crate::exec::pipeline::{
-            fragment_context::FragmentContext,
-            global_driver_executor::{DriverTask, FragmentCompletion, GlobalDriverExecutor},
+            global_driver_executor::{DriverGroupCompletion, DriverRunner, GlobalDriverExecutor},
+            task_context::TaskContext,
         };
         struct FiniteSource {
             session: Arc<Session>,
@@ -1204,10 +1200,10 @@ mod tests {
             }
         }
         impl StepOperator for FiniteSource {
-            fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+            fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
                 panic!("source does not accept input")
             }
-            fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 assert!(
                     !self.session.authority.is_available(),
                     "pre-pull coverage precedes work"
@@ -1219,7 +1215,7 @@ mod tests {
                     0,
                 ))
             }
-            fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+            fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
                 Ok(())
             }
         }
@@ -1245,16 +1241,16 @@ mod tests {
         let root_factory = factory(&session, 64);
         let pulls = Arc::new(AtomicUsize::new(0));
         let runtime = Arc::new(RuntimeState::default());
-        let finst = (61_001, 61_002);
-        let context = Arc::new(FragmentContext::new(
+        let task_key = (61_001, 61_002);
+        let context = Arc::new(TaskContext::new(
             None,
             runtime.clone(),
-            Some(finst),
+            Some(task_key),
             None,
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(64, runtime.error_state());
+        let completion = DriverGroupCompletion::new(64, runtime.error_state());
         let event = session.authority.observable();
         let host = event.try_subscribe(Arc::new(|| {})).unwrap();
         let held = match session.try_acquire_input().unwrap() {
@@ -1263,7 +1259,7 @@ mod tests {
         };
         let tasks = (0..64)
             .map(|id| {
-                DriverTask::new(
+                DriverRunner::new(
                     PipelineDriver::new(
                         id,
                         vec![
@@ -1276,7 +1272,7 @@ mod tests {
                         None,
                         vec![],
                         runtime.clone(),
-                        Some(finst),
+                        Some(task_key),
                     ),
                     completion.clone(),
                     context.clone(),
@@ -1308,7 +1304,7 @@ mod tests {
         assert_eq!(pulls.load(Ordering::Acquire), 64);
         assert_eq!(session.held_bytes.load(Ordering::Acquire), 0);
         assert!(completion.stopped_fact().is_none());
-        *session.state.lock().unwrap() = RootProducerState::ContextHeld;
+        *session.state.lock().unwrap() = RootProducerState::ParticipationHeld;
         event.notify_observers();
         // ContextHeld closes data flow, but the physical owner is still live.
         std::thread::sleep(Duration::from_millis(20));
@@ -1434,7 +1430,7 @@ mod tests {
                 if matches!(entry, Entry::FinishStep) {
                     input_exit_context(&state, |ctx| sink.finish(ctx)).unwrap();
                 }
-                let original: crate::runtime::fragment::ExecutionFailure =
+                let original: crate::runtime::task::ExecutionFailure =
                     novarocks_functions::KernelFailure::ResourceExhausted.into();
                 *session.state.lock().unwrap() = if failed_metadata {
                     RootProducerState::Failed(RootFailureObservation::from_failure(&original))
@@ -1590,7 +1586,7 @@ mod tests {
                 i32::from(point != 4),
                 "a raced finish contributes to the shared count only once"
             );
-            let original: crate::runtime::fragment::ExecutionFailure =
+            let original: crate::runtime::task::ExecutionFailure =
                 novarocks_functions::KernelFailure::ResourceExhausted.into();
             control.report_failure(original.clone());
             assert_eq!(owner.pending_len(), 1);
@@ -1677,7 +1673,7 @@ mod tests {
         session.actual_exit();
     }
     #[test]
-    fn producer_exit_alone_cannot_replace_end_and_context_handoff() {
+    fn producer_exit_alone_cannot_replace_end_and_participation_handoff() {
         let session = Session::new();
         let factory = factory(&session, 1);
         let mut sink = factory.create(1, 0);
@@ -1693,7 +1689,7 @@ mod tests {
             "End and protected context handoff are still missing"
         );
         assert!(matches!(step.next, NextStep::Wait(_)));
-        *session.state.lock().unwrap() = RootProducerState::ContextHeld;
+        *session.state.lock().unwrap() = RootProducerState::ParticipationHeld;
         session.writable_observable().notify_observers();
         assert!(matches!(
             with_context(|ctx| sink.as_mut().drive(ctx)).unwrap().next,
@@ -1714,7 +1710,7 @@ mod tests {
         }
     }
     impl crate::exec::pipeline::shape::SourceKernel for Source {
-        fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             assert!(!self.produced, "last pull is delivered only once");
             assert_eq!(
                 self.session.held_bytes.load(Ordering::SeqCst),
@@ -1908,26 +1904,26 @@ mod tests {
         }
         fn try_push(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             _: crate::exec::pipeline::input::RawInput,
         ) -> crate::exec::pipeline::step::InputResult {
             panic!("source must not receive input")
         }
         fn drive(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("protected source must borrow the original root grant")
         }
         fn finish(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<()> {
             panic!("source must not receive input EOS")
         }
         fn drive_with_root_input(
             &mut self,
-            ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: &RootInputPermit,
         ) -> ExecutionResult<crate::exec::pipeline::step::RootStep> {
             (|| -> ExecutionResult<crate::exec::pipeline::step::RootStep> {
@@ -2232,10 +2228,7 @@ mod tests {
                 DriverState::Ready
             );
             if cancel {
-                assert_eq!(
-                    driver.cancel_for_fragment_abort(),
-                    DriverState::PendingFinish
-                );
+                assert_eq!(driver.cancel_for_task_abort(), DriverState::PendingFinish);
                 assert_workspace_exited_before_credit(&session);
                 session.actual_exit();
                 assert_eq!(
@@ -2362,8 +2355,7 @@ mod tests {
         health: Arc<crate::runtime::execution_health::ExecutionHealth>,
         cleanup: Mutex<[Option<novarocks_failure_contract::FailureFact>; 4]>,
     }
-    impl
-        novarocks_execution_contract::TaskConclusionPort<crate::runtime::fragment::ExecutionFailure>
+    impl novarocks_execution_contract::TaskConclusionPort<crate::runtime::task::ExecutionFailure>
         for InputExitTaskPort
     {
         fn identity(&self) -> TaskIdentity {
@@ -2374,7 +2366,7 @@ mod tests {
         ) -> Option<
             Arc<
                 novarocks_execution_contract::AcceptedTaskConclusion<
-                    crate::runtime::fragment::ExecutionFailure,
+                    crate::runtime::task::ExecutionFailure,
                 >,
             >,
         > {
@@ -2383,7 +2375,7 @@ mod tests {
         fn submit(
             &self,
             proposed: novarocks_execution_contract::TaskConclusionProposal<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
             >,
         ) {
             novarocks_execution_contract::TaskConclusionPort::submit(self.owner.as_ref(), proposed)
@@ -2395,7 +2387,7 @@ mod tests {
         }
         fn report_cleanup(
             &self,
-            cause: &crate::runtime::fragment::ExecutionFailure,
+            cause: &crate::runtime::task::ExecutionFailure,
             _: novarocks_execution_contract::TaskFailurePhase,
         ) {
             use novarocks_failure_contract::FailureProjection;
@@ -2477,12 +2469,12 @@ mod tests {
     }
     fn input_exit_context<T>(
         state: &RuntimeState,
-        action: impl FnOnce(&mut StepContext<'_>) -> T,
+        action: impl FnOnce(&mut DriverStep<'_>) -> T,
     ) -> T {
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -2557,10 +2549,10 @@ mod tests {
                 .unwrap();
         Chunk::new_with_chunk_schema(batch, schema)
     }
-    fn input_rejection() -> FragmentIoError {
-        FragmentIoError::from_domain(
-            FragmentIoOperation::ResultWrite,
-            FragmentIoErrorKind::RemoteRejected,
+    fn input_rejection() -> TaskIoError {
+        TaskIoError::from_domain(
+            TaskIoOperation::ResultWrite,
+            TaskIoErrorKind::RemoteRejected,
             novarocks_functions::KernelFailure::ResourceExhausted,
         )
     }
@@ -2631,7 +2623,7 @@ mod tests {
             let original = if entry_panics {
                 let payload = before.unwrap_err();
                 session.panic_in_submit.store(false, Ordering::SeqCst);
-                let cause: crate::runtime::fragment::ExecutionFailure =
+                let cause: crate::runtime::task::ExecutionFailure =
                     crate::exec::pipeline::driver_failure::DriverFailure::from_panic(
                         payload.as_ref(),
                     )

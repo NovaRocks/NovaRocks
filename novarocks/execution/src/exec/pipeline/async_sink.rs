@@ -24,6 +24,7 @@ use crate::{
     exec::{
         chunk::Chunk,
         pipeline::{
+            driver_step::DriverStep,
             input::{AcceptedInput, InputPreparationFailure, RawInput},
             operator::{
                 ExitObservation, FinishWatch, InputConstructionFactory, InputEncodingPolicy,
@@ -34,13 +35,12 @@ use crate::{
                 ReceiverSlot, StepOperator,
             },
             step::{AdmissionNext, InputResult, NextStep, StepResult, WaitFact, WaitReason},
-            step_context::StepContext,
         },
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         mem_tracker::MemTracker,
         runtime_state::{RuntimeErrorState, RuntimeState},
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use futures::task::{ArcWake, waker_ref};
@@ -112,7 +112,7 @@ impl std::fmt::Display for AsyncSinkFailure {
 impl std::error::Error for AsyncSinkFailure {}
 impl novarocks_failure_contract::FailureProjection for AsyncSinkFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, code) = match self {
             Self::InvalidCapacity(_) => (
@@ -243,7 +243,7 @@ struct AsyncPreparation {
 impl<O: Send> InputPreparation<AsyncTarget<'_, O>> for AsyncPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         raw: &RawInput,
         target: &AsyncTarget<'_, O>,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -284,7 +284,7 @@ impl<O: Send> InputPreparation<AsyncTarget<'_, O>> for AsyncPreparation {
     }
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         target: &AsyncTarget<'_, O>,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -459,7 +459,7 @@ impl<B: AsyncSinkBackend> AsyncSinkOperator<B> {
             }
         }
     }
-    fn fail(&mut self, ctx: &StepContext<'_>, error: ExecutionFailure) -> ExecutionFailure {
+    fn fail(&mut self, ctx: &DriverStep<'_>, error: ExecutionFailure) -> ExecutionFailure {
         if !self
             .shared
             .failure()
@@ -588,7 +588,7 @@ fn panic_failure(phase: &'static str, payload: &(dyn std::any::Any + Send)) -> E
 /// counters do not certify a physical byte bound or successful data exit.
 struct SinkBatch {
     chunk: Option<ManuallyDrop<Chunk>>,
-    permit: Option<ManuallyDrop<crate::runtime::fragment::io::RootInputPermit>>,
+    permit: Option<ManuallyDrop<crate::runtime::task::io::RootInputPermit>>,
     credit: Option<ManuallyDrop<mpsc::OwnedPermit<SinkBatch>>>,
 }
 impl SinkBatch {
@@ -1363,13 +1363,13 @@ impl<B: AsyncSinkBackend> StepOperator for AsyncSinkOperator<B> {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.shared.observable.clone())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = self.shared.failure() {
             return Err(self.fail(ctx, error));
         }
         Ok(ControlStep::Active)
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, raw: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, raw: RawInput) -> InputResult {
         let failure = self
             .failure
             .clone()
@@ -1401,7 +1401,7 @@ impl<B: AsyncSinkBackend> StepOperator for AsyncSinkOperator<B> {
         }
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = self.failure.clone().or_else(|| self.shared.failure()) {
             return Err(self.fail(ctx, error));
         }
@@ -1451,7 +1451,7 @@ impl<B: AsyncSinkBackend> StepOperator for AsyncSinkOperator<B> {
             Ok(ReceiverPreparation::Empty) => Ok(StepResult::new(None, self.next.clone(), 0)),
         }
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(error) = self.failure.clone().or_else(|| self.shared.failure()) {
             return Err(error);
         }
@@ -1499,7 +1499,7 @@ mod tests {
     impl std::error::Error for TestWriteFailure {}
     impl novarocks_failure_contract::FailureProjection for TestWriteFailure {
         fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-            use crate::runtime::fragment::ExecutionReason;
+            use crate::runtime::task::ExecutionReason;
             use novarocks_failure_contract::{FailureClass, FailureFact};
             FailureFact::new(
                 FailureClass::Dependency,
@@ -1511,10 +1511,10 @@ mod tests {
         fn consume_for_test(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             let control = state.error_state();
             let mut work =
-                crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+                crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+            let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
             match self.try_push(&mut ctx, RawInput::for_test(chunk)) {
                 InputResult::Accepted(result) => {
                     result?;
@@ -1529,10 +1529,10 @@ mod tests {
         fn finish_for_test(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
             let control = state.error_state();
             let mut work =
-                crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+                crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
             let mut value_conversions =
                 novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+            let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
             StepOperator::finish(self, &mut ctx)?;
             self.drive(&mut ctx)?;
             Ok(())
@@ -1750,10 +1750,10 @@ mod tests {
         let receiver_bytes = receiver.current();
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         let mut raw = RawInput::for_test(chunk);
         let mut previous = None;
         for _ in 0..2 {
@@ -2242,7 +2242,7 @@ mod tests {
         }
     }
     impl super::super::shape::SourceKernel for TestSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             if self.remaining == 0 {
                 return Ok(StepResult::new(None, NextStep::Finished, 0));
             }
@@ -2425,7 +2425,7 @@ mod tests {
         );
         event.progress
     }
-    struct RoleSink {
+    struct ExitProbeSink {
         fail_finish: Option<ExecutionFailure>,
         abort_error: Option<ExecutionFailure>,
         close_error: Option<ExecutionFailure>,
@@ -2433,13 +2433,13 @@ mod tests {
         finish_gate: Arc<tokio::sync::Semaphore>,
         drops: Arc<AtomicUsize>,
     }
-    impl Drop for RoleSink {
+    impl Drop for ExitProbeSink {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::AcqRel);
         }
     }
     #[async_trait::async_trait]
-    impl AsyncSinkBackend for RoleSink {
+    impl AsyncSinkBackend for ExitProbeSink {
         type Output = usize;
         async fn write_chunk(&mut self, _: &Chunk) -> ExecutionResult<()> {
             Ok(())
@@ -2475,7 +2475,7 @@ mod tests {
         let close = ExecutionFailure::from_domain(TestWriteFailure(82));
         let mut op = AsyncSinkOperator::try_new(
             "cleanup roles",
-            RoleSink {
+            ExitProbeSink {
                 fail_finish: None,
                 abort_error: Some(abort.clone()),
                 close_error: Some(close.clone()),
@@ -2520,7 +2520,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut op = AsyncSinkOperator::try_new(
             "required finish",
-            RoleSink {
+            ExitProbeSink {
                 fail_finish: Some(original.clone()),
                 abort_error: None,
                 close_error: None,
@@ -2569,7 +2569,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut op = AsyncSinkOperator::try_new(
             "close after finish",
-            RoleSink {
+            ExitProbeSink {
                 fail_finish: None,
                 abort_error: None,
                 close_error: Some(original.clone()),
@@ -2967,10 +2967,10 @@ mod tests {
         let channel = op.sender.as_ref().unwrap().clone();
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             op.try_push(&mut ctx, RawInput::for_test(chunk)),
             InputResult::Accepted(Ok(_))
@@ -3165,10 +3165,10 @@ mod tests {
         drop(hold);
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             op.try_push(&mut ctx, RawInput::for_test(chunk)),
             InputResult::Accepted(Ok(_))

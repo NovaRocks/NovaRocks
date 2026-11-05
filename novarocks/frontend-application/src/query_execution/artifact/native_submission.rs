@@ -44,19 +44,19 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 pub struct NativeSubmissionKey {
     backend_idx: usize,
     fragment_id: FragmentId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 impl NativeSubmissionKey {
     pub(crate) const fn new(
         backend_idx: usize,
         fragment_id: FragmentId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     ) -> Self {
         Self {
             backend_idx,
             fragment_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 }
@@ -152,7 +152,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             let key = NativeSubmissionKey::new(
                 submission.backend_idx(),
                 submission.fragment_id(),
-                submission.fragment_instance_id(),
+                submission.task_key(),
             );
             if !actual.insert(key) {
                 return Err(contract_error(format!(
@@ -170,7 +170,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         let root = NativeSubmissionKey::new(
             self.root_fetch.backend_idx(),
             self.root_fetch.fragment_id(),
-            self.root_fetch.fragment_instance_id(),
+            self.root_fetch.task_key(),
         );
         if root != self.root {
             return Err(contract_error(

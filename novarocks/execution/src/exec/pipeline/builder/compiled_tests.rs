@@ -17,7 +17,7 @@
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::tests::{SEED_42_FIRST, SeedMode, program};
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::{Float64Array, Int64Array};
@@ -36,7 +36,7 @@ fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
         )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let prepared = prepare_compiled_program_pipeline_execution(
         program,
         Duration::from_millis(10),
@@ -45,7 +45,7 @@ fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
         None,
         1,
         state,
-        Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+        Arc::new(crate::runtime::task::io::NoopTaskEventSink),
     )
     .expect("compiled program prepares drivers");
     prepared.start().join().expect("compiled program runs");

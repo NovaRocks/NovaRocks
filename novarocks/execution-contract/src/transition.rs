@@ -23,7 +23,7 @@
 
 /// Lifecycle state of one query context.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum QueryContextState {
+pub enum ParticipationState {
     /// No context has been installed for this exact identity.
     Absent,
     /// The creation gate owns the identity while shared facts are installed.
@@ -42,7 +42,7 @@ pub enum QueryContextState {
     Gone,
 }
 
-impl QueryContextState {
+impl ParticipationState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "ABSENT",
@@ -57,7 +57,7 @@ impl QueryContextState {
     }
 }
 
-impl std::fmt::Display for QueryContextState {
+impl std::fmt::Display for ParticipationState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -65,20 +65,20 @@ impl std::fmt::Display for QueryContextState {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryContextState;
+    use super::ParticipationState;
 
     #[test]
     fn every_wire_state_has_a_stable_name() {
-        assert_eq!(QueryContextState::Absent.as_str(), "ABSENT");
-        assert_eq!(QueryContextState::Establishing.as_str(), "ESTABLISHING");
-        assert_eq!(QueryContextState::Active.as_str(), "ACTIVE");
-        assert_eq!(QueryContextState::Quiescing.as_str(), "QUIESCING");
-        assert_eq!(QueryContextState::Releasing.as_str(), "RELEASING");
-        assert_eq!(QueryContextState::Aborting.as_str(), "ABORTING");
+        assert_eq!(ParticipationState::Absent.as_str(), "ABSENT");
+        assert_eq!(ParticipationState::Establishing.as_str(), "ESTABLISHING");
+        assert_eq!(ParticipationState::Active.as_str(), "ACTIVE");
+        assert_eq!(ParticipationState::Quiescing.as_str(), "QUIESCING");
+        assert_eq!(ParticipationState::Releasing.as_str(), "RELEASING");
+        assert_eq!(ParticipationState::Aborting.as_str(), "ABORTING");
         assert_eq!(
-            QueryContextState::TerminalRetained.as_str(),
+            ParticipationState::TerminalRetained.as_str(),
             "TERMINAL_RETAINED"
         );
-        assert_eq!(QueryContextState::Gone.as_str(), "GONE");
+        assert_eq!(ParticipationState::Gone.as_str(), "GONE");
     }
 }

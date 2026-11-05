@@ -196,7 +196,7 @@ impl PartialRuntimeInFilterMerger {
         partition: usize,
         ht_row_count: usize,
         filters: Vec<RuntimeInFilter>,
-    ) -> Result<Option<Vec<RuntimeInFilter>>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Vec<RuntimeInFilter>>, crate::runtime::task::ExecutionFailure> {
         if partition >= self.expected_partitions {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime in-filter partition out of bounds",
@@ -276,8 +276,7 @@ impl PartialRuntimeInFilterMerger {
         partition: usize,
         params: Vec<RuntimeMembershipFilterBuildParam>,
         options: RuntimeMembershipBuildOptions,
-    ) -> Result<Option<Vec<RuntimeMembershipFilter>>, crate::runtime::fragment::ExecutionFailure>
-    {
+    ) -> Result<Option<Vec<RuntimeMembershipFilter>>, crate::runtime::task::ExecutionFailure> {
         if partition >= self.expected_partitions {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime membership filter partition out of bounds",

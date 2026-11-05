@@ -33,7 +33,7 @@ use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::TerminationDetail;
 
 use crate::task_execution::operation::OperationDispatchResult;
-use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution::task_execution::identity::ParticipationRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 use novarocks_execution::task_execution::{OperationKind, OperationOutcome};
 use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
@@ -47,10 +47,12 @@ use super::abort_effect::{
     NativeAbortEffectSettlement, NativeLateAbortEffect, closing_receipt, settle_late_abort_receipt,
 };
 use super::blocking_io::ConnectorBlockingIoSupervisor;
-use super::context_owner::ContextEstablishSource;
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
-use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
+use super::execution::{
+    ActorAbortDispatchState, QueryTaskExecution, QueuedParticipationAcknowledgement,
+};
 use super::intent::{AckPayload, OperationAcknowledgement};
+use super::participation_owner::ParticipationEstablishSource;
 use super::status_intake::ObservationIntake;
 use crate::native::task_transport::{
     CoveredTaskStatusSubscriber, SubscriptionState, TaskAckIntake, TaskOperationIntakeEvent,
@@ -82,7 +84,7 @@ pub(crate) trait AcknowledgementObserver: Send + Sync {
 /// Two loops need exactly this and nothing more: the dynamic-filter feedback
 /// reader, which must fetch from every task whose freshly folded status
 /// advertises a newer version, and the credential rotation owner, which must
-/// mint an `AdvanceDomain` for every context that still owes the current
+/// mint an `AdvanceDomain` for every participation that still owes the current
 /// epoch. Both are attempt-local state machines with their own progression,
 /// and neither belongs inside [`QueryTaskExecution`]: one reads over a data
 /// plane and the other talks to a credential provider, and the state machine
@@ -163,7 +165,7 @@ impl RoundPump {
 pub(crate) trait StatusSubscriptions: Send + Sync {
     fn ensure(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
 
@@ -171,13 +173,13 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
     /// loss, replaying from the serial runner's authoritative cursors.
     fn resubscribe(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
 
     /// Stop one local observation stream when terminal cleanup has closed the
     /// attempt. This never claims the backend task stopped.
-    fn stop(&self, context: QueryContextRef);
+    fn stop(&self, participation: ParticipationRef);
 
     /// The subscription's state once it has settled somewhere resubscribing
     /// cannot repair, and `None` while it can still recover.
@@ -187,32 +189,32 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
     /// else in the attempt is obliged to notice, so reporting it here is what
     /// lets the round decide the attempt on transport evidence instead of
     /// leaving it to a statement deadline.
-    fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState>;
+    fn settled_fatally(&self, participation: ParticipationRef) -> Option<SubscriptionState>;
 }
 
 impl StatusSubscriptions for TaskStatusSubscriber {
     fn ensure(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
-        Self::ensure(self, context, cursors)
+        Self::ensure(self, participation, cursors)
     }
 
     fn resubscribe(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
-        Self::resubscribe(self, context, cursors)
+        Self::resubscribe(self, participation, cursors)
     }
 
-    fn stop(&self, context: QueryContextRef) {
-        Self::stop(self, context);
+    fn stop(&self, participation: ParticipationRef) {
+        Self::stop(self, participation);
     }
 
-    fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState> {
-        Self::state(self, context).filter(|state| state.is_fatal())
+    fn settled_fatally(&self, participation: ParticipationRef) -> Option<SubscriptionState> {
+        Self::state(self, participation).filter(|state| state.is_fatal())
     }
 }
 
@@ -264,7 +266,7 @@ impl TurnReport {
 pub(crate) struct TaskRound {
     execution: QueryTaskExecution,
     acks: TaskAckIntake,
-    establish: Box<dyn ContextEstablishSource>,
+    establish: Box<dyn ParticipationEstablishSource>,
     subscriber: Option<Arc<dyn StatusSubscriptions>>,
     covered_subscriber: Option<Arc<CoveredTaskStatusSubscriber>>,
     observation_intake: Option<Arc<ObservationIntake>>,
@@ -299,7 +301,7 @@ impl TaskRound {
     pub(crate) fn new(
         execution: QueryTaskExecution,
         acks: TaskAckIntake,
-        establish: Box<dyn ContextEstablishSource>,
+        establish: Box<dyn ParticipationEstablishSource>,
         subscriber: Arc<dyn StatusSubscriptions>,
     ) -> Self {
         Self::new_inner(execution, acks, establish, Some(subscriber))
@@ -308,7 +310,7 @@ impl TaskRound {
     pub(crate) fn new_covered(
         execution: QueryTaskExecution,
         acks: TaskAckIntake,
-        establish: Box<dyn ContextEstablishSource>,
+        establish: Box<dyn ParticipationEstablishSource>,
         subscriber: Arc<CoveredTaskStatusSubscriber>,
         intake: Arc<ObservationIntake>,
     ) -> Self {
@@ -320,7 +322,7 @@ impl TaskRound {
     fn new_inner(
         execution: QueryTaskExecution,
         acks: TaskAckIntake,
-        establish: Box<dyn ContextEstablishSource>,
+        establish: Box<dyn ParticipationEstablishSource>,
         subscriber: Option<Arc<dyn StatusSubscriptions>>,
     ) -> Self {
         let (root_status_sender, root_status_source) =
@@ -467,45 +469,50 @@ impl TaskRound {
 
     fn covered_request(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<novarocks_task_codec::operation::DecodedCoveredSubscription, TaskExecutionError>
     {
-        let generation = self.execution.next_covered_generation(context)?;
+        let generation = self.execution.next_covered_generation(participation)?;
         self.execution
-            .covered_subscription_request(context, generation)
+            .covered_subscription_request(participation, generation)
     }
 
     /// Cleanup stops producers, not the original residual evidence owner.
     /// A logical closure ACK must not destroy the stream that can still prove
     /// actual Worker exit. No new subscription authority or recovery budget is
     /// introduced here; reconnect uses the same scope and applied cursors.
-    fn needs_covered_observation(&self, context: QueryContextRef) -> bool {
+    fn needs_covered_observation(&self, participation: ParticipationRef) -> bool {
         // `needs_establish` becomes false during cleanup even for an unknown
         // Establish outcome. Only its actual acknowledgement permits opening
         // the existing stream, including when that ACK arrives after cleanup.
         self.execution
-            .owner(context)
+            .owner(participation)
             .is_some_and(|owner| owner.establish_acknowledged())
             && (!self.terminal_cleanup_started
-                || (!self.execution.context_never_established(context)
+                || (!self
+                    .execution
+                    .participation_never_established(participation)
                     && self
                         .execution
-                        .context_convergence_receipt(context)
+                        .participation_convergence_receipt(participation)
                         .is_none()))
     }
 
-    fn covered_subscription_failure(&self, context: QueryContextRef) -> Option<SubscriptionState> {
-        let state = self.covered_subscriber.as_ref()?.state(context)?;
-        self.classify_covered_subscription_state(context, state)
+    fn covered_subscription_failure(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<SubscriptionState> {
+        let state = self.covered_subscriber.as_ref()?.state(participation)?;
+        self.classify_covered_subscription_state(participation, state)
     }
 
-    /// Exhausted transport recovery matters only while this Context still
+    /// Exhausted transport recovery matters only while this Participation still
     /// owes required Task evidence. Plain disconnection never erases an
     /// accepted fact or creates an application gap. Retired input demand and
     /// an accepted success cut leave residual observation to the drain owner.
     pub(super) fn classify_covered_subscription_state(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         state: SubscriptionState,
     ) -> Option<SubscriptionState> {
         match state {
@@ -545,7 +552,7 @@ impl TaskRound {
                 self.execution
                     .graph()
                     .tasks()
-                    .filter(|task| task.context() == context)
+                    .filter(|task| task.participation() == participation)
                     .filter_map(|task| self.execution.task(task.identity().task_id()))
                     .any(|task| {
                         !task.normally_stood_down() && !task.fenced_out() && !task.is_terminal()
@@ -714,9 +721,11 @@ impl TaskRound {
             let ack = match event {
                 TaskOperationIntakeEvent::EstablishSendStarted {
                     operation_id,
-                    context,
+                    participation,
                 } => {
-                    if let Err(error) = self.execution.establish_send_started(context, operation_id)
+                    if let Err(error) = self
+                        .execution
+                        .establish_send_started(participation, operation_id)
                     {
                         first_ack_error.get_or_insert(error);
                     }
@@ -737,21 +746,21 @@ impl TaskRound {
             report.abort_effects += self.drive_actor_abort_effect()?;
         }
 
-        for context in self.execution.take_status_reconciliations() {
+        for participation in self.execution.take_status_reconciliations() {
             if self.terminal_cleanup_started && self.covered_subscriber.is_none() {
                 break;
             }
-            if !self.needs_covered_observation(context) {
+            if !self.needs_covered_observation(participation) {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                if !subscriber.prepare(context)? {
+                if !subscriber.prepare(participation)? {
                     continue;
                 }
-                subscriber.reconcile(self.covered_request(context)?)?;
+                subscriber.reconcile(self.covered_request(participation)?)?;
             } else {
                 self.legacy_subscriber()
-                    .resubscribe(context, self.execution.status_cursors(context))
+                    .resubscribe(participation, self.execution.status_cursors(participation))
                     .map_err(TaskExecutionError::Schedule)?;
             }
             report.resubscriptions += 1;
@@ -773,14 +782,15 @@ impl TaskRound {
                 .try_enter()
                 .map(|mut runner| runner.drain_ordered(status_budget))
                 .unwrap_or_default();
-            let applied_contexts = entries
+            let applied_participations = entries
                 .iter()
                 .filter_map(|entry| match entry {
                     super::status_intake::ObservationIntakeEntry::Frame(frame) => {
                         match frame.as_ref() {
-                            super::status_intake::ObservationFrame::Covered { context, .. } => {
-                                Some(*context)
-                            }
+                            super::status_intake::ObservationFrame::Covered {
+                                participation,
+                                ..
+                            } => Some(*participation),
                             #[cfg(test)]
                             super::status_intake::ObservationFrame::Status(_)
                             | super::status_intake::ObservationFrame::Gone(_) => None,
@@ -792,18 +802,18 @@ impl TaskRound {
             let status = self.execution.apply_covered_entries(entries)?;
             intake.acknowledge_applied();
             if let Some(subscriber) = &self.covered_subscriber {
-                for context in applied_contexts {
-                    if !self.needs_covered_observation(context) {
-                        subscriber.stop(context);
+                for participation in applied_participations {
+                    if !self.needs_covered_observation(participation) {
+                        subscriber.stop(participation);
                         continue;
                     }
                     if !subscriber
-                        .state(context)
+                        .state(participation)
                         .is_some_and(|state| !state.is_fatal())
                     {
                         continue;
                     }
-                    subscriber.update_applied_request(self.covered_request(context)?)?;
+                    subscriber.update_applied_request(self.covered_request(participation)?)?;
                 }
             }
             status
@@ -854,50 +864,50 @@ impl TaskRound {
         // include a seal accepted at this same serial cut. Idle turns retain
         // the previous revision/Arc without cloning the full Task status set.
         self.publish_protocol_facts()?;
-        for context in self.execution.take_covered_reconciliations() {
-            if self.needs_covered_observation(context)
+        for participation in self.execution.take_covered_reconciliations() {
+            if self.needs_covered_observation(participation)
                 && let Some(subscriber) = &self.covered_subscriber
             {
-                if !subscriber.prepare(context)? {
+                if !subscriber.prepare(participation)? {
                     continue;
                 }
-                subscriber.reconcile(self.covered_request(context)?)?;
+                subscriber.reconcile(self.covered_request(participation)?)?;
                 report.resubscriptions += 1;
             }
         }
         if status.resubscribe
             && (!self.terminal_cleanup_started || self.covered_subscriber.is_some())
         {
-            for &context in self.execution.graph().contexts() {
-                if !self.needs_covered_observation(context) {
+            for &participation in self.execution.graph().participations() {
+                if !self.needs_covered_observation(participation) {
                     continue;
                 }
                 if self
                     .execution
-                    .owner(context)
+                    .owner(participation)
                     .is_none_or(|owner| !owner.establish_acknowledged())
                 {
                     continue;
                 }
                 if let Some(subscriber) = &self.covered_subscriber {
-                    if !subscriber.prepare(context)? {
+                    if !subscriber.prepare(participation)? {
                         continue;
                     }
-                    subscriber.reconcile(self.covered_request(context)?)?;
+                    subscriber.reconcile(self.covered_request(participation)?)?;
                 } else {
                     self.legacy_subscriber()
-                        .resubscribe(context, self.execution.status_cursors(context))
+                        .resubscribe(participation, self.execution.status_cursors(participation))
                         .map_err(TaskExecutionError::Schedule)?;
                 }
                 report.resubscriptions += 1;
                 let fatal = if self.covered_subscriber.is_some() {
-                    self.covered_subscription_failure(context)
+                    self.covered_subscription_failure(participation)
                 } else {
-                    self.legacy_subscriber().settled_fatally(context)
+                    self.legacy_subscriber().settled_fatally(participation)
                 };
                 if let Some(state) = fatal {
                     return Err(TaskExecutionError::ParticipantUnobservable {
-                        backend: context.backend_process_id(),
+                        backend: participation.backend_process_id(),
                         state: participant_observation_failure(state),
                     });
                 }
@@ -929,14 +939,14 @@ impl TaskRound {
         };
         report.operations = pumped.operations;
 
-        // Every context that exists needs its one subscription. Starting it
+        // Every participation that exists needs its one subscription. Starting it
         // here rather than at establish time keeps the runner the only thing
         // that touches the subscriber, and `ensure` is idempotent, so a
-        // context that already has one costs a map lookup.
+        // participation that already has one costs a map lookup.
         //
-        // A context is subscribed only once its own establish has been
-        // acknowledged. A backend holds no context until it applies the
-        // establish, so a subscription that overtakes it names a context that
+        // A participation is subscribed only once its own establish has been
+        // acknowledged. A backend holds no participation until it applies the
+        // establish, so a subscription that overtakes it names a participation that
         // backend does not hold yet -- and that refusal is classified as
         // fatal, which permanently blinds the frontend to that backend's task
         // status. Waiting for the acknowledgement is the ordering every other
@@ -945,28 +955,28 @@ impl TaskRound {
         if self.terminal_cleanup_started && self.covered_subscriber.is_none() {
             return Ok(report);
         }
-        for &context in self.execution.graph().contexts() {
-            if !self.needs_covered_observation(context) {
+        for &participation in self.execution.graph().participations() {
+            if !self.needs_covered_observation(participation) {
                 if let Some(subscriber) = &self.covered_subscriber {
-                    subscriber.stop(context);
+                    subscriber.stop(participation);
                 }
                 continue;
             }
             if self
                 .execution
-                .owner(context)
+                .owner(participation)
                 .is_none_or(|owner| !owner.establish_acknowledged())
             {
                 continue;
             }
             if let Some(subscriber) = &self.covered_subscriber {
-                if !subscriber.prepare(context)? {
+                if !subscriber.prepare(participation)? {
                     continue;
                 }
-                subscriber.ensure(self.covered_request(context)?)?;
+                subscriber.ensure(self.covered_request(participation)?)?;
             } else {
                 self.legacy_subscriber()
-                    .ensure(context, self.execution.status_cursors(context))
+                    .ensure(participation, self.execution.status_cursors(participation))
                     .map_err(TaskExecutionError::Schedule)?;
             }
             // A settled subscription is this attempt's evidence that the
@@ -974,13 +984,13 @@ impl TaskRound {
             // `ensure` is what restarts a stream that can still recover, so
             // asking first would report a state the very next call repairs.
             let fatal = if self.covered_subscriber.is_some() {
-                self.covered_subscription_failure(context)
+                self.covered_subscription_failure(participation)
             } else {
-                self.legacy_subscriber().settled_fatally(context)
+                self.legacy_subscriber().settled_fatally(participation)
             };
             if let Some(state) = fatal {
                 return Err(TaskExecutionError::ParticipantUnobservable {
-                    backend: context.backend_process_id(),
+                    backend: participation.backend_process_id(),
                     state: participant_observation_failure(state),
                 });
             }
@@ -993,10 +1003,10 @@ impl TaskRound {
         &mut self,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        let queued_context = self
+        let queued_participation = self
             .execution
-            .classify_queued_context_acknowledgement(ack)?;
-        if queued_context == QueuedContextAcknowledgement::IgnoreOlderTransportUnknown {
+            .classify_queued_participation_acknowledgement(ack)?;
+        if queued_participation == QueuedParticipationAcknowledgement::IgnoreOlderTransportUnknown {
             // This fact belongs to an older transport generation. The
             // unchanged replay and its actor authorization remain owned by
             // the current queued generation.
@@ -1013,8 +1023,8 @@ impl TaskRound {
         if self.process_abort_ack(ack)? {
             return Ok(());
         }
-        if queued_context == QueuedContextAcknowledgement::ApplyDefinitive {
-            return self.execution.acknowledge_queued_context_replay(ack);
+        if queued_participation == QueuedParticipationAcknowledgement::ApplyDefinitive {
+            return self.execution.acknowledge_queued_participation_replay(ack);
         }
         self.execution.acknowledge(ack)
     }
@@ -1059,13 +1069,13 @@ impl TaskRound {
                 "success seal closed by terminal cleanup",
             ));
         }
-        for &context in self.execution.graph().contexts() {
+        for &participation in self.execution.graph().participations() {
             if let Some(subscriber) = &self.covered_subscriber {
-                if !self.needs_covered_observation(context) {
-                    subscriber.stop(context);
+                if !self.needs_covered_observation(participation) {
+                    subscriber.stop(participation);
                 }
             } else {
-                self.legacy_subscriber().stop(context);
+                self.legacy_subscriber().stop(participation);
             }
         }
         self.execution.begin_terminal_cleanup();
@@ -1095,14 +1105,15 @@ impl TaskRound {
                     "closed Native Abort replay disappeared from its adapter: {error}"
                 ))
             })?;
-            let context = actor_abort_context(effect.intent())?;
+            let participation = actor_abort_participation(effect.intent())?;
             let settlement = effect.settle(&receipt).map_err(Self::abort_settle_error)?;
             if !matches!(settlement, NativeAbortEffectSettlement::WorkerSettled) {
                 return Err(TaskExecutionError::Schedule(
                     "closed Native Abort replay did not produce a Worker settlement".to_owned(),
                 ));
             }
-            self.execution.observe_actor_abort_context_closed(context)?;
+            self.execution
+                .observe_actor_abort_participation_closed(participation)?;
             return Ok(1);
         }
         let Some(reservation) = self.execution.try_reserve_actor_abort(&preview)? else {
@@ -1149,17 +1160,17 @@ impl TaskRound {
     ) -> Result<bool, TaskExecutionError> {
         let operation_id = acknowledgement.operation_id();
 
-        if acknowledgement.kind() == OperationKind::AbortQueryContext
+        if acknowledgement.kind() == OperationKind::AbortParticipation
             && acknowledgement.worker_outcome() == Some(OperationOutcome::OwnerFailed)
         {
-            let active_context = self
+            let active_participation = self
                 .abort_effects
                 .get(&operation_id)
                 .filter(|effect| effect.intent().operation_id() == operation_id)
-                .map(|effect| actor_abort_context(effect.intent()));
-            let context = match active_context {
-                Some(context) => {
-                    let context = context?;
+                .map(|effect| actor_abort_participation(effect.intent()));
+            let participation = match active_participation {
+                Some(participation) => {
+                    let participation = participation?;
                     let settled = match self.execution.actor_abort_dispatch_state(operation_id) {
                         Ok(ActorAbortDispatchState::Queued) => {
                             self.execution.cancel_queued_actor_abort(operation_id)
@@ -1173,22 +1184,22 @@ impl TaskRound {
                         self.fail_closed_abort_operation(operation_id)?;
                         return Err(error);
                     }
-                    Some(context)
+                    Some(participation)
                 }
                 None => self
                     .late_abort_settlements
                     .get(&operation_id)
                     .and_then(|late| late.first())
                     .filter(|late| late.identity().operation_id() == operation_id)
-                    .map(|late| late.identity().context()),
+                    .map(|late| late.identity().participation()),
             };
-            if let Some(context) = context {
+            if let Some(participation) = participation {
                 // This exact negative Worker fact settles only dispatch. The
                 // original actor/residual owner still needs real convergence;
                 // neither a closure receipt nor a replay may be manufactured.
                 self.fail_closed_abort_operation(operation_id)?;
                 return Err(TaskExecutionError::OperationFailed {
-                    context,
+                    participation,
                     operation_id,
                     kind: acknowledgement.kind(),
                     rejection: acknowledgement
@@ -1209,7 +1220,7 @@ impl TaskRound {
             });
             if exact_active {
                 // Missing Worker receipt is expected only for this exact
-                // operation/kind's local refusal. It is never context closure.
+                // operation/kind's local refusal. It is never participation closure.
                 let state = match self.execution.actor_abort_dispatch_state(operation_id) {
                     Ok(state) => state,
                     Err(error) => {
@@ -1232,7 +1243,7 @@ impl TaskRound {
                 self.fail_closed_abort_operation(operation_id)?;
                 return Err(super::error::dispatch_rejection(
                     acknowledgement,
-                    OperationKind::AbortQueryContext,
+                    OperationKind::AbortParticipation,
                 ));
             }
             let exact_late = self
@@ -1241,7 +1252,7 @@ impl TaskRound {
                 .is_some_and(|late| {
                     late.first().is_some_and(|settlement| {
                         settlement.identity().operation_id() == operation_id
-                            && acknowledgement.kind() == OperationKind::AbortQueryContext
+                            && acknowledgement.kind() == OperationKind::AbortParticipation
                     })
                 });
             if !self.abort_effects.contains_key(&operation_id) && exact_late {
@@ -1250,7 +1261,7 @@ impl TaskRound {
                 self.fail_closed_abort_operation(operation_id)?;
                 return Err(super::error::dispatch_rejection(
                     acknowledgement,
-                    OperationKind::AbortQueryContext,
+                    OperationKind::AbortParticipation,
                 ));
             }
         }
@@ -1346,13 +1357,14 @@ impl TaskRound {
                 .abort_effects
                 .remove(&operation_id)
                 .expect("settled dispatcher retains the same Native Abort effect");
-            let context = actor_abort_context(effect.intent())?;
+            let participation = actor_abort_participation(effect.intent())?;
             match effect
                 .settle(acknowledgement)
                 .map_err(Self::abort_settle_error)?
             {
                 NativeAbortEffectSettlement::WorkerSettled => {
-                    self.execution.observe_actor_abort_context_closed(context)?;
+                    self.execution
+                        .observe_actor_abort_participation_closed(participation)?;
                     if let Some(settlements) = self.late_abort_settlements.remove(&operation_id) {
                         for settlement in settlements {
                             settlement.resolved_by_other_generation();
@@ -1407,13 +1419,14 @@ impl TaskRound {
                 ),
             }));
         }
-        // A definitive closing receipt for the exact operation and context
+        // A definitive closing receipt for the exact operation and participation
         // resolves every transport-unknown generation of that same replay.
         for settlement in settlements {
             settlement.resolved_by_other_generation();
         }
-        self.execution
-            .observe_actor_abort_context_closed(actor_abort_receipt_context(acknowledgement)?)?;
+        self.execution.observe_actor_abort_participation_closed(
+            actor_abort_receipt_participation(acknowledgement)?,
+        )?;
         self.abort_closing_receipts
             .insert(operation_id, acknowledgement.clone());
         Ok(())
@@ -1434,12 +1447,12 @@ impl TaskRound {
         if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Ok(());
         }
-        let AckPayload::Context(expected) = closing.payload() else {
+        let AckPayload::Participation(expected) = closing.payload() else {
             return Err(TaskExecutionError::Schedule(
-                "Native Abort closing tombstone lost its context receipt".to_owned(),
+                "Native Abort closing tombstone lost its participation receipt".to_owned(),
             ));
         };
-        closing_receipt(expected.context(), acknowledgement).map_err(|reason| {
+        closing_receipt(expected.participation(), acknowledgement).map_err(|reason| {
             TaskExecutionError::Schedule(format!(
                 "Native Abort replay acknowledgement conflicts with its closing tombstone: {reason:?}"
             ))
@@ -1547,18 +1560,21 @@ impl TaskRound {
             // Only the Contexts with required missing evidence can exhaust
             // this recovery. An unrelated disconnected stream is not a gate.
             let exhausted = self.execution.covered_recovery_expired()
-                || self.execution.covered_gap_contexts().any(|context| {
-                    self.covered_subscriber
-                        .as_ref()
-                        .and_then(|subscriber| subscriber.state(context))
-                        .is_some_and(|state| {
-                            matches!(
-                                state,
-                                SubscriptionState::BudgetExhausted
-                                    | SubscriptionState::ConnectionLossExhausted
-                            )
-                        })
-                });
+                || self
+                    .execution
+                    .covered_gap_participations()
+                    .any(|participation| {
+                        self.covered_subscriber
+                            .as_ref()
+                            .and_then(|subscriber| subscriber.state(participation))
+                            .is_some_and(|state| {
+                                matches!(
+                                    state,
+                                    SubscriptionState::BudgetExhausted
+                                        | SubscriptionState::ConnectionLossExhausted
+                                )
+                            })
+                    });
             if exhausted {
                 self.pending_success_seal.take().expect("pending recovery request").reject(
                     QueryExecutionError::new(QueryExecutionErrorKind::Failed,
@@ -1581,7 +1597,7 @@ impl TaskRound {
             // stays live until its independent Task obligations complete.
             self.begin_normal_drain();
             let withdrawals = self.root_activation.map_or_else(Vec::new, |activation| {
-                self.execution.result_context_withdrawals(activation)
+                self.execution.result_participation_withdrawals(activation)
             });
             let sender = self.root_status_sender.take().ok_or_else(|| {
                 TaskExecutionError::Schedule(
@@ -1625,19 +1641,22 @@ impl TaskRound {
         Ok(())
     }
 
-    /// Whether every query context of this attempt has been established.
+    /// Whether every participation of this attempt has been established.
     ///
     /// This is the task protocol's ControlReady: past it, every backend that
     /// hosts a task has acknowledged this attempt's shared facts. A caller
     /// uses it to close a pre-ready retry window, so it must be an observation
     /// of acknowledgements rather than of having sent them.
     #[cfg(test)]
-    pub(crate) fn contexts_established(&self) -> bool {
-        self.execution.graph().contexts().all(|&context| {
-            self.execution
-                .owner(context)
-                .is_some_and(|owner| !owner.needs_establish())
-        })
+    pub(crate) fn participations_established(&self) -> bool {
+        self.execution
+            .graph()
+            .participations()
+            .all(|&participation| {
+                self.execution
+                    .owner(participation)
+                    .is_some_and(|owner| !owner.needs_establish())
+            })
     }
 
     /// Whether every task of this attempt has a positive Worker ownership fact.
@@ -1687,7 +1706,7 @@ impl TaskRound {
         self.success_sealed
     }
 
-    /// Whether every task terminated and every context was released.
+    /// Whether every task terminated and every participation was released.
     #[cfg(test)]
     pub(crate) fn attempt_drained(&self) -> bool {
         self.execution.attempt_drained()
@@ -1698,7 +1717,7 @@ impl TaskRound {
         self.pumps_sealed
     }
 
-    /// Local pump proof is independent of remote Task/context receipts.
+    /// Local pump proof is independent of remote Task/participation receipts.
     pub(crate) fn pumps_closed(&self) -> bool {
         self.pumps.iter().all(|pump| pump.owner.is_closed())
     }
@@ -1761,24 +1780,24 @@ impl TaskRound {
     }
 }
 
-fn actor_abort_context(
+fn actor_abort_participation(
     intent: &super::intent::OperationIntent,
-) -> Result<novarocks_execution::task_execution::QueryContextRef, TaskExecutionError> {
+) -> Result<novarocks_execution::task_execution::ParticipationRef, TaskExecutionError> {
     match intent {
-        super::intent::OperationIntent::AbortQueryContext(request) => Ok(request.context()),
+        super::intent::OperationIntent::AbortParticipation(request) => Ok(request.participation()),
         _ => Err(TaskExecutionError::Schedule(
             "actor Abort effect retained a non-Abort intent".to_owned(),
         )),
     }
 }
 
-fn actor_abort_receipt_context(
+fn actor_abort_receipt_participation(
     acknowledgement: &OperationAcknowledgement,
-) -> Result<novarocks_execution::task_execution::QueryContextRef, TaskExecutionError> {
+) -> Result<novarocks_execution::task_execution::ParticipationRef, TaskExecutionError> {
     match acknowledgement.payload() {
-        AckPayload::Context(receipt) => Ok(receipt.context()),
+        AckPayload::Participation(receipt) => Ok(receipt.participation()),
         _ => Err(TaskExecutionError::Schedule(
-            "definitive actor Abort acknowledgement omitted its context receipt".to_owned(),
+            "definitive actor Abort acknowledgement omitted its participation receipt".to_owned(),
         )),
     }
 }
@@ -1804,12 +1823,12 @@ pub(super) async fn pending_task_failure_then_invalid_covered_frame_round() -> T
     use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
     let mut round = super::tests::manifest_preparing_observation_round();
     let root = round.execution().graph().root_identity();
-    let context = round
+    let participation = round
         .execution()
         .graph()
         .task(root.task_id())
         .unwrap()
-        .context();
+        .participation();
     let foreign_task = novarocks_types::TaskId::new(u32::MAX).unwrap();
     assert!(round.execution().graph().task(foreign_task).is_none());
     let foreign = novarocks_execution_contract::TaskIdentity::new(
@@ -1850,7 +1869,7 @@ pub(super) async fn pending_task_failure_then_invalid_covered_frame_round() -> T
             .await
             .publish(
                 super::status_intake::ObservationFrame::Covered {
-                    context,
+                    participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
                         fact: CoveredStatusStreamFact::Status(status),
@@ -1876,12 +1895,12 @@ mod pre_ready_receiver_tests {
     async fn pending_receiver_applies_originating_task_failure_through_original_covered_domain() {
         let mut round = super::super::tests::manifest_preparing_observation_round();
         let identity = round.execution().graph().root_identity();
-        let context = round
+        let participation = round
             .execution()
             .graph()
             .task(identity.task_id())
             .unwrap()
-            .context();
+            .participation();
         let intake = Arc::new(
             ObservationIntake::for_task_attempt(
                 Arc::new(super::super::status_intake::CountingWake::default()),
@@ -1913,7 +1932,7 @@ mod pre_ready_receiver_tests {
             .await
             .publish(
                 super::super::status_intake::ObservationFrame::Covered {
-                    context,
+                    participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
                         fact: CoveredStatusStreamFact::Status(status),

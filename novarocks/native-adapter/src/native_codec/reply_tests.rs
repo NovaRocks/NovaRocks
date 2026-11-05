@@ -85,7 +85,7 @@ async fn generated_client_bounds_nested_ack_and_release_telemetry() {
         ],
         ..Default::default()
     });
-    let release_ack = Ack::ReleaseQueryContext(wire::ReleaseQueryContextAck {
+    let release_ack = Ack::ReleaseParticipation(wire::ReleaseParticipationAck {
         runtime_filter: Some(wire::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(wire::query_terminal_profile_contribution_telemetry::Telemetry::Available(wire::QueryTerminalProfileContributionV1 {
                 version: 1,

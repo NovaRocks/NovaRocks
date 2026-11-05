@@ -298,7 +298,7 @@ mod internal_supervisor_tests {
             _: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
-            let contexts = schedule.contexts().to_vec();
+            let participations = schedule.participations().to_vec();
             let window = self.window.clone();
             let signals = Arc::clone(&self.signals);
             Box::pin(async move {
@@ -337,7 +337,7 @@ mod internal_supervisor_tests {
                 Ok(ActivatedNativeAttempt::relayed_rows(
                     InternalCountActive {
                         root,
-                        contexts,
+                        participations,
                         statuses,
                         signals,
                     },
@@ -357,7 +357,7 @@ mod internal_supervisor_tests {
 
     struct InternalCountActive {
         root: novarocks_execution_contract::TaskIdentity,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
         statuses: super::super::super::AcceptedRootStatusSender,
         signals: Arc<InternalAttemptSignals>,
     }
@@ -405,7 +405,7 @@ mod internal_supervisor_tests {
             }
             Box::pin(async move {
                 let mut admissions = SuccessfulCompletionActiveOwner {
-                    contexts: self.contexts.clone(),
+                    participations: self.participations.clone(),
                 };
                 assert!(matches!(
                     admissions.run(drive, cancellation).await,
@@ -476,15 +476,15 @@ mod internal_supervisor_tests {
                 self.signals.release_cleanup.notified().await;
                 self.signals.cleanup_completed.store(true, Ordering::SeqCst);
                 let evidence = if self.signals.factory_failure_before_native {
-                    NativeAttemptConvergence::contexts(
-                        self.contexts
+                    NativeAttemptConvergence::participations(
+                        self.participations
                             .iter()
                             .copied()
-                            .map(crate::api::NativeContextConvergence::never_established)
+                            .map(crate::api::NativeParticipationConvergence::never_established)
                             .collect::<Box<[_]>>(),
                     )
                 } else {
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced()
                 };
                 Ok(NativeActiveConvergenceClosure::Evidence(evidence))
             })
@@ -1007,8 +1007,8 @@ mod internal_supervisor_tests {
 
     impl ReplacementQualificationEffectReservation for RefusingQualificationReservation {
         fn submit(self: Box<Self>, submission: ReplacementQualificationEffectSubmission) {
-            assert!(!submission.request().failed_contexts().is_empty());
-            assert!(!submission.request().replacement_contexts().is_empty());
+            assert!(!submission.request().failed_participations().is_empty());
+            assert!(!submission.request().replacement_participations().is_empty());
             self.submissions.fetch_add(1, Ordering::SeqCst);
             submission.refused(self.failure);
         }

@@ -450,7 +450,7 @@ impl InputEncodingPolicy for JoinInputSink {}
 impl SinkKernel for JoinInputSink {
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         if let Some(cause) = &self.prepare_failure {
@@ -463,7 +463,7 @@ impl SinkKernel for JoinInputSink {
             .as_ref()
             .map(|frame| frame.completion.observable())
     }
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         let frame = self.frame()?;
         frame.completion.check()?;
         if frame.completion.remaining_demand()? == RemainingDemand::Released {
@@ -474,7 +474,7 @@ impl SinkKernel for JoinInputSink {
     }
     fn consume(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
@@ -612,7 +612,7 @@ impl SinkKernel for JoinInputSink {
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         if let Some(cause) = &self.prepare_failure {
             return Err(cause.clone());
         }

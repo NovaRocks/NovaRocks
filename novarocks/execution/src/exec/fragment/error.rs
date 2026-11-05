@@ -45,7 +45,7 @@ impl fmt::Display for ExecPlanInvariant {
 pub struct ExecPlanBuildError {
     invariant: ExecPlanInvariant,
     detail: String,
-    source: Option<crate::runtime::fragment::SharedDomainFailure>,
+    source: Option<crate::runtime::task::SharedDomainFailure>,
 }
 
 impl ExecPlanBuildError {
@@ -61,7 +61,7 @@ impl ExecPlanBuildError {
     where
         E: Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
     {
-        let source = crate::runtime::fragment::SharedDomainFailure::new(source);
+        let source = crate::runtime::task::SharedDomainFailure::new(source);
         Self {
             invariant,
             detail: source.detail().to_owned(),
@@ -291,7 +291,7 @@ mod tests {
 
 impl novarocks_failure_contract::FailureProjection for FragmentBindingError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self.kind {
             FragmentBindingErrorKind::MissingAssignment => {
@@ -319,7 +319,7 @@ impl novarocks_failure_contract::FailureProjection for FragmentBindingError {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<FragmentBindingError> for crate::runtime::fragment::ExecutionFailure {
+impl From<FragmentBindingError> for crate::runtime::task::ExecutionFailure {
     fn from(cause: FragmentBindingError) -> Self {
         Self::from_domain(cause)
     }
@@ -329,7 +329,7 @@ impl novarocks_failure_contract::FailureProjection for ExecPlanBuildError {
         if let Some(source) = self.source.as_ref() {
             return novarocks_failure_contract::FailureProjection::failure_fact(source);
         }
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self.invariant {
             ExecPlanInvariant::Node => ExecutionReason::PlanNodeInvariant,
@@ -342,7 +342,7 @@ impl novarocks_failure_contract::FailureProjection for ExecPlanBuildError {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<ExecPlanBuildError> for crate::runtime::fragment::ExecutionFailure {
+impl From<ExecPlanBuildError> for crate::runtime::task::ExecutionFailure {
     fn from(cause: ExecPlanBuildError) -> Self {
         Self::from_domain(cause)
     }
@@ -352,7 +352,7 @@ impl From<ExecPlanBuildError> for crate::runtime::fragment::ExecutionFailure {
 pub(crate) fn program_binding_failure(
     kind: FragmentBindingErrorKind,
     detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
+) -> crate::runtime::task::ExecutionFailure {
     let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
     FragmentBindingError::new(FragmentBindingTarget::Program, kind, detail.as_str()).into()
 }
@@ -361,7 +361,7 @@ pub(crate) fn program_binding_failure(
 #[cfg(test)]
 pub(crate) fn node_construction_failure(
     detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
+) -> crate::runtime::task::ExecutionFailure {
     let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
     ExecPlanBuildError::new(ExecPlanInvariant::Node, detail.as_str()).into()
 }

@@ -1302,7 +1302,7 @@ pub trait ConnectorReadSplitManager: Send + Sync {
 ///
 /// This is deliberately a marker: it carries no provider payload, wire value,
 /// or role authority.
-pub trait ConnectorReadRegistrationLease: Send + Sync {}
+pub trait ConnectorReadRegistrationPin: Send + Sync {}
 
 pub trait ConnectorReadPageSourceProvider: Send + Sync {
     /// Opens one split as a page stream the host polls with `budget`, the

@@ -27,7 +27,7 @@ use crate::query_execution::completion_facts::{
 };
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
-use novarocks_query_application::api::{ExecutionHandle, StatementNativeHealthFailure};
+use novarocks_query_application::api::{ExecutionOutputObligation, StatementNativeHealthFailure};
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
     GovernedStatementResidual, GovernedStatementVisibilitySealOutcome, StatementActionValue,
@@ -71,7 +71,7 @@ impl GovernedScalarStream {
     }
     pub(super) fn poll_value(
         &mut self,
-        execution: &mut ExecutionHandle,
+        execution: &mut ExecutionOutputObligation,
         cx: &mut Context<'_>,
     ) -> Poll<Result<String, QueryServiceError>> {
         use novarocks_query_application::api::ResultRowCarrier;
@@ -214,7 +214,7 @@ struct SetScalarStage {
     read: Option<crate::query_execution::completion::PreparedLogicalRead>,
     capacity: Option<QueryResultCapacityBinding>,
     original: OriginalComputationStart,
-    execution: Option<Result<ExecutionHandle, QueryExecutionError>>,
+    execution: Option<Result<ExecutionOutputObligation, QueryExecutionError>>,
     scalar: Option<GovernedScalarStream>,
     scalar_schema: Option<novarocks_result_contract::ScalarSchema>,
     literal: Option<String>,

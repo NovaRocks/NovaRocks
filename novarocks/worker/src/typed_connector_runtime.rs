@@ -39,10 +39,10 @@
 //! objects only. It never matches a provider variant and never downcasts, so it
 //! compiles with no provider crate in the dependency graph.
 
-use novarocks_execution::runtime::fragment::connector_failure::{
+use novarocks_execution::runtime::task::connector_failure::{
     ConnectorCallFailure, ConnectorOperation,
 };
-use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use novarocks_execution::runtime::task::{ExecutionFailure, ExecutionResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -53,7 +53,7 @@ use crate::connector_batch_transform::ConnectorBatchTransform;
 use crate::read_attempt::ReceivedReadSplit;
 use crate::typed_preparation_flow::StreamPreparationFlow;
 use crate::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
-use novarocks_execution::connector::{SplitQueue, TaskAttemptSplitQueues};
+use novarocks_execution::connector::{SplitQueue, SplitQueues};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::exec::node::scan::{
     BoundScanRanges, ScanOp, ScanSource, ScanStreamSource,
@@ -201,7 +201,7 @@ fn emit_page_source_marker(
 /// per-plan-node queue, so binding it never waits for enumeration.
 pub struct TypedConnectorScanSource {
     shared: Arc<TypedConnectorScanShared>,
-    queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+    queues: Arc<SplitQueues<ReceivedReadSplit>>,
 }
 
 impl TypedConnectorScanSource {
@@ -214,7 +214,7 @@ impl TypedConnectorScanSource {
         provider: Arc<dyn ConnectorReadPageSourceProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
-        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        queues: Arc<SplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,
@@ -251,7 +251,7 @@ impl TypedConnectorScanSource {
         provider: ReadProvider<dyn ConnectorReadPageSourceProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
-        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        queues: Arc<SplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,
@@ -293,7 +293,7 @@ impl TypedConnectorScanSource {
         provider_factory: PageProviderFactory,
         session: ConnectorSession,
         request: ConnectorRequestContext,
-        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        queues: Arc<SplitQueues<ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         output_schema: ChunkSchemaRef,

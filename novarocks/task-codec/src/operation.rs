@@ -32,32 +32,32 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use novarocks_execution_contract::task_execution::context_convergence::{
-    QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
-};
 use novarocks_execution_contract::task_execution::creation::{FrozenBytes, TaskCreationInput};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{
-    CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainProgression, DomainVersion,
+    CodecOwnedContent, CredentialDomainId, CredentialEpoch, DomainProgression, DomainVersion,
     EdgeOpenVersion, ExchangeEdgeId,
 };
 use novarocks_execution_contract::task_execution::identity::{
-    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionTicketId, ParticipationRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
 use novarocks_execution_contract::task_execution::operation::{
-    AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
-    CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
+    AbortParticipation, AcquireParticipationAdmissionTicket, AdvanceParticipationDomain,
+    CancelTask, CreateTask, CreateTaskReceipt, EstablishParticipation, FetchTaskDynamicFilters,
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
-    QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
-    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    ParticipationAdmissionTicketReceipt, ParticipationDomainReceipt, ParticipationReceipt,
+    QuiesceParticipation, QuiesceParticipationReceipt, ReleaseOutcome, ReleaseParticipation,
+    RenewParticipationLease, TaskDomainReceipt, UpdateParticipation, UpdateTask, UpdateTaskReceipt,
+};
+use novarocks_execution_contract::task_execution::participation_convergence::{
+    ParticipationConvergenceCursor, ParticipationConvergenceReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
 use novarocks_execution_contract::task_execution::task_convergence::{
     TaskConvergenceCursor, TaskConvergenceReceipt, TaskConvergenceVersion,
 };
-use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_execution_contract::task_execution::transition::ParticipationState;
 use novarocks_proto_models::novarocks;
 use novarocks_types::NativeCompatibilityId;
 use prost::Message;
@@ -65,8 +65,8 @@ use prost::Message;
 use crate::creation::decode_task_assignment;
 use crate::descriptor::decode_task_descriptor;
 use crate::domain::{
-    DecodedQueryContextDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, WireContent,
-    decode_credential_domain, decode_plan_node_split_receipt, decode_query_context_domain,
+    DecodedParticipationDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, WireContent,
+    decode_credential_domain, decode_participation_domain, decode_plan_node_split_receipt,
     decode_task_domain,
 };
 use crate::resource_preflight::{check_creation_metadata, check_frozen_fragment};
@@ -92,8 +92,8 @@ pub use novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED
 pub const MAX_NATIVE_ROOT_RESULT_PAYLOAD_BYTES: u64 =
     (NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES - 1024) as u64;
 use crate::identity::{
-    decode_admission_ticket_id, decode_query_context_ref, decode_task_identity,
-    decode_task_operation_id, encode_admission_ticket_id, encode_query_context_ref,
+    decode_admission_ticket_id, decode_participation_ref, decode_task_identity,
+    decode_task_operation_id, encode_admission_ticket_id, encode_participation_ref,
     encode_task_identity, encode_task_operation_id,
 };
 use crate::lease::decode_duration_millis;
@@ -138,7 +138,7 @@ pub fn encode_envelope(value: OperationEnvelope) -> novarocks::TaskOperationEnve
 /// A decoded create request.
 ///
 /// The neutral request carries everything the lifecycle owner decides on:
-/// the exact context, the descriptor and the initial domains. The creation
+/// the exact participation, the descriptor and the initial domains. The creation
 /// input is the short-lived remainder, moved to whichever backend owner wins
 /// this identity's creation and otherwise dropped unread.
 pub struct DecodedCreateTask {
@@ -218,21 +218,21 @@ impl DecodedUpdateTask {
 }
 
 /// A decoded establish request.
-pub struct DecodedEstablishQueryContext {
-    context: QueryContextRef,
+pub struct DecodedEstablishParticipation {
+    participation: ParticipationRef,
     envelope: OperationEnvelope,
     admission_ticket_id: AdmissionTicketId,
     catalog_set: Arc<WireContent<novarocks_proto_models::catalog::CatalogSet>>,
     initial_runtime_filter: Arc<WireContent<novarocks::RuntimeFilterContribution>>,
     query_options: Arc<WireContent<novarocks::QueryOptions>>,
-    initial_credential: DecodedQueryContextDomain,
+    initial_credential: DecodedParticipationDomain,
     initial_lease_valid_for: LeaseValidFor,
     native_compatibility_id: NativeCompatibilityId,
 }
 
-impl DecodedEstablishQueryContext {
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+impl DecodedEstablishParticipation {
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn envelope(&self) -> OperationEnvelope {
@@ -253,18 +253,18 @@ impl DecodedEstablishQueryContext {
         self.initial_runtime_filter.wire()
     }
 
-    /// The exact query options frozen for this query context.
+    /// The exact query options frozen for this participation.
     pub fn query_options(&self) -> &novarocks::QueryOptions {
         self.query_options.wire()
     }
 
     /// The credential rotation, whose material stays behind its confidential
     /// handle.
-    pub const fn credential(&self) -> &DecodedQueryContextDomain {
+    pub const fn credential(&self) -> &DecodedParticipationDomain {
         &self.initial_credential
     }
 
-    pub const fn initial_credential(&self) -> &DecodedQueryContextDomain {
+    pub const fn initial_credential(&self) -> &DecodedParticipationDomain {
         &self.initial_credential
     }
 
@@ -277,32 +277,32 @@ impl DecodedEstablishQueryContext {
     }
 }
 
-/// A decoded query-context command.
-pub enum DecodedUpdateQueryContext {
-    Establish(DecodedEstablishQueryContext),
+/// A decoded participation command.
+pub enum DecodedUpdateParticipation {
+    Establish(DecodedEstablishParticipation),
     AdvanceDomain {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         envelope: OperationEnvelope,
-        domain: DecodedQueryContextDomain,
+        domain: DecodedParticipationDomain,
     },
     RenewLease {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         envelope: OperationEnvelope,
         sequence: novarocks_execution_contract::task_execution::lease::LeaseSequence,
         valid_for: LeaseValidFor,
     },
 }
 
-impl DecodedUpdateQueryContext {
+impl DecodedUpdateParticipation {
     /// The neutral command the backend's own owner consumes.
     ///
     /// The typed content stays reachable through the decoded form; this is the
     /// projection that carries only what the neutral contract defines, which
     /// is what keeps the owner from ever naming a wire type.
-    pub fn as_neutral(&self) -> Option<UpdateQueryContext> {
+    pub fn as_neutral(&self) -> Option<UpdateParticipation> {
         match self {
             Self::Establish(request) => {
-                let DecodedQueryContextDomain::Credential { update, .. } =
+                let DecodedParticipationDomain::Credential { update, .. } =
                     &request.initial_credential
                 else {
                     // The decoder only ever builds this variant from a
@@ -310,9 +310,9 @@ impl DecodedUpdateQueryContext {
                     // rather than a wire condition.
                     return None;
                 };
-                Some(UpdateQueryContext::Establish(EstablishQueryContext::new(
+                Some(UpdateParticipation::Establish(EstablishParticipation::new(
                     request.envelope().operation_id(),
-                    request.context(),
+                    request.participation(),
                     request.admission_ticket_id(),
                     Arc::clone(&request.catalog_set) as Arc<dyn CodecOwnedContent>,
                     Arc::clone(&request.initial_runtime_filter) as Arc<dyn CodecOwnedContent>,
@@ -322,25 +322,25 @@ impl DecodedUpdateQueryContext {
                 )))
             }
             Self::AdvanceDomain {
-                context,
+                participation,
                 envelope,
                 domain,
-            } => Some(UpdateQueryContext::AdvanceDomain(
-                AdvanceQueryContextDomain::new(
+            } => Some(UpdateParticipation::AdvanceDomain(
+                AdvanceParticipationDomain::new(
                     envelope.operation_id(),
-                    *context,
+                    *participation,
                     domain.as_neutral(),
                 ),
             )),
             Self::RenewLease {
-                context,
+                participation,
                 envelope,
                 sequence,
                 valid_for,
-            } => Some(UpdateQueryContext::RenewLease(
-                RenewQueryExecutionLease::new(
+            } => Some(UpdateParticipation::RenewLease(
+                RenewParticipationLease::new(
                     envelope.operation_id(),
-                    *context,
+                    *participation,
                     *sequence,
                     *valid_for,
                 ),
@@ -348,10 +348,12 @@ impl DecodedUpdateQueryContext {
         }
     }
 
-    pub const fn context(&self) -> QueryContextRef {
+    pub const fn participation(&self) -> ParticipationRef {
         match self {
-            Self::Establish(request) => request.context(),
-            Self::AdvanceDomain { context, .. } | Self::RenewLease { context, .. } => *context,
+            Self::Establish(request) => request.participation(),
+            Self::AdvanceDomain { participation, .. } | Self::RenewLease { participation, .. } => {
+                *participation
+            }
         }
     }
 
@@ -362,7 +364,7 @@ impl DecodedUpdateQueryContext {
         }
     }
 
-    /// Only an establish may create a context.
+    /// Only an establish may create a participation.
     pub const fn may_create(&self) -> bool {
         matches!(self, Self::Establish(_))
     }
@@ -370,14 +372,14 @@ impl DecodedUpdateQueryContext {
 
 /// One decoded operation from a batch.
 pub enum DecodedOperation {
-    AcquireQueryContextAdmissionTicket(AcquireQueryContextAdmissionTicket),
+    AcquireParticipationAdmissionTicket(AcquireParticipationAdmissionTicket),
     CreateTask(DecodedCreateTask),
     UpdateTask(DecodedUpdateTask),
-    UpdateQueryContext(DecodedUpdateQueryContext),
+    UpdateParticipation(DecodedUpdateParticipation),
     CancelTask(CancelTask),
-    AbortQueryContext(AbortQueryContext),
-    QuiesceQueryContext(QuiesceQueryContext),
-    ReleaseQueryContext(ReleaseQueryContext),
+    AbortParticipation(AbortParticipation),
+    QuiesceParticipation(QuiesceParticipation),
+    ReleaseParticipation(ReleaseParticipation),
 }
 
 /// Renders only the operation kind and its envelope.
@@ -397,14 +399,14 @@ impl fmt::Debug for DecodedOperation {
 impl DecodedOperation {
     pub const fn envelope(&self) -> OperationEnvelope {
         match self {
-            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope(),
+            Self::AcquireParticipationAdmissionTicket(request) => request.envelope(),
             Self::CreateTask(request) => request.request.envelope(),
             Self::UpdateTask(request) => request.request.envelope(),
-            Self::UpdateQueryContext(request) => request.envelope(),
+            Self::UpdateParticipation(request) => request.envelope(),
             Self::CancelTask(request) => request.envelope(),
-            Self::AbortQueryContext(request) => request.envelope(),
-            Self::QuiesceQueryContext(request) => request.envelope(),
-            Self::ReleaseQueryContext(request) => request.envelope(),
+            Self::AbortParticipation(request) => request.envelope(),
+            Self::QuiesceParticipation(request) => request.envelope(),
+            Self::ReleaseParticipation(request) => request.envelope(),
         }
     }
 
@@ -447,21 +449,23 @@ pub fn decode_operation(
         .ok_or_else(|| missing(path.clone(), "an operation requires a command"))?;
 
     match operation {
-        novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire) => {
-            let acquire_path = path.clone().field("acquire_query_context_admission_ticket");
+        novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(acquire) => {
+            let acquire_path = path.clone().field("acquire_participation_admission_ticket");
             let envelope = decode_envelope(
                 envelope_src,
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
                 path.field("envelope"),
             )?;
-            let context = acquire.query_context.as_ref().ok_or_else(|| {
+            let participation = acquire.participation.as_ref().ok_or_else(|| {
                 missing(
-                    acquire_path.clone().field("query_context"),
-                    "admission ticket acquisition requires a query context reference",
+                    acquire_path.clone().field("participation"),
+                    "admission ticket acquisition requires a participation reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, acquire_path.clone().field("query_context"))?;
+            let participation = decode_participation_ref(
+                participation,
+                acquire_path.clone().field("participation"),
+            )?;
             let valid_for = decode_duration_millis(
                 acquire.valid_for_millis,
                 acquire_path.clone().field("valid_for_millis"),
@@ -500,10 +504,10 @@ pub fn decode_operation(
                 admission_epoch_capability,
                 acquire_path.field("admission_epoch_capability"),
             )?;
-            Ok(DecodedOperation::AcquireQueryContextAdmissionTicket(
-                AcquireQueryContextAdmissionTicket::new(
+            Ok(DecodedOperation::AcquireParticipationAdmissionTicket(
+                AcquireParticipationAdmissionTicket::new(
                     envelope.operation_id(),
-                    context,
+                    participation,
                     valid_for,
                     native_compatibility_id,
                     admission_epoch_capability,
@@ -547,21 +551,21 @@ pub fn decode_operation(
                     format!("invalid creation metadata: {error}"),
                 )
             })?;
-            let context = metadata.query_context.as_ref().ok_or_else(|| {
+            let participation = metadata.participation.as_ref().ok_or_else(|| {
                 missing(
                     create_path
                         .clone()
                         .field("creation_metadata")
-                        .field("query_context"),
-                    "create requires a query context reference",
+                        .field("participation"),
+                    "create requires a participation reference",
                 )
             })?;
-            let context = decode_query_context_ref(
-                context,
+            let participation = decode_participation_ref(
+                participation,
                 create_path
                     .clone()
                     .field("creation_metadata")
-                    .field("query_context"),
+                    .field("participation"),
             )?;
             let descriptor = metadata.descriptor.as_ref().ok_or_else(|| {
                 missing(
@@ -614,7 +618,7 @@ pub fn decode_operation(
             )?;
             let request = CreateTask::try_new(
                 envelope.operation_id(),
-                context,
+                participation,
                 descriptor,
                 initial_domains
                     .iter()
@@ -660,14 +664,18 @@ pub fn decode_operation(
                 domains,
             }))
         }
-        novarocks::task_operation::Operation::UpdateQueryContext(context) => {
+        novarocks::task_operation::Operation::UpdateParticipation(participation) => {
             let envelope = decode_envelope(
                 envelope_src,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
                 path.clone().field("envelope"),
             )?;
-            Ok(DecodedOperation::UpdateQueryContext(
-                decode_update_query_context(context, envelope, path.field("update_query_context"))?,
+            Ok(DecodedOperation::UpdateParticipation(
+                decode_update_participation(
+                    participation,
+                    envelope,
+                    path.field("update_participation"),
+                )?,
             ))
         }
         novarocks::task_operation::Operation::CancelTask(cancel) => {
@@ -689,62 +697,61 @@ pub fn decode_operation(
                 reason,
             )))
         }
-        novarocks::task_operation::Operation::AbortQueryContext(abort) => {
-            let abort_path = path.clone().field("abort_query_context");
+        novarocks::task_operation::Operation::AbortParticipation(abort) => {
+            let abort_path = path.clone().field("abort_participation");
             let envelope = decode_envelope(
                 envelope_src,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
                 path.field("envelope"),
             )?;
-            let context = abort.query_context.as_ref().ok_or_else(|| {
+            let participation = abort.participation.as_ref().ok_or_else(|| {
                 missing(
-                    abort_path.clone().field("query_context"),
-                    "abort requires a query context reference",
+                    abort_path.clone().field("participation"),
+                    "abort requires a participation reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, abort_path.clone().field("query_context"))?;
+            let participation =
+                decode_participation_ref(participation, abort_path.clone().field("participation"))?;
             let cause = decode_abort_cause(abort.cause, abort_path.field("cause"))?;
-            Ok(DecodedOperation::AbortQueryContext(AbortQueryContext::new(
-                envelope.operation_id(),
-                context,
-                cause,
-            )))
-        }
-        novarocks::task_operation::Operation::ReleaseQueryContext(release) => {
-            let release_path = path.clone().field("release_query_context");
-            let envelope = decode_envelope(
-                envelope_src,
-                OperationKind::ReleaseQueryContext,
-                path.field("envelope"),
-            )?;
-            let context = release.query_context.as_ref().ok_or_else(|| {
-                missing(
-                    release_path.field("query_context"),
-                    "release requires a query context reference",
-                )
-            })?;
-            let context = decode_query_context_ref(context, release_path)?;
-            Ok(DecodedOperation::ReleaseQueryContext(
-                ReleaseQueryContext::new(envelope.operation_id(), context),
+            Ok(DecodedOperation::AbortParticipation(
+                AbortParticipation::new(envelope.operation_id(), participation, cause),
             ))
         }
-        novarocks::task_operation::Operation::QuiesceQueryContext(quiesce) => {
-            let request_path = path.clone().field("quiesce_query_context");
+        novarocks::task_operation::Operation::ReleaseParticipation(release) => {
+            let release_path = path.clone().field("release_participation");
             let envelope = decode_envelope(
                 envelope_src,
-                OperationKind::QuiesceQueryContext,
+                OperationKind::ReleaseParticipation,
                 path.field("envelope"),
             )?;
-            let context = quiesce.query_context.as_ref().ok_or_else(|| {
+            let participation = release.participation.as_ref().ok_or_else(|| {
                 missing(
-                    request_path.clone().field("query_context"),
-                    "quiesce requires a query context reference",
+                    release_path.field("participation"),
+                    "release requires a participation reference",
                 )
             })?;
-            let context = decode_query_context_ref(context, request_path.field("query_context"))?;
-            Ok(DecodedOperation::QuiesceQueryContext(
-                QuiesceQueryContext::new(envelope.operation_id(), context),
+            let participation = decode_participation_ref(participation, release_path)?;
+            Ok(DecodedOperation::ReleaseParticipation(
+                ReleaseParticipation::new(envelope.operation_id(), participation),
+            ))
+        }
+        novarocks::task_operation::Operation::QuiesceParticipation(quiesce) => {
+            let request_path = path.clone().field("quiesce_participation");
+            let envelope = decode_envelope(
+                envelope_src,
+                OperationKind::QuiesceParticipation,
+                path.field("envelope"),
+            )?;
+            let participation = quiesce.participation.as_ref().ok_or_else(|| {
+                missing(
+                    request_path.clone().field("participation"),
+                    "quiesce requires a participation reference",
+                )
+            })?;
+            let participation =
+                decode_participation_ref(participation, request_path.field("participation"))?;
+            Ok(DecodedOperation::QuiesceParticipation(
+                QuiesceParticipation::new(envelope.operation_id(), participation),
             ))
         }
     }
@@ -759,28 +766,30 @@ fn decode_identity_field(
     crate::identity::decode_task_identity(identity, path.field("identity"))
 }
 
-fn decode_update_query_context(
-    src: &novarocks::UpdateQueryContextRequest,
+fn decode_update_participation(
+    src: &novarocks::UpdateParticipationRequest,
     envelope: OperationEnvelope,
     path: FieldPath,
-) -> Result<DecodedUpdateQueryContext, ProtocolError> {
+) -> Result<DecodedUpdateParticipation, ProtocolError> {
     let command = src.command.as_ref().ok_or_else(|| {
         missing(
             path.clone(),
-            "update query context requires exactly one command",
+            "update participation requires exactly one command",
         )
     })?;
     match command {
-        novarocks::update_query_context_request::Command::Establish(establish) => {
+        novarocks::update_participation_request::Command::Establish(establish) => {
             let establish_path = path.field("establish");
-            let context = establish.query_context.as_ref().ok_or_else(|| {
+            let participation = establish.participation.as_ref().ok_or_else(|| {
                 missing(
-                    establish_path.clone().field("query_context"),
-                    "establish requires a query context reference",
+                    establish_path.clone().field("participation"),
+                    "establish requires a participation reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, establish_path.clone().field("query_context"))?;
+            let participation = decode_participation_ref(
+                participation,
+                establish_path.clone().field("participation"),
+            )?;
             let admission_ticket_id = establish.admission_ticket_id.as_ref().ok_or_else(|| {
                 missing(
                     establish_path.clone().field("admission_ticket_id"),
@@ -881,9 +890,9 @@ fn decode_update_query_context(
                     error.to_string(),
                 )
             })?;
-            Ok(DecodedUpdateQueryContext::Establish(
-                DecodedEstablishQueryContext {
-                    context,
+            Ok(DecodedUpdateParticipation::Establish(
+                DecodedEstablishParticipation {
+                    participation,
                     envelope,
                     admission_ticket_id,
                     catalog_set,
@@ -895,39 +904,41 @@ fn decode_update_query_context(
                 },
             ))
         }
-        novarocks::update_query_context_request::Command::AdvanceDomain(advance) => {
+        novarocks::update_participation_request::Command::AdvanceDomain(advance) => {
             let advance_path = path.field("advance_domain");
-            let context = advance.query_context.as_ref().ok_or_else(|| {
+            let participation = advance.participation.as_ref().ok_or_else(|| {
                 missing(
-                    advance_path.clone().field("query_context"),
-                    "advance requires a query context reference",
+                    advance_path.clone().field("participation"),
+                    "advance requires a participation reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, advance_path.clone().field("query_context"))?;
+            let participation = decode_participation_ref(
+                participation,
+                advance_path.clone().field("participation"),
+            )?;
             let domain = advance.domain.as_ref().ok_or_else(|| {
                 missing(
                     advance_path.clone().field("domain"),
                     "advance requires a domain",
                 )
             })?;
-            let domain = decode_query_context_domain(domain, advance_path.field("domain"))?;
-            Ok(DecodedUpdateQueryContext::AdvanceDomain {
-                context,
+            let domain = decode_participation_domain(domain, advance_path.field("domain"))?;
+            Ok(DecodedUpdateParticipation::AdvanceDomain {
+                participation,
                 envelope,
                 domain,
             })
         }
-        novarocks::update_query_context_request::Command::RenewLease(renew) => {
+        novarocks::update_participation_request::Command::RenewLease(renew) => {
             let renew_path = path.field("renew_lease");
-            let context = renew.query_context.as_ref().ok_or_else(|| {
+            let participation = renew.participation.as_ref().ok_or_else(|| {
                 missing(
-                    renew_path.clone().field("query_context"),
-                    "renew requires a query context reference",
+                    renew_path.clone().field("participation"),
+                    "renew requires a participation reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, renew_path.clone().field("query_context"))?;
+            let participation =
+                decode_participation_ref(participation, renew_path.clone().field("participation"))?;
             let lease = renew.lease.as_ref().ok_or_else(|| {
                 missing(
                     renew_path.clone().field("lease"),
@@ -935,8 +946,8 @@ fn decode_update_query_context(
                 )
             })?;
             let grant = crate::lease::decode_lease_grant(lease, renew_path.field("lease"))?;
-            Ok(DecodedUpdateQueryContext::RenewLease {
-                context,
+            Ok(DecodedUpdateParticipation::RenewLease {
+                participation,
                 envelope,
                 sequence: grant.sequence(),
                 valid_for: grant.valid_for(),
@@ -988,7 +999,7 @@ pub fn decode_ordinary_operation_batch(
 /// Validates an ordinary batch before any operation is applied, allowing the
 /// Worker to supply an exact refusal for selected expired Establish items.
 ///
-/// A skipped item still has its formal envelope, context, ticket identity, and
+/// A skipped item still has its formal envelope, participation, ticket identity, and
 /// ordinary-method shape checked here. Only its potentially large Establish
 /// content is left undecoded. The caller must have an owner-authored receipt
 /// for every skipped position; this codec never decides whether to skip.
@@ -1022,42 +1033,42 @@ pub fn decode_ordinary_operation_batch_with_skip(
             })?;
             decode_envelope(
                 envelope_src,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
                 item_path.clone().field("envelope"),
             )?;
-            let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+            let Some(novarocks::task_operation::Operation::UpdateParticipation(update)) =
                 operation.operation.as_ref()
             else {
                 return Err(invalid(item_path, "only Establish may skip deep decode"));
             };
-            let Some(novarocks::update_query_context_request::Command::Establish(establish)) =
+            let Some(novarocks::update_participation_request::Command::Establish(establish)) =
                 update.command.as_ref()
             else {
                 return Err(invalid(item_path, "only Establish may skip deep decode"));
             };
-            let context = establish.query_context.as_ref().ok_or_else(|| {
+            let participation = establish.participation.as_ref().ok_or_else(|| {
                 missing(
                     item_path
                         .clone()
-                        .field("update_query_context")
+                        .field("update_participation")
                         .field("establish")
-                        .field("query_context"),
-                    "establish requires a query context reference",
+                        .field("participation"),
+                    "establish requires a participation reference",
                 )
             })?;
-            decode_query_context_ref(
-                context,
+            decode_participation_ref(
+                participation,
                 item_path
                     .clone()
-                    .field("update_query_context")
+                    .field("update_participation")
                     .field("establish")
-                    .field("query_context"),
+                    .field("participation"),
             )?;
             let ticket = establish.admission_ticket_id.as_ref().ok_or_else(|| {
                 missing(
                     item_path
                         .clone()
-                        .field("update_query_context")
+                        .field("update_participation")
                         .field("establish")
                         .field("admission_ticket_id"),
                     "establish requires an admission ticket id",
@@ -1066,7 +1077,7 @@ pub fn decode_ordinary_operation_batch_with_skip(
             decode_admission_ticket_id(
                 ticket,
                 item_path
-                    .field("update_query_context")
+                    .field("update_participation")
                     .field("establish")
                     .field("admission_ticket_id"),
             )?;
@@ -1088,8 +1099,8 @@ pub fn decode_ordinary_operation_batch_with_skip(
 fn is_small_control(operation: &DecodedOperation) -> bool {
     use novarocks_execution_contract::operation::OperationShape as S;
     let (shape, only_close) = match operation {
-        DecodedOperation::AcquireQueryContextAdmissionTicket(_) => {
-            (S::AcquireQueryContextAdmissionTicket, false)
+        DecodedOperation::AcquireParticipationAdmissionTicket(_) => {
+            (S::AcquireParticipationAdmissionTicket, false)
         }
         DecodedOperation::CreateTask(_) => (S::CreateTask, false),
         DecodedOperation::UpdateTask(update) => (
@@ -1099,18 +1110,18 @@ fn is_small_control(operation: &DecodedOperation) -> bool {
                     matches!(domain, DecodedTaskDomain::CloseExchangeDestination { .. })
                 }),
         ),
-        DecodedOperation::UpdateQueryContext(command) => (
+        DecodedOperation::UpdateParticipation(command) => (
             match command {
-                DecodedUpdateQueryContext::Establish(_) => S::EstablishQueryContext,
-                DecodedUpdateQueryContext::AdvanceDomain { .. } => S::AdvanceQueryContextDomain,
-                DecodedUpdateQueryContext::RenewLease { .. } => S::RenewQueryExecutionLease,
+                DecodedUpdateParticipation::Establish(_) => S::EstablishParticipation,
+                DecodedUpdateParticipation::AdvanceDomain { .. } => S::AdvanceParticipationDomain,
+                DecodedUpdateParticipation::RenewLease { .. } => S::RenewParticipationLease,
             },
             false,
         ),
         DecodedOperation::CancelTask(_) => (S::CancelTask, false),
-        DecodedOperation::AbortQueryContext(_) => (S::AbortQueryContext, false),
-        DecodedOperation::QuiesceQueryContext(_) => (S::QuiesceQueryContext, false),
-        DecodedOperation::ReleaseQueryContext(_) => (S::ReleaseQueryContext, false),
+        DecodedOperation::AbortParticipation(_) => (S::AbortParticipation, false),
+        DecodedOperation::QuiesceParticipation(_) => (S::QuiesceParticipation, false),
+        DecodedOperation::ReleaseParticipation(_) => (S::ReleaseParticipation, false),
     };
     novarocks_proto_codec::native_rpc::operation_method(shape, only_close)
         == novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskControlOperations
@@ -1165,10 +1176,10 @@ pub fn decode_control_operation_batch(
                 })
             }
             novarocks::task_control_operation::Control::RenewLease(request) => {
-                novarocks::task_operation::Operation::UpdateQueryContext(
-                    novarocks::UpdateQueryContextRequest {
+                novarocks::task_operation::Operation::UpdateParticipation(
+                    novarocks::UpdateParticipationRequest {
                         command: Some(
-                            novarocks::update_query_context_request::Command::RenewLease(
+                            novarocks::update_participation_request::Command::RenewLease(
                                 request.clone(),
                             ),
                         ),
@@ -1178,14 +1189,14 @@ pub fn decode_control_operation_batch(
             novarocks::task_control_operation::Control::CancelTask(request) => {
                 novarocks::task_operation::Operation::CancelTask(request.clone())
             }
-            novarocks::task_control_operation::Control::AbortQueryContext(request) => {
-                novarocks::task_operation::Operation::AbortQueryContext(request.clone())
+            novarocks::task_control_operation::Control::AbortParticipation(request) => {
+                novarocks::task_operation::Operation::AbortParticipation(request.clone())
             }
-            novarocks::task_control_operation::Control::ReleaseQueryContext(request) => {
-                novarocks::task_operation::Operation::ReleaseQueryContext(request.clone())
+            novarocks::task_control_operation::Control::ReleaseParticipation(request) => {
+                novarocks::task_operation::Operation::ReleaseParticipation(request.clone())
             }
-            novarocks::task_control_operation::Control::QuiesceQueryContext(request) => {
-                novarocks::task_operation::Operation::QuiesceQueryContext(request.clone())
+            novarocks::task_control_operation::Control::QuiesceParticipation(request) => {
+                novarocks::task_operation::Operation::QuiesceParticipation(request.clone())
             }
         };
         operations.push(decode_operation(
@@ -1213,19 +1224,19 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
         Ok(novarocks::TaskOperationOutcome::CompatibilityMismatch) => {
             Ok(OperationOutcome::CompatibilityMismatch)
         }
-        Ok(novarocks::TaskOperationOutcome::ContextNotEstablished) => {
-            Ok(OperationOutcome::ContextNotEstablished)
+        Ok(novarocks::TaskOperationOutcome::ParticipationNotEstablished) => {
+            Ok(OperationOutcome::ParticipationNotEstablished)
         }
-        Ok(novarocks::TaskOperationOutcome::ContextConflict) => {
-            Ok(OperationOutcome::ContextConflict)
+        Ok(novarocks::TaskOperationOutcome::ParticipationConflict) => {
+            Ok(OperationOutcome::ParticipationConflict)
         }
         Ok(novarocks::TaskOperationOutcome::DomainConflict) => Ok(OperationOutcome::DomainConflict),
         Ok(novarocks::TaskOperationOutcome::LeaseExpired) => Ok(OperationOutcome::LeaseExpired),
         Ok(novarocks::TaskOperationOutcome::ReleaseNotReady) => {
             Ok(OperationOutcome::ReleaseNotReady)
         }
-        Ok(novarocks::TaskOperationOutcome::ContextTerminalReceipt) => {
-            Ok(OperationOutcome::ContextTerminalReceipt)
+        Ok(novarocks::TaskOperationOutcome::ParticipationTerminalReceipt) => {
+            Ok(OperationOutcome::ParticipationTerminalReceipt)
         }
         Ok(novarocks::TaskOperationOutcome::InvalidStateOrRequest) => {
             Ok(OperationOutcome::InvalidStateOrRequest)
@@ -1265,15 +1276,17 @@ fn encode_outcome(value: OperationOutcome) -> i32 {
         OperationOutcome::CompatibilityMismatch => {
             novarocks::TaskOperationOutcome::CompatibilityMismatch
         }
-        OperationOutcome::ContextNotEstablished => {
-            novarocks::TaskOperationOutcome::ContextNotEstablished
+        OperationOutcome::ParticipationNotEstablished => {
+            novarocks::TaskOperationOutcome::ParticipationNotEstablished
         }
-        OperationOutcome::ContextConflict => novarocks::TaskOperationOutcome::ContextConflict,
+        OperationOutcome::ParticipationConflict => {
+            novarocks::TaskOperationOutcome::ParticipationConflict
+        }
         OperationOutcome::DomainConflict => novarocks::TaskOperationOutcome::DomainConflict,
         OperationOutcome::LeaseExpired => novarocks::TaskOperationOutcome::LeaseExpired,
         OperationOutcome::ReleaseNotReady => novarocks::TaskOperationOutcome::ReleaseNotReady,
-        OperationOutcome::ContextTerminalReceipt => {
-            novarocks::TaskOperationOutcome::ContextTerminalReceipt
+        OperationOutcome::ParticipationTerminalReceipt => {
+            novarocks::TaskOperationOutcome::ParticipationTerminalReceipt
         }
         OperationOutcome::InvalidStateOrRequest => {
             novarocks::TaskOperationOutcome::InvalidStateOrRequest
@@ -1290,51 +1303,54 @@ fn encode_outcome(value: OperationOutcome) -> i32 {
     encoded as i32
 }
 
-fn decode_context_state(value: i32, path: FieldPath) -> Result<QueryContextState, ProtocolError> {
-    match novarocks::QueryContextState::try_from(value) {
-        Ok(novarocks::QueryContextState::Establishing) => Ok(QueryContextState::Establishing),
-        Ok(novarocks::QueryContextState::Active) => Ok(QueryContextState::Active),
-        Ok(novarocks::QueryContextState::Quiescing) => Ok(QueryContextState::Quiescing),
-        Ok(novarocks::QueryContextState::Releasing) => Ok(QueryContextState::Releasing),
-        Ok(novarocks::QueryContextState::Aborting) => Ok(QueryContextState::Aborting),
-        Ok(novarocks::QueryContextState::TerminalRetained) => {
-            Ok(QueryContextState::TerminalRetained)
+fn decode_participation_state(
+    value: i32,
+    path: FieldPath,
+) -> Result<ParticipationState, ProtocolError> {
+    match novarocks::ParticipationState::try_from(value) {
+        Ok(novarocks::ParticipationState::Establishing) => Ok(ParticipationState::Establishing),
+        Ok(novarocks::ParticipationState::Active) => Ok(ParticipationState::Active),
+        Ok(novarocks::ParticipationState::Quiescing) => Ok(ParticipationState::Quiescing),
+        Ok(novarocks::ParticipationState::Releasing) => Ok(ParticipationState::Releasing),
+        Ok(novarocks::ParticipationState::Aborting) => Ok(ParticipationState::Aborting),
+        Ok(novarocks::ParticipationState::TerminalRetained) => {
+            Ok(ParticipationState::TerminalRetained)
         }
-        Ok(novarocks::QueryContextState::Gone) => Ok(QueryContextState::Gone),
-        Ok(novarocks::QueryContextState::Unspecified) | Err(_) => Err(invalid_enum(
+        Ok(novarocks::ParticipationState::Gone) => Ok(ParticipationState::Gone),
+        Ok(novarocks::ParticipationState::Unspecified) | Err(_) => Err(invalid_enum(
             path,
-            "query context state must be a known non-default value",
+            "participation state must be a known non-default value",
         )),
     }
 }
 
-/// Encodes a query context state.
+/// Encodes a participation state.
 ///
 /// `Absent` deliberately has no wire representation: a backend never reports a
-/// context it does not have as a state, it reports it as an outcome. Returning
+/// participation it does not have as a state, it reports it as an outcome. Returning
 /// `None` keeps that from being silently encoded as `Establishing`.
-fn encode_context_state(value: QueryContextState) -> Option<i32> {
+fn encode_participation_state_body(value: ParticipationState) -> Option<i32> {
     let encoded = match value {
-        QueryContextState::Absent => return None,
-        QueryContextState::Establishing => novarocks::QueryContextState::Establishing,
-        QueryContextState::Active => novarocks::QueryContextState::Active,
-        QueryContextState::Quiescing => novarocks::QueryContextState::Quiescing,
-        QueryContextState::Releasing => novarocks::QueryContextState::Releasing,
-        QueryContextState::Aborting => novarocks::QueryContextState::Aborting,
-        QueryContextState::TerminalRetained => novarocks::QueryContextState::TerminalRetained,
-        QueryContextState::Gone => novarocks::QueryContextState::Gone,
+        ParticipationState::Absent => return None,
+        ParticipationState::Establishing => novarocks::ParticipationState::Establishing,
+        ParticipationState::Active => novarocks::ParticipationState::Active,
+        ParticipationState::Quiescing => novarocks::ParticipationState::Quiescing,
+        ParticipationState::Releasing => novarocks::ParticipationState::Releasing,
+        ParticipationState::Aborting => novarocks::ParticipationState::Aborting,
+        ParticipationState::TerminalRetained => novarocks::ParticipationState::TerminalRetained,
+        ParticipationState::Gone => novarocks::ParticipationState::Gone,
     };
     Some(encoded as i32)
 }
 
 fn decode_release_outcome(value: i32, path: FieldPath) -> Result<ReleaseOutcome, ProtocolError> {
-    match novarocks::ReleaseQueryContextOutcome::try_from(value) {
-        Ok(novarocks::ReleaseQueryContextOutcome::Released) => Ok(ReleaseOutcome::Released),
-        Ok(novarocks::ReleaseQueryContextOutcome::NotReady) => Ok(ReleaseOutcome::NotReady),
-        Ok(novarocks::ReleaseQueryContextOutcome::AlreadyTerminal) => {
+    match novarocks::ReleaseParticipationOutcome::try_from(value) {
+        Ok(novarocks::ReleaseParticipationOutcome::Released) => Ok(ReleaseOutcome::Released),
+        Ok(novarocks::ReleaseParticipationOutcome::NotReady) => Ok(ReleaseOutcome::NotReady),
+        Ok(novarocks::ReleaseParticipationOutcome::AlreadyTerminal) => {
             Ok(ReleaseOutcome::AlreadyTerminal)
         }
-        Ok(novarocks::ReleaseQueryContextOutcome::Unspecified) | Err(_) => Err(invalid_enum(
+        Ok(novarocks::ReleaseParticipationOutcome::Unspecified) | Err(_) => Err(invalid_enum(
             path,
             "release outcome must be a known non-default value",
         )),
@@ -1343,9 +1359,9 @@ fn decode_release_outcome(value: i32, path: FieldPath) -> Result<ReleaseOutcome,
 
 fn encode_release_outcome(value: ReleaseOutcome) -> i32 {
     let encoded = match value {
-        ReleaseOutcome::Released => novarocks::ReleaseQueryContextOutcome::Released,
-        ReleaseOutcome::NotReady => novarocks::ReleaseQueryContextOutcome::NotReady,
-        ReleaseOutcome::AlreadyTerminal => novarocks::ReleaseQueryContextOutcome::AlreadyTerminal,
+        ReleaseOutcome::Released => novarocks::ReleaseParticipationOutcome::Released,
+        ReleaseOutcome::NotReady => novarocks::ReleaseParticipationOutcome::NotReady,
+        ReleaseOutcome::AlreadyTerminal => novarocks::ReleaseParticipationOutcome::AlreadyTerminal,
     };
     encoded as i32
 }
@@ -1565,16 +1581,16 @@ pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinal
     }
 }
 
-/// Encodes the credential receipt of one query context.
+/// Encodes the credential receipt of one participation.
 ///
 /// Only the accepted epoch is reported: no credential material, and no digest
 /// of any, ever appears in a receipt.
 pub fn encode_credential_receipt(
-    lease_id: novarocks_execution_contract::task_execution::domain::CredentialLeaseId,
+    domain_id: novarocks_execution_contract::task_execution::domain::CredentialDomainId,
     epoch: CredentialEpoch,
-) -> novarocks::QueryContextCredentialReceipt {
-    novarocks::QueryContextCredentialReceipt {
-        lease_id: lease_id.get(),
+) -> novarocks::ParticipationCredentialReceipt {
+    novarocks::ParticipationCredentialReceipt {
+        credential_domain_id: domain_id.get(),
         accepted_epoch: epoch.get(),
     }
 }
@@ -1582,19 +1598,19 @@ pub fn encode_credential_receipt(
 /// The shared fixed scalar header for a Quiesce acknowledgement or fact.
 /// Membership is encoded only by the external wire projection below.
 fn encode_quiesce_scalar(
-    value: &QuiesceQueryContextReceipt,
-) -> Option<novarocks::QuiesceQueryContextAck> {
-    Some(novarocks::QuiesceQueryContextAck {
-        query_context: Some(encode_query_context_ref(value.context())),
+    value: &QuiesceParticipationReceipt,
+) -> Option<novarocks::QuiesceParticipationAck> {
+    Some(novarocks::QuiesceParticipationAck {
+        participation: Some(encode_participation_ref(value.participation())),
         fence_version: value.fence_version(),
         accepted_tasks: Vec::new(),
-        state: encode_context_state(value.state())?,
+        state: encode_participation_state_body(value.state())?,
     })
 }
 
 pub fn encode_quiesce_ack(
-    value: &QuiesceQueryContextReceipt,
-) -> Option<novarocks::QuiesceQueryContextAck> {
+    value: &QuiesceParticipationReceipt,
+) -> Option<novarocks::QuiesceParticipationAck> {
     let mut wire = encode_quiesce_scalar(value)?;
     wire.accepted_tasks = value
         .accepted_tasks()
@@ -1607,23 +1623,23 @@ pub fn encode_quiesce_ack(
 
 /// Constant-time conservative encoded size of a live covered Quiesce fact.
 /// This never clones or traverses accepted_tasks. It bounds every legal typed
-/// identity, including foreign-context members; membership validation remains
+/// identity, including foreign-participation members; membership validation remains
 /// with the actual encoder/decoder and the original Core author.
-pub fn covered_quiesce_fact_size_bound(value: &QuiesceQueryContextReceipt) -> Option<usize> {
-    use novarocks_execution_contract::QueryContextState;
+pub fn covered_quiesce_fact_size_bound(value: &QuiesceParticipationReceipt) -> Option<usize> {
+    use novarocks_execution_contract::ParticipationState;
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use prost::encoding::{encoded_len_varint, key_len};
 
     if value.fence_version() == 0
-        || value.accepted_tasks().len() > TransportBudget::DEFAULT.max_tasks_per_context()
+        || value.accepted_tasks().len() > TransportBudget::DEFAULT.max_tasks_per_participation()
         || !matches!(
             value.state(),
-            QueryContextState::Quiescing
-                | QueryContextState::Releasing
-                | QueryContextState::Aborting
-                | QueryContextState::TerminalRetained
+            ParticipationState::Quiescing
+                | ParticipationState::Releasing
+                | ParticipationState::Aborting
+                | ParticipationState::TerminalRetained
         )
     {
         return None;
@@ -1663,26 +1679,27 @@ pub fn covered_quiesce_fact_size_bound(value: &QuiesceQueryContextReceipt) -> Op
 }
 
 pub fn decode_quiesce_ack(
-    src: &novarocks::QuiesceQueryContextAck,
+    src: &novarocks::QuiesceParticipationAck,
     path: FieldPath,
-) -> Result<QuiesceQueryContextReceipt, ProtocolError> {
-    let context = src.query_context.as_ref().ok_or_else(|| {
+) -> Result<QuiesceParticipationReceipt, ProtocolError> {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "quiesce acknowledgement requires a query context reference",
+            path.clone().field("participation"),
+            "quiesce acknowledgement requires a participation reference",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
     if src.fence_version == 0 {
         return Err(out_of_range(
             path.clone().field("fence_version"),
             "quiesce fence version must be positive",
         ));
     }
-    if src.accepted_tasks.len() > TransportBudget::DEFAULT.max_tasks_per_context() {
+    if src.accepted_tasks.len() > TransportBudget::DEFAULT.max_tasks_per_participation() {
         return Err(out_of_range(
             path.clone().field("accepted_tasks"),
-            "quiesce membership exceeds the context task bound",
+            "quiesce membership exceeds the participation task bound",
         ));
     }
     let tasks = src
@@ -1694,12 +1711,12 @@ pub fn decode_quiesce_ack(
         })
         .collect::<Result<Vec<_>, _>>()?;
     if tasks.iter().any(|identity| {
-        identity.query_execution_id() != context.query_execution_id()
-            || identity.backend_process_id() != context.backend_process_id()
+        identity.query_execution_id() != participation.query_execution_id()
+            || identity.backend_process_id() != participation.backend_process_id()
     }) {
         return Err(invalid(
             path.clone().field("accepted_tasks"),
-            "quiesce task identity belongs to another context",
+            "quiesce task identity belongs to another participation",
         ));
     }
     if tasks.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -1708,21 +1725,21 @@ pub fn decode_quiesce_ack(
             "quiesce membership must be sorted and unique",
         ));
     }
-    let state = decode_context_state(src.state, path.clone().field("state"))?;
+    let state = decode_participation_state(src.state, path.clone().field("state"))?;
     if !matches!(
         state,
-        QueryContextState::Quiescing
-            | QueryContextState::Releasing
-            | QueryContextState::Aborting
-            | QueryContextState::TerminalRetained
+        ParticipationState::Quiescing
+            | ParticipationState::Releasing
+            | ParticipationState::Aborting
+            | ParticipationState::TerminalRetained
     ) {
         return Err(invalid(
             path.field("state"),
             "quiesce acknowledgement requires a closing state",
         ));
     }
-    Ok(QuiesceQueryContextReceipt::new(
-        context,
+    Ok(QuiesceParticipationReceipt::new(
+        participation,
         src.fence_version,
         tasks,
         state,
@@ -1730,15 +1747,15 @@ pub fn decode_quiesce_ack(
 }
 
 pub fn encode_release_ack(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     outcome: ReleaseOutcome,
-    state: QueryContextState,
+    state: ParticipationState,
     runtime_filter: Option<&QueryTerminalProfileContributionTelemetry>,
-) -> Option<novarocks::ReleaseQueryContextAck> {
-    Some(novarocks::ReleaseQueryContextAck {
-        query_context: Some(encode_query_context_ref(context)),
+) -> Option<novarocks::ReleaseParticipationAck> {
+    Some(novarocks::ReleaseParticipationAck {
+        participation: Some(encode_participation_ref(participation)),
         outcome: encode_release_outcome(outcome),
-        state: encode_context_state(state)?,
+        state: encode_participation_state_body(state)?,
         termination_cause: None,
         runtime_filter: runtime_filter.map(|value| value.as_proto().clone()),
     })
@@ -1751,10 +1768,10 @@ pub fn encode_release_ack(
 /// silently swap the termination cause for the sealed contribution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedReleaseAck {
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub outcome: ReleaseOutcome,
-    pub state: QueryContextState,
-    /// Why the context was terminated, when a release answered on one that was
+    pub state: ParticipationState,
+    /// Why the participation was terminated, when a release answered on one that was
     /// terminated instead of released.
     pub termination_cause: Option<novarocks_execution_contract::task_execution::status::AbortCause>,
     /// The backend's sealed runtime-filter observation. Absent means the
@@ -1765,21 +1782,22 @@ pub struct DecodedReleaseAck {
 /// Decodes a release acknowledgement, returning the termination cause the
 /// backend reported rather than validating and discarding it.
 ///
-/// A release that comes back on a context that was terminated instead of
+/// A release that comes back on a participation that was terminated instead of
 /// released carries the only statement of why.
 pub fn decode_release_ack(
-    src: &novarocks::ReleaseQueryContextAck,
+    src: &novarocks::ReleaseParticipationAck,
     path: FieldPath,
 ) -> Result<DecodedReleaseAck, ProtocolError> {
-    let context = src.query_context.as_ref().ok_or_else(|| {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "a release acknowledgement requires a query context reference",
+            path.clone().field("participation"),
+            "a release acknowledgement requires a participation reference",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
     let outcome = decode_release_outcome(src.outcome, path.clone().field("outcome"))?;
-    let state = decode_context_state(src.state, path.clone().field("state"))?;
+    let state = decode_participation_state(src.state, path.clone().field("state"))?;
     let cause = src
         .termination_cause
         .map(|cause| decode_abort_cause(cause, path.clone().field("termination_cause")))
@@ -1804,7 +1822,7 @@ pub fn decode_release_ack(
         })
         .transpose()?;
     Ok(DecodedReleaseAck {
-        context,
+        participation,
         outcome,
         state,
         termination_cause: cause,
@@ -1815,7 +1833,7 @@ pub fn decode_release_ack(
 /// Decode the original owned Release body without cloning its generated
 /// terminal graph. The existing borrowed decoder remains a pure projection.
 pub fn decode_release_ack_owned(
-    mut src: novarocks::ReleaseQueryContextAck,
+    mut src: novarocks::ReleaseParticipationAck,
     path: FieldPath,
 ) -> Result<DecodedReleaseAck, ProtocolError> {
     let telemetry = src.runtime_filter.take();
@@ -1848,9 +1866,9 @@ pub fn encode_operation_outcome(value: OperationOutcome) -> i32 {
     encode_outcome(value)
 }
 
-/// Encodes a query context state back onto the wire, or `None` for `Absent`.
-pub fn encode_query_context_state(value: QueryContextState) -> Option<i32> {
-    encode_context_state(value)
+/// Encodes a participation state back onto the wire, or `None` for `Absent`.
+pub fn encode_participation_state(value: ParticipationState) -> Option<i32> {
+    encode_participation_state_body(value)
 }
 
 // The frontend side of the operation surface: building requests, and reading
@@ -1909,50 +1927,50 @@ pub fn encode_cancel_task(request: CancelTask) -> novarocks::TaskOperation {
     }
 }
 
-pub fn encode_abort_query_context(request: AbortQueryContext) -> novarocks::TaskOperation {
+pub fn encode_abort_participation(request: AbortParticipation) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::AbortQueryContext(
-            novarocks::AbortQueryContextRequest {
-                query_context: Some(encode_query_context_ref(request.context())),
+        operation: Some(novarocks::task_operation::Operation::AbortParticipation(
+            novarocks::AbortParticipationRequest {
+                participation: Some(encode_participation_ref(request.participation())),
                 cause: encode_abort_cause(request.cause()),
             },
         )),
     }
 }
 
-pub fn encode_release_query_context(request: ReleaseQueryContext) -> novarocks::TaskOperation {
+pub fn encode_release_participation(request: ReleaseParticipation) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::ReleaseQueryContext(
-            novarocks::ReleaseQueryContextRequest {
-                query_context: Some(encode_query_context_ref(request.context())),
+        operation: Some(novarocks::task_operation::Operation::ReleaseParticipation(
+            novarocks::ReleaseParticipationRequest {
+                participation: Some(encode_participation_ref(request.participation())),
             },
         )),
     }
 }
 
-pub fn encode_quiesce_query_context(request: QuiesceQueryContext) -> novarocks::TaskOperation {
+pub fn encode_quiesce_participation(request: QuiesceParticipation) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::QuiesceQueryContext(
-            novarocks::QuiesceQueryContextRequest {
-                query_context: Some(encode_query_context_ref(request.context())),
+        operation: Some(novarocks::task_operation::Operation::QuiesceParticipation(
+            novarocks::QuiesceParticipationRequest {
+                participation: Some(encode_participation_ref(request.participation())),
             },
         )),
     }
 }
 
 /// Encodes one worker admission ticket acquisition.
-pub fn encode_acquire_query_context_admission_ticket(
-    request: AcquireQueryContextAdmissionTicket,
+pub fn encode_acquire_participation_admission_ticket(
+    request: AcquireParticipationAdmissionTicket,
 ) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
         operation: Some(
-            novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(
-                novarocks::AcquireQueryContextAdmissionTicketRequest {
-                    query_context: Some(encode_query_context_ref(request.context())),
+            novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(
+                novarocks::AcquireParticipationAdmissionTicketRequest {
+                    participation: Some(encode_participation_ref(request.participation())),
                     valid_for_millis: request.valid_for().get().as_millis() as u64,
                     native_compatibility_id: Some(novarocks::NativeCompatibilityId {
                         value: request.native_compatibility_id().as_bytes().to_vec(),
@@ -1969,15 +1987,15 @@ pub fn encode_acquire_query_context_admission_ticket(
 }
 
 /// Encodes one lease renewal.
-pub fn encode_renew_lease(request: &RenewQueryExecutionLease) -> novarocks::TaskOperation {
+pub fn encode_renew_lease(request: &RenewParticipationLease) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-            novarocks::UpdateQueryContextRequest {
+        operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+            novarocks::UpdateParticipationRequest {
                 command: Some(
-                    novarocks::update_query_context_request::Command::RenewLease(
-                        novarocks::RenewQueryExecutionLeaseRequest {
-                            query_context: Some(encode_query_context_ref(request.context())),
+                    novarocks::update_participation_request::Command::RenewLease(
+                        novarocks::RenewParticipationLeaseRequest {
+                            participation: Some(encode_participation_ref(request.participation())),
                             lease: Some(crate::lease::encode_lease_grant(
                                 crate::lease::LeaseGrant::new(
                                     request.sequence(),
@@ -1993,18 +2011,18 @@ pub fn encode_renew_lease(request: &RenewQueryExecutionLease) -> novarocks::Task
 }
 
 /// Encodes one shared-domain advance.
-pub fn encode_advance_query_context_domain(
-    request: &AdvanceQueryContextDomain,
-    domain: novarocks::QueryContextDomainUpdate,
+pub fn encode_advance_participation_domain(
+    request: &AdvanceParticipationDomain,
+    domain: novarocks::ParticipationDomainUpdate,
 ) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-            novarocks::UpdateQueryContextRequest {
+        operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+            novarocks::UpdateParticipationRequest {
                 command: Some(
-                    novarocks::update_query_context_request::Command::AdvanceDomain(
-                        novarocks::AdvanceQueryContextDomainRequest {
-                            query_context: Some(encode_query_context_ref(request.context())),
+                    novarocks::update_participation_request::Command::AdvanceDomain(
+                        novarocks::AdvanceParticipationDomainRequest {
+                            participation: Some(encode_participation_ref(request.participation())),
                             domain: Some(domain),
                         },
                     ),
@@ -2015,21 +2033,21 @@ pub fn encode_advance_query_context_domain(
 }
 
 /// Encodes one establish.
-pub fn encode_establish_query_context(
-    request: &EstablishQueryContext,
+pub fn encode_establish_participation(
+    request: &EstablishParticipation,
     catalog_set: novarocks_proto_models::catalog::CatalogSet,
     initial_runtime_filter: novarocks::RuntimeFilterContribution,
-    initial_credential: novarocks::QueryContextCredentialDomain,
+    initial_credential: novarocks::ParticipationCredentialDomain,
     query_options: novarocks::QueryOptions,
     native_compatibility_id: NativeCompatibilityId,
 ) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
-        operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-            novarocks::UpdateQueryContextRequest {
-                command: Some(novarocks::update_query_context_request::Command::Establish(
-                    novarocks::EstablishQueryContextRequest {
-                        query_context: Some(encode_query_context_ref(request.context())),
+        operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+            novarocks::UpdateParticipationRequest {
+                command: Some(novarocks::update_participation_request::Command::Establish(
+                    novarocks::EstablishParticipationRequest {
+                        participation: Some(encode_participation_ref(request.participation())),
                         catalog_set: Some(catalog_set),
                         initial_runtime_filter: Some(initial_runtime_filter),
                         initial_credential: Some(initial_credential),
@@ -2080,13 +2098,13 @@ pub fn encode_control_operation_batch(
     let mut controls = Vec::with_capacity(operations.len());
     for (index, operation) in operations.into_iter().enumerate() {
         let control = match operation.operation {
-            Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) => {
+            Some(novarocks::task_operation::Operation::UpdateParticipation(update)) => {
                 match update.command {
-                    Some(novarocks::update_query_context_request::Command::RenewLease(request)) => {
+                    Some(novarocks::update_participation_request::Command::RenewLease(request)) => {
                         novarocks::task_control_operation::Control::RenewLease(request)
                     }
-                    Some(novarocks::update_query_context_request::Command::Establish(_))
-                    | Some(novarocks::update_query_context_request::Command::AdvanceDomain(_))
+                    Some(novarocks::update_participation_request::Command::Establish(_))
+                    | Some(novarocks::update_participation_request::Command::AdvanceDomain(_))
                     | None => {
                         return Err(invalid(
                             path.clone().index(index),
@@ -2098,14 +2116,14 @@ pub fn encode_control_operation_batch(
             Some(novarocks::task_operation::Operation::CancelTask(request)) => {
                 novarocks::task_control_operation::Control::CancelTask(request)
             }
-            Some(novarocks::task_operation::Operation::AbortQueryContext(request)) => {
-                novarocks::task_control_operation::Control::AbortQueryContext(request)
+            Some(novarocks::task_operation::Operation::AbortParticipation(request)) => {
+                novarocks::task_control_operation::Control::AbortParticipation(request)
             }
-            Some(novarocks::task_operation::Operation::ReleaseQueryContext(request)) => {
-                novarocks::task_control_operation::Control::ReleaseQueryContext(request)
+            Some(novarocks::task_operation::Operation::ReleaseParticipation(request)) => {
+                novarocks::task_control_operation::Control::ReleaseParticipation(request)
             }
-            Some(novarocks::task_operation::Operation::QuiesceQueryContext(request)) => {
-                novarocks::task_control_operation::Control::QuiesceQueryContext(request)
+            Some(novarocks::task_operation::Operation::QuiesceParticipation(request)) => {
+                novarocks::task_control_operation::Control::QuiesceParticipation(request)
             }
             Some(novarocks::task_operation::Operation::UpdateTask(request)) => {
                 if request.domains.is_empty() || request.domains.len() > MAX_DOMAIN_UPDATES {
@@ -2134,7 +2152,7 @@ pub fn encode_control_operation_batch(
                     },
                 )
             }
-            Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
+            Some(novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(_))
             | Some(novarocks::task_operation::Operation::CreateTask(_))
             | None => {
                 return Err(invalid(
@@ -2276,33 +2294,33 @@ pub fn decode_task_domain_receipt(
     }
 }
 
-/// Decodes one query-context domain receipt.
-pub fn decode_query_context_domain_receipt(
-    src: &novarocks::QueryContextDomainReceipt,
+/// Decodes one participation domain receipt.
+pub fn decode_participation_domain_receipt(
+    src: &novarocks::ParticipationDomainReceipt,
     path: FieldPath,
-) -> Result<QueryContextDomainReceipt, ProtocolError> {
+) -> Result<ParticipationDomainReceipt, ProtocolError> {
     let progression =
         decode_accepted_progression(src.progression, path.clone().field("progression"))?;
     let receipt = src.receipt.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("receipt"),
-            "a query context domain receipt requires a typed body",
+            "a participation domain receipt requires a typed body",
         )
     })?;
     match receipt {
-        novarocks::query_context_domain_receipt::Receipt::CatalogBinding(scalar) => {
-            Ok(QueryContextDomainReceipt::CatalogBinding {
+        novarocks::participation_domain_receipt::Receipt::CatalogBinding(scalar) => {
+            Ok(ParticipationDomainReceipt::CatalogBinding {
                 accepted_version: decode_scalar_receipt(scalar),
                 progression,
             })
         }
-        novarocks::query_context_domain_receipt::Receipt::SharedDynamicFilter(scalar) => {
-            Ok(QueryContextDomainReceipt::SharedDynamicFilter {
+        novarocks::participation_domain_receipt::Receipt::SharedDynamicFilter(scalar) => {
+            Ok(ParticipationDomainReceipt::SharedDynamicFilter {
                 accepted_version: decode_scalar_receipt(scalar),
                 progression,
             })
         }
-        novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
+        novarocks::participation_domain_receipt::Receipt::Credential(credential) => {
             let credential_path = path.field("credential");
             let accepted_epoch =
                 CredentialEpoch::new(credential.accepted_epoch).map_err(|error| {
@@ -2311,8 +2329,8 @@ pub fn decode_query_context_domain_receipt(
                         error.to_string(),
                     )
                 })?;
-            Ok(QueryContextDomainReceipt::Credential {
-                lease_id: CredentialLeaseId::new(credential.lease_id),
+            Ok(ParticipationDomainReceipt::Credential {
+                credential_domain_id: CredentialDomainId::new(credential.credential_domain_id),
                 accepted_epoch,
                 progression,
             })
@@ -2375,13 +2393,13 @@ pub fn encode_task_domain_receipt(
     })
 }
 
-/// Encodes one query-context domain receipt.
+/// Encodes one participation domain receipt.
 /// Returns `None` when the receipt holds a conflict, for the same reason its
 /// task-scoped sibling does.
-pub fn encode_query_context_domain_receipt(
-    value: &QueryContextDomainReceipt,
-) -> Option<novarocks::QueryContextDomainReceipt> {
-    use novarocks_execution_contract::task_execution::operation::QueryContextDomainReceipt as Receipt;
+pub fn encode_participation_domain_receipt(
+    value: &ParticipationDomainReceipt,
+) -> Option<novarocks::ParticipationDomainReceipt> {
+    use novarocks_execution_contract::task_execution::operation::ParticipationDomainReceipt as Receipt;
     let progression = encode_accepted_progression(match value {
         Receipt::CatalogBinding { progression, .. }
         | Receipt::SharedDynamicFilter { progression, .. }
@@ -2390,30 +2408,30 @@ pub fn encode_query_context_domain_receipt(
     let receipt = match value {
         Receipt::CatalogBinding {
             accepted_version, ..
-        } => novarocks::query_context_domain_receipt::Receipt::CatalogBinding(
+        } => novarocks::participation_domain_receipt::Receipt::CatalogBinding(
             novarocks::ScalarDomainReceipt {
                 accepted_version: accepted_version.map_or(0, DomainVersion::get),
             },
         ),
         Receipt::SharedDynamicFilter {
             accepted_version, ..
-        } => novarocks::query_context_domain_receipt::Receipt::SharedDynamicFilter(
+        } => novarocks::participation_domain_receipt::Receipt::SharedDynamicFilter(
             novarocks::ScalarDomainReceipt {
                 accepted_version: accepted_version.map_or(0, DomainVersion::get),
             },
         ),
         Receipt::Credential {
-            lease_id,
+            credential_domain_id,
             accepted_epoch,
             ..
-        } => novarocks::query_context_domain_receipt::Receipt::Credential(
-            novarocks::QueryContextCredentialReceipt {
-                lease_id: lease_id.get(),
+        } => novarocks::participation_domain_receipt::Receipt::Credential(
+            novarocks::ParticipationCredentialReceipt {
+                credential_domain_id: credential_domain_id.get(),
                 accepted_epoch: accepted_epoch.get(),
             },
         ),
     };
-    Some(novarocks::QueryContextDomainReceipt {
+    Some(novarocks::ParticipationDomainReceipt {
         receipt: Some(receipt),
         progression,
     })
@@ -2512,14 +2530,14 @@ pub fn decode_update_task_ack(
 
 /// Decodes an admission-ticket acknowledgement against the exact request.
 ///
-/// An opaque ticket id proves nothing by itself. The repeated context and
+/// An opaque ticket id proves nothing by itself. The repeated participation and
 /// requested validity must match before the caller may use the ticket to
-/// establish a query context.
-pub fn decode_query_context_admission_ticket_ack(
-    src: &novarocks::QueryContextAdmissionTicketAck,
-    expected: AcquireQueryContextAdmissionTicket,
+/// establish a participation.
+pub fn decode_participation_admission_ticket_ack(
+    src: &novarocks::ParticipationAdmissionTicketAck,
+    expected: AcquireParticipationAdmissionTicket,
     path: FieldPath,
-) -> Result<QueryContextAdmissionTicketReceipt, ProtocolError> {
+) -> Result<ParticipationAdmissionTicketReceipt, ProtocolError> {
     let ticket_id = src.ticket_id.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("ticket_id"),
@@ -2528,17 +2546,18 @@ pub fn decode_query_context_admission_ticket_ack(
     })?;
     let ticket_id = decode_admission_ticket_id(ticket_id, path.clone().field("ticket_id"))?;
 
-    let context = src.query_context.as_ref().ok_or_else(|| {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "an admission ticket acknowledgement requires a context reference",
+            path.clone().field("participation"),
+            "an admission ticket acknowledgement requires a participation reference",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
-    if context != expected.context() {
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
+    if participation != expected.participation() {
         return Err(invalid(
-            path.clone().field("query_context"),
-            "an admission ticket acknowledgement names a different context than the request",
+            path.clone().field("participation"),
+            "an admission ticket acknowledgement names a different participation than the request",
         ));
     }
 
@@ -2556,8 +2575,10 @@ pub fn decode_query_context_admission_ticket_ack(
         ));
     }
 
-    Ok(QueryContextAdmissionTicketReceipt::new(
-        ticket_id, context, valid_for,
+    Ok(ParticipationAdmissionTicketReceipt::new(
+        ticket_id,
+        participation,
+        valid_for,
     ))
 }
 
@@ -2582,37 +2603,38 @@ fn decode_task_domain_receipts(
     Ok(domains)
 }
 
-/// Decodes a query-context acknowledgement against the context the caller
+/// Decodes a participation acknowledgement against the participation the caller
 /// sent, returning the receipt and the termination cause the backend reported.
 ///
 /// The cause is returned rather than validated and dropped: it is the only
-/// statement of why a context the frontend still believed in is gone.
-pub fn decode_query_context_ack(
-    src: &novarocks::QueryContextAck,
-    expected: QueryContextRef,
+/// statement of why a participation the frontend still believed in is gone.
+pub fn decode_participation_ack(
+    src: &novarocks::ParticipationAck,
+    expected: ParticipationRef,
     path: FieldPath,
 ) -> Result<
     (
-        QueryContextReceipt,
+        ParticipationReceipt,
         Option<novarocks_execution_contract::task_execution::status::AbortCause>,
     ),
     ProtocolError,
 > {
-    let context = src.query_context.as_ref().ok_or_else(|| {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "a query context acknowledgement requires a context reference",
+            path.clone().field("participation"),
+            "a participation acknowledgement requires a participation reference",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
-    if context != expected {
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
+    if participation != expected {
         return Err(invalid(
-            path.clone().field("query_context"),
-            "a query context acknowledgement names a different context than the request",
+            path.clone().field("participation"),
+            "a participation acknowledgement names a different participation than the request",
         ));
     }
-    let state = decode_context_state(src.state, path.clone().field("state"))?;
-    let mut receipt = QueryContextReceipt::new(context, state);
+    let state = decode_participation_state(src.state, path.clone().field("state"))?;
+    let mut receipt = ParticipationReceipt::new(participation, state);
     if let Some(lease) = src.lease.as_ref() {
         receipt = receipt.with_lease(crate::lease::decode_lease_receipt(
             lease,
@@ -2628,7 +2650,7 @@ pub fn decode_query_context_ack(
     }
     let mut domains = Vec::with_capacity(src.accepted_domains.len());
     for (index, domain) in src.accepted_domains.iter().enumerate() {
-        domains.push(decode_query_context_domain_receipt(
+        domains.push(decode_participation_domain_receipt(
             domain,
             domain_path.clone().index(index),
         )?);
@@ -2641,34 +2663,34 @@ pub fn decode_query_context_ack(
     Ok((receipt, cause))
 }
 
-/// Encodes a query-context acknowledgement.
+/// Encodes a participation acknowledgement.
 ///
 /// Returns `None` when the receipt reports the one state that has no wire
 /// representation.
-pub fn encode_query_context_ack(
-    value: &novarocks_execution_contract::task_execution::operation::QueryContextReceipt,
+pub fn encode_participation_ack(
+    value: &novarocks_execution_contract::task_execution::operation::ParticipationReceipt,
     termination_cause: Option<novarocks_execution_contract::task_execution::status::AbortCause>,
-) -> Option<novarocks::QueryContextAck> {
-    Some(novarocks::QueryContextAck {
-        query_context: Some(encode_query_context_ref(value.context())),
-        state: encode_context_state(value.state())?,
+) -> Option<novarocks::ParticipationAck> {
+    Some(novarocks::ParticipationAck {
+        participation: Some(encode_participation_ref(value.participation())),
+        state: encode_participation_state_body(value.state())?,
         lease: value.lease().map(crate::lease::encode_lease_receipt),
         accepted_domains: value
             .domains()
             .iter()
-            .map(encode_query_context_domain_receipt)
+            .map(encode_participation_domain_receipt)
             .collect::<Option<Vec<_>>>()?,
         termination_cause: termination_cause.map(encode_abort_cause),
     })
 }
 
 /// Encodes the exact worker admission grant returned for one acquisition.
-pub fn encode_query_context_admission_ticket_ack(
-    value: QueryContextAdmissionTicketReceipt,
-) -> novarocks::QueryContextAdmissionTicketAck {
-    novarocks::QueryContextAdmissionTicketAck {
+pub fn encode_participation_admission_ticket_ack(
+    value: ParticipationAdmissionTicketReceipt,
+) -> novarocks::ParticipationAdmissionTicketAck {
+    novarocks::ParticipationAdmissionTicketAck {
         ticket_id: Some(encode_admission_ticket_id(value.ticket_id())),
-        query_context: Some(encode_query_context_ref(value.context())),
+        participation: Some(encode_participation_ref(value.participation())),
         valid_for_millis: value.valid_for().get().as_millis() as u64,
     }
 }
@@ -2719,14 +2741,14 @@ pub fn encode_status_event(
     }
 }
 
-/// Encodes one worker query-context convergence event.
-pub fn encode_context_convergence_event(
-    value: novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceReceipt,
+/// Encodes one worker participation convergence event.
+pub fn encode_participation_convergence_event(
+    value: novarocks_execution_contract::task_execution::participation_convergence::ParticipationConvergenceReceipt,
 ) -> novarocks::TaskStatusStreamEvent {
     novarocks::TaskStatusStreamEvent {
         event: Some(
-            novarocks::task_status_stream_event::Event::ContextConvergence(
-                crate::context_convergence::encode_query_context_convergence_receipt(value),
+            novarocks::task_status_stream_event::Event::ParticipationConvergence(
+                crate::participation_convergence::encode_participation_convergence_receipt(value),
             ),
         ),
         source_revision: None,
@@ -2775,9 +2797,9 @@ pub fn decode_status_event(
             )?;
             Ok(StatusStreamEvent::Gone(identity))
         }
-        novarocks::task_status_stream_event::Event::ContextConvergence(_) => Err(invalid(
-            path.field("context_convergence"),
-            "context convergence events require the convergence-aware decoder",
+        novarocks::task_status_stream_event::Event::ParticipationConvergence(_) => Err(invalid(
+            path.field("participation_convergence"),
+            "participation convergence events require the convergence-aware decoder",
         )),
         _ => Err(invalid(
             path,
@@ -2803,19 +2825,19 @@ pub enum StatusStreamEvent {
     reason = "Status events carry frozen TaskStatus snapshots by value; boxing would change the consumer contract and allocate per event."
 )]
 #[derive(Clone, Debug)]
-pub enum ContextAwareStatusStreamEvent {
+pub enum ParticipationAwareStatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
     Gone(TaskIdentity),
-    ContextConvergence(
-        novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceReceipt,
+    ParticipationConvergence(
+        novarocks_execution_contract::task_execution::participation_convergence::ParticipationConvergenceReceipt,
     ),
 }
 
-/// Decodes one task or query-context observation from a convergence-aware stream.
-pub fn decode_context_aware_status_event(
+/// Decodes one task or participation observation from a convergence-aware stream.
+pub fn decode_participation_aware_status_event(
     src: &novarocks::TaskStatusStreamEvent,
     path: FieldPath,
-) -> Result<ContextAwareStatusStreamEvent, ProtocolError> {
+) -> Result<ParticipationAwareStatusStreamEvent, ProtocolError> {
     if src.source_revision.is_some() {
         return Err(invalid(
             path.clone().field("source_revision"),
@@ -2828,7 +2850,7 @@ pub fn decode_context_aware_status_event(
         .ok_or_else(|| missing(path.clone(), "a status event requires a body"))?;
     match event {
         novarocks::task_status_stream_event::Event::TaskStatus(status) => {
-            Ok(ContextAwareStatusStreamEvent::Status(
+            Ok(ParticipationAwareStatusStreamEvent::Status(
                 crate::status::decode_task_status(status, path.field("task_status"))?,
             ))
         }
@@ -2839,16 +2861,16 @@ pub fn decode_context_aware_status_event(
                 gone_path,
                 "a task-gone event requires a task identity",
             )?;
-            Ok(ContextAwareStatusStreamEvent::Gone(identity))
+            Ok(ParticipationAwareStatusStreamEvent::Gone(identity))
         }
-        novarocks::task_status_stream_event::Event::ContextConvergence(receipt) => {
-            Ok(ContextAwareStatusStreamEvent::ContextConvergence(
-                crate::context_convergence::decode_query_context_convergence_receipt(
+        novarocks::task_status_stream_event::Event::ParticipationConvergence(receipt) => Ok(
+            ParticipationAwareStatusStreamEvent::ParticipationConvergence(
+                crate::participation_convergence::decode_participation_convergence_receipt(
                     receipt,
-                    path.field("context_convergence"),
+                    path.field("participation_convergence"),
                 )?,
-            ))
-        }
+            ),
+        ),
         _ => Err(invalid(
             path,
             "covered observations require the covered decoder",
@@ -2858,7 +2880,7 @@ pub fn decode_context_aware_status_event(
 
 /// Encodes a status subscription request.
 pub fn encode_subscribe_task_status(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     cursors: &[novarocks_execution_contract::task_execution::status::TaskStatusCursor],
 ) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
     if cursors.len() > crate::status::MAX_SUBSCRIPTION_CURSORS {
@@ -2868,13 +2890,13 @@ pub fn encode_subscribe_task_status(
         ));
     }
     Ok(novarocks::SubscribeTaskStatusRequest {
-        query_context: Some(encode_query_context_ref(context)),
+        participation: Some(encode_participation_ref(participation)),
         cursors: cursors
             .iter()
             .copied()
             .map(crate::status::encode_task_status_cursor)
             .collect(),
-        context_convergence_cursor: None,
+        participation_convergence_cursor: None,
         generation: 0,
         task_convergence_cursors: Vec::new(),
         required_identities: Vec::new(),
@@ -2882,17 +2904,17 @@ pub fn encode_subscribe_task_status(
     })
 }
 
-/// Encodes a status subscription with an optional exact context cursor.
-pub fn encode_context_aware_subscribe_task_status(
-    context: QueryContextRef,
+/// Encodes a status subscription with an optional exact participation cursor.
+pub fn encode_participation_aware_subscribe_task_status(
+    participation: ParticipationRef,
     cursors: &[novarocks_execution_contract::task_execution::status::TaskStatusCursor],
-    context_convergence_cursor: Option<
-        novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor,
+    participation_convergence_cursor: Option<
+        novarocks_execution_contract::task_execution::participation_convergence::ParticipationConvergenceCursor,
     >,
 ) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
-    let mut request = encode_subscribe_task_status(context, cursors)?;
-    request.context_convergence_cursor = context_convergence_cursor
-        .map(crate::context_convergence::encode_query_context_convergence_cursor);
+    let mut request = encode_subscribe_task_status(participation, cursors)?;
+    request.participation_convergence_cursor = participation_convergence_cursor
+        .map(crate::participation_convergence::encode_participation_convergence_cursor);
     Ok(request)
 }
 
@@ -2902,31 +2924,31 @@ pub fn decode_subscribe_task_status(
     path: FieldPath,
 ) -> Result<
     (
-        QueryContextRef,
+        ParticipationRef,
         Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
     ),
     ProtocolError,
 > {
-    if src.context_convergence_cursor.is_some() {
+    if src.participation_convergence_cursor.is_some() {
         return Err(invalid(
-            path.clone().field("context_convergence_cursor"),
-            "context convergence cursor requires the convergence-aware decoder",
+            path.clone().field("participation_convergence_cursor"),
+            "participation convergence cursor requires the convergence-aware decoder",
         ));
     }
-    let (context, cursors, _) = decode_context_aware_subscribe_task_status(src, path)?;
-    Ok((context, cursors))
+    let (participation, cursors, _) = decode_participation_aware_subscribe_task_status(src, path)?;
+    Ok((participation, cursors))
 }
 
-/// Decodes a status subscription and preserves its exact context cursor.
-pub fn decode_context_aware_subscribe_task_status(
+/// Decodes a status subscription and preserves its exact participation cursor.
+pub fn decode_participation_aware_subscribe_task_status(
     src: &novarocks::SubscribeTaskStatusRequest,
     path: FieldPath,
 ) -> Result<
     (
-        QueryContextRef,
+        ParticipationRef,
         Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
         Option<
-            novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor,
+            novarocks_execution_contract::task_execution::participation_convergence::ParticipationConvergenceCursor,
         >,
     ),
     ProtocolError,
@@ -2941,13 +2963,14 @@ pub fn decode_context_aware_subscribe_task_status(
             "covered subscription fields require the covered decoder",
         ));
     }
-    let context = src.query_context.as_ref().ok_or_else(|| {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "a subscription requires a query context reference",
+            path.clone().field("participation"),
+            "a subscription requires a participation reference",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
     if src.cursors.len() > crate::status::MAX_SUBSCRIPTION_CURSORS {
         return Err(out_of_range(
             path.clone().field("cursors"),
@@ -2961,23 +2984,23 @@ pub fn decode_context_aware_subscribe_task_status(
             path.clone().field("cursors").index(index),
         )?);
     }
-    let context_convergence_cursor = src
-        .context_convergence_cursor
+    let participation_convergence_cursor = src
+        .participation_convergence_cursor
         .as_ref()
         .map(|cursor| {
-            crate::context_convergence::decode_query_context_convergence_cursor(
+            crate::participation_convergence::decode_participation_convergence_cursor(
                 cursor,
-                path.field("context_convergence_cursor"),
+                path.field("participation_convergence_cursor"),
             )
         })
         .transpose()?;
-    Ok((context, cursors, context_convergence_cursor))
+    Ok((participation, cursors, participation_convergence_cursor))
 }
 
 /// The optional quiesce fence already observed by one reconnecting FE.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct QuiesceObservationCursor {
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub fence_version: Option<NonZeroU64>,
 }
 
@@ -2985,22 +3008,22 @@ pub struct QuiesceObservationCursor {
 /// the Worker source against its latest retained facts after decoding.
 #[derive(Clone, Debug)]
 pub struct DecodedCoveredSubscription {
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub generation: NonZeroU64,
     pub status_cursors: Vec<TaskStatusCursor>,
     pub task_convergence_cursors: Vec<TaskConvergenceCursor>,
-    pub context_cursor: Option<QueryContextConvergenceCursor>,
+    pub participation_cursor: Option<ParticipationConvergenceCursor>,
     pub quiesce_cursor: Option<QuiesceObservationCursor>,
     pub required_identities: Vec<TaskIdentity>,
 }
 
 fn check_covered_identity(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     identity: TaskIdentity,
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
     identity
-        .verify_query_context(context)
+        .verify_participation(participation)
         .map_err(|error| invalid(path, error.to_string()))
 }
 
@@ -3009,13 +3032,14 @@ pub fn decode_covered_subscribe_task_status(
     src: &novarocks::SubscribeTaskStatusRequest,
     path: FieldPath,
 ) -> Result<DecodedCoveredSubscription, ProtocolError> {
-    let context = src.query_context.as_ref().ok_or_else(|| {
+    let participation = src.participation.as_ref().ok_or_else(|| {
         missing(
-            path.clone().field("query_context"),
-            "subscription requires a context",
+            path.clone().field("participation"),
+            "subscription requires a participation",
         )
     })?;
-    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    let participation =
+        decode_participation_ref(participation, path.clone().field("participation"))?;
     let generation = NonZeroU64::new(src.generation).ok_or_else(|| {
         invalid(
             path.clone().field("generation"),
@@ -3038,7 +3062,7 @@ pub fn decode_covered_subscribe_task_status(
     for (index, wire) in src.cursors.iter().enumerate() {
         let item_path = path.clone().field("cursors").index(index);
         let cursor = crate::status::decode_task_status_cursor(wire, item_path.clone())?;
-        check_covered_identity(context, cursor.identity(), item_path.clone())?;
+        check_covered_identity(participation, cursor.identity(), item_path.clone())?;
         if !status_seen.insert(cursor.identity()) {
             return Err(invalid(item_path, "duplicate task status cursor"));
         }
@@ -3056,7 +3080,7 @@ pub fn decode_covered_subscribe_task_status(
             )
         })?;
         let identity = decode_task_identity(identity, item_path.clone().field("identity"))?;
-        check_covered_identity(context, identity, item_path.clone())?;
+        check_covered_identity(participation, identity, item_path.clone())?;
         if !convergence_seen.insert(identity) {
             return Err(invalid(item_path, "duplicate task convergence cursor"));
         }
@@ -3079,7 +3103,7 @@ pub fn decode_covered_subscribe_task_status(
     for (index, wire) in src.required_identities.iter().enumerate() {
         let item_path = path.clone().field("required_identities").index(index);
         let identity = decode_task_identity(wire, item_path.clone())?;
-        check_covered_identity(context, identity, item_path.clone())?;
+        check_covered_identity(participation, identity, item_path.clone())?;
         if !required_seen.insert(identity) {
             return Err(invalid(item_path, "duplicate required identity"));
         }
@@ -3092,20 +3116,20 @@ pub fn decode_covered_subscribe_task_status(
             "covered target union exceeds task bound",
         ));
     }
-    let context_cursor = src
-        .context_convergence_cursor
+    let participation_cursor = src
+        .participation_convergence_cursor
         .as_ref()
         .map(|wire| {
-            crate::context_convergence::decode_query_context_convergence_cursor(
+            crate::participation_convergence::decode_participation_convergence_cursor(
                 wire,
-                path.clone().field("context_convergence_cursor"),
+                path.clone().field("participation_convergence_cursor"),
             )
         })
         .transpose()?;
-    if context_cursor.is_some_and(|cursor| cursor.context() != context) {
+    if participation_cursor.is_some_and(|cursor| cursor.participation() != participation) {
         return Err(invalid(
-            path.clone().field("context_convergence_cursor"),
-            "context convergence cursor names another context",
+            path.clone().field("participation_convergence_cursor"),
+            "participation convergence cursor names another participation",
         ));
     }
     let quiesce_cursor = src
@@ -3113,31 +3137,34 @@ pub fn decode_covered_subscribe_task_status(
         .as_ref()
         .map(|wire| {
             let cursor_path = path.clone().field("quiesce_cursor");
-            let cursor_context = wire.query_context.as_ref().ok_or_else(|| {
+            let cursor_participation = wire.participation.as_ref().ok_or_else(|| {
                 missing(
-                    cursor_path.clone().field("query_context"),
-                    "quiesce cursor requires context",
+                    cursor_path.clone().field("participation"),
+                    "quiesce cursor requires participation",
                 )
             })?;
-            let cursor_context = decode_query_context_ref(
-                cursor_context,
-                cursor_path.clone().field("query_context"),
+            let cursor_participation = decode_participation_ref(
+                cursor_participation,
+                cursor_path.clone().field("participation"),
             )?;
-            if cursor_context != context {
-                return Err(invalid(cursor_path, "quiesce cursor names another context"));
+            if cursor_participation != participation {
+                return Err(invalid(
+                    cursor_path,
+                    "quiesce cursor names another participation",
+                ));
             }
             Ok(QuiesceObservationCursor {
-                context: cursor_context,
+                participation: cursor_participation,
                 fence_version: NonZeroU64::new(wire.fence_version),
             })
         })
         .transpose()?;
     Ok(DecodedCoveredSubscription {
-        context,
+        participation,
         generation,
         status_cursors,
         task_convergence_cursors,
-        context_cursor,
+        participation_cursor,
         quiesce_cursor,
         required_identities,
     })
@@ -3148,16 +3175,16 @@ pub fn encode_covered_subscribe_task_status(
     request: &DecodedCoveredSubscription,
 ) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
     let wire = novarocks::SubscribeTaskStatusRequest {
-        query_context: Some(encode_query_context_ref(request.context)),
+        participation: Some(encode_participation_ref(request.participation)),
         cursors: request
             .status_cursors
             .iter()
             .copied()
             .map(crate::status::encode_task_status_cursor)
             .collect(),
-        context_convergence_cursor: request
-            .context_cursor
-            .map(crate::context_convergence::encode_query_context_convergence_cursor),
+        participation_convergence_cursor: request
+            .participation_cursor
+            .map(crate::participation_convergence::encode_participation_convergence_cursor),
         generation: request.generation.get(),
         task_convergence_cursors: request
             .task_convergence_cursors
@@ -3175,12 +3202,12 @@ pub fn encode_covered_subscribe_task_status(
             .copied()
             .map(encode_task_identity)
             .collect(),
-        quiesce_cursor: request
-            .quiesce_cursor
-            .map(|cursor| novarocks::QuiesceQueryContextCursor {
-                query_context: Some(encode_query_context_ref(cursor.context)),
+        quiesce_cursor: request.quiesce_cursor.map(|cursor| {
+            novarocks::QuiesceParticipationCursor {
+                participation: Some(encode_participation_ref(cursor.participation)),
                 fence_version: cursor.fence_version.map_or(0, NonZeroU64::get),
-            }),
+            }
+        }),
     };
     decode_covered_subscribe_task_status(&wire, FieldPath::root("covered_subscribe_task_status"))?;
     Ok(wire)
@@ -3208,9 +3235,9 @@ pub struct CoveredObservationBookmark {
 pub enum CoveredStatusStreamFact {
     Status(TaskStatus),
     Gone(TaskIdentity),
-    ContextConvergence(QueryContextConvergenceReceipt),
+    ParticipationConvergence(ParticipationConvergenceReceipt),
     TaskConvergence(TaskConvergenceReceipt),
-    Quiesce(QuiesceQueryContextReceipt),
+    Quiesce(QuiesceParticipationReceipt),
     StatusUnchanged(TaskIdentity),
     TaskConvergenceUnchanged(TaskIdentity),
     Unknown(TaskIdentity),
@@ -3262,11 +3289,11 @@ pub fn decode_covered_status_event(
                 path.clone().field("task_gone").field("identity"),
             )?)
         }
-        novarocks::task_status_stream_event::Event::ContextConvergence(value) => {
-            CoveredStatusStreamFact::ContextConvergence(
-                crate::context_convergence::decode_query_context_convergence_receipt(
+        novarocks::task_status_stream_event::Event::ParticipationConvergence(value) => {
+            CoveredStatusStreamFact::ParticipationConvergence(
+                crate::participation_convergence::decode_participation_convergence_receipt(
                     value,
-                    path.clone().field("context_convergence"),
+                    path.clone().field("participation_convergence"),
                 )?,
             )
         }
@@ -3283,8 +3310,8 @@ pub fn decode_covered_status_event(
             ))
         }
         novarocks::task_status_stream_event::Event::Quiesce(value) => {
-            let ack = novarocks::QuiesceQueryContextAck {
-                query_context: value.query_context.clone(),
+            let ack = novarocks::QuiesceParticipationAck {
+                participation: value.participation.clone(),
                 fence_version: value.fence_version,
                 accepted_tasks: value.accepted_tasks.clone(),
                 state: value.state,
@@ -3378,9 +3405,13 @@ pub fn encode_covered_status_event(
         CoveredStatusStreamFact::Gone(identity) => Event::TaskGone(novarocks::TaskGone {
             identity: Some(encode_task_identity(*identity)),
         }),
-        CoveredStatusStreamFact::ContextConvergence(receipt) => Event::ContextConvergence(
-            crate::context_convergence::encode_query_context_convergence_receipt(*receipt),
-        ),
+        CoveredStatusStreamFact::ParticipationConvergence(receipt) => {
+            Event::ParticipationConvergence(
+                crate::participation_convergence::encode_participation_convergence_receipt(
+                    *receipt,
+                ),
+            )
+        }
         CoveredStatusStreamFact::TaskConvergence(receipt) => {
             Event::TaskConvergence(novarocks::TaskConvergenceReceipt {
                 identity: Some(encode_task_identity(receipt.identity())),
@@ -3394,8 +3425,8 @@ pub fn encode_covered_status_event(
                     "quiesce requires a closing state",
                 )
             })?;
-            Event::Quiesce(novarocks::QuiesceQueryContextObservation {
-                query_context: ack.query_context,
+            Event::Quiesce(novarocks::QuiesceParticipationObservation {
+                participation: ack.participation,
                 fence_version: ack.fence_version,
                 accepted_tasks: ack.accepted_tasks,
                 state: ack.state,
@@ -3440,19 +3471,19 @@ pub fn encode_covered_status_event(
 #[cfg(test)]
 mod covered_wire_tests {
     use super::*;
-    use novarocks_execution_contract::task_execution::context_convergence::{
-        QueryContextConvergenceState, QueryContextConvergenceVersion,
+    use novarocks_execution_contract::task_execution::participation_convergence::{
+        ParticipationConvergenceState, ParticipationConvergenceVersion,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    pub(super) fn context_and_task() -> (QueryContextRef, TaskIdentity) {
+    pub(super) fn participation_and_task() -> (ParticipationRef, TaskIdentity) {
         let execution =
             QueryExecutionId::new(QueryId::new(13, 14), AttemptId::new(1).unwrap()).unwrap();
         let backend = BackendProcessId::new_v7();
         (
-            QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend),
+            ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend),
             TaskIdentity::new(
                 execution,
                 StageId::new(1).unwrap(),
@@ -3462,15 +3493,15 @@ mod covered_wire_tests {
         )
     }
 
-    fn request(context: QueryContextRef, task: TaskIdentity) -> DecodedCoveredSubscription {
+    fn request(participation: ParticipationRef, task: TaskIdentity) -> DecodedCoveredSubscription {
         DecodedCoveredSubscription {
-            context,
+            participation,
             generation: NonZeroU64::new(7).unwrap(),
             status_cursors: vec![TaskStatusCursor::unobserved(task)],
             task_convergence_cursors: vec![TaskConvergenceCursor::unobserved(task)],
-            context_cursor: Some(QueryContextConvergenceCursor::unobserved(context)),
+            participation_cursor: Some(ParticipationConvergenceCursor::unobserved(participation)),
             quiesce_cursor: Some(QuiesceObservationCursor {
-                context,
+                participation,
                 fence_version: None,
             }),
             required_identities: vec![task],
@@ -3479,31 +3510,34 @@ mod covered_wire_tests {
 
     #[test]
     fn covered_request_roundtrip_and_hybrid_rejection() {
-        let (context, task) = context_and_task();
-        let wire = encode_covered_subscribe_task_status(&request(context, task)).unwrap();
+        let (participation, task) = participation_and_task();
+        let wire = encode_covered_subscribe_task_status(&request(participation, task)).unwrap();
         let decoded =
             decode_covered_subscribe_task_status(&wire, FieldPath::root("covered_request"))
                 .unwrap();
         assert_eq!(decoded.generation.get(), 7);
         assert_eq!(decoded.status_cursors[0].identity(), task);
         assert_eq!(decoded.task_convergence_cursors[0].identity(), task);
-        assert_eq!(decoded.quiesce_cursor.unwrap().context, context);
+        assert_eq!(decoded.quiesce_cursor.unwrap().participation, participation);
         assert!(
-            decode_context_aware_subscribe_task_status(&wire, FieldPath::root("legacy_request"),)
-                .is_err()
+            decode_participation_aware_subscribe_task_status(
+                &wire,
+                FieldPath::root("legacy_request"),
+            )
+            .is_err()
         );
         let mut zero = wire.clone();
         zero.generation = 0;
         assert!(decode_covered_subscribe_task_status(&zero, FieldPath::root("zero")).is_err());
-        let legacy = encode_subscribe_task_status(context, &[]).unwrap();
+        let legacy = encode_subscribe_task_status(participation, &[]).unwrap();
         assert!(decode_covered_subscribe_task_status(&legacy, FieldPath::root("legacy")).is_err());
     }
 
     #[test]
-    fn covered_request_rejects_identity_context_and_duplicate_targets() {
-        let (context, task) = context_and_task();
-        let (other_context, other_task) = context_and_task();
-        let mut wire = encode_covered_subscribe_task_status(&request(context, task)).unwrap();
+    fn covered_request_rejects_identity_participation_and_duplicate_targets() {
+        let (participation, task) = participation_and_task();
+        let (other_participation, other_task) = participation_and_task();
+        let mut wire = encode_covered_subscribe_task_status(&request(participation, task)).unwrap();
         wire.required_identities
             .push(encode_task_identity(other_task));
         assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("mismatch")).is_err());
@@ -3511,8 +3545,8 @@ mod covered_wire_tests {
         wire.required_identities.push(encode_task_identity(task));
         assert!(decode_covered_subscribe_task_status(&wire, FieldPath::root("duplicate")).is_err());
         wire.required_identities.pop();
-        wire.quiesce_cursor.as_mut().unwrap().query_context =
-            Some(encode_query_context_ref(other_context));
+        wire.quiesce_cursor.as_mut().unwrap().participation =
+            Some(encode_participation_ref(other_participation));
         assert!(
             decode_covered_subscribe_task_status(&wire, FieldPath::root("quiesce_mismatch"))
                 .is_err()
@@ -3521,7 +3555,7 @@ mod covered_wire_tests {
 
     #[test]
     fn covered_frame_roundtrip_and_nonzero_rejections() {
-        let (context, task) = context_and_task();
+        let (participation, task) = participation_and_task();
         let frames = [
             CoveredStatusStreamEvent {
                 fact: CoveredStatusStreamFact::Status(TaskStatus::created(task)),
@@ -3534,21 +3568,21 @@ mod covered_wire_tests {
                 source_revision: Some(2),
             },
             CoveredStatusStreamEvent {
-                fact: CoveredStatusStreamFact::ContextConvergence(
-                    QueryContextConvergenceReceipt::new(
-                        context,
-                        QueryContextConvergenceVersion::FIRST,
-                        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                fact: CoveredStatusStreamFact::ParticipationConvergence(
+                    ParticipationConvergenceReceipt::new(
+                        participation,
+                        ParticipationConvergenceVersion::FIRST,
+                        ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
                     ),
                 ),
                 source_revision: Some(3),
             },
             CoveredStatusStreamEvent {
-                fact: CoveredStatusStreamFact::Quiesce(QuiesceQueryContextReceipt::new(
-                    context,
+                fact: CoveredStatusStreamFact::Quiesce(QuiesceParticipationReceipt::new(
+                    participation,
                     1,
                     vec![task],
-                    QueryContextState::Quiescing,
+                    ParticipationState::Quiescing,
                 )),
                 source_revision: Some(4),
             },

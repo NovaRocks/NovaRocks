@@ -50,8 +50,8 @@ pub enum NativeFilterEnvelopeError {
     ZeroEpoch,
     MissingRoute,
     MissingRouteValue,
-    MissingFragment,
-    ZeroFragment,
+    MissingTaskKey,
+    ZeroTaskKey,
     ZeroProducerBinding,
     ZeroRouteEdge,
     ZeroDeliverySequence,
@@ -77,10 +77,8 @@ impl std::fmt::Display for NativeFilterEnvelopeError {
             Self::MissingRouteValue => {
                 f.write_str("runtime filter route identity value is missing")
             }
-            Self::MissingFragment => f.write_str("runtime filter fragment instance id is missing"),
-            Self::ZeroFragment => {
-                f.write_str("runtime filter fragment instance id must be non-zero")
-            }
+            Self::MissingTaskKey => f.write_str("runtime filter task key is missing"),
+            Self::ZeroTaskKey => f.write_str("runtime filter task key must be non-zero"),
             Self::ZeroProducerBinding => {
                 f.write_str("runtime filter producer binding id must be non-zero")
             }
@@ -133,8 +131,8 @@ impl FailureProjection for NativeFilterEnvelopeError {
             Self::ZeroEpoch => 9505,
             Self::MissingRoute => 9506,
             Self::MissingRouteValue => 9507,
-            Self::MissingFragment => 9508,
-            Self::ZeroFragment => 9509,
+            Self::MissingTaskKey => 9508,
+            Self::ZeroTaskKey => 9509,
             Self::ZeroProducerBinding => 9510,
             Self::ZeroRouteEdge => 9511,
             Self::ZeroDeliverySequence => 9512,
@@ -283,7 +281,7 @@ impl BackendNativeRouteIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendNativeContributionRouteIdentity {
     producer_binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     partition_id: PartitionId,
     sequence: BackendTransportSequence,
 }
@@ -291,13 +289,13 @@ pub struct BackendNativeContributionRouteIdentity {
 impl BackendNativeContributionRouteIdentity {
     pub const fn new(
         producer_binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition_id: PartitionId,
         sequence: BackendTransportSequence,
     ) -> Self {
         Self {
             producer_binding_id,
-            fragment_instance_id,
+            task_key,
             partition_id,
             sequence,
         }
@@ -307,8 +305,8 @@ impl BackendNativeContributionRouteIdentity {
         self.producer_binding_id
     }
 
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn partition_id(self) -> PartitionId {
@@ -349,17 +347,14 @@ impl BackendNativeDeliveryRouteIdentity {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BackendNativeProducerInstanceRouteIdentity {
     producer_binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 impl BackendNativeProducerInstanceRouteIdentity {
-    pub const fn new(
-        producer_binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
-    ) -> Self {
+    pub const fn new(producer_binding_id: RuntimeFilterBindingId, task_key: UniqueId) -> Self {
         Self {
             producer_binding_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 
@@ -367,8 +362,8 @@ impl BackendNativeProducerInstanceRouteIdentity {
         self.producer_binding_id
     }
 
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 }
 
@@ -910,9 +905,9 @@ fn encode_route_identity(
         BackendNativeRouteIdentity::Contribution(identity) => {
             Value::Contribution(proto::filter::RuntimeFilterContributionRouteIdentity {
                 producer_binding_id: identity.producer_binding_id().get(),
-                fragment_instance_id: Some(proto::common::UniqueId {
-                    hi: identity.fragment_instance_id().high(),
-                    lo: identity.fragment_instance_id().low(),
+                task_key: Some(proto::common::UniqueId {
+                    hi: identity.task_key().high(),
+                    lo: identity.task_key().low(),
                 }),
                 partition_id: identity.partition_id().get(),
                 sequence: identity.sequence().get(),
@@ -931,9 +926,9 @@ fn encode_route_identity(
         BackendNativeRouteIdentity::ProducerInstance(identity) => {
             Value::ProducerInstance(proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
                 producer_binding_id: identity.producer_binding_id().get(),
-                fragment_instance_id: Some(proto::common::UniqueId {
-                    hi: identity.fragment_instance_id().high(),
-                    lo: identity.fragment_instance_id().low(),
+                task_key: Some(proto::common::UniqueId {
+                    hi: identity.task_key().high(),
+                    lo: identity.task_key().low(),
                 }),
             })
         }
@@ -948,23 +943,22 @@ fn decode_route_identity(
 
     match route_identity.value.as_ref() {
         Some(Value::Contribution(identity)) => {
-            let fragment_instance_id = identity
-                .fragment_instance_id
-                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingFragment))?;
-            let fragment_instance_id =
-                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
+            let task_key = identity
+                .task_key
+                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingTaskKey))?;
+            let task_key = UniqueId::new(task_key.hi, task_key.lo);
             if identity.producer_binding_id == 0 {
                 return Err(invalid_argument(
                     NativeFilterEnvelopeError::ZeroProducerBinding,
                 ));
             }
-            if fragment_instance_id == UniqueId::new(0, 0) {
-                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroFragment));
+            if task_key == UniqueId::new(0, 0) {
+                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroTaskKey));
             }
             Ok(BackendNativeRouteIdentity::contribution(
                 BackendNativeContributionRouteIdentity::new(
                     RuntimeFilterBindingId::new(identity.producer_binding_id),
-                    fragment_instance_id,
+                    task_key,
                     PartitionId::new(identity.partition_id),
                     BackendTransportSequence::new(identity.sequence),
                 ),
@@ -987,23 +981,22 @@ fn decode_route_identity(
             ))
         }
         Some(Value::ProducerInstance(identity)) => {
-            let fragment_instance_id = identity
-                .fragment_instance_id
-                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingFragment))?;
-            let fragment_instance_id =
-                UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
+            let task_key = identity
+                .task_key
+                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingTaskKey))?;
+            let task_key = UniqueId::new(task_key.hi, task_key.lo);
             if identity.producer_binding_id == 0 {
                 return Err(invalid_argument(
                     NativeFilterEnvelopeError::ZeroProducerBinding,
                 ));
             }
-            if fragment_instance_id == UniqueId::new(0, 0) {
-                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroFragment));
+            if task_key == UniqueId::new(0, 0) {
+                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroTaskKey));
             }
             Ok(BackendNativeRouteIdentity::producer_instance(
                 BackendNativeProducerInstanceRouteIdentity::new(
                     RuntimeFilterBindingId::new(identity.producer_binding_id),
-                    fragment_instance_id,
+                    task_key,
                 ),
             ))
         }
@@ -1130,7 +1123,7 @@ mod tests {
                 proto::filter::runtime_filter_route_identity::Value::Contribution(
                     proto::filter::RuntimeFilterContributionRouteIdentity {
                         producer_binding_id: 17,
-                        fragment_instance_id: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
+                        task_key: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
                         partition_id: 20,
                         sequence: 21,
                     },
@@ -1158,7 +1151,7 @@ mod tests {
                 proto::filter::runtime_filter_route_identity::Value::ProducerInstance(
                     proto::filter::RuntimeFilterProducerInstanceRouteIdentity {
                         producer_binding_id: 17,
-                        fragment_instance_id: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
+                        task_key: Some(proto::common::UniqueId { hi: 18, lo: 19 }),
                     },
                 ),
             ),
@@ -1296,7 +1289,7 @@ mod tests {
                         .as_contribution()
                         .expect("contribution identity");
                     assert_eq!(identity.producer_binding_id(), BindingId::new(17));
-                    assert_eq!(identity.fragment_instance_id(), UniqueId::new(18, 19));
+                    assert_eq!(identity.task_key(), UniqueId::new(18, 19));
                     assert_eq!(identity.partition_id(), PartitionId::new(20));
                     assert_eq!(identity.sequence(), ProducerSequence::new(21));
                 }
@@ -1306,7 +1299,7 @@ mod tests {
                         .as_producer_instance()
                         .expect("producer-instance identity");
                     assert_eq!(identity.producer_binding_id(), BindingId::new(17));
-                    assert_eq!(identity.fragment_instance_id(), UniqueId::new(18, 19));
+                    assert_eq!(identity.task_key(), UniqueId::new(18, 19));
                 }
                 RuntimeFilterEnvelopeKind::Artifact
                 | RuntimeFilterEnvelopeKind::FinalArtifact
@@ -1367,7 +1360,7 @@ mod tests {
             (UniqueId::new(11, 12), UniqueId::new(41, 0)),
         ];
 
-        for (query_id, fragment_instance_id) in cases {
+        for (query_id, task_key) in cases {
             let ingress = Arc::new(RecordingIngress::new(RuntimeFilterIngressResult::accepted()));
             let mut request =
                 valid_wire_envelope(proto::filter::RuntimeFilterEnvelopeKind::Contribution);
@@ -1380,9 +1373,9 @@ mod tests {
             else {
                 unreachable!()
             };
-            identity.fragment_instance_id = Some(proto::common::UniqueId {
-                hi: fragment_instance_id.high(),
-                lo: fragment_instance_id.low(),
+            identity.task_key = Some(proto::common::UniqueId {
+                hi: task_key.high(),
+                lo: task_key.low(),
             });
 
             let response = handle_runtime_filter_envelope(ingress.clone(), request).unwrap();
@@ -1399,7 +1392,7 @@ mod tests {
                 .route_identity()
                 .as_contribution()
                 .expect("contribution identity");
-            assert_eq!(identity.fragment_instance_id(), fragment_instance_id);
+            assert_eq!(identity.task_key(), task_key);
         }
     }
 
@@ -1714,10 +1707,10 @@ mod tests {
                 identity.producer_binding_id = 0
             },
             |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
-                identity.fragment_instance_id = None
+                identity.task_key = None
             },
             |identity: &mut proto::filter::RuntimeFilterContributionRouteIdentity| {
-                identity.fragment_instance_id = Some(proto::common::UniqueId { hi: 0, lo: 0 })
+                identity.task_key = Some(proto::common::UniqueId { hi: 0, lo: 0 })
             },
         ] {
             let mut request =

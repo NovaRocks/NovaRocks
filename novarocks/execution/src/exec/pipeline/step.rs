@@ -20,7 +20,7 @@
 use super::{input::RawInput, operator::DriverBlockDeadline, schedule::observer::Observable};
 use crate::{
     exec::chunk::Chunk,
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use std::sync::Arc;
 
@@ -94,7 +94,7 @@ pub enum NextStep {
 pub enum UpstreamPull {
     Busy,
     Uncovered,
-    Root(crate::runtime::fragment::io::RootInputPermit),
+    Root(crate::runtime::task::io::RootInputPermit),
     Wait(WaitFact),
 }
 

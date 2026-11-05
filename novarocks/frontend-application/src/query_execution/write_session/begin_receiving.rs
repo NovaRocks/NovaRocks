@@ -27,7 +27,7 @@ type CowPlanOutcome = Result<
     novarocks_spi::connector::ConnectorCowBeginFailure,
 >;
 struct BeginInput {
-    lease: ConnectorWriteStackLease,
+    write_stack_pin: ConnectorWriteStackPin,
     catalog_properties: novarocks_spi::connector::CatalogProperties,
     finish_publication: WritePublicationState,
     metadata_only_publication: bool,
@@ -102,14 +102,18 @@ impl WriteBeginReceiving {
     }
     pub(super) fn install_input(
         &self,
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
     ) {
-        self.install_publication_input(lease, catalog_properties, WritePublicationState::Ordinary);
+        self.install_publication_input(
+            write_stack_pin,
+            catalog_properties,
+            WritePublicationState::Ordinary,
+        );
     }
     pub(super) fn install_publication_input(
         &self,
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         finish_publication: WritePublicationState,
     ) {
@@ -125,7 +129,7 @@ impl WriteBeginReceiving {
             "same begin input can be installed only once"
         );
         *slot = Some(BeginInput {
-            lease,
+            write_stack_pin,
             catalog_properties,
             finish_publication,
             metadata_only_publication,
@@ -139,7 +143,7 @@ impl WriteBeginReceiving {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .expect("same installed begin input")
-            .lease
+            .write_stack_pin
             .session()
     }
     pub(super) fn publish_plan(&self, outcome: Result<ConnectorWriteSessionPlan, ConnectorError>) {
@@ -164,7 +168,7 @@ impl WriteBeginReceiving {
                     .take()
                     .expect("same retained begin input");
                 let session = Arc::new(ConnectorWriteSession::from_begin_plan(
-                    input.lease,
+                    input.write_stack_pin,
                     input.catalog_properties,
                     plan,
                     input.finish_publication,
@@ -222,7 +226,7 @@ impl WriteBeginReceiving {
                     .take()
                     .expect("same retained checked COW input");
                 ConnectorWriteSession::from_checked_cow_plan(
-                    input.lease,
+                    input.write_stack_pin,
                     input.catalog_properties,
                     plan,
                 )

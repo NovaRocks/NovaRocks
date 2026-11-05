@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use novarocks_execution::runtime::fragment::io::{
-    FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentSinkLoadStats,
+use novarocks_execution::runtime::task::io::{
     TabletCommitInfo as ExecutionTabletCommitInfo, TabletFailInfo as ExecutionTabletFailInfo,
+    TaskCommitPort, TaskCommitRegistration, TaskCommitReport, TaskSinkLoadStats,
 };
 use novarocks_spi::connector::{WriteCommitEvidenceLedger, WriteCommitEvidenceLimits};
 use novarocks_types::UniqueId;
@@ -60,12 +60,12 @@ pub(crate) struct SinkCommitReportSnapshot {
 #[derive(Debug, Default)]
 pub struct WorkerSinkCommitPort;
 
-impl FragmentCommitPort for WorkerSinkCommitPort {
+impl TaskCommitPort for WorkerSinkCommitPort {
     fn acquire(
         &self,
-        fragment_instance_id: UniqueId,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
-        acquire_worker_sink_commit_lease(fragment_instance_id, WriteCommitEvidenceLimits::default())
+        task_key: UniqueId,
+    ) -> novarocks_execution::runtime::task::ExecutionResult<Box<dyn TaskCommitRegistration>> {
+        acquire_worker_sink_commit_lease(task_key, WriteCommitEvidenceLimits::default())
     }
 }
 
@@ -81,50 +81,47 @@ impl ConfiguredWorkerSinkCommitPort {
     }
 }
 
-impl FragmentCommitPort for ConfiguredWorkerSinkCommitPort {
+impl TaskCommitPort for ConfiguredWorkerSinkCommitPort {
     fn acquire(
         &self,
-        fragment_instance_id: UniqueId,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
-        acquire_worker_sink_commit_lease(fragment_instance_id, self.evidence_limits)
+        task_key: UniqueId,
+    ) -> novarocks_execution::runtime::task::ExecutionResult<Box<dyn TaskCommitRegistration>> {
+        acquire_worker_sink_commit_lease(task_key, self.evidence_limits)
     }
 }
 
 fn acquire_worker_sink_commit_lease(
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     evidence_limits: WriteCommitEvidenceLimits,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<Box<dyn FragmentCommitLease>> {
-    if !try_register_with_ledger(
-        fragment_instance_id,
-        WriteCommitEvidenceLedger::new(evidence_limits),
-    ) {
+) -> novarocks_execution::runtime::task::ExecutionResult<Box<dyn TaskCommitRegistration>> {
+    if !try_register_with_ledger(task_key, WriteCommitEvidenceLedger::new(evidence_limits)) {
         return Err(
-            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
-                DuplicateCommitRegistration(fragment_instance_id),
+            novarocks_execution::runtime::task::ExecutionFailure::from_domain(
+                DuplicateCommitRegistration(task_key),
             ),
         );
     }
-    Ok(Box::new(WorkerSinkCommitLease {
-        fragment_instance_id,
+    Ok(Box::new(WorkerSinkCommitRegistration {
+        task_key,
         active: true,
     }))
 }
 
-struct WorkerSinkCommitLease {
-    fragment_instance_id: UniqueId,
+struct WorkerSinkCommitRegistration {
+    task_key: UniqueId,
     active: bool,
 }
 
-impl WorkerSinkCommitLease {
+impl WorkerSinkCommitRegistration {
     fn require_registration_permission(
         &self,
-        operation: CommitLeaseOperation,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        operation: SinkCommitOperation,
+    ) -> novarocks_execution::runtime::task::ExecutionResult<()> {
         if !self.active {
             return Err(
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
-                    CommitLeaseAfterSettled {
-                        fragment_instance_id: self.fragment_instance_id,
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(
+                    SinkCommitAfterSettled {
+                        task_key: self.task_key,
                         operation,
                     },
                 ),
@@ -133,9 +130,9 @@ impl WorkerSinkCommitLease {
         Ok(())
     }
 
-    fn snapshot(&self) -> FragmentCommitReport {
-        let snapshot = report_snapshot(self.fragment_instance_id);
-        FragmentCommitReport {
+    fn snapshot(&self) -> TaskCommitReport {
+        let snapshot = report_snapshot(self.task_key);
+        TaskCommitReport {
             tablet_commit_infos: snapshot
                 .tablet_commit_infos
                 .into_iter()
@@ -152,7 +149,7 @@ impl WorkerSinkCommitLease {
                     backend_id: info.backend_id,
                 })
                 .collect(),
-            load_stats: FragmentSinkLoadStats {
+            load_stats: TaskSinkLoadStats {
                 loaded_rows: snapshot.load_stats.loaded_rows,
                 loaded_bytes: snapshot.load_stats.loaded_bytes,
                 filtered_rows: snapshot.load_stats.filtered_rows,
@@ -161,14 +158,14 @@ impl WorkerSinkCommitLease {
     }
 }
 
-impl FragmentCommitLease for WorkerSinkCommitLease {
+impl TaskCommitRegistration for WorkerSinkCommitRegistration {
     fn add_load_stats(
         &mut self,
-        stats: FragmentSinkLoadStats,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.require_registration_permission(CommitLeaseOperation::AddLoadStats)?;
+        stats: TaskSinkLoadStats,
+    ) -> novarocks_execution::runtime::task::ExecutionResult<()> {
+        self.require_registration_permission(SinkCommitOperation::AddLoadStats)?;
         add_load_stats(
-            self.fragment_instance_id,
+            self.task_key,
             stats.loaded_rows,
             stats.loaded_bytes,
             stats.filtered_rows,
@@ -179,10 +176,10 @@ impl FragmentCommitLease for WorkerSinkCommitLease {
     fn add_tablet_commit_info(
         &mut self,
         info: ExecutionTabletCommitInfo,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.require_registration_permission(CommitLeaseOperation::AddTabletCommitInfo)?;
+    ) -> novarocks_execution::runtime::task::ExecutionResult<()> {
+        self.require_registration_permission(SinkCommitOperation::AddTabletCommitInfo)?;
         try_add_tablet_commit_info(
-            self.fragment_instance_id,
+            self.task_key,
             TabletCommitInfo {
                 tablet_id: info.tablet_id,
                 backend_id: info.backend_id,
@@ -193,10 +190,10 @@ impl FragmentCommitLease for WorkerSinkCommitLease {
     fn add_tablet_fail_info(
         &mut self,
         info: ExecutionTabletFailInfo,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.require_registration_permission(CommitLeaseOperation::AddTabletFailInfo)?;
+    ) -> novarocks_execution::runtime::task::ExecutionResult<()> {
+        self.require_registration_permission(SinkCommitOperation::AddTabletFailInfo)?;
         try_add_tablet_fail_info(
-            self.fragment_instance_id,
+            self.task_key,
             TabletFailInfo {
                 tablet_id: info.tablet_id,
                 backend_id: info.backend_id,
@@ -204,40 +201,38 @@ impl FragmentCommitLease for WorkerSinkCommitLease {
         )
     }
 
-    fn finish(
-        &mut self,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<FragmentCommitReport> {
-        self.require_registration_permission(CommitLeaseOperation::Finish)?;
+    fn finish(&mut self) -> novarocks_execution::runtime::task::ExecutionResult<TaskCommitReport> {
+        self.require_registration_permission(SinkCommitOperation::Finish)?;
         self.active = false;
         let snapshot = self.snapshot();
-        unregister(self.fragment_instance_id);
+        unregister(self.task_key);
         Ok(snapshot)
     }
 
-    fn handoff(&mut self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.require_registration_permission(CommitLeaseOperation::Handoff)?;
+    fn handoff(&mut self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
+        self.require_registration_permission(SinkCommitOperation::Handoff)?;
         self.active = false;
         Ok(())
     }
 
-    fn rollback(&mut self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.require_registration_permission(CommitLeaseOperation::Rollback)?;
+    fn rollback(&mut self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
+        self.require_registration_permission(SinkCommitOperation::Rollback)?;
         self.active = false;
-        unregister(self.fragment_instance_id);
+        unregister(self.task_key);
         Ok(())
     }
 }
 
-impl Drop for WorkerSinkCommitLease {
+impl Drop for WorkerSinkCommitRegistration {
     fn drop(&mut self) {
         if self.active {
-            unregister(self.fragment_instance_id);
+            unregister(self.task_key);
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitLeaseOperation {
+enum SinkCommitOperation {
     AddLoadStats,
     AddTabletCommitInfo,
     AddTabletFailInfo,
@@ -246,21 +241,21 @@ enum CommitLeaseOperation {
     Rollback,
 }
 #[derive(Debug)]
-struct CommitLeaseAfterSettled {
-    fragment_instance_id: UniqueId,
-    operation: CommitLeaseOperation,
+struct SinkCommitAfterSettled {
+    task_key: UniqueId,
+    operation: SinkCommitOperation,
 }
-impl std::fmt::Display for CommitLeaseAfterSettled {
+impl std::fmt::Display for SinkCommitAfterSettled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "sink commit lease for fragment instance {} is settled before {:?}",
-            self.fragment_instance_id, self.operation
+            self.task_key, self.operation
         )
     }
 }
-impl std::error::Error for CommitLeaseAfterSettled {}
-impl novarocks_execution_contract::failure::FailureProjection for CommitLeaseAfterSettled {
+impl std::error::Error for SinkCommitAfterSettled {}
+impl novarocks_execution_contract::failure::FailureProjection for SinkCommitAfterSettled {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{FailureClass, FailureFact};
         FailureFact::new(
@@ -302,39 +297,39 @@ fn store() -> &'static SinkCommitStore {
 }
 
 fn try_register_with_ledger(
-    finst_id: UniqueId,
+    task_key: UniqueId,
     evidence_ledger: WriteCommitEvidenceLedger,
 ) -> bool {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
-    if guard.contains_key(&finst_id) {
+    if guard.contains_key(&task_key) {
         return false;
     }
-    guard.insert(finst_id, SinkCommitEntry::new(evidence_ledger));
+    guard.insert(task_key, SinkCommitEntry::new(evidence_ledger));
     true
 }
 
-fn unregister(finst_id: UniqueId) {
+fn unregister(task_key: UniqueId) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
-    guard.remove(&finst_id);
+    guard.remove(&task_key);
 }
 
 fn try_add_tablet_commit_info(
-    finst_id: UniqueId,
+    task_key: UniqueId,
     info: TabletCommitInfo,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+) -> novarocks_execution::runtime::task::ExecutionResult<()> {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard
-        .entry(finst_id)
+        .entry(task_key)
         .or_insert_with(|| SinkCommitEntry::new(WriteCommitEvidenceLedger::default()));
     if !entry.tablet_commit_infos.contains(&info) {
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
             .map_err(|source| {
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                     CommitEvidenceFailure {
                         operation: CommitEvidenceOperation::Commit,
                         source,
@@ -347,20 +342,20 @@ fn try_add_tablet_commit_info(
 }
 
 fn try_add_tablet_fail_info(
-    finst_id: UniqueId,
+    task_key: UniqueId,
     info: TabletFailInfo,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+) -> novarocks_execution::runtime::task::ExecutionResult<()> {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard
-        .entry(finst_id)
+        .entry(task_key)
         .or_insert_with(|| SinkCommitEntry::new(WriteCommitEvidenceLedger::default()));
     if !entry.tablet_fail_infos.contains(&info) {
         entry
             .evidence_ledger
             .reserve(TABLET_TERMINAL_CANONICAL_BYTES, 1)
             .map_err(|source| {
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                     CommitEvidenceFailure {
                         operation: CommitEvidenceOperation::Failure,
                         source,
@@ -372,19 +367,19 @@ fn try_add_tablet_fail_info(
     Ok(())
 }
 
-fn add_load_stats(finst_id: UniqueId, loaded_rows: i64, loaded_bytes: i64, filtered_rows: i64) {
+fn add_load_stats(task_key: UniqueId, loaded_rows: i64, loaded_bytes: i64, filtered_rows: i64) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
-    let entry = guard.entry(finst_id).or_default();
+    let entry = guard.entry(task_key).or_default();
     entry.loaded_rows = entry.loaded_rows.saturating_add(loaded_rows.max(0));
     entry.loaded_bytes = entry.loaded_bytes.saturating_add(loaded_bytes.max(0));
     entry.filtered_rows = entry.filtered_rows.saturating_add(filtered_rows.max(0));
 }
 
-pub(crate) fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
+pub(crate) fn report_snapshot(task_key: UniqueId) -> SinkCommitReportSnapshot {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
-    let Some(entry) = guard.get(&finst_id) else {
+    let Some(entry) = guard.get(&task_key) else {
         return SinkCommitReportSnapshot::default();
     };
     SinkCommitReportSnapshot {
@@ -408,17 +403,17 @@ mod tests {
 
     #[test]
     fn tablet_domain_records_deduplicate_by_tablet_and_backend() {
-        let finst_id = UniqueId::new(41, 42);
-        unregister(finst_id);
+        let task_key = UniqueId::new(41, 42);
+        unregister(task_key);
 
         let commit = TabletCommitInfo {
             tablet_id: 101,
             backend_id: 202,
         };
-        try_add_tablet_commit_info(finst_id, commit).expect("first commit fact");
-        try_add_tablet_commit_info(finst_id, commit).expect("duplicate commit fact");
+        try_add_tablet_commit_info(task_key, commit).expect("first commit fact");
+        try_add_tablet_commit_info(task_key, commit).expect("duplicate commit fact");
         try_add_tablet_commit_info(
-            finst_id,
+            task_key,
             TabletCommitInfo {
                 tablet_id: 101,
                 backend_id: 303,
@@ -430,10 +425,10 @@ mod tests {
             tablet_id: 404,
             backend_id: 505,
         };
-        try_add_tablet_fail_info(finst_id, fail).expect("first failure fact");
-        try_add_tablet_fail_info(finst_id, fail).expect("duplicate failure fact");
+        try_add_tablet_fail_info(task_key, fail).expect("first failure fact");
+        try_add_tablet_fail_info(task_key, fail).expect("duplicate failure fact");
 
-        let snapshot = super::report_snapshot(finst_id);
+        let snapshot = super::report_snapshot(task_key);
         assert_eq!(
             snapshot.tablet_commit_infos,
             vec![
@@ -446,11 +441,11 @@ mod tests {
         );
         assert_eq!(snapshot.tablet_fail_infos, vec![fail]);
 
-        unregister(finst_id);
+        unregister(task_key);
     }
     #[test]
     fn borrowed_commit_settlement_and_box_drop_preserve_the_replacement_epoch() {
-        use novarocks_execution::runtime::fragment::io::FragmentCommitPort;
+        use novarocks_execution::runtime::task::io::TaskCommitPort;
         let port = super::WorkerSinkCommitPort;
         for (ordinal, finish) in [false, true].into_iter().enumerate() {
             let identity = UniqueId::new(44_598, ordinal as i64);
@@ -489,20 +484,20 @@ mod tests {
 
     #[test]
     fn settled_borrowed_lease_rejects_every_operation_without_touching_same_id_replacement() {
-        use super::{CommitLeaseAfterSettled, CommitLeaseOperation};
-        use novarocks_execution::runtime::fragment::{
+        use super::{SinkCommitAfterSettled, SinkCommitOperation};
+        use novarocks_execution::runtime::task::{
             ExecutionFailureCause,
             io::{
-                FragmentCommitPort, FragmentSinkLoadStats, TabletCommitInfo as Commit,
-                TabletFailInfo as Failed,
+                TabletCommitInfo as Commit, TabletFailInfo as Failed, TaskCommitPort,
+                TaskSinkLoadStats,
             },
         };
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
         let port = super::WorkerSinkCommitPort;
         for (ordinal, settlement) in [
-            CommitLeaseOperation::Finish,
-            CommitLeaseOperation::Handoff,
-            CommitLeaseOperation::Rollback,
+            SinkCommitOperation::Finish,
+            SinkCommitOperation::Handoff,
+            SinkCommitOperation::Rollback,
         ]
         .into_iter()
         .enumerate()
@@ -510,18 +505,18 @@ mod tests {
             let identity = UniqueId::new(44_608, ordinal as i64);
             let mut original = port.acquire(identity).unwrap();
             original
-                .add_load_stats(FragmentSinkLoadStats {
+                .add_load_stats(TaskSinkLoadStats {
                     loaded_rows: 1,
                     loaded_bytes: 2,
                     filtered_rows: 3,
                 })
                 .unwrap();
             match settlement {
-                CommitLeaseOperation::Finish => {
+                SinkCommitOperation::Finish => {
                     let report = original.finish().unwrap();
                     assert_eq!(report.load_stats.loaded_rows, 1);
                 }
-                CommitLeaseOperation::Handoff => {
+                SinkCommitOperation::Handoff => {
                     original.handoff().unwrap();
                     assert_eq!(super::report_snapshot(identity).load_stats.loaded_rows, 1);
                     assert!(
@@ -530,12 +525,12 @@ mod tests {
                     );
                     super::unregister(identity); // The original host's explicit final retirement.
                 }
-                CommitLeaseOperation::Rollback => original.rollback().unwrap(),
+                SinkCommitOperation::Rollback => original.rollback().unwrap(),
                 _ => unreachable!("only settlement authors in this test"),
             }
             let mut replacement = port.acquire(identity).unwrap();
             replacement
-                .add_load_stats(FragmentSinkLoadStats {
+                .add_load_stats(TaskSinkLoadStats {
                     loaded_rows: 17,
                     loaded_bytes: 23,
                     filtered_rows: 29,
@@ -548,36 +543,36 @@ mod tests {
             replacement.add_tablet_commit_info(commit).unwrap();
             let expected = super::report_snapshot(identity);
             for operation in [
-                CommitLeaseOperation::AddLoadStats,
-                CommitLeaseOperation::AddTabletCommitInfo,
-                CommitLeaseOperation::AddTabletFailInfo,
-                CommitLeaseOperation::Finish,
-                CommitLeaseOperation::Handoff,
-                CommitLeaseOperation::Rollback,
+                SinkCommitOperation::AddLoadStats,
+                SinkCommitOperation::AddTabletCommitInfo,
+                SinkCommitOperation::AddTabletFailInfo,
+                SinkCommitOperation::Finish,
+                SinkCommitOperation::Handoff,
+                SinkCommitOperation::Rollback,
             ] {
                 let error = match operation {
-                    CommitLeaseOperation::AddLoadStats => {
-                        original.add_load_stats(FragmentSinkLoadStats {
+                    SinkCommitOperation::AddLoadStats => {
+                        original.add_load_stats(TaskSinkLoadStats {
                             loaded_rows: 1000,
                             loaded_bytes: 2000,
                             filtered_rows: 3000,
                         })
                     }
-                    CommitLeaseOperation::AddTabletCommitInfo => {
+                    SinkCommitOperation::AddTabletCommitInfo => {
                         original.add_tablet_commit_info(Commit {
                             tablet_id: 41,
                             backend_id: 43,
                         })
                     }
-                    CommitLeaseOperation::AddTabletFailInfo => {
+                    SinkCommitOperation::AddTabletFailInfo => {
                         original.add_tablet_fail_info(Failed {
                             tablet_id: 47,
                             backend_id: 53,
                         })
                     }
-                    CommitLeaseOperation::Finish => original.finish().map(|_| ()),
-                    CommitLeaseOperation::Handoff => original.handoff(),
-                    CommitLeaseOperation::Rollback => original.rollback(),
+                    SinkCommitOperation::Finish => original.finish().map(|_| ()),
+                    SinkCommitOperation::Handoff => original.handoff(),
+                    SinkCommitOperation::Rollback => original.rollback(),
                 }
                 .unwrap_err();
                 assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
@@ -588,8 +583,8 @@ mod tests {
                 let ExecutionFailureCause::Domain(source) = error.cause() else {
                     panic!("the real Worker author is retained");
                 };
-                let source = source.downcast_ref::<CommitLeaseAfterSettled>().unwrap();
-                assert_eq!(source.fragment_instance_id, identity);
+                let source = source.downcast_ref::<SinkCommitAfterSettled>().unwrap();
+                assert_eq!(source.task_key, identity);
                 assert_eq!(source.operation, operation);
                 assert_eq!(
                     super::report_snapshot(identity),
@@ -617,8 +612,8 @@ mod tests {
 
     #[test]
     fn actual_commit_lease_preserves_evidence_refusal_and_does_not_publish_a_partial_fact() {
-        use novarocks_execution::runtime::fragment::io::{
-            FragmentCommitPort, TabletCommitInfo as Commit, TabletFailInfo as Failed,
+        use novarocks_execution::runtime::task::io::{
+            TabletCommitInfo as Commit, TabletFailInfo as Failed, TaskCommitPort,
         };
         use novarocks_execution_contract::failure::{
             FailureClass, FailureProjection, ResourceDimension, ResourceScope, domain,

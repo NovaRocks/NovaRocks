@@ -37,7 +37,7 @@ fn losing_a_generic_author_keeps_the_original_unknown_without_unused_or_quota_re
     let cut = f.custody.cut();
     drop(f.author.take().unwrap());
 
-    assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
     assert!(f.custody.0.sender.lock().unwrap().is_some());
     assert!(!f.ingress.event_unused(cut).unwrap());
     assert!(f.inbox.deliver_next().unwrap().is_none());
@@ -49,8 +49,8 @@ fn losing_a_generic_author_keeps_the_original_unknown_without_unused_or_quota_re
     let retained = Arc::downgrade(&f.custody.0);
     drop(f.custody.clone());
     assert_eq!(
-        retained.upgrade().unwrap().role.phase(),
-        ExitRolePhase::Unresolved
+        retained.upgrade().unwrap().exit_custody.phase(),
+        ExitCustodyPhase::Unresolved
     );
 }
 
@@ -62,14 +62,14 @@ fn a_wrong_task_handoff_retains_the_exact_generic_input_and_original_unknown() {
     let wrong_task = task(f.runtime.identity, 2);
     assert_ne!(wrong_task, f.custody.task());
     let author = f.author.take().unwrap();
-    let refusal = author.publish(ContextInput::Running { task: wrong_task });
+    let refusal = author.publish(ParticipationInput::Running { task: wrong_task });
 
     assert!(matches!(refusal, Err(CausalInputError::HandoffRejected)));
     assert!(
-        matches!(f.custody.take_rejected(), Some(ContextInput::Running { task }) if task == wrong_task)
+        matches!(f.custody.take_rejected(), Some(ParticipationInput::Running { task }) if task == wrong_task)
     );
     assert!(f.custody.take_rejected().is_none());
-    assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
     assert!(!f.ingress.event_unused(cut).unwrap());
     assert!(f.inbox.deliver_next().unwrap().is_none());
     assert!(!f.custody.actual_exit_ready().unwrap());
@@ -119,7 +119,7 @@ fn another_real_core_cannot_consume_a_generic_authors_original_core_leg() {
         f.custody.report().consumption(observer()).unwrap(),
         Consumption::Consumed
     );
-    assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
     assert!(!f.custody.try_retire().unwrap());
     assert_eq!(original_fees(&f), funded);
     assert_eq!(original_fees(&other), other_funded);
@@ -161,7 +161,7 @@ fn a_start_permit_dropped_after_scope_failure_withdraws_only_its_original_unused
     // its loader/preparation bodies or the cut's Source holders have exited.
     assert!(f.ingress.event_unused(cut).unwrap());
     assert!(f.inbox.deliver_next().unwrap().is_none());
-    assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
     assert!(f.custody.actual_exit_ready().unwrap());
     assert!(!f.custody.try_retire().unwrap());
     assert_eq!(original_fees(&f), funded);
@@ -195,7 +195,7 @@ fn a_start_permit_dropped_after_scope_failure_withdraws_only_its_original_unused
     assert!(f.custody.observe_consumers(&mut f.inbox).unwrap());
     f.ingress.observe_cut_exit(cut, true, true).unwrap();
     f.retire_cut(cut);
-    assert_eq!(f.custody.phase(), ExitRolePhase::Retired);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Retired);
     assert!(f.inbox.is_empty());
     assert!(f.runtime.scope.gates().unwrap().failed);
     assert!(!f.runtime.scope.join_ready().unwrap());
@@ -223,12 +223,12 @@ fn a_late_start_handoff_after_scope_failure_retains_running_without_core_consump
     // scope liveness. The paid runtime input has its separate failure fence.
     start.handoff_running().unwrap();
     assert!(!f.ingress.event_unused(cut).unwrap());
-    assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
     assert!(f.custody.actual_exit_ready().unwrap());
     assert!(matches!(
         f.inbox.deliver_next(),
-        Err(CausalError::Driver(
-            novarocks_control_runtime::driver::DriverError::ActorFailed
+        Err(CausalError::ActorTurn(
+            novarocks_control_runtime::actor_turn::ActorTurnError::ActorFailed
         ))
     ));
     assert!(!f.inbox.event_core_consumed(cut).unwrap());
@@ -260,9 +260,9 @@ fn a_late_start_handoff_after_scope_failure_retains_running_without_core_consump
         .expect("the failed runtime returns this original neutral input");
     assert!(matches!(
         &rejected,
-        (None, WorkerMessage::Context(ContextMessage::Command {
+        (None, WorkerMessage::Participation(ParticipationMessage::Command {
             request: None,
-            command: ContextInput::Running { task: original_task },
+            command: ParticipationInput::Running { task: original_task },
             ..
         })) if *original_task == task
     ));
@@ -297,7 +297,7 @@ fn an_original_business_start_is_refused_after_stop_or_failure_without_fabricati
             ),
         };
         assert_eq!(permit.identity(), task);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
         assert_eq!(original_fees(&f), funded);
         assert!(!f.ingress.event_unused(cut).unwrap());
         assert!(f.inbox.deliver_next().unwrap().is_none());
@@ -305,7 +305,7 @@ fn an_original_business_start_is_refused_after_stop_or_failure_without_fabricati
         if failed {
             assert!(matches!(
                 error,
-                Some(ExitRoleError::Runtime(RuntimeError::Scope(
+                Some(ExitCustodyError::Runtime(RuntimeError::Scope(
                     novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch
                 )))
             ));

@@ -281,7 +281,7 @@ pub fn dispatch_delivery_frame(
 pub struct ProducerIngressRoute {
     channel_id: RuntimeFilterChannelId,
     binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     partition: PartitionId,
     sequence: ProducerSequence,
     local_partition_count: u32,
@@ -291,7 +291,7 @@ impl ProducerIngressRoute {
     pub const fn new(
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
         sequence: ProducerSequence,
         local_partition_count: u32,
@@ -299,7 +299,7 @@ impl ProducerIngressRoute {
         Self {
             channel_id,
             binding_id,
-            fragment_instance_id,
+            task_key,
             partition,
             sequence,
             local_partition_count,
@@ -337,7 +337,7 @@ pub fn dispatch_producer_frame(
         .authorize_contribution(
             route.channel_id,
             route.binding_id,
-            route.fragment_instance_id,
+            route.task_key,
             envelope_kind,
         )
         .is_err()
@@ -363,7 +363,7 @@ pub fn dispatch_producer_frame(
     };
     if session
         .open_producer(
-            route.fragment_instance_id,
+            route.task_key,
             RuntimeFilterProducerOpenRequest::new(
                 channel_install.contract().clone(),
                 route.local_partition_count,
@@ -377,7 +377,7 @@ pub fn dispatch_producer_frame(
     }
     observation.register_producer_instance(
         BackendChannelIdentity::new(install.participant(), route.binding_id, route.channel_id),
-        route.fragment_instance_id,
+        route.task_key,
         route.local_partition_count,
     );
     match command {
@@ -386,7 +386,7 @@ pub fn dispatch_producer_frame(
             payload,
         } => match session.submit(
             route.binding_id,
-            route.fragment_instance_id,
+            route.task_key,
             route.partition,
             route.sequence,
             RuntimeFilterContribution::from_shared(
@@ -401,7 +401,7 @@ pub fn dispatch_producer_frame(
                     install.participant(),
                     route.binding_id,
                     route.channel_id,
-                    route.fragment_instance_id,
+                    route.task_key,
                     route.partition,
                     route.sequence,
                     submission.outcome(),
@@ -421,7 +421,7 @@ pub fn dispatch_producer_frame(
         },
         ProducerIngressCommand::Closed => match session.close_partition(
             route.binding_id,
-            route.fragment_instance_id,
+            route.task_key,
             route.partition,
             route.sequence,
         ) {
@@ -440,14 +440,14 @@ pub fn record_contribution_outcome(
     participant: BackendParticipantIdentity,
     binding_id: RuntimeFilterBindingId,
     channel_id: RuntimeFilterChannelId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     partition: PartitionId,
     sequence: ProducerSequence,
     outcome: RuntimeFilterSubmitOutcome,
 ) {
     let stream = BackendProducerStreamIdentity::new(
         BackendChannelIdentity::new(participant, binding_id, channel_id),
-        fragment_instance_id,
+        task_key,
         partition,
     );
     observation.record(match outcome {
@@ -478,14 +478,14 @@ pub fn dispatch_producer_failure(
     producer_sessions: &BTreeMap<RuntimeFilterBindingId, Arc<BackendRuntimeFilterSession>>,
     channel_id: RuntimeFilterChannelId,
     binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 ) -> BackendIngressResult {
     if install
         .routing()
         .authorize_contribution(
             channel_id,
             binding_id,
-            fragment_instance_id,
+            task_key,
             BackendEnvelopeKind::ProducerUnavailable,
         )
         .is_err()
@@ -506,7 +506,7 @@ pub fn dispatch_producer_failure(
     }
     match session.fail(
         binding_id,
-        fragment_instance_id,
+        task_key,
         RuntimeFilterProducerFailure::UpstreamUnavailable,
     ) {
         Ok(RuntimeFilterSubmitOutcome::TerminalNoop) => BackendIngressResult::duplicate(),

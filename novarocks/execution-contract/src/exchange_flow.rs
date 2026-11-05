@@ -52,7 +52,7 @@ impl std::error::Error for ExchangeFlowContractError {}
 pub struct ExchangeStreamIdentity {
     source: ExchangeSource,
     destination: TaskIdentity,
-    destination_fragment_instance_id: UniqueId,
+    destination_task_key: UniqueId,
     destination_node: FragmentNodeId,
 }
 
@@ -60,7 +60,7 @@ impl ExchangeStreamIdentity {
     pub fn try_new(
         source: ExchangeSource,
         destination: TaskIdentity,
-        destination_fragment_instance_id: UniqueId,
+        destination_task_key: UniqueId,
         destination_node: FragmentNodeId,
     ) -> Result<Self, ExchangeFlowContractError> {
         if source.task().query_execution_id() != destination.query_execution_id() {
@@ -72,7 +72,7 @@ impl ExchangeStreamIdentity {
         Ok(Self {
             source,
             destination,
-            destination_fragment_instance_id,
+            destination_task_key,
             destination_node,
         })
     }
@@ -82,8 +82,8 @@ impl ExchangeStreamIdentity {
     pub const fn destination(self) -> TaskIdentity {
         self.destination
     }
-    pub const fn destination_fragment_instance_id(self) -> UniqueId {
-        self.destination_fragment_instance_id
+    pub const fn destination_task_key(self) -> UniqueId {
+        self.destination_task_key
     }
     pub const fn destination_node(self) -> FragmentNodeId {
         self.destination_node

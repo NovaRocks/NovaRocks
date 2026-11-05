@@ -71,7 +71,7 @@ struct WriteRecipe {
 
 impl WriteRecipe {
     fn freeze(
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
     ) -> Result<Self, ConnectorError> {
@@ -556,7 +556,7 @@ impl WritePublicationDispatch {
 impl IcebergWriteSessionControl {
     pub(super) async fn dispatch_operation_async(
         &self,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
@@ -807,7 +807,7 @@ impl IcebergWriteSessionControl {
 
     fn adopt_received_operation(
         &self,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         validated: &[ValidatedFragment<'_>],
         context: &ConnectorRequestContext,
     ) -> Result<
@@ -846,7 +846,7 @@ impl IcebergWriteSessionControl {
 
     pub(super) async fn cleanup_received_set_async(
         &self,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         received: &ConnectorPreparedWriteSet,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
@@ -885,7 +885,7 @@ impl IcebergWriteSessionControl {
 
     async fn reject_operation(
         &self,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         operation: &IcebergCommitOperation,
         error: ConnectorError,
     ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
@@ -899,7 +899,7 @@ impl IcebergWriteSessionControl {
 
     async fn reject_operation_failure(
         &self,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
         operation: &IcebergCommitOperation,
         failure: ConnectorMutationFailure,
     ) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
@@ -993,7 +993,7 @@ impl RecoveryTemplate {
     fn from_handle(
         descriptor: &ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
             descriptor: descriptor.clone(),
@@ -1124,7 +1124,7 @@ impl RecoveryPayload {
         &self,
         descriptor: &ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
-        handle: &IcebergCommitHandle,
+        handle: &IcebergWriteCommitSession,
     ) -> Result<(), ConnectorError> {
         self.validate_facts(&RecoveryTemplate::from_handle(
             descriptor,
@@ -1256,7 +1256,7 @@ mod recovery_tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
+                Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime.clone())),
             );
             let stop = ConnectorStopOwner::new();
             let session_id = IcebergWriteSessionId::from_bytes([17; 16]);

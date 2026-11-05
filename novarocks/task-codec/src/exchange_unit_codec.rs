@@ -156,8 +156,8 @@ fn checked_stream(
         value.ok_or_else(|| missing(path.clone(), "exchange stream identity is required"))?,
         path.clone(),
     )?;
-    if stream.source().fragment_instance_id() == UniqueId::new(0, 0)
-        || stream.destination_fragment_instance_id() == UniqueId::new(0, 0)
+    if stream.source().task_key() == UniqueId::new(0, 0)
+        || stream.destination_task_key() == UniqueId::new(0, 0)
     {
         return Err(invalid(
             path,
@@ -193,11 +193,10 @@ pub fn decode_delivery_request(
     path: FieldPath,
 ) -> Result<DecodedExchangeUnitFrame, ProtocolError> {
     let stream = checked_stream(value.stream.as_ref(), path.field("stream"))?;
-    if stream.destination_fragment_instance_id()
-        != UniqueId::new(value.finst_id_hi, value.finst_id_lo)
+    if stream.destination_task_key() != UniqueId::new(value.task_key_hi, value.task_key_lo)
         || stream.destination_node().get() != value.node_id
-        || stream.source().fragment_instance_id()
-            != UniqueId::new(value.source_finst_id_hi, value.source_finst_id_lo)
+        || stream.source().task_key()
+            != UniqueId::new(value.source_task_key_hi, value.source_task_key_lo)
         || stream.source().sender_ordinal() != value.sender_ordinal
     {
         return Err(inconsistent(
@@ -288,13 +287,13 @@ pub fn encode_delivery_request(
 ) -> wire::DeliverExchangeUnitRequest {
     let stream = value.stream;
     wire::DeliverExchangeUnitRequest {
-        finst_id_hi: stream.destination_fragment_instance_id().high(),
-        finst_id_lo: stream.destination_fragment_instance_id().low(),
+        task_key_hi: stream.destination_task_key().high(),
+        task_key_lo: stream.destination_task_key().low(),
         node_id: stream.destination_node().get(),
         sender_id: value.sender_id,
         be_number: value.backend_number,
-        source_finst_id_hi: stream.source().fragment_instance_id().high(),
-        source_finst_id_lo: stream.source().fragment_instance_id().low(),
+        source_task_key_hi: stream.source().task_key().high(),
+        source_task_key_lo: stream.source().task_key().low(),
         sender_ordinal: stream.source().sender_ordinal(),
         sender_count: value.sender_count,
         stream: Some(encode_stream(stream)),

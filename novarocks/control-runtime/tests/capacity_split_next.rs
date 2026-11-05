@@ -20,7 +20,7 @@
 use novarocks_control_runtime::{
     completion::ReportSlot,
     history::HistoryCapture,
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -51,7 +51,10 @@ fn quota_only(quota: ResourceVector) -> ReservationResources {
 fn used(ledger: &RuntimeLedger) -> (u64, u64) {
     (ledger.used(dimension(1)), ledger.used(dimension(2)))
 }
-fn reserve(scope: &ScopeHandle, resources: ResourceVector) -> (WorkLease, ReservationBundle) {
+fn reserve(
+    scope: &ScopeHandle,
+    resources: ResourceVector,
+) -> (WorkObligation, ReservationObligation) {
     scope
         .reserve_next(
             generation(),
@@ -63,16 +66,16 @@ fn reserve(scope: &ScopeHandle, resources: ResourceVector) -> (WorkLease, Reserv
         .bind(WorkKind::Step)
         .unwrap()
 }
-fn release(mut capacity: ReservationBundle) {
+fn release(mut capacity: ReservationObligation) {
     let resources = capacity.resources().unwrap();
     capacity.release_quota(&resources.quota).unwrap();
     capacity.finish().unwrap();
 }
-fn exit(work: &mut WorkLease) {
+fn exit(work: &mut WorkObligation) {
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
 }
-fn exit_with_report(work: &mut WorkLease, report: &ReportSlot) {
+fn exit_with_report(work: &mut WorkObligation, report: &ReportSlot) {
     work.body_exited().unwrap();
     work.captures_exited_with_report(report).unwrap();
     report.body_exited().unwrap();
@@ -316,7 +319,7 @@ fn two_original_bundles_split_next_while_another_scope_reserves_without_identity
     second_work.start().unwrap();
     let initial_max = second_capacity.id();
     let barrier = Arc::new(Barrier::new(4));
-    let splitting = |mut capacity: ReservationBundle, barrier: Arc<Barrier>| {
+    let splitting = |mut capacity: ReservationObligation, barrier: Arc<Barrier>| {
         thread::spawn(move || {
             barrier.wait();
             let result = capacity.split_next(&quota_only(resources(1, 2)));

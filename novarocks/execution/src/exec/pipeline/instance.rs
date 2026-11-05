@@ -20,16 +20,16 @@
 
 use super::{
     driver_failure::{DriverFailure, ExitHook},
+    driver_step::DriverStep,
     input::RawInput,
     operator::{ExitObservation, Operator},
     operator_exit::{ExitAction, OperatorExitScope, OwnedOperator},
     shape::StepOperator,
     step::{AdmissionNext, InputResult, NextStep, RootPending, RootStep, StepResult, UpstreamPull},
-    step_context::StepContext,
 };
 use crate::runtime::{
-    fragment::{ExecutionResult, PipelineOperation},
     mem_tracker::MemTracker,
+    task::{ExecutionResult, PipelineOperation},
 };
 use std::{
     ops::{Deref, DerefMut},
@@ -79,7 +79,7 @@ impl OperatorInstance {
     pub(crate) fn tracker(&self) -> Option<&Arc<MemTracker>> {
         self.tracker.as_ref()
     }
-    pub(crate) fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    pub(crate) fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if !self.inner.is_live() {
             return Ok(());
         }
@@ -246,7 +246,7 @@ impl OperatorInstance {
     }
     pub(crate) fn reserve_upstream(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<UpstreamPull> {
         if !self.need_input() {
             return Ok(UpstreamPull::Busy);
@@ -284,8 +284,8 @@ impl OperatorInstance {
     }
     pub(crate) fn drive_precovered(
         &mut self,
-        ctx: &mut StepContext<'_>,
-        input: &crate::runtime::fragment::io::RootInputPermit,
+        ctx: &mut DriverStep<'_>,
+        input: &crate::runtime::task::io::RootInputPermit,
     ) -> ExecutionResult<RootStep> {
         let mut ctx = ctx.operator_step(self.ordinal, PipelineOperation::Pull);
         ctx.checkpoint()?;
@@ -329,7 +329,7 @@ impl StepOperator for OperatorInstance {
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         let mut ctx = ctx.operator_step(self.ordinal, PipelineOperation::Admission);
         let result = self.inner.try_push(&mut ctx, input);
         match &result {
@@ -342,7 +342,7 @@ impl StepOperator for OperatorInstance {
         }
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let mut ctx = ctx.operator_step(self.ordinal, PipelineOperation::Pull);
         ctx.checkpoint()?;
         self.admission_next = None;
@@ -353,7 +353,7 @@ impl StepOperator for OperatorInstance {
         self.next = step.next.clone();
         Ok(step)
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if self.finishing {
             return Ok(());
         }

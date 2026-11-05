@@ -16,12 +16,12 @@
 // under the License.
 
 //! Composition of actual process quotas and per-object storage profiles.
-//! Context, ticket and retained metadata follow their original objects; they
+//! Participation, ticket and retained metadata follow their original objects; they
 //! do not contribute a process count threshold or prepaid storage dimension.
 
 use super::{
-    context_host::{CONTEXT_BOOTSTRAP_STORAGE, CONTEXT_REQUEST_STORAGE},
     control_request::{CONTROL_REQUEST_STORAGE, ESTABLISH_REQUEST_STORAGE},
+    participation_host::{PARTICIPATION_BOOTSTRAP_STORAGE, PARTICIPATION_REQUEST_STORAGE},
 };
 use crate::{
     control_admission::{AdmissionStorage, Dimension},
@@ -31,10 +31,10 @@ use novarocks_control_runtime_core::capacity::ResourceVector;
 use std::num::NonZeroUsize;
 
 /// T remains the wire bound on cumulative Task identities. A/P/bytes and the
-/// original ingress R describe actual resources; Context records have no cap.
+/// original ingress R describe actual resources; Participation records have no cap.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeGeometryInputs {
-    pub tasks_per_context: NonZeroUsize,
+    pub tasks_per_participation: NonZeroUsize,
     pub active_tasks: NonZeroUsize,
     pub preparing_tasks: NonZeroUsize,
     pub preparing_bytes: NonZeroUsize,
@@ -120,13 +120,13 @@ impl NodeGeometry {
             return Err(NodeGeometryError::RootHolderMismatch);
         }
         let request_positions =
-            NonZeroUsize::new(policy.request_roles).ok_or(NodeGeometryError::PolicyMismatch)?;
+            NonZeroUsize::new(policy.request_positions).ok_or(NodeGeometryError::PolicyMismatch)?;
         // These are the largest mutually exclusive branches of one actual R,
         // not a process-wide prepaid metadata pool.
         let request_per_position = [
             CONTROL_REQUEST_STORAGE,
             ESTABLISH_REQUEST_STORAGE,
-            CONTEXT_REQUEST_STORAGE,
+            PARTICIPATION_REQUEST_STORAGE,
             StorageNeed::domain_request()?,
         ]
         .into_iter()
@@ -151,7 +151,7 @@ impl NodeGeometry {
         let admission = AdmissionStorage {
             loading: policy.loading.resources()?,
             accepted: policy.accepted.resources()?,
-            context: CONTEXT_BOOTSTRAP_STORAGE.resources()?,
+            participation: PARTICIPATION_BOOTSTRAP_STORAGE.resources()?,
         };
         Ok(Self {
             limits,

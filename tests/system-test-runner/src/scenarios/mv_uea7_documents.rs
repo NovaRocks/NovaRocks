@@ -14,7 +14,7 @@ use super::mv_uea7::{
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -729,7 +729,10 @@ impl HeldExpiry {
             actor: Some(actor),
             trigger,
         };
-        let marker = format!("NOVAROCKS_MV_DOCUMENT_EXPIRY_PLANNED token={token}");
+        let marker = format!(
+            "{} token={token}",
+            novarocks_failpoint::observation_marker::MV_DOCUMENT_EXPIRY_PLANNED
+        );
         loop {
             if context.handle().fe_log_contents()?.contains(&marker) {
                 break;

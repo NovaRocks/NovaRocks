@@ -16,18 +16,18 @@
 // under the License.
 
 //! Real registered owners qualify these metadata addresses. The Control
-//! namespace below uses a Context actor too; no Root lifecycle is simulated.
+//! namespace below uses a Participation actor too; no Root lifecycle is simulated.
 //! FIFO is local to each owner; Common schedules fairness between actors.
 
 use super::*;
 use crate::{
     control_admission::AdmissionStorage,
-    control_runtime::actors::{ContextActor, tests::initial_establishment},
+    control_runtime::actors::{ParticipationActor, tests::initial_establishment},
 };
 use novarocks_control_runtime::{
     actor::ActorConfig,
-    driver::{ActorRegistration, DriverError},
-    lease::{ReservationBundle, WorkLease},
+    actor_turn::{ActorRegistration, ActorTurnError},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -35,11 +35,11 @@ use novarocks_control_runtime_core::{
     identity::{ActorId, Generation, ScopedWorkRef},
     scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId};
 use novarocks_worker_protocol::{
-    context::{ContextConfig, ContextCore},
     lease::LeaseBounds,
+    participation::{ParticipationConfig, ParticipationCore},
 };
 use std::{
     sync::Barrier,
@@ -52,11 +52,11 @@ fn input(n: u64) -> InputId {
 struct Owner {
     scope: ScopeHandle,
     registration: ActorRegistration,
-    roles: Vec<(WorkLease, ReservationBundle)>,
+    obligation_pairs: Vec<(WorkObligation, ReservationObligation)>,
 }
 impl Owner {
     fn work(&self, index: usize) -> ScopedWorkRef {
-        self.roles[index].0.reference()
+        self.obligation_pairs[index].0.reference()
     }
 }
 struct Fixture {
@@ -72,7 +72,7 @@ impl Fixture {
         let mut owners = Vec::with_capacity(count);
         for n in 0..count {
             let scope = ledger.open_scope_next(None, generation).unwrap();
-            let mut roles = Vec::with_capacity(3);
+            let mut obligation_pairs = Vec::with_capacity(3);
             for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
                 let (mut work, capacity) = scope
                     .reserve_next(
@@ -87,32 +87,32 @@ impl Fixture {
                 if kind != WorkKind::Cleanup {
                     work.start().unwrap();
                 }
-                roles.push((work, capacity));
+                obligation_pairs.push((work, capacity));
             }
-            let identity = QueryContextRef::new(
+            let identity = ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(8101, 8102), AttemptId::new(1).unwrap())
                     .unwrap(),
                 FrontendProcessId::new_v7(),
                 BackendProcessId::new_v7(),
             );
-            let core = ContextCore::new(
+            let core = ParticipationCore::new(
                 identity,
                 generation,
                 initial_establishment(),
-                ContextConfig {
+                ParticipationConfig {
                     request_horizon: crate::RequestHorizon::DEFAULT,
                     max_tasks: 1,
                     max_creation_waiters: 2,
                     max_pending_requests: 2,
                     max_preparing: 1,
                     max_task_bytes: 16,
-                    step_budget: ContextCore::MAX_STEP_WORK,
+                    step_budget: ParticipationCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
                 },
             )
             .unwrap();
-            let actor = ContextActor::new(
+            let actor = ParticipationActor::new(
                 core,
                 scope.clone(),
                 AdmissionStorage {
@@ -120,34 +120,38 @@ impl Fixture {
                         novarocks_control_runtime_core::capacity::ReservationResources::default(),
                     accepted:
                         novarocks_control_runtime_core::capacity::ReservationResources::default(),
-                    context:
+                    participation:
                         novarocks_control_runtime_core::capacity::ReservationResources::default(),
                 },
-                roles[1].0.reference(),
-                roles[2].0.reference(),
+                obligation_pairs[1].0.reference(),
+                obligation_pairs[2].0.reference(),
             );
             let registration = runtime
                 .register_supervised_bound(
                     ActorId::new(u64::try_from(n + 1).unwrap()).unwrap(),
                     scope.clone(),
-                    WorkerActor::Context(Box::new(actor)),
+                    WorkerActor::Participation(Box::new(actor)),
                     ActorConfig {
                         mailbox: [4; 4],
                         max_batches: 4,
                         max_effects_per_step:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         max_dependencies_per_effect:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
-                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
-                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+                        turn_budget:
+                            crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
+                        max_step_work:
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
                     },
-                    &roles[0].0,
+                    &obligation_pairs[0].0,
                 )
-                .unwrap_or_else(|(error, _core)| panic!("original Context registration: {error}"));
+                .unwrap_or_else(|(error, _core)| {
+                    panic!("original Participation registration: {error}")
+                });
             owners.push(Owner {
                 scope,
                 registration,
-                roles,
+                obligation_pairs,
             });
         }
         Self {
@@ -174,7 +178,7 @@ impl Fixture {
                 .close_timer_source(owner.registration.actor())
                 .unwrap();
             owner.scope.close_external().unwrap();
-            for (work, _) in &mut owner.roles {
+            for (work, _) in &mut owner.obligation_pairs {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
             }
@@ -186,7 +190,7 @@ impl Fixture {
                     .remove_actor(owner.registration.actor())
                     .unwrap(),
             );
-            for (_, capacity) in &mut owner.roles {
+            for (_, capacity) in &mut owner.obligation_pairs {
                 capacity
                     .release_quota(&capacity.resources().unwrap().quota)
                     .unwrap();
@@ -208,27 +212,27 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
     let control = ready
         .register_control(input(1), &owner.registration)
         .unwrap();
-    let context = ready
-        .register_context(&owner.roles[1].0, &owner.registration)
+    let participation = ready
+        .register_participation(&owner.obligation_pairs[1].0, &owner.registration)
         .unwrap();
     let distinct_namespaces = ready.registered() == 2;
     let duplicate_control = matches!(
         ready.register_control(input(1), &owner.registration),
         Err(ControlRequestError::DuplicateReadySlot)
     );
-    let duplicate_context = matches!(
-        ready.register_context(&owner.roles[1].0, &owner.registration),
+    let duplicate_participation = matches!(
+        ready.register_participation(&owner.obligation_pairs[1].0, &owner.registration),
         Err(ControlRequestError::DuplicateReadySlot)
     );
     let full_control = matches!(
         ready.register_control(input(2), &owner.registration),
         Err(ControlRequestError::ReadyFull)
     );
-    let full_context = matches!(
-        ready.register_context(&owner.roles[2].0, &owner.registration),
+    let full_participation = matches!(
+        ready.register_participation(&owner.obligation_pairs[2].0, &owner.registration),
         Err(ControlRequestError::ReadyFull)
     );
-    ready.unregister(&context).unwrap();
+    ready.unregister(&participation).unwrap();
     let replacement = ready
         .register_control(input(2), &owner.registration)
         .unwrap();
@@ -249,14 +253,14 @@ fn both_namespaces_share_one_limit_without_issuing_work_or_accepting_duplicate_s
     ready.unregister(&replacement).unwrap();
     let emptied = ready.registered() == 0;
     f.finish();
-    assert!(distinct_namespaces && duplicate_control && duplicate_context);
-    assert!(full_control && full_context && still_bounded && unchanged_inventory);
+    assert!(distinct_namespaces && duplicate_control && duplicate_participation);
+    assert!(full_control && full_participation && still_bounded && unchanged_inventory);
     assert!(same_index && emptied);
     assert!(control_first && control_requeue_fifo && queued_unregister_removed);
 }
 
 #[test]
-fn each_context_owner_keeps_ready_fifo_and_cannot_consume_another_owner() {
+fn each_participation_owner_keeps_ready_fifo_and_cannot_consume_another_owner() {
     let f = Fixture::new(2);
     let a = &f.owners[0];
     let b = &f.owners[1];
@@ -264,18 +268,18 @@ fn each_context_owner_keeps_ready_fifo_and_cannot_consume_another_owner() {
     let control = ready.register_control(input(7), &a.registration).unwrap();
     let a_slots = [
         ready
-            .register_context(&a.roles[1].0, &a.registration)
+            .register_participation(&a.obligation_pairs[1].0, &a.registration)
             .unwrap(),
         ready
-            .register_context(&a.roles[2].0, &a.registration)
+            .register_participation(&a.obligation_pairs[2].0, &a.registration)
             .unwrap(),
     ];
     let b_slots = [
         ready
-            .register_context(&b.roles[1].0, &b.registration)
+            .register_participation(&b.obligation_pairs[1].0, &b.registration)
             .unwrap(),
         ready
-            .register_context(&b.roles[2].0, &b.registration)
+            .register_participation(&b.obligation_pairs[2].0, &b.registration)
             .unwrap(),
     ];
     a_slots[1].notify();
@@ -284,17 +288,17 @@ fn each_context_owner_keeps_ready_fifo_and_cannot_consume_another_owner() {
     a_slots[0].notify();
     b_slots[0].notify();
     control.notify();
-    let first_a = ready.next_context_ready(&a.registration);
+    let first_a = ready.next_participation_ready(&a.registration);
     a_slots[1].notify();
     let rest_a = [
-        ready.next_context_ready(&a.registration),
-        ready.next_context_ready(&a.registration),
-        ready.next_context_ready(&a.registration),
+        ready.next_participation_ready(&a.registration),
+        ready.next_participation_ready(&a.registration),
+        ready.next_participation_ready(&a.registration),
     ];
     let untouched_b = [
-        ready.next_context_ready(&b.registration),
-        ready.next_context_ready(&b.registration),
-        ready.next_context_ready(&b.registration),
+        ready.next_participation_ready(&b.registration),
+        ready.next_participation_ready(&b.registration),
+        ready.next_participation_ready(&b.registration),
     ];
     let control_independent = ready.next_ready() == Some(input(7)) && ready.next_ready().is_none();
     for slot in a_slots
@@ -325,20 +329,20 @@ fn foreign_owners_and_old_slot_aliases_cannot_mutate_or_consume_the_original_que
         .unwrap();
     let foreign_control = matches!(
         ready.register_control(input(2), &foreign_owner.registration),
-        Err(ControlRequestError::Driver(
-            DriverError::EffectTicketOriginMismatch
+        Err(ControlRequestError::ActorTurn(
+            ActorTurnError::EffectTicketOriginMismatch
         ))
     );
-    let foreign_context = matches!(
-        ready.register_context(&a.roles[1].0, &foreign_owner.registration),
-        Err(ControlRequestError::Driver(
-            DriverError::EffectTicketOriginMismatch
+    let foreign_participation = matches!(
+        ready.register_participation(&a.obligation_pairs[1].0, &foreign_owner.registration),
+        Err(ControlRequestError::ActorTurn(
+            ActorTurnError::EffectTicketOriginMismatch
         ))
     );
     let foreign_scope = matches!(
-        ready.register_context(&foreign_owner.roles[1].0, &a.registration),
-        Err(ControlRequestError::Driver(
-            DriverError::InputAuthorMismatch
+        ready.register_participation(&foreign_owner.obligation_pairs[1].0, &a.registration),
+        Err(ControlRequestError::ActorTurn(
+            ActorTurnError::InputAuthorMismatch
         ))
     );
     let foreign_index = matches!(
@@ -356,44 +360,45 @@ fn foreign_owners_and_old_slot_aliases_cannot_mutate_or_consume_the_original_que
         ready.unregister(&original),
         Err(ControlRequestError::UnknownReadySlot)
     );
-    let context = ready
-        .register_context(&a.roles[1].0, &a.registration)
+    let participation = ready
+        .register_participation(&a.obligation_pairs[1].0, &a.registration)
         .unwrap();
-    context.notify();
+    participation.notify();
     let same_numbers = a.scope.id() == foreign_owner.scope.id()
         && a.work(1) == foreign_owner.work(1)
         && a.registration.actor() == foreign_owner.registration.actor()
         && a.registration.attachment() == foreign_owner.registration.attachment();
     let foreign_pop_noop = ready
-        .next_context_ready(&foreign_owner.registration)
+        .next_participation_ready(&foreign_owner.registration)
         .is_none();
-    let original_pop = ready.next_context_ready(&a.registration) == Some(a.work(1));
+    let original_pop = ready.next_participation_ready(&a.registration) == Some(a.work(1));
     other.notify();
     let foreign_queue_independent =
         ready.next_ready().is_none() && foreign.next_ready() == Some(input(1));
     replacement.notify();
     let replacement_works = ready.next_ready() == Some(input(1));
     ready.unregister(&replacement).unwrap();
-    ready.unregister(&context).unwrap();
-    let context_replacement = ready
-        .register_context(&a.roles[1].0, &a.registration)
+    ready.unregister(&participation).unwrap();
+    let participation_replacement = ready
+        .register_participation(&a.obligation_pairs[1].0, &a.registration)
         .unwrap();
-    let before_old_context_notify = ready.change_version();
-    context.notify();
-    let old_context_noop = ready.change_version() == before_old_context_notify
-        && ready.next_context_ready(&a.registration).is_none();
-    context_replacement.notify();
-    let replacement_context_works = ready.next_context_ready(&a.registration) == Some(a.work(1));
-    ready.unregister(&context_replacement).unwrap();
+    let before_old_participation_notify = ready.change_version();
+    participation.notify();
+    let old_participation_noop = ready.change_version() == before_old_participation_notify
+        && ready.next_participation_ready(&a.registration).is_none();
+    participation_replacement.notify();
+    let replacement_participation_works =
+        ready.next_participation_ready(&a.registration) == Some(a.work(1));
+    ready.unregister(&participation_replacement).unwrap();
     foreign.unregister(&other).unwrap();
     f.finish();
     foreign_fixture.finish();
-    assert!(foreign_control && foreign_context && foreign_scope && foreign_index && belongs);
+    assert!(foreign_control && foreign_participation && foreign_scope && foreign_index && belongs);
     assert!(
         old_notify_noop && old_remove_refused && same_numbers && foreign_pop_noop && original_pop
     );
     assert!(foreign_queue_independent && replacement_works);
-    assert!(old_context_noop && replacement_context_works);
+    assert!(old_participation_noop && replacement_participation_works);
 }
 
 #[test]
@@ -403,15 +408,15 @@ fn original_slot_notification_wakes_its_host_and_survives_a_racing_release() {
     let b = &f.owners[1];
     let ready = f.index(2);
     let first = ready
-        .register_context(&a.roles[1].0, &a.registration)
+        .register_participation(&a.obligation_pairs[1].0, &a.registration)
         .unwrap();
     let second = ready
-        .register_context(&b.roles[1].0, &b.registration)
+        .register_participation(&b.obligation_pairs[1].0, &b.registration)
         .unwrap();
     first.notify();
     let turn = f.runtime.claim_host_actor().unwrap();
     let original_claim = turn.matches_registration(&a.registration);
-    let first_address = ready.next_context_ready(&a.registration);
+    let first_address = ready.next_participation_ready(&a.registration);
     let race = Arc::new(Barrier::new(2));
     let worker_race = race.clone();
     let worker_slot = first.clone();
@@ -431,10 +436,10 @@ fn original_slot_notification_wakes_its_host_and_survives_a_racing_release() {
     let again = f.runtime.claim_host_actor().unwrap();
     let original_mark_retained = again.matches_registration(&a.registration);
     again.release(false).unwrap();
-    let coalesced_a = ready.next_context_ready(&a.registration) == Some(a.work(1))
-        && ready.next_context_ready(&a.registration).is_none();
-    let coalesced_b = ready.next_context_ready(&b.registration) == Some(b.work(1))
-        && ready.next_context_ready(&b.registration).is_none();
+    let coalesced_a = ready.next_participation_ready(&a.registration) == Some(a.work(1))
+        && ready.next_participation_ready(&a.registration).is_none();
+    let coalesced_b = ready.next_participation_ready(&b.registration) == Some(b.work(1))
+        && ready.next_participation_ready(&b.registration).is_none();
     let original_address = first_address == Some(a.work(1));
     ready.unregister(&first).unwrap();
     ready.unregister(&second).unwrap();
@@ -449,7 +454,7 @@ fn a_retained_weak_slot_cannot_keep_the_index_alive_or_wake_its_former_owner() {
     let a = &f.owners[0];
     let ready = f.index(1);
     let slot = ready
-        .register_context(&a.roles[1].0, &a.registration)
+        .register_participation(&a.obligation_pairs[1].0, &a.registration)
         .unwrap();
     let actual_index = Arc::downgrade(&ready.shared);
     let baseline = a.scope.snapshot().unwrap();
@@ -474,7 +479,7 @@ fn external_end_publishes_its_phase_before_the_original_host_notice_and_is_idemp
     let a = &f.owners[0];
     let ready = f.index(1);
     let slot = ready
-        .register_context(&a.roles[1].0, &a.registration)
+        .register_participation(&a.obligation_pairs[1].0, &a.registration)
         .unwrap();
     let leg = Arc::new(RequestExternalLeg::new(slot.clone()));
     let reply = PublishedReply::<u8>::new(&a.scope);
@@ -509,10 +514,11 @@ fn external_end_publishes_its_phase_before_the_original_host_notice_and_is_idemp
     let ended = ready.change_version();
     leg.end();
     let second_end_noop = ready.change_version() == ended;
-    let ready_once = ready.next_context_ready(&a.registration) == Some(a.work(1))
-        && ready.next_context_ready(&a.registration).is_none();
+    let ready_once = ready.next_participation_ready(&a.registration) == Some(a.work(1))
+        && ready.next_participation_ready(&a.registration).is_none();
     leg.notify();
-    let explicit_progress_notice = ready.next_context_ready(&a.registration) == Some(a.work(1));
+    let explicit_progress_notice =
+        ready.next_participation_ready(&a.registration) == Some(a.work(1));
     let no_pending_reply = leg.try_take(&reply).is_none();
     ready.unregister(leg.slot()).unwrap();
     drop(leg);

@@ -783,7 +783,7 @@ impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExe
             &new_owner,
             context.clone(),
         )?;
-        let planning = crate::connector::acquire_metadata_planning_lease(
+        let planning = crate::connector::acquire_metadata_planning_pin(
             self.ports.connector_control(),
             &target.catalog,
         )?;

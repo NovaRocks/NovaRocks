@@ -29,18 +29,18 @@ use super::{
     actors::WorkerAction, adopted_cleanup::AdoptedCleanupEffect, failure::ScopePublicationsDrained,
 };
 #[cfg(test)]
-use crate::task_completion_roles::AdmittedCompletionRole;
+use crate::task_completion_set::AdmittedCompletionTransfer;
 use crate::task_port::TaskPendingNotice;
 use novarocks_control_runtime::{
+    actor_turn::ActorTurnError,
     completion::ReportSlot,
-    driver::DriverError,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::WorkRetirementObserver,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::WorkRetirementObserver,
     reported_work::ReportedWork,
 };
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    fragment::ExecutionFailure,
+    task::ExecutionFailure,
 };
 use novarocks_execution_contract::{
     RetainedTaskSource, SourceRetentionCapability, TaskFailurePhase, TaskIdentity,
@@ -55,7 +55,7 @@ enum Leg {
 }
 #[derive(Default)]
 struct Exits {
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     bound: bool,
     source_phase: Option<TaskFailurePhase>,
     holder: bool,
@@ -83,7 +83,7 @@ enum SourceCoreReceipt {
 struct Custody {
     task: TaskIdentity,
     scope: novarocks_control_runtime::transaction::ScopeHandle,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     work: novarocks_control_runtime_core::identity::WorkId,
     report: ReportSlot,
     retirement: WorkRetirementObserver,
@@ -96,8 +96,8 @@ struct Custody {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SourceCleanupError {
-    Exit(ExitRoleError),
-    Driver(DriverError),
+    Exit(ExitCustodyError),
+    ActorTurn(ActorTurnError),
 }
 #[derive(Clone)]
 #[must_use = "The original source Work/report remain until actual retirement"]
@@ -124,12 +124,12 @@ impl SourceRetentionCapability for Marker {}
 impl SourceCustody {
     pub(crate) fn observe_core_input(
         &self,
-        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
-        registration: &novarocks_control_runtime::driver::ActorRegistration,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<super::actors::WorkerActor>,
+        registration: &novarocks_control_runtime::actor_turn::ActorRegistration,
         source: novarocks_control_runtime_core::identity::ActorId,
         input: novarocks_control_runtime_core::identity::InputId,
-    ) -> Result<bool, DriverError> {
-        use novarocks_control_runtime::driver::InputPhase;
+    ) -> Result<bool, ActorTurnError> {
+        use novarocks_control_runtime::actor_turn::InputPhase;
         use novarocks_control_runtime_core::completion::Consumption;
         self.report().bind_actor_consumer(
             runtime,
@@ -139,15 +139,15 @@ impl SourceCustody {
         let actor = registration.actor();
         let custody = runtime
             .input_custody(actor, input)?
-            .ok_or(DriverError::UnknownInput)?;
+            .ok_or(ActorTurnError::UnknownInput)?;
         if custody.source != source {
-            return Err(DriverError::PublicationTargetMismatch);
+            return Err(ActorTurnError::PublicationTargetMismatch);
         }
         let phase = custody.phase;
         let consumption = match phase {
             InputPhase::Committed => Consumption::Consumed,
             InputPhase::AbandonedByOwnerFailure => Consumption::AbandonedByOwnerFailure,
-            _ => return Err(DriverError::InputStillQueued),
+            _ => return Err(ActorTurnError::InputStillQueued),
         };
         let mut exits = self
             .0
@@ -161,7 +161,7 @@ impl SourceCustody {
         };
         match exits.core_input {
             Some(receipt) if receipt == observed => Ok(false),
-            Some(_) => Err(DriverError::PublicationTargetMismatch),
+            Some(_) => Err(ActorTurnError::PublicationTargetMismatch),
             None => {
                 exits.core_input = Some(observed);
                 Ok(true)
@@ -171,9 +171,9 @@ impl SourceCustody {
     pub(crate) fn observe_untransferred_core(
         &self,
         stage: &ScopePublicationsDrained<'_>,
-        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
-        registration: &novarocks_control_runtime::driver::ActorRegistration,
-    ) -> Result<bool, DriverError> {
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<super::actors::WorkerActor>,
+        registration: &novarocks_control_runtime::actor_turn::ActorRegistration,
+    ) -> Result<bool, ActorTurnError> {
         let actor = registration.actor();
         stage.validate(runtime, actor)?;
         self.report().bind_actor_consumer(
@@ -192,7 +192,7 @@ impl SourceCustody {
             .expect("original untransferred source receipt");
         match exits.core_input {
             Some(receipt) if receipt == observed => Ok(false),
-            Some(_) => Err(DriverError::PublicationTargetMismatch),
+            Some(_) => Err(ActorTurnError::PublicationTargetMismatch),
             None => {
                 exits.core_input = Some(observed);
                 Ok(true)
@@ -236,13 +236,13 @@ impl SourceCustody {
     #[cfg(test)]
     pub(crate) fn from_admitted(
         task: TaskIdentity,
-        admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
         pending: Arc<dyn TaskPendingNotice>,
         health: Arc<ExecutionHealth>,
     ) -> (Self, SourcePermit) {
         Self::from_reported(
             task,
-            super::admitted_role::adopt_reported_work(
+            super::reported_work_admission::adopt_reported_work(
                 admitted.work,
                 admitted.capacity,
                 admitted.report,
@@ -263,11 +263,11 @@ impl SourceCustody {
         let work = reported.work().id();
         let report = reported.report().clone();
         let retirement = reported.work().retirement_observer();
-        let (role, authority) = ExitRole::from_admitted(reported);
+        let (exit_custody, authority) = ExitCustody::from_admitted(reported);
         let shared = Arc::new(Custody {
             task,
             scope,
-            role,
+            exit_custody,
             work,
             report,
             retirement,
@@ -305,11 +305,11 @@ impl SourceCustody {
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.0.report
     }
-    pub(crate) fn phase(&self) -> ExitRolePhase {
-        self.0.role.phase()
+    pub(crate) fn phase(&self) -> ExitCustodyPhase {
+        self.0.exit_custody.phase()
     }
-    pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
-        self.0.role.actual_exit_ready()
+    pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitCustodyError> {
+        self.0.exit_custody.actual_exit_ready()
     }
     /// The exact bank lookup selected this source. Its original role supplies
     /// physical exit; the cleanup effect cannot supply that evidence itself.
@@ -317,13 +317,13 @@ impl SourceCustody {
         &self,
         stage: &ScopePublicationsDrained<'_>,
         cleanup: AdoptedCleanupEffect,
-    ) -> Result<(), (DriverError, AdoptedCleanupEffect)> {
+    ) -> Result<(), (ActorTurnError, AdoptedCleanupEffect)> {
         if cleanup.is_completed()
-            || !matches!(cleanup.effect(), WorkerAction::Context(
-                novarocks_worker_protocol::context::ContextEffect::DisposeSource { task, .. }
+            || !matches!(cleanup.effect(), WorkerAction::Participation(
+                novarocks_worker_protocol::participation::ParticipationEffect::DisposeSource { task, .. }
             ) if *task == self.0.task)
         {
-            return Err((DriverError::PublicationTargetMismatch, cleanup));
+            return Err((ActorTurnError::PublicationTargetMismatch, cleanup));
         }
         if let Err(error) = cleanup.validate_scope(stage, &self.0.scope) {
             return Err((error, cleanup));
@@ -334,7 +334,7 @@ impl SourceCustody {
             .lock()
             .expect("original source cleanup effect");
         if slot.is_some() {
-            return Err((DriverError::RoleBusy, cleanup));
+            return Err((ActorTurnError::StandingInputBusy, cleanup));
         }
         *slot = Some(cleanup);
         drop(slot);
@@ -356,8 +356,8 @@ impl SourceCustody {
             .expect("original source cleanup effect")
             .as_mut()
             .map_or(Ok(false), |cleanup| cleanup.complete())
-            .map_err(SourceCleanupError::Driver)?;
-        if self.phase() == ExitRolePhase::Retired && self.cleanup_completed() {
+            .map_err(SourceCleanupError::ActorTurn)?;
+        if self.phase() == ExitCustodyPhase::Retired && self.cleanup_completed() {
             let retained = self
                 .0
                 .retained
@@ -387,7 +387,7 @@ impl SourceCustody {
             .expect("source capture exits")
             .unresolved;
         !unresolved
-            && self.phase() == ExitRolePhase::Retired
+            && self.phase() == ExitCustodyPhase::Retired
             && self.0.retirement.is_retired()
             && self.cleanup_completed()
     }
@@ -401,7 +401,7 @@ impl SourceCustody {
             .lock()
             .expect("source capture exits")
             .unresolved;
-        !unresolved && self.phase() == ExitRolePhase::Started
+        !unresolved && self.phase() == ExitCustodyPhase::Started
     }
     /// An unclaimed paid holder can move to another segment without issuing
     /// new authority. An inventory fault makes that original holder unusable
@@ -411,7 +411,7 @@ impl SourceCustody {
             let exits = self.0.exits.lock().expect("source capture exits");
             !exits.bound && !exits.unresolved && exits.authority.is_some()
         };
-        ready && self.phase() == ExitRolePhase::Admitted
+        ready && self.phase() == ExitCustodyPhase::Admitted
     }
     /// Unexpected inventory loss only records metadata here. A slot may be
     /// returned on an unwinding short-lock path, so its actual authority stays
@@ -422,7 +422,7 @@ impl SourceCustody {
     /// The real host independently acknowledges every report consumer. The
     /// issuing owner keeps this custodian until `reusable`, even after this
     /// method has retired the original role/report/capacity custody.
-    pub(crate) fn try_retire(&self) -> Result<bool, ExitRoleError> {
+    pub(crate) fn try_retire(&self) -> Result<bool, ExitCustodyError> {
         self.observe_pending_failure();
         if self
             .0
@@ -433,7 +433,8 @@ impl SourceCustody {
         {
             return Ok(false);
         }
-        let retired = self.phase() == ExitRolePhase::Retired || self.0.role.try_retire()?;
+        let retired =
+            self.phase() == ExitCustodyPhase::Retired || self.0.exit_custody.try_retire()?;
         let complete = retired && self.cleanup_completed();
         if complete {
             let retained = self
@@ -451,18 +452,18 @@ impl SourceCustody {
     pub(crate) fn observe_failed_consumers(
         &self,
         stage: &super::failure::ScopePublicationsDrained<'_>,
-        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<super::actors::WorkerActor>,
         actor: novarocks_control_runtime_core::identity::ActorId,
         original_generation: novarocks_control_runtime_core::identity::Generation,
         core_receipt: novarocks_control_runtime_core::completion::Consumption,
-    ) -> Result<bool, ExitRoleError> {
+    ) -> Result<bool, ExitCustodyError> {
         use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
         stage.validate(runtime, actor).map_err(|_| {
-            ExitRoleError::Runtime(
+            ExitCustodyError::Runtime(
                 novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
             )
         })?;
-        if self.phase() == ExitRolePhase::Retired {
+        if self.phase() == ExitCustodyPhase::Retired {
             return Ok(false);
         }
         let mut progressed = false;
@@ -472,12 +473,12 @@ impl SourceCustody {
         {
             let original = stage.registration();
             if original.initial_epoch() != original_generation {
-                return Err(ExitRoleError::Runtime(
+                return Err(ExitCustodyError::Runtime(
                     novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
                 ));
             }
             let failure = runtime.failure_proof_for(original).map_err(|_| {
-                ExitRoleError::Runtime(
+                ExitCustodyError::Runtime(
                     novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
                 )
             })?;
@@ -485,12 +486,12 @@ impl SourceCustody {
                 .report()
                 .bind_actor_consumer(runtime, original, core)
                 .map_err(|_| {
-                    ExitRoleError::Runtime(
+                    ExitCustodyError::Runtime(
                         novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
                     )
                 })?;
             consumer.abandon(&failure).map_err(|_| {
-                ExitRoleError::Runtime(
+                ExitCustodyError::Runtime(
                     novarocks_control_runtime::transaction::RuntimeError::UnknownScope,
                 )
             })?;
@@ -533,10 +534,10 @@ impl SourceCustody {
         );
         self.notify_pending();
     }
-    fn finish_authority(&self, authority: ExitAuthority) {
+    fn finish_authority(&self, authority: ExitObligation) {
         self.observe_authority_exit(authority.exited());
     }
-    fn observe_authority_exit(&self, result: Result<(), ExitRoleError>) {
+    fn observe_authority_exit(&self, result: Result<(), ExitCustodyError>) {
         if result.is_err() {
             self.0
                 .exits
@@ -728,7 +729,7 @@ impl Drop for Marker {
 mod tests {
     use super::*;
     use novarocks_control_runtime::{
-        lease::{ReservationBundle, WorkLease},
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -763,8 +764,8 @@ mod tests {
     struct Fixture {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
-        parent: WorkLease,
-        funding: ReservationBundle,
+        parent: WorkObligation,
+        funding: ReservationObligation,
         custody: SourceCustody,
         permit: Option<SourcePermit>,
         health: Arc<ExecutionHealth>,
@@ -826,7 +827,7 @@ mod tests {
         let pending = Arc::new(Pending(AtomicUsize::new(0)));
         let (custody, permit) = SourceCustody::from_admitted(
             task,
-            AdmittedCompletionRole {
+            AdmittedCompletionTransfer {
                 work,
                 capacity,
                 report,
@@ -874,7 +875,7 @@ mod tests {
         }
         fn finish(mut self) {
             assert!(self.permit.is_none());
-            assert_eq!(self.custody.phase(), ExitRolePhase::Exited);
+            assert_eq!(self.custody.phase(), ExitCustodyPhase::Exited);
             assert!(self.custody.actual_exit_ready().unwrap());
             assert!(!self.custody.reusable());
             assert!(
@@ -896,10 +897,10 @@ mod tests {
                 );
             }
             assert!(self.custody.try_retire().unwrap());
-            assert_eq!(self.custody.phase(), ExitRolePhase::Retired);
+            assert_eq!(self.custody.phase(), ExitCustodyPhase::Retired);
             assert!(
                 !self.custody.reusable(),
-                "ExitRole/capacity retirement is not common Work header retirement"
+                "ExitCustody/capacity retirement is not common Work header retirement"
             );
             assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 1).unwrap(), 1);
             assert!(self.custody.reusable());
@@ -950,7 +951,7 @@ mod tests {
                 !custody.exits.lock().unwrap().source_node,
                 "source-node marker cannot precede the real domain source destructor"
             );
-            assert_ne!(custody.role.phase(), ExitRolePhase::Exited);
+            assert_ne!(custody.exit_custody.phase(), ExitCustodyPhase::Exited);
             self.dropped.fetch_add(1, Ordering::SeqCst);
             assert!(
                 !self.panic,
@@ -987,7 +988,7 @@ mod tests {
         let last = accepted.clone();
         drop(accepted);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Started);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Started);
         assert!(!f.custody.actual_exit_ready().unwrap());
         drop(last);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -1008,7 +1009,7 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         assert!(f.custody.0.exits.lock().unwrap().holder);
         assert!(!f.custody.0.exits.lock().unwrap().source_node);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Started);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Started);
         assert!(!f.custody.actual_exit_ready().unwrap());
         assert!(!f.parent.actual_exit_ready().unwrap());
         assert!(!f.custody.try_retire().unwrap());
@@ -1024,7 +1025,7 @@ mod tests {
     }
     #[test]
     fn a_shared_inner_domain_alias_keeps_the_original_source_and_work_header_counted() {
-        use novarocks_execution::runtime::fragment::ExecutionFailureCause;
+        use novarocks_execution::runtime::task::ExecutionFailureCause;
 
         for alias_before_retain in [false, true] {
             let mut f = fixture();
@@ -1048,7 +1049,7 @@ mod tests {
             let exits = f.custody.0.exits.lock().unwrap();
             assert!(exits.holder && !exits.source_node && !exits.unresolved);
             drop(exits);
-            assert_eq!(f.custody.phase(), ExitRolePhase::Started);
+            assert_eq!(f.custody.phase(), ExitCustodyPhase::Started);
             assert!(!f.custody.actual_exit_ready().unwrap());
             assert!(f.custody.report().consume(observer()).is_err());
             assert!(!f.custody.try_retire().unwrap());
@@ -1079,13 +1080,13 @@ mod tests {
         {
             let _cut = cut.lock().unwrap();
             f.custody.note_inventory_abandoned();
-            assert_eq!(f.custody.phase(), ExitRolePhase::Started);
+            assert_eq!(f.custody.phase(), ExitCustodyPhase::Started);
             assert!(!f.custody.retained_source_ready());
             assert_eq!(f.ledger.change_version(), version);
             assert!(f.health.failure().is_none());
         }
         assert!(f.custody.observe_pending_failure());
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         drop(retained);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(!f.custody.try_retire().unwrap());
@@ -1103,7 +1104,7 @@ mod tests {
                 f.custody.note_inventory_abandoned();
                 // Only local capture metadata changes under the real short
                 // lock. Work/report and notification authority stay original.
-                assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+                assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
                 assert!(!f.custody.unused_source_ready());
                 assert!(f.health.failure().is_none());
                 assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
@@ -1113,7 +1114,7 @@ mod tests {
             }
             drop(f.permit.take());
             f.custody.observe_pending_failure();
-            assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+            assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
             assert!(!f.custody.actual_exit_ready().unwrap());
             assert!(!f.custody.try_retire().unwrap());
             assert!(!f.custody.reusable());
@@ -1145,7 +1146,7 @@ mod tests {
         let payload = catch_unwind(AssertUnwindSafe(|| drop(accepted))).unwrap_err();
         let _retained_panic = ManuallyDrop::new(payload);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!f.custody.actual_exit_ready().unwrap());
         assert!(!f.custody.try_retire().unwrap());
         assert!(!f.custody.reusable());
@@ -1183,7 +1184,7 @@ mod tests {
         let payload = catch_unwind(AssertUnwindSafe(|| drop(accepted))).unwrap_err();
         let _retained_panic = ManuallyDrop::new(payload);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!f.custody.try_retire().unwrap());
         assert!(f.custody.report().consume(observer()).is_err());
         assert!(!f.parent.actual_exit_ready().unwrap());
@@ -1207,7 +1208,7 @@ mod tests {
         let payload = catch_unwind(AssertUnwindSafe(|| drop(old_alias))).unwrap_err();
         let _retained_panic = ManuallyDrop::new(payload);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!f.custody.try_retire().unwrap());
         assert!(f.custody.report().consume(observer()).is_err());
         assert_eq!(f.ledger.used(dimension()), 1);
@@ -1224,7 +1225,7 @@ mod tests {
         }))
         .unwrap_err();
         let _retained_panic = ManuallyDrop::new(payload);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         drop(old_alias);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(!f.custody.0.exits.lock().unwrap().holder);
@@ -1247,11 +1248,11 @@ mod tests {
                 .claim(TaskFailurePhase::Preparation);
         }
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.health.failure().is_none());
         assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
         let accepted = f.accept(original, TaskFailurePhase::Preparation);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Started);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Started);
         drop(accepted);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         f.finish();
@@ -1276,7 +1277,7 @@ mod tests {
             version,
             "claim/Drop must not touch the common ledger"
         );
-        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.ledger.unresolved_work().is_empty());
         assert!(f.custody.0.exits.lock().unwrap().unresolved);
         assert!(f.custody.0.exits.lock().unwrap().authority.is_some());
@@ -1286,7 +1287,7 @@ mod tests {
         assert!(!f.custody.reusable());
         assert!(f.custody.observe_pending_failure());
         assert!(f.ledger.change_version() > version);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert_eq!(f.ledger.unresolved_work().len(), 1);
         assert!(f.custody.report().consume(observer()).is_err());
         assert!(!f.parent.actual_exit_ready().unwrap());
@@ -1327,7 +1328,7 @@ mod tests {
         );
         assert_eq!(f.ledger.change_version(), version);
         assert!(f.ledger.unresolved_work().is_empty());
-        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.custody.0.exits.lock().unwrap().failure_pending);
         assert!(f.health.failure().is_none());
         assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
@@ -1335,7 +1336,7 @@ mod tests {
         // try_retire may drain the same pending metadata only after unlocking;
         // it cannot turn the unknown source into a positive completion.
         assert!(!f.custody.try_retire().unwrap());
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert_eq!(f.ledger.unresolved_work().len(), 1);
         assert!(f.custody.report().consume(observer()).is_err());
         assert!(!f.custody.reusable());
@@ -1367,7 +1368,7 @@ mod tests {
         );
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(f.custody.observe_pending_failure());
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(f.custody.report().consume(observer()).is_err());
         assert!(!f.custody.reusable());
         assert_eq!(

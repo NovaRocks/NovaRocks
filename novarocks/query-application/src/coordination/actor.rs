@@ -16,7 +16,8 @@
 // under the License.
 
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, LogicalExecutionActorId, MonotonicClock, ResultContextWithdrawal,
+    AttemptActivationIdentity, LogicalExecutionActorId, MonotonicClock,
+    ResultParticipationWithdrawal,
 };
 
 mod internal_ready;
@@ -35,8 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, EstablishQueryContext, OperationOutcome, QueryContextRef,
-    ResultPacketSequence, TaskIdentity, TaskStatus, TaskStatusCursor,
+    AcquireParticipationAdmissionTicket, EstablishParticipation, OperationOutcome,
+    ParticipationRef, ResultPacketSequence, TaskIdentity, TaskStatus, TaskStatusCursor,
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::QueryExecutionId;
@@ -60,17 +61,18 @@ use super::actor_state::{
 };
 use super::receipt_channel;
 use super::{
-    AbortQueryContextEffectPort, AbortQueryContextIssuePermit, AbortQueryContextIssueSubmit,
+    AbortParticipationEffectPort, AbortParticipationIssuePermit, AbortParticipationIssueSubmit,
     ActiveReplacementResources, AdmissionIssueDisposition, AdmissionIssueReceipt,
-    AdmissionIssueSettlement, BeginSchemaDelivery, ContextStandDownCause, ContextStandDownError,
-    ContextStandDownLedger, ContextStandDownSnapshot, DeliveryPermit, EstablishIssueError,
+    AdmissionIssueSettlement, BeginSchemaDelivery, DeliveryObligation, EstablishIssueError,
     EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot, ExecutionPhase,
-    LogicalConclusion, LogicalOutputMode, RecoveryRefusal, RegistryContextConvergence,
-    ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
-    ReplacementQualificationEffectReceipt, ReplacementQualificationEffectSubmission,
-    ReplacementQualificationFailure, ReplacementQualificationIdentity,
-    ReplacementQualificationRequest, ReplacementQualificationSettlement,
-    ReplacementWorkerAdmissionEvidence, ResultPacket, SchemaDeliveryPermit,
+    LogicalConclusion, LogicalOutputMode, ParticipationStandDownCause, ParticipationStandDownError,
+    ParticipationStandDownLedger, ParticipationStandDownSnapshot, RecoveryRefusal,
+    RegistryParticipationConvergence, ReplacementQualificationEffectAdmission,
+    ReplacementQualificationEffectPort, ReplacementQualificationEffectReceipt,
+    ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
+    ReplacementQualificationIdentity, ReplacementQualificationRequest,
+    ReplacementQualificationSettlement, ReplacementWorkerAdmissionEvidence, ResultPacket,
+    SchemaDeliveryObligation,
 };
 use novarocks_coordination_contract::{
     AttemptFailureClass, ExecutionEffect, MonotonicInstant, ObservedTaskTransition, RecoveryMode,
@@ -396,7 +398,7 @@ impl RunningAttemptDriveAuthority {
 
     pub(crate) async fn begin_admission_issue(
         &self,
-        request_to_issue: AcquireQueryContextAdmissionTicket,
+        request_to_issue: AcquireParticipationAdmissionTicket,
     ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
         request(&self.mailbox, |reply| ActorCommand::BeginAdmissionIssue {
             activation: self.activation,
@@ -422,7 +424,7 @@ impl RunningAttemptDriveAuthority {
 
     pub(crate) async fn authorize_establish(
         &self,
-        request_to_issue: Arc<EstablishQueryContext>,
+        request_to_issue: Arc<EstablishParticipation>,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
         request(&self.mailbox, |reply| ActorCommand::AuthorizeEstablish {
@@ -436,11 +438,11 @@ impl RunningAttemptDriveAuthority {
 
     pub(crate) async fn reauthorize_establish(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
         request(&self.mailbox, |reply| ActorCommand::ReauthorizeEstablish {
             activation: self.activation,
-            context,
+            participation,
             reply,
         })
         .await
@@ -479,7 +481,7 @@ impl RunningAttemptPermit {
     /// transport is issued. Exact transport replay keeps this receipt.
     pub async fn begin_admission_issue(
         &self,
-        request_to_issue: AcquireQueryContextAdmissionTicket,
+        request_to_issue: AcquireParticipationAdmissionTicket,
     ) -> Result<AdmissionIssueReceipt, LogicalExecutionActorError> {
         request(self.mailbox(), |reply| ActorCommand::BeginAdmissionIssue {
             activation: self.identity(),
@@ -509,7 +511,7 @@ impl RunningAttemptPermit {
     /// permit. Replays must retain the same request allocation.
     pub async fn authorize_establish(
         &self,
-        request_to_issue: Arc<EstablishQueryContext>,
+        request_to_issue: Arc<EstablishParticipation>,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
         request(self.mailbox(), |reply| ActorCommand::AuthorizeEstablish {
@@ -525,11 +527,11 @@ impl RunningAttemptPermit {
     /// or transport-unknown outcome. The caller cannot replace its payload.
     pub async fn reauthorize_establish(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<EstablishIssuePermit, LogicalExecutionActorError> {
         request(self.mailbox(), |reply| ActorCommand::ReauthorizeEstablish {
             activation: self.identity(),
-            context,
+            participation,
             reply,
         })
         .await
@@ -643,7 +645,7 @@ impl RunningAttemptPermit {
     /// requires exact root Finished and final Worker EOS ACK observations.
     pub(crate) async fn finish_result_stream(
         self,
-        withdrawals: Vec<ResultContextWithdrawal>,
+        withdrawals: Vec<ResultParticipationWithdrawal>,
     ) -> Result<LogicalConclusion, RunningAttemptHandoffError> {
         self.handoff(|permit, reply| ActorCommand::FinishResultStream {
             permit,
@@ -816,13 +818,13 @@ pub struct LogicalExecutionActorConfig {
     output_mode: LogicalOutputMode,
     max_attempts: u32,
     mailbox_capacity: NonZeroUsize,
-    required_establish_contexts: Vec<QueryContextRef>,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_establish_authorizations_per_context: NonZeroUsize,
-    abort_effect_port: Option<Arc<dyn AbortQueryContextEffectPort>>,
+    required_establish_participations: Vec<ParticipationRef>,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_establish_authorizations_per_participation: NonZeroUsize,
+    abort_effect_port: Option<Arc<dyn AbortParticipationEffectPort>>,
     replacement_effect_port: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     replacement_reservation_valid_for: Option<Duration>,
-    max_abort_authorizations_per_context: NonZeroUsize,
+    max_abort_authorizations_per_participation: NonZeroUsize,
     clock: Arc<dyn MonotonicClock>,
     work_owner: Option<WorkOwner>,
     execution_stage: Option<StagePermit>,
@@ -880,8 +882,8 @@ impl LogicalExecutionActorConfig {
         self.initial_execution
     }
 
-    pub(crate) fn required_establish_contexts(&self) -> &[QueryContextRef] {
-        &self.required_establish_contexts
+    pub(crate) fn required_establish_participations(&self) -> &[ParticipationRef] {
+        &self.required_establish_participations
     }
 
     /// Constructs an execution whose business contract permits no attempt
@@ -890,9 +892,9 @@ impl LogicalExecutionActorConfig {
         initial_execution: QueryExecutionId,
         effect: ExecutionEffect,
         mailbox_capacity: NonZeroUsize,
-        required_establish_contexts: Vec<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        required_establish_participations: Vec<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         work_owner: WorkOwner,
         initial_execution_stage: StagePermit,
     ) -> Result<Self, LogicalExecutionActorError> {
@@ -911,13 +913,14 @@ impl LogicalExecutionActorConfig {
             output_mode: LogicalOutputMode::CompletionOnly,
             max_attempts: 1,
             mailbox_capacity,
-            required_establish_contexts,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            required_establish_participations,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             abort_effect_port: None,
             replacement_effect_port: None,
             replacement_reservation_valid_for: None,
-            max_abort_authorizations_per_context: max_establish_authorizations_per_context,
+            max_abort_authorizations_per_participation:
+                max_establish_authorizations_per_participation,
             clock: Arc::new(ProcessMonotonicClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
@@ -934,9 +937,9 @@ impl LogicalExecutionActorConfig {
         initial_execution: QueryExecutionId,
         effect: ExecutionEffect,
         mailbox_capacity: NonZeroUsize,
-        required_establish_contexts: Vec<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        required_establish_participations: Vec<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         work_owner: WorkOwner,
         initial_execution_stage: StagePermit,
     ) -> Result<Self, LogicalExecutionActorError> {
@@ -944,9 +947,9 @@ impl LogicalExecutionActorConfig {
             initial_execution,
             effect,
             mailbox_capacity,
-            required_establish_contexts,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            required_establish_participations,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             work_owner,
             initial_execution_stage,
         )
@@ -970,9 +973,9 @@ impl LogicalExecutionActorConfig {
     pub fn single_attempt_read_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
-        required_establish_contexts: Vec<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        required_establish_participations: Vec<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         work_owner: WorkOwner,
         initial_execution_stage: StagePermit,
         schema: ResultSchema,
@@ -983,9 +986,9 @@ impl LogicalExecutionActorConfig {
             initial_execution,
             ExecutionEffect::None,
             mailbox_capacity,
-            required_establish_contexts,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            required_establish_participations,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             work_owner,
             initial_execution_stage,
         )?
@@ -998,9 +1001,9 @@ impl LogicalExecutionActorConfig {
     pub(crate) fn read_only_pre_visibility_recovery(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
-        required_establish_contexts: Vec<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        required_establish_participations: Vec<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         max_attempts: NonZeroU32,
         replacement_effect_port: Arc<dyn ReplacementQualificationEffectPort>,
         work_owner: WorkOwner,
@@ -1032,13 +1035,14 @@ impl LogicalExecutionActorConfig {
             output_mode: LogicalOutputMode::ResultStream,
             max_attempts: max_attempts.get(),
             mailbox_capacity,
-            required_establish_contexts,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            required_establish_participations,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             abort_effect_port: None,
             replacement_effect_port: Some(replacement_effect_port),
             replacement_reservation_valid_for: Some(replacement_reservation_valid_for),
-            max_abort_authorizations_per_context: max_establish_authorizations_per_context,
+            max_abort_authorizations_per_participation:
+                max_establish_authorizations_per_participation,
             clock: Arc::new(ProcessMonotonicClock::new()),
             work_owner: Some(work_owner),
             execution_stage: Some(initial_execution_stage),
@@ -1060,9 +1064,9 @@ impl LogicalExecutionActorConfig {
     pub fn read_only_pre_visibility_recovery_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
-        required_establish_contexts: Vec<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        required_establish_participations: Vec<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         max_attempts: NonZeroU32,
         replacement_effect_port: Arc<dyn ReplacementQualificationEffectPort>,
         work_owner: WorkOwner,
@@ -1075,9 +1079,9 @@ impl LogicalExecutionActorConfig {
         Ok(Self::read_only_pre_visibility_recovery(
             initial_execution,
             mailbox_capacity,
-            required_establish_contexts,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            required_establish_participations,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             max_attempts,
             replacement_effect_port,
             work_owner,
@@ -1143,13 +1147,13 @@ impl LogicalExecutionActorConfig {
 
     /// Connects the role-composed Abort effect port. The query application
     /// retains no Native operation carrier or codec dependency.
-    pub fn with_abort_query_context_effect_port(
+    pub fn with_abort_participation_effect_port(
         mut self,
-        port: Arc<dyn AbortQueryContextEffectPort>,
-        max_authorizations_per_context: NonZeroUsize,
+        port: Arc<dyn AbortParticipationEffectPort>,
+        max_authorizations_per_participation: NonZeroUsize,
     ) -> Self {
         self.abort_effect_port = Some(port);
-        self.max_abort_authorizations_per_context = max_authorizations_per_context;
+        self.max_abort_authorizations_per_participation = max_authorizations_per_participation;
         self
     }
 
@@ -1173,7 +1177,7 @@ pub enum LogicalExecutionActorError {
     ReplacementQualificationFailed(ReplacementQualificationFailure),
     InvariantViolation,
     Establish(EstablishIssueError),
-    StandDown(ContextStandDownError),
+    StandDown(ParticipationStandDownError),
     /// The exact root Task reached a non-success terminal state. The caller
     /// still owns the running-attempt permit and must classify this attempt
     /// for replacement or logical conclusion.
@@ -1191,7 +1195,7 @@ impl fmt::Display for LogicalExecutionActorError {
             return write!(formatter, "Establish issue protocol failed: {error}");
         }
         if let Self::StandDown(error) = self {
-            return write!(formatter, "query-context stand-down failed: {error}");
+            return write!(formatter, "participation stand-down failed: {error}");
         }
         if let Self::RecoveryRefused(reason) = self {
             return write!(
@@ -1324,8 +1328,8 @@ impl From<EstablishIssueError> for LogicalExecutionActorError {
     }
 }
 
-impl From<ContextStandDownError> for LogicalExecutionActorError {
-    fn from(value: ContextStandDownError) -> Self {
+impl From<ParticipationStandDownError> for LogicalExecutionActorError {
+    fn from(value: ParticipationStandDownError) -> Self {
         Self::StandDown(value)
     }
 }
@@ -1341,7 +1345,7 @@ pub struct LogicalExecutionActorSnapshot {
     pub accepted_result_packets: u64,
     pub delivered_result_through: Option<ResultPacketSequence>,
     pub establish_error: Option<EstablishIssueError>,
-    pub stand_down_error: Option<ContextStandDownError>,
+    pub stand_down_error: Option<ParticipationStandDownError>,
     pub replacement_error: Option<ReplacementQualificationFailure>,
 }
 
@@ -1350,9 +1354,9 @@ struct AttemptLedgers {
     establish: EstablishIssueLedger,
     establish_error: Option<EstablishIssueError>,
     establish_protocol_error: Option<EstablishIssueError>,
-    stand_down: ContextStandDownLedger,
-    stand_down_error: Option<ContextStandDownError>,
-    pending_aborts: BTreeMap<QueryContextRef, AbortQueryContextIssuePermit>,
+    stand_down: ParticipationStandDownLedger,
+    stand_down_error: Option<ParticipationStandDownError>,
+    pending_aborts: BTreeMap<ParticipationRef, AbortParticipationIssuePermit>,
     abort_backpressured: bool,
     attempt_obligation: Option<Obligation>,
     active_resources: Option<ActiveReplacementResources>,
@@ -1372,8 +1376,8 @@ impl AttemptLedgers {
     }
 
     /// Every success entrance uses the same fence. Only an exact sealed
-    /// result withdrawal can remove an ordinary context requirement; protocol
-    /// faults remain fatal even when their original context was withdrawn.
+    /// result withdrawal can remove an ordinary participation requirement; protocol
+    /// faults remain fatal even when their original participation was withdrawn.
     fn ensure_success_ready(&mut self) -> Result<(), EstablishIssueError> {
         if let Some(error) = self.establish_protocol_error {
             return Err(error);
@@ -1511,11 +1515,11 @@ enum PendingResult {
 
 enum InFlightResult {
     Schema {
-        permit: SchemaDeliveryPermit,
+        permit: SchemaDeliveryObligation,
         receipt: ResultDeliveryReceipt,
     },
     Batch {
-        permit: DeliveryPermit<()>,
+        permit: DeliveryObligation<()>,
         receipt: ResultDeliveryReceipt,
         reply: ActorReply<()>,
     },
@@ -1689,7 +1693,7 @@ enum ActorCommand {
     },
     FinishResultStream {
         permit: RunningAttemptPermit,
-        withdrawals: Vec<ResultContextWithdrawal>,
+        withdrawals: Vec<ResultParticipationWithdrawal>,
         reply: ActorReply<LogicalConclusion>,
     },
     AwaitWorkCancellation {
@@ -1702,7 +1706,7 @@ enum ActorCommand {
         pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
         terminal_error: Option<QueryExecutionError>,
         replacement: QueryExecutionId,
-        replacement_contexts: Vec<QueryContextRef>,
+        replacement_participations: Vec<ParticipationRef>,
         reply: ActorReply<ReplacementQualification>,
     },
     ActivateReplacement {
@@ -1716,7 +1720,7 @@ enum ActorCommand {
     },
     BeginAdmissionIssue {
         activation: AttemptActivationIdentity,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
         reply: ActorReply<AdmissionIssueReceipt>,
     },
     SettleAdmissionIssue {
@@ -1727,26 +1731,26 @@ enum ActorCommand {
     },
     AuthorizeEstablish {
         activation: AttemptActivationIdentity,
-        request: Arc<EstablishQueryContext>,
+        request: Arc<EstablishParticipation>,
         native_compatibility_id: NativeCompatibilityId,
         reply: ActorReply<EstablishIssuePermit>,
     },
     ReauthorizeEstablish {
         activation: AttemptActivationIdentity,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         reply: ActorReply<EstablishIssuePermit>,
     },
     EstablishSnapshot {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         reply: ActorReply<Option<EstablishIssueSnapshot>>,
     },
     StandDownSnapshot {
-        context: QueryContextRef,
-        reply: ActorReply<Option<ContextStandDownSnapshot>>,
+        participation: ParticipationRef,
+        reply: ActorReply<Option<ParticipationStandDownSnapshot>>,
     },
-    RegistryContextConverged {
-        context: QueryContextRef,
-        convergence: RegistryContextConvergence,
+    RegistryParticipationConverged {
+        participation: ParticipationRef,
+        convergence: RegistryParticipationConvergence,
         reply: ActorReply<()>,
     },
     RegistryJoinReadiness {
@@ -1798,14 +1802,14 @@ impl LogicalExecutionActor {
         self.id
     }
 
-    pub(crate) async fn observe_registry_context_convergence(
+    pub(crate) async fn observe_registry_participation_convergence(
         &self,
-        context: QueryContextRef,
-        convergence: RegistryContextConvergence,
+        participation: ParticipationRef,
+        convergence: RegistryParticipationConvergence,
     ) -> Result<(), LogicalExecutionActorError> {
         request(&self.sender, |reply| {
-            ActorCommand::RegistryContextConverged {
-                context,
+            ActorCommand::RegistryParticipationConverged {
+                participation,
                 convergence,
                 reply,
             }
@@ -1948,7 +1952,7 @@ impl LogicalExecutionActor {
         permit: RunningAttemptPermit,
         failure: AttemptFailureClass,
         replacement: QueryExecutionId,
-        replacement_contexts: Vec<QueryContextRef>,
+        replacement_participations: Vec<ParticipationRef>,
     ) -> Result<ReplacementQualification, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::BeginReplacement {
             permit,
@@ -1956,7 +1960,7 @@ impl LogicalExecutionActor {
             pre_ready_replacement: None,
             terminal_error: None,
             replacement,
-            replacement_contexts,
+            replacement_participations,
             reply,
         })
         .await
@@ -1969,7 +1973,7 @@ impl LogicalExecutionActor {
         terminal_error: QueryExecutionError,
         pre_ready_replacement: Option<crate::api::PreReadyProcessReplacementWitness>,
         replacement: QueryExecutionId,
-        replacement_contexts: Vec<QueryContextRef>,
+        replacement_participations: Vec<ParticipationRef>,
     ) -> Result<ReplacementQualification, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::BeginReplacement {
             permit,
@@ -1977,7 +1981,7 @@ impl LogicalExecutionActor {
             pre_ready_replacement,
             terminal_error: Some(terminal_error),
             replacement,
-            replacement_contexts,
+            replacement_participations,
             reply,
         })
         .await
@@ -2038,10 +2042,10 @@ impl LogicalExecutionActor {
 
     pub async fn establish_snapshot(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<Option<EstablishIssueSnapshot>, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::EstablishSnapshot {
-            context,
+            participation,
             reply,
         })
         .await
@@ -2049,10 +2053,10 @@ impl LogicalExecutionActor {
 
     pub async fn stand_down_snapshot(
         &self,
-        context: QueryContextRef,
-    ) -> Result<Option<ContextStandDownSnapshot>, LogicalExecutionActorError> {
+        participation: ParticipationRef,
+    ) -> Result<Option<ParticipationStandDownSnapshot>, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::StandDownSnapshot {
-            context,
+            participation,
             reply,
         })
         .await
@@ -2227,7 +2231,7 @@ impl SpawnedLogicalExecution {
 }
 
 #[derive(Debug)]
-#[must_use = "residual query-context stand-down must remain supervised"]
+#[must_use = "residual participation stand-down must remain supervised"]
 pub struct ResidualStandDownSupervisor {
     actor: LogicalExecutionActor,
     join: JoinHandle<()>,
@@ -2243,17 +2247,17 @@ impl ResidualStandDownSupervisor {
     }
 
     /// Applies the Registry's composite proof that the exact Worker stopped,
-    /// normal context admission was fenced, and its old admission authority
+    /// normal participation admission was fenced, and its old admission authority
     /// was revoked. Holding this move-only supervisor is the source authority;
     /// ordinary actor handles cannot submit convergence evidence.
-    pub async fn observe_worker_stopped_and_context_fenced(
+    pub async fn observe_worker_stopped_and_participation_fenced(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionActorError> {
         request(&self.actor.sender, |reply| {
-            ActorCommand::RegistryContextConverged {
-                context,
-                convergence: RegistryContextConvergence::WorkerStoppedAndContextFenced,
+            ActorCommand::RegistryParticipationConverged {
+                participation,
+                convergence: RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced,
                 reply,
             }
         })
@@ -2261,16 +2265,16 @@ impl ResidualStandDownSupervisor {
     }
 
     /// Applies exact process-replacement evidence for the Worker process
-    /// embedded in this context identity. It fences residual Abort
+    /// embedded in this participation identity. It fences residual Abort
     /// responsibility without claiming clean resource release.
     pub async fn observe_worker_process_replaced(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionActorError> {
         request(&self.actor.sender, |reply| {
-            ActorCommand::RegistryContextConverged {
-                context,
-                convergence: RegistryContextConvergence::WorkerProcessReplaced,
+            ActorCommand::RegistryParticipationConverged {
+                participation,
+                convergence: RegistryParticipationConvergence::WorkerProcessReplaced,
                 reply,
             }
         })
@@ -2313,28 +2317,31 @@ pub(crate) fn spawn_logical_execution_actor(
     let (sender, receiver) = mpsc::channel(config.mailbox_capacity.get());
     let (registry_close_requested, registry_close_requested_rx) = watch::channel(None);
     let (registry_ingress_closed, registry_ingress_closed_rx) = watch::channel(false);
-    let required_contexts: BTreeSet<_> =
-        config.required_establish_contexts.iter().copied().collect();
-    if required_contexts.len() != config.required_establish_contexts.len() {
+    let required_participations: BTreeSet<_> = config
+        .required_establish_participations
+        .iter()
+        .copied()
+        .collect();
+    if required_participations.len() != config.required_establish_participations.len() {
         return Err(LogicalExecutionActorError::InvariantViolation);
     }
-    if required_contexts
+    if required_participations
         .iter()
-        .any(|context| context.query_execution_id() != config.initial_execution)
+        .any(|participation| participation.query_execution_id() != config.initial_execution)
     {
         return Err(LogicalExecutionActorError::WrongExecution);
     }
-    if !required_contexts.is_empty() && config.abort_effect_port.is_none() {
+    if !required_participations.is_empty() && config.abort_effect_port.is_none() {
         return Err(LogicalExecutionActorError::InvariantViolation);
     }
     let establish = EstablishIssueLedger::new(
-        required_contexts.clone(),
-        config.max_admission_issues_per_context,
-        config.max_establish_authorizations_per_context,
+        required_participations.clone(),
+        config.max_admission_issues_per_participation,
+        config.max_establish_authorizations_per_participation,
     );
-    let stand_down = ContextStandDownLedger::new(
-        required_contexts,
-        config.max_abort_authorizations_per_context,
+    let stand_down = ParticipationStandDownLedger::new(
+        required_participations,
+        config.max_abort_authorizations_per_participation,
     )?;
     let abort_capacity = config
         .abort_effect_port
@@ -2491,9 +2498,9 @@ pub(crate) fn spawn_logical_execution_actor(
             replacement_receipts,
             replacement_receipt_rx,
             work_cancellation,
-            config.max_admission_issues_per_context,
-            config.max_establish_authorizations_per_context,
-            config.max_abort_authorizations_per_context,
+            config.max_admission_issues_per_participation,
+            config.max_establish_authorizations_per_participation,
+            config.max_abort_authorizations_per_participation,
             result_runtime,
             config.native_actions.take(),
             clock,
@@ -2532,7 +2539,7 @@ async fn run_actor(
     mut abandoned: watch::Receiver<bool>,
     lifetime: Arc<PermitLifetime>,
     mut attempts: BTreeMap<QueryExecutionId, AttemptLedgers>,
-    abort_effect_port: Option<Arc<dyn AbortQueryContextEffectPort>>,
+    abort_effect_port: Option<Arc<dyn AbortParticipationEffectPort>>,
     mut abort_capacity: Option<watch::Receiver<u64>>,
     replacement_effect_port: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     work_owner: WorkOwner,
@@ -2542,9 +2549,9 @@ async fn run_actor(
     replacement_receipts: mpsc::UnboundedSender<ReplacementQualificationEffectReceipt>,
     mut replacement_receipt_rx: mpsc::UnboundedReceiver<ReplacementQualificationEffectReceipt>,
     work_cancellation: CancellationView,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_establish_authorizations_per_context: NonZeroUsize,
-    max_abort_authorizations_per_context: NonZeroUsize,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_establish_authorizations_per_participation: NonZeroUsize,
+    max_abort_authorizations_per_participation: NonZeroUsize,
     mut result_runtime: Option<ResultRuntime>,
     native_actions: Option<novarocks_workload_control::joint_admission::NativeAsyncActionAuthority>,
     clock: Arc<dyn MonotonicClock>,
@@ -2621,9 +2628,9 @@ async fn run_actor(
             &mut attempts,
             &mut replacement,
             &work_owner.scope(),
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
-            max_abort_authorizations_per_context,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
+            max_abort_authorizations_per_participation,
             clock.as_ref(),
             result_runtime.as_mut(),
         );
@@ -2987,7 +2994,7 @@ fn expire_replacement_reservation(
 
 enum AttemptLedgerEvent {
     Establish(QueryExecutionId, Result<(), EstablishIssueError>),
-    StandDown(QueryExecutionId, Result<(), ContextStandDownError>),
+    StandDown(QueryExecutionId, Result<(), ParticipationStandDownError>),
 }
 
 async fn wait_for_attempt_ledger_event(
@@ -3024,7 +3031,7 @@ fn apply_attempt_ledger_event(
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     event: AttemptLedgerEvent,
     establish_error: &mut Option<EstablishIssueError>,
-    stand_down_error: &mut Option<ContextStandDownError>,
+    stand_down_error: &mut Option<ParticipationStandDownError>,
 ) {
     match event {
         AttemptLedgerEvent::Establish(execution, result) => {
@@ -3051,7 +3058,7 @@ fn apply_attempt_ledger_event(
                 //
                 // Every success entrance checks the same ledger. A protocol
                 // fault always vetoes success. An ordinary refusal vetoes a
-                // still-required context; only the Native owner's exact sealed
+                // still-required participation; only the Native owner's exact sealed
                 // result withdrawal can make it diagnostic/residual instead.
                 // The original request, verdict and stand-down responsibility
                 // remain in the ledger in either case.
@@ -3097,9 +3104,9 @@ fn revoke_all_establish_authority(attempts: &mut BTreeMap<QueryExecutionId, Atte
 fn synchronize_all_stand_down(
     state: &LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
-    stand_down_error: &mut Option<ContextStandDownError>,
+    stand_down_error: &mut Option<ParticipationStandDownError>,
     now: MonotonicInstant,
-    abort_effect_port: Option<&dyn AbortQueryContextEffectPort>,
+    abort_effect_port: Option<&dyn AbortParticipationEffectPort>,
 ) {
     for attempt in attempts.values_mut() {
         if !attempt.stand_down.started()
@@ -3117,13 +3124,15 @@ fn synchronize_all_stand_down(
             ExecutionPhase::Replacing { failed, .. } if failed == attempt.activation.execution()
         );
         let cause = if attempt.stand_down.started() || replacement_failed {
-            Some(ContextStandDownCause::LogicalExecutionFailed)
+            Some(ParticipationStandDownCause::LogicalExecutionFailed)
         } else {
             state.conclusion().and_then(|conclusion| match conclusion {
                 LogicalConclusion::Cancelled => {
-                    Some(ContextStandDownCause::LogicalExecutionCancelled)
+                    Some(ParticipationStandDownCause::LogicalExecutionCancelled)
                 }
-                LogicalConclusion::Failed => Some(ContextStandDownCause::LogicalExecutionFailed),
+                LogicalConclusion::Failed => {
+                    Some(ParticipationStandDownCause::LogicalExecutionFailed)
+                }
                 LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady => None,
             })
         };
@@ -3159,10 +3168,10 @@ fn synchronize_all_stand_down(
                 attempt.active_resources.take();
             } else {
                 stand_down_error
-                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                    .get_or_insert(ParticipationStandDownError::ResponsibilitySettlementFailed);
                 attempt
                     .stand_down_error
-                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                    .get_or_insert(ParticipationStandDownError::ResponsibilitySettlementFailed);
                 continue;
             }
         } else if attempt.stand_down.residual_resource_settled() {
@@ -3174,10 +3183,10 @@ fn synchronize_all_stand_down(
                 attempt.attempt_obligation.take();
             } else {
                 stand_down_error
-                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                    .get_or_insert(ParticipationStandDownError::ResponsibilitySettlementFailed);
                 attempt
                     .stand_down_error
-                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                    .get_or_insert(ParticipationStandDownError::ResponsibilitySettlementFailed);
                 continue;
             }
             if let Some(resources) = attempt.active_resources.take() {
@@ -3202,35 +3211,39 @@ fn synchronize_all_stand_down(
 
 fn begin_or_refresh_stand_down(
     attempt: &mut AttemptLedgers,
-    cause: ContextStandDownCause,
-) -> Result<(), ContextStandDownError> {
+    cause: ParticipationStandDownCause,
+) -> Result<(), ParticipationStandDownError> {
     let facts = attempt
         .establish
         .stand_down_facts()
-        .map_err(|_| ContextStandDownError::WrongState)?;
+        .map_err(|_| ParticipationStandDownError::WrongState)?;
     if !attempt.stand_down.started() {
         return attempt.stand_down.begin(attempt.activation, cause, facts);
     }
-    for (context, fact) in facts {
-        attempt.stand_down.refresh_establish_fact(context, fact)?;
+    for (participation, fact) in facts {
+        attempt
+            .stand_down
+            .refresh_establish_fact(participation, fact)?;
     }
     Ok(())
 }
 
 fn begin_or_refresh_successful_cleanup(
     attempt: &mut AttemptLedgers,
-) -> Result<(), ContextStandDownError> {
+) -> Result<(), ParticipationStandDownError> {
     let facts = attempt
         .establish
         .stand_down_facts()
-        .map_err(|_| ContextStandDownError::WrongState)?;
+        .map_err(|_| ParticipationStandDownError::WrongState)?;
     if !attempt.stand_down.started() {
         return attempt
             .stand_down
             .begin_successful_cleanup(attempt.activation, facts);
     }
-    for (context, fact) in facts {
-        attempt.stand_down.refresh_establish_fact(context, fact)?;
+    for (participation, fact) in facts {
+        attempt
+            .stand_down
+            .refresh_establish_fact(participation, fact)?;
     }
     Ok(())
 }
@@ -3395,9 +3408,9 @@ fn try_activate_qualified_replacement(
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     replacement: &mut Option<ReplacementRuntime>,
     work: &WorkScope,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_establish_authorizations_per_context: NonZeroUsize,
-    max_abort_authorizations_per_context: NonZeroUsize,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_establish_authorizations_per_participation: NonZeroUsize,
+    max_abort_authorizations_per_participation: NonZeroUsize,
     clock: &dyn MonotonicClock,
     result_runtime: Option<&mut ResultRuntime>,
 ) {
@@ -3467,7 +3480,7 @@ fn try_activate_qualified_replacement(
         return;
     }
     for fact in [
-        ReplacementFact::ReachableContextsClosed,
+        ReplacementFact::ReachableParticipationsClosed,
         ReplacementFact::AttemptIsolationProven,
         ReplacementFact::StaleUsageAccounted,
         ReplacementFact::NewCapacityAdmitted,
@@ -3518,9 +3531,9 @@ fn try_activate_qualified_replacement(
     match state.activate_replacement(&active.token) {
         Ok(capability) => {
             let activation = identity_of(&capability);
-            let contexts = active
+            let participations = active
                 .request
-                .replacement_contexts()
+                .replacement_participations()
                 .iter()
                 .copied()
                 .collect();
@@ -3529,10 +3542,10 @@ fn try_activate_qualified_replacement(
             } else {
                 new_attempt_ledgers(
                     activation,
-                    contexts,
-                    max_admission_issues_per_context,
-                    max_establish_authorizations_per_context,
-                    max_abort_authorizations_per_context,
+                    participations,
+                    max_admission_issues_per_participation,
+                    max_establish_authorizations_per_participation,
+                    max_abort_authorizations_per_participation,
                     None,
                     work,
                 )
@@ -3713,7 +3726,7 @@ fn start_schema_delivery(
     if identity_of(&capability) != activation {
         return Err(LogicalExecutionActorError::StaleAuthority);
     }
-    let BeginSchemaDelivery::Permit(permit) = state.begin_schema_delivery(&capability)? else {
+    let BeginSchemaDelivery::Obligation(permit) = state.begin_schema_delivery(&capability)? else {
         return Ok(());
     };
     if runtime.schema_writer_completed {
@@ -3843,7 +3856,7 @@ fn settle_finish_establish_readiness(
     let execution = finish.permit.identity().execution();
     let result = attempts
         .get_mut(&execution)
-        .ok_or(EstablishIssueError::UnknownContext)
+        .ok_or(EstablishIssueError::UnknownParticipation)
         .and_then(AttemptLedgers::ensure_success_ready);
     match result {
         Ok(()) => true,
@@ -4484,7 +4497,7 @@ fn handle_command(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     establish_error: &mut Option<EstablishIssueError>,
-    stand_down_error: &mut Option<ContextStandDownError>,
+    stand_down_error: &mut Option<ParticipationStandDownError>,
     replacement: &mut Option<ReplacementRuntime>,
     replacement_error: &mut Option<ReplacementQualificationFailure>,
     clock: &dyn MonotonicClock,
@@ -5059,22 +5072,22 @@ fn handle_command(
             if withdrawals.iter().any(|fact| {
                 fact.activation() != activation
                     || fact.root() != root
-                    || fact.context().query_execution_id() != activation.execution()
-                    || fact.context().backend_process_id() == root.backend_process_id()
+                    || fact.participation().query_execution_id() != activation.execution()
+                    || fact.participation().backend_process_id() == root.backend_process_id()
             }) {
                 conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
             }
-            let contexts = withdrawals
+            let participations = withdrawals
                 .iter()
-                .map(|fact| fact.context())
+                .map(|fact| fact.participation())
                 .collect::<BTreeSet<_>>();
             let attempt = attempts
                 .get_mut(&activation.execution())
                 .expect("checked attempt");
             if attempt
                 .establish
-                .record_result_withdrawals(&contexts)
+                .record_result_withdrawals(&participations)
                 .is_err()
             {
                 conclude_consumed_handoff_as_failed(state, permit, reply);
@@ -5120,13 +5133,13 @@ fn handle_command(
             pre_ready_replacement,
             terminal_error,
             replacement: replacement_execution,
-            replacement_contexts,
+            replacement_participations,
             reply,
         } => {
             let activation = permit.identity();
             let (capability, lifetime, mailbox_liveness) = permit.into_parts();
             if pre_ready_replacement.as_ref().is_some_and(|witness| {
-                witness.context().query_execution_id() != activation.execution()
+                witness.participation().query_execution_id() != activation.execution()
                     || !terminal_error
                         .as_ref()
                         .and_then(QueryExecutionError::execution_failure)
@@ -5168,20 +5181,21 @@ fn handle_command(
                 let _ = reply.send(Err(error));
                 return;
             }
-            let preparation = validate_contexts(replacement_execution, &replacement_contexts)
-                .and_then(|contexts| {
-                    let failed = attempts
-                        .get_mut(&activation.execution())
-                        .ok_or(LogicalExecutionActorError::WrongExecution)?;
-                    failed.establish.revoke_issue_authority();
-                    let failed_contexts = failed.establish.required_contexts();
-                    begin_or_refresh_stand_down(
-                        failed,
-                        ContextStandDownCause::LogicalExecutionFailed,
-                    )?;
-                    Ok((contexts, failed_contexts))
-                });
-            let (contexts, failed_contexts) = match preparation {
+            let preparation =
+                validate_participations(replacement_execution, &replacement_participations)
+                    .and_then(|participations| {
+                        let failed = attempts
+                            .get_mut(&activation.execution())
+                            .ok_or(LogicalExecutionActorError::WrongExecution)?;
+                        failed.establish.revoke_issue_authority();
+                        let failed_participations = failed.establish.required_participations();
+                        begin_or_refresh_stand_down(
+                            failed,
+                            ParticipationStandDownCause::LogicalExecutionFailed,
+                        )?;
+                        Ok((participations, failed_participations))
+                    });
+            let (participations, failed_participations) = match preparation {
                 Ok(preparation) => preparation,
                 Err(error) => {
                     if result_runtime
@@ -5255,8 +5269,8 @@ fn handle_command(
             let (effect_cancellation, _) = watch::channel(false);
             let request = Arc::new(ReplacementQualificationRequest::new(
                 identity,
-                failed_contexts,
-                contexts,
+                failed_participations,
+                participations,
                 issued_at,
                 conservative_expiry,
                 native_actions.cloned(),
@@ -5390,7 +5404,7 @@ fn handle_command(
                 }
                 // As with an ordinary Establish refusal, the Native owner
                 // receives the original typed error and determines whether it
-                // preceded its accepted root cut. Required contexts are still
+                // preceded its accepted root cut. Required participations are still
                 // checked at every success entrance. Protocol faults cannot
                 // acquire this result-only exemption.
                 if error != EstablishIssueError::AdmissionRejected
@@ -5441,7 +5455,7 @@ fn handle_command(
         }
         ActorCommand::ReauthorizeEstablish {
             activation,
-            context,
+            participation,
             reply,
         } => {
             let result = verify_running_activation(state, activation)
@@ -5457,33 +5471,39 @@ fn handle_command(
                         .get_mut(&activation.execution())
                         .ok_or(LogicalExecutionActorError::WrongExecution)?
                         .establish
-                        .reauthorize_issue(activation, context, clock.now())
+                        .reauthorize_issue(activation, participation, clock.now())
                         .map_err(Into::into)
                 });
             let _ = reply.send(result);
         }
-        ActorCommand::EstablishSnapshot { context, reply } => {
+        ActorCommand::EstablishSnapshot {
+            participation,
+            reply,
+        } => {
             let snapshot = attempts
-                .get(&context.query_execution_id())
-                .and_then(|attempt| attempt.establish.snapshot(context));
+                .get(&participation.query_execution_id())
+                .and_then(|attempt| attempt.establish.snapshot(participation));
             let _ = reply.send(Ok(snapshot));
         }
-        ActorCommand::StandDownSnapshot { context, reply } => {
+        ActorCommand::StandDownSnapshot {
+            participation,
+            reply,
+        } => {
             let snapshot = attempts
-                .get(&context.query_execution_id())
-                .and_then(|attempt| attempt.stand_down.snapshot(context));
+                .get(&participation.query_execution_id())
+                .and_then(|attempt| attempt.stand_down.snapshot(participation));
             let _ = reply.send(Ok(snapshot));
         }
-        ActorCommand::RegistryContextConverged {
-            context,
+        ActorCommand::RegistryParticipationConverged {
+            participation,
             convergence,
             reply,
         } => {
-            let result = match attempts.get_mut(&context.query_execution_id()) {
+            let result = match attempts.get_mut(&participation.query_execution_id()) {
                 Some(attempt) => {
                     let result = attempt
                         .stand_down
-                        .observe_registry_convergence(context, convergence)
+                        .observe_registry_convergence(participation, convergence)
                         .map_err(Into::into);
                     if let Err(LogicalExecutionActorError::StandDown(error)) = &result {
                         attempt.stand_down_error.get_or_insert(*error);
@@ -5531,15 +5551,15 @@ fn verify_actor_activation(
     Ok(())
 }
 
-fn validate_contexts(
+fn validate_participations(
     execution: QueryExecutionId,
-    contexts: &[QueryContextRef],
-) -> Result<Arc<[QueryContextRef]>, LogicalExecutionActorError> {
-    let distinct: BTreeSet<_> = contexts.iter().copied().collect();
-    if distinct.len() != contexts.len()
+    participations: &[ParticipationRef],
+) -> Result<Arc<[ParticipationRef]>, LogicalExecutionActorError> {
+    let distinct: BTreeSet<_> = participations.iter().copied().collect();
+    if distinct.len() != participations.len()
         || distinct
             .iter()
-            .any(|context| context.query_execution_id() != execution)
+            .any(|participation| participation.query_execution_id() != execution)
     {
         return Err(LogicalExecutionActorError::WrongExecution);
     }
@@ -5548,26 +5568,28 @@ fn validate_contexts(
 
 fn new_attempt_ledgers(
     activation: AttemptActivationIdentity,
-    required_contexts: BTreeSet<QueryContextRef>,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_establish_authorizations_per_context: NonZeroUsize,
-    max_abort_authorizations_per_context: NonZeroUsize,
+    required_participations: BTreeSet<ParticipationRef>,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_establish_authorizations_per_participation: NonZeroUsize,
+    max_abort_authorizations_per_participation: NonZeroUsize,
     active_resources: Option<ActiveReplacementResources>,
     work: &WorkScope,
 ) -> Result<AttemptLedgers, LogicalExecutionActorError> {
-    if required_contexts
+    if required_participations
         .iter()
-        .any(|context| context.query_execution_id() != activation.execution())
+        .any(|participation| participation.query_execution_id() != activation.execution())
     {
         return Err(LogicalExecutionActorError::WrongExecution);
     }
     let establish = EstablishIssueLedger::new(
-        required_contexts.clone(),
-        max_admission_issues_per_context,
-        max_establish_authorizations_per_context,
+        required_participations.clone(),
+        max_admission_issues_per_participation,
+        max_establish_authorizations_per_participation,
     );
-    let stand_down =
-        ContextStandDownLedger::new(required_contexts, max_abort_authorizations_per_context)?;
+    let stand_down = ParticipationStandDownLedger::new(
+        required_participations,
+        max_abort_authorizations_per_participation,
+    )?;
     let attempt_obligation = work
         .register_obligation(
             attempt_obligation_key(activation.actor(), activation.execution()),
@@ -5589,35 +5611,35 @@ fn new_attempt_ledgers(
 }
 
 fn drive_abort_effect(
-    stand_down: &mut ContextStandDownLedger,
-    port: Option<&dyn AbortQueryContextEffectPort>,
-    pending: &mut BTreeMap<QueryContextRef, AbortQueryContextIssuePermit>,
+    stand_down: &mut ParticipationStandDownLedger,
+    port: Option<&dyn AbortParticipationEffectPort>,
+    pending: &mut BTreeMap<ParticipationRef, AbortParticipationIssuePermit>,
     backpressured: &mut bool,
     now: MonotonicInstant,
-) -> Result<(), ContextStandDownError> {
+) -> Result<(), ParticipationStandDownError> {
     let Some(port) = port else {
         return Ok(());
     };
-    let pending_contexts: Vec<_> = pending.keys().copied().collect();
-    for context in pending_contexts {
+    let pending_participations: Vec<_> = pending.keys().copied().collect();
+    for participation in pending_participations {
         let permit = pending
-            .remove(&context)
-            .expect("pending Abort context was collected from the same map");
+            .remove(&participation)
+            .expect("pending Abort participation was collected from the same map");
         match permit.try_submit(port)? {
-            AbortQueryContextIssueSubmit::Accepted => {}
-            AbortQueryContextIssueSubmit::Backpressured(permit) => {
-                pending.insert(context, permit);
+            AbortParticipationIssueSubmit::Accepted => {}
+            AbortParticipationIssueSubmit::Backpressured(permit) => {
+                pending.insert(participation, permit);
             }
         }
     }
 
     while let Some(permit) = stand_down.authorize_next_at(now)? {
-        let context = permit.identity().context();
+        let participation = permit.identity().participation();
         match permit.try_submit(port)? {
-            AbortQueryContextIssueSubmit::Accepted => {}
-            AbortQueryContextIssueSubmit::Backpressured(permit) => {
-                if pending.insert(context, permit).is_some() {
-                    return Err(ContextStandDownError::EventBackpressureInvariant);
+            AbortParticipationIssueSubmit::Accepted => {}
+            AbortParticipationIssueSubmit::Backpressured(permit) => {
+                if pending.insert(participation, permit).is_some() {
+                    return Err(ParticipationStandDownError::EventBackpressureInvariant);
                 }
             }
         }
@@ -5627,10 +5649,10 @@ fn drive_abort_effect(
 }
 
 fn cancel_pending_abort_issues(
-    stand_down: &mut ContextStandDownLedger,
-    pending: &mut BTreeMap<QueryContextRef, AbortQueryContextIssuePermit>,
+    stand_down: &mut ParticipationStandDownLedger,
+    pending: &mut BTreeMap<ParticipationRef, AbortParticipationIssuePermit>,
     now: MonotonicInstant,
-) -> Result<(), ContextStandDownError> {
+) -> Result<(), ParticipationStandDownError> {
     let pending = std::mem::take(pending);
     for (_, permit) in pending {
         permit.settle_definitely_unsent()?;
@@ -5649,12 +5671,12 @@ async fn wait_for_abort_retry(clock: &dyn MonotonicClock, retry_at: Option<Monot
 
 async fn wait_for_abort_capacity(
     capacity: &mut Option<watch::Receiver<u64>>,
-) -> Result<(), ContextStandDownError> {
+) -> Result<(), ParticipationStandDownError> {
     if let Some(capacity) = capacity {
         capacity
             .changed()
             .await
-            .map_err(|_| ContextStandDownError::EffectCapacityClosed)
+            .map_err(|_| ParticipationStandDownError::EffectCapacityClosed)
     } else {
         std::future::pending::<()>().await;
         Ok(())
@@ -5718,23 +5740,23 @@ fn pre_ready_refusal_matches_establish(
     activation: AttemptActivationIdentity,
     refusal: &crate::execution_error::ExecutionFailureInput,
 ) -> bool {
-    let Some((context, operation_id, kind)) =
+    let Some((participation, operation_id, kind)) =
         crate::api::PreReadyProcessReplacementWitness::refusal_operation(refusal)
     else {
         return false;
     };
-    if context.query_execution_id() != activation.execution() {
+    if participation.query_execution_id() != activation.execution() {
         return false;
     }
     let Some(attempt) = attempts.get(&activation.execution()) else {
         return false;
     };
-    attempt.establish.snapshot(context).is_some_and(|snapshot| {
+    attempt.establish.snapshot(participation).is_some_and(|snapshot| {
         snapshot.identity().is_some_and(|identity| {
             identity.activation() == activation
-                && identity.context() == context
+                && identity.participation() == participation
                 && match kind {
-                    novarocks_execution_contract::OperationKind::UpdateQueryContext => {
+                    novarocks_execution_contract::OperationKind::UpdateParticipation => {
                         identity.operation_id() == operation_id
                     }
                     novarocks_execution_contract::OperationKind::CreateTask => matches!(
@@ -6116,9 +6138,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution_contract::{
         AbortCause, AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent,
-        ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-        CredentialUpdate, LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt,
-        QueryContextReceipt, QueryContextState, TaskOperationId, TaskOutputFacts, TaskState,
+        ConfidentialContent, ContentFingerprint, CredentialDomainId, CredentialEpoch,
+        CredentialUpdate, LeaseValidFor, OperationOutcome, ParticipationAdmissionTicketReceipt,
+        ParticipationReceipt, ParticipationState, TaskOperationId, TaskOutputFacts, TaskState,
         TaskStatusVersion, TerminationDetail,
     };
     use novarocks_types::NativeCompatibilityId;
@@ -6133,42 +6155,42 @@ mod tests {
 
     #[derive(Debug)]
     struct SelectiveAbortPort {
-        blocked: QueryContextRef,
-        accepted: Arc<Mutex<Vec<QueryContextRef>>>,
+        blocked: ParticipationRef,
+        accepted: Arc<Mutex<Vec<ParticipationRef>>>,
         capacity: watch::Sender<u64>,
     }
 
     #[derive(Debug)]
     struct AcceptedAbortReservation {
-        accepted: Arc<Mutex<Vec<QueryContextRef>>>,
+        accepted: Arc<Mutex<Vec<ParticipationRef>>>,
     }
 
-    impl super::super::AbortQueryContextEffectReservation for AcceptedAbortReservation {
-        fn submit(self: Box<Self>, submission: super::super::AbortQueryContextEffectSubmission) {
-            let context = submission.identity().context();
-            self.accepted.lock().unwrap().push(context);
+    impl super::super::AbortParticipationEffectReservation for AcceptedAbortReservation {
+        fn submit(self: Box<Self>, submission: super::super::AbortParticipationEffectSubmission) {
+            let participation = submission.identity().participation();
+            self.accepted.lock().unwrap().push(participation);
             submission
-                .worker_settled(QueryContextReceipt::new(
-                    context,
-                    QueryContextState::Aborting,
+                .worker_settled(ParticipationReceipt::new(
+                    participation,
+                    ParticipationState::Aborting,
                 ))
                 .unwrap();
         }
     }
 
-    impl AbortQueryContextEffectPort for SelectiveAbortPort {
+    impl AbortParticipationEffectPort for SelectiveAbortPort {
         fn subscribe_capacity(&self) -> watch::Receiver<u64> {
             self.capacity.subscribe()
         }
 
         fn try_reserve(
             &self,
-            identity: super::super::AbortQueryContextIssueIdentity,
-        ) -> super::super::AbortQueryContextEffectAdmission {
-            if identity.context() == self.blocked {
-                super::super::AbortQueryContextEffectAdmission::Backpressured
+            identity: super::super::AbortParticipationIssueIdentity,
+        ) -> super::super::AbortParticipationEffectAdmission {
+            if identity.participation() == self.blocked {
+                super::super::AbortParticipationEffectAdmission::Backpressured
             } else {
-                super::super::AbortQueryContextEffectAdmission::Admitted(Box::new(
+                super::super::AbortParticipationEffectAdmission::Admitted(Box::new(
                     AcceptedAbortReservation {
                         accepted: Arc::clone(&self.accepted),
                     },
@@ -6179,15 +6201,15 @@ mod tests {
 
     #[derive(Debug)]
     struct ClosingMixedAbortPort {
-        accepted: QueryContextRef,
-        blocked: QueryContextRef,
-        submissions: Arc<Mutex<Vec<super::super::AbortQueryContextEffectSubmission>>>,
+        accepted: ParticipationRef,
+        blocked: ParticipationRef,
+        submissions: Arc<Mutex<Vec<super::super::AbortParticipationEffectSubmission>>>,
         capacity: Mutex<Option<watch::Sender<u64>>>,
         reserve_calls: AtomicUsize,
     }
 
     impl ClosingMixedAbortPort {
-        fn new(accepted: QueryContextRef, blocked: QueryContextRef) -> Self {
+        fn new(accepted: ParticipationRef, blocked: ParticipationRef) -> Self {
             let (capacity, _) = watch::channel(0);
             Self {
                 accepted,
@@ -6205,16 +6227,16 @@ mod tests {
 
     #[derive(Debug)]
     struct HoldingAbortReservation {
-        submissions: Arc<Mutex<Vec<super::super::AbortQueryContextEffectSubmission>>>,
+        submissions: Arc<Mutex<Vec<super::super::AbortParticipationEffectSubmission>>>,
     }
 
-    impl super::super::AbortQueryContextEffectReservation for HoldingAbortReservation {
-        fn submit(self: Box<Self>, submission: super::super::AbortQueryContextEffectSubmission) {
+    impl super::super::AbortParticipationEffectReservation for HoldingAbortReservation {
+        fn submit(self: Box<Self>, submission: super::super::AbortParticipationEffectSubmission) {
             self.submissions.lock().unwrap().push(submission);
         }
     }
 
-    impl AbortQueryContextEffectPort for ClosingMixedAbortPort {
+    impl AbortParticipationEffectPort for ClosingMixedAbortPort {
         fn subscribe_capacity(&self) -> watch::Receiver<u64> {
             self.capacity
                 .lock()
@@ -6226,19 +6248,19 @@ mod tests {
 
         fn try_reserve(
             &self,
-            identity: super::super::AbortQueryContextIssueIdentity,
-        ) -> super::super::AbortQueryContextEffectAdmission {
+            identity: super::super::AbortParticipationIssueIdentity,
+        ) -> super::super::AbortParticipationEffectAdmission {
             self.reserve_calls.fetch_add(1, Ordering::SeqCst);
-            if identity.context() == self.accepted {
-                super::super::AbortQueryContextEffectAdmission::Admitted(Box::new(
+            if identity.participation() == self.accepted {
+                super::super::AbortParticipationEffectAdmission::Admitted(Box::new(
                     HoldingAbortReservation {
                         submissions: Arc::clone(&self.submissions),
                     },
                 ))
-            } else if identity.context() == self.blocked {
-                super::super::AbortQueryContextEffectAdmission::Backpressured
+            } else if identity.participation() == self.blocked {
+                super::super::AbortParticipationEffectAdmission::Backpressured
             } else {
-                super::super::AbortQueryContextEffectAdmission::Closed
+                super::super::AbortParticipationEffectAdmission::Closed
             }
         }
     }
@@ -6600,8 +6622,8 @@ mod tests {
     #[derive(Debug)]
     struct TestIsolationReservation {
         identity: ReplacementQualificationIdentity,
-        failed_contexts: BTreeSet<QueryContextRef>,
-        contexts: BTreeSet<QueryContextRef>,
+        failed_participations: BTreeSet<ParticipationRef>,
+        participations: BTreeSet<ParticipationRef>,
         admissions: Box<[QualifiedWorkerAdmission]>,
     }
 
@@ -6620,15 +6642,15 @@ mod tests {
         }
         fn validate_binding(
             &self,
-            failed_contexts: &[QueryContextRef],
+            failed_participations: &[ParticipationRef],
         ) -> Result<(), ReplacementQualificationFailure> {
-            let failed: BTreeSet<_> = failed_contexts.iter().copied().collect();
-            let contexts: BTreeSet<_> = self
+            let failed: BTreeSet<_> = failed_participations.iter().copied().collect();
+            let participations: BTreeSet<_> = self
                 .admissions
                 .iter()
-                .map(QualifiedWorkerAdmission::context)
+                .map(QualifiedWorkerAdmission::participation)
                 .collect();
-            (failed == self.failed_contexts && contexts == self.contexts)
+            (failed == self.failed_participations && participations == self.participations)
                 .then_some(())
                 .ok_or(ReplacementQualificationFailure::InvalidReservation)
         }
@@ -6668,7 +6690,7 @@ mod tests {
         }
         fn validate_binding(
             &self,
-            _failed_contexts: &[QueryContextRef],
+            _failed_participations: &[ParticipationRef],
         ) -> Result<(), ReplacementQualificationFailure> {
             Ok(())
         }
@@ -6726,7 +6748,7 @@ mod tests {
 
         fn validate_binding(
             &self,
-            _failed_contexts: &[QueryContextRef],
+            _failed_participations: &[ParticipationRef],
         ) -> Result<(), ReplacementQualificationFailure> {
             Ok(())
         }
@@ -6749,8 +6771,8 @@ mod tests {
     #[derive(Debug)]
     struct LifecycleIsolationReservation {
         identity: ReplacementQualificationIdentity,
-        failed_contexts: BTreeSet<QueryContextRef>,
-        contexts: BTreeSet<QueryContextRef>,
+        failed_participations: BTreeSet<ParticipationRef>,
+        participations: BTreeSet<ParticipationRef>,
         admissions: Box<[QualifiedWorkerAdmission]>,
         finished: Arc<AtomicUsize>,
         abandoned: Arc<AtomicUsize>,
@@ -6771,15 +6793,15 @@ mod tests {
 
         fn validate_binding(
             &self,
-            failed_contexts: &[QueryContextRef],
+            failed_participations: &[ParticipationRef],
         ) -> Result<(), ReplacementQualificationFailure> {
-            let failed: BTreeSet<_> = failed_contexts.iter().copied().collect();
-            let contexts: BTreeSet<_> = self
+            let failed: BTreeSet<_> = failed_participations.iter().copied().collect();
+            let participations: BTreeSet<_> = self
                 .admissions
                 .iter()
-                .map(QualifiedWorkerAdmission::context)
+                .map(QualifiedWorkerAdmission::participation)
                 .collect();
-            (failed == self.failed_contexts && contexts == self.contexts)
+            (failed == self.failed_participations && participations == self.participations)
                 .then_some(())
                 .ok_or(ReplacementQualificationFailure::InvalidReservation)
         }
@@ -6826,30 +6848,30 @@ mod tests {
     ) -> QualifiedReplacementReservation {
         let request = submission.request();
         let admissions: Box<[_]> = request
-            .replacement_contexts()
+            .replacement_participations()
             .iter()
             .enumerate()
-            .map(|(index, context)| {
+            .map(|(index, participation)| {
                 let tag = u8::try_from(index + 1).unwrap();
                 QualifiedWorkerAdmission::try_new(
                     request.identity().replacement(),
-                    admission_request(*context, tag),
-                    admission_ticket(*context, tag),
+                    admission_request(*participation, tag),
+                    admission_ticket(*participation, tag),
                 )
                 .unwrap()
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let contexts = admissions
+        let participations = admissions
             .iter()
-            .map(QualifiedWorkerAdmission::context)
+            .map(QualifiedWorkerAdmission::participation)
             .collect();
         QualifiedReplacementReservation::try_new(
             request,
             Box::new(TestIsolationReservation {
                 identity: request.identity(),
-                failed_contexts: request.failed_contexts().iter().copied().collect(),
-                contexts,
+                failed_participations: request.failed_participations().iter().copied().collect(),
+                participations,
                 admissions,
             }),
         )
@@ -6862,54 +6884,57 @@ mod tests {
     }
 
     fn admission_request(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         tag: u8,
-    ) -> novarocks_execution_contract::AcquireQueryContextAdmissionTicket {
-        novarocks_execution_contract::AcquireQueryContextAdmissionTicket::new(
+    ) -> novarocks_execution_contract::AcquireParticipationAdmissionTicket {
+        novarocks_execution_contract::AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([tag; 32]),
             AdmissionEpochCapability::try_from_bytes([tag; 16]).unwrap(),
         )
     }
 
-    fn admission_ticket(context: QueryContextRef, tag: u8) -> QueryContextAdmissionTicketReceipt {
-        QueryContextAdmissionTicketReceipt::new(
+    fn admission_ticket(
+        participation: ParticipationRef,
+        tag: u8,
+    ) -> ParticipationAdmissionTicketReceipt {
+        ParticipationAdmissionTicketReceipt::new(
             AdmissionTicketId::try_from_bytes([tag; 16]).unwrap(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
         )
     }
 
     fn establish_request(
-        context: QueryContextRef,
-        ticket: QueryContextAdmissionTicketReceipt,
+        participation: ParticipationRef,
+        ticket: ParticipationAdmissionTicketReceipt,
         tag: u8,
-    ) -> Arc<novarocks_execution_contract::EstablishQueryContext> {
-        establish_request_with_operation(context, ticket, tag, TaskOperationId::new_v7())
+    ) -> Arc<novarocks_execution_contract::EstablishParticipation> {
+        establish_request_with_operation(participation, ticket, tag, TaskOperationId::new_v7())
     }
 
     fn establish_request_with_operation(
-        context: QueryContextRef,
-        ticket: QueryContextAdmissionTicketReceipt,
+        participation: ParticipationRef,
+        ticket: ParticipationAdmissionTicketReceipt,
         tag: u8,
         operation_id: TaskOperationId,
-    ) -> Arc<novarocks_execution_contract::EstablishQueryContext> {
+    ) -> Arc<novarocks_execution_contract::EstablishParticipation> {
         let content = |offset| {
             Arc::new(FakeContent(ContentFingerprint::from_bytes(
                 [tag + offset; 16],
             ))) as Arc<dyn CodecOwnedContent>
         };
-        Arc::new(novarocks_execution_contract::EstablishQueryContext::new(
+        Arc::new(novarocks_execution_contract::EstablishParticipation::new(
             operation_id,
-            context,
+            participation,
             ticket.ticket_id(),
             content(0),
             content(1),
             content(2),
             CredentialUpdate::new(
-                CredentialLeaseId::new(u64::from(tag)),
+                CredentialDomainId::new(u64::from(tag)),
                 CredentialEpoch::new(1).unwrap(),
                 Arc::new(FakeSecret),
             ),
@@ -6941,9 +6966,9 @@ mod tests {
         .unwrap()
     }
 
-    fn recovery_config_with_contexts(
+    fn recovery_config_with_participations(
         initial_execution: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
         port: Arc<dyn ReplacementQualificationEffectPort>,
         max_attempts: u32,
     ) -> LogicalExecutionActorConfig {
@@ -6951,7 +6976,7 @@ mod tests {
         LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
             initial_execution,
             NonZeroUsize::new(4).unwrap(),
-            contexts,
+            participations,
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroU32::new(max_attempts).unwrap(),
@@ -7192,31 +7217,31 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(877);
         let frontend = FrontendProcessId::new_v7();
-        let context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let abort_port = Arc::new(ClosingMixedAbortPort::new(context, unrelated));
+        let participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(participation, unrelated));
         let abort_submissions = Arc::clone(&abort_port.submissions);
         let (work_owner, stage) = test_governed_work();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             first,
             ExecutionEffect::None,
             NonZeroUsize::new(4).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        .with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(context, 71);
+        let ticket = admission_ticket(participation, 71);
         let admission = running
-            .begin_admission_issue(admission_request(context, 71))
+            .begin_admission_issue(admission_request(participation, 71))
             .await
             .unwrap();
         running
@@ -7233,7 +7258,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(context, ticket, 71),
+                establish_request(participation, ticket, 71),
                 NativeCompatibilityId::new([71; 32]),
             )
             .await
@@ -7266,7 +7291,7 @@ mod tests {
             "query success is not a Worker resource-convergence fact"
         );
         supervisor
-            .observe_worker_stopped_and_context_fenced(context)
+            .observe_worker_stopped_and_participation_fenced(participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -7416,7 +7441,7 @@ mod tests {
         ));
         let submission = submissions.lock().unwrap().pop().unwrap();
         assert_eq!(submission.request().identity().replacement(), second);
-        assert!(submission.request().failed_contexts().is_empty());
+        assert!(submission.request().failed_participations().is_empty());
         qualify(submission);
 
         let permit = activation.await.unwrap();
@@ -7434,26 +7459,26 @@ mod tests {
         let first = execution(811);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let old_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
         let (capacity, _) = watch::channel(0);
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let abort_port = Arc::new(SelectiveAbortPort {
-            blocked: QueryContextRef::new(first, frontend, BackendProcessId::new_v7()),
+            blocked: ParticipationRef::new(first, frontend, BackendProcessId::new_v7()),
             accepted: Arc::clone(&accepted),
             capacity,
         });
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
-            .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let config = recovery_config_with_participations(first, vec![old_participation], port, 2)
+            .with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(old_context, 21);
+        let ticket = admission_ticket(old_participation, 21);
         let admission = running
-            .begin_admission_issue(admission_request(old_context, 21))
+            .begin_admission_issue(admission_request(old_participation, 21))
             .await
             .unwrap();
         running
@@ -7470,7 +7495,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(old_context, ticket, 21),
+                establish_request(old_participation, ticket, 21),
                 NativeCompatibilityId::new([21; 32]),
             )
             .await
@@ -7485,44 +7510,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            submissions.lock().unwrap()[0].request().failed_contexts(),
-            &[old_context]
+            submissions.lock().unwrap()[0]
+                .request()
+                .failed_participations(),
+            &[old_participation]
         );
         qualify(submissions.lock().unwrap().pop().unwrap());
         let successor = actor.activate_replacement(qualification).await.unwrap();
         let successor = actor.activate(successor.ready()).await.unwrap();
         assert_eq!(
             actor
-                .stand_down_snapshot(old_context)
+                .stand_down_snapshot(old_participation)
                 .await
                 .unwrap()
                 .unwrap()
                 .closure(),
-            super::super::ContextClosureState::AwaitingEstablishIssue
+            super::super::ParticipationClosureState::AwaitingEstablishIssue
         );
 
         drop(establish);
         for _ in 0..16 {
             let closure = actor
-                .stand_down_snapshot(old_context)
+                .stand_down_snapshot(old_participation)
                 .await
                 .unwrap()
                 .unwrap()
                 .closure();
-            if closure == super::super::ContextClosureState::Aborting {
+            if closure == super::super::ParticipationClosureState::Aborting {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(&*accepted.lock().unwrap(), &[old_context]);
+        assert_eq!(&*accepted.lock().unwrap(), &[old_participation]);
         assert_eq!(
             actor
-                .stand_down_snapshot(old_context)
+                .stand_down_snapshot(old_participation)
                 .await
                 .unwrap()
                 .unwrap()
                 .closure(),
-            super::super::ContextClosureState::Aborting
+            super::super::ParticipationClosureState::Aborting
         );
         assert_eq!(
             actor.fail_attempt(successor).await.unwrap(),
@@ -7536,15 +7563,20 @@ mod tests {
         let first = execution(812);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let blocked_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let old_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let blocked_participation =
+            ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let abort_port = Arc::new(ClosingMixedAbortPort::new(old_context, blocked_context));
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(
+            old_participation,
+            blocked_participation,
+        ));
         let abort_submissions = Arc::clone(&abort_port.submissions);
-        let mut config = recovery_config_with_contexts(first, vec![old_context], port, 2);
+        let mut config =
+            recovery_config_with_participations(first, vec![old_participation], port, 2);
         config =
-            config.with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+            config.with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         // Result-stream success is not exposed by this actor slice yet. The
         // completion-only test mode reaches the same actor cleanup loop after
         // exercising the real replacement and residual ledgers.
@@ -7554,9 +7586,9 @@ mod tests {
             .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(old_context, 22);
+        let ticket = admission_ticket(old_participation, 22);
         let admission = running
-            .begin_admission_issue(admission_request(old_context, 22))
+            .begin_admission_issue(admission_request(old_participation, 22))
             .await
             .unwrap();
         running
@@ -7573,7 +7605,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(old_context, ticket, 22),
+                establish_request(old_participation, ticket, 22),
                 NativeCompatibilityId::new([22; 32]),
             )
             .await
@@ -7596,12 +7628,12 @@ mod tests {
         );
         assert_eq!(
             actor
-                .stand_down_snapshot(old_context)
+                .stand_down_snapshot(old_participation)
                 .await
                 .unwrap()
                 .unwrap()
                 .closure(),
-            super::super::ContextClosureState::AwaitingEstablishIssue
+            super::super::ParticipationClosureState::AwaitingEstablishIssue
         );
 
         let supervisor = owner.into_residual_stand_down_supervisor();
@@ -7627,9 +7659,9 @@ mod tests {
         .expect("late Establish settlement must start residual Abort");
         assert!(!supervisor.is_finished());
         abort
-            .worker_settled(QueryContextReceipt::new(
-                old_context,
-                QueryContextState::Aborting,
+            .worker_settled(ParticipationReceipt::new(
+                old_participation,
+                ParticipationState::Aborting,
             ))
             .unwrap();
         for _ in 0..16 {
@@ -7640,7 +7672,7 @@ mod tests {
             "Abort acknowledgement is not an actual-stop or process-fence fact"
         );
         supervisor
-            .observe_worker_stopped_and_context_fenced(old_context)
+            .observe_worker_stopped_and_participation_fenced(old_participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -7651,36 +7683,36 @@ mod tests {
 
     async fn assert_initial_attempt_residual_requires_positive_convergence(
         query: i64,
-        worker_state: QueryContextState,
+        worker_state: ParticipationState,
     ) {
         let runtime = Handle::current();
         let first = execution(query);
         let frontend = FrontendProcessId::new_v7();
-        let context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let abort_port = Arc::new(ClosingMixedAbortPort::new(context, unrelated));
+        let participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(participation, unrelated));
         let abort_submissions = Arc::clone(&abort_port.submissions);
         let (work_owner, stage) = test_governed_work();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             first,
             ExecutionEffect::None,
             NonZeroUsize::new(4).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        .with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(context, 51);
+        let ticket = admission_ticket(participation, 51);
         let admission = running
-            .begin_admission_issue(admission_request(context, 51))
+            .begin_admission_issue(admission_request(participation, 51))
             .await
             .unwrap();
         running
@@ -7697,7 +7729,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(context, ticket, 51),
+                establish_request(participation, ticket, 51),
                 NativeCompatibilityId::new([51; 32]),
             )
             .await
@@ -7718,7 +7750,7 @@ mod tests {
         .await
         .expect("failed initial attempt must reach the Abort effect owner");
         abort
-            .worker_settled(QueryContextReceipt::new(context, worker_state))
+            .worker_settled(ParticipationReceipt::new(participation, worker_state))
             .unwrap();
 
         let supervisor = owner.into_residual_stand_down_supervisor();
@@ -7731,7 +7763,7 @@ mod tests {
             "a Worker status without positive stop or process replacement must retain supervision"
         );
         supervisor
-            .observe_worker_stopped_and_context_fenced(context)
+            .observe_worker_stopped_and_participation_fenced(participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -7744,15 +7776,18 @@ mod tests {
     async fn initial_terminal_retained_attempt_remains_residually_supervised() {
         assert_initial_attempt_residual_requires_positive_convergence(
             872,
-            QueryContextState::TerminalRetained,
+            ParticipationState::TerminalRetained,
         )
         .await;
     }
 
     #[tokio::test]
     async fn initial_gone_attempt_remains_residually_supervised() {
-        assert_initial_attempt_residual_requires_positive_convergence(873, QueryContextState::Gone)
-            .await;
+        assert_initial_attempt_residual_requires_positive_convergence(
+            873,
+            ParticipationState::Gone,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -7761,11 +7796,11 @@ mod tests {
         let first = execution(82);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let old_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
-            .with_abort_query_context_effect_port(
+        let config = recovery_config_with_participations(first, vec![old_participation], port, 2)
+            .with_abort_participation_effect_port(
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -7790,9 +7825,9 @@ mod tests {
         let (reply, response) = oneshot::channel();
         actor
             .sender
-            .send(ActorCommand::RegistryContextConverged {
-                context: old_context,
-                convergence: RegistryContextConvergence::WorkerProcessReplaced,
+            .send(ActorCommand::RegistryParticipationConverged {
+                participation: old_participation,
+                convergence: RegistryParticipationConvergence::WorkerProcessReplaced,
                 reply,
             })
             .await
@@ -7814,23 +7849,28 @@ mod tests {
         let first = execution(821);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let old_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let new_participation = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         let qualification_port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&qualification_port.submissions);
-        let config = recovery_config_with_contexts(first, vec![old_context], qualification_port, 2)
-            .with_abort_query_context_effect_port(
-                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
-                NonZeroUsize::new(2).unwrap(),
-            );
+        let config = recovery_config_with_participations(
+            first,
+            vec![old_participation],
+            qualification_port,
+            2,
+        )
+        .with_abort_participation_effect_port(
+            super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        );
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(old_context, 22);
+        let ticket = admission_ticket(old_participation, 22);
         let admission = running
-            .begin_admission_issue(admission_request(old_context, 22))
+            .begin_admission_issue(admission_request(old_participation, 22))
             .await
             .unwrap();
         running
@@ -7847,7 +7887,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(old_context, ticket, 22),
+                establish_request(old_participation, ticket, 22),
                 NativeCompatibilityId::new([22; 32]),
             )
             .await
@@ -7862,7 +7902,7 @@ mod tests {
                 running,
                 AttemptFailureClass::RecoverableInfrastructure,
                 second,
-                vec![new_context],
+                vec![new_participation],
             )
             .await
             .unwrap();
@@ -7874,12 +7914,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(admissions.len(), 1);
-        assert_eq!(admissions[0].context(), new_context);
+        assert_eq!(admissions[0].participation(), new_participation);
         let successor = actor.activate(successor.ready()).await.unwrap();
 
         transport
             .take()
-            .worker_settled(OperationOutcome::ContextConflict)
+            .worker_settled(OperationOutcome::ParticipationConflict)
             .unwrap();
         for _ in 0..16 {
             if actor.snapshot().await.unwrap().establish_error
@@ -7895,7 +7935,7 @@ mod tests {
         );
         let _establish = successor
             .authorize_establish(
-                establish_request(new_context, admissions[0].receipt(), 23),
+                establish_request(new_participation, admissions[0].receipt(), 23),
                 NativeCompatibilityId::new([23; 32]),
             )
             .await
@@ -7911,12 +7951,12 @@ mod tests {
         let runtime = Handle::current();
         let execution = execution(822);
         let frontend = FrontendProcessId::new_v7();
-        let context = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let participation = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
         let (work_owner, stage) = test_governed_work();
         let config = LogicalExecutionActorConfig::single_attempt_read_rows(
             execution,
             NonZeroUsize::new(4).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
@@ -7927,7 +7967,7 @@ mod tests {
         )
         .unwrap()
         .with_result_row_carrier(result_carrier())
-        .with_abort_query_context_effect_port(
+        .with_abort_participation_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         );
@@ -7940,9 +7980,9 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(context, 22);
+        let ticket = admission_ticket(participation, 22);
         let admission = running
-            .begin_admission_issue(admission_request(context, 22))
+            .begin_admission_issue(admission_request(participation, 22))
             .await
             .unwrap();
         running
@@ -7959,7 +7999,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(context, ticket, 22),
+                establish_request(participation, ticket, 22),
                 NativeCompatibilityId::new([22; 32]),
             )
             .await
@@ -7971,7 +8011,7 @@ mod tests {
         );
         transport
             .take()
-            .worker_settled(OperationOutcome::ContextConflict)
+            .worker_settled(OperationOutcome::ParticipationConflict)
             .unwrap();
 
         for _ in 0..16 {
@@ -8016,14 +8056,14 @@ mod tests {
             let runtime = Handle::current();
             let execution = execution(824 + mode);
             let frontend = FrontendProcessId::new_v7();
-            let root_context =
-                QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-            let unused = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+            let root_participation =
+                ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+            let unused = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
             let (work_owner, stage) = test_governed_work();
             let config = LogicalExecutionActorConfig::single_attempt_read_rows(
                 execution,
                 NonZeroUsize::new(4).unwrap(),
-                vec![root_context, unused],
+                vec![root_participation, unused],
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 work_owner,
@@ -8034,7 +8074,7 @@ mod tests {
             )
             .unwrap()
             .with_result_row_carrier(result_carrier())
-            .with_abort_query_context_effect_port(
+            .with_abort_participation_effect_port(
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -8050,13 +8090,13 @@ mod tests {
             let activation = running.identity();
             let mut root_submission = None;
             let mut late = None;
-            for (context, tag) in [(root_context, 24), (unused, 25)] {
-                if context == unused && mode == 0 {
+            for (participation, tag) in [(root_participation, 24), (unused, 25)] {
+                if participation == unused && mode == 0 {
                     continue;
                 }
-                let ticket = admission_ticket(context, tag);
+                let ticket = admission_ticket(participation, tag);
                 let admission = running
-                    .begin_admission_issue(admission_request(context, tag))
+                    .begin_admission_issue(admission_request(participation, tag))
                     .await
                     .unwrap();
                 running
@@ -8073,7 +8113,7 @@ mod tests {
                     .unwrap();
                 let establish = running
                     .authorize_establish(
-                        establish_request(context, ticket, tag),
+                        establish_request(participation, ticket, tag),
                         NativeCompatibilityId::new([tag; 32]),
                     )
                     .await
@@ -8084,7 +8124,7 @@ mod tests {
                     EstablishIssueSubmit::Accepted
                 );
                 let submission = transport.take();
-                if context == root_context {
+                if participation == root_participation {
                     root_submission = Some(submission);
                 } else if mode == 1 {
                     submission.definitely_unsent().unwrap();
@@ -8096,7 +8136,7 @@ mod tests {
                 execution,
                 StageId::new(24).unwrap(),
                 TaskId::new(24).unwrap(),
-                root_context.backend_process_id(),
+                root_participation.backend_process_id(),
             );
             let observer = running.bind_root_result(root).await.unwrap();
             observer
@@ -8107,13 +8147,13 @@ mod tests {
                 .observe_local_root_end(root, result_end(0))
                 .await
                 .unwrap();
-            let fact = ResultContextWithdrawal::new(activation, root, unused);
+            let fact = ResultParticipationWithdrawal::new(activation, root, unused);
             let finish =
                 tokio::spawn(async move { running.finish_result_stream(vec![fact]).await });
             tokio::task::yield_now().await;
             assert!(
                 !finish.is_finished(),
-                "the root context must still have its own Applied receipt"
+                "the root participation must still have its own Applied receipt"
             );
             root_submission
                 .take()
@@ -8136,7 +8176,7 @@ mod tests {
             }
             assert!(
                 !owner.is_finished(),
-                "Client End is not the original physical/context exit"
+                "Client End is not the original physical/participation exit"
             );
             if let Some(late) = late {
                 late.worker_settled(OperationOutcome::Accepted).unwrap();
@@ -8173,12 +8213,12 @@ mod tests {
             drop((stream, observer, actor));
             let residual = owner.into_residual_stand_down_supervisor();
             residual
-                .observe_worker_stopped_and_context_fenced(root_context)
+                .observe_worker_stopped_and_participation_fenced(root_participation)
                 .await
                 .unwrap();
             if mode != 0 {
                 residual
-                    .observe_worker_stopped_and_context_fenced(unused)
+                    .observe_worker_stopped_and_participation_fenced(unused)
                     .await
                     .unwrap();
             }
@@ -8192,19 +8232,19 @@ mod tests {
     #[tokio::test]
     async fn sealed_withdrawal_keeps_late_refusals_but_not_required_or_protocol_vetoes() {
         use super::super::{EstablishIssueState, EstablishWorkerSettlement};
-        // Five ordinary unused-context refusals, then a contradictory original
+        // Five ordinary unused-participation refusals, then a contradictory original
         // receipt and two required-root admission refusals without Establish.
         for mode in 0..8 {
             let execution = execution(840 + mode);
             let frontend = FrontendProcessId::new_v7();
-            let root_context =
-                QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-            let unused = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+            let root_participation =
+                ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+            let unused = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
             let (work_owner, stage) = test_governed_work();
             let config = LogicalExecutionActorConfig::single_attempt_read_rows(
                 execution,
                 NonZeroUsize::new(4).unwrap(),
-                vec![root_context, unused],
+                vec![root_participation, unused],
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 work_owner,
@@ -8215,7 +8255,7 @@ mod tests {
             )
             .unwrap()
             .with_result_row_carrier(result_carrier())
-            .with_abort_query_context_effect_port(
+            .with_abort_participation_effect_port(
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -8235,20 +8275,20 @@ mod tests {
             let mut unused_late = None;
             let mut root_admission = None;
             let mut unused_admission = None;
-            for (context, tag) in [(root_context, 34), (unused, 35)] {
+            for (participation, tag) in [(root_participation, 34), (unused, 35)] {
                 let admission = running
-                    .begin_admission_issue(admission_request(context, tag))
+                    .begin_admission_issue(admission_request(participation, tag))
                     .await
                     .unwrap();
-                if context == root_context && mode >= 6 {
+                if participation == root_participation && mode >= 6 {
                     root_admission = Some(admission);
                     continue;
                 }
-                if context == unused && (2..=4).contains(&mode) {
+                if participation == unused && (2..=4).contains(&mode) {
                     unused_admission = Some(admission);
                     continue;
                 }
-                let ticket = admission_ticket(context, tag);
+                let ticket = admission_ticket(participation, tag);
                 running
                     .settle_admission_issue(
                         admission,
@@ -8261,7 +8301,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let request = establish_request(context, ticket, tag);
+                let request = establish_request(participation, ticket, tag);
                 let establish = running
                     .authorize_establish(
                         Arc::clone(&request),
@@ -8275,10 +8315,10 @@ mod tests {
                     EstablishIssueSubmit::Accepted
                 );
                 let submission = transport.take();
-                if context == root_context {
+                if participation == root_participation {
                     if mode == 5 {
                         root_late = Some(submission.transport_unknown().unwrap());
-                        let replay = running.reauthorize_establish(context).await.unwrap();
+                        let replay = running.reauthorize_establish(participation).await.unwrap();
                         assert_eq!(
                             replay.try_submit(&transport).unwrap(),
                             EstablishIssueSubmit::Accepted
@@ -8300,7 +8340,7 @@ mod tests {
                 execution,
                 StageId::new(34).unwrap(),
                 TaskId::new(34).unwrap(),
-                root_context.backend_process_id(),
+                root_participation.backend_process_id(),
             );
             let observer = running.bind_root_result(root).await.unwrap();
             observer
@@ -8311,13 +8351,13 @@ mod tests {
                 .observe_local_root_end(root, result_end(0))
                 .await
                 .unwrap();
-            let fact = ResultContextWithdrawal::new(activation, root, unused);
+            let fact = ResultParticipationWithdrawal::new(activation, root, unused);
 
             let expected_diagnostic = if let Some(admission) = root_admission.or(unused_admission) {
                 let settlement = if mode == 2 || mode == 6 {
                     AdmissionIssueSettlement::rejected(
                         admission.operation_id(),
-                        OperationOutcome::ContextConflict,
+                        OperationOutcome::ParticipationConflict,
                     )
                     .unwrap()
                 } else {
@@ -8338,7 +8378,7 @@ mod tests {
                 if mode == 1 {
                     late.pre_worker_rejected().unwrap();
                 } else {
-                    late.worker_settled(OperationOutcome::ContextConflict)
+                    late.worker_settled(OperationOutcome::ParticipationConflict)
                         .unwrap();
                 }
                 EstablishIssueError::EstablishRejected
@@ -8360,7 +8400,7 @@ mod tests {
                 // The first root receipt already said Applied. The actual
                 // original late carrier contradicts it: a result withdrawal
                 // must never hide this protocol fault behind the first refusal.
-                late.worker_settled(OperationOutcome::ContextConflict)
+                late.worker_settled(OperationOutcome::ParticipationConflict)
                     .unwrap();
             }
             let finish =
@@ -8374,7 +8414,7 @@ mod tests {
                     .worker_settled(OperationOutcome::Accepted)
                     .unwrap();
                 let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
-                    panic!("the exact unused context must not veto End")
+                    panic!("the exact unused participation must not veto End")
                 };
                 end.complete();
                 assert_eq!(finish.await.unwrap().unwrap(), LogicalConclusion::Succeeded);
@@ -8414,7 +8454,7 @@ mod tests {
                         .unwrap()
                         .state(),
                     EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(
-                        OperationOutcome::ContextConflict
+                        OperationOutcome::ParticipationConflict
                     ))
                 );
             } else if mode == 1 {
@@ -8435,15 +8475,15 @@ mod tests {
             }
             assert!(
                 !owner.is_finished(),
-                "logical End/failure is not physical context exit"
+                "logical End/failure is not physical participation exit"
             );
             drop((stream, observer, actor, root_submission, unused_late));
             let residual = owner.into_residual_stand_down_supervisor();
             // This is the original Registry composite unit-test teardown, not
             // evidence of a Native Worker physical exit.
-            for context in [root_context, unused] {
+            for participation in [root_participation, unused] {
                 residual
-                    .observe_worker_stopped_and_context_fenced(context)
+                    .observe_worker_stopped_and_participation_fenced(participation)
                     .await
                     .unwrap();
             }
@@ -8455,19 +8495,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn result_withdrawal_cannot_exempt_root_foreign_context_or_foreign_activation() {
+    async fn result_withdrawal_cannot_exempt_root_foreign_participation_or_foreign_activation() {
         for mode in 0..3 {
             let runtime = Handle::current();
             let execution = execution(830 + mode);
             let frontend = FrontendProcessId::new_v7();
-            let root_context =
-                QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-            let unused = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+            let root_participation =
+                ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+            let unused = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
             let (work_owner, stage) = test_governed_work();
             let config = LogicalExecutionActorConfig::single_attempt_read_rows(
                 execution,
                 NonZeroUsize::new(4).unwrap(),
-                vec![root_context, unused],
+                vec![root_participation, unused],
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 work_owner,
@@ -8478,7 +8518,7 @@ mod tests {
             )
             .unwrap()
             .with_result_row_carrier(result_carrier())
-            .with_abort_query_context_effect_port(
+            .with_abort_participation_effect_port(
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -8496,7 +8536,7 @@ mod tests {
                 execution,
                 StageId::new(30).unwrap(),
                 TaskId::new(30).unwrap(),
-                root_context.backend_process_id(),
+                root_participation.backend_process_id(),
             );
             let observer = running.bind_root_result(root).await.unwrap();
             observer
@@ -8508,13 +8548,13 @@ mod tests {
                 .await
                 .unwrap();
             let fact = match mode {
-                0 => ResultContextWithdrawal::new(activation, root, root_context),
-                1 => ResultContextWithdrawal::new(
+                0 => ResultParticipationWithdrawal::new(activation, root, root_participation),
+                1 => ResultParticipationWithdrawal::new(
                     activation,
                     root,
-                    QueryContextRef::new(execution, frontend, BackendProcessId::new_v7()),
+                    ParticipationRef::new(execution, frontend, BackendProcessId::new_v7()),
                 ),
-                _ => ResultContextWithdrawal::new(
+                _ => ResultParticipationWithdrawal::new(
                     AttemptActivationIdentity::from_parts(
                         activation.actor().get(),
                         execution,
@@ -8536,7 +8576,7 @@ mod tests {
             );
             assert!(
                 actor
-                    .establish_snapshot(root_context)
+                    .establish_snapshot(root_participation)
                     .await
                     .unwrap()
                     .is_none()
@@ -8558,12 +8598,12 @@ mod tests {
         let runtime = Handle::current();
         let execution = execution(823);
         let frontend = FrontendProcessId::new_v7();
-        let context = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let participation = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
         let (work_owner, stage) = test_governed_work();
         let config = LogicalExecutionActorConfig::single_attempt_read_rows(
             execution,
             NonZeroUsize::new(4).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
@@ -8574,7 +8614,7 @@ mod tests {
         )
         .unwrap()
         .with_result_row_carrier(result_carrier())
-        .with_abort_query_context_effect_port(
+        .with_abort_participation_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         );
@@ -8587,9 +8627,9 @@ mod tests {
         stream.begin_schema().unwrap().complete();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(context, 23);
+        let ticket = admission_ticket(participation, 23);
         let admission = running
-            .begin_admission_issue(admission_request(context, 23))
+            .begin_admission_issue(admission_request(participation, 23))
             .await
             .unwrap();
         running
@@ -8606,7 +8646,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(context, ticket, 23),
+                establish_request(participation, ticket, 23),
                 NativeCompatibilityId::new([23; 32]),
             )
             .await
@@ -9213,7 +9253,7 @@ mod tests {
         let runtime = Handle::current();
         let first = execution(882);
         let second = replacement(first, 2);
-        let failed_context = QueryContextRef::new(
+        let failed_participation = ParticipationRef::new(
             first,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -9224,7 +9264,7 @@ mod tests {
         let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
             first,
             NonZeroUsize::new(4).unwrap(),
-            vec![failed_context],
+            vec![failed_participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroU32::new(2).unwrap(),
@@ -9239,7 +9279,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
         )
         .with_result_row_carrier(result_carrier())
-        .with_abort_query_context_effect_port(
+        .with_abort_participation_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         );
@@ -9286,7 +9326,7 @@ mod tests {
             "work ownership must outlive successor cleanup until the failed Worker converges"
         );
         supervisor
-            .observe_worker_stopped_and_context_fenced(failed_context)
+            .observe_worker_stopped_and_participation_fenced(failed_participation)
             .await
             .unwrap();
         supervisor.join().await.unwrap();
@@ -9456,22 +9496,22 @@ mod tests {
         let first = execution(874);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let old_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let abort_port = Arc::new(ClosingMixedAbortPort::new(old_context, unrelated));
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(old_participation, unrelated));
         let abort_submissions = Arc::clone(&abort_port.submissions);
-        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
-            .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let config = recovery_config_with_participations(first, vec![old_participation], port, 2)
+            .with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(old_context, 61);
+        let ticket = admission_ticket(old_participation, 61);
         let admission = running
-            .begin_admission_issue(admission_request(old_context, 61))
+            .begin_admission_issue(admission_request(old_participation, 61))
             .await
             .unwrap();
         running
@@ -9488,7 +9528,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request(old_context, ticket, 61),
+                establish_request(old_participation, ticket, 61),
                 NativeCompatibilityId::new([61; 32]),
             )
             .await
@@ -9540,9 +9580,9 @@ mod tests {
         .await
         .expect("the old attempt must remain under Abort supervision");
         abort
-            .worker_settled(QueryContextReceipt::new(
-                old_context,
-                QueryContextState::TerminalRetained,
+            .worker_settled(ParticipationReceipt::new(
+                old_participation,
+                ParticipationState::TerminalRetained,
             ))
             .unwrap();
         let supervisor = owner.into_residual_stand_down_supervisor();
@@ -9552,7 +9592,7 @@ mod tests {
         }
         assert!(!supervisor.is_finished());
         supervisor
-            .observe_worker_stopped_and_context_fenced(old_context)
+            .observe_worker_stopped_and_participation_fenced(old_participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -9562,12 +9602,12 @@ mod tests {
     }
 
     #[test]
-    fn qualified_worker_admission_rejects_a_foreign_receipt_context() {
+    fn qualified_worker_admission_rejects_a_foreign_receipt_participation() {
         let first = execution(864);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let expected = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
-        let foreign = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let expected = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
+        let foreign = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         assert_eq!(
             QualifiedWorkerAdmission::try_new(
                 second,
@@ -9727,21 +9767,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_reservation_rejects_incorrect_failed_context_proof() {
+    async fn replacement_reservation_rejects_incorrect_failed_participation_proof() {
         let runtime = Handle::current();
         let first = execution(871);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let failed_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let foreign_failed_context =
-            QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let failed_participation =
+            ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let foreign_failed_participation =
+            ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let config = recovery_config_with_contexts(first, vec![failed_context], port, 2)
-            .with_abort_query_context_effect_port(
-                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
-                NonZeroUsize::new(2).unwrap(),
-            );
+        let config =
+            recovery_config_with_participations(first, vec![failed_participation], port, 2)
+                .with_abort_participation_effect_port(
+                    super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+                    NonZeroUsize::new(2).unwrap(),
+                );
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
@@ -9763,8 +9805,8 @@ mod tests {
                 request,
                 Box::new(TestIsolationReservation {
                     identity: request.identity(),
-                    failed_contexts: BTreeSet::from([foreign_failed_context]),
-                    contexts: BTreeSet::new(),
+                    failed_participations: BTreeSet::from([foreign_failed_participation]),
+                    participations: BTreeSet::new(),
                     admissions: Vec::new().into_boxed_slice(),
                 }),
             )
@@ -9776,12 +9818,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_replacement_contexts_fail_and_conclude_the_consumed_attempt() {
+    async fn duplicate_replacement_participations_fail_and_conclude_the_consumed_attempt() {
         let runtime = Handle::current();
         let first = execution(876);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let duplicate = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let duplicate = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let (owner, initial, _output) =
             spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2))
@@ -9960,7 +10002,7 @@ mod tests {
         let first = execution(875);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let new_participation = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
         let (owner, initial, _output) =
@@ -9974,7 +10016,7 @@ mod tests {
                 running,
                 AttemptFailureClass::RecoverableInfrastructure,
                 second,
-                vec![new_context],
+                vec![new_participation],
             )
             .await
             .unwrap();
@@ -9998,7 +10040,7 @@ mod tests {
             .unwrap()
             .expect("a cancelled receiver must not consume the move-only admission bundle");
         assert_eq!(admissions.len(), 1);
-        assert_eq!(admissions[0].context(), new_context);
+        assert_eq!(admissions[0].participation(), new_participation);
         drop(successor);
         wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
         drop(owner);
@@ -10010,10 +10052,10 @@ mod tests {
         let first = execution(878);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let new_participation = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let mut config = recovery_config(first, port, 2).with_abort_query_context_effect_port(
+        let mut config = recovery_config(first, port, 2).with_abort_participation_effect_port(
             super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         );
@@ -10028,7 +10070,7 @@ mod tests {
                 running,
                 AttemptFailureClass::RecoverableInfrastructure,
                 second,
-                vec![new_context],
+                vec![new_participation],
             )
             .await
             .unwrap();
@@ -10036,8 +10078,8 @@ mod tests {
         let request = submission.request();
         let admission = QualifiedWorkerAdmission::try_new(
             second,
-            admission_request(new_context, 81),
-            admission_ticket(new_context, 81),
+            admission_request(new_participation, 81),
+            admission_ticket(new_participation, 81),
         )
         .unwrap();
         let finished = Arc::new(AtomicUsize::new(0));
@@ -10046,8 +10088,8 @@ mod tests {
             request,
             Box::new(LifecycleIsolationReservation {
                 identity: request.identity(),
-                failed_contexts: BTreeSet::new(),
-                contexts: BTreeSet::from([new_context]),
+                failed_participations: BTreeSet::new(),
+                participations: BTreeSet::from([new_participation]),
                 admissions: vec![admission].into_boxed_slice(),
                 finished: Arc::clone(&finished),
                 abandoned: Arc::clone(&abandoned),
@@ -10064,7 +10106,7 @@ mod tests {
         let successor = actor.activate(successor.ready()).await.unwrap();
         let establish = successor
             .authorize_establish(
-                establish_request(new_context, admissions[0].receipt(), 81),
+                establish_request(new_participation, admissions[0].receipt(), 81),
                 NativeCompatibilityId::new([81; 32]),
             )
             .await
@@ -10099,7 +10141,7 @@ mod tests {
         assert!(!supervisor.is_finished());
         assert_eq!(finished.load(Ordering::SeqCst), 0);
         supervisor
-            .observe_worker_stopped_and_context_fenced(new_context)
+            .observe_worker_stopped_and_participation_fenced(new_participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -11864,18 +11906,19 @@ mod tests {
     }
 
     #[test]
-    fn one_backpressured_context_does_not_block_other_abort_issues() {
+    fn one_backpressured_participation_does_not_block_other_abort_issues() {
         let execution = execution(10);
         let frontend = FrontendProcessId::new_v7();
-        let blocked = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-        let reachable = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-        let contexts = BTreeSet::from([blocked, reachable]);
+        let blocked = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+        let reachable = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+        let participations = BTreeSet::from([blocked, reachable]);
         let mut stand_down =
-            ContextStandDownLedger::new(contexts, NonZeroUsize::new(2).unwrap()).unwrap();
+            ParticipationStandDownLedger::new(participations, NonZeroUsize::new(2).unwrap())
+                .unwrap();
         stand_down
             .begin(
                 AttemptActivationIdentity::from_parts(17, execution, 1),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (blocked, super::super::EstablishStandDownFact::AbortRequired),
                     (
@@ -11910,7 +11953,7 @@ mod tests {
         assert!(backpressured);
         assert_eq!(
             stand_down.snapshot(reachable).unwrap().closure(),
-            super::super::ContextClosureState::Aborting
+            super::super::ParticipationClosureState::Aborting
         );
     }
 
@@ -11919,24 +11962,28 @@ mod tests {
         let first = execution(101);
         let second = replacement(first, 2);
         let frontend = FrontendProcessId::new_v7();
-        let blocked = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
-        let reachable = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let blocked = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
+        let reachable = ParticipationRef::new(second, frontend, BackendProcessId::new_v7());
         let first_activation = AttemptActivationIdentity::from_parts(17, first, 1);
         let second_activation = AttemptActivationIdentity::from_parts(17, second, 2);
-        let make_attempt = |activation, context| {
-            let contexts = BTreeSet::from([context]);
+        let make_attempt = |activation, participation| {
+            let participations = BTreeSet::from([participation]);
             let establish = EstablishIssueLedger::new(
-                contexts.clone(),
+                participations.clone(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
             );
             let mut stand_down =
-                ContextStandDownLedger::new(contexts, NonZeroUsize::new(2).unwrap()).unwrap();
+                ParticipationStandDownLedger::new(participations, NonZeroUsize::new(2).unwrap())
+                    .unwrap();
             stand_down
                 .begin(
                     activation,
-                    ContextStandDownCause::LogicalExecutionFailed,
-                    [(context, super::super::EstablishStandDownFact::AbortRequired)],
+                    ParticipationStandDownCause::LogicalExecutionFailed,
+                    [(
+                        participation,
+                        super::super::EstablishStandDownFact::AbortRequired,
+                    )],
                 )
                 .unwrap();
             AttemptLedgers {
@@ -11957,7 +12004,7 @@ mod tests {
             (second, make_attempt(second_activation, reachable)),
         ]);
         attempts.get_mut(&first).unwrap().stand_down_error =
-            Some(ContextStandDownError::WrongState);
+            Some(ParticipationStandDownError::WrongState);
         let (capacity, _) = watch::channel(0);
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let port = SelectiveAbortPort {
@@ -11975,7 +12022,7 @@ mod tests {
         .unwrap();
         let first_capability = state.attempt_capability(first).unwrap();
         state.mark_running(&first_capability).unwrap();
-        let mut global_error = Some(ContextStandDownError::WrongState);
+        let mut global_error = Some(ParticipationStandDownError::WrongState);
 
         synchronize_all_stand_down(
             &state,
@@ -11993,8 +12040,8 @@ mod tests {
         let runtime = Handle::current();
         let execution = execution(102);
         let frontend = FrontendProcessId::new_v7();
-        let unknown = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
-        let blocked = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let unknown = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+        let blocked = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
         let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
         let port = Arc::new(ClosingMixedAbortPort::new(unknown, blocked));
         let (work_owner, stage) = test_governed_work();
@@ -12009,16 +12056,16 @@ mod tests {
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(port.clone(), NonZeroUsize::new(2).unwrap())
+        .with_abort_participation_effect_port(port.clone(), NonZeroUsize::new(2).unwrap())
         .with_clock(clock.clone());
         let (owner, initial, _output) = spawn_logical_execution_actor(&runtime, config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        for (context, tag) in [(unknown, 31), (blocked, 32)] {
+        for (participation, tag) in [(unknown, 31), (blocked, 32)] {
             let issue = running
-                .begin_admission_issue(admission_request(context, tag))
+                .begin_admission_issue(admission_request(participation, tag))
                 .await
                 .unwrap();
             running
@@ -12027,7 +12074,7 @@ mod tests {
                     AdmissionIssueSettlement::applied(
                         issue.operation_id(),
                         OperationOutcome::Accepted,
-                        admission_ticket(context, tag),
+                        admission_ticket(participation, tag),
                     )
                     .unwrap(),
                 )
@@ -12048,14 +12095,14 @@ mod tests {
             }
         })
         .await
-        .expect("the accepted context must reach the Abort effect owner");
-        assert_eq!(submission.identity().context(), unknown);
+        .expect("the accepted participation must reach the Abort effect owner");
+        assert_eq!(submission.identity().participation(), unknown);
         let _late = submission.transport_unknown().unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = actor.stand_down_snapshot(unknown).await.unwrap().unwrap();
                 if snapshot.issue_state()
-                    == Some(super::super::AbortQueryContextIssueState::TransportUnknown)
+                    == Some(super::super::AbortParticipationIssueState::TransportUnknown)
                 {
                     break;
                 }
@@ -12069,7 +12116,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if actor.snapshot().await.unwrap().stand_down_error
-                    == Some(ContextStandDownError::EffectCapacityClosed)
+                    == Some(ParticipationStandDownError::EffectCapacityClosed)
                 {
                     break;
                 }
@@ -12088,7 +12135,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             snapshot.stand_down_error,
-            Some(ContextStandDownError::EffectCapacityClosed)
+            Some(ParticipationStandDownError::EffectCapacityClosed)
         );
         let residual = tokio::time::timeout(
             Duration::from_millis(250),
@@ -12100,7 +12147,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             residual.issue_state(),
-            Some(super::super::AbortQueryContextIssueState::TransportUnknown)
+            Some(super::super::AbortParticipationIssueState::TransportUnknown)
         );
         assert_eq!(
             port.reserve_calls.load(Ordering::SeqCst),
@@ -12113,18 +12160,18 @@ mod tests {
     {
         let first = execution(12_170);
         let second = replacement(first, 2);
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             first,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
         let (input, witness, failure) =
-            crate::api::pre_ready_identity_refusal_test_fixture(context);
+            crate::api::pre_ready_identity_refusal_test_fixture(participation);
         let original = failure.error().clone();
         let port = Arc::new(DelayedQualificationPort::default());
         let submissions = Arc::clone(&port.submissions);
-        let config = recovery_config_with_contexts(first, vec![context], port, 2)
-            .with_abort_query_context_effect_port(
+        let config = recovery_config_with_participations(first, vec![participation], port, 2)
+            .with_abort_participation_effect_port(
                 super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -12139,9 +12186,9 @@ mod tests {
         };
         stream.begin_schema().unwrap().complete();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = admission_ticket(context, 73);
+        let ticket = admission_ticket(participation, 73);
         let admission = running
-            .begin_admission_issue(admission_request(context, 73))
+            .begin_admission_issue(admission_request(participation, 73))
             .await
             .unwrap();
         running
@@ -12158,7 +12205,7 @@ mod tests {
             .unwrap();
         let establish = running
             .authorize_establish(
-                establish_request_with_operation(context, ticket, 73, witness.operation_id()),
+                establish_request_with_operation(participation, ticket, 73, witness.operation_id()),
                 NativeCompatibilityId::new([73; 32]),
             )
             .await
@@ -12170,7 +12217,7 @@ mod tests {
         );
         let submission = transport.take();
         assert_eq!(submission.identity().operation_id(), witness.operation_id());
-        assert_eq!(submission.identity().context(), context);
+        assert_eq!(submission.identity().participation(), participation);
         submission
             .worker_settled(OperationOutcome::IdentityMismatch)
             .unwrap();
@@ -12207,10 +12254,10 @@ mod tests {
         };
         assert_eq!(observed, original);
         assert_eq!(observed.execution_failure(), Some(&input));
-        // This fixture's exact Worker is stopped and its admission/context
+        // This fixture's exact Worker is stopped and its admission/participation
         // fenced. Logical failure alone is not original Root convergence.
         residual
-            .observe_worker_stopped_and_context_fenced(context)
+            .observe_worker_stopped_and_participation_fenced(participation)
             .await
             .unwrap();
         drop((qualification, stream, actor));
@@ -12227,21 +12274,21 @@ mod tests {
         use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
         for recovery in [false, true] {
             for outcome in [
-                OperationOutcome::ContextConflict,
+                OperationOutcome::ParticipationConflict,
                 OperationOutcome::Accepted,
                 OperationOutcome::IdentityMismatch,
             ] {
                 let applied = outcome == OperationOutcome::Accepted;
                 let first = execution(if recovery { 12_181 } else { 12_180 });
-                let context = QueryContextRef::new(
+                let participation = ParticipationRef::new(
                     first,
                     FrontendProcessId::new_v7(),
                     BackendProcessId::new_v7(),
                 );
                 let config = if recovery {
-                    recovery_config_with_contexts(
+                    recovery_config_with_participations(
                         first,
-                        vec![context],
+                        vec![participation],
                         Arc::new(DelayedQualificationPort::default()),
                         2,
                     )
@@ -12250,7 +12297,7 @@ mod tests {
                     LogicalExecutionActorConfig::single_attempt_read_rows(
                         first,
                         NonZeroUsize::new(4).unwrap(),
-                        vec![context],
+                        vec![participation],
                         NonZeroUsize::new(2).unwrap(),
                         NonZeroUsize::new(2).unwrap(),
                         work_owner,
@@ -12261,7 +12308,7 @@ mod tests {
                     )
                     .unwrap()
                 }
-                .with_abort_query_context_effect_port(
+                .with_abort_participation_effect_port(
                     super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
                     NonZeroUsize::new(2).unwrap(),
                 );
@@ -12272,16 +12319,17 @@ mod tests {
                 let actor = owner.actor().clone();
                 let running = actor.activate(initial.ready()).await.unwrap();
                 let drive = super::super::NativeAttemptDrive::new(&running);
-                let (unissued, _, _) = crate::api::pre_ready_identity_refusal_test_fixture(context);
+                let (unissued, _, _) =
+                    crate::api::pre_ready_identity_refusal_test_fixture(participation);
                 assert!(
                     !drive
                         .may_observe_pre_ready_replacement(&unissued)
                         .await
                         .unwrap()
                 );
-                let ticket = admission_ticket(context, 72);
+                let ticket = admission_ticket(participation, 72);
                 let admission = drive
-                    .begin_admission_issue(admission_request(context, 72))
+                    .begin_admission_issue(admission_request(participation, 72))
                     .await
                     .unwrap();
                 drive
@@ -12296,26 +12344,26 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let request = establish_request(context, ticket, 72);
+                let request = establish_request(participation, ticket, 72);
                 let input = ExecutionFailureInput::new(
                     unissued.fact(),
                     unissued.detail().clone(),
                     ExecutionFailureSite::Operation {
-                        context,
+                        participation,
                         operation_id: request.envelope().operation_id(),
-                        kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                        kind: novarocks_execution_contract::OperationKind::UpdateParticipation,
                     },
                 );
                 let create_input = ExecutionFailureInput::new(
                     unissued.fact(),
                     unissued.detail().clone(),
                     ExecutionFailureSite::Operation {
-                        context,
+                        participation,
                         operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
                         kind: novarocks_execution_contract::OperationKind::CreateTask,
                     },
                 );
-                // An admission ticket alone does not prove the parent context.
+                // An admission ticket alone does not prove the parent participation.
                 assert!(
                     !drive
                         .may_observe_pre_ready_replacement(&create_input)
@@ -12333,7 +12381,7 @@ mod tests {
                 );
                 let submission = transport.take();
                 let issued_identity = submission.identity();
-                assert_eq!(issued_identity.context(), context);
+                assert_eq!(issued_identity.participation(), participation);
                 assert_eq!(
                     issued_identity.operation_id(),
                     match input.site() {
@@ -12343,7 +12391,7 @@ mod tests {
                 );
                 assert_eq!(
                     actor
-                        .establish_snapshot(context)
+                        .establish_snapshot(participation)
                         .await
                         .unwrap()
                         .unwrap()
@@ -12362,7 +12410,7 @@ mod tests {
                 assert_eq!(late.identity(), issued_identity);
                 assert_eq!(
                     actor
-                        .establish_snapshot(context)
+                        .establish_snapshot(participation)
                         .await
                         .unwrap()
                         .unwrap()
@@ -12401,16 +12449,16 @@ mod tests {
                         .unwrap(),
                     recovery && (applied || outcome == OperationOutcome::IdentityMismatch),
                 );
-                let foreign_context = QueryContextRef::new(
+                let foreign_participation = ParticipationRef::new(
                     first,
                     FrontendProcessId::new_v7(),
-                    context.backend_process_id(),
+                    participation.backend_process_id(),
                 );
                 let foreign_create = ExecutionFailureInput::new(
                     create_input.fact(),
                     create_input.detail().clone(),
                     ExecutionFailureSite::Operation {
-                        context: foreign_context,
+                        participation: foreign_participation,
                         operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
                         kind: novarocks_execution_contract::OperationKind::CreateTask,
                     },
@@ -12433,12 +12481,12 @@ mod tests {
                 drop((drive, actor, output));
                 let residual = owner.into_residual_stand_down_supervisor();
                 residual
-                    .observe_worker_stopped_and_context_fenced(context)
+                    .observe_worker_stopped_and_participation_fenced(participation)
                     .await
                     .unwrap();
                 tokio::time::timeout(Duration::from_secs(1), residual.join())
                     .await
-                    .expect("the actual actor and original context converge")
+                    .expect("the actual actor and original participation converge")
                     .unwrap();
             }
         }
@@ -12447,19 +12495,20 @@ mod tests {
     #[tokio::test]
     async fn begin_replacement_drains_the_same_late_parent_refusal_before_final_acceptance() {
         let first = execution(12_182);
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             first,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
         let (input, witness, failure) =
             crate::api::pre_ready_identity_refusal_test_fixture_for_kind(
-                context,
+                participation,
                 novarocks_execution_contract::OperationKind::CreateTask,
             );
         let original = failure.error().clone();
         let port = Arc::new(DelayedQualificationPort::default());
-        let mut config = recovery_config_with_contexts(first, vec![context], port.clone(), 2);
+        let mut config =
+            recovery_config_with_participations(first, vec![participation], port.clone(), 2);
         let scope = config.work_owner.as_ref().unwrap().scope();
         let cancellation = scope.cancellation().unwrap();
         let clock = ManualActorClock::new(MonotonicInstant::ORIGIN);
@@ -12479,18 +12528,22 @@ mod tests {
         // consume the queued late receipt before BeginReplacement's drain.
         let mut attempt = new_attempt_ledgers(
             activation,
-            BTreeSet::from([context]),
-            config.max_admission_issues_per_context,
-            config.max_establish_authorizations_per_context,
-            config.max_abort_authorizations_per_context,
+            BTreeSet::from([participation]),
+            config.max_admission_issues_per_participation,
+            config.max_establish_authorizations_per_participation,
+            config.max_abort_authorizations_per_participation,
             None,
             &scope,
         )
         .unwrap();
-        let ticket = admission_ticket(context, 74);
+        let ticket = admission_ticket(participation, 74);
         let admission = attempt
             .establish
-            .begin_admission_issue(activation, admission_request(context, 74), clock.now())
+            .begin_admission_issue(
+                activation,
+                admission_request(participation, 74),
+                clock.now(),
+            )
             .unwrap();
         attempt
             .establish
@@ -12506,7 +12559,7 @@ mod tests {
                 clock.now(),
             )
             .unwrap();
-        let request = establish_request(context, ticket, 74);
+        let request = establish_request(participation, ticket, 74);
         let operation_id = request.envelope().operation_id();
         let issue = attempt
             .establish
@@ -12524,13 +12577,13 @@ mod tests {
         );
         let submission = transport.take();
         let parent_identity = submission.identity();
-        assert_eq!(parent_identity.context(), context);
+        assert_eq!(parent_identity.participation(), participation);
         assert_eq!(parent_identity.operation_id(), operation_id);
         let late = submission.transport_unknown().unwrap();
         assert_eq!(late.identity(), parent_identity);
         attempt.establish.drain_events().unwrap();
         assert_eq!(
-            attempt.establish.snapshot(context).unwrap().state(),
+            attempt.establish.snapshot(participation).unwrap().state(),
             super::super::EstablishIssueState::TransportUnknown,
         );
         let mut attempts = BTreeMap::from([(first, attempt)]);
@@ -12582,7 +12635,7 @@ mod tests {
         // The exact transport's late result is queued after opportunity was
         // observed. The snapshot is still Unknown until the original handler
         // drains it while preparing this same attempt's stand-down.
-        late.worker_settled(OperationOutcome::ContextConflict)
+        late.worker_settled(OperationOutcome::ParticipationConflict)
             .unwrap();
         assert!(pre_ready_refusal_matches_establish(
             &attempts, activation, &input
@@ -12606,7 +12659,7 @@ mod tests {
                 pre_ready_replacement: Some(witness),
                 terminal_error: Some(original.clone()),
                 replacement: replacement(first, 2),
-                replacement_contexts: Vec::new(),
+                replacement_participations: Vec::new(),
                 reply,
             },
         );
@@ -12617,13 +12670,13 @@ mod tests {
             ))
         ));
         assert_eq!(state.conclusion(), Some(LogicalConclusion::Failed));
-        let snapshot = attempts[&first].establish.snapshot(context).unwrap();
+        let snapshot = attempts[&first].establish.snapshot(participation).unwrap();
         assert_eq!(snapshot.identity(), Some(parent_identity));
         assert_eq!(
             snapshot.state(),
             super::super::EstablishIssueState::WorkerSettled(
                 super::super::EstablishWorkerSettlement::Rejected(
-                    OperationOutcome::ContextConflict
+                    OperationOutcome::ParticipationConflict
                 ),
             )
         );
@@ -12651,14 +12704,14 @@ mod tests {
         assert_eq!(observed.execution_failure(), Some(&input));
 
         // No real Worker is spawned by this fixture. Its original Registry
-        // owner supplies the exact stopped/context-fenced fact for cleanup.
+        // owner supplies the exact stopped/participation-fenced fact for cleanup.
         attempts
             .get_mut(&first)
             .unwrap()
             .stand_down
             .observe_registry_convergence(
-                context,
-                RegistryContextConvergence::WorkerStoppedAndContextFenced,
+                participation,
+                RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced,
             )
             .unwrap();
         synchronize_all_stand_down(

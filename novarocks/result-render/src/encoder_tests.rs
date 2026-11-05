@@ -119,13 +119,13 @@ fn actual_scratch_capacity_layout() {
         size_of::<[u8; 65536]>(),
         size_of::<[u32; 4096]>(),
         e.cursor.stack.capacity(),
-        size_of::<Task>(),
-        e.cursor.stack.capacity() * size_of::<Task>(),
+        size_of::<EncodeStep>(),
+        e.cursor.stack.capacity() * size_of::<EncodeStep>(),
         size_of::<ArrowClientRowEncoder>()
     );
     assert_eq!(
         capacity,
-        size_of::<ArrowClientRowEncoder>() + 65536 + 16384 + 196 * size_of::<Task>()
+        size_of::<ArrowClientRowEncoder>() + 65536 + 16384 + 196 * size_of::<EncodeStep>()
     );
     assert!(capacity < 2 * 1024 * 1024);
 }

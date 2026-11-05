@@ -29,7 +29,7 @@ mod profile_snapshot_tests {
     use novarocks_execution_contract::root_result::RootResultEnd;
     use novarocks_query_application::api::{ComputationObservationBudgets, QueryExecutionKind};
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, LogicalExecutionActorConfig,
+        AbortParticipationEffectPort, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::preparation::{
         CompletedPhysicalPlanCandidate, ExecutionResourceRequirements, FrozenCostEstimate,
@@ -159,7 +159,7 @@ mod profile_snapshot_tests {
         let (mut round, acks, release, clock, establish_facts) =
             crate::task_execution::tests::manifest_normal_release_ack_with_actor_facts_fixture();
         let root_task = round.root_task();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let cut = clock.now();
         let diagnostic_budget = Duration::from_millis(10);
         let convergence_budget = Duration::from_secs(60);
@@ -193,15 +193,15 @@ mod profile_snapshot_tests {
             root_task.query_execution_id(),
             ExecutionEffect::None,
             NonZeroUsize::new(8).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             governed.owner,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(
-            abort as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            abort as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
         let mut logical = LogicalExecutionTestHarness::install_internal(
@@ -212,7 +212,7 @@ mod profile_snapshot_tests {
             Arc::clone(&clock) as Arc<dyn MonotonicClock>,
             ComputationObservationBudgets::new(diagnostic_budget, convergence_budget),
             root_task.query_execution_id(),
-            vec![context],
+            vec![participation],
         )
         .unwrap();
         let activation = logical.activate_initial().await.unwrap();
@@ -338,26 +338,26 @@ mod profile_snapshot_tests {
             let no_snapshot_after_rebegin = observer.current(ready).unwrap().is_none();
             let original_deadline_after_rebegin = collector.observation_deadline();
 
-            let OperationIntent::ReleaseQueryContext(request) = &release else {
+            let OperationIntent::ReleaseParticipation(request) = &release else {
                 unreachable!()
             };
             let original_contribution =
                 crate::task_execution::tests::fixture_runtime_filter_contribution();
             acks.publish(OperationAcknowledgement::new(
                 release.operation_id(),
-                OperationKind::ReleaseQueryContext,
+                OperationKind::ReleaseParticipation,
                 OperationOutcome::Accepted,
                 AckPayload::Release {
-                    receipt: QueryContextReceipt::new(
-                        request.context(),
-                        QueryContextState::TerminalRetained,
+                    receipt: ParticipationReceipt::new(
+                        request.participation(),
+                        ParticipationState::TerminalRetained,
                     ),
                     outcome: ReleaseOutcome::Released,
                     runtime_filter: Some(original_contribution.clone()),
                 },
             ));
             round.turn().unwrap();
-            publish_exit(&mut round, context);
+            publish_exit(&mut round, participation);
             // A test-only watchdog drops only this borrowing wait on failure;
             // the same collector/round/owner remain in this fixture's stack.
             let result = tokio::time::timeout(
@@ -376,7 +376,7 @@ mod profile_snapshot_tests {
             // Finish the original actor before checking the captured cut facts.
             logical.abandon_running_attempt();
             logical
-                .observe_worker_stopped_and_context_fenced(context)
+                .observe_worker_stopped_and_participation_fenced(participation)
                 .await
                 .unwrap();
             logical
@@ -419,7 +419,7 @@ mod profile_snapshot_tests {
             assert!(snapshot.runtime_filters.is_complete());
             assert_eq!(
                 snapshot.runtime_filters.contributions(),
-                &[(context.backend_process_id(), original_contribution)]
+                &[(participation.backend_process_id(), original_contribution)]
             );
             assert!(matches!(
                 snapshot.split,
@@ -570,17 +570,17 @@ mod profile_snapshot_tests {
         assert_eq!(owner.remote_deadline, Some(remote_deadline));
         assert!(owner.remote_closure.is_none());
 
-        let OperationIntent::ReleaseQueryContext(request) = &release else {
+        let OperationIntent::ReleaseParticipation(request) = &release else {
             unreachable!()
         };
         acks.publish(OperationAcknowledgement::new(
             release.operation_id(),
-            OperationKind::ReleaseQueryContext,
+            OperationKind::ReleaseParticipation,
             OperationOutcome::Accepted,
             AckPayload::Release {
-                receipt: QueryContextReceipt::new(
-                    request.context(),
-                    QueryContextState::TerminalRetained,
+                receipt: ParticipationReceipt::new(
+                    request.participation(),
+                    ParticipationState::TerminalRetained,
                 ),
                 outcome: ReleaseOutcome::Released,
                 runtime_filter: Some(
@@ -589,7 +589,7 @@ mod profile_snapshot_tests {
             },
         ));
         round.turn().unwrap();
-        publish_exit(&mut round, context);
+        publish_exit(&mut round, participation);
         assert!(round.attempt_drained());
         assert!(round.pumps_closed());
         assert!(!collector.is_closed());
@@ -650,7 +650,7 @@ mod profile_snapshot_tests {
         // Collect the actor/registry's real teardown before reporting assertions.
         logical.abandon_running_attempt();
         logical
-            .observe_worker_stopped_and_context_fenced(context)
+            .observe_worker_stopped_and_participation_fenced(participation)
             .await
             .unwrap();
         logical

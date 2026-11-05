@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+use novarocks_execution::runtime::task::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 
 use crate::native_ingress::NativeIngressOwnership;

@@ -55,7 +55,7 @@ pub(crate) struct PipelineObserver {
     observable: Weak<Observable>,
     key: DriverKey,
     driver_id: i32,
-    fragment_instance_id: Option<(i64, i64)>,
+    task_key: Option<(i64, i64)>,
 }
 
 impl PipelineObserver {
@@ -64,14 +64,14 @@ impl PipelineObserver {
         observable: Weak<Observable>,
         key: DriverKey,
         driver_id: i32,
-        fragment_instance_id: Option<(i64, i64)>,
+        task_key: Option<(i64, i64)>,
     ) -> Self {
         Self {
             scheduler,
             observable,
             key,
             driver_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 
@@ -97,8 +97,8 @@ impl PipelineObserver {
             scheduler.enqueue_observable(self.key, &self.observable, observable.generation());
         } else if should_log_observer(&OBSERVER_NOT_BLOCKED_LOG_COUNT) {
             debug!(
-                "Observer update dropped: scheduler already released; finst={:?} driver_id={} event={}",
-                self.fragment_instance_id, self.driver_id, event
+                "Observer update dropped: scheduler already released; task_key={:?} driver_id={} event={}",
+                self.task_key, self.driver_id, event
             );
         }
     }

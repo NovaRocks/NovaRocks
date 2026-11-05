@@ -19,22 +19,22 @@ use super::*;
 use crate::control_runtime::actors::tests::{Fixture, actor, initial_establishment, operation};
 use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass};
 use novarocks_worker_protocol::{
-    context::{ContextInput, EstablishReplayRequest, EstablishReplayResult},
-    creation::RequestContext,
+    creation::RequestReplyTag,
     lease::MonotonicInstant,
+    participation::{EstablishReplayRequest, EstablishReplayResult, ParticipationInput},
 };
 use std::time::Duration;
 
 #[test]
-fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_tokens() {
+fn participation_control_handoffs_keep_core_order_across_batches_and_reverse_request_tokens() {
     let f = Fixture::new();
     let initial = initial_establishment();
-    // These are correlation values from the requesting actor, not Context
-    // inputs or Context Work authority. Their numeric order is irrelevant.
+    // These are correlation values from the requesting actor, not Participation
+    // inputs or Participation Work authority. Their numeric order is irrelevant.
     // This component has no Root actor: its two Root R references are plain
     // monotonically issued correlation facts, never runtime author proofs.
     let requests = [(900, 1), (100, 2)].map(|(token, root_work)| EstablishReplayRequest {
-        request: RequestContext {
+        request: RequestReplyTag {
             token: InputId::new(token).unwrap(),
             author: novarocks_control_runtime_core::identity::ScopedWorkRef {
                 scope: novarocks_control_runtime_core::identity::ScopeId::new(7001).unwrap(),
@@ -49,8 +49,8 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
     });
     let inputs = requests.map(|request| {
         f.send(
-            ContextInput::ProbeEstablish {
-                context: f.identity,
+            ParticipationInput::ProbeEstablish {
+                participation: f.identity,
                 request,
                 comparison: None,
             },
@@ -60,10 +60,10 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
         )
     });
     f.runtime.poll_one(Tick(2)).unwrap();
-    let mut dispatch = EffectDispatch::context(
+    let mut dispatch = EffectDispatch::participation(
         f.runtime.clone(),
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 2,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS * 2,
     );
     let indexed = dispatch.index_committed(&f.runtime, 32).unwrap();
     let first = dispatch.take_ready(&f.runtime, 8).unwrap().unwrap();
@@ -72,12 +72,12 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
         action: first.descriptor.id,
     };
     let first_request = match &first.effect {
-        WorkerAction::Context(ContextEffect::EstablishProbed {
+        WorkerAction::Participation(ParticipationEffect::EstablishProbed {
             request,
             result: EstablishReplayResult::Decided(_),
             ..
         }) => *request,
-        _ => panic!("actual first Context owner verdict"),
+        _ => panic!("actual first Participation owner verdict"),
     };
     let premature = dispatch.completion_observed(first_ref);
     let overtaken = dispatch.take_ready(&f.runtime, 8).unwrap();
@@ -86,15 +86,17 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
     let first_completed = dispatch.completion_observed(first_ref);
     let second = overtaken
         .or_else(|| dispatch.take_ready(&f.runtime, 8).unwrap())
-        .expect("second original Context handoff");
+        .expect("second original Participation handoff");
     let stale = dispatch.completion_observed(first_ref);
     let second_ref = EffectRef {
         input: second.input,
         action: second.descriptor.id,
     };
     let second_request = match &second.effect {
-        WorkerAction::Context(ContextEffect::EstablishProbed { request, .. }) => *request,
-        _ => panic!("actual second Context owner verdict"),
+        WorkerAction::Participation(ParticipationEffect::EstablishProbed { request, .. }) => {
+            *request
+        }
+        _ => panic!("actual second Participation owner verdict"),
     };
     f.runtime.effect_completed(second).unwrap();
     let second_completed = dispatch.completion_observed(second_ref);
@@ -111,7 +113,7 @@ fn context_control_handoffs_keep_core_order_across_batches_and_reverse_request_t
     assert_eq!(second_request, requests[1].request);
     assert!(
         blocked,
-        "later Context metadata cannot overtake its handoff"
+        "later Participation metadata cannot overtake its handoff"
     );
     assert!(premature.is_err());
     assert!(first_completed.is_ok());
@@ -127,8 +129,8 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     use novarocks_control_runtime_core::effect::EffectState;
     use novarocks_execution_contract::TaskStatus;
     use novarocks_worker_protocol::{
-        context::ContextCommand,
         creation::{CreationCost, PayloadId},
+        participation::ParticipationCommand,
     };
     use std::sync::Arc;
 
@@ -137,7 +139,7 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     let mut f = Fixture::new();
     let task = task(f.identity, 1);
     let create = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task,
             payload: PayloadId(71),
         }),
@@ -148,7 +150,7 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     f.runtime.poll_one(Tick(1)).unwrap();
     f.drain(create);
     let loaded = f.send(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task,
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -164,14 +166,14 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
     f.drain(loaded);
 
     let publishing = f.send(
-        ContextInput::Installed { task },
+        ParticipationInput::Installed { task },
         None,
         InputClass::Lifecycle,
         2,
     );
     f.runtime.poll_one(Tick(2)).unwrap();
     let request = f.send(
-        ContextInput::Request(ContextCommand::GetDynamicFilters {
+        ParticipationInput::Request(ParticipationCommand::GetDynamicFilters {
             task,
             acknowledged: None,
         }),
@@ -186,19 +188,19 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
             actor(),
             request,
             None,
-            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         )
         .unwrap()
         .len();
-    let mut dispatch = EffectDispatch::context(
+    let mut dispatch = EffectDispatch::participation(
         f.runtime.clone(),
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 4,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS * 4,
     );
     dispatch.index_committed(&f.runtime, 64).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     let snapshot = match &publication.effect {
-        WorkerAction::Context(ContextEffect::PublishTask {
+        WorkerAction::Participation(ParticipationEffect::PublishTask {
             task: actual,
             snapshot,
             ..
@@ -220,7 +222,7 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
                 actor(),
                 input,
                 None,
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             )
             .unwrap();
         let exited = inventory.iter().any(|(descriptor, state)| {
@@ -266,8 +268,8 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
             &ticket.effect,
             WorkerAction::Reply(reply)
                 if matches!(reply.body.as_ref(),
-                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
-                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                    novarocks_worker_protocol::participation::ParticipationReplyBody::Verdict(
+                        novarocks_worker_protocol::participation::RequestResult::Outcome(
                             novarocks_execution_contract::OperationOutcome::Idempotent)))
         )
     });
@@ -284,7 +286,7 @@ fn a_later_request_waits_for_actual_task_publication_but_not_its_capture_exit() 
             actor(),
             publishing,
             None,
-            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         )
         .unwrap()
         .iter()
@@ -348,8 +350,8 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
         CancelReason, DomainVersion, OperationOutcome, TaskConclusion, TaskStatus,
     };
     use novarocks_worker_protocol::{
-        context::{ContextCommand, ContextReplyBody},
         creation::{CreationCost, PayloadId},
+        participation::{ParticipationCommand, ParticipationReplyBody},
     };
     use std::sync::Arc;
 
@@ -361,7 +363,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
     let task = task(f.identity, 1);
     for (command, request, class) in [
         (
-            ContextInput::Request(ContextCommand::Create {
+            ParticipationInput::Request(ParticipationCommand::Create {
                 task,
                 payload: PayloadId(81),
             }),
@@ -369,7 +371,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
             InputClass::Ordinary,
         ),
         (
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -381,12 +383,12 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
             InputClass::Lifecycle,
         ),
         (
-            ContextInput::Installed { task },
+            ParticipationInput::Installed { task },
             None,
             InputClass::Lifecycle,
         ),
         (
-            ContextInput::DynamicFilterPublished {
+            ParticipationInput::DynamicFilterPublished {
                 task,
                 version: DomainVersion::FIRST,
                 payload: PayloadId(82),
@@ -401,7 +403,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
         f.drain(input);
     }
     let read = f.send(
-        ContextInput::Request(ContextCommand::GetDynamicFilters {
+        ParticipationInput::Request(ParticipationCommand::GetDynamicFilters {
             task,
             acknowledged: None,
         }),
@@ -411,7 +413,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
     );
     f.runtime.poll_one(Tick(2)).unwrap();
     let newer = f.send(
-        ContextInput::DynamicFilterPublished {
+        ParticipationInput::DynamicFilterPublished {
             task,
             version: DomainVersion::new(2).unwrap(),
             payload: PayloadId(83),
@@ -423,7 +425,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
     );
     f.runtime.poll_one(Tick(2)).unwrap();
     let cancel = f.send(
-        ContextInput::Request(ContextCommand::Cancel {
+        ParticipationInput::Request(ParticipationCommand::Cancel {
             task,
             reason: CancelReason::UpstreamNoLongerNeeded,
         }),
@@ -439,19 +441,19 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
             actor(),
             read,
             None,
-            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         )
         .unwrap()
         .len();
-    let mut dispatch = EffectDispatch::context(
+    let mut dispatch = EffectDispatch::participation(
         f.runtime.clone(),
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 4,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS * 4,
     );
     dispatch.index_committed(&f.runtime, 64).unwrap();
     let prepare = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     let exact_prepare = matches!(&prepare.effect,
-        WorkerAction::Context(ContextEffect::PrepareReadPayload {
+        WorkerAction::Participation(ParticipationEffect::PrepareReadPayload {
             request, task: same_task, version, payload,
         }) if *request == read && *same_task == task
             && *version == DomainVersion::FIRST && *payload == PayloadId(82));
@@ -494,14 +496,14 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
         match &ticket.effect {
             WorkerAction::Reply(reply) if reply.request.token == read => {
                 read_replies += 1;
-                exact_body = matches!(reply.body.as_ref(), ContextReplyBody::ReadPayload {
+                exact_body = matches!(reply.body.as_ref(), ParticipationReplyBody::ReadPayload {
                     version, payload, outcome: OperationOutcome::Accepted,
                 } if *version == DomainVersion::FIRST && *payload == PayloadId(82));
             }
             WorkerAction::Reply(reply) if reply.request.token == cancel => {
                 cancel_replied = read_replies == 1;
             }
-            WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) => {
+            WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) => {
                 if ticket.input == newer {
                     newer_after_started_reply = read_replies == 1;
                 }
@@ -512,8 +514,9 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
                 );
                 dispatch.publication_committed(&f.runtime, &ticket).unwrap();
             }
-            WorkerAction::Context(ContextEffect::PublishConclusion {
-                conclusion: value, ..
+            WorkerAction::Participation(ParticipationEffect::PublishConclusion {
+                conclusion: value,
+                ..
             }) => {
                 drop(
                     f.runtime
@@ -522,7 +525,7 @@ fn original_read_preparation_gates_task_order_until_actual_completion_only() {
                 );
                 dispatch.publication_committed(&f.runtime, &ticket).unwrap();
             }
-            WorkerAction::Context(ContextEffect::StopTask { .. }) => {
+            WorkerAction::Participation(ParticipationEffect::StopTask { .. }) => {
                 stopped_after_started_reply = read_replies == 1;
             }
             _ => {}

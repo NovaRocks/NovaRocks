@@ -29,14 +29,15 @@ use crate::query_execution::{
             MvWriteActivationOriginal, MvWriteActivationOutput, MvWriteActivationRequest,
         },
         create_publication::{CreatePublicationInput, CreatePublicationOutput, EmptyCreateWrite},
-        refresh_preparation::driver::{MvRefreshTurnCustody, MvTurnFailure},
+        refresh_preparation::turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
     },
 };
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
     management::{
         CreateIntent, EffectDisposition, EffectIdentity, EffectScope, ManagedMvTarget,
-        ManagementAdmissionError, ManagementEntrance, ManagementEntranceLease, ManagementRequest,
+        ManagementAdmissionError, ManagementEntrance, ManagementEntranceObligation,
+        ManagementRequest,
     },
     persistence::create_documents::MvCreateDocuments,
     product::{MvCreatePublicationOutcome, MvCreatedTarget, MvStagedTarget, MvTarget},
@@ -48,18 +49,18 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
-    ConnectorDocumentManagementOperation, ConnectorDocumentStorageLease, KeyedCreateIntent,
+    ConnectorDocumentManagementOperation, ConnectorDocumentStorage, KeyedCreateIntent,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlPlanningLease, ConnectorError, ConnectorMutationFailure,
+    CatalogHandle, ConnectorControlPlanningPin, ConnectorError, ConnectorMutationFailure,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorStagedCreateAbortOutcome,
-    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateLease,
-    ConnectorStagedCreateNeededCommitted, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublication,
-    ConnectorStagedCreatePublicationPayload, ConnectorStagedCreatePublicationReceiving,
-    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
-    ConnectorStagedTableHandle, ConnectorTableIdentity, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationFinalization, LakePublicationId,
+    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateNeededCommitted,
+    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreatePublication, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublicationReceiving, ConnectorStagedCreatePublishOutcome,
+    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateSession, ConnectorStagedTableHandle,
+    ConnectorTableIdentity, CreatePolicy, ExternalMutationEffect, ExternalMutationFinalization,
+    LakePublicationId,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
 use std::{
@@ -77,7 +78,7 @@ pub(crate) struct CreateOriginalInput {
     pub(crate) plan: Arc<IcebergMvCreatePlan>,
     pub(crate) seed: Arc<MvCreateProjectionSeed>,
     pub(crate) ports: IcebergMvCorePorts,
-    pub(crate) planning: ConnectorControlPlanningLease,
+    pub(crate) planning: ConnectorControlPlanningPin,
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) cancellation: QueryCancellationView,
@@ -145,10 +146,10 @@ struct Body {
     table: ConnectorTableIdentity,
     target: MvTarget,
     operation: ConnectorMutationOperationId,
-    documents_lease: ConnectorDocumentStorageLease,
-    staged_lease: ConnectorStagedCreateLease,
+    document_storage: ConnectorDocumentStorage,
+    staged_session: ConnectorStagedCreateSession,
     intent: CreateIntent,
-    management: Option<Result<ManagementEntranceLease, ManagementAdmissionError>>,
+    management: Option<Result<ManagementEntranceObligation, ManagementAdmissionError>>,
     admission: Option<ConnectorDocumentManagementAdmission>,
     request: Option<ConnectorStagedCreatePrepareRequest>,
     stage_result: Option<Result<ConnectorStagedCreatePrepareOutcome, ConnectorError>>,
@@ -300,11 +301,11 @@ impl CreateOriginal {
             EffectIdentity::from_bytes(*input.operation_id.as_bytes()),
         )
         .map_err(|e| invalid(format!("freeze CREATE intent: {e:?}")))?;
-        let documents_lease = input
+        let document_storage = input
             .planning
             .derive_document_storage_lease()
             .map_err(provider)?;
-        let staged_lease = input
+        let staged_session = input
             .planning
             .derive_staged_create_lease()
             .map_err(provider)?;
@@ -319,8 +320,8 @@ impl CreateOriginal {
                     table,
                     target,
                     operation,
-                    documents_lease,
-                    staged_lease,
+                    document_storage,
+                    staged_session,
                     intent,
                     management: None,
                     admission: None,
@@ -693,7 +694,7 @@ impl CreateOriginal {
         // THIS Source/lease in the existing Root residual until disposed; never
         // use current-generation presence as an independent owner or add a cycle.
         if let Some(handle) = body.handle.as_ref() {
-            match body.staged_lease.cleanup_responsibility(handle) {
+            match body.staged_session.cleanup_responsibility(handle) {
                 Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed) => {
                     Poll::Ready(())
                 }
@@ -774,10 +775,10 @@ impl Body {
                 )
             })?;
         self.admission = Some(
-            self.documents_lease
+            self.document_storage
                 .admit_management(
                     ConnectorDocumentManagementAdmissionRequest::try_new(
-                        self.documents_lease.owner().clone(),
+                        self.document_storage.owner().clone(),
                         self.catalog.clone(),
                         self.operation,
                         self.table.clone(),
@@ -838,7 +839,7 @@ impl Body {
             unreachable!()
         };
         self.request = Some(
-            self.staged_lease
+            self.staged_session
                 .prepare_document_managed_request(
                     LakePublicationId::try_from_uuid(self.input.operation_id)
                         .map_err(|e| invalid(e.to_string()))?,
@@ -860,7 +861,7 @@ impl Body {
             .mark_create_intent_dispatched(super::now_management_timestamp().map_err(invalid)?)
             .map_err(|e| invalid(format!("record CREATE intent: {e:?}")))?;
         let result = self
-            .staged_lease
+            .staged_session
             .prepare_async(self.request.as_ref().unwrap().clone(), &state.stage_raw)
             .await;
         self.stage_result = Some(result);
@@ -887,7 +888,7 @@ impl Body {
         self.cpu(CreatePublicationInput::Publication {
             plan: self.input.plan.clone(),
             seed: self.input.seed.clone(),
-            staged: self.staged_lease.clone(),
+            staged: self.staged_session.clone(),
             handle: handle.clone(),
             admission: self.admission.as_ref().unwrap().clone(),
             owner: self.entrance.owner().clone(),
@@ -919,7 +920,7 @@ impl Body {
             .seal(
                 &host,
                 &self.input.planning,
-                &self.staged_lease,
+                &self.staged_session,
                 &handle,
                 begin,
             )
@@ -940,7 +941,7 @@ impl Body {
         // The caller-owned receiving installs the strong Provider Source
         // before any original publish Future can be polled.
         self.publication = Some(
-            self.staged_lease
+            self.staged_session
                 .begin_publish_original(
                     ConnectorStagedCreatePublishRequest {
                         operation_id: self.operation,
@@ -1002,7 +1003,7 @@ impl Body {
             }
         }
     }
-    fn management_mut(&mut self) -> Result<&mut ManagementEntranceLease, MvApplicationError> {
+    fn management_mut(&mut self) -> Result<&mut ManagementEntranceObligation, MvApplicationError> {
         self.management
             .as_mut()
             .and_then(|r| r.as_mut().ok())
@@ -1068,7 +1069,7 @@ impl Body {
             .ok_or_else(|| invalid("CREATE abort has no stage"))?
             .clone();
         self.abort_result = Some(
-            self.staged_lease
+            self.staged_session
                 .abort_async(
                     ConnectorStagedCreateAbortRequest {
                         operation_id: self.operation,
@@ -1748,7 +1749,7 @@ mod original_stage_tests {
             .unwrap()
             .try_with_document_storage(Some(documents))
             .unwrap();
-            let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+            let planning = ConnectorControlPlanningPin::new(Arc::new(binding), || {});
             let catalog = planning.binding().catalog_handle().unwrap().clone();
             let table = ConnectorTableIdentity {
                 instance_id,

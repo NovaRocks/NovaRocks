@@ -239,7 +239,11 @@ impl DocumentExpiryClaim {
         }
         self.ensure_active(context)?;
         self.claim.record_hit().map_err(|error| error.to_string())?;
-        eprintln!("NOVAROCKS_MV_DOCUMENT_EXPIRY_PLANNED token={}", self.token);
+        eprintln!(
+            "{} token={}",
+            novarocks_failpoint::observation_marker::MV_DOCUMENT_EXPIRY_PLANNED,
+            self.token
+        );
         if let Some(trigger) = trigger {
             wait_release(&self.claim, &trigger, Duration::from_secs(30), || {
                 context.is_cancelled() || Instant::now() >= context.deadline()
@@ -531,7 +535,10 @@ impl MvTestControls {
             Err(_) => return Ok(None),
         };
         claim.record_hit().map_err(|error| error.to_string())?;
-        eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
+        eprintln!(
+            "{} phase={phase} token={token}",
+            novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+        );
         Ok(Some(AuthorizedBarrier { claim, trigger }))
     }
 
@@ -593,7 +600,8 @@ impl MvTestControls {
         .map_err(|error| format!("write authorized MV projector marker: {error}"))?;
         claim.record_hit().map_err(|error| error.to_string())?;
         eprintln!(
-            "NOVAROCKS_MV_PROJECTOR_PHASE publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
+            "{} publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
+            novarocks_failpoint::observation_marker::MV_PROJECTOR_PHASE,
             publication_id.as_uuid()
         );
         Ok(Some(AuthorizedBarrier { claim, trigger }))

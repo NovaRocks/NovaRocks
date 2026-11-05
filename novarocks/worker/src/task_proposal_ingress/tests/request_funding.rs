@@ -21,7 +21,7 @@
 //! consuming the summary does not manufacture a Context actor Core receipt.
 
 use super::*;
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 
 fn consume_source_free_cut(f: &Fixture, cut: CutId) -> RetiredCut {
     drop_handoff(f.ingress.submit(TaskConclusionProposal::Succeeded));
@@ -116,7 +116,7 @@ fn a_lone_source_free_cut_recovers_its_exact_funding_and_leaves_the_base_open_pa
             .funding
             .custody
             .iter()
-            .all(|role| role.phase() == ExitRolePhase::Admitted
+            .all(|role| role.phase() == ExitCustodyPhase::Admitted
                 && !role.actual_exit_ready().unwrap()
                 && !role.reusable())
     );
@@ -257,7 +257,7 @@ fn a_pending_cuts_funding_cannot_be_stolen_by_an_earlier_returned_pair() {
         pending_funding
             .custody
             .iter()
-            .all(|role| role.phase() == ExitRolePhase::Admitted)
+            .all(|role| role.phase() == ExitCustodyPhase::Admitted)
     );
     // Complete the second actual cut, then dispose B and C by their real
     // funding identities. No ownership may be recovered by scanning cuts.
@@ -459,7 +459,7 @@ fn funding_in_an_unclaimed_spare_waits_for_its_actual_summary_consumption() {
             .funding
             .custody
             .iter()
-            .all(|role| role.phase() == ExitRolePhase::Admitted)
+            .all(|role| role.phase() == ExitCustodyPhase::Admitted)
     );
     retire_owned_unused_pair(&f, returned.pair, &returned.funding);
     f.finish();

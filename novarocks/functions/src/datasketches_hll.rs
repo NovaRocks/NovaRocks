@@ -29,7 +29,7 @@ pub enum HllTargetType {
 
 /// Allocation evidence for one HLL operation.
 ///
-/// `current_bytes` is the retained handle footprint before the operation.
+/// `current_bytes` is the retained accumulator footprint before the operation.
 /// `operation_peak_bytes` is the conservative absolute peak while the operation runs. Payload
 /// storage and any Arrow owner retaining it remain caller-owned and are excluded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +69,7 @@ struct PayloadProfile {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HandleProfile {
+struct AccumulatorProfile {
     generation: u64,
     lg_k: u8,
     lg_max_k: u8,
@@ -80,7 +80,7 @@ struct HandleProfile {
     empty: bool,
 }
 
-/// Allocation-free evidence for creating a handle.
+/// Allocation-free evidence for creating a accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HllNewPreflight {
     log_k: u8,
@@ -94,10 +94,10 @@ impl HllNewPreflight {
     }
 }
 
-/// Allocation-free evidence for updating an existing handle.
+/// Allocation-free evidence for updating an existing accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HllUpdatePreflight {
-    handle: HandleProfile,
+    accumulator_profile: AccumulatorProfile,
     bounds: HllAllocationUpperBounds,
 }
 
@@ -107,10 +107,10 @@ impl HllUpdatePreflight {
     }
 }
 
-/// Allocation-free evidence for decoding a payload, optionally into an existing handle.
+/// Allocation-free evidence for decoding a payload, optionally into an existing accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HllPayloadPreflight {
-    handle: Option<HandleProfile>,
+    accumulator_profile: Option<AccumulatorProfile>,
     payload: PayloadProfile,
     bounds: HllAllocationUpperBounds,
 }
@@ -451,12 +451,12 @@ fn payload_profile_with_failure<F: HllFailureSink>(
     }
 }
 
-fn empty_handle_current_bytes() -> usize {
-    std::mem::size_of::<HllHandle>() + LIST_HEAP_BYTES
+fn empty_accumulator_current_bytes() -> usize {
+    std::mem::size_of::<HllAccumulator>() + LIST_HEAP_BYTES
 }
 
 fn simulate_coupon_destination_with_failure<F: HllFailureSink>(
-    profile: HandleProfile,
+    profile: AccumulatorProfile,
     additions: usize,
     sink: &mut F,
 ) -> Result<usize, F::Error> {
@@ -498,32 +498,38 @@ fn simulate_coupon_destination_with_failure<F: HllFailureSink>(
 }
 
 fn union_workspace_bytes_with_failure<F: HllFailureSink>(
-    handle: HandleProfile,
+    accumulator_profile: AccumulatorProfile,
     payload: PayloadProfile,
     sink: &mut F,
 ) -> Result<usize, F::Error> {
     Ok(match payload.mode {
         AdmissionMode::List | AdmissionMode::Set => {
-            if handle.empty && payload.lg_k == handle.lg_k {
+            if accumulator_profile.empty && payload.lg_k == accumulator_profile.lg_k {
                 payload.retained_heap_bytes
             } else {
-                simulate_coupon_destination_with_failure(handle, payload.coupon_count, sink)?
-                    .saturating_sub(handle.heap_bytes)
+                simulate_coupon_destination_with_failure(
+                    accumulator_profile,
+                    payload.coupon_count,
+                    sink,
+                )?
+                .saturating_sub(accumulator_profile.heap_bytes)
             }
         }
         AdmissionMode::Hll => {
-            let result_lg_k = payload.lg_k.min(handle.lg_max_k);
+            let result_lg_k = payload.lg_k.min(accumulator_profile.lg_max_k);
             let result_heap = 1usize << result_lg_k;
-            match handle.mode {
-                _ if handle.empty => result_heap,
-                AdmissionMode::Hll if payload.lg_k < handle.lg_k => result_heap + handle.heap_bytes,
+            match accumulator_profile.mode {
+                _ if accumulator_profile.empty => result_heap,
+                AdmissionMode::Hll if payload.lg_k < accumulator_profile.lg_k => {
+                    result_heap + accumulator_profile.heap_bytes
+                }
                 AdmissionMode::Hll => 0,
                 AdmissionMode::List | AdmissionMode::Set => result_heap,
-                AdmissionMode::ListOrHll if payload.lg_k < handle.lg_k => {
+                AdmissionMode::ListOrHll if payload.lg_k < accumulator_profile.lg_k => {
                     // At lg_k=5 the 32-byte heap may be either LIST or HLL8. A lower-precision
                     // dense source makes the HLL alternative allocate the replacement array while
                     // cloning the old gadget; the LIST alternative only allocates the result.
-                    result_heap + handle.heap_bytes
+                    result_heap + accumulator_profile.heap_bytes
                 }
                 AdmissionMode::ListOrHll => result_heap,
             }
@@ -570,7 +576,7 @@ pub fn hll_estimate_with_failure<F: HllFailureSink>(
 }
 
 /// Bounds for the pinned library's clone/conversion/serialization request graph.
-/// The source handle is already retained; these additional bytes do not include
+/// The source accumulator is already retained; these additional bytes do not include
 /// Arrow builders, source payloads, allocator usable size or a funding grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HllSerializationBounds {
@@ -583,7 +589,7 @@ pub struct HllSerializationBounds {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HllSerializePreflight {
-    handle: HandleProfile,
+    accumulator_profile: AccumulatorProfile,
     target_type: HllTargetType,
     bounds: HllSerializationBounds,
 }
@@ -593,13 +599,15 @@ impl HllSerializePreflight {
     }
 }
 
-pub struct HllHandle {
+/// Owned mutable HyperLogLog accumulator. The caller retains the original
+/// allocation reservation and retained charge; this value owns the sketch state.
+pub struct HllAccumulator {
     target_type: HllTargetType,
     sketch_union: HllUnion,
     generation: u64,
 }
 
-impl HllHandle {
+impl HllAccumulator {
     pub fn new_allocation_preflight(
         log_k: u8,
         target_type: HllTargetType,
@@ -623,7 +631,7 @@ impl HllHandle {
             target_type,
             bounds: HllAllocationUpperBounds {
                 current_bytes: 0,
-                operation_peak_bytes: empty_handle_current_bytes(),
+                operation_peak_bytes: empty_accumulator_current_bytes(),
             },
         })
     }
@@ -649,7 +657,7 @@ impl HllHandle {
             return Err(sink.invariant(HllInvariantRecipe::NewPreflight));
         }
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let handle = HllUnion::new(preflight.log_k)
+        let accumulator = HllUnion::new(preflight.log_k)
             .map_err(|err| {
                 sink.failure(HllFailureRecipe {
                     context: HllDiagnosticContext::Direct,
@@ -662,10 +670,10 @@ impl HllHandle {
                 generation: 0,
             })?;
         let outcome = HllAllocationUpperBounds {
-            current_bytes: handle.current_allocation_upper_bound(),
+            current_bytes: accumulator.current_allocation_upper_bound(),
             operation_peak_bytes: preflight.bounds.operation_peak_bytes,
         };
-        Ok((handle, outcome))
+        Ok((accumulator, outcome))
     }
 
     pub fn new_unreserved(
@@ -681,7 +689,8 @@ impl HllHandle {
         sink: &mut F,
     ) -> Result<Self, F::Error> {
         let preflight = Self::new_allocation_preflight_with_failure(log_k, target_type, sink)?;
-        Self::new_under_reservation_with_failure(&preflight, &(), sink).map(|(handle, _)| handle)
+        Self::new_under_reservation_with_failure(&preflight, &(), sink)
+            .map(|(accumulator, _)| accumulator)
     }
 
     pub fn from_payload_allocation_preflight(
@@ -696,23 +705,23 @@ impl HllHandle {
     ) -> Result<HllPayloadPreflight, F::Error> {
         let payload =
             payload_profile_with_failure(payload, HllDiagnosticContext::InitialPreflight, sink)?;
-        let handle = HandleProfile {
+        let accumulator_profile = AccumulatorProfile {
             generation: 0,
             lg_k: payload.lg_k,
             lg_max_k: payload.lg_k,
             mode: AdmissionMode::List,
             coupon_count_upper: 0,
             heap_bytes: LIST_HEAP_BYTES,
-            current_bytes: empty_handle_current_bytes(),
+            current_bytes: empty_accumulator_current_bytes(),
             empty: true,
         };
         let decoded_peak = std::mem::size_of::<HllSketch>() + payload.decode_peak_heap_bytes;
-        let union_peak = handle.current_bytes
+        let union_peak = accumulator_profile.current_bytes
             + std::mem::size_of::<HllSketch>()
             + payload.retained_heap_bytes
-            + union_workspace_bytes_with_failure(handle, payload, sink)?;
+            + union_workspace_bytes_with_failure(accumulator_profile, payload, sink)?;
         Ok(HllPayloadPreflight {
-            handle: None,
+            accumulator_profile: None,
             payload,
             bounds: HllAllocationUpperBounds {
                 current_bytes: 0,
@@ -754,16 +763,16 @@ impl HllHandle {
             })
         })?;
         sketch_union.update(&sketch);
-        let handle = Self {
+        let accumulator = Self {
             target_type,
             sketch_union,
             generation: 0,
         };
         let outcome = HllAllocationUpperBounds {
-            current_bytes: handle.current_allocation_upper_bound(),
+            current_bytes: accumulator.current_allocation_upper_bound(),
             operation_peak_bytes: preflight.bounds.operation_peak_bytes,
         };
-        Ok((handle, outcome))
+        Ok((accumulator, outcome))
     }
 
     pub fn from_payload_unreserved(payload: &[u8]) -> Result<Self, ClassifiedHllFailure> {
@@ -776,7 +785,7 @@ impl HllHandle {
     ) -> Result<Self, F::Error> {
         let preflight = Self::from_payload_allocation_preflight_with_failure(payload, sink)?;
         Self::from_payload_under_reservation_with_failure(payload, &preflight, &(), sink)
-            .map(|(handle, _)| handle)
+            .map(|(accumulator, _)| accumulator)
     }
 
     pub fn update_hash_allocation_preflight(
@@ -789,14 +798,15 @@ impl HllHandle {
         sink: &mut F,
     ) -> Result<HllUpdatePreflight, F::Error> {
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let handle = self.profile();
+        let accumulator_profile = self.profile();
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let peak_heap = simulate_coupon_destination_with_failure(handle, 1, sink)?;
+        let peak_heap = simulate_coupon_destination_with_failure(accumulator_profile, 1, sink)?;
         Ok(HllUpdatePreflight {
-            handle,
+            accumulator_profile,
             bounds: HllAllocationUpperBounds {
-                current_bytes: handle.current_bytes,
-                operation_peak_bytes: handle.current_bytes + peak_heap - handle.heap_bytes,
+                current_bytes: accumulator_profile.current_bytes,
+                operation_peak_bytes: accumulator_profile.current_bytes + peak_heap
+                    - accumulator_profile.heap_bytes,
             },
         })
     }
@@ -866,22 +876,22 @@ impl HllHandle {
         sink: &mut F,
     ) -> Result<HllPayloadPreflight, F::Error> {
         sink.observe(HllObservation::OpaqueBoundary)?;
-        let handle = self.profile();
+        let accumulator_profile = self.profile();
         sink.observe(HllObservation::OpaqueBoundary)?;
         let payload =
             payload_profile_with_failure(payload, HllDiagnosticContext::MergePreflight, sink)?;
-        let decoded_peak = handle.current_bytes
+        let decoded_peak = accumulator_profile.current_bytes
             + std::mem::size_of::<HllSketch>()
             + payload.decode_peak_heap_bytes;
-        let union_peak = handle.current_bytes
+        let union_peak = accumulator_profile.current_bytes
             + std::mem::size_of::<HllSketch>()
             + payload.retained_heap_bytes
-            + union_workspace_bytes_with_failure(handle, payload, sink)?;
+            + union_workspace_bytes_with_failure(accumulator_profile, payload, sink)?;
         Ok(HllPayloadPreflight {
-            handle: Some(handle),
+            accumulator_profile: Some(accumulator_profile),
             payload,
             bounds: HllAllocationUpperBounds {
-                current_bytes: handle.current_bytes,
+                current_bytes: accumulator_profile.current_bytes,
                 operation_peak_bytes: decoded_peak.max(union_peak),
             },
         })
@@ -948,29 +958,32 @@ impl HllHandle {
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<HllSerializePreflight, E> {
-        let handle = self.profile();
-        let k = 1usize << handle.lg_k;
+        let accumulator_profile = self.profile();
+        let k = 1usize << accumulator_profile.lg_k;
         // Sparse containers clone their actual Box<[Coupon]> backing. Their
         // compact output never contains more coupons than that backing.
         let sparse = |preamble: usize| {
-            let payload = preamble + handle.heap_bytes;
+            let payload = preamble + accumulator_profile.heap_bytes;
             HllSerializationBounds {
-                current_bytes: handle.current_bytes,
-                converted_retained_heap_bytes: handle.heap_bytes,
-                conversion_peak_heap_bytes: handle.heap_bytes,
-                serializer_peak_heap_bytes: handle.heap_bytes + payload,
-                additional_headroom_bytes: handle.heap_bytes + payload,
+                current_bytes: accumulator_profile.current_bytes,
+                converted_retained_heap_bytes: accumulator_profile.heap_bytes,
+                conversion_peak_heap_bytes: accumulator_profile.heap_bytes,
+                serializer_peak_heap_bytes: accumulator_profile.heap_bytes + payload,
+                additional_headroom_bytes: accumulator_profile.heap_bytes + payload,
                 serialized_payload_bytes: payload,
             }
         };
-        if matches!(handle.mode, AdmissionMode::List | AdmissionMode::Set) {
-            let bounds = sparse(if handle.mode == AdmissionMode::List {
+        if matches!(
+            accumulator_profile.mode,
+            AdmissionMode::List | AdmissionMode::Set
+        ) {
+            let bounds = sparse(if accumulator_profile.mode == AdmissionMode::List {
                 8
             } else {
                 12
             });
             return Ok(HllSerializePreflight {
-                handle,
+                accumulator_profile,
                 target_type: self.target_type,
                 bounds,
             });
@@ -979,7 +992,7 @@ impl HllHandle {
             HllTargetType::Hll8 => {
                 let payload = HLL_PREAMBLE_BYTES + k;
                 HllSerializationBounds {
-                    current_bytes: handle.current_bytes,
+                    current_bytes: accumulator_profile.current_bytes,
                     converted_retained_heap_bytes: k,
                     conversion_peak_heap_bytes: k,
                     serializer_peak_heap_bytes: k + payload,
@@ -991,7 +1004,7 @@ impl HllHandle {
                 let packed = 3 * k / 4 + 1;
                 let payload = HLL_PREAMBLE_BYTES + packed;
                 HllSerializationBounds {
-                    current_bytes: handle.current_bytes,
+                    current_bytes: accumulator_profile.current_bytes,
                     converted_retained_heap_bytes: packed,
                     conversion_peak_heap_bytes: packed,
                     serializer_peak_heap_bytes: packed + payload,
@@ -1002,7 +1015,7 @@ impl HllHandle {
             HllTargetType::Hll4 => {
                 let packed = k / 2;
                 let (aux_retained, aux_growth_peak) =
-                    hll4_aux_allocation_observed(handle.lg_k, k, observe)?;
+                    hll4_aux_allocation_observed(accumulator_profile.lg_k, k, observe)?;
                 // cur_min rebuilding retains old_aux while constructing and
                 // growing new_aux. Include all three actual map backings.
                 let conversion_peak = packed + aux_retained + aux_growth_peak;
@@ -1016,7 +1029,7 @@ impl HllHandle {
                 let serializer_peak =
                     converted_retained + collector_growth_peak.max(entries + payload);
                 HllSerializationBounds {
-                    current_bytes: handle.current_bytes,
+                    current_bytes: accumulator_profile.current_bytes,
                     converted_retained_heap_bytes: converted_retained,
                     conversion_peak_heap_bytes: conversion_peak,
                     serializer_peak_heap_bytes: serializer_peak,
@@ -1025,14 +1038,14 @@ impl HllHandle {
                 }
             }
         };
-        let bounds = match handle.mode {
+        let bounds = match accumulator_profile.mode {
             AdmissionMode::List => sparse(8),
             AdmissionMode::Set => sparse(12),
             AdmissionMode::Hll => dense,
             AdmissionMode::ListOrHll => {
                 let sparse = sparse(8);
                 HllSerializationBounds {
-                    current_bytes: handle.current_bytes,
+                    current_bytes: accumulator_profile.current_bytes,
                     converted_retained_heap_bytes: sparse
                         .converted_retained_heap_bytes
                         .max(dense.converted_retained_heap_bytes),
@@ -1052,7 +1065,7 @@ impl HllHandle {
             }
         };
         Ok(HllSerializePreflight {
-            handle,
+            accumulator_profile,
             target_type: self.target_type,
             bounds,
         })
@@ -1075,7 +1088,9 @@ impl HllHandle {
         _reservation: &G,
         sink: &mut F,
     ) -> Result<Vec<u8>, F::Error> {
-        if self.profile() != preflight.handle || self.target_type != preflight.target_type {
+        if self.profile() != preflight.accumulator_profile
+            || self.target_type != preflight.target_type
+        {
             return Err(sink.invariant(HllInvariantRecipe::SerializePreflight));
         }
         self.serialize_with_failure(sink)
@@ -1109,17 +1124,17 @@ impl HllHandle {
         Ok(result)
     }
 
-    /// Returns a conservative upper bound for the live handle's current allocation footprint.
+    /// Returns a conservative upper bound for the live accumulator's current allocation footprint.
     ///
     /// The bound uses DataSketches' capacity-aware `estimated_size()` and includes this wrapper's
     /// inline bytes. It does not use the serialized payload length or derive retained memory from
     /// `lg_k`.
     pub fn current_allocation_upper_bound(&self) -> usize {
-        std::mem::size_of::<HllHandle>() - std::mem::size_of::<HllUnion>()
+        std::mem::size_of::<HllAccumulator>() - std::mem::size_of::<HllUnion>()
             + self.sketch_union.estimated_size()
     }
 
-    fn profile(&self) -> HandleProfile {
+    fn profile(&self) -> AccumulatorProfile {
         let current_bytes = self.current_allocation_upper_bound();
         let heap_bytes = self.sketch_union.estimated_size() - std::mem::size_of::<HllUnion>();
         let lg_k = self.sketch_union.lg_config_k();
@@ -1147,7 +1162,7 @@ impl HllHandle {
         } else {
             (AdmissionMode::Set, sparse_coupon_count_upper)
         };
-        HandleProfile {
+        AccumulatorProfile {
             generation: self.generation,
             lg_k,
             lg_max_k: self.sketch_union.lg_max_k(),
@@ -1162,7 +1177,7 @@ impl HllHandle {
 
 /*
  * Aggregate callers preflight and reserve each operation, then reconcile the actual retained
- * allocation reported by the handle before releasing headroom. Callers without such an admission
+ * allocation reported by the accumulator before releasing headroom. Callers without such an admission
  * owner use the explicitly named unreserved methods.
  */
 
@@ -1196,25 +1211,28 @@ mod typed_generation_failure_tests {
         }
     }
     #[test]
-    fn actual_generation_exhaustion_is_typed_and_precedes_the_handle_mutation() {
+    fn actual_generation_exhaustion_is_typed_and_precedes_the_accumulator_mutation() {
         let mut sink = TypedSink;
-        let mut handle =
-            HllHandle::new_unreserved_with_failure(4, HllTargetType::Hll6, &mut sink).unwrap();
-        handle.generation = u64::MAX;
-        let before = handle.serialize_with_failure(&mut sink).unwrap();
-        let preflight = handle
+        let mut accumulator =
+            HllAccumulator::new_unreserved_with_failure(4, HllTargetType::Hll6, &mut sink).unwrap();
+        accumulator.generation = u64::MAX;
+        let before = accumulator.serialize_with_failure(&mut sink).unwrap();
+        let preflight = accumulator
             .update_hash_allocation_preflight_with_failure(&mut sink)
             .unwrap();
         // Deliberately no capacity authority: this semantic refusal must happen
         // before the operation can perform its mutation or allocation.
-        struct NoLease;
-        let error = handle
-            .update_hash_under_reservation_with_failure(11, &preflight, &NoLease, &mut sink)
+        struct NoReservation;
+        let error = accumulator
+            .update_hash_under_reservation_with_failure(11, &preflight, &NoReservation, &mut sink)
             .unwrap_err();
         let fact = error.failure_fact();
         assert_eq!(fact.class(), FailureClass::Resource);
         assert_eq!(fact.reason().code(), 183);
-        assert_eq!(handle.generation, u64::MAX);
-        assert_eq!(handle.serialize_with_failure(&mut sink).unwrap(), before);
+        assert_eq!(accumulator.generation, u64::MAX);
+        assert_eq!(
+            accumulator.serialize_with_failure(&mut sink).unwrap(),
+            before
+        );
     }
 }

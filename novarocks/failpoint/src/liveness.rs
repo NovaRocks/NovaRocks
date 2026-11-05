@@ -160,12 +160,12 @@ fn frame_until(
 }
 
 // Own the exact socket inode from bind onward, including startup failure paths.
-struct SocketLease {
+struct BoundSocketFile {
     path: PathBuf,
     device: u64,
     inode: u64,
 }
-impl SocketLease {
+impl BoundSocketFile {
     fn capture(path: PathBuf) -> io::Result<Self> {
         let metadata = std::fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_socket() {
@@ -194,7 +194,7 @@ impl SocketLease {
         std::fs::remove_file(&self.path)
     }
 }
-impl Drop for SocketLease {
+impl Drop for BoundSocketFile {
     fn drop(&mut self) {
         let _ = self.remove();
     }
@@ -222,7 +222,7 @@ pub struct RunnerSession {
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<RunnerState>>,
     worker: Option<JoinHandle<io::Result<()>>>,
-    socket: SocketLease,
+    socket: BoundSocketFile,
 }
 
 impl RunnerSession {
@@ -250,7 +250,7 @@ impl RunnerSession {
             ));
         }
         let listener = UnixListener::bind(&declaration.liveness_socket)?;
-        let socket = SocketLease::capture(declaration.liveness_socket.clone())?;
+        let socket = BoundSocketFile::capture(declaration.liveness_socket.clone())?;
         if let Err(error) = listener.set_nonblocking(true) {
             return with_cleanup(Err(error), socket.remove()).map(|_| unreachable!());
         }
@@ -619,7 +619,7 @@ mod tests {
     fn a_helper_panic_still_removes_its_exact_owned_socket() {
         let socket = std::env::temp_dir().join(format!("g2-panic-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&socket).unwrap();
-        let lease = SocketLease::capture(socket.clone()).unwrap();
+        let lease = BoundSocketFile::capture(socket.clone()).unwrap();
         let mut runner = RunnerSession {
             declaration: SessionDeclaration {
                 schema_version: 1,

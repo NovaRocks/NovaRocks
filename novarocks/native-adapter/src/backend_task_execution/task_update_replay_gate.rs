@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::connector::TaskAttemptSplitQueues;
+use novarocks_execution::connector::SplitQueues;
 use novarocks_execution::connector::scan_queue::TestSplitConsumptionGate;
 use novarocks_execution_contract::{TaskDomainUpdate, TaskIdentity, TaskOperationId, UpdateTask};
 use novarocks_failpoint::scope::{ControlCancellation, ProcessBinding};
@@ -126,7 +126,7 @@ pub(super) struct TaskUpdateReplayGate {
 impl TaskUpdateReplayGate {
     pub(super) fn reserve<S: novarocks_execution::connector::ScheduledSplitFacts>(
         request: &UpdateTask,
-        queues: &TaskAttemptSplitQueues<S>,
+        queues: &SplitQueues<S>,
         control: ControlCancellation,
         task_stop: ConnectorStopView,
     ) -> Result<Arc<Self>, ReplayReservationFailure> {
@@ -374,7 +374,7 @@ mod tests {
         Controlled, bind_fixture, controlled, controlled_replay, end_fixture, task,
     };
     use novarocks_execution::connector::{
-        ScheduledSplitFacts, SplitPoll, SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey,
+        ScheduledSplitFacts, SplitPoll, SplitQueueConfig, SplitQueueKey, SplitQueueRegistry,
     };
     use novarocks_execution_contract::{
         CodecOwnedContent, ContentFingerprint, PlanNodeId, SplitAssignmentIntent, SplitOffer,
@@ -426,9 +426,9 @@ mod tests {
         )
         .unwrap()
     }
-    fn queues(fixture: &Controlled) -> Arc<TaskAttemptSplitQueues<Split>> {
+    fn queues(fixture: &Controlled) -> Arc<SplitQueues<Split>> {
         SplitQueueRegistry::new().open_attempt(
-            TaskAttemptKey::new(fixture.execution, UniqueId::new(1, 2)),
+            SplitQueueKey::new(fixture.execution, UniqueId::new(1, 2)),
             SplitQueueConfig::default(),
         )
     }

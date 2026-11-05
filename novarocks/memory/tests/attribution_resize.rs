@@ -17,14 +17,14 @@
 
 #![cfg(not(loom))]
 use novarocks_memory::attribution::{AttributingAllocator, binding};
-use novarocks_memory::lane::{ResponsibilityClass, StoreHandle, global_store};
+use novarocks_memory::lane::{RecordStorePin, ResponsibilityClass, global_store};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 fn layout(size: usize) -> Layout {
     Layout::from_size_align(size, 8).unwrap()
 }
 fn owner() -> novarocks_memory::lane::RecordOwner {
-    StoreHandle::global()
+    RecordStorePin::global()
         .acquire(
             7,
             ResponsibilityClass::Query,

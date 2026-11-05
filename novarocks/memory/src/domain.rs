@@ -18,9 +18,9 @@
 //! One independently redeemable authorization domain.
 use crate::sync::{Arc, AtomicU64, Mutex, Ordering};
 use crate::{
-    account::{AccountHandle, Path, grow_locked, qualify},
+    account::{Account, Path, grow_locked, qualify},
     error::{CapacityError, MetadataRegistryLabel},
-    lane::LaneHandle,
+    lane::Lane,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,7 @@ pub(crate) struct FundingState {
 #[derive(Debug)]
 pub(crate) struct Domain {
     pub id: u64,
-    pub lane: LaneHandle,
+    pub lane: Lane,
     pub covered_sequence: AtomicU64,
     pub covered_epoch: AtomicU64,
     pub state: Mutex<FundingState>,
@@ -69,7 +69,7 @@ pub const OWNER_METADATA_BYTES: u64 = (std::mem::size_of::<Domain>()
     + 6 * std::mem::size_of::<usize>()
     + 64) as u64;
 
-impl AccountHandle {
+impl Account {
     pub fn create_domain(&self, authorized: u64) -> Result<FundingDomain, CapacityError> {
         self.create_domain_from(authorized, None)
             .map_err(|e| e.with_requested(authorized))
@@ -82,7 +82,7 @@ impl AccountHandle {
         let shared = &self.0.shared;
         let record = Arc::new(Domain {
             id: shared.next_identity()?,
-            lane: LaneHandle::new(self, crate::lane::RecordRegion::Funding).map_err(|_| {
+            lane: Lane::new(self, crate::lane::RecordRegion::Funding).map_err(|_| {
                 CapacityError::Invalid {
                     detail: "lane record storage unavailable",
                 }
@@ -223,10 +223,10 @@ impl FundingDomain {
     pub fn seal(&self) {
         self.0.lane.seal();
     }
-    pub(crate) fn affiliation(&self) -> AccountHandle {
+    pub(crate) fn affiliation(&self) -> Account {
         self.0.lane.affiliation()
     }
-    pub fn lane(&self) -> &LaneHandle {
+    pub fn lane(&self) -> &Lane {
         &self.0.lane
     }
 }

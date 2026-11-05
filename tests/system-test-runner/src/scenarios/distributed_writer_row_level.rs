@@ -50,8 +50,8 @@ pub(super) fn observation_specs(cluster_size: usize) -> Vec<StatementSpec> {
             observations: (0..cluster_size)
                 .flat_map(|index| {
                     [
-                        (index, "writer-marker", None),
-                        (index, "grpc-fragment", None),
+                        (index, novarocks_failpoint::observation_marker::ObservationAction::WriterMarker.as_str(), None),
+                        (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None),
                     ]
                 })
                 .collect(),

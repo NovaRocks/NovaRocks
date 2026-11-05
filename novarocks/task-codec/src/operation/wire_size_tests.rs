@@ -22,12 +22,12 @@ use super::*;
 use crate::domain::{WireContent, WireCredential, stored_credential, stored_message};
 use novarocks_execution_contract::task_execution::{
     domain::{
-        ContentFingerprint, CredentialEpoch, CredentialLeaseId, DomainVersion, EdgeOpenVersion,
+        ContentFingerprint, CredentialDomainId, CredentialEpoch, DomainVersion, EdgeOpenVersion,
         ExchangeEdgeId, PlanNodeId, SplitOffer,
     },
     lease::LeaseSequence,
     operation::{
-        CredentialUpdate, QueryContextDomainUpdate, SplitAssignmentIntent, TaskDomainUpdate,
+        CredentialUpdate, ParticipationDomainUpdate, SplitAssignmentIntent, TaskDomainUpdate,
     },
     status::{AbortCause, CancelReason},
 };
@@ -35,10 +35,10 @@ use novarocks_proto_models::{catalog, filter};
 use novarocks_types::identity::{StageId, TaskId};
 use std::time::Duration;
 
-fn pair(bound: u32) -> (QueryContextRef, TaskIdentity) {
-    let (context, task) = super::covered_wire_tests::context_and_task();
+fn pair(bound: u32) -> (ParticipationRef, TaskIdentity) {
+    let (participation, task) = super::covered_wire_tests::participation_and_task();
     (
-        context,
+        participation,
         TaskIdentity::new(
             task.query_execution_id(),
             StageId::new(bound).unwrap(),
@@ -128,22 +128,22 @@ fn credential(value: u64, nonempty: bool) -> CredentialUpdate {
         vec![]
     };
     CredentialUpdate::new(
-        CredentialLeaseId::new(value),
+        CredentialDomainId::new(value),
         CredentialEpoch::new(value.max(1)).unwrap(),
         Arc::new(WireCredential::decode(&descriptors, FieldPath::root("credential")).unwrap()),
     )
 }
 fn establish_request(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     catalog: Arc<dyn CodecOwnedContent>,
     filter: Arc<dyn CodecOwnedContent>,
     options: Arc<dyn CodecOwnedContent>,
     credential: CredentialUpdate,
     wait: u64,
-) -> EstablishQueryContext {
-    EstablishQueryContext::new(
+) -> EstablishParticipation {
+    EstablishParticipation::new(
         TaskOperationId::new_v7(),
-        context,
+        participation,
         AdmissionTicketId::try_from_bytes([0x61; 16]).unwrap(),
         catalog,
         filter,
@@ -152,7 +152,7 @@ fn establish_request(
         LeaseValidFor::new(Duration::from_millis(wait)).unwrap(),
     )
 }
-fn encoded_establish(value: &EstablishQueryContext) -> novarocks::TaskOperation {
+fn encoded_establish(value: &EstablishParticipation) -> novarocks::TaskOperation {
     let catalog = stored_message::<catalog::CatalogSet>(value.catalog_binding().as_ref())
         .unwrap()
         .clone();
@@ -164,12 +164,12 @@ fn encoded_establish(value: &EstablishQueryContext) -> novarocks::TaskOperation 
     let options =
         *stored_message::<novarocks::QueryOptions>(value.query_options().as_ref()).unwrap();
     let material = stored_credential(value.initial_credential().material().as_ref()).unwrap();
-    encode_establish_query_context(
+    encode_establish_participation(
         value,
         catalog,
         filter,
-        novarocks::QueryContextCredentialDomain {
-            lease_id: value.initial_credential().lease_id().get(),
+        novarocks::ParticipationCredentialDomain {
+            credential_domain_id: value.initial_credential().credential_domain_id().get(),
             epoch: value.initial_credential().epoch().get(),
             descriptors: material.descriptors().to_vec(),
         },
@@ -181,18 +181,18 @@ fn encoded_establish(value: &EstablishQueryContext) -> novarocks::TaskOperation 
 #[test]
 fn acquire_establish_and_renew_match_original_wire_at_scalar_and_nested_length_boundaries() {
     for value in [1u32, 127, 128, 16383, 16384] {
-        let (context, _) = pair(value);
-        let acquire=AcquireQueryContextAdmissionTicket::new(TaskOperationId::new_v7(),context,
+        let (participation, _) = pair(value);
+        let acquire=AcquireParticipationAdmissionTicket::new(TaskOperationId::new_v7(),participation,
             LeaseValidFor::new(Duration::from_millis(value as u64)).unwrap(),NativeCompatibilityId::new([0x71;32]),
             novarocks_execution_contract::task_execution::identity::AdmissionEpochCapability::try_from_bytes([0x62;16]).unwrap());
         ordinary(
             size::acquire(acquire),
-            encode_acquire_query_context_admission_ticket(acquire),
+            encode_acquire_participation_admission_ticket(acquire),
         );
         for sequence in [0, value as u64] {
-            let renew = RenewQueryExecutionLease::new(
+            let renew = RenewParticipationLease::new(
                 TaskOperationId::new_v7(),
-                context,
+                participation,
                 LeaseSequence::new(sequence),
                 LeaseValidFor::new(Duration::from_millis(value as u64)).unwrap(),
             );
@@ -201,14 +201,14 @@ fn acquire_establish_and_renew_match_original_wire_at_scalar_and_nested_length_b
         }
     }
     for width in [0usize, 1, 127, 128, 16383, 16384] {
-        let (context, _) = pair(1);
+        let (participation, _) = pair(1);
         let options = novarocks::QueryOptions {
             query_mem_limit: width as i64,
             pipeline_dop: if width == 0 { 0 } else { 128 },
             ..Default::default()
         };
         let value = establish_request(
-            context,
+            participation,
             Arc::new(WireContent::new(
                 ESTABLISH_CATALOG_DOMAIN_TAG,
                 catalog(width),
@@ -232,41 +232,41 @@ fn acquire_establish_and_renew_match_original_wire_at_scalar_and_nested_length_b
 }
 
 #[test]
-fn all_three_context_domain_advances_match_their_original_codec() {
+fn all_three_participation_domain_advances_match_their_original_codec() {
     for value in [1u64, 127, 128, 16383, 16384] {
-        let (context, _) = pair(1);
+        let (participation, _) = pair(1);
         let domains = [
-            QueryContextDomainUpdate::CatalogBinding {
+            ParticipationDomainUpdate::CatalogBinding {
                 version: DomainVersion::new(value).unwrap(),
                 payload: Arc::new(WireContent::new(
                     b"size.catalog",
                     catalog(if value == 1 { 0 } else { value as usize }),
                 )),
             },
-            QueryContextDomainUpdate::SharedDynamicFilter {
+            ParticipationDomainUpdate::SharedDynamicFilter {
                 version: DomainVersion::new(value).unwrap(),
                 payload: Arc::new(WireContent::new(
                     b"size.filter",
                     contribution(if value == 1 { 0 } else { value as u32 }),
                 )),
             },
-            QueryContextDomainUpdate::Credential(credential(value, value != 1)),
+            ParticipationDomainUpdate::Credential(credential(value, value != 1)),
         ];
         for domain in domains {
-            let wire = crate::domain::encode_neutral_query_context_domain(
+            let wire = crate::domain::encode_neutral_participation_domain(
                 &domain,
                 FieldPath::root("domain"),
             )
             .unwrap();
             assert_eq!(
-                size::query_context_domain(&domain).unwrap(),
+                size::participation_domain(&domain).unwrap(),
                 wire.encoded_len()
             );
             let request =
-                AdvanceQueryContextDomain::new(TaskOperationId::new_v7(), context, domain);
+                AdvanceParticipationDomain::new(TaskOperationId::new_v7(), participation, domain);
             ordinary(
                 size::advance(&request),
-                encode_advance_query_context_domain(&request, wire),
+                encode_advance_participation_domain(&request, wire),
             );
         }
     }
@@ -405,7 +405,7 @@ fn update_all_four_domains_and_control_close_match_original_projection() {
 #[test]
 fn cancel_abort_release_and_quiesce_match_both_real_method_codecs() {
     for bound in [1u32, 127, 128, 16383, 16384] {
-        let (context, identity) = pair(bound);
+        let (participation, identity) = pair(bound);
         let cancel = CancelTask::new(
             TaskOperationId::new_v7(),
             identity,
@@ -418,27 +418,27 @@ fn cancel_abort_release_and_quiesce_match_both_real_method_codecs() {
             AbortCause::LeaseExpired,
             AbortCause::PeerTaskFailed,
         ] {
-            let abort = AbortQueryContext::new(TaskOperationId::new_v7(), context, cause);
-            ordinary(size::abort(abort, false), encode_abort_query_context(abort));
-            control(size::abort(abort, true), encode_abort_query_context(abort));
+            let abort = AbortParticipation::new(TaskOperationId::new_v7(), participation, cause);
+            ordinary(size::abort(abort, false), encode_abort_participation(abort));
+            control(size::abort(abort, true), encode_abort_participation(abort));
         }
-        let release = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+        let release = ReleaseParticipation::new(TaskOperationId::new_v7(), participation);
         ordinary(
             size::release(release, false),
-            encode_release_query_context(release),
+            encode_release_participation(release),
         );
         control(
             size::release(release, true),
-            encode_release_query_context(release),
+            encode_release_participation(release),
         );
-        let quiesce = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let quiesce = QuiesceParticipation::new(TaskOperationId::new_v7(), participation);
         ordinary(
             size::quiesce(quiesce, false),
-            encode_quiesce_query_context(quiesce),
+            encode_quiesce_participation(quiesce),
         );
         control(
             size::quiesce(quiesce, true),
-            encode_quiesce_query_context(quiesce),
+            encode_quiesce_participation(quiesce),
         );
     }
 }
@@ -491,32 +491,33 @@ impl novarocks_execution_contract::task_execution::domain::ConfidentialContent
 #[test]
 fn a_numeric_length_or_foreign_type_is_not_a_codec_produced_source() {
     let foreign: Arc<dyn CodecOwnedContent> = Arc::new(ForeignContent);
-    let (context, _) = pair(1);
+    let (participation, _) = pair(1);
     let bad_credential = CredentialUpdate::new(
-        CredentialLeaseId::new(1),
+        CredentialDomainId::new(1),
         CredentialEpoch::FIRST,
         Arc::new(ForeignCredential),
     );
     for domain in [
-        QueryContextDomainUpdate::CatalogBinding {
+        ParticipationDomainUpdate::CatalogBinding {
             version: DomainVersion::FIRST,
             payload: foreign.clone(),
         },
-        QueryContextDomainUpdate::SharedDynamicFilter {
+        ParticipationDomainUpdate::SharedDynamicFilter {
             version: DomainVersion::FIRST,
             payload: foreign.clone(),
         },
-        QueryContextDomainUpdate::Credential(bad_credential.clone()),
+        ParticipationDomainUpdate::Credential(bad_credential.clone()),
     ] {
         assert_eq!(
-            size::query_context_domain(&domain),
+            size::participation_domain(&domain),
             Err(size::WireSizeError::NotCodecProduced)
         );
         assert!(
-            crate::domain::encode_neutral_query_context_domain(&domain, FieldPath::root("domain"))
+            crate::domain::encode_neutral_participation_domain(&domain, FieldPath::root("domain"))
                 .is_err()
         );
-        let advance = AdvanceQueryContextDomain::new(TaskOperationId::new_v7(), context, domain);
+        let advance =
+            AdvanceParticipationDomain::new(TaskOperationId::new_v7(), participation, domain);
         assert_eq!(
             size::advance(&advance),
             Err(size::WireSizeError::NotCodecProduced)
@@ -553,7 +554,7 @@ fn a_numeric_length_or_foreign_type_is_not_a_codec_produced_source() {
     ));
     let values = [
         establish_request(
-            context,
+            participation,
             foreign.clone(),
             good_filter.clone(),
             good_options.clone(),
@@ -561,7 +562,7 @@ fn a_numeric_length_or_foreign_type_is_not_a_codec_produced_source() {
             1,
         ),
         establish_request(
-            context,
+            participation,
             good_catalog.clone(),
             foreign.clone(),
             good_options.clone(),
@@ -569,7 +570,7 @@ fn a_numeric_length_or_foreign_type_is_not_a_codec_produced_source() {
             1,
         ),
         establish_request(
-            context,
+            participation,
             good_catalog.clone(),
             good_filter.clone(),
             foreign.clone(),
@@ -577,7 +578,7 @@ fn a_numeric_length_or_foreign_type_is_not_a_codec_produced_source() {
             1,
         ),
         establish_request(
-            context,
+            participation,
             good_catalog,
             good_filter,
             good_options,

@@ -19,6 +19,7 @@
 
 use super::{
     driver::{DriverState, PipelineDriver},
+    driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep},
     input::{AcceptedInput, InputPreparationFailure, PreparedInput, RawInput},
     operator::{InputEncodingPolicy, Operator, OperatorLifecycle},
     shape::{
@@ -26,13 +27,12 @@ use super::{
         TransformKernel,
     },
     step::{AdmissionNext, NextStep, StepResult},
-    step_context::{DEFAULT_TURN_WORK_UNITS, StepContext},
 };
 use crate::{
     exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema},
     runtime::{
-        fragment::{ExecutionResult, PipelineOperation},
         runtime_state::RuntimeState,
+        task::{ExecutionResult, PipelineOperation},
     },
 };
 use arrow::{
@@ -72,7 +72,7 @@ struct Observed {
     output: Mutex<Vec<i32>>,
     source_array: Mutex<Option<Weak<dyn Array>>>,
 }
-fn observe(ctx: &mut StepContext<'_>, observed: &Observed, site: &'static str) {
+fn observe(ctx: &mut DriverStep<'_>, observed: &Observed, site: &'static str) {
     let work = ctx.work();
     observed.trace.lock().unwrap().push(Observation {
         site,
@@ -88,7 +88,7 @@ struct IdentityPreparation {
 impl<K: Send> InputPreparation<K> for IdentityPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
         _: &K,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -102,7 +102,7 @@ impl<K: Send> InputPreparation<K> for IdentityPreparation {
     }
     fn prepare(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: AcceptedInput,
         _: &K,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -130,7 +130,7 @@ impl OperatorLifecycle for OneBatch {
     }
 }
 impl SourceKernel for OneBatch {
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.observed.source_calls.fetch_add(1, Ordering::SeqCst);
         observe(ctx, &self.observed, "source.before");
         let values = self
@@ -178,7 +178,7 @@ impl OperatorLifecycle for NestedPass {
 impl TransformKernel for NestedPass {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.observed.receivers[0]
@@ -202,13 +202,13 @@ impl TransformKernel for NestedPass {
         let rows = chunk.len() as u64;
         Ok(StepResult::new(Some(chunk), NextStep::NeedInput, rows))
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.observed.receivers[0]
             .drive
             .fetch_add(1, Ordering::SeqCst);
         panic!("the first transform has no unfinished payload work")
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.observed.receivers[0]
             .finish
             .fetch_add(1, Ordering::SeqCst);
@@ -228,7 +228,7 @@ struct DeferredPass {
 impl DeferredPass {
     fn advance(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         site: &'static str,
     ) -> ExecutionResult<StepResult> {
         observe(ctx, &self.observed, site);
@@ -255,7 +255,7 @@ impl OperatorLifecycle for DeferredPass {
 impl TransformKernel for DeferredPass {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.observed.receivers[1]
@@ -268,13 +268,13 @@ impl TransformKernel for DeferredPass {
         self.input = Some(input);
         self.advance(ctx, "second.first_turn")
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.observed.receivers[1]
             .drive
             .fetch_add(1, Ordering::SeqCst);
         self.advance(ctx, "second.next_turn")
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.observed.receivers[1]
             .finish
             .fetch_add(1, Ordering::SeqCst);
@@ -303,7 +303,7 @@ impl OperatorLifecycle for Collect {
 impl SinkKernel for Collect {
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         self.observed.receivers[2]
@@ -320,7 +320,7 @@ impl SinkKernel for Collect {
         );
         Ok(SinkStep::new(NextStep::NeedInput, chunk.len() as u64))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.observed.receivers[2]
             .finish
             .fetch_add(1, Ordering::SeqCst);

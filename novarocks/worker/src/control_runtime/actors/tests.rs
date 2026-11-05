@@ -19,12 +19,12 @@
 //! The host records neutral effects; they do not claim Native/Execution wiring.
 use super::*;
 use crate::control_admission::Dimension;
-use crate::control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits, StorageNeed};
+use crate::control_runtime_policy::{ControlRuntimePolicy, IngressPositionLimits, StorageNeed};
 use novarocks_control_runtime::{
     actor::ActorConfig,
+    actor_turn::{ActorRuntime, ActorTurnError, FailureSourceState, InputPhase},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, FailureSourceState, InputPhase},
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
@@ -37,16 +37,16 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution_contract::failure::FailureProjection;
 use novarocks_execution_contract::{
-    LeaseValidFor, OperationOutcome, QueryContextRef, TaskOperationId,
+    LeaseValidFor, OperationOutcome, ParticipationRef, TaskOperationId,
 };
 use novarocks_types::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
-use novarocks_worker_protocol::context::ContextCommand;
+use novarocks_worker_protocol::participation::ParticipationCommand;
 use novarocks_worker_protocol::{
-    context::{ContextConfig, PhysicalFact, RequestResult},
     creation::{CreationCost, PayloadId},
     lease::LeaseBounds,
+    participation::{ParticipationConfig, PhysicalFact, RequestResult},
 };
 pub(in crate::control_runtime) fn generation() -> Generation {
     Generation::new(1).unwrap()
@@ -54,14 +54,14 @@ pub(in crate::control_runtime) fn generation() -> Generation {
 pub(in crate::control_runtime) fn actor() -> ActorId {
     ActorId::new(1).unwrap()
 }
-fn context() -> QueryContextRef {
-    QueryContextRef::new(
+fn participation() -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7301, 7302), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     )
 }
-pub(in crate::control_runtime) fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
+pub(in crate::control_runtime) fn task(c: ParticipationRef, n: u32) -> TaskIdentity {
     TaskIdentity::new(
         c.query_execution_id(),
         StageId::new(1).unwrap(),
@@ -76,14 +76,14 @@ pub(in crate::control_runtime) fn operation(n: u8) -> TaskOperationId {
     TaskOperationId::try_from_bytes(bytes).unwrap()
 }
 
-/// Explicit initial facts for standalone Task/Context runtime fixtures. The
-/// real Context bootstrap tests instead consume their actual Materialize ticket.
+/// Explicit initial facts for standalone Task/Participation runtime fixtures. The
+/// real Participation bootstrap tests instead consume their actual Materialize ticket.
 pub(in crate::control_runtime) fn initial_establishment()
--> novarocks_worker_protocol::context::ContextEstablishment {
+-> novarocks_worker_protocol::participation::ParticipationEstablishment {
     use novarocks_execution_contract::{
-        AdmissionTicketId, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
+        AdmissionTicketId, ContentFingerprint, CredentialDomainId, CredentialEpoch,
     };
-    novarocks_worker_protocol::context::ContextEstablishment {
+    novarocks_worker_protocol::participation::ParticipationEstablishment {
         operation: operation(1),
         ticket: AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
         payload: PayloadId(1),
@@ -92,7 +92,7 @@ pub(in crate::control_runtime) fn initial_establishment()
             catalog: ContentFingerprint::from_bytes([1; 16]),
             shared_filter: ContentFingerprint::from_bytes([2; 16]),
             query_options: ContentFingerprint::from_bytes([3; 16]),
-            credential_lease: CredentialLeaseId::new(1),
+            credential_domain_id: CredentialDomainId::new(1),
             credential_epoch: CredentialEpoch::new(1).unwrap(),
             initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
         },
@@ -101,8 +101,8 @@ pub(in crate::control_runtime) fn initial_establishment()
 /// Symbolic credential slot supplied by the metadata-only materialization
 /// fixture. Native resource creation and physical exit are separate tests.
 pub(in crate::control_runtime) fn initial_materialized()
--> novarocks_worker_protocol::context::ContextMaterialized {
-    novarocks_worker_protocol::context::ContextMaterialized {
+-> novarocks_worker_protocol::participation::ParticipationMaterialized {
+    novarocks_worker_protocol::participation::ParticipationMaterialized {
         initial_credential_resource: 101,
     }
 }
@@ -145,7 +145,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         structural_bytes: 4,
     };
     let loading = f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task,
             payload: PayloadId(1),
         }),
@@ -154,14 +154,14 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     let source_parent = loading
         .iter()
         .find_map(|effect| match effect {
-            WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => {
+            WorkerAction::Participation(ParticipationEffect::LoadInput { reservation, .. }) => {
                 Some(*reservation)
             }
             _ => None,
         })
         .unwrap();
     let loaded = f.send(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task,
             result: Ok(cost),
         },
@@ -173,7 +173,8 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     let mut dispatch = crate::control_runtime::effect_dispatch::EffectDispatch::new(actor(), 15);
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
-    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &publication.effect
+    let WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) =
+        &publication.effect
     else {
         panic!("Accepted snapshot is the first actual publication");
     };
@@ -195,7 +196,10 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         .unwrap();
     let ticket = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
     let reservation = match ticket.effect {
-        WorkerAction::Context(ContextEffect::EnqueuePreparation { reservation, .. }) => reservation,
+        WorkerAction::Participation(ParticipationEffect::EnqueuePreparation {
+            reservation,
+            ..
+        }) => reservation,
         _ => unreachable!(),
     };
     let port = crate::task_port::TaskRuntimePort::from_admitted(
@@ -218,7 +222,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     .unwrap_or_else(|(error, _)| panic!("original Accepted guard adoption: {error}"));
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
-        Err(DriverError::UnknownReservation)
+        Err(ActorTurnError::UnknownReservation)
     ));
     let queue = PreparationQueue::new(1, 1, 1);
     queue
@@ -236,7 +240,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
         PreparationOutcome::Returned(())
     ));
     f.run(
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task,
             fact: PhysicalFact::PreparationBodyExited,
         },
@@ -245,7 +249,7 @@ fn actual_accepted_guard_moves_once_to_the_host_preparation_queue_and_retains_cl
     assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
     assert!(custody.publish_whole_exit().unwrap());
     f.run(
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task,
             fact: PhysicalFact::PreparationExited,
         },
@@ -288,7 +292,7 @@ fn retire_source_partials(
 fn source_role(
     scope: &ScopeHandle,
     parent: ReservationId,
-) -> crate::task_completion_roles::AdmittedCompletionRole {
+) -> crate::task_completion_set::AdmittedCompletionTransfer {
     let generation = scope.gates().unwrap().generation;
     let admitted = scope
         .reserve_child_next(
@@ -317,7 +321,7 @@ fn source_role(
         ],
     )
     .unwrap();
-    crate::task_completion_roles::AdmittedCompletionRole {
+    crate::task_completion_set::AdmittedCompletionTransfer {
         work,
         capacity,
         report,
@@ -329,7 +333,7 @@ pub(in crate::control_runtime) fn admitted_source_slot(
 ) -> crate::control_runtime::source_positions::SourceSlotAdmission {
     let admitted = source_role(scope, parent);
     crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
-        crate::control_runtime::admitted_role::adopt_reported_work(
+        crate::control_runtime::reported_work_admission::adopt_reported_work(
             admitted.work,
             admitted.capacity,
             admitted.report,
@@ -466,10 +470,10 @@ pub(in crate::control_runtime) struct Fixture {
     pub(in crate::control_runtime) scope: ScopeHandle,
     pub(in crate::control_runtime) runtime: ActorRuntime<WorkerActor>,
     pub(in crate::control_runtime) registration:
-        novarocks_control_runtime::driver::ActorRegistration,
-    pub(in crate::control_runtime) identity: QueryContextRef,
-    roles: Vec<(WorkLease, ReservationBundle)>,
-    jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
+        novarocks_control_runtime::actor_turn::ActorRegistration,
+    pub(in crate::control_runtime) identity: ParticipationRef,
+    obligation_pairs: Vec<(WorkObligation, ReservationObligation)>,
+    jobs: BTreeMap<ReservationId, (WorkObligation, ReservationObligation)>,
     /// Optional production profile assertions for the single-Task component.
     policy: Option<ControlRuntimePolicy>,
 }
@@ -481,7 +485,7 @@ impl Fixture {
         Self::with_admission_storage(bytes, None)
     }
     pub(in crate::control_runtime) fn with_policy_byte_limits(bytes: u64) -> Self {
-        let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+        let policy = ControlRuntimePolicy::try_new(IngressPositionLimits {
             ordinary_running: 1,
             ordinary_waiting: 0,
             control_running: 1,
@@ -503,7 +507,7 @@ impl Fixture {
         ])
         .unwrap();
         let effective_policy = policy.unwrap_or_else(|| {
-            ControlRuntimePolicy::try_new(IngressRoleLimits {
+            ControlRuntimePolicy::try_new(IngressPositionLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 0,
                 control_running: 1,
@@ -516,13 +520,13 @@ impl Fixture {
         let storage = AdmissionStorage {
             loading: effective_policy.loading.resources().unwrap(),
             accepted: effective_policy.accepted.resources().unwrap(),
-            context: empty(),
+            participation: empty(),
         };
-        // The three original supervisor/Step headers are context-unit owners,
+        // The three original supervisor/Step headers are participation-unit owners,
         // separate from the policy's Task lifetime and fixed Source inventory.
         let ledger = RuntimeLedger::new(limits);
         let scope = ledger.open_scope_next(None, generation()).unwrap();
-        let mut roles = Vec::new();
+        let mut obligation_pairs = Vec::new();
         for kind in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step] {
             let (mut work, capacity) = scope
                 .reserve_next(
@@ -531,7 +535,7 @@ impl Fixture {
                         StorageNeed {
                             inputs: 49,
                             batches: 49,
-                            effects: 49 * ContextActor::MAX_STEP_ACTIONS,
+                            effects: 49 * ParticipationActor::MAX_STEP_ACTIONS,
                             replies: 49,
                             work: 1,
                             ..StorageNeed::default()
@@ -550,20 +554,20 @@ impl Fixture {
             if kind != WorkKind::Cleanup {
                 work.start().unwrap();
             }
-            roles.push((work, capacity));
+            obligation_pairs.push((work, capacity));
         }
-        let identity = context();
-        let core = ContextCore::new(
+        let identity = participation();
+        let core = ParticipationCore::new(
             identity,
             generation(),
             initial_establishment(),
-            ContextConfig {
+            ParticipationConfig {
                 max_tasks: 4,
                 max_creation_waiters: 4,
                 max_pending_requests: 16,
                 max_preparing: 1,
                 max_task_bytes: bytes,
-                step_budget: ContextCore::MAX_STEP_WORK,
+                step_budget: ParticipationCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
                 request_horizon: crate::RequestHorizon::DEFAULT,
@@ -571,46 +575,48 @@ impl Fixture {
         )
         .unwrap();
         let runtime = ActorRuntime::new();
-        let bound = ContextActor::new(
+        let bound = ParticipationActor::new(
             core,
             scope.clone(),
             storage,
-            roles[1].0.reference(),
-            roles[2].0.reference(),
+            obligation_pairs[1].0.reference(),
+            obligation_pairs[2].0.reference(),
         );
         let registration = runtime
             .register_supervised_bound(
                 actor(),
                 scope.clone(),
-                WorkerActor::Context(Box::new(bound)),
+                WorkerActor::Participation(Box::new(bound)),
                 match policy {
-                    Some(policy) => policy.context_actor(1).unwrap(),
+                    Some(policy) => policy.participation_actor(1).unwrap(),
                     None => ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
                         max_effects_per_step:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         max_dependencies_per_effect:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
-                        turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
-                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+                        turn_budget:
+                            crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
+                        max_step_work:
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
                     },
                 },
-                &roles[0].0,
+                &obligation_pairs[0].0,
             )
-            .unwrap_or_else(|(e, _)| panic!("context registration: {e:?}"));
+            .unwrap_or_else(|(e, _)| panic!("participation registration: {e:?}"));
         let mut fixture = Self {
             ledger,
             scope,
             runtime,
             registration,
             identity,
-            roles,
+            obligation_pairs,
             jobs: BTreeMap::new(),
             policy,
         };
         let input = fixture.send(
-            ContextInput::MaterializationFinished {
+            ParticipationInput::MaterializationFinished {
                 result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
             },
             None,
@@ -630,7 +636,7 @@ impl Fixture {
     ) -> crate::control_runtime::task::TaskHostRecord {
         use crate::control_runtime::task::{TaskHostBinding, TaskHostRecord};
         let create = self.send(
-            ContextInput::Request(ContextCommand::Create {
+            ParticipationInput::Request(ParticipationCommand::Create {
                 task,
                 payload: PayloadId(1),
             }),
@@ -646,7 +652,7 @@ impl Fixture {
             &ticket,
             &TaskHostBinding {
                 registration: self.registration.clone(),
-                context: self.identity,
+                participation: self.identity,
                 task_source: ActorId::new(2).unwrap(),
                 protocol_generation: generation(),
                 max_cuts,
@@ -655,7 +661,7 @@ impl Fixture {
                     novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
                 ),
             },
-            &self.roles[0].0,
+            &self.obligation_pairs[0].0,
         )
         .unwrap();
         self.runtime.effect_completed(ticket).unwrap();
@@ -664,7 +670,7 @@ impl Fixture {
     }
     pub(in crate::control_runtime) fn send(
         &self,
-        command: ContextInput,
+        command: ParticipationInput,
         request: Option<TaskOperationId>,
         class: InputClass,
         source: u64,
@@ -674,22 +680,24 @@ impl Fixture {
                 &self.registration,
                 ActorId::new(source).unwrap(),
                 class,
-                &self.roles[2].0,
+                &self.obligation_pairs[2].0,
             )
             .unwrap()
-            .fill(WorkerMessage::Context(ContextMessage::Command {
-                work: self.roles[2].0.reference(),
-                request: request.map(|operation| RequestMetadata {
-                    operation,
-                    deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
-                }),
-                command,
-            }))
+            .fill(WorkerMessage::Participation(
+                ParticipationMessage::Command {
+                    work: self.obligation_pairs[2].0.reference(),
+                    request: request.map(|operation| RequestMetadata {
+                        operation,
+                        deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
+                    }),
+                    command,
+                },
+            ))
             .unwrap()
     }
     fn run(
         &mut self,
-        command: ContextInput,
+        command: ParticipationInput,
         request: Option<TaskOperationId>,
     ) -> Vec<WorkerAction> {
         let input = self.send(command, request, InputClass::Ordinary, 2);
@@ -735,7 +743,7 @@ impl Fixture {
                     target,
                     input,
                     None,
-                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                 )
                 .unwrap();
             let states: BTreeMap<_, _> = inventory.iter().map(|(d, s)| (d.id, *s)).collect();
@@ -755,7 +763,7 @@ impl Fixture {
                 .ready_effects(
                     target,
                     input,
-                    crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                 )
                 .unwrap();
             if ready.is_empty() {
@@ -764,9 +772,9 @@ impl Fixture {
             for action in ready {
                 let ticket = self.runtime.take_effect(target, input, action).unwrap();
                 let admitted = match &ticket.effect {
-                    WorkerAction::Context(
-                        ContextEffect::LoadInput { reservation, .. }
-                        | ContextEffect::EnqueuePreparation { reservation, .. },
+                    WorkerAction::Participation(
+                        ParticipationEffect::LoadInput { reservation, .. }
+                        | ParticipationEffect::EnqueuePreparation { reservation, .. },
                     ) => Some(*reservation),
                     WorkerAction::Control { admitted, .. } => *admitted,
                     _ => None,
@@ -800,7 +808,7 @@ impl Fixture {
                 }
                 if let WorkerAction::OwnerFailed { scope, .. } = &ticket.effect {
                     assert_eq!(*scope, self.scope.id());
-                    self.roles[0].0.start().unwrap();
+                    self.obligation_pairs[0].0.start().unwrap();
                 }
                 outputs.push(ticket.effect.clone());
                 self.runtime.effect_completed(ticket).unwrap();
@@ -851,12 +859,12 @@ impl Fixture {
         self.runtime.seal_actor(actor()).unwrap();
         // Every fixture-owned body and capture exits before joining any parent.
         // A still-live child must remain a real teardown failure.
-        for (work, _) in &mut self.roles {
+        for (work, _) in &mut self.obligation_pairs {
             work.body_exited().unwrap();
             work.captures_exited().unwrap();
         }
         self.ledger.reap_scope_ready(self.scope.id(), 256).unwrap();
-        for (work, capacity) in &mut self.roles {
+        for (work, capacity) in &mut self.obligation_pairs {
             assert!(work.actual_exit_ready().unwrap());
             capacity
                 .release_quota(&capacity.resources().unwrap().quota)
@@ -866,7 +874,7 @@ impl Fixture {
         self.scope.close_external().unwrap();
         self.runtime
             .remove_actor(actor())
-            .unwrap_or_else(|e| panic!("context removal: {e:?}"));
+            .unwrap_or_else(|e| panic!("participation removal: {e:?}"));
         self.ledger.remove_scope(self.scope.id()).unwrap();
         assert!(self.ledger.is_empty());
     }
@@ -884,7 +892,7 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
     assert_eq!(original.unresolved, 0);
 
     let create = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task,
             payload: PayloadId(1),
         }),
@@ -896,7 +904,9 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
     let action = f.runtime.ready_effects(actor(), create, 15).unwrap()[0];
     let ticket = f.runtime.take_effect(actor(), create, action).unwrap();
     let reservation = match ticket.effect {
-        WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => reservation,
+        WorkerAction::Participation(ParticipationEffect::LoadInput { reservation, .. }) => {
+            reservation
+        }
         _ => panic!("the actual elected Task's LoadInput effect"),
     };
     let task_work = ticket.descriptor.work;
@@ -909,7 +919,7 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
         &ticket,
         &TaskHostBinding {
             registration: f.registration.clone(),
-            context: f.identity,
+            participation: f.identity,
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 1,
@@ -918,7 +928,7 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
-        &f.roles[0].0,
+        &f.obligation_pairs[0].0,
     )
     .unwrap_or_else(|refusal| {
         panic!(
@@ -928,7 +938,7 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
     });
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
-        Err(DriverError::UnknownReservation)
+        Err(ActorTurnError::UnknownReservation)
     ));
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
@@ -942,7 +952,7 @@ fn source_bootstrap_keeps_the_original_paid_task_until_actual_unused_holders_exi
     assert!(resources.pending_loading.is_none());
     assert!(resources.preparation.is_none());
     assert!(resources.preparation_remainder.is_none());
-    assert!(resources.accepted_role_storage.is_none());
+    assert!(resources.accepted_completion_storage.is_none());
     assert!(resources.pending_preparation_adoption.is_none());
     assert!(resources.completion.is_none());
     assert!(resources.completion_action.is_none());
@@ -1048,11 +1058,11 @@ fn stopped_loader_returns_unread_input_and_reaps_only_original_unused_roles() {
     let mut f = Fixture::with_policy_byte_limits(4096);
     let policy = f.policy.unwrap();
     let task = task(f.identity, 1);
-    let context_headers = f.scope.snapshot().unwrap().work;
+    let participation_headers = f.scope.snapshot().unwrap().work;
     let mut host = f.adopt_task_host(task, 2);
     let elected = f.scope.snapshot().unwrap();
     assert_eq!(elected.storage, 8);
-    assert_eq!(elected.work, context_headers + 8);
+    assert_eq!(elected.work, participation_headers + 8);
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
 
     let reads = Arc::new(AtomicUsize::new(0));
@@ -1130,7 +1140,7 @@ fn stopped_loader_returns_unread_input_and_reaps_only_original_unused_roles() {
         pending_loading,
         preparation,
         preparation_remainder,
-        accepted_role_storage,
+        accepted_completion_storage,
         pending_preparation_adoption,
         mut source_partials,
         completion,
@@ -1191,7 +1201,7 @@ fn stopped_loader_returns_unread_input_and_reaps_only_original_unused_roles() {
     assert_eq!(f.scope.snapshot().unwrap().unresolved, elected.unresolved);
     assert!(preparation.is_none());
     assert!(preparation_remainder.is_none());
-    assert!(accepted_role_storage.is_none());
+    assert!(accepted_completion_storage.is_none());
     assert!(completion.is_none());
     assert!(completion_action.is_none());
     assert!(lifecycle_inputs.is_empty());
@@ -1214,7 +1224,7 @@ fn stopped_loader_returns_unread_input_and_reaps_only_original_unused_roles() {
     assert!(disposal_retired && disposal.is_retired());
     finish_source_routes(&f, port.ingress());
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
-    assert_eq!(f.scope.snapshot().unwrap().work, context_headers + 1);
+    assert_eq!(f.scope.snapshot().unwrap().work, participation_headers + 1);
     assert!(!lifetime.actual_exit_ready().unwrap());
     let TaskCreatePayload {
         input,
@@ -1248,7 +1258,7 @@ fn stopped_loader_returns_unread_input_and_reaps_only_original_unused_roles() {
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 0);
 
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
-    assert_eq!(f.scope.snapshot().unwrap().work, context_headers);
+    assert_eq!(f.scope.snapshot().unwrap().work, participation_headers);
     drop(lifetime);
     drop(active);
     f.finish();
@@ -1260,7 +1270,7 @@ fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differ
     let first_task = task(f.identity, 1);
     let second_task = task(f.identity, 2);
     let first = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: first_task,
             payload: PayloadId(1),
         }),
@@ -1269,7 +1279,7 @@ fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differ
         2,
     );
     let second = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: second_task,
             payload: PayloadId(2),
         }),
@@ -1283,10 +1293,10 @@ fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differ
     let a = f.drain(first);
     let b = f.drain(second);
     assert!(
-        matches!(a.as_slice(), [WorkerAction::Context(ContextEffect::LoadInput { task, .. })] if *task == first_task)
+        matches!(a.as_slice(), [WorkerAction::Participation(ParticipationEffect::LoadInput { task, .. })] if *task == first_task)
     );
     assert!(
-        matches!(b.as_slice(), [WorkerAction::Context(ContextEffect::LoadInput { task, .. })] if *task == second_task)
+        matches!(b.as_slice(), [WorkerAction::Participation(ParticipationEffect::LoadInput { task, .. })] if *task == second_task)
     );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 2);
     let mut replied = Vec::new();
@@ -1297,7 +1307,7 @@ fn actual_fair_delivery_uses_each_envelope_token_even_when_issuance_order_differ
             second_task
         };
         let outputs = f.run(
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: identity,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -1333,14 +1343,14 @@ fn accepted_preparation_keeps_its_original_bundle_after_the_body_fact() {
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
         Some(operation(1)),
     );
     let outputs = f.run(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 5,
@@ -1355,14 +1365,14 @@ fn accepted_preparation_keeps_its_original_bundle_after_the_body_fact() {
     assert_eq!(f.ledger.used(Dimension::PreparingBytes.id()), 23);
 
     f.run(
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: identity,
             fact: PhysicalFact::LoaderExited,
         },
         None,
     );
     f.run(
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: identity,
             fact: PhysicalFact::PreparationBodyExited,
         },
@@ -1378,7 +1388,7 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     let earlier = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
@@ -1393,13 +1403,13 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
         .unwrap()[0];
     let mut dispatch = crate::control_runtime::effect_dispatch::EffectDispatch::new(
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
     );
     dispatch.index_committed(&f.runtime, 16).unwrap();
     assert!(!dispatch.is_empty());
     assert!(dispatch.clear_failed_index(&f.runtime).is_err());
     let failed = f.send(
-        ContextInput::Installed {
+        ParticipationInput::Installed {
             task: task(f.identity, 999),
         },
         None,
@@ -1427,11 +1437,11 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
         .runtime
         .take_effect(actor(), failed, ActionId::new(1).unwrap())
         .unwrap();
-    assert_eq!(failure.descriptor.work, f.roles[0].0.reference());
+    assert_eq!(failure.descriptor.work, f.obligation_pairs[0].0.reference());
     assert!(
         matches!(failure.effect, WorkerAction::OwnerFailed { scope, generation } if scope == f.scope.id() && generation.get() == 2)
     );
-    f.roles[0].0.start().unwrap();
+    f.obligation_pairs[0].0.start().unwrap();
     f.runtime.effect_completed(failure).unwrap();
     f.runtime.retire_input(actor(), failed).unwrap();
     let descriptor = f
@@ -1447,7 +1457,7 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
     // publication has completed; its original unstarted guard still exists.
     assert_eq!(
         f.runtime.take_effect(actor(), earlier, descriptor.id).err(),
-        Some(DriverError::InputAuthorInactive)
+        Some(ActorTurnError::InputAuthorInactive)
     );
     assert_eq!(
         f.scope.work_lifecycle(descriptor.work.work).unwrap(),
@@ -1459,7 +1469,7 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
         .unwrap();
     assert_eq!(
         f.runtime.retire_input(actor(), earlier),
-        Err(DriverError::ReservationsRemain)
+        Err(ActorTurnError::ReservationsRemain)
     );
     assert_eq!(f.ledger.used(Dimension::ActiveTasks.id()), 1);
     drop(
@@ -1473,18 +1483,18 @@ fn failed_core_retains_unstarted_original_reservations_for_the_fixed_cleanup_own
 }
 
 #[test]
-fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generation() {
+fn logical_participation_close_does_not_invalidate_the_runtime_responsibility_generation() {
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
         Some(operation(1)),
     );
     f.run(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -1495,7 +1505,7 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
         None,
     );
     let aborted = f.run(
-        ContextInput::Request(ContextCommand::Abort {
+        ParticipationInput::Request(ParticipationCommand::Abort {
             cause: novarocks_execution_contract::AbortCause::QueryFailed,
         }),
         Some(operation(2)),
@@ -1503,30 +1513,31 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
     let close = aborted
         .iter()
         .find_map(|action| match action {
-            WorkerAction::Context(ContextEffect::CloseExternalAdmission { generation, .. }) => {
-                Some(*generation)
-            }
+            WorkerAction::Participation(ParticipationEffect::CloseExternalAdmission {
+                generation,
+                ..
+            }) => Some(*generation),
             _ => None,
         })
         .unwrap();
     assert_eq!(close.get(), 2);
-    let outputs = f.run(ContextInput::NextInternal, None);
+    let outputs = f.run(ParticipationInput::NextInternal, None);
     assert!(outputs.iter().any(|action| matches!(action,
-        WorkerAction::Context(ContextEffect::ApplyTaskClose { task, generation,
+        WorkerAction::Participation(ParticipationEffect::ApplyTaskClose { task, generation,
 ..
 }) if *task == identity && *generation == close)));
     let outputs = f.run(
-        ContextInput::ApplyTaskClose {
+        ParticipationInput::ApplyTaskClose {
             task: identity,
             generation: close,
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::QueryFailed,
             ),
         },
         None,
     );
     assert!(outputs.iter().any(|action| matches!(action,
-        WorkerAction::Context(ContextEffect::StopTask { task, generation }) if *task == identity && *generation == close)));
+        WorkerAction::Participation(ParticipationEffect::StopTask { task, generation }) if *task == identity && *generation == close)));
     assert_eq!(
         f.runtime.snapshot(actor()).unwrap().generation,
         generation()
@@ -1539,10 +1550,10 @@ fn logical_context_close_does_not_invalidate_the_runtime_responsibility_generati
 }
 
 #[test]
-fn process_control_and_context_share_one_scheduler_with_independent_original_custody() {
+fn process_control_and_participation_share_one_scheduler_with_independent_original_custody() {
     use novarocks_execution_contract::{
-        AcquireQueryContextAdmissionTicket, AdmissionTicketId, ContentFingerprint, CredentialEpoch,
-        CredentialLeaseId, QueryContextState,
+        AcquireParticipationAdmissionTicket, AdmissionTicketId, ContentFingerprint,
+        CredentialDomainId, CredentialEpoch, ParticipationState,
     };
     use novarocks_types::NativeCompatibilityId;
     use novarocks_worker_protocol::{
@@ -1554,14 +1565,14 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
         Some(operation(1)),
     );
     f.run(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 5,
@@ -1582,7 +1593,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
                     StorageNeed {
                         inputs: 49,
                         batches: 49,
-                        effects: 49 * ContextActor::MAX_STEP_ACTIONS,
+                        effects: 49 * ParticipationActor::MAX_STEP_ACTIONS,
                         replies: 49,
                         work: 1,
                         ..StorageNeed::default()
@@ -1620,7 +1631,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         AdmissionStorage {
             loading: empty(),
             accepted: empty(),
-            context: empty(),
+            participation: empty(),
         },
         roles[1].0.reference(),
         roles[0].0.reference(),
@@ -1646,9 +1657,9 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         )
         .unwrap_or_else(|(e, _)| panic!("control registration: {e:?}"));
     // This is another attempt. Its control work must remain eligible even
-    // while the first context retains all physical preparation positions.
+    // while the first participation retains all physical preparation positions.
     let c = f.identity;
-    let next = QueryContextRef::new(
+    let next = ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7401, 7402), AttemptId::new(1).unwrap()).unwrap(),
         c.frontend_process_id(),
         c.backend_process_id(),
@@ -1691,7 +1702,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
                     .unwrap(),
                 Some(WorkerAction::Control {
                     effect: ControlEffect::Route {
-                        state: QueryContextState::Active,
+                        state: ParticipationState::Active,
                         ..
                     },
                     ..
@@ -1700,7 +1711,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         }
         f.drain_for(target, input)
     };
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(3),
         next,
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
@@ -1732,7 +1743,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         })
         .expect("the original ticket grant carries only its neutral receipt");
     assert_eq!(receipt.ticket_id(), ticket_id);
-    assert_eq!(receipt.context(), next);
+    assert_eq!(receipt.participation(), next);
     assert_eq!(control_scope.snapshot().unwrap().work, work_before_grant);
     assert_eq!(f.jobs.len(), jobs_before_grant);
 
@@ -1741,7 +1752,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         catalog: ContentFingerprint::from_bytes([1; 16]),
         shared_filter: ContentFingerprint::from_bytes([2; 16]),
         query_options: ContentFingerprint::from_bytes([3; 16]),
-        credential_lease: CredentialLeaseId::new(1),
+        credential_domain_id: CredentialDomainId::new(1),
         credential_epoch: CredentialEpoch::new(1).unwrap(),
         initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     };
@@ -1749,7 +1760,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
         &mut f,
         ControlInput::Establish {
             request: operation(4),
-            context: next,
+            participation: next,
             ticket: ticket_id,
             payload: PayloadId(2),
             semantics,
@@ -1760,36 +1771,38 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     send(
         &mut f,
         ControlInput::EstablishmentDecided {
-            context: next,
-            decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
-                state: novarocks_execution_contract::QueryContextState::Active,
+            participation: next,
+            decision: novarocks_worker_protocol::participation::ParticipationEstablishmentDecision {
+                state: novarocks_execution_contract::ParticipationState::Active,
                 outcome: Ok(OperationOutcome::Accepted),
-                acknowledgement: Some(novarocks_worker_protocol::context::ContextAcknowledgement {
-                    outcome: OperationOutcome::Accepted,
-                    receipt: std::sync::Arc::new(
-                        novarocks_execution_contract::QueryContextReceipt::new(
-                            next,
-                            novarocks_execution_contract::QueryContextState::Active,
-                        )
-                        .with_lease(
-                            novarocks_worker_protocol::lease::InstalledLease::install_initial(
-                                semantics.initial_lease_valid_for,
-                                novarocks_worker_protocol::lease::LeaseBounds::DEFAULT,
-                                MonotonicInstant::ORIGIN,
+                acknowledgement: Some(
+                    novarocks_worker_protocol::participation::ParticipationAcknowledgement {
+                        outcome: OperationOutcome::Accepted,
+                        receipt: std::sync::Arc::new(
+                            novarocks_execution_contract::ParticipationReceipt::new(
+                                next,
+                                novarocks_execution_contract::ParticipationState::Active,
                             )
-                            .receipt(),
+                            .with_lease(
+                                novarocks_worker_protocol::lease::InstalledLease::install_initial(
+                                    semantics.initial_lease_valid_for,
+                                    novarocks_worker_protocol::lease::LeaseBounds::DEFAULT,
+                                    MonotonicInstant::ORIGIN,
+                                )
+                                .receipt(),
+                            ),
                         ),
-                    ),
-                    termination_cause: None,
-                }),
+                        termination_cause: None,
+                    },
+                ),
                 decided_at: MonotonicInstant::ORIGIN,
             },
         },
         None,
     );
-    // A broken context actor loses only its own scope, including uncompleted
+    // A broken participation actor loses only its own scope, including uncompleted
     // physical work. The same runtime keeps the process actor live.
-    let failed = f.run(ContextInput::Installed { task: task(c, 999) }, None);
+    let failed = f.run(ParticipationInput::Installed { task: task(c, 999) }, None);
     assert!(
         failed
             .iter()
@@ -1798,7 +1811,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     assert!(f.runtime.snapshot(actor()).unwrap().failed);
     assert!(!f.runtime.snapshot(target).unwrap().failed);
     assert_eq!(f.ledger.used(Dimension::PreparingTasks.id()), 1);
-    let healthy_context = QueryContextRef::new(
+    let healthy_participation = ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7403, 7404), AttemptId::new(1).unwrap()).unwrap(),
         c.frontend_process_id(),
         c.backend_process_id(),
@@ -1806,9 +1819,9 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     let healthy_reply = send(
         &mut f,
         ControlInput::Acquire {
-            request: AcquireQueryContextAdmissionTicket::new(
+            request: AcquireParticipationAdmissionTicket::new(
                 operation(5),
-                healthy_context,
+                healthy_participation,
                 LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                 NativeCompatibilityId::new([3; 32]),
                 capability,
@@ -1819,7 +1832,7 @@ fn process_control_and_context_share_one_scheduler_with_independent_original_cus
     );
     assert!(healthy_reply.iter().any(|action| matches!(action,
         WorkerAction::Control { effect: ControlEffect::AdmissionReply { result: Ok(receipt), .. }, .. }
-            if receipt.context() == healthy_context)), "the healthy process actor actually advances after Context failure");
+            if receipt.participation() == healthy_participation)), "the healthy process actor actually advances after Participation failure");
     f.finish_jobs();
     for (mut work, mut capacity) in roles {
         work.body_exited().unwrap();
@@ -1853,14 +1866,14 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
         Some(operation(1)),
     );
     f.run(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -1871,13 +1884,13 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
         None,
     );
     let installed = f.send(
-        ContextInput::Installed { task: identity },
+        ParticipationInput::Installed { task: identity },
         None,
         InputClass::Ordinary,
         2,
     );
     let running = f.send(
-        ContextInput::Running { task: identity },
+        ParticipationInput::Running { task: identity },
         None,
         InputClass::Lifecycle,
         2,
@@ -1885,7 +1898,7 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
     f.runtime.poll_one(Tick(1)).unwrap();
     let mut dispatch = EffectDispatch::new(
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS * 2,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS * 2,
     );
     assert!(
         dispatch
@@ -1909,7 +1922,9 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
         "the later snapshot cannot overtake its original predecessor"
     );
     let target = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(identity)));
-    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &first.effect else {
+    let WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) =
+        &first.effect
+    else {
         panic!("installed snapshot effect")
     };
     let previous = f
@@ -1920,11 +1935,13 @@ fn host_publications_follow_core_order_without_waiting_for_old_body_capture_reti
     dispatch.publication_committed(&f.runtime, &first).unwrap();
     assert_eq!(
         f.runtime.retire_input(actor(), installed),
-        Err(DriverError::EffectsRemain)
+        Err(ActorTurnError::EffectsRemain)
     );
     let second = dispatch.take_ready(&f.runtime, 8).unwrap().unwrap();
     assert_eq!(second.input, running);
-    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &second.effect else {
+    let WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) =
+        &second.effect
+    else {
         panic!("running snapshot effect")
     };
     let previous = f
@@ -1955,14 +1972,14 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     let mut f = Fixture::new();
     let identity = task(f.identity, 1);
     f.run(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task: identity,
             payload: PayloadId(1),
         }),
         Some(operation(1)),
     );
     f.run(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: identity,
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -1973,7 +1990,7 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         None,
     );
     let input = f.send(
-        ContextInput::Request(ContextCommand::Cancel {
+        ParticipationInput::Request(ParticipationCommand::Cancel {
             task: identity,
             reason: CancelReason::UpstreamNoLongerNeeded,
         }),
@@ -1983,9 +2000,9 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     );
     f.runtime.poll_one(Tick(1)).unwrap();
     let settled = f.send(
-        ContextInput::Settle {
+        ParticipationInput::Settle {
             task: identity,
-            work: f.roles[2].0.reference(),
+            work: f.obligation_pairs[2].0.reference(),
         },
         None,
         InputClass::Lifecycle,
@@ -1994,21 +2011,22 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     f.runtime.poll_one(Tick(2)).unwrap();
     let mut dispatch = EffectDispatch::new(
         actor(),
-        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
     );
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let conclusion = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
     assert!(matches!(
         conclusion.effect,
-        WorkerAction::Context(ContextEffect::PublishConclusion { .. })
+        WorkerAction::Participation(ParticipationEffect::PublishConclusion { .. })
     ));
     assert!(
         dispatch.take_ready(&f.runtime, 16).unwrap().is_none(),
         "neither stop nor the accepted reply may precede actual publication"
     );
     let accepted = PublishedSnapshot::new(&f.scope, Arc::new(None::<TaskConclusion>));
-    let WorkerAction::Context(ContextEffect::PublishConclusion {
-        conclusion: value, ..
+    let WorkerAction::Participation(ParticipationEffect::PublishConclusion {
+        conclusion: value,
+        ..
     }) = &conclusion.effect
     else {
         unreachable!()
@@ -2022,7 +2040,9 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
         .publication_committed(&f.runtime, &conclusion)
         .unwrap();
     let status = dispatch.take_ready(&f.runtime, 16).unwrap().unwrap();
-    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &status.effect else {
+    let WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) =
+        &status.effect
+    else {
         panic!("Task status must follow the conclusion")
     };
     let current = PublishedSnapshot::new(&f.scope, Arc::new(TaskStatus::created(identity)));
@@ -2041,12 +2061,12 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
     while let Some(ticket) = dispatch.take_ready(&f.runtime, 16).unwrap() {
         stopped |= matches!(
             ticket.effect,
-            WorkerAction::Context(ContextEffect::StopTask { .. })
+            WorkerAction::Participation(ParticipationEffect::StopTask { .. })
         );
         replied |= matches!(ticket.effect, WorkerAction::Reply(_));
         if matches!(
             ticket.effect,
-            WorkerAction::Context(ContextEffect::SettlementBarrier { .. })
+            WorkerAction::Participation(ParticipationEffect::SettlementBarrier { .. })
         ) {
             assert!(accepted.read().is_some());
             assert_eq!(current.read().state(), TaskState::Canceling);
@@ -2064,7 +2084,7 @@ fn actual_conclusion_and_status_publication_precede_stop_dispatch_and_reply_visi
                 actor(),
                 input,
                 None,
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             )
             .unwrap()
         {
@@ -2097,14 +2117,14 @@ fn exercise_original_fragment_roles(task_stopped: bool, settlement: SettlementSc
 fn exercise_fragment_roles_with_lifecycle(
     task_stopped: bool,
     settlement: SettlementScenario,
-    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleRole>,
+    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleInputKind>,
 ) {
     exercise_fragment_roles_with_preparation(task_stopped, settlement, lifecycle_role);
 }
 fn exercise_fragment_roles_with_preparation(
     task_stopped: bool,
     settlement: SettlementScenario,
-    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleRole>,
+    lifecycle_role: Option<crate::control_runtime_policy::TaskLifecycleInputKind>,
 ) {
     use crate::control_runtime::{
         effect_dispatch::EffectDispatch,
@@ -2112,7 +2132,7 @@ fn exercise_fragment_roles_with_preparation(
         task::{TaskHostBinding, TaskHostError, TaskHostRecord, TaskHostResources},
     };
     use crate::{
-        control_runtime_policy::TaskLifecycleRole, settlement::RegistrationNotice,
+        control_runtime_policy::TaskLifecycleInputKind, settlement::RegistrationNotice,
         task_port::TaskPendingNotice,
     };
     use novarocks_control_runtime_core::identity::ConsumerId;
@@ -2160,7 +2180,7 @@ fn exercise_fragment_roles_with_preparation(
 
     let task = task(f.identity, 1);
     let create = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task,
             payload: PayloadId(1),
         }),
@@ -2184,7 +2204,7 @@ fn exercise_fragment_roles_with_preparation(
         &ticket,
         &TaskHostBinding {
             registration: f.registration.clone(),
-            context: f.identity,
+            participation: f.identity,
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 4,
@@ -2193,7 +2213,7 @@ fn exercise_fragment_roles_with_preparation(
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
-        &f.roles[0].0,
+        &f.obligation_pairs[0].0,
     )
     .unwrap();
     let source4_headers = f.scope.snapshot().unwrap();
@@ -2210,7 +2230,7 @@ fn exercise_fragment_roles_with_preparation(
     ));
     assert!(
         f.runtime
-            .role_inventory(actor(), None, 32)
+            .standing_input_inventory(actor(), None, 32)
             .unwrap()
             .is_empty(),
         "loading cannot borrow post-Accepted input positions from another Task"
@@ -2221,7 +2241,7 @@ fn exercise_fragment_roles_with_preparation(
     ));
     let registration = Arc::new(AtomicUsize::new(0));
     let (error, notice) =
-        match host.issue_completion_roles(Box::new(Registered(registration.clone()))) {
+        match host.issue_completion_work(Box::new(Registered(registration.clone()))) {
             Err(refused) => refused,
             Ok(_) => panic!("completion before Accepted must fail"),
         };
@@ -2282,7 +2302,7 @@ fn exercise_fragment_roles_with_preparation(
         "input source is still retained, so loader whole exit remains false"
     );
     let loaded = f.send(
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task,
             result: Ok(cost),
         },
@@ -2295,7 +2315,8 @@ fn exercise_fragment_roles_with_preparation(
     let mut dispatch = EffectDispatch::new(actor(), 15);
     dispatch.index_committed(&f.runtime, 32).unwrap();
     let publication = dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
-    let WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) = &publication.effect
+    let WorkerAction::Participation(ParticipationEffect::PublishTask { snapshot, .. }) =
+        &publication.effect
     else {
         panic!("actual Accepted snapshot")
     };
@@ -2334,20 +2355,20 @@ fn exercise_fragment_roles_with_preparation(
             self.calls.fetch_add(2, Ordering::SeqCst);
         }
     }
-    if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
+    if lifecycle_role == Some(TaskLifecycleInputKind::OperatorStatistics) {
         let (producer, finalizer) = host.issue_statistics_producer().unwrap();
         assert_eq!(producer.identity(), task);
         assert_eq!(finalizer.identity(), task);
         assert!(matches!(
             host.issue_statistics_producer(),
             Err(TaskHostError::LifecycleAlreadyIssued(
-                TaskLifecycleRole::OperatorStatistics
+                TaskLifecycleInputKind::OperatorStatistics
             ))
         ));
         drop(producer);
         assert_eq!(
             host.statistics().unwrap().phase(),
-            novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+            novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted
         );
         assert!(finalizer.seal_for_terminal(None).is_none());
         assert!(host.statistics().unwrap().advance().unwrap().retired);
@@ -2356,11 +2377,11 @@ fn exercise_fragment_roles_with_preparation(
         // Actual typed permits have no common public issuer or clone. This
         // test erases only their local destructor after recording identity.
         let (identity, permit): (_, Box<dyn Any>) = match kind {
-            TaskLifecycleRole::Running => {
+            TaskLifecycleInputKind::Running => {
                 let permit = host.issue_start_permit().unwrap();
                 (permit.identity(), Box::new(permit))
             }
-            TaskLifecycleRole::TerminalObservation => {
+            TaskLifecycleInputKind::TerminalObservation => {
                 let permit = host.issue_terminal_permit().unwrap();
                 (permit.identity(), Box::new(permit))
             }
@@ -2370,8 +2391,8 @@ fn exercise_fragment_roles_with_preparation(
         let issued = f.scope.snapshot().unwrap();
         let cut = host.lifecycle_input(kind).unwrap().cut();
         let refused = match kind {
-            TaskLifecycleRole::Running => host.issue_start_permit().map(drop),
-            TaskLifecycleRole::TerminalObservation => host.issue_terminal_permit().map(drop),
+            TaskLifecycleInputKind::Running => host.issue_start_permit().map(drop),
+            TaskLifecycleInputKind::TerminalObservation => host.issue_terminal_permit().map(drop),
             _ => unreachable!("fixed test role"),
         };
         assert!(
@@ -2395,12 +2416,12 @@ fn exercise_fragment_roles_with_preparation(
         f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
         assert_eq!(
             host.lifecycle_input(kind).unwrap().phase(),
-            novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+            novarocks_control_runtime::exit_custody::ExitCustodyPhase::Retired
         );
         assert!(host.causal().is_empty());
         assert!(
             f.runtime
-                .role_inventory(actor(), None, 32)
+                .standing_input_inventory(actor(), None, 32)
                 .unwrap()
                 .is_empty()
         );
@@ -2417,7 +2438,7 @@ fn exercise_fragment_roles_with_preparation(
             .custody
             .iter()
             .all(|role| role.phase()
-                == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted)
+                == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted)
     );
 
     assert!(matches!(
@@ -2425,17 +2446,20 @@ fn exercise_fragment_roles_with_preparation(
         Err(crate::control_runtime::task::TaskHostError::CompletionAlreadyIssued)
     ));
     assert_eq!(
-        f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
+        f.runtime
+            .standing_input_inventory(actor(), None, 32)
+            .unwrap()
+            .len(),
         2
     );
     let admitted = host
-        .issue_completion_roles(Box::new(CountedRegistration {
+        .issue_completion_work(Box::new(CountedRegistration {
             notice,
             calls: registration.clone(),
         }))
         .unwrap_or_else(|(error, _)| panic!("original completion issuer: {error}"));
     assert!(matches!(
-        host.issue_completion_roles(Box::new(Registered(registration.clone()))),
+        host.issue_completion_work(Box::new(Registered(registration.clone()))),
         Err((TaskHostError::CompletionAlreadyIssued, _))
     ));
     f.runtime.effect_completed(preparation).unwrap();
@@ -2444,7 +2468,7 @@ fn exercise_fragment_roles_with_preparation(
     f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
     assert!(host.loader().unwrap().ready_for_exit().unwrap());
     f.run(
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task,
             fact: PhysicalFact::LoaderExited,
         },
@@ -2462,7 +2486,7 @@ fn exercise_fragment_roles_with_preparation(
     assert!(loader.try_retire().unwrap());
     if task_stopped {
         let canceled = f.send(
-            ContextInput::Request(ContextCommand::Cancel {
+            ParticipationInput::Request(ParticipationCommand::Cancel {
                 task,
                 reason: novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
             }),
@@ -2477,7 +2501,7 @@ fn exercise_fragment_roles_with_preparation(
             let publication = cancel_dispatch.take_ready(&f.runtime, 15).unwrap().unwrap();
             let current = port.publication().read();
             let next = match &publication.effect {
-                WorkerAction::Context(ContextEffect::PublishConclusion {
+                WorkerAction::Participation(ParticipationEffect::PublishConclusion {
                     generation,
                     conclusion,
                     source,
@@ -2492,9 +2516,9 @@ fn exercise_fragment_roles_with_preparation(
                         .unwrap();
                     current.with_conclusion(accepted).unwrap()
                 }
-                WorkerAction::Context(ContextEffect::PublishTask { snapshot, .. }) => {
-                    current.with_status(snapshot.clone()).unwrap()
-                }
+                WorkerAction::Participation(ParticipationEffect::PublishTask {
+                    snapshot, ..
+                }) => current.with_status(snapshot.clone()).unwrap(),
                 _ => panic!("actual ordered cancellation publication"),
             };
             drop(current);
@@ -2515,7 +2539,7 @@ fn exercise_fragment_roles_with_preparation(
                 .expect("actual producer stop remains ready");
             let stop = matches!(
                 effect.effect,
-                WorkerAction::Context(ContextEffect::StopTask { .. })
+                WorkerAction::Participation(ParticipationEffect::StopTask { .. })
             );
             if stop {
                 port.notify_stopped();
@@ -2529,7 +2553,7 @@ fn exercise_fragment_roles_with_preparation(
         assert!(port.is_stopped());
         assert!(
             !f.scope.snapshot().unwrap().stopped,
-            "Task stop keeps the context scope live for other Tasks"
+            "Task stop keeps the participation scope live for other Tasks"
         );
     }
     let called = AtomicUsize::new(0);
@@ -2655,7 +2679,7 @@ fn exercise_fragment_roles_with_preparation(
         ordered.index_committed(&f.runtime, 32).unwrap();
         let barrier = ordered.take_ready(&f.runtime, 15).unwrap().unwrap();
         assert!(matches!(barrier.effect,
-            WorkerAction::Context(ContextEffect::SettlementBarrier { task: t, work: w })
+            WorkerAction::Participation(ParticipationEffect::SettlementBarrier { task: t, work: w })
                 if t == task && w == work));
         if settlement != SettlementScenario::FailBeforeBarrier {
             completion
@@ -2666,7 +2690,7 @@ fn exercise_fragment_roles_with_preparation(
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         if failed {
             let bad = f.send(
-                ContextInput::Installed {
+                ParticipationInput::Installed {
                     task: self::task(f.identity, 999),
                 },
                 None,
@@ -2699,7 +2723,7 @@ fn exercise_fragment_roles_with_preparation(
                 .runtime
                 .take_effect(actor(), bad, ActionId::new(1).unwrap())
                 .unwrap();
-            f.roles[0].0.start().unwrap();
+            f.obligation_pairs[0].0.start().unwrap();
             let mut session = f.runtime.claim_failure_publication(&cleanup).unwrap();
             assert!(matches!(
                 completion.commit_failure_settlement_barrier(&mut session, &port),
@@ -2708,8 +2732,8 @@ fn exercise_fragment_roles_with_preparation(
             if settlement == SettlementScenario::FailBeforeBarrier {
                 assert!(matches!(
                     completion.commit_settlement_barrier(&f.runtime, &barrier, &port),
-                    Err(SettlementDispatchError::Driver(
-                        DriverError::FailurePublicationRequired
+                    Err(SettlementDispatchError::ActorTurn(
+                        ActorTurnError::FailurePublicationRequired
                     ))
                 ));
             }
@@ -2727,8 +2751,8 @@ fn exercise_fragment_roles_with_preparation(
             } else {
                 assert!(matches!(
                     completion.commit_failure_settlement_barrier(&mut session, &port),
-                    Err(SettlementDispatchError::Driver(
-                        DriverError::ReplyAlreadyCommitted
+                    Err(SettlementDispatchError::ActorTurn(
+                        ActorTurnError::ReplyAlreadyCommitted
                     ))
                 ));
             }
@@ -2776,10 +2800,10 @@ fn exercise_fragment_roles_with_preparation(
     dispose_retired_pair(&f, port.ingress(), retired);
     assert!(host.causal().is_empty());
     for role in [
-        TaskLifecycleRole::Finisher,
-        TaskLifecycleRole::Settlement,
-        TaskLifecycleRole::WallTime,
-        TaskLifecycleRole::TerminalPublisher,
+        TaskLifecycleInputKind::Finisher,
+        TaskLifecycleInputKind::Settlement,
+        TaskLifecycleInputKind::WallTime,
+        TaskLifecycleInputKind::TerminalPublisher,
     ] {
         if failed {
             completion
@@ -2814,7 +2838,7 @@ fn exercise_fragment_roles_with_preparation(
         pending_loading,
         preparation,
         mut preparation_remainder,
-        mut accepted_role_storage,
+        mut accepted_completion_storage,
         pending_preparation_adoption,
         mut source_partials,
         completion,
@@ -2853,14 +2877,14 @@ fn exercise_fragment_roles_with_preparation(
         "this component issued no open-summary role"
     );
     assert!(causal.is_empty());
-    if lifecycle_role == Some(TaskLifecycleRole::OperatorStatistics) {
+    if lifecycle_role == Some(TaskLifecycleInputKind::OperatorStatistics) {
         assert!(lifecycle_inputs.is_empty());
         assert!(statistics.as_ref().unwrap().is_retired());
     } else if let Some(kind) = lifecycle_role {
         assert_eq!(lifecycle_inputs.len(), 1);
         assert_eq!(
             lifecycle_inputs[&kind].phase(),
-            novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+            novarocks_control_runtime::exit_custody::ExitCustodyPhase::Retired
         );
     } else {
         assert!(lifecycle_inputs.is_empty());
@@ -2874,16 +2898,16 @@ fn exercise_fragment_roles_with_preparation(
     drop(preparation);
     drop(loader);
     let retained = preparation_remainder.as_mut().unwrap();
-    let accepted_roles = TaskLifecycleRole::COUNT - TaskLifecycleRole::LOADING.len();
-    let task_roles = StorageNeed::role(false)
+    let accepted_roles = TaskLifecycleInputKind::COUNT - TaskLifecycleInputKind::LOADING.len();
+    let task_roles = StorageNeed::causal_cut_storage(false)
         .checked_mul(accepted_roles)
         .unwrap();
     let mut consumed_roles = crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
         .checked_mul(6)
         .unwrap();
     if let Some(kind) = lifecycle_role {
-        let extra = if kind == TaskLifecycleRole::OperatorStatistics {
-            StorageNeed::role(false)
+        let extra = if kind == TaskLifecycleInputKind::OperatorStatistics {
+            StorageNeed::causal_cut_storage(false)
                 .checked_sub(
                     crate::control_runtime::source_positions::SOURCE_SLOT_STORAGE
                         .checked_mul(2)
@@ -2891,12 +2915,16 @@ fn exercise_fragment_roles_with_preparation(
                 )
                 .unwrap()
         } else {
-            StorageNeed::role(false)
+            StorageNeed::causal_cut_storage(false)
         };
         consumed_roles = consumed_roles.checked_add(extra).unwrap();
     }
     assert_eq!(
-        accepted_role_storage.as_ref().unwrap().resources().unwrap(),
+        accepted_completion_storage
+            .as_ref()
+            .unwrap()
+            .resources()
+            .unwrap(),
         task_roles
             .checked_sub(consumed_roles)
             .unwrap()
@@ -2999,11 +3027,11 @@ fn exercise_fragment_roles_with_preparation(
     drop(port);
     f.ledger.reap_scope_ready(f.scope.id(), 32).unwrap();
     assert!(lifetime.actual_exit_ready().unwrap());
-    if let Some(storage) = &mut accepted_role_storage {
+    if let Some(storage) = &mut accepted_completion_storage {
         assert!(storage.resources().unwrap().quota.is_empty());
         storage.finish().unwrap();
     }
-    drop(accepted_role_storage);
+    drop(accepted_completion_storage);
 
     active
         .release_quota(&active.resources().unwrap().quota)
@@ -3028,7 +3056,7 @@ fn an_accepted_start_issuer_holds_one_original_role_and_withdraws_only_its_unuse
     exercise_fragment_roles_with_lifecycle(
         false,
         SettlementScenario::Unused,
-        Some(crate::control_runtime_policy::TaskLifecycleRole::Running),
+        Some(crate::control_runtime_policy::TaskLifecycleInputKind::Running),
     );
 }
 
@@ -3037,7 +3065,7 @@ fn an_accepted_terminal_issuer_withdraws_only_its_unbound_original_observation()
     exercise_fragment_roles_with_lifecycle(
         false,
         SettlementScenario::Unused,
-        Some(crate::control_runtime_policy::TaskLifecycleRole::TerminalObservation),
+        Some(crate::control_runtime_policy::TaskLifecycleInputKind::TerminalObservation),
     );
 }
 
@@ -3046,7 +3074,7 @@ fn one_accepted_statistics_issuer_waits_for_the_original_producer_and_finalizer_
     exercise_fragment_roles_with_lifecycle(
         false,
         SettlementScenario::Unused,
-        Some(crate::control_runtime_policy::TaskLifecycleRole::OperatorStatistics),
+        Some(crate::control_runtime_policy::TaskLifecycleInputKind::OperatorStatistics),
     );
 }
 
@@ -3055,7 +3083,7 @@ fn original_fragment_roles_belong_to_task_lifetime_and_do_not_hold_preparation_p
     exercise_original_fragment_roles(false, SettlementScenario::Unused);
 }
 #[test]
-fn task_stop_prevents_queued_preparation_start_without_stopping_the_context_scope() {
+fn task_stop_prevents_queued_preparation_start_without_stopping_the_participation_scope() {
     exercise_original_fragment_roles(true, SettlementScenario::Unused);
 }
 
@@ -3094,7 +3122,7 @@ impl CausalHarness {
         let mut fixture = Fixture::new();
         let task = task(fixture.identity, 1);
         let loading = fixture.run(
-            ContextInput::Request(ContextCommand::Create {
+            ParticipationInput::Request(ParticipationCommand::Create {
                 task,
                 payload: PayloadId(1),
             }),
@@ -3103,14 +3131,14 @@ impl CausalHarness {
         let source_parent = loading
             .iter()
             .find_map(|effect| match effect {
-                WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => {
-                    Some(*reservation)
-                }
+                WorkerAction::Participation(ParticipationEffect::LoadInput {
+                    reservation, ..
+                }) => Some(*reservation),
                 _ => None,
             })
             .expect("the real Task lifetime was adopted from its LoadInput effect");
         fixture.run(
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -3154,7 +3182,7 @@ impl CausalHarness {
                 StorageNeed {
                     inputs: 4,
                     batches: 4,
-                    effects: 4 * ContextActor::MAX_STEP_ACTIONS,
+                    effects: 4 * ParticipationActor::MAX_STEP_ACTIONS,
                     cuts: 1,
                     work: 1,
                     ..StorageNeed::default()
@@ -3168,7 +3196,7 @@ impl CausalHarness {
             .bind(WorkKind::Settlement)
             .unwrap();
         let id = work.id();
-        self.fixture.roles.push((work, capacity));
+        self.fixture.obligation_pairs.push((work, capacity));
         id
     }
     fn settlement(
@@ -3184,7 +3212,7 @@ impl CausalHarness {
             .admit_settlement(
                 &self
                     .fixture
-                    .roles
+                    .obligation_pairs
                     .iter()
                     .find(|(original, _)| original.id() == work)
                     .unwrap()
@@ -3196,7 +3224,7 @@ impl CausalHarness {
             .unwrap();
         sender.bind_work(
             self.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == work)
                 .unwrap()
@@ -3264,7 +3292,7 @@ impl CausalHarness {
 #[test]
 fn lifecycle_event_report_cannot_use_its_prefix_as_its_own_core_receipt() {
     use crate::control_runtime::causal::TaskCausalInbox;
-    use novarocks_control_runtime::driver::Clock;
+    use novarocks_control_runtime::actor_turn::Clock;
     use novarocks_control_runtime_core::completion::Consumption;
     use novarocks_execution_contract::{CancelReason, TaskConclusionProposal};
     use std::sync::{
@@ -3300,7 +3328,7 @@ fn lifecycle_event_report_cannot_use_its_prefix_as_its_own_core_receipt() {
         .inbox
         .admit_input(
             &h.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == work)
                 .expect("the same actual author")
@@ -3314,7 +3342,7 @@ fn lifecycle_event_report_cannot_use_its_prefix_as_its_own_core_receipt() {
         CancelReason::UpstreamNoLongerNeeded,
     )));
     sender
-        .send_input(ContextInput::Physical {
+        .send_input(ParticipationInput::Physical {
             task: h.task,
             fact: PhysicalFact::OutputReleased,
         })
@@ -3379,7 +3407,7 @@ fn actual_causal_registration_order_seals_each_prefix_and_does_not_wait_for_host
         h.fixture
             .runtime
             .retire_input(actor(), earlier.prefix.unwrap()),
-        Err(DriverError::EffectsRemain)
+        Err(ActorTurnError::EffectsRemain)
     );
     let later = h.inbox.deliver_next().unwrap().unwrap();
     assert_eq!(later.cut, first);
@@ -3389,11 +3417,11 @@ fn actual_causal_registration_order_seals_each_prefix_and_does_not_wait_for_host
     let earlier_effects = h.retire(earlier);
     let later_effects = h.retire(later);
     assert!(earlier_effects.iter().any(|effect| matches!(effect,
-        WorkerAction::Context(ContextEffect::PublishConclusion { conclusion, .. })
+        WorkerAction::Participation(ParticipationEffect::PublishConclusion { conclusion, .. })
             if *conclusion == TaskConclusion::Terminated(TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded)))));
     assert!(!later_effects.iter().any(|effect| matches!(
         effect,
-        WorkerAction::Context(ContextEffect::PublishConclusion { .. })
+        WorkerAction::Participation(ParticipationEffect::PublishConclusion { .. })
     )));
     h.finish();
 }
@@ -3404,28 +3432,29 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
     use novarocks_execution_contract::{AbortCause, CancelReason, TaskConclusionProposal};
     let mut h = CausalHarness::new(2);
     // Close and settlement are already admitted responsibilities. The actual
-    // Context stop commit must not be bypassed by fresh external admission.
+    // Participation stop commit must not be bypassed by fresh external admission.
     let work = h.work();
     let admission = h.admission();
     let settlement_work = h.work();
     let settlement_admission = h.admission();
     let mut closing = h.fixture.run(
-        ContextInput::Request(ContextCommand::Abort {
+        ParticipationInput::Request(ParticipationCommand::Abort {
             cause: AbortCause::PeerTaskFailed,
         }),
         Some(operation(2)),
     );
-    assert!(
-        closing
-            .iter()
-            .any(|effect| matches!(effect, WorkerAction::Context(ContextEffect::WakeInternal)))
-    );
-    closing.extend(h.fixture.run(ContextInput::NextInternal, None));
+    assert!(closing.iter().any(|effect| matches!(
+        effect,
+        WorkerAction::Participation(ParticipationEffect::WakeInternal)
+    )));
+    closing.extend(h.fixture.run(ParticipationInput::NextInternal, None));
     let next = closing
         .iter()
         .find_map(|effect| match effect {
-            WorkerAction::Context(ContextEffect::ApplyTaskClose {
-                task, generation, ..
+            WorkerAction::Participation(ParticipationEffect::ApplyTaskClose {
+                task,
+                generation,
+                ..
             }) if *task == h.task => Some(*generation),
             _ => None,
         })
@@ -3435,9 +3464,11 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
         .inbox
         .admit_close(
             next,
-            novarocks_worker_protocol::context::TaskCloseIntent::Abort(AbortCause::PeerTaskFailed),
+            novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
+                AbortCause::PeerTaskFailed,
+            ),
             &h.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == work)
                 .expect("the same actual close author")
@@ -3457,7 +3488,7 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
         .inbox
         .admit_settlement(
             &h.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == settlement_work)
                 .unwrap()
@@ -3469,7 +3500,7 @@ fn actual_task_close_handoff_advances_the_next_prefix_generation_in_the_same_fif
         .unwrap();
     settle.bind_work(
         h.fixture
-            .roles
+            .obligation_pairs
             .iter()
             .find(|(original, _)| original.id() == settlement_work)
             .unwrap()
@@ -3506,7 +3537,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     assert_eq!(
         h.fixture
             .runtime
-            .role_inventory(actor(), None, 32)
+            .standing_input_inventory(actor(), None, 32)
             .unwrap()
             .len(),
         2
@@ -3521,7 +3552,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
         .inbox
         .admit_settlement(
             &h.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == producer)
                 .unwrap()
@@ -3545,7 +3576,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     assert_eq!(
         h.fixture
             .runtime
-            .role_inventory(actor(), None, 32)
+            .standing_input_inventory(actor(), None, 32)
             .unwrap()
             .len(),
         2,
@@ -3563,7 +3594,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     assert_eq!(
         h.fixture
             .runtime
-            .role_inventory(actor(), None, 32)
+            .standing_input_inventory(actor(), None, 32)
             .unwrap()
             .len(),
         2
@@ -3580,7 +3611,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
     assert!(
         h.fixture
             .runtime
-            .role_inventory(actor(), None, 32)
+            .standing_input_inventory(actor(), None, 32)
             .unwrap()
             .is_empty()
     );
@@ -3590,7 +3621,7 @@ fn actual_causal_role_refusal_rolls_back_only_unused_positions_and_unused_holder
 #[test]
 fn missing_actual_input_observation_cannot_be_reconstructed_from_a_retired_queue() {
     use crate::control_runtime::causal::CausalError;
-    use novarocks_control_runtime::driver::InputPhase;
+    use novarocks_control_runtime::actor_turn::InputPhase;
     let mut h = CausalHarness::new(1);
     let (cut, sender) = h.settlement();
     sender.registered();
@@ -3641,7 +3672,7 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
                 .runtime
                 .reserve_input(actor(), ActorId::new(7002).unwrap(), InputClass::Lifecycle)
                 .unwrap()
-                .into_role()
+                .into_standing_input()
                 .unwrap_or_else(|_| panic!("original empty input role")),
         );
     }
@@ -3655,7 +3686,7 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
         .inbox
         .admit_settlement(
             &h.fixture
-                .roles
+                .obligation_pairs
                 .iter()
                 .find(|(original, _)| original.id() == producer)
                 .unwrap()
@@ -3668,7 +3699,7 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
         .expect("all real lifecycle positions are already held");
     assert!(matches!(
         refusal.error,
-        crate::control_runtime::causal::CausalError::Driver(_)
+        crate::control_runtime::causal::CausalError::ActorTurn(_)
     ));
     let CutSourceAdmission::Fresh(ref roles) = refusal.admission else {
         panic!("runtime refusal preserves the original source roles");
@@ -3689,8 +3720,8 @@ fn a_runtime_input_refusal_returns_the_same_two_paid_source_roles() {
 fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_witnesses() {
     use crate::control_runtime::causal::{CausalSourceRetirement, TaskCausalInbox};
     use crate::task_proposal_ingress::PairRoute;
-    use novarocks_control_runtime::driver::Clock;
-    use novarocks_execution::runtime::fragment::ExecutionFailure;
+    use novarocks_control_runtime::actor_turn::Clock;
+    use novarocks_execution::runtime::task::ExecutionFailure;
     use novarocks_execution_contract::{TaskConclusionProposal, TaskFailurePhase};
     use novarocks_worker_protocol::proposal_summary::SourceId;
     use std::sync::{
@@ -3805,7 +3836,7 @@ fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_wi
     h.inbox.observe_core(cut).unwrap();
     let prefix_effects = h.fixture.drain(prefix);
     assert!(prefix_effects.iter().any(|effect| matches!(effect,
-        WorkerAction::Context(ContextEffect::PublishConclusion { source: Some(actual), .. }) if *actual == source)));
+        WorkerAction::Participation(ParticipationEffect::PublishConclusion { source: Some(actual), .. }) if *actual == source)));
     h.fixture.drain(delivery.event);
     // Only the actual Core effect names this retained source. Dispose it on
     // this component's host stack, then consume reports using that saved proof.
@@ -3881,5 +3912,5 @@ fn source_core_receipt_names_its_real_prefix_and_retirement_returns_both_reap_wi
 #[path = "tests/host_call_bootstrap.rs"]
 mod host_call_bootstrap;
 
-#[path = "tests/context_internal_budget.rs"]
-mod context_internal_budget;
+#[path = "tests/participation_internal_budget.rs"]
+mod participation_internal_budget;

@@ -88,7 +88,7 @@ impl SimdBlockFilter {
     pub(in crate::exec::runtime_filter) fn merge_from(
         &mut self,
         other: &SimdBlockFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if !self.can_use() || !other.can_use() {
             return Ok(());
         }
@@ -148,7 +148,7 @@ impl SimdBlockFilter {
     pub(in crate::exec::runtime_filter) fn deserialize(
         data: &[u8],
         offset: &mut usize,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let log_num_buckets = read_i32_le(data, offset)?;
         let directory_mask = read_u32_le(data, offset)?;
         let data_size = read_i32_le(data, offset)? as usize;
@@ -282,7 +282,7 @@ impl RuntimeBloomFilter {
     pub fn merge_from(
         &mut self,
         other: &RuntimeBloomFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.ltype != other.ltype {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime bloom filter metadata mismatch",
@@ -305,7 +305,7 @@ impl RuntimeBloomFilter {
     pub fn filter_chunk(
         &self,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -339,7 +339,7 @@ impl RuntimeBloomFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -374,7 +374,7 @@ impl RuntimeBloomFilter {
         &self,
         array: &ArrayRef,
         keep: &mut [bool],
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         let Some(bf) = self.bf.as_ref() else {
             return Ok(());
         };
@@ -388,7 +388,7 @@ impl RuntimeBloomFilter {
         ltype: RuntimeFilterType,
         array: &ArrayRef,
         join_mode: i8,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let size = array.len() as u64;
         let min_max = RuntimeMinMaxFilter::from_arrays(ltype, std::slice::from_ref(array))?;
         if size == 0 {
@@ -431,7 +431,7 @@ impl RuntimeBloomFilter {
     pub fn insert_array(
         &mut self,
         array: &ArrayRef,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         let Some(bf) = self.bf.as_mut() else {
             return Ok(());
         };
@@ -520,7 +520,7 @@ fn apply_bloom_filter(
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],
-) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(), crate::runtime::task::ExecutionFailure> {
     let len = array.len();
     if keep.len() != len {
         return Err(crate::exec::runtime_filter::failure::contract(
@@ -826,7 +826,7 @@ fn build_bloom_from_array(
     ltype: &RuntimeFilterType,
     array: &ArrayRef,
     bf: &mut SimdBlockFilter,
-) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<bool, crate::runtime::task::ExecutionFailure> {
     let len = array.len();
     let mut has_null = false;
     match array.data_type() {

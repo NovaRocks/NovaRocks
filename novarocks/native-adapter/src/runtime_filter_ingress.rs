@@ -19,7 +19,7 @@
 //!
 //! One owner installs runtime-filter participants on this backend process:
 //! the query-context host installs the participant named by an
-//! `EstablishQueryContext`, and every intent runs on the task protocol. A
+//! `EstablishParticipation`, and every intent runs on the task protocol. A
 //! participant is reachable only through the owner that installed it, so the
 //! wire ingress asks that owner.
 //!

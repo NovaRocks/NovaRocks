@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use novarocks_fs::{
         FsAccessResolver, FsAccessResources, ObjectStoreProviderPool,
-        ObjectStoreProviderPoolOptions, TokioFileIoRuntime, TokioFileTaskSpawner,
+        ObjectStoreProviderPoolOptions, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -304,7 +304,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         // The test does not schedule file I/O; the runtime is needed only to
         // construct a valid binding while validating resolver selection.

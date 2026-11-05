@@ -29,9 +29,9 @@ use std::sync::Arc;
 use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_spi::connector::write_stack::{ConnectorWriteTargetPlan, WriteTargetOrdinal};
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
-    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorWriteCohortId, ConnectorWriteReceipt,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewriteReceipt, ConnectorError,
+    ConnectorErrorKind, ConnectorRequestContext, ConnectorWriteCohortId, ConnectorWriteReceipt,
+    SharedConnectorDistributedRewrite,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -177,7 +177,7 @@ pub struct ConnectorDistributedRewriteSession {
 
 struct ConnectorDistributedRewriteSessionInner {
     plan: Arc<ConnectorDistributedRewritePlan>,
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     write_session: Option<Arc<ConnectorWriteSession>>,
 }
 
@@ -186,10 +186,10 @@ impl ConnectorDistributedRewriteSession {
     /// remains an affirmative owner independently of this borrowed CPU work.
     pub(crate) fn from_original_session(
         plan: Arc<ConnectorDistributedRewritePlan>,
-        lease: ConnectorDistributedRewriteLease,
+        rewrite: SharedConnectorDistributedRewrite,
         write_session: Option<Arc<ConnectorWriteSession>>,
     ) -> Result<Self, ConnectorError> {
-        lease.validate_plan(plan.as_ref())?;
+        rewrite.validate_plan(plan.as_ref())?;
         match (&write_session, plan.cohorts().is_empty()) {
             (None, true) => {}
             (Some(session), false) => validate_rewrite_target_groups(
@@ -208,7 +208,7 @@ impl ConnectorDistributedRewriteSession {
         Ok(Self {
             inner: Arc::new(ConnectorDistributedRewriteSessionInner {
                 plan,
-                lease,
+                rewrite,
                 write_session,
             }),
         })
@@ -230,8 +230,8 @@ impl ConnectorDistributedRewriteSession {
     /// Exact composite lease retained from frozen planning through terminal
     /// commit or abort.  Provider-facing execution may use only this lease to
     /// plan the opaque frozen source.
-    pub fn lease(&self) -> &ConnectorDistributedRewriteLease {
-        &self.inner.lease
+    pub fn rewrite(&self) -> &SharedConnectorDistributedRewrite {
+        &self.inner.rewrite
     }
 
     pub fn is_noop(&self) -> bool {
@@ -273,7 +273,9 @@ impl ConnectorDistributedRewriteSession {
         &self,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<ConnectorDistributedRewriteReceipt, ConnectorError> {
-        self.inner.lease.finalize_rewrite(&self.inner.plan, receipt)
+        self.inner
+            .rewrite
+            .finalize_rewrite(&self.inner.plan, receipt)
     }
 
     fn require_write_session(&self) -> Result<&Arc<ConnectorWriteSession>, ConnectorError> {
@@ -710,7 +712,7 @@ mod tests {
         cohorts: usize,
     ) -> (
         ConnectorDistributedRewritePlan,
-        ConnectorDistributedRewriteLease,
+        SharedConnectorDistributedRewrite,
     ) {
         fixture_with_group_schemas(&vec![rewrite_scan_schema(); cohorts])
     }
@@ -722,7 +724,7 @@ mod tests {
         group_schemas: &[arrow::datatypes::SchemaRef],
     ) -> (
         ConnectorDistributedRewritePlan,
-        ConnectorDistributedRewriteLease,
+        SharedConnectorDistributedRewrite,
     ) {
         let cohorts = group_schemas.len();
         let provider = ConnectorProviderId::parse("rewrite-session-test").unwrap();
@@ -825,11 +827,11 @@ mod tests {
             descriptor: descriptor.clone(),
             key: key.clone(),
         });
-        let lease = ConnectorDistributedRewriteLease::new(
+        let rewrite_session = SharedConnectorDistributedRewrite::new(
             descriptor.clone(),
             novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes([7; 16]),
             key.incarnation,
-            novarocks_spi::connector::ConnectorControlPlanningLease::new(
+            novarocks_spi::connector::ConnectorControlPlanningPin::new(
                 Arc::new(
                     ConnectorControlBinding::try_new(
                         descriptor.clone(),
@@ -862,7 +864,7 @@ mod tests {
             || {},
         )
         .unwrap();
-        (plan, lease)
+        (plan, rewrite_session)
     }
 
     #[test]
@@ -900,20 +902,25 @@ mod tests {
 
     #[test]
     fn empty_plan_is_noop_without_writer_session() {
-        let (plan, lease) = fixture(0);
-        let session =
-            ConnectorDistributedRewriteSession::from_original_session(Arc::new(plan), lease, None)
-                .unwrap();
+        let (plan, rewrite) = fixture(0);
+        let session = ConnectorDistributedRewriteSession::from_original_session(
+            Arc::new(plan),
+            rewrite,
+            None,
+        )
+        .unwrap();
         assert!(session.is_noop());
         assert!(session.write_session().is_none());
     }
 
     #[test]
     fn a_plan_with_frozen_groups_requires_its_original_writer_session() {
-        let (plan, lease) = fixture(1);
-        let Err(error) =
-            ConnectorDistributedRewriteSession::from_original_session(Arc::new(plan), lease, None)
-        else {
+        let (plan, rewrite) = fixture(1);
+        let Err(error) = ConnectorDistributedRewriteSession::from_original_session(
+            Arc::new(plan),
+            rewrite,
+            None,
+        ) else {
             panic!("a plan that froze a group must open a write session");
         };
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);

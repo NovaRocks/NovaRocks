@@ -19,11 +19,11 @@
 //! borrowed from the same codec-produced facts; no DTO or transport is formed.
 use super::*;
 use crate::creation::size::{
-    CreationSizeOverflow, context, message as raw_message, packed, task, uint,
+    CreationSizeOverflow, message as raw_message, packed, participation, task, uint,
 };
 use crate::domain::{stored_credential, stored_message};
 use novarocks_execution_contract::task_execution::operation::{
-    CredentialUpdate, QueryContextDomainUpdate, TaskDomainUpdate,
+    CredentialUpdate, ParticipationDomainUpdate, TaskDomainUpdate,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,15 +66,15 @@ pub fn batch_item(operation_bytes: usize) -> SizeResult {
 pub fn credential(value: &CredentialUpdate) -> SizeResult {
     let original =
         stored_credential(value.material().as_ref()).ok_or(WireSizeError::NotCodecProduced)?;
-    let mut out = uint(1, value.lease_id().get()) + uint(2, value.epoch().get());
+    let mut out = uint(1, value.credential_domain_id().get()) + uint(2, value.epoch().get());
     for descriptor in original.descriptors() {
         out = add(out, message(3, descriptor.encoded_len())?)?;
     }
     Ok(out)
 }
-pub fn query_context_domain(value: &QueryContextDomainUpdate) -> SizeResult {
+pub fn participation_domain(value: &ParticipationDomainUpdate) -> SizeResult {
     match value {
-        QueryContextDomainUpdate::CatalogBinding { version, payload } => {
+        ParticipationDomainUpdate::CatalogBinding { version, payload } => {
             let original =
                 stored_message::<novarocks_proto_models::catalog::CatalogSet>(payload.as_ref())
                     .ok_or(WireSizeError::NotCodecProduced)?;
@@ -83,7 +83,7 @@ pub fn query_context_domain(value: &QueryContextDomainUpdate) -> SizeResult {
                 add(uint(1, version.get()), message(2, original.encoded_len())?)?,
             )
         }
-        QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
+        ParticipationDomainUpdate::SharedDynamicFilter { version, payload } => {
             let original = stored_message::<novarocks::RuntimeFilterContribution>(payload.as_ref())
                 .ok_or(WireSizeError::NotCodecProduced)?;
             message(
@@ -91,7 +91,7 @@ pub fn query_context_domain(value: &QueryContextDomainUpdate) -> SizeResult {
                 add(uint(1, version.get()), message(2, original.encoded_len())?)?,
             )
         }
-        QueryContextDomainUpdate::Credential(value) => message(3, credential(value)?),
+        ParticipationDomainUpdate::Credential(value) => message(3, credential(value)?),
     }
 }
 fn close_destination(value: &TaskDomainUpdate) -> SizeResult {
@@ -168,36 +168,36 @@ pub fn cancel(value: CancelTask, control: bool) -> SizeResult {
         )?,
     )
 }
-pub fn abort(value: AbortQueryContext, control: bool) -> SizeResult {
+pub fn abort(value: AbortParticipation, control: bool) -> SizeResult {
     operation(
         value.envelope(),
         if control { 4 } else { 6 },
         add(
-            message(1, context(value.context())?)?,
+            message(1, participation(value.participation())?)?,
             uint(2, encode_abort_cause(value.cause()) as u64),
         )?,
     )
 }
-pub fn release(value: ReleaseQueryContext, control: bool) -> SizeResult {
+pub fn release(value: ReleaseParticipation, control: bool) -> SizeResult {
     operation(
         value.envelope(),
         if control { 5 } else { 7 },
-        message(1, context(value.context())?)?,
+        message(1, participation(value.participation())?)?,
     )
 }
-pub fn quiesce(value: QuiesceQueryContext, control: bool) -> SizeResult {
+pub fn quiesce(value: QuiesceParticipation, control: bool) -> SizeResult {
     operation(
         value.envelope(),
         if control { 6 } else { 9 },
-        message(1, context(value.context())?)?,
+        message(1, participation(value.participation())?)?,
     )
 }
-pub fn acquire(value: AcquireQueryContextAdmissionTicket) -> SizeResult {
+pub fn acquire(value: AcquireParticipationAdmissionTicket) -> SizeResult {
     operation(
         value.envelope(),
         8,
         sum([
-            message(1, context(value.context())?)?,
+            message(1, participation(value.participation())?)?,
             uint(2, value.valid_for().get().as_millis() as u64),
             message(
                 3,
@@ -207,30 +207,33 @@ pub fn acquire(value: AcquireQueryContextAdmissionTicket) -> SizeResult {
         ])?,
     )
 }
-pub fn renew(value: &RenewQueryExecutionLease, control: bool) -> SizeResult {
+pub fn renew(value: &RenewParticipationLease, control: bool) -> SizeResult {
     let lease =
         uint(1, value.sequence().get()) + uint(2, value.valid_for().get().as_millis() as u64);
-    let body = add(message(1, context(value.context())?)?, message(2, lease)?)?;
+    let body = add(
+        message(1, participation(value.participation())?)?,
+        message(2, lease)?,
+    )?;
     if control {
         operation(value.envelope(), 2, body)
     } else {
         operation(value.envelope(), 4, message(3, body)?)
     }
 }
-pub fn advance(value: &AdvanceQueryContextDomain) -> SizeResult {
+pub fn advance(value: &AdvanceParticipationDomain) -> SizeResult {
     operation(
         value.envelope(),
         4,
         message(
             2,
             add(
-                message(1, context(value.context())?)?,
-                message(2, query_context_domain(value.domain())?)?,
+                message(1, participation(value.participation())?)?,
+                message(2, participation_domain(value.domain())?)?,
             )?,
         )?,
     )
 }
-pub fn establish(value: &EstablishQueryContext) -> SizeResult {
+pub fn establish(value: &EstablishParticipation) -> SizeResult {
     let catalog = stored_message::<novarocks_proto_models::catalog::CatalogSet>(
         value.catalog_binding().as_ref(),
     )
@@ -244,7 +247,7 @@ pub fn establish(value: &EstablishQueryContext) -> SizeResult {
     let lease = uint(1, value.initial_lease_sequence().get())
         + uint(2, value.initial_lease_valid_for().get().as_millis() as u64);
     let body = sum([
-        message(1, context(value.context())?)?,
+        message(1, participation(value.participation())?)?,
         message(2, catalog.encoded_len())?,
         message(3, filter.encoded_len())?,
         message(4, credential(value.initial_credential())?)?,

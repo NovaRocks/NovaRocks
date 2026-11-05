@@ -21,7 +21,7 @@
 use crate::runtime::query_memory::QueryMemoryBinding;
 use novarocks_memory::attribution::scope::AmbientStepObservation;
 use novarocks_memory::{
-    CapacityError, CoverageReceipt, FundingDomain, RequestOutcome, ScopeLease, ShortageReceipt,
+    CapacityError, CoverageReceipt, FundingDomain, FundingScope, RequestOutcome, ShortageReceipt,
     StepReceipt, TeardownError,
 };
 use std::cell::Cell;
@@ -132,7 +132,7 @@ pub struct ReadyKernelMemory {
 }
 
 struct SettleReady<'a> {
-    lease: Option<ScopeLease>,
+    funding: Option<FundingScope>,
     domain: &'a FundingDomain,
     journal: &'a mut KernelMemoryJournal,
     stopped: &'a Cell<bool>,
@@ -141,7 +141,7 @@ impl Drop for SettleReady<'_> {
     fn drop(&mut self) {
         // Complete the same synchronous writer after restoration/flush. This
         // stops this producer, not the query account or surviving allocations.
-        self.journal.settlement = Some(self.lease.take().expect("one active writer").finish());
+        self.journal.settlement = Some(self.funding.take().expect("one active writer").finish());
         let stopped = self.domain.stop_producing();
         self.stopped.set(stopped.is_ok());
         self.journal.stopped = Some(stopped);
@@ -176,12 +176,12 @@ impl ReadyKernelMemory {
         journal: &mut KernelMemoryJournal,
         body: impl FnOnce() -> T,
     ) -> Result<T, CapacityError> {
-        let lease = self
+        let funding = self
             .domain
             .activate(self.stock_bytes, self.threshold_bytes)?;
         *journal = KernelMemoryJournal::default();
         let guard = SettleReady {
-            lease: Some(lease),
+            funding: Some(funding),
             domain: &self.domain,
             journal,
             stopped: &self.stopped,

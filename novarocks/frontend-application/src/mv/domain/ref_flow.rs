@@ -54,7 +54,7 @@ pub(crate) fn execute_with_ports(
     // Retain one exact generation across MV admission and the ref mutation.
     // The application never decodes the provider-owned table handle.
     let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &catalog_name)?;
+        crate::connector::acquire_metadata_planning_pin(connector_control, &catalog_name)?;
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -62,7 +62,7 @@ pub(crate) fn execute_with_ports(
         namespace: namespace.clone(),
         table: table_name.clone(),
     };
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
         storage_observation,
         &exact_lease,
         readiness,
@@ -74,7 +74,7 @@ pub(crate) fn execute_with_ports(
     let instance_id =
         ConnectorInstanceId::parse(&catalog_name).map_err(|error| error.to_string())?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
-        return Err("connector planning lease identity changed during ALTER TABLE ref".to_string());
+        return Err("connector planning pin identity changed during ALTER TABLE ref".to_string());
     }
     let mutation_lease = exact_lease
         .derive_mutation_lease()

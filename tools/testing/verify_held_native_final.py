@@ -47,12 +47,12 @@ RECEIPT_FIELDS = frozenset(("schema_version", "status", "native_acceptance", "so
     "original_roles", "selected_root", "independent_target_source", "closed_acks",
     "protocol_complete", "actor", "actor_actual_join", "mysql_actual_join", "kill_attempted",
     "kill_returned", "timings_origin", "protocol_started_us", "kill_started_us", "kill_returned_us",
-    "settled_us", "expected_server_error_actual_source_retained", "expected_driver_joinerror_retained",
+    "settled_us", "expected_server_error_actual_source_retained", "expected_connection_joinerror_retained",
     "root_samples", "original_wire", "same_socket_health", "failed_source_slots",
     "raw_error_formatter_invoked", "scope", "mysql_terminal_code", "health_before_tasks_created", "health_after_tasks_created"))
 TASK_FIELDS = frozenset(("query_hi", "query_lo", "attempt", "stage", "task", "backend"))
 CREATE = "NOVAROCKS_TASK_CREATE_APPLIED"
-CONTEXT = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED"
+CONTEXT = "NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED"
 ROOT = "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT"
 require = old.require
 
@@ -247,15 +247,15 @@ def _wire(row,health):
 ACTOR_FIELDS={"phase","first_failure","backend_index","actual_grpc_port","proven_offered_sequence",
         "received_frames","received_bytes","received_sha256","received_digest_complete","captured_prefix_bytes",
         "captured_prefix_sha256","declared_message_bytes","withheld_stream_credit_bytes","released_stream_credit_bytes",
-        "reply_fully_decoded","reset_requested","response_abandoned","abort_requested","driver_exit"}
+        "reply_fully_decoded","reset_requested","response_abandoned","abort_requested","connection_exit"}
 
 def _actor_dto(actor):
     require(type(actor) is dict and set(actor)==ACTOR_FIELDS, "held_actor_fields")
     require(type(actor["phase"]) is str and actor["phase"] in
         ("Prepared","Opening","Held","Settling","Settled"), "held_actor_phase_type")
     require(actor["first_failure"] is None or (type(actor["first_failure"]) is str
-        and actor["first_failure"] in ("Preparation","Transition","Clock","Transport","Framing","Driver","PriorFailure")), "held_actor_failure_type")
-    require(type(actor["driver_exit"]) is str and actor["driver_exit"] in
+        and actor["first_failure"] in ("Preparation","Transition","Clock","Transport","Framing","ConnectionJob","PriorFailure")), "held_actor_failure_type")
+    require(type(actor["connection_exit"]) is str and actor["connection_exit"] in
         ("NotSpawned","Live","Closed","AbortedAndJoined","ConnectionFailed","JoinFailed"), "held_actor_exit_type")
     require(all(type(actor[key]) is bool for key in ("received_digest_complete","reply_fully_decoded",
         "reset_requested","response_abandoned","abort_requested")), "held_actor_boolean_types")
@@ -286,7 +286,7 @@ def _receipt_dtos(receipt):
         and old._text(receipt["timings_origin"]) and old._text(receipt["scope"]), "held_receipt_text_types")
     require(all(type(receipt[key]) is bool for key in ("native_acceptance","protocol_complete","actor_actual_join",
         "mysql_actual_join","kill_attempted","kill_returned","expected_server_error_actual_source_retained",
-        "expected_driver_joinerror_retained","raw_error_formatter_invoked")), "held_receipt_boolean_types")
+        "expected_connection_joinerror_retained","raw_error_formatter_invoked")), "held_receipt_boolean_types")
     require(all(old._uint(receipt[key],20000000) for key in
         ("protocol_started_us","kill_started_us","kill_returned_us","settled_us")), "held_receipt_clock_types")
     require(old._uint(receipt["mysql_terminal_code"],65535), "held_receipt_terminal_type")
@@ -411,10 +411,10 @@ def verify_held_final(expected,actual,*,kill=os.kill):
     _actor_dto(actor)
     require( actor["phase"]=="Settled" and actor["first_failure"] is None
         and actor["backend_index"]==slot and actor["proven_offered_sequence"]==1
-        and actor["driver_exit"] in ("AbortedAndJoined","Closed") and actor["reply_fully_decoded"] is False
+        and actor["connection_exit"] in ("AbortedAndJoined","Closed") and actor["reply_fully_decoded"] is False
         and actor["released_stream_credit_bytes"]==0 and actor["withheld_stream_credit_bytes"]>0
         and actor["response_abandoned"] is True and actor["abort_requested"] is True, "original_held_actor")
-    require(receipt["expected_driver_joinerror_retained"] is (actor["driver_exit"]=="AbortedAndJoined"),"original_driver_source")
+    require(receipt["expected_connection_joinerror_retained"] is (actor["connection_exit"]=="AbortedAndJoined"),"original_connection_source")
     require(old._uint(actor["backend_index"],2) and type(actor["proven_offered_sequence"]) is int
         and type(actor["released_stream_credit_bytes"]) is int
         and old._uint(actor["withheld_stream_credit_bytes"]),"held_actor_scalar_types")
@@ -436,4 +436,4 @@ def verify_held_final(expected,actual,*,kill=os.kill):
         except BaseException: raise old.VerificationFailure("original_pid_absence_unknown") from None
         else: raise old.VerificationFailure("original_pid_present") from None
     return {"schema_version":1,"case":CASE,"native_acceptance":True,"original_role_absence":absent,
-        "scope":"context-owned unique root positive delivery/reservation holder and late ACK accepted0, original response driver/MySQL joins and four PID ESRCH; excludes last Arc alias, allocator deallocation, released roots and fullClosing64"}
+        "scope":"context-owned unique root positive delivery/reservation holder and late ACK accepted0, original response connection job/MySQL joins and four PID ESRCH; excludes last Arc alias, allocator deallocation, released roots and fullClosing64"}

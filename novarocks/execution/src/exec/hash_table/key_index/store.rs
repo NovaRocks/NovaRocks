@@ -24,7 +24,7 @@ use crate::{
         chunk::ChunkConstructionFailure,
         pipeline::operator::{ConstructionFailure, InputConstructionOwner},
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::{Array, ArrayRef};
 use novarocks_functions::{

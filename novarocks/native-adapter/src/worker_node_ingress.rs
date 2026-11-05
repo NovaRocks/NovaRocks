@@ -23,26 +23,26 @@ use crate::{
     task_protocol::{TaskOperationBatchApplier, host_rejection_status},
 };
 use novarocks_execution_contract::{
-    AdmissionTicketId, OperationOutcome, QueryContextRef, ReleaseOutcome, TaskOperationId,
-    UpdateQueryContext, operation::OperationResult,
+    AdmissionTicketId, OperationOutcome, ParticipationRef, ReleaseOutcome, TaskOperationId,
+    UpdateParticipation, operation::OperationResult,
 };
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::{
     operation::{
-        DecodedOperation, DecodedUpdateQueryContext, encode_abort_cause_field,
-        encode_create_task_ack, encode_query_context_ack,
-        encode_query_context_admission_ticket_ack, encode_quiesce_ack, encode_receipt,
+        DecodedOperation, DecodedUpdateParticipation, encode_abort_cause_field,
+        encode_create_task_ack, encode_participation_ack,
+        encode_participation_admission_ticket_ack, encode_quiesce_ack, encode_receipt,
         encode_release_ack,
     },
     status::encode_task_status,
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_worker::{
-    NodeAdmissionTicketObservation, ReleasedContextEvidence, WorkerCancelOutcome,
-    WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery, WorkerControlReplyBody,
-    WorkerCreateDelivery, WorkerCreateReply, WorkerIngressResponsibility, WorkerMonotonicInstant,
-    WorkerRequestError, WorkerRequestRefusal, WorkerRequestResult, WorkerTaskControl,
-    WorkerTaskDelivery,
+    NodeAdmissionTicketObservation, ReleasedParticipationEvidence, WorkerCancelOutcome,
+    WorkerControlDelivery, WorkerControlReplyBody, WorkerCreateDelivery, WorkerCreateReply,
+    WorkerIngressResponsibility, WorkerMonotonicInstant, WorkerParticipationDelivery,
+    WorkerParticipationReplyBody, WorkerRequestError, WorkerRequestRefusal, WorkerRequestResult,
+    WorkerTaskControl, WorkerTaskDelivery,
 };
 use std::{
     fmt,
@@ -95,16 +95,16 @@ impl WorkerNodeTaskIngress {
     }
     fn compatibility_refusal(&self, request: &DecodedOperation) -> Option<Receipt> {
         let (operation, compatibility) = match request {
-            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => (
+            DecodedOperation::AcquireParticipationAdmissionTicket(request) => (
                 request.envelope().operation_id(),
                 request.native_compatibility_id(),
             ),
-            DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) => {
-                (
-                    request.envelope().operation_id(),
-                    request.native_compatibility_id(),
-                )
-            }
+            DecodedOperation::UpdateParticipation(DecodedUpdateParticipation::Establish(
+                request,
+            )) => (
+                request.envelope().operation_id(),
+                request.native_compatibility_id(),
+            ),
             _ => return None,
         };
         (compatibility != self.compatibility)
@@ -142,7 +142,7 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
         let identity = operation.envelope().operation_id();
         let deadline = self.deadline(deadline);
         match operation {
-            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => {
+            DecodedOperation::AcquireParticipationAdmissionTicket(request) => {
                 // A new independent Native nonce, never a hash/reinterpretation
                 // of the caller's operation ID. The Worker chooses replay.
                 let ticket =
@@ -158,8 +158,8 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
             DecodedOperation::CreateTask(decoded) => {
                 #[cfg(novarocks_dev_controls)]
                 if let Some(controls) = self.test_controls.get()
-                    && crate::task_protocol_fault::restart_after_establish_context_holds_task_creation(
-                        controls, decoded.request().context(),
+                    && crate::task_protocol_fault::restart_after_establish_participation_holds_task_creation(
+                        controls, decoded.request().participation(),
                     )
                 {
                     // The old hook blocks on runner-owned file/UDS waits.
@@ -186,10 +186,9 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                         #[cfg(novarocks_dev_controls)]
                         let original_outcome = if let Some(controls) = self.test_controls.get() {
                             check_operation(identity, original.operation())?;
-                            if let WorkerCreateReply::Context(WorkerContextReplyBody::Create {
-                                outcome,
-                                receipt,
-                            }) = original.reply()
+                            if let WorkerCreateReply::Participation(
+                                WorkerParticipationReplyBody::Create { outcome, receipt },
+                            ) = original.reply()
                             {
                                 if receipt.identity() != task_identity {
                                     return Err(Status::internal(
@@ -240,21 +239,21 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     Err(error) => request_error(identity, error),
                 }
             }
-            DecodedOperation::UpdateQueryContext(decoded) => {
+            DecodedOperation::UpdateParticipation(decoded) => {
                 let Some(request) = decoded.as_neutral() else {
                     return Err(Status::internal(
-                        "decoded Context command has no neutral projection",
+                        "decoded Participation command has no neutral projection",
                     ));
                 };
                 let result = match request {
-                    UpdateQueryContext::Establish(request) => {
+                    UpdateParticipation::Establish(request) => {
                         #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get() {
-                            crate::task_protocol_fault::arm_restart_after_establish_context(
+                            crate::task_protocol_fault::arm_restart_after_establish_participation(
                                 controls,
-                                request.context(),
+                                request.participation(),
                             )?;
-                            if crate::task_protocol_fault::restart_after_establish_context_holds_task_creation(controls, request.context()) {
+                            if crate::task_protocol_fault::restart_after_establish_participation_holds_task_creation(controls, request.participation()) {
                                 return Err(Status::unimplemented("the asynchronous restart-after-establish rendezvous is not connected"));
                             }
                         }
@@ -263,12 +262,12 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                             Err(error) => request_error(identity, error),
                         };
                     }
-                    UpdateQueryContext::RenewLease(request) => {
+                    UpdateParticipation::RenewLease(request) => {
                         #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get()
                             && let Some(mut claim) = controls
-                                .claim_context_owner_panic(
-                                    request.context(),
+                                .claim_participation_owner_panic(
+                                    request.participation(),
                                     request.envelope().operation_id(),
                                 )
                                 .map_err(Status::failed_precondition)?
@@ -279,7 +278,7 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                                 deadline.min(self.deadline(claim.cancellation().deadline()));
                             let result = self
                                 .control
-                                .renew_with_context_owner_panic(request, deadline)
+                                .renew_with_participation_owner_panic(request, deadline)
                                 .await;
                             if let Ok(original) = &result
                                 && original.body().matches(WorkerRequestResult::Outcome(
@@ -289,17 +288,19 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                                 claim.record_hit().map_err(Status::failed_precondition)?;
                             }
                             return match result {
-                                Ok(original) => {
-                                    encode_context(identity, original, ReplyKind::Context)
-                                }
+                                Ok(original) => encode_participation(
+                                    identity,
+                                    original,
+                                    ReplyKind::Participation,
+                                ),
                                 Err(error) => request_error(identity, error),
                             };
                         }
                         self.control.renew(request, deadline).await
                     }
-                    UpdateQueryContext::AdvanceDomain(request) => {
+                    UpdateParticipation::AdvanceDomain(request) => {
                         self.control
-                            .advance_query_context_domain(
+                            .advance_participation_domain(
                                 request,
                                 deadline,
                                 WorkerIngressResponsibility::from_admitted(ownership),
@@ -308,7 +309,9 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     }
                 };
                 match result {
-                    Ok(original) => encode_context(identity, original, ReplyKind::Context),
+                    Ok(original) => {
+                        encode_participation(identity, original, ReplyKind::Participation)
+                    }
                     Err(error) => request_error(identity, error),
                 }
             }
@@ -318,34 +321,36 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     Err(error) => request_error(identity, error),
                 }
             }
-            DecodedOperation::AbortQueryContext(request) => {
+            DecodedOperation::AbortParticipation(request) => {
                 match self.control.abort(request, deadline).await {
-                    Ok(original) => encode_context(identity, original, ReplyKind::Context),
+                    Ok(original) => {
+                        encode_participation(identity, original, ReplyKind::Participation)
+                    }
                     Err(error) => request_error(identity, error),
                 }
             }
-            DecodedOperation::QuiesceQueryContext(request) => {
+            DecodedOperation::QuiesceParticipation(request) => {
                 match self.control.quiesce(request, deadline).await {
-                    Ok(original) => encode_context(identity, original, ReplyKind::Quiesce),
+                    Ok(original) => encode_participation(identity, original, ReplyKind::Quiesce),
                     Err(error) => request_error(identity, error),
                 }
             }
-            DecodedOperation::ReleaseQueryContext(request) => {
+            DecodedOperation::ReleaseParticipation(request) => {
                 match self.control.release(request, deadline).await {
-                    Ok(original) => encode_context(identity, original, ReplyKind::Release),
+                    Ok(original) => encode_participation(identity, original, ReplyKind::Release),
                     Err(error) => request_error(identity, error),
                 }
             }
             DecodedOperation::UpdateTask(decoded) => {
                 let request = decoded.into_request();
                 let task = request.identity();
-                let context = self.control.context_for_task(task).ok_or_else(|| {
-                    Status::failed_precondition("the Node does not hold this Task's Context")
+                let participation = self.control.participation_for_task(task).ok_or_else(|| {
+                    Status::failed_precondition("the Node does not hold this Task's Participation")
                 })?;
                 match self
                     .control
                     .update_task(
-                        context,
+                        participation,
                         request,
                         deadline,
                         WorkerIngressResponsibility::from_admitted(ownership),
@@ -362,12 +367,12 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: Instant,
     ) -> Result<NodeAdmissionTicketObservation, Status> {
         let original = self
             .control
-            .observe_admission_ticket(operation, ticket, context, self.deadline(deadline))
+            .observe_admission_ticket(operation, ticket, participation, self.deadline(deadline))
             .await
             .map_err(request_status)?;
         check_operation(operation, original.operation())?;
@@ -385,7 +390,7 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         compatibility: Option<&proto::NativeCompatibilityId>,
         deadline: Instant,
     ) -> Result<Option<Receipt>, Status> {
@@ -400,7 +405,12 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
         }
         let original = match self
             .control
-            .preflight_expired_establish_ticket(operation, ticket, context, self.deadline(deadline))
+            .preflight_expired_establish_ticket(
+                operation,
+                ticket,
+                participation,
+                self.deadline(deadline),
+            )
             .await
         {
             Ok(original) => original,
@@ -425,7 +435,7 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
 #[derive(Clone, Copy)]
 enum ReplyKind {
     Create,
-    Context,
+    Participation,
     Quiesce,
     Release,
 }
@@ -471,11 +481,11 @@ fn encode_create(
 ) -> Result<Receipt, Status> {
     check_operation(operation, original.operation())?;
     match original.reply() {
-        WorkerCreateReply::Context(body) => {
-            project_context(operation, body, ReplyKind::Create, None)
+        WorkerCreateReply::Participation(body) => {
+            project_participation(operation, body, ReplyKind::Create, None)
         }
-        WorkerCreateReply::Root(WorkerControlReplyBody::CreateContext(body)) => {
-            project_context(operation, body, ReplyKind::Create, None)
+        WorkerCreateReply::Root(WorkerControlReplyBody::CreateParticipation(body)) => {
+            project_participation(operation, body, ReplyKind::Create, None)
         }
         WorkerCreateReply::Root(WorkerControlReplyBody::Verdict(result)) => {
             encode_result(operation, *result)
@@ -494,21 +504,21 @@ fn encode_control(
         WorkerControlReplyBody::Admission(Ok(receipt)) => Ok(verdict(
             operation,
             OperationOutcome::Accepted,
-            Some(Ack::QueryContextAdmissionTicket(
-                encode_query_context_admission_ticket_ack(*receipt),
+            Some(Ack::ParticipationAdmissionTicket(
+                encode_participation_admission_ticket_ack(*receipt),
             )),
         )),
         WorkerControlReplyBody::Admission(Err(outcome)) => Ok(verdict(operation, *outcome, None)),
-        WorkerControlReplyBody::Context(ack) => {
-            tracing::debug!(context = ?ack.receipt.context(), state = ?ack.receipt.state(), outcome = ?ack.outcome, "Worker returned original Context acknowledgement");
+        WorkerControlReplyBody::Participation(ack) => {
+            tracing::debug!(participation = ?ack.receipt.participation(), state = ?ack.receipt.state(), outcome = ?ack.outcome, "Worker returned original Participation acknowledgement");
             let body =
-                encode_query_context_ack(&ack.receipt, ack.termination_cause).ok_or_else(|| {
-                    Status::internal("original Context acknowledgement has no wire state")
+                encode_participation_ack(&ack.receipt, ack.termination_cause).ok_or_else(|| {
+                    Status::internal("original Participation acknowledgement has no wire state")
                 })?;
             Ok(verdict(
                 operation,
                 ack.outcome,
-                Some(Ack::QueryContext(body)),
+                Some(Ack::Participation(body)),
             ))
         }
         WorkerControlReplyBody::Domain(refusal) => Ok(encode_receipt(
@@ -524,13 +534,13 @@ fn encode_control(
         )),
     }
 }
-fn encode_context(
+fn encode_participation(
     operation: TaskOperationId,
-    original: WorkerContextDelivery,
+    original: WorkerParticipationDelivery,
     kind: ReplyKind,
 ) -> Result<Receipt, Status> {
     check_operation(operation, original.operation())?;
-    project_context(
+    project_participation(
         operation,
         original.body(),
         kind,
@@ -543,7 +553,7 @@ fn encode_cancel(
 ) -> Result<Receipt, Status> {
     match original {
         WorkerCancelOutcome::Task(original) => encode_task(operation, original),
-        WorkerCancelOutcome::Context(original) => {
+        WorkerCancelOutcome::Participation(original) => {
             check_operation(operation, original.operation())?;
             project_cancel(operation, original.body())
         }
@@ -574,16 +584,16 @@ fn encode_task(
 }
 fn project_cancel(
     operation: TaskOperationId,
-    body: &WorkerContextReplyBody,
+    body: &WorkerParticipationReplyBody,
 ) -> Result<Receipt, Status> {
     match body {
-        WorkerContextReplyBody::Task { outcome, status } => Ok(verdict(
+        WorkerParticipationReplyBody::Task { outcome, status } => Ok(verdict(
             operation,
             *outcome,
             Some(Ack::CancelTask(encode_task_status(status))),
         )),
-        WorkerContextReplyBody::Verdict(result) => encode_result(operation, *result),
-        WorkerContextReplyBody::Domain(refusal) => Ok(encode_receipt(
+        WorkerParticipationReplyBody::Verdict(result) => encode_result(operation, *result),
+        WorkerParticipationReplyBody::Domain(refusal) => Ok(encode_receipt(
             operation,
             OperationResult::DomainFailure {
                 outcome: refusal.outcome,
@@ -595,15 +605,17 @@ fn project_cancel(
         )),
     }
 }
-fn project_context(
+fn project_participation(
     operation: TaskOperationId,
-    original: &WorkerContextReplyBody,
+    original: &WorkerParticipationReplyBody,
     kind: ReplyKind,
-    evidence: Option<&ReleasedContextEvidence>,
+    evidence: Option<&ReleasedParticipationEvidence>,
 ) -> Result<Receipt, Status> {
     let (outcome, ack) = match (kind, original) {
-        (_, WorkerContextReplyBody::Verdict(result)) => return encode_result(operation, *result),
-        (_, WorkerContextReplyBody::Domain(refusal)) => {
+        (_, WorkerParticipationReplyBody::Verdict(result)) => {
+            return encode_result(operation, *result);
+        }
+        (_, WorkerParticipationReplyBody::Domain(refusal)) => {
             return Ok(encode_receipt(
                 operation,
                 OperationResult::DomainFailure {
@@ -612,37 +624,37 @@ fn project_context(
                 },
             ));
         }
-        (ReplyKind::Create, WorkerContextReplyBody::Create { outcome, receipt }) => (
+        (ReplyKind::Create, WorkerParticipationReplyBody::Create { outcome, receipt }) => (
             *outcome,
             Ack::CreateTask(encode_create_task_ack(receipt).ok_or_else(|| {
                 Status::internal("original Create acknowledgement has no wire state")
             })?),
         ),
-        (ReplyKind::Context, WorkerContextReplyBody::Context(ack))
+        (ReplyKind::Participation, WorkerParticipationReplyBody::Participation(ack))
         | (
-            ReplyKind::Context,
-            WorkerContextReplyBody::ContextDomain {
+            ReplyKind::Participation,
+            WorkerParticipationReplyBody::ParticipationDomain {
                 acknowledgement: ack,
                 ..
             },
         ) => (
             ack.outcome,
-            Ack::QueryContext(
-                encode_query_context_ack(&ack.receipt, ack.termination_cause).ok_or_else(|| {
-                    Status::internal("original Context acknowledgement has no wire state")
+            Ack::Participation(
+                encode_participation_ack(&ack.receipt, ack.termination_cause).ok_or_else(|| {
+                    Status::internal("original Participation acknowledgement has no wire state")
                 })?,
             ),
         ),
-        (ReplyKind::Quiesce, WorkerContextReplyBody::Quiesce { outcome, receipt }) => (
+        (ReplyKind::Quiesce, WorkerParticipationReplyBody::Quiesce { outcome, receipt }) => (
             *outcome,
-            Ack::QuiesceQueryContext(encode_quiesce_ack(receipt).ok_or_else(|| {
+            Ack::QuiesceParticipation(encode_quiesce_ack(receipt).ok_or_else(|| {
                 Status::internal("original Quiesce acknowledgement has no wire state")
             })?),
         ),
         (
             ReplyKind::Release,
-            WorkerContextReplyBody::Release {
-                context,
+            WorkerParticipationReplyBody::Release {
+                participation,
                 release,
                 state,
                 termination_cause,
@@ -658,21 +670,22 @@ fn project_context(
                         .map_err(host_rejection_status)?
                 }
             };
-            let mut ack = encode_release_ack(*context, *release, *state, runtime_filter.as_ref())
-                .ok_or_else(|| {
-                Status::internal("original Release acknowledgement has no wire state")
-            })?;
+            let mut ack =
+                encode_release_ack(*participation, *release, *state, runtime_filter.as_ref())
+                    .ok_or_else(|| {
+                        Status::internal("original Release acknowledgement has no wire state")
+                    })?;
             ack.termination_cause = termination_cause.map(encode_abort_cause_field);
             let outcome = match release {
                 ReleaseOutcome::NotReady => OperationOutcome::ReleaseNotReady,
                 ReleaseOutcome::Released => OperationOutcome::Accepted,
-                ReleaseOutcome::AlreadyTerminal => OperationOutcome::ContextTerminalReceipt,
+                ReleaseOutcome::AlreadyTerminal => OperationOutcome::ParticipationTerminalReceipt,
             };
-            (outcome, Ack::ReleaseQueryContext(ack))
+            (outcome, Ack::ReleaseParticipation(ack))
         }
         _ => {
             return Err(Status::internal(
-                "original Worker Context reply has another body shape",
+                "original Worker Participation reply has another body shape",
             ));
         }
     };
@@ -801,26 +814,26 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
             FieldPath::root("fetch_task_dynamic_filters"),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let context = self
+        let participation = self
             .control
-            .context_for_task(request.identity())
+            .participation_for_task(request.identity())
             .ok_or_else(|| {
-                Status::failed_precondition("the Node does not hold this Task's Context")
+                Status::failed_precondition("the Node does not hold this Task's Participation")
             })?;
         let original = self
             .control
-            .get_dynamic_filters(context, request, self.deadline(deadline))
+            .get_dynamic_filters(participation, request, self.deadline(deadline))
             .await
             .map_err(request_status)?;
         check_operation(request.envelope().operation_id(), original.operation())?;
         match original.body() {
             // This is the actual Core's no-payload decision, not a default for
             // an unprojectable or missing versioned payload.
-            WorkerContextReplyBody::Verdict(WorkerRequestResult::Outcome(
+            WorkerParticipationReplyBody::Verdict(WorkerRequestResult::Outcome(
                 OperationOutcome::Idempotent,
             )) => crate::task_protocol::encode_dynamic_filter_read(request.identity(), None)
                 .map_err(host_rejection_status),
-            WorkerContextReplyBody::ReadPayload { version, .. } => {
+            WorkerParticipationReplyBody::ReadPayload { version, .. } => {
                 let (selected, payload) = original.dynamic_filter_payload().ok_or_else(|| {
                     Status::internal("the original selected dynamic-filter loan is missing")
                 })?;
@@ -830,7 +843,7 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
                     ));
                 }
                 // Codec getters run on this original RPC thread, outside the
-                // Context/Task/store locks. `original` retains the same R pin.
+                // Participation/Task/store locks. `original` retains the same R pin.
                 let domain = novarocks_task_codec::domain::encode_task_dynamic_filter_domain(
                     selected, payload,
                 )
@@ -843,11 +856,11 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
                     domains: vec![domain],
                 })
             }
-            WorkerContextReplyBody::Verdict(WorkerRequestResult::Outcome(_))
-            | WorkerContextReplyBody::Domain(_) => Err(Status::failed_precondition(
+            WorkerParticipationReplyBody::Verdict(WorkerRequestResult::Outcome(_))
+            | WorkerParticipationReplyBody::Domain(_) => Err(Status::failed_precondition(
                 "the original Worker refused the dynamic-filter read",
             )),
-            WorkerContextReplyBody::Verdict(WorkerRequestResult::TimeoutWhileAccepted) => {
+            WorkerParticipationReplyBody::Verdict(WorkerRequestResult::TimeoutWhileAccepted) => {
                 Err(Status::deadline_exceeded(
                     "the original dynamic-filter request timed out while accepted",
                 ))
@@ -869,37 +882,37 @@ impl crate::task_protocol::TaskExecutionIngress for WorkerNodeTaskIngress {
             FieldPath::root("get_final_task_info"),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let context = self
+        let participation = self
             .control
-            .context_for_task(request.identity())
+            .participation_for_task(request.identity())
             .ok_or_else(|| {
-                Status::failed_precondition("the Node does not hold this Task's Context")
+                Status::failed_precondition("the Node does not hold this Task's Participation")
             })?;
         let original = self
             .control
-            .get_final_task_info(context, request, self.deadline(deadline))
+            .get_final_task_info(participation, request, self.deadline(deadline))
             .await
             .map_err(request_status)?;
         check_operation(request.envelope().operation_id(), original.operation())?;
         let result = match original.body() {
-            WorkerContextReplyBody::FinalInfo(info) => {
+            WorkerParticipationReplyBody::FinalInfo(info) => {
                 proto::get_final_task_info_response::Result::Info(
                     novarocks_task_codec::status::encode_final_task_info(info),
                 )
             }
-            WorkerContextReplyBody::Verdict(WorkerRequestResult::Outcome(outcome)) => {
+            WorkerParticipationReplyBody::Verdict(WorkerRequestResult::Outcome(outcome)) => {
                 proto::get_final_task_info_response::Result::Unavailable(
                     novarocks_task_codec::operation::encode_operation_outcome(*outcome),
                 )
             }
-            WorkerContextReplyBody::Domain(refusal) => {
+            WorkerParticipationReplyBody::Domain(refusal) => {
                 proto::get_final_task_info_response::Result::Unavailable(
                     novarocks_task_codec::operation::encode_operation_outcome(
                         refusal.outcome.outcome(),
                     ),
                 )
             }
-            WorkerContextReplyBody::Verdict(WorkerRequestResult::TimeoutWhileAccepted) => {
+            WorkerParticipationReplyBody::Verdict(WorkerRequestResult::TimeoutWhileAccepted) => {
                 return Err(Status::deadline_exceeded(
                     "the original final-info request timed out while accepted",
                 ));
@@ -923,7 +936,7 @@ fn encode_task_domain(
 ) -> Result<Receipt, Status> {
     check_operation(operation, original.operation())?;
     match original.body() {
-        WorkerContextReplyBody::TaskDomain { outcome, receipts } => {
+        WorkerParticipationReplyBody::TaskDomain { outcome, receipts } => {
             let accepted_domains = receipts
                 .iter()
                 .map(novarocks_task_codec::operation::encode_task_domain_receipt)
@@ -940,8 +953,8 @@ fn encode_task_domain(
                 })),
             ))
         }
-        WorkerContextReplyBody::Verdict(result) => encode_result(operation, *result),
-        WorkerContextReplyBody::Domain(refusal) => Ok(encode_receipt(
+        WorkerParticipationReplyBody::Verdict(result) => encode_result(operation, *result),
+        WorkerParticipationReplyBody::Domain(refusal) => Ok(encode_receipt(
             operation,
             OperationResult::DomainFailure {
                 outcome: refusal.outcome,

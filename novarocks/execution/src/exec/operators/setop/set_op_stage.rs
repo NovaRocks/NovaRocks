@@ -50,7 +50,7 @@ impl SetOpStageController {
     pub(crate) fn new(
         op_name: &'static str,
         stage_producer_counts: Vec<usize>,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         let node_failure = |detail: std::fmt::Arguments<'_>| {
             let detail = novarocks_failure_contract::BoundedDetail::truncating_display(detail);
             crate::exec::fragment::error::ExecPlanBuildError::new(
@@ -165,7 +165,7 @@ impl std::fmt::Display for StageCompletionFailure {
 impl std::error::Error for StageCompletionFailure {}
 impl novarocks_failure_contract::FailureProjection for StageCompletionFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::InvalidStage { .. } => ExecutionReason::SetInvalidStage,

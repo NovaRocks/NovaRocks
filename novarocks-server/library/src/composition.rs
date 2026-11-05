@@ -41,7 +41,7 @@ use novarocks_frontend_application::{
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
-    TokioFileIoRuntime, TokioFileTaskSpawner,
+    TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
@@ -53,7 +53,7 @@ use novarocks_query_application::coordination::{
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
     MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
     MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
@@ -150,7 +150,7 @@ fn mv_partition_observation(
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
     fn observe_source_schema(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvSourceSchemaObservation, ConnectorError> {
@@ -188,7 +188,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 
     fn observe_created_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvCreatedTargetObservation, ConnectorError> {
@@ -220,7 +220,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 
     fn observe_schema_validation(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvSchemaValidationObservation, ConnectorError> {
@@ -258,7 +258,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 
     fn observe_refresh_base(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvRefreshBaseObservation, ConnectorError> {
@@ -275,7 +275,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 
     fn observe_refresh_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvRefreshTargetObservation, ConnectorError> {
@@ -309,7 +309,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 
     fn observe_maintenance_metadata(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {
@@ -451,7 +451,7 @@ pub fn compose_backend_server_config(
             )
             .map_err(|error| anyhow::anyhow!("resolve root result producer limits: {error}"))?,
         preparation_limits: novarocks_worker::TaskPreparationLimits::try_new(
-            config.runtime.task_preparation_max_tasks_per_context,
+            config.runtime.task_preparation_max_tasks_per_participation,
             config.runtime.task_preparation_max_tasks,
             config.runtime.task_preparation_max_bytes,
             config.runtime.task_preparation_max_workers,
@@ -953,12 +953,12 @@ fn compose_frontend_workload_runtime(
             input.logical_actor_mailbox_capacity,
         )?,
         nonzero(
-            "logical_context_admission_issue_capacity",
-            input.logical_context_admission_issue_capacity,
+            "logical_participation_admission_issue_capacity",
+            input.logical_participation_admission_issue_capacity,
         )?,
         nonzero(
-            "logical_context_establish_capacity",
-            input.logical_context_establish_capacity,
+            "logical_participation_establish_capacity",
+            input.logical_participation_establish_capacity,
         )?,
         rows,
     )
@@ -1004,8 +1004,8 @@ fn compose_task_execution_budgets(
         anyhow::anyhow!("construct task operation wait caps: both caps must be nonzero")
     })?;
     let lease_bounds = LeaseBounds::new(
-        Duration::from_millis(runtime.task_lease_min_ms),
-        Duration::from_millis(runtime.task_lease_max_ms),
+        Duration::from_millis(runtime.participation_lease_min_ms),
+        Duration::from_millis(runtime.participation_lease_max_ms),
     )
     .ok_or_else(|| {
         anyhow::anyhow!("construct task lease bounds: the accepted range must not be inverted")
@@ -1018,7 +1018,7 @@ fn compose_task_execution_budgets(
         runtime.task_query_backend_max_queued_bytes,
         runtime.task_backend_max_queued_operations,
         runtime.task_backend_max_queued_bytes,
-        runtime.task_max_tasks_per_context,
+        runtime.task_max_tasks_per_participation,
         runtime.task_max_active_tasks_per_backend,
         Duration::from_millis(runtime.task_operation_queue_residence_ms),
     )
@@ -1102,7 +1102,7 @@ pub fn compose_iceberg_execution_resources(
     // Read and write are I/O views of the same BE storage authority. Moving
     // reads onto scan I/O must not mint another credential registry or pool.
     let read_resources =
-        write_resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
+        write_resources.with_file_io(scan_io.file_runtime(), scan_io.file_io_spawner());
     let read_binding = compose_iceberg_access_template_from_resources(config, read_resources)?
         .with_range_service(scan_io.range_service());
     let write_binding = compose_iceberg_access_template_from_resources(config, write_resources)?;
@@ -1162,7 +1162,7 @@ pub fn compose_connector_file_planning_resources(
         pool,
         FsAccessResolver::with_runtime(runtime.clone()),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
+        std::sync::Arc::new(TokioFileIoSpawner::new(runtime)),
     ))
 }
 
@@ -1361,8 +1361,8 @@ mod tests {
             config.runtime.task_backend_max_queued_bytes
         );
         assert_eq!(
-            budgets.transport.max_tasks_per_context(),
-            frozen.max_tasks_per_context()
+            budgets.transport.max_tasks_per_participation(),
+            frozen.max_tasks_per_participation()
         );
         assert_eq!(
             budgets.transport.max_active_tasks_per_backend(),

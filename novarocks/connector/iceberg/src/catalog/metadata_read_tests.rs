@@ -35,7 +35,7 @@ fn binding(context: ConnectorRequestContext) -> IcebergReadBinding {
         None,
         novarocks_fs::FsAccessResolver::new(),
         Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+        Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
     )
     .for_request(context)
 }
@@ -405,7 +405,7 @@ async fn missing_or_expired_original_context_is_refused_before_session_io() {
         None,
         novarocks_fs::FsAccessResolver::new(),
         Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+        Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
     );
     assert_eq!(
         catalog

@@ -19,7 +19,7 @@
 //! rather than merely an admitted RPC or a running foreign getter.
 
 use super::*;
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 use novarocks_control_runtime_core::completion::ReturnState;
 
 #[test]
@@ -109,7 +109,7 @@ fn an_actual_stopped_rpc_start_is_not_an_unknown_getter_failure() {
 pub(super) fn symbolic_panicking_source(
     f: &Fixture,
     drop_gate: Option<Arc<Gate>>,
-) -> (EstablishQueryContext, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+) -> (EstablishParticipation, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let getters = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let content = |panic_getter, drop_gate| {
@@ -123,15 +123,15 @@ pub(super) fn symbolic_panicking_source(
         }) as Arc<dyn CodecOwnedContent>
     };
     (
-        EstablishQueryContext::new(
+        EstablishParticipation::new(
             operation(),
-            f.context,
+            f.participation,
             AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
             content(true, drop_gate),
             content(false, None),
             content(false, None),
             CredentialUpdate::new(
-                CredentialLeaseId::new(1),
+                CredentialDomainId::new(1),
                 CredentialEpoch::new(1).unwrap(),
                 Arc::new(Credential {
                     drops: drops.clone(),
@@ -195,7 +195,7 @@ fn an_observed_getter_panic_drains_one_return_and_reply_but_waits_for_actual_raw
         Some(EstablishIngressOutcome::GetterPanicked)
     );
     let authority_still_started =
-        f.root.resources().requests[&input].role.phase() == ExitRolePhase::Started;
+        f.root.resources().requests[&input].exit_custody.phase() == ExitCustodyPhase::Started;
     let withdrawal_refused = matches!(
         f.root.begin_unsubmitted_withdrawal(input),
         Err(ControlRequestError::WrongPhase)
@@ -254,7 +254,7 @@ fn five_observed_getter_panics_reuse_one_paid_rpc_position_after_actual_retireme
         AdmissionStorage {
             loading: Default::default(),
             accepted: Default::default(),
-            context: Default::default(),
+            participation: Default::default(),
         },
         ESTABLISH_REQUEST_STORAGE
             .checked_sub(CONTROL_REQUEST_STORAGE)
@@ -328,9 +328,9 @@ fn a_lost_original_job_remains_unknown_after_its_failure_reply_without_fake_raw_
         .unwrap()
         == Some(ReturnState::Unknown);
     let source_unresolved =
-        f.root.establish_source_phase(input).unwrap() == Some(ExitRolePhase::Unresolved);
+        f.root.establish_source_phase(input).unwrap() == Some(ExitCustodyPhase::Unresolved);
     let supervisor_started =
-        f.root.resources().requests[&input].role.phase() == ExitRolePhase::Started;
+        f.root.resources().requests[&input].exit_custody.phase() == ExitCustodyPhase::Started;
     f.root.submit_establish_ingress_failure(input).unwrap();
     let (disposal, same_input, owner_failed) =
         dispatch_owner_failure(&mut f, input, &mut external, Tick(1));

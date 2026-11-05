@@ -248,7 +248,7 @@ pub(crate) fn project_prepared_change_window_for_table_original(
         .clone();
     let observation = crate::mv::domain::storage_observation::observe_source_schema(
         storage_observation,
-        &captured.lease,
+        &captured.planning_pin,
         prepared.to_metadata(),
         connector_context.clone(),
     )?;

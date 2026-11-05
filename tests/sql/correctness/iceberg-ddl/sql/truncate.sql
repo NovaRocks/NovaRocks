@@ -38,6 +38,9 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
 -- query 2
 -- @skip_result_check=true
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.t_v3 VALUES (1, 'a'), (2, 'b'), (3, 'c');
 
 -- query 3
@@ -46,7 +49,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_v3;
 
 -- query 4
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE writes an operation=delete snapshot.
@@ -76,6 +79,9 @@ TBLPROPERTIES ("format-version" = "2");
 
 -- query 9
 -- @skip_result_check=true
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.t_v2 VALUES (1, 'x'), (2, 'y'), (3, 'z');
 
 -- query 10
@@ -83,7 +89,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_v2;
 
 -- query 11
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 TRUNCATE TABLE ${case_db}.t_v2;
@@ -113,7 +119,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t_empty;
 
 -- query 17
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE on empty still writes a delete snapshot (audit-trail entry).
@@ -152,6 +158,9 @@ ALTER TABLE iceberg_ddl_cat_${suite_uuid0}.${case_db}.t_branch CREATE BRANCH dev
 
 -- query 24
 -- @skip_result_check=true
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.t_branch.branch_dev VALUES (3, 'dev_only');
 
 -- query 25
@@ -161,7 +170,7 @@ SELECT id, v FROM ${case_db}.t_branch
 
 -- query 26
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE only the dev branch.
@@ -192,6 +201,9 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
 -- query 31
 -- @skip_result_check=true
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 INSERT INTO ${case_db}.t_dv VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
 
 -- query 32
@@ -206,7 +218,7 @@ SELECT id, v FROM ${case_db}.t_dv ORDER BY id;
 
 -- query 34
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- TRUNCATE must mark both data files and delete-content files as DELETED.

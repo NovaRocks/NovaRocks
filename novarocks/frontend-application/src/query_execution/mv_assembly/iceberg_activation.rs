@@ -22,9 +22,9 @@
 //! writer registration, provenance encoding and commit/reconcile machinery.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorRequestContext, ConnectorWriteInputRequest, ConnectorWriteLease,
+    ConnectorRequestContext, ConnectorWrite, ConnectorWriteInputRequest,
 };
 
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -118,8 +118,8 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
 pub(crate) async fn begin_first_refresh_connector_write_session_async_in(
     prepared: &PreparedMvFirstRefreshWrite,
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorWrite,
+    planning_pin: &ConnectorControlPlanningPin,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     receiving: &crate::query_execution::write_session::WriteBeginReceiving,
 ) -> Result<
@@ -131,7 +131,7 @@ pub(crate) async fn begin_first_refresh_connector_write_session_async_in(
     begin_pending_document_write_async_in(
         request,
         exact_lease,
-        planning_lease,
+        planning_pin,
         typed_connector_control,
         receiving,
     )
@@ -141,7 +141,7 @@ pub(crate) async fn begin_first_refresh_connector_write_session_async_in(
 fn prepare_first_refresh_document_write_request(
     prepared: &PreparedMvFirstRefreshWrite,
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
+    exact_lease: &ConnectorWrite,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
         return Err(invalid_activation(
@@ -233,8 +233,8 @@ fn prepare_first_refresh_document_write_request(
 pub(crate) async fn begin_metadata_only_connector_write_session_async_in(
     prepared: &PreparedMvMetadataOnlyWrite,
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorWrite,
+    planning_pin: &ConnectorControlPlanningPin,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     receiving: &crate::query_execution::write_session::WriteBeginReceiving,
 ) -> Result<
@@ -246,7 +246,7 @@ pub(crate) async fn begin_metadata_only_connector_write_session_async_in(
     begin_pending_document_write_async_in(
         request,
         exact_lease,
-        planning_lease,
+        planning_pin,
         typed_connector_control,
         receiving,
     )
@@ -256,7 +256,7 @@ pub(crate) async fn begin_metadata_only_connector_write_session_async_in(
 fn prepare_metadata_only_document_write_request(
     prepared: &PreparedMvMetadataOnlyWrite,
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
+    exact_lease: &ConnectorWrite,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     let publication = prepared.publication_intent();
     if !matches!(
@@ -434,8 +434,8 @@ pub(crate) async fn begin_incremental_connector_write_session_async_in(
     mode: MvIncrementalWriteMode,
     target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorWrite,
+    planning_pin: &ConnectorControlPlanningPin,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     receiving: &crate::query_execution::write_session::WriteBeginReceiving,
 ) -> Result<
@@ -454,7 +454,7 @@ pub(crate) async fn begin_incremental_connector_write_session_async_in(
     begin_pending_document_write_async_in(
         request,
         exact_lease,
-        planning_lease,
+        planning_pin,
         typed_connector_control,
         receiving,
     )
@@ -468,7 +468,7 @@ fn prepare_incremental_document_write_request(
     mode: MvIncrementalWriteMode,
     target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
     connector_context: ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
+    exact_lease: &ConnectorWrite,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, ConnectorError> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -550,7 +550,7 @@ pub(crate) fn document_publication_declaration(
 /// Ask the exact write generation for the base this publication will commit
 /// onto. The declaration and the session must name the same one.
 pub(crate) fn publication_write_base(
-    exact_lease: &ConnectorWriteLease,
+    exact_lease: &ConnectorWrite,
     table: &novarocks_spi::connector::ConnectorTableHandle,
     target_ref: &str,
     intent: novarocks_spi::connector::ConnectorWriteIntent,
@@ -581,8 +581,8 @@ fn invalid_activation(message: String) -> ConnectorError {
 
 async fn begin_pending_document_write_async_in(
     request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-    exact_lease: &ConnectorWriteLease,
-    planning_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorWrite,
+    planning_pin: &ConnectorControlPlanningPin,
     typed_connector_control: &novarocks_catalog_application::ConnectorControlHost,
     receiving: &crate::query_execution::write_session::WriteBeginReceiving,
 ) -> Result<
@@ -590,7 +590,7 @@ async fn begin_pending_document_write_async_in(
     ConnectorError,
 > {
     let lease =
-        typed_connector_control.acquire_exact_write_stack(planning_lease.control_runtime_id())?;
+        typed_connector_control.acquire_exact_write_stack(planning_pin.control_runtime_id())?;
     crate::query_execution::write_session::begin_connector_application_document_write_session_pending_async_in(
         lease, exact_lease, request, receiving,
     ).await
@@ -724,8 +724,8 @@ mod tests {
         use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
         use novarocks_spi::connector::{
             ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey,
-            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle,
-            ConnectorWriteAdmissionPurpose, ConnectorWriteControl, ConnectorWriteLease,
+            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableHandle, ConnectorWrite,
+            ConnectorWriteAdmissionPurpose, ConnectorWriteControl,
             ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
             ProviderBindingEpoch,
         };
@@ -790,7 +790,7 @@ mod tests {
                 request: Mutex::new(None),
                 failure: Mutex::new(Some(error)),
             });
-            let lease = ConnectorWriteLease::new(key.clone(), control.clone(), || {}).unwrap();
+            let lease = ConnectorWrite::new(key.clone(), control.clone(), || {}).unwrap();
             let table = ConnectorTableHandle::try_new(
                 key.instance_id.clone(),
                 bytes::Bytes::from_static(b"admitted-mv-table"),

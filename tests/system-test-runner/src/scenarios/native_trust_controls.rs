@@ -21,7 +21,7 @@ use crate::scenario::ScenarioContext;
 use crate::scenarios::native_sql_controls::{SelectedStatement, StatementSpec};
 use anyhow::{Context, Result};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{QueryLifecycleStructuredSnapshot, ServerHandle};
+use novarocks_cluster_harness::{QueryLifecycleStructuredSnapshot, TestClusterOwner};
 
 pub(super) const BASELINE_SQL: &str =
     "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
@@ -35,7 +35,14 @@ pub(super) fn grpc_statement(sql: &str) -> StatementSpec {
         // These are possible placements, not an oracle claiming all three
         // participate. The original Task evidence checks the actual set.
         observations: (0..super::REQUIRED_BACKENDS)
-            .map(|index| (index, "grpc-fragment", None))
+            .map(|index| {
+                (
+                    index,
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    None,
+                )
+            })
             .collect(),
     }
 }
@@ -82,20 +89,22 @@ pub(super) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result
     }
 }
 
-pub(super) async fn join_probe_driver(
-    driver: Option<tokio::task::JoinHandle<std::result::Result<(), h2::Error>>>,
+pub(super) async fn join_probe_connection(
+    connection_job: Option<tokio::task::JoinHandle<std::result::Result<(), h2::Error>>>,
 ) -> Result<()> {
-    let Some(driver) = driver else {
+    let Some(connection_job) = connection_job else {
         return Ok(());
     };
-    driver.abort();
-    match driver.await {
+    connection_job.abort();
+    match connection_job.await {
         Ok(Ok(())) => Ok(()),
         Err(error) if error.is_cancelled() => Ok(()),
         Ok(Err(error)) => {
-            Err(anyhow::Error::from(error).context("Native probe HTTP/2 driver failed"))
+            Err(anyhow::Error::from(error).context("Native probe HTTP/2 connection job failed"))
         }
-        Err(error) => Err(anyhow::Error::from(error).context("join Native probe HTTP/2 driver")),
+        Err(error) => {
+            Err(anyhow::Error::from(error).context("join Native probe HTTP/2 connection job"))
+        }
     }
 }
 
@@ -115,9 +124,24 @@ mod tests {
             assert_eq!(
                 spec.observations,
                 vec![
-                    (0, "grpc-fragment", None),
-                    (1, "grpc-fragment", None),
-                    (2, "grpc-fragment", None)
+                    (
+                        0,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None
+                    ),
+                    (
+                        1,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None
+                    ),
+                    (
+                        2,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None
+                    )
                 ]
             );
         }
@@ -128,11 +152,8 @@ mod tests {
         let spec = grpc_statement(PARITY_SQL);
         assert_eq!(spec.sql, PARITY_SQL);
         assert!(spec.faults.is_empty());
-        assert!(
-            spec.observations
-                .iter()
-                .all(|(_, action, _)| *action == "grpc-fragment")
-        );
+        assert!(spec.observations.iter().all(|(_, action, _)| *action
+            == novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str()));
         assert_eq!(spec.observations.len(), super::super::REQUIRED_BACKENDS);
     }
 
@@ -179,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_h2_driver_is_joined_before_cleanup_returns() {
+    fn cancelled_h2_connection_is_joined_before_cleanup_returns() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -194,32 +215,32 @@ mod tests {
             let exited = Arc::new(AtomicBool::new(false));
             let retained = exited.clone();
             let (started, observed) = tokio::sync::oneshot::channel();
-            let driver = tokio::spawn(async move {
+            let connection_job = tokio::spawn(async move {
                 let _owner = Exited(retained);
                 started.send(()).unwrap();
                 std::future::pending::<std::result::Result<(), h2::Error>>().await
             });
             observed.await.unwrap();
-            join_probe_driver(Some(driver)).await.unwrap();
+            join_probe_connection(Some(connection_job)).await.unwrap();
             assert!(exited.load(Ordering::Acquire));
         });
     }
 
     #[test]
-    fn h2_driver_panic_is_a_cleanup_failure() {
+    fn h2_connection_panic_is_a_cleanup_failure() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let driver: tokio::task::JoinHandle<std::result::Result<(), h2::Error>> =
+            let connection_job: tokio::task::JoinHandle<std::result::Result<(), h2::Error>> =
                 tokio::spawn(async {
-                    panic!("mechanism driver panic");
+                    panic!("connection job panic");
                 });
             tokio::time::timeout(Duration::from_secs(1), async {
-                while !driver.is_finished() {
+                while !connection_job.is_finished() {
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .unwrap();
-            assert!(join_probe_driver(Some(driver)).await.is_err());
+            assert!(join_probe_connection(Some(connection_job)).await.is_err());
         });
     }
 }

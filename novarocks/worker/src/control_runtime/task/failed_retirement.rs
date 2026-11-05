@@ -24,7 +24,7 @@ use crate::control_runtime::{
 };
 use crate::task_port::TaskProjection;
 use crate::task_proposal_ingress::{CausalEventInput, PairRoute, SummaryInput};
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 use novarocks_control_runtime::transaction::RuntimeLedger;
 use novarocks_control_runtime_core::{
     completion::Consumption,
@@ -38,7 +38,7 @@ const CLASSES: usize = 9;
 /// wakes its original Task and starts another sweep of these same owners.
 pub(super) struct FailedRetirementCursor {
     class: usize,
-    lifecycle: Option<TaskLifecycleRole>,
+    lifecycle: Option<TaskLifecycleInputKind>,
     cut: Option<CutId>,
     probes_left: usize,
 }
@@ -61,7 +61,7 @@ pub(crate) struct FailedTaskStep {
     /// Large neutral bodies must be disposed outside the metadata turn by
     /// the same original failure Work, not dropped while returning this step.
     pub neutral: Option<FailedTaskNeutral>,
-    pub root: Option<RootContextRetention>,
+    pub root: Option<RootParticipationRetention>,
     pub detached_projection: Option<Arc<TaskProjection>>,
     pub ready_for_disposal: bool,
 }
@@ -81,7 +81,7 @@ pub(crate) enum FailedTaskNeutral {
         _original: WorkerMessage,
     },
     Loading {
-        _original: [Option<novarocks_worker_protocol::context::ContextInput>; 2],
+        _original: [Option<novarocks_worker_protocol::participation::ParticipationInput>; 2],
     },
 }
 /// Each variant contains an existing unique physical permission. The queue
@@ -236,10 +236,10 @@ impl TaskHostRecord {
                 .advance_cleanup()
                 .map_err(|error| match error {
                     super::super::source_custody::SourceCleanupError::Exit(error) => {
-                        TaskHostError::Causal(CausalError::Role(error))
+                        TaskHostError::Causal(CausalError::ExitCustody(error))
                     }
-                    super::super::source_custody::SourceCleanupError::Driver(error) => {
-                        TaskHostError::Driver(error)
+                    super::super::source_custody::SourceCleanupError::ActorTurn(error) => {
+                        TaskHostError::ActorTurn(error)
                     }
                 })?;
         }
@@ -256,7 +256,7 @@ impl TaskHostRecord {
     ) -> Result<FailedTaskStep, TaskHostError> {
         stage
             .validate_scope(self.resources.causal.runtime(), self.actor, &self.scope)
-            .map_err(TaskHostError::Driver)?;
+            .map_err(TaskHostError::ActorTurn)?;
         let mut step = FailedTaskStep::default();
         if budget == 0 {
             return Ok(step);
@@ -364,8 +364,8 @@ impl TaskHostRecord {
                     super::super::loading::InputCleanupError::Exit(error) => {
                         TaskHostError::Loading(LoadingEventError::Role(error))
                     }
-                    super::super::loading::InputCleanupError::Driver(error) => {
-                        TaskHostError::Driver(error)
+                    super::super::loading::InputCleanupError::ActorTurn(error) => {
+                        TaskHostError::ActorTurn(error)
                     }
                 })?;
         }
@@ -473,7 +473,7 @@ impl TaskHostRecord {
             }
         }
         if let Some(job) = self.take_preparation_rollback_job(execution.clone()) {
-            let super::super::context_host::task_driver::TaskDriverHostJob::RollbackPreparation {
+            let super::super::participation_host::task_io::TaskIoHostJob::RollbackPreparation {
                 preparation,
                 owner,
                 host,
@@ -546,7 +546,7 @@ impl TaskHostRecord {
                 .next()
                 .is_some();
             let before = input.phase();
-            if before != ExitRolePhase::Retired {
+            if before != ExitCustodyPhase::Retired {
                 let core = input.report().consumption(ConsumerId::new(1).unwrap())?;
                 input
                     .observe_failed_consumers(
@@ -556,13 +556,13 @@ impl TaskHostRecord {
                     )
                     .map_err(TaskHostError::CompletionAction)?;
                 step.progressed |= before != input.phase()
-                    || (input.phase() != ExitRolePhase::Retired
+                    || (input.phase() != ExitCustodyPhase::Retired
                         && core != input.report().consumption(ConsumerId::new(1).unwrap())?);
             }
         }
         if let Some(action) = &self.resources.completion_action {
             let before = action.phase();
-            if before != ExitRolePhase::Retired {
+            if before != ExitCustodyPhase::Retired {
                 let core = action.report().consumption(ConsumerId::new(1).unwrap())?;
                 action
                     .observe_failed_consumers(
@@ -572,7 +572,7 @@ impl TaskHostRecord {
                     )
                     .map_err(TaskHostError::CompletionAction)?;
                 step.progressed |= before != action.phase()
-                    || (action.phase() != ExitRolePhase::Retired
+                    || (action.phase() != ExitCustodyPhase::Retired
                         && core != action.report().consumption(ConsumerId::new(1).unwrap())?);
             }
         }
@@ -603,15 +603,15 @@ impl TaskHostRecord {
             return Ok(());
         }
         for kind in [
-            TaskLifecycleRole::Finisher,
-            TaskLifecycleRole::WallTime,
-            TaskLifecycleRole::TerminalPublisher,
-            TaskLifecycleRole::Settlement,
+            TaskLifecycleInputKind::Finisher,
+            TaskLifecycleInputKind::WallTime,
+            TaskLifecycleInputKind::TerminalPublisher,
+            TaskLifecycleInputKind::Settlement,
         ] {
-            let retired = if kind == TaskLifecycleRole::Settlement {
+            let retired = if kind == TaskLifecycleInputKind::Settlement {
                 roles.settlement_phase() == crate::settlement::SettlementPhase::Retired
             } else {
-                roles.phase(kind) == ExitRolePhase::Retired
+                roles.phase(kind) == ExitCustodyPhase::Retired
             };
             if retired {
                 continue;
@@ -627,17 +627,17 @@ impl TaskHostRecord {
             }
         }
         let before = (
-            roles.phase(TaskLifecycleRole::Finisher),
-            roles.phase(TaskLifecycleRole::WallTime),
-            roles.phase(TaskLifecycleRole::TerminalPublisher),
+            roles.phase(TaskLifecycleInputKind::Finisher),
+            roles.phase(TaskLifecycleInputKind::WallTime),
+            roles.phase(TaskLifecycleInputKind::TerminalPublisher),
             roles.settlement_phase(),
         );
         roles.try_retire();
         step.progressed |= before
             != (
-                roles.phase(TaskLifecycleRole::Finisher),
-                roles.phase(TaskLifecycleRole::WallTime),
-                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.phase(TaskLifecycleInputKind::Finisher),
+                roles.phase(TaskLifecycleInputKind::WallTime),
+                roles.phase(TaskLifecycleInputKind::TerminalPublisher),
                 roles.settlement_phase(),
             );
         Ok(())
@@ -986,13 +986,13 @@ impl TaskHostRecord {
                             self.core_generation,
                             position.custody.core_consumption(),
                         )
-                        .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?;
+                        .map_err(|error| TaskHostError::Causal(CausalError::ExitCustody(error)))?;
                 }
                 let before = position.custody.phase();
                 if !position
                     .custody
                     .try_retire()
-                    .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?
+                    .map_err(|error| TaskHostError::Causal(CausalError::ExitCustody(error)))?
                 {
                     return Ok(());
                 }
@@ -1039,12 +1039,12 @@ impl TaskHostRecord {
                     .resources
                     .completion_action
                     .as_ref()
-                    .is_some_and(|c| c.phase() != ExitRolePhase::Retired)
+                    .is_some_and(|c| c.phase() != ExitCustodyPhase::Retired)
                 || self
                     .resources
                     .lifecycle_inputs
                     .values()
-                    .any(|c| c.phase() != ExitRolePhase::Retired)
+                    .any(|c| c.phase() != ExitCustodyPhase::Retired)
                 || self
                     .resources
                     .statistics
@@ -1092,7 +1092,7 @@ impl TaskHostRecord {
 fn waiting_cut(error: CausalError) -> bool {
     matches!(
         error,
-        CausalError::Driver(DriverError::RoleBusy)
+        CausalError::ActorTurn(ActorTurnError::StandingInputBusy)
             | CausalError::Cut(CutError::ExitUnobserved | CutError::NotReady | CutError::Consuming)
             | CausalError::Source(
                 super::super::source_positions::SourcePositionError::NotAvailable
@@ -1107,7 +1107,7 @@ fn abandon_report(
 ) -> Result<bool, TaskHostError> {
     stage
         .validate_scope(task.resources.causal.runtime(), task.actor, &task.scope)
-        .map_err(TaskHostError::Driver)?;
+        .map_err(TaskHostError::ActorTurn)?;
     let core = ConsumerId::new(1).unwrap();
     if report.consumption(core)? != Consumption::Pending {
         return Ok(false);

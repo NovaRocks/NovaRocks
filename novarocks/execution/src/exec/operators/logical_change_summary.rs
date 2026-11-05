@@ -21,20 +21,20 @@ use crate::{
     exec::{
         chunk::{Chunk, ChunkSchemaRef},
         pipeline::{
+            driver_step::DriverStep,
             operator::{
                 ConstructionFailure, InputConstructionFactory, Operator, OperatorLifecycle,
             },
             operator_factory::OperatorFactory,
             shape::{Source, SourceKernel},
             step::{NextStep, StepResult, WaitFact, WaitReason},
-            step_context::StepContext,
         },
     },
     runtime::{
-        exchange::{ExchangeReceiverHandle, SourcedExchangePopResult},
-        fragment::{ExecutionFailure, ExecutionReason, ExecutionResult},
+        exchange::{ExchangeReceiverPin, SourcedExchangePopResult},
         mem_tracker::{MemTracker, TrackedBytes},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionReason, ExecutionResult},
     },
 };
 use arrow::{
@@ -331,7 +331,7 @@ impl SourceKernel for SummarySource {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.state.observable.clone())
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         ctx.checkpoint()?;
         #[cfg(novarocks_dev_controls)]
         if let Some(scope) = &self.diagnostics {
@@ -510,7 +510,7 @@ impl SummarySourceIndex {
     }
 }
 pub(crate) struct SourceBoundSummaryInput {
-    receiver: ExchangeReceiverHandle,
+    receiver: ExchangeReceiverPin,
     expected: Arc<[ExchangeSource]>,
     index: Option<Arc<SummarySourceIndex>>,
     layout: StaticLayout,
@@ -521,7 +521,7 @@ pub(crate) struct SourceBoundSummaryInput {
 }
 impl SourceBoundSummaryInput {
     pub(crate) fn new(
-        receiver: ExchangeReceiverHandle,
+        receiver: ExchangeReceiverPin,
         expected: Arc<[ExchangeSource]>,
         layout: StaticLayout,
     ) -> ExecutionResult<Self> {
@@ -570,7 +570,7 @@ impl SourceBoundSummaryInput {
     pub(crate) fn ready(&self) -> bool {
         self.ended || self.receiver.has_output_or_finished(self.expected.len())
     }
-    pub(crate) fn poll(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SummaryRead> {
+    pub(crate) fn poll(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<SummaryRead> {
         ctx.checkpoint()?;
         if self.ended {
             return Ok(SummaryRead::End);
@@ -698,7 +698,7 @@ impl SummaryCoverage {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::exec::pipeline::step_context::TurnWork;
+    use crate::exec::pipeline::driver_step::TurnWork;
     use crate::runtime::{
         exchange::{ExchangeKey, ExecutionExchangeRegistry, online_unit},
         runtime_state::RuntimeState,
@@ -771,8 +771,8 @@ pub(crate) mod tests {
                 .expect("summary ingress fixture requires its actual execution runtime")
                 .exchange_registry();
             let key = ExchangeKey {
-                finst_id_hi: 946801,
-                finst_id_lo: 946802,
+                task_key_hi: 946801,
+                task_key_lo: 946802,
                 node_id: 31,
             };
             let layout = summary_layout();
@@ -803,7 +803,7 @@ pub(crate) mod tests {
                             u32::try_from(i).unwrap(),
                         ),
                         target,
-                        UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+                        UniqueId::new(key.task_key_hi, key.task_key_lo),
                         novarocks_execution_contract::FragmentNodeId::new(key.node_id),
                     )
                     .unwrap()
@@ -825,7 +825,7 @@ pub(crate) mod tests {
         pub(crate) fn input(&self) -> SourceBoundSummaryInput {
             SourceBoundSummaryInput::new(
                 self.registry
-                    .get_receiver_handle(self.key, self.streams.len())
+                    .get_receiver_pin(self.key, self.streams.len())
                     .unwrap(),
                 self.streams
                     .iter()
@@ -854,7 +854,7 @@ pub(crate) mod tests {
                         .unwrap()
                 })
                 .unwrap_or_default();
-            use crate::runtime::fragment::io::exchange_unit::{
+            use crate::runtime::task::io::exchange_unit::{
                 ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitDemand, ExchangeUnitItem,
                 ExchangeUnitReceiverFrame, ExchangeUnitSequence,
             };
@@ -963,7 +963,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn logical_change_summary_wait_outlives_transport_deadline_and_real_data_end_complete() {
-        let owner = crate::runtime::fragment::io::exchange::test_support::Fixture::with_runtime(
+        let owner = crate::runtime::task::io::exchange::test_support::Fixture::with_runtime(
             crate::exec::operators::exchange_source::test_support::runtime_with_transport_timeout(
                 std::time::Duration::from_millis(10),
             ),
@@ -985,7 +985,7 @@ pub(crate) mod tests {
         let errors = runtime.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&errors, &mut work, &mut conversions);
+        let mut ctx = DriverStep::new(&errors, &mut work, &mut conversions);
         let SummaryRead::Pending(before) = input.poll(&mut ctx).unwrap() else {
             panic!("summary input must actually wait")
         };
@@ -1064,7 +1064,7 @@ pub(crate) mod tests {
         let errors = runtime.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&errors, &mut work, &mut conversions);
+        let mut ctx = DriverStep::new(&errors, &mut work, &mut conversions);
         let SummaryRead::Pending(wait) = input.poll(&mut ctx).unwrap() else {
             panic!("summary must be pending")
         };
@@ -1102,7 +1102,7 @@ pub(crate) mod tests {
         let errors = runtime.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&errors, &mut work, &mut conversions);
+        let mut ctx = DriverStep::new(&errors, &mut work, &mut conversions);
         fixture.send(
             1,
             1,

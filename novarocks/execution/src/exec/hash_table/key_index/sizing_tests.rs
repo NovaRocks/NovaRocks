@@ -21,7 +21,7 @@
 use super::super::sizing::{SizingDomain, SizingDomainKind, SizingSketch};
 use super::*;
 use crate::runtime::{
-    fragment::ExecutionFailureCause, tracked_state_allocator::expression_allocation_host,
+    task::ExecutionFailureCause, tracked_state_allocator::expression_allocation_host,
 };
 use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
 use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl, KernelFailure};

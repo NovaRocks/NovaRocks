@@ -31,9 +31,9 @@ use std::{
 
 /// The same checked recipe author is used by production and the static minimum
 /// invoice. RootStage is the existing QA execution owner, never another Source.
-pub(crate) fn source_count(scans: usize, contexts: usize) -> Result<NonZeroUsize, WorkError> {
+pub(crate) fn source_count(scans: usize, participations: usize) -> Result<NonZeroUsize, WorkError> {
     let count = scans
-        .checked_add(contexts)
+        .checked_add(participations)
         .ok_or(WorkError::ArithmeticOverflow)?;
     NonZeroUsize::new(count).ok_or(WorkError::InvalidConfig("empty Native Source cohort"))
 }

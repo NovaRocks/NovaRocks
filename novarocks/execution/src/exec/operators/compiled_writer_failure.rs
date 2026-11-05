@@ -16,7 +16,7 @@
 // under the License.
 //! Compiled writer preparation owns frozen binding and call identity failures.
 use crate::exec::fragment::error::{FragmentBindingErrorKind, program_binding_failure};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, RepresentationBoundary,
     RepresentationFacts, RepresentationLayout, domain,

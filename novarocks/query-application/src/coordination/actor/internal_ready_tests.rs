@@ -1332,14 +1332,14 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
     let first = execution(if probe_reply { 12_090 } else { 12_091 });
     let root = root_task(first, 1);
     let frontend = FrontendProcessId::new_v7();
-    let root_context = QueryContextRef::new(first, frontend, root.backend_process_id());
-    let held_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+    let root_participation = ParticipationRef::new(first, frontend, root.backend_process_id());
+    let held_participation = ParticipationRef::new(first, frontend, BackendProcessId::new_v7());
     let mut config = internal_config(first, Arc::new(DelayedQualificationPort::default()));
-    config.required_establish_contexts = vec![root_context, held_context];
+    config.required_establish_participations = vec![root_participation, held_participation];
     let (capacity, _) = watch::channel(0);
-    config = config.with_abort_query_context_effect_port(
+    config = config.with_abort_participation_effect_port(
         Arc::new(SelectiveAbortPort {
-            blocked: held_context,
+            blocked: held_participation,
             accepted: Arc::new(Mutex::new(Vec::new())),
             capacity,
         }),
@@ -1354,12 +1354,12 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
     let activation = running.bind_internal_consumer(root).await.unwrap();
 
     // Original actor-issued admission/Establish capabilities: the root settles,
-    // while the other context keeps its exact pre-transport permit.
+    // while the other participation keeps its exact pre-transport permit.
     let mut held = None;
-    for (context, tag) in [(root_context, 81), (held_context, 82)] {
-        let ticket = admission_ticket(context, tag);
+    for (participation, tag) in [(root_participation, 81), (held_participation, 82)] {
+        let ticket = admission_ticket(participation, tag);
         let admission = running
-            .begin_admission_issue(admission_request(context, tag))
+            .begin_admission_issue(admission_request(participation, tag))
             .await
             .unwrap();
         running
@@ -1376,12 +1376,12 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
             .unwrap();
         let permit = running
             .authorize_establish(
-                establish_request(context, ticket, tag),
+                establish_request(participation, ticket, tag),
                 NativeCompatibilityId::new([tag; 32]),
             )
             .await
             .unwrap();
-        if context == held_context {
+        if participation == held_participation {
             held = Some(permit);
         } else {
             let transport = HoldingEstablishTransport::default();
@@ -1397,7 +1397,7 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
     }
     assert_eq!(
         actor
-            .establish_snapshot(root_context)
+            .establish_snapshot(root_participation)
             .await
             .unwrap()
             .unwrap()
@@ -1406,7 +1406,7 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
     );
     assert_eq!(
         actor
-            .establish_snapshot(held_context)
+            .establish_snapshot(held_participation)
             .await
             .unwrap()
             .unwrap()
@@ -1479,14 +1479,14 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
     };
     drop((running, ready, stream, output, outcome));
     let supervisor = owner.into_residual_stand_down_supervisor();
-    // These separate Worker/context stop facts come from the existing fixture
+    // These separate Worker/participation stop facts come from the existing fixture
     // author. Neither the ACK nor the statement watch is an actual-exit proof.
     supervisor
-        .observe_worker_stopped_and_context_fenced(root_context)
+        .observe_worker_stopped_and_participation_fenced(root_participation)
         .await
         .unwrap();
     supervisor
-        .observe_worker_stopped_and_context_fenced(held_context)
+        .observe_worker_stopped_and_participation_fenced(held_participation)
         .await
         .unwrap();
     drop(actor);
@@ -1509,12 +1509,12 @@ async fn internal_failure_revokes_original_issue_authority(probe_reply: bool) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn internal_failure_ack_revokes_the_other_contexts_pre_transport_permit() {
+async fn internal_failure_ack_revokes_the_other_participations_pre_transport_permit() {
     internal_failure_revokes_original_issue_authority(true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn internal_failure_watch_revokes_the_other_contexts_pre_transport_permit() {
+async fn internal_failure_watch_revokes_the_other_participations_pre_transport_permit() {
     internal_failure_revokes_original_issue_authority(false).await;
 }
 

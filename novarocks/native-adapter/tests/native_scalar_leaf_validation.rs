@@ -24,7 +24,7 @@
 use arrow::array::{ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::datatypes::Field;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use novarocks_execution::runtime::fragment::io::{ResultWriteAdmission, ResultWriteCredit};
+use novarocks_execution::runtime::task::io::{ResultWriteAdmission, ResultWriteCredit};
 use novarocks_native_adapter::root_scalar_leaf_codec::{
     NativeScalarLeafEncoder, NativeScalarLeafError,
 };

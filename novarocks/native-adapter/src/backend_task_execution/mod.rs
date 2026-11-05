@@ -33,8 +33,8 @@
 // Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 mod compiled_package;
-mod context_host;
 pub(crate) mod execution_host;
+mod participation_host;
 mod preparation_memory_control;
 #[cfg(novarocks_dev_controls)]
 mod prepared_exit_control;
@@ -51,8 +51,8 @@ pub use compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter, CompiledTaskOptions,
     CompiledTaskProgram, CompiledTypeScope, CompiledTypeScopes, NativeTypeConstructionError,
 };
-pub use context_host::NativeQueryContextHost;
-pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
+pub use execution_host::{NativeTaskExecutionHost, TaskParticipationFacts};
+pub use participation_host::NativeParticipationHost;
 
 #[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]

@@ -17,7 +17,7 @@
 
 //! The frontend-only write session.
 //!
-//! One `begin_write` on one exact control generation returns the commit handle
+//! One `begin_write` on one exact control generation returns the commit session
 //! and the complete set of logical writer recipes the sealed plan may use.
 //! Everything else about a distributed write hangs off that: the plan encodes
 //! the recipes, the backends execute them, and this session -- and only this
@@ -52,7 +52,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
-use novarocks_catalog_application::ConnectorWriteStackLease;
+use novarocks_catalog_application::ConnectorWriteStackPin;
 use novarocks_plan_codec::SealedWriteTargets;
 
 #[path = "write_computation.rs"]
@@ -109,7 +109,7 @@ pub(crate) struct ConnectorWriteSession {
             novarocks_spi::connector::StatisticsArtifactIdentity,
         )>,
     >,
-    lease: ConnectorWriteStackLease,
+    write_stack_pin: ConnectorWriteStackPin,
     plan: ConnectorWriteSessionPlan,
     metadata_only_publication: bool,
     /// The application-owned publication attached to the provider's single
@@ -188,7 +188,7 @@ impl ConnectorWriteSession {
     /// The statement owns `receiving` before polling this borrowed begin.
     /// Adopt the actual Provider result before dropping its original child F.
     pub(crate) async fn begin_async_in(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
         receiving: &WriteBeginReceiving,
@@ -204,7 +204,7 @@ impl ConnectorWriteSession {
             ));
         }
         Self::begin_validated_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties,
             request,
             WritePublicationState::Ordinary,
@@ -216,7 +216,7 @@ impl ConnectorWriteSession {
     /// Retain the exact pending declaration in the original receiving Source
     /// before constructing the Provider's borrowed application-document begin.
     pub(crate) async fn begin_pending_application_document_publication_async_in(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
         receiving: &WriteBeginReceiving,
@@ -234,7 +234,7 @@ impl ConnectorWriteSession {
             }
         };
         Self::begin_validated_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties,
             request,
             WritePublicationState::Pending { declaration },
@@ -246,14 +246,18 @@ impl ConnectorWriteSession {
     // Both explicit entrypoints claim and validate their flavor before using
     // this one original Provider poll/result-before-child-Drop/adoption path.
     async fn begin_validated_async_in(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         mut request: ConnectorWriteBeginRequest,
         finish_publication: WritePublicationState,
         receiving: &WriteBeginReceiving,
     ) -> Result<Arc<Self>, ConnectorError> {
         request.context = context_for_write_begin(request.context, &catalog_properties)?;
-        receiving.install_publication_input(lease, catalog_properties, finish_publication);
+        receiving.install_publication_input(
+            write_stack_pin,
+            catalog_properties,
+            finish_publication,
+        );
         let control = receiving.control();
         receiving.enter_factory();
         let mut original = control.begin_write_async(request);
@@ -280,7 +284,7 @@ impl ConnectorWriteSession {
 
     /// Borrow the selected stable original Rewrite source; no synchronous begin fallback.
     pub(crate) async fn begin_rewrite_scoped_in(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
         receiving: &WriteBeginReceiving,
@@ -303,7 +307,7 @@ impl ConnectorWriteSession {
             ));
         }
         receiving.claim()?;
-        receiving.install_input(lease, catalog_properties);
+        receiving.install_input(write_stack_pin, catalog_properties);
         let mut request = Some(request);
         receiving.control().prepare_rewrite_begin_source_in(
             &mut request,
@@ -330,9 +334,9 @@ impl ConnectorWriteSession {
     ) -> Result<novarocks_spi::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>
     {
         let provider = self
-            .lease
+            .write_stack_pin
             .session()
-            .cleanup_responsibility(self.plan.commit_handle())?;
+            .cleanup_responsibility(self.plan.commit_session())?;
         if self.has_unreceived_productions()? {
             return Ok(novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained);
         }
@@ -402,9 +406,9 @@ impl ConnectorWriteSession {
     pub(super) fn existing_finalization_context(
         &self,
     ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
-        self.lease
+        self.write_stack_pin
             .session()
-            .existing_finalization_context(self.plan.commit_handle())
+            .existing_finalization_context(self.plan.commit_session())
     }
 
     /// Settle the original begin on preparation or Native refusal. The same
@@ -509,7 +513,7 @@ impl ConnectorWriteSession {
     }
 
     fn from_begin_plan(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         plan: ConnectorWriteSessionPlan,
         finish_publication: WritePublicationState,
@@ -532,7 +536,7 @@ impl ConnectorWriteSession {
                     })
                     .collect(),
             ),
-            lease,
+            write_stack_pin,
             plan,
             metadata_only_publication,
             finish_publication: Mutex::new(finish_publication),
@@ -547,7 +551,7 @@ impl ConnectorWriteSession {
     }
 
     fn from_checked_cow_plan(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         checked: novarocks_spi::connector::ConnectorCowBeginPlan,
     ) -> Result<Self, novarocks_spi::connector::ConnectorCowBeginFailure> {
@@ -578,7 +582,7 @@ impl ConnectorWriteSession {
                     })
                     .collect(),
             ),
-            lease,
+            write_stack_pin,
             plan,
             metadata_only_publication: false,
             finish_publication: Mutex::new(WritePublicationState::Ordinary),
@@ -719,14 +723,14 @@ impl ConnectorWriteSession {
         &self,
         handle: &novarocks_spi::connector::write_stack::ConnectorWriterHandle,
     ) -> Result<novarocks_spi::connector::ConnectorEncodedPayload, ConnectorError> {
-        self.lease
+        self.write_stack_pin
             .handle_encoder()
             .encode_writer_handle_payload(handle)
             .map_err(|error| ConnectorError::from_domain(ConnectorErrorKind::Internal, error))
     }
 
     pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
-        let encoder = self.lease.handle_encoder();
+        let encoder = self.write_stack_pin.handle_encoder();
         let mut ledger = UniqueWriterHandleLedger::new();
         let mut handles = std::collections::BTreeMap::new();
         for target in self.plan.targets() {
@@ -776,8 +780,8 @@ impl ConnectorWriteSession {
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
         ensure_finish_context_active(context)?;
-        match self.lease.session().prepared_logical_row_change(
-            self.plan.commit_handle(),
+        match self.write_stack_pin.session().prepared_logical_row_change(
+            self.plan.commit_session(),
             prepared,
             context,
         )? {
@@ -1030,7 +1034,7 @@ pub(super) fn context_for_write_begin(
 }
 
 fn prepare_cow_begin_input(
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    write_lease: &novarocks_spi::connector::ConnectorWrite,
     mut request: ConnectorWriteBeginRequest,
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
 ) -> Result<
@@ -1066,8 +1070,8 @@ fn prepare_cow_begin_input(
 /// The exact checked COW plan and typed cause enter the original receiving
 /// source before the Provider child Future is destroyed.
 pub(crate) async fn begin_cow_connector_write_session_async_in(
-    lease: ConnectorWriteStackLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    write_stack_pin: ConnectorWriteStackPin,
+    write_lease: &novarocks_spi::connector::ConnectorWrite,
     request: ConnectorWriteBeginRequest,
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
     receiving: &WriteBeginReceiving,
@@ -1081,7 +1085,7 @@ pub(crate) async fn begin_cow_connector_write_session_async_in(
             original.clone(),
         ))
     })?;
-    receiving.install_input(lease, catalog_properties);
+    receiving.install_input(write_stack_pin, catalog_properties);
     let control = receiving.control();
     receiving.enter_factory();
     let mut child = control.begin_cow_write_checked_async(request, original);
@@ -1109,8 +1113,8 @@ pub(crate) async fn begin_cow_connector_write_session_async_in(
 /// Borrow the original asynchronous begin while retaining its exact declaration.
 /// Preparation and Provider refusals keep the original ConnectorError.
 pub(crate) async fn begin_connector_application_document_write_session_pending_async_in(
-    lease: ConnectorWriteStackLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    write_stack_pin: ConnectorWriteStackPin,
+    write_lease: &novarocks_spi::connector::ConnectorWrite,
     request: ConnectorWriteBeginRequest,
     receiving: &WriteBeginReceiving,
 ) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
@@ -1121,7 +1125,7 @@ pub(crate) async fn begin_connector_application_document_write_session_pending_a
         )
     })?;
     ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-        lease,
+        write_stack_pin,
         catalog_properties,
         request,
         receiving,
@@ -1174,7 +1178,7 @@ pub(crate) mod tests {
     }
 
     impl ProviderWriteRuntime for FakeProvider {
-        type CommitHandle = FakeCommit;
+        type CommitSession = FakeCommit;
         type WriterHandle = FakeHandle;
         type CommitFragment = FakeFragment;
 
@@ -1454,7 +1458,7 @@ pub(crate) mod tests {
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
         fn existing_finalization_context(
             &self,
-            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            _: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
         ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
             let mut recorded = self.recorded.lock().unwrap();
             recorded.finalization_context_reads += 1;
@@ -1618,10 +1622,10 @@ pub(crate) mod tests {
         }
         fn cleanup_responsibility(
             &self,
-            commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
         ) -> Result<novarocks_spi::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>
         {
-            self.adapter.commit_handle(commit)?;
+            self.adapter.commit_session(commit)?;
             let recorded = self.recorded.lock().unwrap();
             if recorded.enforce_cleanup_responsibility
                 && !matches!(
@@ -1643,14 +1647,14 @@ pub(crate) mod tests {
 
         fn prepared_logical_row_change(
             &self,
-            commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
             prepared: &ConnectorPreparedWriteSet,
             _: &ConnectorRequestContext,
         ) -> Result<
             Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
             ConnectorError,
         > {
-            self.adapter.commit_handle(commit)?;
+            self.adapter.commit_session(commit)?;
             assert_eq!(prepared.row_count(), 1);
             let mut original_payload = None;
             for (_, fragment) in prepared.fragments() {
@@ -1758,7 +1762,7 @@ pub(crate) mod tests {
                     recorded.begin_context = Some(request.context);
                 }
             }
-            let commit = self.adapter.wrap_commit_handle(FakeCommit);
+            let commit = self.adapter.wrap_commit_session(FakeCommit);
             let targets = (0..self.targets)
                 .map(|index| {
                     let ordinal = WriteTargetOrdinal::try_new(
@@ -1925,14 +1929,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn begin_for_test(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
     ) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let result = futures::executor::block_on(ConnectorWriteSession::begin_async_in(
-            lease, properties, request, &receiving,
+            write_stack_pin,
+            properties,
+            request,
+            &receiving,
         ));
         drop(receiving);
         drop(original);
@@ -1940,7 +1947,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn begin_pending_for_test(
-        lease: ConnectorWriteStackLease,
+        write_stack_pin: ConnectorWriteStackPin,
         properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
     ) -> Result<Arc<ConnectorWriteSession>, ConnectorError> {
@@ -1948,7 +1955,10 @@ pub(crate) mod tests {
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let result = futures::executor::block_on(
             ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-                lease, properties, request, &receiving,
+                write_stack_pin,
+                properties,
+                request,
+                &receiving,
             ),
         );
         drop(receiving);
@@ -2021,9 +2031,9 @@ pub(crate) mod tests {
             &self,
             context: ConnectorRequestContext,
         ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            let control = self.session.lease.session();
+            let control = self.session.write_stack_pin.session();
             control.abort_write_async(ConnectorWriteSessionAbortRequest {
-                commit: self.session.plan.commit_handle(), context,
+                commit: self.session.plan.commit_session(), context,
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::Unproven,
                 received: None,
             }).await
@@ -2063,11 +2073,11 @@ pub(crate) mod tests {
             KeyedPublicationIntent,
         )>,
     ) -> Fixture {
-        let (lease, recorded) = unopened_fixture(targets, payload_bytes, outcome);
+        let (write_stack_pin, recorded) = unopened_fixture(targets, payload_bytes, outcome);
         let session = match publication {
             Some((declaration, publication)) => {
                 let session = begin_pending_for_test(
-                    lease,
+                    write_stack_pin,
                     catalog_properties(),
                     application_document_begin_request(declaration),
                 )
@@ -2077,9 +2087,8 @@ pub(crate) mod tests {
                     .expect("bind exact publication");
                 session
             }
-            None => {
-                begin_for_test(lease, catalog_properties(), begin_request()).expect("begin write")
-            }
+            None => begin_for_test(write_stack_pin, catalog_properties(), begin_request())
+                .expect("begin write"),
         };
         Fixture { session, recorded }
     }
@@ -2088,7 +2097,7 @@ pub(crate) mod tests {
         targets: usize,
         payload_bytes: usize,
         outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
-    ) -> (ConnectorWriteStackLease, Arc<Mutex<Recorded>>) {
+    ) -> (ConnectorWriteStackPin, Arc<Mutex<Recorded>>) {
         unopened_fixture_with_encoder(targets, outcome, Arc::new(FakeEncoder { payload_bytes }))
     }
 
@@ -2096,7 +2105,7 @@ pub(crate) mod tests {
         targets: usize,
         outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
         encoder: Arc<dyn ConnectorWriteHandleWireEncoder>,
-    ) -> (ConnectorWriteStackLease, Arc<Mutex<Recorded>>) {
+    ) -> (ConnectorWriteStackPin, Arc<Mutex<Recorded>>) {
         let adapter = adapter();
         let binding_key = ConnectorProviderBindingKey {
             instance_id: catalog_handle().catalog_name().clone(),
@@ -2121,14 +2130,14 @@ pub(crate) mod tests {
             }),
         );
         let source_retirement = Arc::clone(&recorded);
-        let lease = novarocks_catalog_application::test_support::write_stack_lease(
+        let write_stack_pin = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             group,
             move || {
                 source_retirement.lock().unwrap().source_drops += 1;
             },
         );
-        (lease, recorded)
+        (write_stack_pin, recorded)
     }
 
     fn fixture_with_statistics(targets: usize) -> Fixture {
@@ -2161,13 +2170,13 @@ pub(crate) mod tests {
                 recorded: Arc::clone(&recorded),
             }),
         );
-        let lease = novarocks_catalog_application::test_support::write_stack_lease(
+        let write_stack_pin = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             group,
             || {},
         );
-        let session =
-            begin_for_test(lease, catalog_properties(), begin_request()).expect("begin write");
+        let session = begin_for_test(write_stack_pin, catalog_properties(), begin_request())
+            .expect("begin write");
         Fixture { session, recorded }
     }
 
@@ -2274,7 +2283,7 @@ pub(crate) mod tests {
         .and_then(|binding| binding.try_with_document_storage(Some(documents)))
         .expect("control binding");
         let documents =
-            novarocks_spi::connector::ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+            novarocks_spi::connector::ConnectorControlPlanningPin::new(Arc::new(binding), || {})
                 .derive_document_storage_lease()
                 .expect("document storage lease");
 
@@ -2979,9 +2988,9 @@ pub(crate) mod tests {
         }
         let (declaration, publication) = application_document_publication();
         let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
-        let key = lease.session().binding_key().clone();
-        let write_lease = novarocks_spi::connector::ConnectorWriteLease::new(
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
+        let key = write_stack_pin.session().binding_key().clone();
+        let write_lease = novarocks_spi::connector::ConnectorWrite::new(
             key.clone(),
             Arc::new(BindingOnlyControl(key)),
             || {},
@@ -2992,7 +3001,7 @@ pub(crate) mod tests {
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let session = begin_connector_application_document_write_session_pending_async_in(
-            lease,
+            write_stack_pin,
             &write_lease,
             application_document_begin_request(declaration.clone()),
             &receiving,
@@ -3037,14 +3046,14 @@ pub(crate) mod tests {
             novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly,
         );
         let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let mut request = application_document_begin_request(declaration.clone());
         request.intent = novarocks_spi::connector::ConnectorWriteIntent::Append;
         let session =
             ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-                lease,
+                write_stack_pin,
                 catalog_properties(),
                 request,
                 &receiving,
@@ -3081,13 +3090,13 @@ pub(crate) mod tests {
     #[test]
     fn pending_document_async_drop_panic_retains_plan_input_and_exact_declaration() {
         let (declaration, _) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let mut borrowed = Box::pin(
             ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-                lease,
+                write_stack_pin,
                 catalog_properties(),
                 application_document_begin_request(declaration.clone()),
                 &receiving,
@@ -3117,11 +3126,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn async_document_and_ordinary_entries_reject_the_other_flavor_before_begin() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
         let failure =
             ConnectorWriteSession::begin_pending_application_document_publication_async_in(
-                lease,
+                write_stack_pin,
                 catalog_properties(),
                 begin_request(),
                 &receiving,
@@ -3136,10 +3145,10 @@ pub(crate) mod tests {
         assert!(!receiving.retains_input());
 
         let (declaration, _) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
         let failure = ConnectorWriteSession::begin_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
             &receiving,
@@ -3157,9 +3166,9 @@ pub(crate) mod tests {
     fn pending_application_publication_binds_once_after_execution_and_reaches_finish() {
         let (declaration, publication) = application_document_publication();
         let expected = ConnectorWriteFinishPublication::KeyedDocuments(publication.clone());
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session = begin_pending_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3184,9 +3193,9 @@ pub(crate) mod tests {
     #[test]
     fn pending_application_publication_refuses_finish_before_provider_invocation() {
         let (declaration, publication) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session = begin_pending_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3211,9 +3220,9 @@ pub(crate) mod tests {
     #[test]
     fn application_document_publication_rejects_a_second_bind() {
         let (declaration, publication) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session = begin_pending_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3234,9 +3243,9 @@ pub(crate) mod tests {
     fn pending_application_publication_rejects_a_mismatched_bind() {
         let (declaration, publication) = application_document_publication();
         let (_, other_publication) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session = begin_pending_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3270,10 +3279,10 @@ pub(crate) mod tests {
     #[test]
     fn ordinary_begin_rejects_an_application_document_flavor_before_provider_begin() {
         let (declaration, _) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
 
         let error = begin_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3288,9 +3297,9 @@ pub(crate) mod tests {
 
     #[test]
     fn application_document_begin_rejects_an_ordinary_flavor_before_provider_begin() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
 
-        let error = begin_pending_for_test(lease, catalog_properties(), begin_request())
+        let error = begin_pending_for_test(write_stack_pin, catalog_properties(), begin_request())
             .err()
             .expect("publication intent must require an application-document flavor");
 
@@ -3302,9 +3311,9 @@ pub(crate) mod tests {
 
     #[test]
     fn pending_application_document_begin_rejects_an_ordinary_flavor_before_provider_begin() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
 
-        let error = begin_pending_for_test(lease, catalog_properties(), begin_request())
+        let error = begin_pending_for_test(write_stack_pin, catalog_properties(), begin_request())
             .err()
             .expect("pending publication requires an application-document flavor");
 
@@ -3318,9 +3327,9 @@ pub(crate) mod tests {
     fn application_document_pending_bind_rejects_a_mismatched_intent_without_finishing() {
         let (declaration, publication) = application_document_publication();
         let (_, other_publication) = application_document_publication();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session = begin_pending_for_test(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             application_document_begin_request(declaration),
         )
@@ -3364,12 +3373,13 @@ pub(crate) mod tests {
             ledger.charge_raw(2).unwrap_err(),
         );
         let fact = original.failure_fact();
-        let (lease, recorded) = unopened_fixture_with_encoder(
+        let (write_stack_pin, recorded) = unopened_fixture_with_encoder(
             1,
             known_committed(),
             Arc::new(RefusingEncoder(original.clone())),
         );
-        let session = begin_for_test(lease, catalog_properties(), begin_request()).unwrap();
+        let session =
+            begin_for_test(write_stack_pin, catalog_properties(), begin_request()).unwrap();
         let payload_error = session
             .encode_writer_handle_payload(session.targets()[0].handle())
             .expect_err("actual provider encoder refuses the payload");
@@ -3919,7 +3929,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_implicit_empty_seal_reaches_an_invisible_staged_create() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let mut request = begin_request();
         request.flavor =
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -3929,8 +3939,8 @@ pub(crate) mod tests {
                 )
                 .expect("staged target handle"),
             );
-        let session =
-            begin_for_test(lease, catalog_properties(), request).expect("begin staged write");
+        let session = begin_for_test(write_stack_pin, catalog_properties(), request)
+            .expect("begin staged write");
 
         let outcome = session
             .publish_for_test(request_context())
@@ -4018,12 +4028,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn async_begin_uses_the_original_session_plan_and_context() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().capture_begin_context = true;
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let session = ConnectorWriteSession::begin_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             begin_request(),
             &receiving,
@@ -4674,11 +4684,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let same_original = original.clone();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session_receiving = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&session_receiving));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties());
+        receiving.install_input(write_stack_pin, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         let mut child = control.begin_cow_write_checked_async(begin_request(), original);
@@ -4721,12 +4731,12 @@ pub(crate) mod tests {
             &binding, &context,
         )
         .unwrap();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let slot = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&slot));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties());
+        receiving.install_input(write_stack_pin, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         let mut child = control.begin_cow_write_checked_async(begin_request(), original);
@@ -4762,11 +4772,11 @@ pub(crate) mod tests {
             &binding, &context,
         )
         .unwrap();
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
         receiving.claim().unwrap();
-        receiving.install_input(lease, catalog_properties());
+        receiving.install_input(write_stack_pin, catalog_properties());
         let control = receiving.control();
         receiving.enter_factory();
         // The same original control authors the typed stop failure.
@@ -4791,11 +4801,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn begin_in_installs_the_same_accepted_session_before_return() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         let session_receiving = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&session_receiving));
         let session = ConnectorWriteSession::begin_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             begin_request(),
             &receiving,
@@ -4813,12 +4823,12 @@ pub(crate) mod tests {
 
     #[test]
     fn begin_child_drop_panic_keeps_the_actual_plan_as_original_session() {
-        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(1, 16, known_committed());
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let original = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original));
         let mut future = Box::pin(ConnectorWriteSession::begin_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             begin_request(),
             &receiving,
@@ -4846,11 +4856,11 @@ pub(crate) mod tests {
 
     #[test]
     fn begin_child_drop_panic_keeps_the_original_rejection_cause() {
-        let (lease, recorded) = unopened_fixture(0, 16, known_committed());
+        let (write_stack_pin, recorded) = unopened_fixture(0, 16, known_committed());
         recorded.lock().unwrap().panic_begin_future_drop = true;
         let receiving = WriteBeginReceiving::new(Arc::new(Mutex::new(None)));
         let mut future = Box::pin(ConnectorWriteSession::begin_async_in(
-            lease,
+            write_stack_pin,
             catalog_properties(),
             begin_request(),
             &receiving,

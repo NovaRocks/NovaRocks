@@ -920,7 +920,7 @@ impl ConnectorReadWireEncoder for NoEncoding {
 impl MvStorageObservationPort for SourceFixture {
     fn observe_source_schema(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvSourceSchemaObservation, ConnectorError> {
@@ -946,7 +946,7 @@ impl MvStorageObservationPort for SourceFixture {
     }
     fn observe_refresh_base(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvRefreshBaseObservation, ConnectorError> {
@@ -960,7 +960,7 @@ impl MvStorageObservationPort for SourceFixture {
     }
     fn observe_schema_validation(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvSchemaValidationObservation, ConnectorError> {
@@ -984,7 +984,7 @@ impl MvStorageObservationPort for SourceFixture {
     }
     fn observe_refresh_target(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::MvRefreshTargetObservation, ConnectorError> {
@@ -1008,7 +1008,7 @@ impl MvStorageObservationPort for SourceFixture {
     }
     fn observe_created_target(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvCreatedTargetObservation, ConnectorError> {
@@ -1016,7 +1016,7 @@ impl MvStorageObservationPort for SourceFixture {
     }
     fn observe_maintenance_metadata(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {

@@ -1819,8 +1819,8 @@ mod tests {
     #[tokio::test]
     async fn catalog_applied_receiving_survives_ready_child_drop_and_noop_grants_nothing() {
         use novarocks_spi::connector::{
-            ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
-            ConnectorCatalogMutationReceiving, ConnectorCatalogMutationRequest,
+            ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceiving,
+            ConnectorCatalogMutationRequest, ConnectorCatalogMutationSession,
             ConnectorControlRuntimeId, ConnectorNamespaceIdentity, ConnectorProviderBindingKey,
             ConnectorStopOwner, DropPolicy,
         };
@@ -1843,7 +1843,7 @@ mod tests {
                 panic_on_drop,
                 no_op,
             });
-            let lease = ConnectorCatalogMutationLease::new(
+            let lease = ConnectorCatalogMutationSession::new(
                 descriptor.clone(),
                 ConnectorControlRuntimeId::new(),
                 epoch,

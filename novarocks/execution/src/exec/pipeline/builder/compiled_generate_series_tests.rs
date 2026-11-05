@@ -610,9 +610,9 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
     use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+    use crate::runtime::task::ExecutionFailureCause;
     let program = compile(literal_source([Some(1), Some(3), Some(1)], true, false), 8);
     let weak = Arc::downgrade(&program);
     let factory = CompiledGenerateSeriesProcessorFactory::try_new(
@@ -680,9 +680,9 @@ fn compiled_series_prepare_keeps_typed_first_memory_refusal_without_later_constr
     use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
+    use crate::runtime::task::ExecutionFailureCause;
     let program = compile(literal_source([Some(1), Some(3), Some(1)], true, false), 8);
     let factory = CompiledGenerateSeriesProcessorFactory::try_new(
         Arc::clone(&program),

@@ -22,10 +22,45 @@ use std::io::Read;
 use std::time::Instant;
 
 pub(crate) const SCAN_BYTES: u64 = 2 * 1024 * 1024;
-const STEM: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE";
+const STEM: &[u8] =
+    novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE.as_bytes();
 #[cfg(test)]
-const BASE: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE ";
-const PREFIX: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE frontend_process_id=";
+const BASE: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE.as_bytes();
+    let suffix = b" ";
+    let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE
+        .len()
+        + b" ".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
+const PREFIX: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE.as_bytes();
+    let suffix = b" frontend_process_id=";
+    let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE
+        .len()
+        + b" frontend_process_id=".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
 const LINE_BYTES: usize = 384;
 fn parse(line: &[u8]) -> Result<FrontendProcessId> {
     ensure!(
@@ -160,7 +195,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::time::Duration;
-    const LINE: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
+    const LINE: &[u8] = &const {
+        let marker =
+            novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE.as_bytes();
+        let suffix = b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
+        let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE
+            .len()
+            + b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n".len()];
+        let mut index = 0;
+        while index < marker.len() {
+            bytes[index] = marker[index];
+            index += 1;
+        }
+        let mut suffix_index = 0;
+        while suffix_index < suffix.len() {
+            bytes[index + suffix_index] = suffix[suffix_index];
+            suffix_index += 1;
+        }
+        bytes
+    };
     fn decode(bytes: &[u8]) -> Result<FrontendProcessId> {
         scan(
             &mut Cursor::new(bytes),
@@ -245,7 +298,25 @@ mod tests {
     }
     #[test]
     fn neutral_source_does_not_accept_an_exact_gate_marker() {
-        let old = b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
+        let old = &const {
+            let marker =
+                novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.as_bytes();
+            let suffix = b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
+            let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE
+                .len()
+                + b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n".len()];
+            let mut index = 0;
+            while index < marker.len() {
+                bytes[index] = marker[index];
+                index += 1;
+            }
+            let mut suffix_index = 0;
+            while suffix_index < suffix.len() {
+                bytes[index + suffix_index] = suffix[suffix_index];
+                suffix_index += 1;
+            }
+            bytes
+        };
         assert!(decode(old).is_err());
     }
     #[test]

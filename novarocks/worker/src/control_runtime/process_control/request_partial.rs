@@ -21,7 +21,7 @@
 
 use super::{ControlRequestAdmissionRefusal, ControlRequestError, ProcessControlOwner};
 use crate::control_runtime::control_request::ControlRequestPartial;
-use novarocks_control_runtime::{lease::WorkRetirementObserver, transaction::RuntimeLedger};
+use novarocks_control_runtime::{obligation::WorkRetirementObserver, transaction::RuntimeLedger};
 use novarocks_control_runtime_core::identity::WorkId;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -64,7 +64,7 @@ impl OriginalPartial {
                         if let Some(permit) = self.original.permit.take() {
                             permit
                                 .revoke_unused()
-                                .map_err(ControlRequestError::Driver)?;
+                                .map_err(ControlRequestError::ActorTurn)?;
                         }
                         Phase::RevokeReport
                     }

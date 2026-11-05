@@ -31,8 +31,8 @@ use crate::{
         pipeline::operator::InputConstructionOwner,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         mem_tracker::MemTracker,
+        task::{ExecutionFailure, ExecutionResult},
         tracked_state_allocator::expression_allocation_host,
     },
 };

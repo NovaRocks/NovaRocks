@@ -88,7 +88,7 @@ impl StepOperator for Probe {
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         assert!(!matches!(self.role, Role::Source));
         if self.input.is_some() || matches!(self.next, NextStep::Wait(_)) {
             return InputResult::Deferred {
@@ -120,7 +120,7 @@ impl StepOperator for Probe {
             }
         }
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         match self.role {
             Role::Source => {
@@ -139,7 +139,7 @@ impl StepOperator for Probe {
             _ => panic!("input-only probe has no continuation"),
         }
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
         self.next = NextStep::Finished;
         Ok(())
     }

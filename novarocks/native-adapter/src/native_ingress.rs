@@ -1116,7 +1116,7 @@ mod tests {
                 .await
         });
         let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
-        let driver = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(NativeRpcMethod::FetchRootResult.contract().path)
@@ -1136,9 +1136,9 @@ mod tests {
             .unwrap();
         drop(body);
         drop(client);
-        driver.abort();
+        connection_job.abort();
         server.abort();
-        let _ = driver.await;
+        let _ = connection_job.await;
         let _ = server.await;
         assert_eq!(status, "5");
         assert!(

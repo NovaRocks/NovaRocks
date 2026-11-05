@@ -15,46 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Retirement-only custody of one uniquely moved original RPC causal role.
+//! Retirement-only custody of one uniquely moved original RPC causal cut.
 
 use super::*;
 use crate::control_runtime::source_positions::{
     DetachedSourcePosition, RetirementProbe, SourcePositionObservation, SourcePositionPair,
     UnusedPosition,
 };
-use novarocks_worker_protocol::creation::RequestContext;
+use novarocks_worker_protocol::creation::RequestReplyTag;
 
 pub(crate) struct RpcTailBinding<'a> {
-    pub request: RequestContext,
+    pub request: RequestReplyTag,
     pub financial_scope: &'a ScopeHandle,
     pub original_report: &'a ReportSlot,
     pub target: &'a ActorRegistration,
 }
 
-pub(super) struct CausalRoleEnv<'a> {
+pub(super) struct CausalCutEnv<'a> {
     pub(super) runtime: &'a ActorRuntime<WorkerActor>,
     pub(super) registration: &'a ActorRegistration,
     pub(super) actor: ActorId,
     pub(super) ingress: &'a TaskProposalIngress,
 }
-impl CausalRoleEnv<'_> {
+impl CausalCutEnv<'_> {
     fn validate_financial_scope(
         &self,
-        role: &Role,
+        cut_state: &CausalCutState,
         scope: &ScopeHandle,
     ) -> Result<(), CausalError> {
         self.runtime.validate_registration(self.registration)?;
-        if !role.financial_scope.same_scope(scope) {
+        if !cut_state.financial_scope.same_scope(scope) {
             return Err(CausalError::WrongAuthor);
         }
         Ok(())
     }
     fn source_core_consumption(
         &self,
-        role: &Role,
+        cut_state: &CausalCutState,
         source: SourceId,
     ) -> Result<Consumption, CausalError> {
-        let delivered = role.delivered.as_ref().ok_or(CausalError::NotDelivered)?;
+        let delivered = cut_state
+            .delivered
+            .as_ref()
+            .ok_or(CausalError::NotDelivered)?;
         if !delivered.names_source(source) {
             return Err(CausalError::UnknownSource);
         }
@@ -70,12 +73,12 @@ impl CausalRoleEnv<'_> {
     pub(super) fn observe_effects_exited(
         &self,
         cut: CutId,
-        role: &Role,
+        cut_state: &CausalCutState,
     ) -> Result<bool, CausalError> {
-        if role.inputs.in_flight()?.iter().any(Option::is_some) {
+        if cut_state.inputs.in_flight()?.iter().any(Option::is_some) {
             return Ok(false);
         }
-        match &role.delivered {
+        match &cut_state.delivered {
             Some(delivered) if delivered.rejected.is_some() => return Ok(false),
             None if !self.ingress.event_unused(cut)? => return Ok(false),
             _ => {}
@@ -86,10 +89,10 @@ impl CausalRoleEnv<'_> {
     pub(super) fn advance_source_pair_retirement(
         &self,
         cut: CutId,
-        role: &Role,
+        cut_state: &CausalCutState,
         scope: &ScopeHandle,
     ) -> Result<CausalSourceProgress, CausalError> {
-        self.validate_financial_scope(role, scope)?;
+        self.validate_financial_scope(cut_state, scope)?;
         self.advance_pair_retirement(
             crate::task_proposal_ingress::PairRoute::Cut(cut),
             |source| {
@@ -99,7 +102,7 @@ impl CausalRoleEnv<'_> {
                     .map_err(CausalError::Source)?;
                 let receipt = original.custody.core_consumption();
                 if receipt == Consumption::Pending {
-                    self.source_core_consumption(role, source)
+                    self.source_core_consumption(cut_state, source)
                 } else {
                     Ok(receipt)
                 }
@@ -116,7 +119,9 @@ impl CausalRoleEnv<'_> {
         use novarocks_control_runtime_core::identity::ConsumerId;
         self.runtime.validate_registration(self.registration)?;
         let runtime_error = |error| {
-            CausalError::Role(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(error))
+            CausalError::ExitCustody(
+                novarocks_control_runtime::exit_custody::ExitCustodyError::Runtime(error),
+            )
         };
         let mut progressed = false;
         // The ingress verifies sealed/unused before moving any Available
@@ -127,7 +132,7 @@ impl CausalRoleEnv<'_> {
         }
         for original in self.ingress.pair_inventory(route)? {
             let before = original.custody.phase();
-            if before == ExitRolePhase::Retired {
+            if before == ExitCustodyPhase::Retired {
                 continue;
             }
             if let Some(source) = original.source {
@@ -136,7 +141,7 @@ impl CausalRoleEnv<'_> {
                 if original
                     .custody
                     .actual_exit_ready()
-                    .map_err(CausalError::Role)?
+                    .map_err(CausalError::ExitCustody)?
                 {
                     let core = ConsumerId::new(1).expect("original source Core consumer");
                     let receipt = receipt(source)?;
@@ -182,7 +187,10 @@ impl CausalRoleEnv<'_> {
                     }
                 }
             }
-            original.custody.try_retire().map_err(CausalError::Role)?;
+            original
+                .custody
+                .try_retire()
+                .map_err(CausalError::ExitCustody)?;
             progressed |= original.custody.phase() != before;
         }
         let originals = self.ingress.pair_inventory(route)?;
@@ -207,30 +215,31 @@ impl CausalRoleEnv<'_> {
     pub(super) fn retire_after_exit(
         &self,
         cut: CutId,
-        role: &mut Role,
+        cut_state: &mut CausalCutState,
         retirement: CausalSourceRetirement,
     ) -> Result<RetiredCut, CausalRetirementRefusal> {
         let checked = (|| {
-            let input_tail_ready = match &role.input_author {
-                Some(author) => author.cut_tail_ready().map_err(CausalError::Role)?,
+            let input_tail_ready = match &cut_state.input_author {
+                Some(author) => author.cut_tail_ready().map_err(CausalError::ExitCustody)?,
                 None => true,
             };
-            let rpc_tail_ready = match &role.rpc_author {
+            let rpc_tail_ready = match &cut_state.rpc_author {
                 Some(author) => author.cut_tail_ready()?,
                 None => true,
             };
             if !input_tail_ready
                 || !rpc_tail_ready
-                || role.loader_exit.as_ref().is_some_and(|loader| {
-                    loader.phase() != novarocks_control_runtime::exit_role::ExitRolePhase::Retired
+                || cut_state.loader_exit.as_ref().is_some_and(|loader| {
+                    loader.phase()
+                        != novarocks_control_runtime::exit_custody::ExitCustodyPhase::Retired
                 })
-                || role.inputs.in_flight()?.iter().any(Option::is_some)
-                || role
+                || cut_state.inputs.in_flight()?.iter().any(Option::is_some)
+                || cut_state
                     .delivered
                     .as_ref()
                     .is_some_and(|d| d.rejected.is_some())
             {
-                return Err(DriverError::RoleBusy.into());
+                return Err(ActorTurnError::StandingInputBusy.into());
             }
             self.ingress.event_unused(cut).map_err(Into::into)
         })();
@@ -262,24 +271,25 @@ impl CausalRoleEnv<'_> {
                 })?
             }
         };
-        role.inputs
+        cut_state
+            .inputs
             .close_after_exit()
             .expect("exclusive idle causal positions retain their actor");
         Ok(retired)
     }
 }
 
-#[must_use = "The original RPC causal role must retain its actual retirement owner"]
+#[must_use = "The original RPC causal cut must retain its actual retirement owner"]
 pub(crate) struct RpcCausalTail {
     runtime: ActorRuntime<WorkerActor>,
     registration: ActorRegistration,
     cut: CutId,
     ingress: Arc<TaskProposalIngress>,
-    original: Option<Role>,
+    original: Option<CausalCutState>,
 }
 impl RpcCausalTail {
-    fn role_env(&self) -> CausalRoleEnv<'_> {
-        CausalRoleEnv {
+    fn cut_env(&self) -> CausalCutEnv<'_> {
+        CausalCutEnv {
             runtime: &self.runtime,
             registration: &self.registration,
             actor: self.registration.actor(),
@@ -287,34 +297,40 @@ impl RpcCausalTail {
         }
     }
     pub(crate) fn observe_effects_exited(&self) -> Result<bool, CausalError> {
-        let role = self.original.as_ref().ok_or(CausalError::UnknownRole)?;
-        self.role_env().observe_effects_exited(self.cut, role)
+        let cut_state = self
+            .original
+            .as_ref()
+            .ok_or(CausalError::MissingCutCustody)?;
+        self.cut_env().observe_effects_exited(self.cut, cut_state)
     }
     pub(crate) fn advance_source_pair_retirement(
         &self,
         scope: &ScopeHandle,
     ) -> Result<CausalSourceProgress, CausalError> {
-        let role = self.original.as_ref().ok_or(CausalError::UnknownRole)?;
-        self.role_env()
-            .advance_source_pair_retirement(self.cut, role, scope)
+        let cut_state = self
+            .original
+            .as_ref()
+            .ok_or(CausalError::MissingCutCustody)?;
+        self.cut_env()
+            .advance_source_pair_retirement(self.cut, cut_state, scope)
     }
     pub(crate) fn retire_after_exit(
         &mut self,
         retirement: CausalSourceRetirement,
     ) -> Result<RetiredCut, CausalRetirementRefusal> {
-        let Some(role) = self.original.as_mut() else {
+        let Some(cut_state) = self.original.as_mut() else {
             return Err(CausalRetirementRefusal {
-                error: CausalError::UnknownRole,
+                error: CausalError::MissingCutCustody,
                 retirement,
             });
         };
-        let env = CausalRoleEnv {
+        let env = CausalCutEnv {
             runtime: &self.runtime,
             registration: &self.registration,
             actor: self.registration.actor(),
             ingress: &self.ingress,
         };
-        let retired = env.retire_after_exit(self.cut, role, retirement)?;
+        let retired = env.retire_after_exit(self.cut, cut_state, retirement)?;
         self.original.take();
         Ok(retired)
     }
@@ -323,8 +339,8 @@ impl RpcCausalTail {
     }
 }
 impl TaskCausalInbox {
-    pub(super) fn role_env(&self) -> CausalRoleEnv<'_> {
-        CausalRoleEnv {
+    pub(super) fn cut_env(&self) -> CausalCutEnv<'_> {
+        CausalCutEnv {
             runtime: &self.runtime,
             registration: &self.registration,
             actor: self.actor,
@@ -334,7 +350,7 @@ impl TaskCausalInbox {
     pub(crate) fn retirement_bank(&self) -> CausalRetirementBank {
         CausalRetirementBank(self.ingress.clone())
     }
-    /// Transfer the one original role only after all Core/input facts have
+    /// Transfer the one original cut only after all Core/input facts have
     /// been saved. External R/report exit remains a final retirement gate.
     pub(crate) fn try_take_rpc_tail(
         &mut self,
@@ -351,28 +367,33 @@ impl TaskCausalInbox {
         if failed {
             return Ok(None);
         }
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        let rpc = role.rpc_author.as_ref().ok_or(CausalError::WrongAuthor)?;
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        let rpc = cut_state
+            .rpc_author
+            .as_ref()
+            .ok_or(CausalError::WrongAuthor)?;
         self.validate_author_binding(&rpc.binding)?;
-        if !role.financial_scope.same_scope(binding.financial_scope)
+        if !cut_state
+            .financial_scope
+            .same_scope(binding.financial_scope)
             || !rpc.report.same_slot(binding.original_report)
             || rpc.binding.work != binding.request.author
-            || role.inputs.event_author()?.work() != binding.request.author
+            || cut_state.inputs.event_author()?.work() != binding.request.author
             || rpc.request.operation != binding.request.operation
             || rpc.request.deadline != binding.request.deadline
         {
             return Err(CausalError::WrongAuthor);
         }
-        let Some(returned) = &role.rpc_sender_returned else {
+        let Some(returned) = &cut_state.rpc_sender_returned else {
             return Ok(None);
         };
         if !Arc::ptr_eq(&returned.original, rpc) {
             return Err(CausalError::WrongAuthor);
         }
-        if role.input_author.is_some() || role.loader_exit.is_some() {
+        if cut_state.input_author.is_some() || cut_state.loader_exit.is_some() {
             return Err(CausalError::WrongAuthor);
         }
-        let Some(delivered) = role.delivered.as_ref() else {
+        let Some(delivered) = cut_state.delivered.as_ref() else {
             return Ok(None);
         };
         if delivered.event != Some(binding.request.token) {
@@ -383,7 +404,7 @@ impl TaskCausalInbox {
             || self.ingress.cut_consumption(cut) != Some(Consumption::Consumed)
             || (delivered.sources.iter().any(Option::is_some)
                 && delivered.source_consumption != Consumption::Consumed)
-            || role.inputs.in_flight()?.iter().any(Option::is_some)
+            || cut_state.inputs.in_flight()?.iter().any(Option::is_some)
         {
             return Ok(None);
         }
@@ -391,9 +412,9 @@ impl TaskCausalInbox {
         let registration = self.registration.clone();
         let ingress = self.ingress.clone();
         let original = self
-            .roles
+            .cuts
             .remove(&cut)
-            .expect("same preflighted original RPC role");
+            .expect("same preflighted original RPC cut");
         if self.observing_prefix == Some(cut) {
             self.observing_prefix = None;
         }

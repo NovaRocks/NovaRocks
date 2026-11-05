@@ -34,9 +34,9 @@ use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteLease, ConnectorRequestContext, ConnectorRewritePlanSource,
-    ConnectorRewritePrepared, ConnectorRewriteSelection, ConnectorRewriteSourceRequest,
-    LakePublicationDisposition, ProviderMetadataCpuPort, RewriteCpuPort,
+    ConnectorRequestContext, ConnectorRewritePlanSource, ConnectorRewritePrepared,
+    ConnectorRewriteSelection, ConnectorRewriteSourceRequest, LakePublicationDisposition,
+    ProviderMetadataCpuPort, RewriteCpuPort, SharedConnectorDistributedRewrite,
 };
 use novarocks_table_maintenance::worker::OptimizeJobOriginals;
 use novarocks_table_maintenance::{OptimizeJob, OptimizeJobOutcome, OptimizeProcessRuntime};
@@ -85,7 +85,7 @@ pub(crate) struct RewriteDomain {
     engine: RequestScopedMaintenanceEngine,
     root: WorkScope,
     context: ConnectorRequestContext,
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     cpu: Arc<dyn RewriteCpuPort>,
     binding_cpu: Arc<dyn ProviderMetadataCpuPort>,
     io: Arc<MetadataIoAdmission>,
@@ -99,7 +99,7 @@ pub(crate) struct RewriteDomain {
     >,
     begin: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
     begin_source: Option<Arc<dyn novarocks_spi::connector::ConnectorRewriteWriteBeginSource>>,
-    write_stack: Option<novarocks_catalog_application::ConnectorWriteStackLease>,
+    write_stack: Option<novarocks_catalog_application::ConnectorWriteStackPin>,
     seal: Option<Arc<super::rewrite_preparation::RewriteCohortCpuOriginal>>,
     provider: Option<Arc<FrontendCompletionCustody>>,
     preparation: RewritePreparationCustody,
@@ -705,7 +705,7 @@ impl GovernedStatementResidual for RewriteResidual {
 fn form_original_domain(
     engine: RequestScopedMaintenanceEngine,
     root: WorkScope,
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     io: Arc<MetadataIoAdmission>,
     target: &MaintenanceTarget,
     #[cfg(novarocks_dev_controls)] observation: Option<
@@ -762,13 +762,13 @@ fn form_original_domain(
     let write_stack = engine
         .kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
+        .acquire_exact_write_stack(rewrite.planning_pin().control_runtime_id())
         .map_err(TerminalError::from_original_cause)?;
     let (cpu, binding_cpu) = cpu
         .rewrite_cpu_ports(
             &root,
             capacity.window_alias(),
-            &lease,
+            &rewrite,
             &write_stack,
             execution.cancellation().clone(),
             runtime.execution.0.runtime().clone(),
@@ -797,7 +797,7 @@ fn form_original_domain(
         engine,
         root: root.clone(),
         context,
-        lease,
+        rewrite,
         cpu,
         binding_cpu,
         io: io.clone(),
@@ -850,18 +850,18 @@ pub(crate) async fn mount_original(
         .clone();
     let identity = RequestScopedMaintenanceEngine::target_identity(&job.target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let lease = engine
+    let rewrite = engine
         .kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
         .map_err(TerminalError::from_original_cause)?;
-    let mut dependencies = lease
+    let mut dependencies = rewrite
         .planning_initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;
     let write = engine
         .kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
+        .acquire_exact_write_stack(rewrite.planning_pin().control_runtime_id())
         .map_err(TerminalError::from_original_cause)?;
     extend_original_dependencies(
         &mut dependencies,
@@ -884,7 +884,7 @@ pub(crate) async fn mount_original(
     let domain = form_original_domain(
         engine,
         root.clone(),
-        lease,
+        rewrite,
         io.clone(),
         &job.target,
         // Background admission has its own job controls, not a SQL observation.
@@ -1030,7 +1030,7 @@ pub(crate) async fn rebind_original(
         .map_err(|e| e.to_string())?;
     let identity = RequestScopedMaintenanceEngine::target_identity(&job.target)?;
     let binding = original
-        .lease
+        .rewrite
         .metadata()
         .rebind_table_object_with_cpu(
             ConnectorTableObjectRebindRequest {
@@ -1094,9 +1094,9 @@ async fn begin_original(
         selection,
         context: original.context.clone(),
     });
-    let lease = original.lease.clone();
+    let rewrite = original.rewrite.clone();
     // The entire request/source is in the original Action before its first poll.
-    lease
+    rewrite
         .prepare_plan_source_in(&mut request, &mut original.plan_source)
         .map_err(from_connector_cause)?;
     let capture = super::rewrite_capture::borrow_positive_capture(&original.io, &original.context)
@@ -1136,7 +1136,7 @@ async fn begin_original(
         let request_source =
             super::rewrite_preparation::RewriteCohortCpuOriginal::begin_request_original(
                 plan.clone(),
-                lease.clone(),
+                rewrite.clone(),
                 prepared.table.identity.clone(),
                 original.context.clone(),
                 prepared.capture.clone(),
@@ -1185,7 +1185,7 @@ async fn begin_original(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     original.seal = Some(
-        super::rewrite_preparation::RewriteCohortCpuOriginal::seal_original(plan, lease, write),
+        super::rewrite_preparation::RewriteCohortCpuOriginal::seal_original(plan, rewrite, write),
     );
     let mut input = Some(RewriteCpuInput(original.seal.as_ref().unwrap().clone()));
     cpu.submit_in(&mut input)
@@ -1275,7 +1275,7 @@ async fn execute_original_cohort(
             .clone();
         let session = original.session.as_ref().unwrap().clone();
         let id = session.plan().cohorts()[ordinal].cohort_id();
-        let lease = original.lease.clone();
+        let rewrite = original.rewrite.clone();
         let cpu = original.cpu.clone();
         // Previous preparation's actual worker/forwarder and Provider already
         // exited before its Ready was transferred. Retire those original
@@ -1296,7 +1296,7 @@ async fn execute_original_cohort(
             &engine,
             &session,
             id,
-            &lease,
+            &rewrite,
             cpu.as_ref(),
             &provider,
             completion,

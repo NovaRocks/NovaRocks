@@ -24,7 +24,7 @@ use novarocks_control_runtime::actor::ActorConfig;
 /// Physical listener positions and the exact codec batch bound. Waiting calls
 /// are included so their ownership can move without acquiring another slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IngressRoleLimits {
+pub struct IngressPositionLimits {
     pub ordinary_running: usize,
     pub ordinary_waiting: usize,
     pub control_running: usize,
@@ -60,8 +60,8 @@ impl std::fmt::Display for PolicyError {
 }
 impl std::error::Error for PolicyError {}
 
-impl IngressRoleLimits {
-    pub fn request_roles(self) -> Result<usize, PolicyError> {
+impl IngressPositionLimits {
+    pub fn request_positions(self) -> Result<usize, PolicyError> {
         if self.ordinary_running == 0 || self.control_running == 0 {
             return Err(PolicyError::ZeroRunningPositions);
         }
@@ -236,13 +236,13 @@ impl StorageNeed {
     /// planned-domain feedback cut. Context compare/application use the same
     /// maximum with two distinct direct returns, never another R position.
     pub(crate) fn domain_request() -> Result<Self, PolicyError> {
-        Self::role(true).checked_add(Self::role(false))
+        Self::causal_cut_storage(true).checked_add(Self::causal_cut_storage(false))
     }
-    pub fn role(reply: bool) -> Self {
+    pub fn causal_cut_storage(reply: bool) -> Self {
         Self {
             inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             batches: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
-            effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+            effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS
                 * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
@@ -263,7 +263,7 @@ impl StorageNeed {
 /// coalesced pending flag; it cannot enqueue an unbounded stream of copies.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(usize)]
-pub enum TaskLifecycleRole {
+pub enum TaskLifecycleInputKind {
     InputLoaded,
     LoaderExited,
     PreparationBodyExited,
@@ -284,31 +284,32 @@ pub enum TaskLifecycleRole {
     TerminalPublisher,
     TerminalAction,
     QuiesceClose,
-    ContextClose,
+    ParticipationClose,
 }
-impl TaskLifecycleRole {
-    pub(crate) const COUNT: usize = Self::ContextClose as usize + 1;
-    pub(crate) const CONTEXT_CLOSE: [Self; 2] = [Self::QuiesceClose, Self::ContextClose];
+impl TaskLifecycleInputKind {
+    pub(crate) const COUNT: usize = Self::ParticipationClose as usize + 1;
+    pub(crate) const PARTICIPATION_CLOSE: [Self; 2] =
+        [Self::QuiesceClose, Self::ParticipationClose];
     pub(crate) const LOADING: [Self; 4] = [
         Self::InputLoaded,
         Self::LoaderExited,
         Self::QuiesceClose,
-        Self::ContextClose,
+        Self::ParticipationClose,
     ];
-    pub(crate) fn is_context_close(self) -> bool {
-        Self::CONTEXT_CLOSE.contains(&self)
+    pub(crate) fn is_participation_close(self) -> bool {
+        Self::PARTICIPATION_CLOSE.contains(&self)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlRuntimePolicy {
-    pub ingress: IngressRoleLimits,
+    pub ingress: IngressPositionLimits,
     /// Independently admitted Root RPCs, outside the operation-batch gates.
     pub root_request_positions: usize,
     /// Long-lived status streams use their actual independent transport lane,
     /// without monopolizing ordinary operation setup positions.
     pub observation_request_positions: usize,
-    pub request_roles: usize,
+    pub request_positions: usize,
     pub task_base: StorageNeed,
     /// Creating owns these original positions before any input getter runs.
     /// Accepted reserves only the remainder, never the same storage twice.
@@ -322,32 +323,32 @@ pub struct ControlRuntimePolicy {
 }
 
 impl ControlRuntimePolicy {
-    pub fn try_new(ingress: IngressRoleLimits) -> Result<Self, PolicyError> {
+    pub fn try_new(ingress: IngressPositionLimits) -> Result<Self, PolicyError> {
         Self::try_new_with_root_requests(ingress, 0)
     }
     pub fn try_new_with_root_requests(
-        ingress: IngressRoleLimits,
+        ingress: IngressPositionLimits,
         root_request_positions: usize,
     ) -> Result<Self, PolicyError> {
         Self::try_new_with_request_sources(ingress, root_request_positions, 0)
     }
     pub fn try_new_with_request_sources(
-        ingress: IngressRoleLimits,
+        ingress: IngressPositionLimits,
         root_request_positions: usize,
         observation_request_positions: usize,
     ) -> Result<Self, PolicyError> {
-        let request_roles = ingress
-            .request_roles()?
+        let request_positions = ingress
+            .request_positions()?
             .checked_add(root_request_positions)
             .and_then(|positions| positions.checked_add(observation_request_positions))
             .ok_or(PolicyError::Overflow)?;
         // Provider callback phases own no independent causal roles. Only the
         // actual Task lifecycle authors contribute fixed cuts; the Accepted
         // preparation body has its own Work/report/capture footprint below.
-        let fixed_roles = TaskLifecycleRole::COUNT;
+        let fixed_roles = TaskLifecycleInputKind::COUNT;
         let host_calls = crate::control_runtime::task_host_call::HOST_CALL_STORAGE
             .checked_mul(crate::control_runtime::task_host_call::HOST_CALL_KINDS.len())?;
-        let mut task_base = StorageNeed::role(false)
+        let mut task_base = StorageNeed::causal_cut_storage(false)
             .checked_mul(fixed_roles)?
             .checked_add(crate::control_runtime::preparation::PREPARATION_STORAGE)?
             .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?
@@ -375,24 +376,24 @@ impl ControlRuntimePolicy {
         // sibling Cleanup Work/report, through physical callback and Drop.
         task_base =
             task_base.checked_add(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)?;
-        let mut loading = StorageNeed::role(false)
-            .checked_mul(TaskLifecycleRole::LOADING.len())?
+        let mut loading = StorageNeed::causal_cut_storage(false)
+            .checked_mul(TaskLifecycleInputKind::LOADING.len())?
             .checked_add(crate::control_runtime::open_summary::OPEN_SUMMARY_STORAGE)?;
         // Loading's two real producer/input holders and both finite close authors have original
         // Work/report geometry. Keep the candidate positions of their actual
         // cuts, and fund the Task's open/consuming candidates before exposing
         // even its first port. Accepted acquires only the remaining inventory.
-        let loading_sources = TaskLifecycleRole::LOADING
+        let loading_sources = TaskLifecycleInputKind::LOADING
             .len()
             .checked_mul(2)
             .and_then(|cuts| cuts.checked_add(4))
             .ok_or(PolicyError::Overflow)?;
         loading.work = crate::control_runtime::loading::LOADING_WORK_POSITIONS
-            .checked_add(TaskLifecycleRole::CONTEXT_CLOSE.len()) // Both close authors predate Accepted.
+            .checked_add(TaskLifecycleInputKind::PARTICIPATION_CLOSE.len()) // Both close authors predate Accepted.
             .and_then(|work| work.checked_add(loading_sources))
             .ok_or(PolicyError::Overflow)?;
         loading.completions = crate::control_runtime::loading::LOADING_REPORT_POSITIONS
-            .checked_add(TaskLifecycleRole::CONTEXT_CLOSE.len()) // Each has its original exit report.
+            .checked_add(TaskLifecycleInputKind::PARTICIPATION_CLOSE.len()) // Each has its original exit report.
             .and_then(|reports| reports.checked_add(loading_sources))
             .ok_or(PolicyError::Overflow)?;
         loading.captures = loading
@@ -421,19 +422,23 @@ impl ControlRuntimePolicy {
             loading.checked_add(crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE)?;
         let accepted = task_base.checked_sub(loading)?;
         let max_task_cuts = fixed_roles
-            .checked_add(request_roles.checked_mul(2).ok_or(PolicyError::Overflow)?)
+            .checked_add(
+                request_positions
+                    .checked_mul(2)
+                    .ok_or(PolicyError::Overflow)?,
+            )
             .and_then(|n| n.checked_add(ingress.root_read_holders))
             .ok_or(PolicyError::Overflow)?;
         Ok(Self {
             ingress,
             root_request_positions,
             observation_request_positions,
-            request_roles,
+            request_positions,
             task_base,
             loading,
             accepted,
             max_task_cuts,
-            request_pool: StorageNeed::domain_request()?.checked_mul(request_roles)?,
+            request_pool: StorageNeed::domain_request()?.checked_mul(request_positions)?,
             root_read_pool_per_root: ROOT_READ_DATA_STORAGE
                 .checked_mul(ingress.root_read_holders)?,
         })
@@ -453,7 +458,7 @@ impl ControlRuntimePolicy {
             .checked_add(self.root_read_pool_per_root.checked_mul(roots)?)
     }
 
-    pub fn context_actor(self, max_live_tasks: usize) -> Result<ActorConfig, PolicyError> {
+    pub fn participation_actor(self, max_live_tasks: usize) -> Result<ActorConfig, PolicyError> {
         if max_live_tasks == 0 {
             return Err(PolicyError::ZeroRunningPositions);
         }
@@ -471,16 +476,16 @@ impl ControlRuntimePolicy {
             .checked_add(self.root_read_pool_per_root.inputs)
             .and_then(|n| n.checked_mul(max_live_tasks))
             .and_then(|n| {
-                self.request_roles
+                self.request_positions
                     .checked_mul(3)
                     .and_then(|r| n.checked_add(r))
             })
             .ok_or(PolicyError::Overflow)?;
         let ordinary = task_ordinary
             .checked_mul(max_live_tasks)
-            .and_then(|n| n.checked_add(self.request_roles))
+            .and_then(|n| n.checked_add(self.request_positions))
             .ok_or(PolicyError::Overflow)?;
-        let control = self.request_roles;
+        let control = self.request_positions;
         let inputs = lifecycle
             .checked_add(ordinary)
             .and_then(|n| n.checked_add(control))
@@ -489,11 +494,12 @@ impl ControlRuntimePolicy {
         ActorConfig {
             mailbox: [lifecycle, control, ordinary, 1],
             max_batches: inputs,
-            max_effects_per_step: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+            max_effects_per_step:
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             max_dependencies_per_effect:
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
-            turn_budget: crate::control_runtime::actors::ContextActor::TURN_BUDGET,
-            max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+            turn_budget: crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
+            max_step_work: crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
         }
         .validate()
         .map_err(|_| PolicyError::InvalidActorBudget)
@@ -503,8 +509,8 @@ impl ControlRuntimePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn ingress() -> IngressRoleLimits {
-        IngressRoleLimits {
+    fn ingress() -> IngressPositionLimits {
+        IngressPositionLimits {
             ordinary_running: 3,
             ordinary_waiting: 2,
             control_running: 2,
@@ -517,31 +523,31 @@ mod tests {
     #[test]
     fn request_storage_counts_every_batch_item_in_each_actual_ingress_position() {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
-        assert_eq!(policy.request_roles, (3 + 2 + 2 + 1) * 7);
-        assert_eq!(policy.request_pool.replies, policy.request_roles);
-        assert_eq!(policy.request_pool.requests, policy.request_roles);
+        assert_eq!(policy.request_positions, (3 + 2 + 2 + 1) * 7);
+        assert_eq!(policy.request_pool.replies, policy.request_positions);
+        assert_eq!(policy.request_pool.requests, policy.request_positions);
         assert_eq!(policy.task_base.requests, 0);
         assert_eq!(policy.root_read_pool_per_root.requests, 0);
-        assert_eq!(policy.request_pool.cuts, 2 * policy.request_roles);
-        assert_eq!(policy.request_pool.inputs, 4 * policy.request_roles);
-        let actor = policy.context_actor(9).unwrap();
+        assert_eq!(policy.request_pool.cuts, 2 * policy.request_positions);
+        assert_eq!(policy.request_pool.inputs, 4 * policy.request_positions);
+        let actor = policy.participation_actor(9).unwrap();
         assert_eq!(
             actor.mailbox[0],
             (policy.task_base.inputs
                 - crate::control_runtime::operator_statistics::STATISTICS_INPUT_POSITIONS
                 - crate::control_runtime::dynamic_filters::RF_INPUT_POSITIONS)
                 * 9
-                + 3 * policy.request_roles
+                + 3 * policy.request_positions
         );
-        assert_eq!(actor.mailbox[1], policy.request_roles);
-        assert_eq!(actor.mailbox[2], policy.request_roles + 2 * 9);
+        assert_eq!(actor.mailbox[1], policy.request_positions);
+        assert_eq!(actor.mailbox[2], policy.request_positions + 2 * 9);
     }
 
     #[test]
     fn live_statistics_inputs_do_not_borrow_busy_request_positions() {
         use novarocks_control_runtime::{
-            actor::{Actor, StepContext},
-            driver::{ActorRuntime, DriverError},
+            actor::{Actor, ActorStep},
+            actor_turn::{ActorRuntime, ActorTurnError},
             transaction::RuntimeLedger,
         };
         use novarocks_control_runtime_core::{
@@ -554,7 +560,7 @@ mod tests {
             type Input = ();
             type Effect = ();
             fn timer_input(_: Tick) {}
-            fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {}
+            fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
             fn next_deadline(&self) -> Option<Tick> {
                 None
             }
@@ -562,11 +568,11 @@ mod tests {
                 _: ScopeId,
                 _: Generation,
                 _: InputEnvelope,
-                _: &mut StepContext<'_, ()>,
+                _: &mut ActorStep<'_, ()>,
             ) {
             }
         }
-        let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+        let policy = ControlRuntimePolicy::try_new(IngressPositionLimits {
             ordinary_running: 1,
             ordinary_waiting: 0,
             control_running: 1,
@@ -575,8 +581,8 @@ mod tests {
             root_read_holders: 1,
         })
         .unwrap();
-        let live_tasks = policy.request_roles + 1;
-        let config = policy.context_actor(live_tasks).unwrap();
+        let live_tasks = policy.request_positions + 1;
+        let config = policy.participation_actor(live_tasks).unwrap();
         let ledger = RuntimeLedger::new(ResourceVector::new([]).unwrap());
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
@@ -594,9 +600,9 @@ mod tests {
                 + crate::control_runtime::dynamic_filters::RF_INPUT_POSITIONS;
         assert_eq!(
             config.mailbox[2],
-            policy.request_roles + periodic_positions * live_tasks
+            policy.request_positions + periodic_positions * live_tasks
         );
-        for _ in 0..policy.request_roles + periodic_positions * live_tasks {
+        for _ in 0..policy.request_positions + periodic_positions * live_tasks {
             permits.push(
                 runtime
                     .reserve_input(actor, actor, InputClass::Ordinary)
@@ -605,13 +611,13 @@ mod tests {
         }
         assert!(matches!(
             runtime.reserve_input(actor, actor, InputClass::Ordinary),
-            Err(DriverError::InputCapacity)
+            Err(ActorTurnError::InputCapacity)
         ));
         // Moving between classes must not add another storage payment.
         assert_eq!(
             config.mailbox.iter().sum::<usize>(),
             (policy.task_base.inputs + policy.root_read_pool_per_root.inputs) * live_tasks
-                + 5 * policy.request_roles
+                + 5 * policy.request_positions
                 + 1
         );
         for permit in permits {
@@ -641,8 +647,8 @@ mod tests {
         let one = policy.process_task_storage(1, 0).unwrap();
         let two = policy.process_task_storage(2, 0).unwrap();
         assert_eq!(two.replies, one.replies);
-        assert_eq!(one.requests, policy.request_roles);
-        assert_eq!(two.requests, policy.request_roles);
+        assert_eq!(one.requests, policy.request_positions);
+        assert_eq!(two.requests, policy.request_positions);
         assert_eq!(two.inputs - one.inputs, policy.task_base.inputs);
         assert_eq!(two.cuts - one.cuts, policy.task_base.cuts);
         assert_eq!(two.work - one.work, policy.task_base.work);
@@ -656,7 +662,7 @@ mod tests {
             "the same R owns the Root cut; retained Root data adds no author"
         );
         assert_eq!(policy.root_read_pool_per_root.inputs, 0);
-        assert_eq!(root.requests, policy.request_roles);
+        assert_eq!(root.requests, policy.request_positions);
         assert_eq!(root.work - two.work, policy.root_read_pool_per_root.work);
         assert_eq!(
             root.completions - two.completions,
@@ -664,7 +670,7 @@ mod tests {
         );
         assert_eq!(
             policy.max_task_cuts,
-            policy.task_base.cuts + 2 * policy.request_roles + policy.ingress.root_read_holders
+            policy.task_base.cuts + 2 * policy.request_positions + policy.ingress.root_read_holders
         );
     }
 
@@ -696,7 +702,7 @@ mod tests {
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
         // Loading owns both loader observations and both distinct Context-close
         // authors before Accepted. Only these real cuts add input positions.
-        let cuts = TaskLifecycleRole::LOADING.len();
+        let cuts = TaskLifecycleInputKind::LOADING.len();
         let sources = 2 * cuts + 4; // Each cut's Source2 plus open/consuming candidates.
         let host_calls = crate::control_runtime::task_host_call::HOST_CALL_KINDS.len();
         let disposal = crate::control_runtime::task_disposal::TASK_DISPOSAL_STORAGE;
@@ -704,13 +710,14 @@ mod tests {
         assert_eq!(policy.loading.batches, policy.loading.inputs);
         assert_eq!(
             policy.loading.effects,
-            policy.loading.inputs * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS
+            policy.loading.inputs
+                * crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS
         );
         assert_eq!(policy.loading.cuts, cuts);
         assert_eq!(
             policy.loading.work,
             crate::control_runtime::loading::LOADING_WORK_POSITIONS
-                + TaskLifecycleRole::CONTEXT_CLOSE.len()
+                + TaskLifecycleInputKind::PARTICIPATION_CLOSE.len()
                 + sources
                 + host_calls
                 + disposal.work
@@ -718,7 +725,7 @@ mod tests {
         assert_eq!(
             policy.loading.completions,
             crate::control_runtime::loading::LOADING_REPORT_POSITIONS
-                + TaskLifecycleRole::CONTEXT_CLOSE.len()
+                + TaskLifecycleInputKind::PARTICIPATION_CLOSE.len()
                 + sources
                 + host_calls
                 + disposal.completions
@@ -733,22 +740,22 @@ mod tests {
         );
         assert_eq!(
             policy.accepted.inputs,
-            2 * (TaskLifecycleRole::COUNT - TaskLifecycleRole::LOADING.len())
+            2 * (TaskLifecycleInputKind::COUNT - TaskLifecycleInputKind::LOADING.len())
         );
     }
 
     #[test]
     fn actor_cpu_includes_selector_and_wake_while_storage_pays_only_output_slots() {
-        use crate::control_runtime::actors::ContextActor;
+        use crate::control_runtime::actors::ParticipationActor;
         let policy = ControlRuntimePolicy::try_new(ingress()).unwrap();
-        let config = policy.context_actor(1).unwrap();
+        let config = policy.participation_actor(1).unwrap();
         assert_eq!(
             config.max_step_work,
-            novarocks_worker_protocol::context::ContextCore::MAX_STEP_WORK + 1
+            novarocks_worker_protocol::participation::ParticipationCore::MAX_STEP_WORK + 1
         );
         assert_eq!(
             config.max_effects_per_step,
-            novarocks_worker_protocol::context::ContextCore::MAX_STEP_ACTIONS + 1
+            novarocks_worker_protocol::participation::ParticipationCore::MAX_STEP_ACTIONS + 1
         );
         assert_eq!(config.turn_budget, 4 * (config.max_step_work + 1));
         let mut insufficient = config;
@@ -759,11 +766,11 @@ mod tests {
         );
         assert_eq!(
             policy.loading.effects,
-            policy.loading.inputs * ContextActor::MAX_STEP_ACTIONS
+            policy.loading.inputs * ParticipationActor::MAX_STEP_ACTIONS
         );
         assert_eq!(
             policy.accepted.effects,
-            policy.accepted.inputs * ContextActor::MAX_STEP_ACTIONS
+            policy.accepted.inputs * ParticipationActor::MAX_STEP_ACTIONS
         );
         assert!(config.max_effects_per_step < config.max_step_work);
     }
@@ -786,8 +793,8 @@ mod tests {
             policy.process_task_storage(usize::MAX, 0),
             Err(PolicyError::Overflow)
         );
-        assert!(policy.context_actor(usize::MAX).is_err());
-        assert!(policy.context_actor(0).is_err());
+        assert!(policy.participation_actor(usize::MAX).is_err());
+        assert!(policy.participation_actor(0).is_err());
     }
 
     #[test]
@@ -817,8 +824,8 @@ mod tests {
             cells.requests, 0,
             "a reply cell alone is not an external request grant"
         );
-        assert_eq!(StorageNeed::role(false).requests, 0);
-        assert_eq!(StorageNeed::role(true).requests, 1);
+        assert_eq!(StorageNeed::causal_cut_storage(false).requests, 0);
+        assert_eq!(StorageNeed::causal_cut_storage(true).requests, 1);
         assert_eq!(
             crate::control_runtime::control_request::ESTABLISH_REQUEST_STORAGE.requests,
             1

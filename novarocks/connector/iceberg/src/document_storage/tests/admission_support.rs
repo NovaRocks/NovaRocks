@@ -232,11 +232,11 @@ impl novarocks_fs::FileIoRuntime for AdmissionFileIoSpy {
     }
 }
 
-impl novarocks_fs::FileTaskSpawner for AdmissionFileIoSpy {
+impl novarocks_fs::FileIoSpawner for AdmissionFileIoSpy {
     fn spawn(
         &self,
-        _task: novarocks_fs::FileTaskFuture,
-    ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+        _task: novarocks_fs::FileIoFuture,
+    ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
         self.unexpected()
     }
 

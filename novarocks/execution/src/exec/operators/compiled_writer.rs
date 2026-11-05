@@ -65,8 +65,8 @@ use crate::exec::operators::compiled_writer_statistics::{
 use crate::exec::operators::table_writer::{WriterPageProjection, WriterProjectionFactory};
 use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFactory};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::ExecutionResult;
 
 /// Build the compiled writer of local node `id` over the Task's exact write
 /// capability.
@@ -297,7 +297,7 @@ impl CompiledWriterProjection {
             let site = ProgramExpressionRootSite::WriterProjection {
                 node: id,
                 expression: novarocks_local_program::checked_program_ordinal(ordinal)
-                    .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                    .map_err(crate::runtime::task::ExecutionFailure::from_domain)?,
             };
             // Every projected value reads the writer's input port, the batch
             // the writer is pushed.

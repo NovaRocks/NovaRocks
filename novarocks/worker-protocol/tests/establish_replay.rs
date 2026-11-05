@@ -21,23 +21,24 @@ use novarocks_control_runtime_core::identity::{
     Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
 };
 use novarocks_execution_contract::{
-    AbortCause, AdmissionTicketId, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainProgression, DomainVersion, LeaseValidFor, OperationOutcome, QueryContextRef,
-    QueryContextState, TaskOperationId,
+    AbortCause, AdmissionTicketId, ContentFingerprint, CredentialDomainId, CredentialEpoch,
+    DomainProgression, DomainVersion, LeaseValidFor, OperationOutcome, ParticipationRef,
+    ParticipationState, TaskOperationId,
 };
 use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
 };
 use novarocks_worker_protocol::{
-    context::{
-        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
-        ContextInput, ContextMaterialized, ContextStep, CoreError, EstablishCredentialComparison,
-        EstablishReplayRequest, EstablishReplayResult,
-    },
     control::EstablishSemanticFacts,
-    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestContext},
-    domain::{ContextDomainInput, CredentialInput, CredentialState, QueryContextDomains},
+    creation::{AdmissionNeed, AdmissionPort, AdmissionRefusal, PayloadId, RequestReplyTag},
+    domain::{CredentialInput, CredentialState, ParticipationDomainInput, ParticipationDomains},
     lease::{LeaseBounds, MonotonicInstant},
+    participation::{
+        CoreError, EstablishCredentialComparison, EstablishReplayRequest, EstablishReplayResult,
+        ParticipationCommand, ParticipationConfig, ParticipationCore, ParticipationEffect,
+        ParticipationEstablishment, ParticipationInput, ParticipationMaterialized,
+        ParticipationStep,
+    },
 };
 use std::time::Duration;
 
@@ -60,18 +61,18 @@ fn operation(value: u8) -> TaskOperationId {
     bytes[8] = 0x80;
     TaskOperationId::try_from_bytes(bytes).unwrap()
 }
-fn context(query: i64) -> QueryContextRef {
+fn participation(query: i64) -> ParticipationRef {
     let mut bytes = [1; 16];
     bytes[6] = 0x70;
     bytes[8] = 0x80;
-    QueryContextRef::new(
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(query, query + 1), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::try_from_bytes(bytes).unwrap(),
         BackendProcessId::try_from_bytes(bytes).unwrap(),
     )
 }
-fn original() -> ContextEstablishment {
-    ContextEstablishment {
+fn original() -> ParticipationEstablishment {
+    ParticipationEstablishment {
         operation: operation(10),
         ticket: AdmissionTicketId::try_from_bytes([20; 16]).unwrap(),
         payload: PayloadId(30),
@@ -79,25 +80,25 @@ fn original() -> ContextEstablishment {
             catalog: ContentFingerprint::from_bytes([40; 16]),
             shared_filter: ContentFingerprint::from_bytes([41; 16]),
             query_options: ContentFingerprint::from_bytes([42; 16]),
-            credential_lease: CredentialLeaseId::new(43),
+            credential_domain_id: CredentialDomainId::new(43),
             credential_epoch: CredentialEpoch::FIRST,
             initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
         },
         elected_at: at(0),
     }
 }
-fn core() -> ContextCore {
-    ContextCore::new(
-        context(100),
+fn core() -> ParticipationCore {
+    ParticipationCore::new(
+        participation(100),
         Generation::new(1).unwrap(),
         original(),
-        ContextConfig {
+        ParticipationConfig {
             max_tasks: 8,
             max_creation_waiters: 8,
             max_pending_requests: 8,
             max_preparing: 2,
             max_task_bytes: 1024,
-            step_budget: ContextCore::MAX_STEP_WORK,
+            step_budget: ParticipationCore::MAX_STEP_WORK,
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: Duration::from_millis(100),
             request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
@@ -107,16 +108,16 @@ fn core() -> ContextCore {
 }
 
 fn command_step(
-    core: &mut ContextCore,
+    core: &mut ParticipationCore,
     now: u64,
     token: u64,
     operation: TaskOperationId,
-    command: ContextCommand,
-) -> ContextStep {
+    command: ParticipationCommand,
+) -> ParticipationStep {
     let step = core
         .handle_request(
             at(now),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation,
@@ -126,7 +127,7 @@ fn command_step(
             &mut NoAdmission,
         )
         .unwrap();
-    assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(step.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     step
 }
 
@@ -136,14 +137,14 @@ impl AdmissionPort for NoAdmission {
         panic!("a pure Establish probe must not acquire capacity");
     }
 }
-fn step(core: &mut ContextCore, now: u64, input: ContextInput) -> ContextStep {
+fn step(core: &mut ParticipationCore, now: u64, input: ParticipationInput) -> ParticipationStep {
     let result = core.handle(at(now), input, &mut NoAdmission).unwrap();
-    assert!(result.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(result.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     result
 }
 fn request() -> EstablishReplayRequest {
     EstablishReplayRequest {
-        request: RequestContext {
+        request: RequestReplyTag {
             author: model_request_author(InputId::new(101).unwrap()),
             token: InputId::new(101).unwrap(),
             operation: original().operation,
@@ -156,17 +157,17 @@ fn request() -> EstablishReplayRequest {
     }
 }
 fn probe(
-    core: &mut ContextCore,
+    core: &mut ParticipationCore,
     now: u64,
     request: EstablishReplayRequest,
     comparison: Option<EstablishCredentialComparison>,
 ) -> EstablishReplayResult {
-    let context = core.identity();
+    let participation = core.identity();
     let result = step(
         core,
         now,
-        ContextInput::ProbeEstablish {
-            context,
+        ParticipationInput::ProbeEstablish {
+            participation,
             request,
             comparison,
         },
@@ -175,13 +176,13 @@ fn probe(
     assert!(result.requests.is_empty());
     assert_eq!(result.effects.len(), 1);
     match result.effects.into_iter().next().unwrap() {
-        ContextEffect::EstablishProbed {
-            context: actual,
+        ParticipationEffect::EstablishProbed {
+            participation: actual,
             request: correlated,
             result,
             decided_at,
         } => {
-            assert_eq!(actual, context);
+            assert_eq!(actual, participation);
             assert_eq!(correlated, request.request);
             assert_eq!(decided_at, at(now));
             result
@@ -189,26 +190,26 @@ fn probe(
         _ => panic!("one original neutral probe result"),
     }
 }
-fn materialize(core: &mut ContextCore, resource: u64, now: u64) {
+fn materialize(core: &mut ParticipationCore, resource: u64, now: u64) {
     step(
         core,
         now,
-        ContextInput::MaterializationFinished {
-            result: Ok(ContextMaterialized {
+        ParticipationInput::MaterializationFinished {
+            result: Ok(ParticipationMaterialized {
                 initial_credential_resource: resource,
             }),
         },
     );
 }
-fn active(resource: u64) -> ContextCore {
+fn active(resource: u64) -> ParticipationCore {
     let mut core = core();
     materialize(&mut core, resource, 0);
-    assert_eq!(core.state(), QueryContextState::Active);
+    assert_eq!(core.state(), ParticipationState::Active);
     core
 }
 fn expected(resource: u64, epoch: CredentialEpoch) -> CredentialState {
     CredentialState {
-        lease: original().semantics.credential_lease,
+        credential_domain_id: original().semantics.credential_domain_id,
         epoch,
         resource,
     }
@@ -223,8 +224,8 @@ fn comparison(
     })
 }
 fn update(
-    core: &mut ContextCore,
-    input: ContextDomainInput,
+    core: &mut ParticipationCore,
+    input: ParticipationDomainInput,
     now: u64,
     token: u64,
 ) -> DomainProgression {
@@ -233,20 +234,20 @@ fn update(
         now,
         token,
         operation(50),
-        ContextCommand::UpdateContext {
+        ParticipationCommand::UpdateParticipation {
             payload: PayloadId(901),
             update: input,
         },
     );
     let progression = initiated.effects.iter().find_map(|effect| match effect {
-        ContextEffect::ApplyContextDomain { progression, .. } => Some(*progression),
+        ParticipationEffect::ApplyParticipationDomain { progression, .. } => Some(*progression),
         _ => None,
     });
     let progression = progression.expect("the symbolic domain change was admitted");
     step(
         core,
         now,
-        ContextInput::ContextUpdateApplied {
+        ParticipationInput::ParticipationUpdateApplied {
             request: InputId::new(token).unwrap(),
             result: Ok(()),
         },
@@ -256,7 +257,7 @@ fn update(
 
 #[test]
 fn materialization_installs_the_initial_domains_only_after_real_success() {
-    assert_eq!(QueryContextDomains::default().credential(), None);
+    assert_eq!(ParticipationDomains::default().credential(), None);
     let mut core = core();
     assert_eq!(
         probe(&mut core, 0, request(), None),
@@ -270,11 +271,11 @@ fn materialization_installs_the_initial_domains_only_after_real_success() {
     );
     let facts = original().semantics;
     for (token, input) in [
-        ContextDomainInput::Catalog {
+        ParticipationDomainInput::Catalog {
             version: DomainVersion::FIRST,
             fingerprint: facts.catalog,
         },
-        ContextDomainInput::Filter {
+        ParticipationDomainInput::Filter {
             version: DomainVersion::FIRST,
             fingerprint: facts.shared_filter,
         },
@@ -307,7 +308,7 @@ fn every_immutable_establish_field_conflicts_but_a_new_carrier_is_valid() {
             2 => candidate.semantics.catalog = ContentFingerprint::from_bytes([99; 16]),
             3 => candidate.semantics.shared_filter = ContentFingerprint::from_bytes([99; 16]),
             4 => candidate.semantics.query_options = ContentFingerprint::from_bytes([99; 16]),
-            5 => candidate.semantics.credential_lease = CredentialLeaseId::new(44),
+            5 => candidate.semantics.credential_domain_id = CredentialDomainId::new(44),
             6 => candidate.semantics.credential_epoch = CredentialEpoch::new(2).unwrap(),
             7 => {
                 candidate.semantics.initial_lease_valid_for =
@@ -316,7 +317,7 @@ fn every_immutable_establish_field_conflicts_but_a_new_carrier_is_valid() {
             _ => unreachable!(),
         }
         assert!(
-            matches!(probe(&mut core, 1, candidate, comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+            matches!(probe(&mut core, 1, candidate, comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
         );
     }
     for payload in [PayloadId(900), PayloadId(901), original().payload] {
@@ -327,7 +328,7 @@ fn every_immutable_establish_field_conflicts_but_a_new_carrier_is_valid() {
         );
     }
     assert!(
-        matches!(probe(&mut core, 1, request(), comparison(current, false)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe(&mut core, 1, request(), comparison(current, false)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
 }
 
@@ -346,9 +347,9 @@ fn an_initial_probe_waits_without_accepting_uninstalled_comparison_facts() {
     let mut changed = request();
     changed.ticket = AdmissionTicketId::try_from_bytes([21; 16]).unwrap();
     assert!(
-        matches!(probe(&mut core, 1, changed, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe(&mut core, 1, changed, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
-    assert_eq!(core.state(), QueryContextState::Establishing);
+    assert_eq!(core.state(), ParticipationState::Establishing);
 }
 
 #[test]
@@ -360,8 +361,8 @@ fn credential_rotation_requires_a_current_comparison_and_repeated_materializatio
     assert_eq!(
         update(
             &mut core,
-            ContextDomainInput::Credential(CredentialInput {
-                lease: old.lease,
+            ParticipationDomainInput::Credential(CredentialInput {
+                credential_domain_id: old.credential_domain_id,
                 epoch,
                 current_resource: old.resource,
                 replacement_resource: 701,
@@ -386,7 +387,7 @@ fn credential_rotation_requires_a_current_comparison_and_repeated_materializatio
     );
     // Even equal material cannot make the old initial epoch current again.
     assert!(
-        matches!(probe(&mut core, 1, request(), comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe(&mut core, 1, request(), comparison(current, true)), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
     assert_eq!(core.establishment(), original());
 }
@@ -405,7 +406,7 @@ fn matching_epoch_or_material_does_not_authorize_a_different_resource_or_lease()
             ..current
         },
         CredentialState {
-            lease: CredentialLeaseId::new(44),
+            credential_domain_id: CredentialDomainId::new(44),
             ..current
         },
     ] {
@@ -425,11 +426,17 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
     mismatched.semantics.catalog = ContentFingerprint::from_bytes([99; 16]);
     for started in [false, true] {
         let mut core = if started { active(700) } else { core() };
-        command_step(&mut core, 1, 10002, operation(60), ContextCommand::Quiesce);
+        command_step(
+            &mut core,
+            1,
+            10002,
+            operation(60),
+            ParticipationCommand::Quiesce,
+        );
         materialize(&mut core, 999, 1);
-        assert_eq!(core.state(), QueryContextState::Quiescing);
+        assert_eq!(core.state(), ParticipationState::Quiescing);
         assert!(
-            matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextTerminalReceipt)
+            matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationTerminalReceipt)
         );
     }
     let mut unmaterialized = core();
@@ -438,7 +445,7 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
         1,
         10003,
         operation(62),
-        ContextCommand::Abort {
+        ParticipationCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
     );
@@ -447,26 +454,38 @@ fn closed_state_priority_does_not_reinterpret_payload_conflicts_or_lease_expiry(
         matches!(probe(&mut unmaterialized, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
     let mut core = active(700);
-    step(&mut core, 30, ContextInput::Tick);
-    assert_eq!(core.state(), QueryContextState::Aborting);
+    step(&mut core, 30, ParticipationInput::Tick);
+    assert_eq!(core.state(), ParticipationState::Aborting);
     assert!(
         matches!(probe(&mut core, 30, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
     // Normal release reaches Releasing through the actual Quiesce protocol,
     // independently of the Aborting state above.
     let mut core = active(700);
-    command_step(&mut core, 1, 10004, operation(60), ContextCommand::Quiesce);
-    step(&mut core, 1, ContextInput::ContinueQuiesce);
-    command_step(&mut core, 1, 10005, operation(61), ContextCommand::Release);
-    assert_eq!(core.state(), QueryContextState::Releasing);
+    command_step(
+        &mut core,
+        1,
+        10004,
+        operation(60),
+        ParticipationCommand::Quiesce,
+    );
+    step(&mut core, 1, ParticipationInput::ContinueQuiesce);
+    command_step(
+        &mut core,
+        1,
+        10005,
+        operation(61),
+        ParticipationCommand::Release,
+    );
+    assert_eq!(core.state(), ParticipationState::Releasing);
     assert!(
         matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::InvalidStateOrRequest)
     );
-    step(&mut core, 1, ContextInput::HostReleased);
-    assert_eq!(core.state(), QueryContextState::TerminalRetained);
+    step(&mut core, 1, ParticipationInput::HostReleased);
+    assert_eq!(core.state(), ParticipationState::TerminalRetained);
     materialize(&mut core, 999, 1);
     assert!(
-        matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextTerminalReceipt)
+        matches!(probe(&mut core, 1, mismatched, None), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationTerminalReceipt)
     );
 }
 
@@ -476,8 +495,8 @@ fn probe_identity_and_time_are_checked_without_creating_root_rpc_state() {
     let error = core
         .handle(
             at(31),
-            ContextInput::ProbeEstablish {
-                context: context(200),
+            ParticipationInput::ProbeEstablish {
+                participation: participation(200),
                 request: request(),
                 comparison: None,
             },
@@ -485,7 +504,7 @@ fn probe_identity_and_time_are_checked_without_creating_root_rpc_state() {
         )
         .unwrap_err();
     assert_eq!(error, CoreError::WrongIdentity);
-    assert_eq!(core.state(), QueryContextState::Active);
+    assert_eq!(core.state(), ParticipationState::Active);
     assert_eq!(
         probe(&mut core, 1, request(), None),
         EstablishReplayResult::CompareCredential {
@@ -495,8 +514,8 @@ fn probe_identity_and_time_are_checked_without_creating_root_rpc_state() {
     let error = core
         .handle(
             at(0),
-            ContextInput::ProbeEstablish {
-                context: core.identity(),
+            ParticipationInput::ProbeEstablish {
+                participation: core.identity(),
                 request: request(),
                 comparison: None,
             },
@@ -505,7 +524,7 @@ fn probe_identity_and_time_are_checked_without_creating_root_rpc_state() {
         .unwrap_err();
     assert_eq!(error, CoreError::TimeRegressed);
     // Repeating the same original Root token is a new observation, not a
-    // Context handle_request join or a duplicate-token failure.
+    // Participation handle_request join or a duplicate-token failure.
     assert_eq!(
         probe(&mut core, 1, request(), None),
         EstablishReplayResult::CompareCredential {

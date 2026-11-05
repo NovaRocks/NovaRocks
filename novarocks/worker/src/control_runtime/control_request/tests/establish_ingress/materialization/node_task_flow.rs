@@ -26,37 +26,36 @@ use super::node_flow::{
 };
 use super::*;
 use crate::{
-    PreparedTaskInstallation, RunnableTask, TaskExecutionHost, TaskPreparationContext,
-    TaskPreparationRoles, TaskStatusReporter, TaskTerminalAction,
+    PreparedTaskInstallation, RunnableTask, TaskExecutionHost, TaskPreparationCapture,
+    TaskPreparationContext, TaskStatusReporter, TaskTerminalAction,
     control_runtime::{
-        context_host::{TaskDriverPorts, task_driver::TaskDriverHostJob},
         host_executor::{HostExecutor, HostExecutorLimits},
         loading::TaskCreatePayload,
         loading_host_job::LoadingHostJob,
         node::WorkerNodeHost,
+        participation_host::{TaskIoPorts, task_io::TaskIoHostJob},
     },
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
-use novarocks_execution::runtime::fragment::scan::CompiledScanSources;
+use novarocks_execution::runtime::task::scan::CompiledScanSources;
 use novarocks_execution::{
     exec::fragment::program::FragmentContractVersion,
     runtime::{
         execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig},
-        fragment::{
-            BackendNum, CompiledFragmentSubmission, DormantFragmentHandle,
-            ExchangeInputAssignments, ExecutionResult, FragmentCancelReason, FragmentInstanceId,
-            FragmentInstanceSpec, FragmentOutcome, FragmentPrepareContext, FragmentRuntimeOptions,
-            FragmentSinkAssignment, RunningFragmentHandle, ScanAssignments,
-            io::{
-                ExchangeFrameTransmitter, FragmentCommitLease, FragmentCommitPort,
-                FragmentCommitReport, FragmentIoError, FragmentResultSession, FragmentResultWriter,
-                FragmentSinkLoadStats, NoopFragmentEventSink, ResultWriteSpec, TabletCommitInfo,
-                TabletFailInfo,
-            },
-            prepare_compiled_fragment,
-        },
         function_set::ExecutionFunctionSetBuilder,
         query_options::QueryOptions,
+        task::{
+            CompiledTaskSubmission, ExchangeInputAssignments, ExecutionResult, InstanceOrdinal,
+            LocalTaskOutcome, LocalTaskPrepareContext, PreparedTaskExecution, RunningTaskExecution,
+            ScanAssignments, TaskCancelDetail, TaskInstanceSpec, TaskKey, TaskRuntimeOptions,
+            TaskSinkAssignment,
+            io::{
+                ExchangeFrameTransmitter, NoopTaskEventSink, ResultWriteSpec, TabletCommitInfo,
+                TabletFailInfo, TaskCommitPort, TaskCommitRegistration, TaskCommitReport,
+                TaskIoError, TaskResultSession, TaskResultWriter, TaskSinkLoadStats,
+            },
+            prepare_compiled_task,
+        },
     },
 };
 use novarocks_execution_contract::{
@@ -79,7 +78,7 @@ use novarocks_type_contract::{
     ExpressionEvaluationDomain, PureCompileControl, SemanticParameters,
 };
 use novarocks_types::{StageId, TaskId, UniqueId};
-use novarocks_worker_protocol::context::{ContextCommand, ContextReplyBody};
+use novarocks_worker_protocol::participation::{ParticipationCommand, ParticipationReplyBody};
 use std::{any::Any, collections::BTreeMap, num::NonZeroU64, sync::Weak};
 
 type Failure = Box<dyn Any + Send>;
@@ -292,12 +291,12 @@ fn root_contract() -> novarocks_result_contract::RootOutputContract {
 }
 use crate::root_result_channel::{RootProducerExit, RootResultChannel};
 use novarocks_execution::runtime::{
-    fragment::io::{
-        FragmentIoErrorKind, FragmentIoOperation, ResultAbort, ResultWriteAdmission,
-        RootInputAdmission, RootInputAuthority, RootInputReservationAdmission, RootProducerState,
-        RootResultInput, RootResultSession, RootResultWriteSpec, RootWorkExitProgress,
-    },
     observable::Observable,
+    task::io::{
+        ResultAbort, ResultWriteAdmission, RootInputAdmission, RootInputAuthority,
+        RootInputReservationAdmission, RootProducerState, RootResultInput, RootResultSession,
+        RootResultWriteSpec, RootWorkExitProgress, TaskIoErrorKind, TaskIoOperation,
+    },
 };
 use std::task::Waker;
 struct CountSession {
@@ -308,10 +307,10 @@ struct CountSession {
     _metadata: Arc<crate::root_result_channel::RootMetadataReservation>,
     observed: Arc<Observations>,
 }
-fn root_io(error: crate::root_result_channel::RootChannelError) -> FragmentIoError {
-    FragmentIoError::from_domain(
-        FragmentIoOperation::ResultWrite,
-        FragmentIoErrorKind::Internal,
+fn root_io(error: crate::root_result_channel::RootChannelError) -> TaskIoError {
+    TaskIoError::from_domain(
+        TaskIoOperation::ResultWrite,
+        TaskIoErrorKind::Internal,
         error,
     )
 }
@@ -353,7 +352,7 @@ impl RootResultSession for CountSession {
     fn spec(&self) -> &RootResultWriteSpec {
         self.channel.spec()
     }
-    fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
+    fn try_acquire_input(&self) -> Result<RootInputAdmission, TaskIoError> {
         let RootInputReservationAdmission::Granted(mut reservation) =
             self.authority.try_reserve()?
         else {
@@ -379,7 +378,7 @@ impl RootResultSession for CountSession {
     fn writable_observable(&self) -> Arc<Observable> {
         self.authority.observable()
     }
-    fn submit_input(&self, offered: &mut Option<RootResultInput>) -> Result<(), FragmentIoError> {
+    fn submit_input(&self, offered: &mut Option<RootResultInput>) -> Result<(), TaskIoError> {
         assert!(
             self.authority
                 .owns_original(offered.as_ref().unwrap().permit())
@@ -399,7 +398,7 @@ impl RootResultSession for CountSession {
         self.observed.input_submitted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn finish_input(&self) -> Result<(), FragmentIoError> {
+    fn finish_input(&self) -> Result<(), TaskIoError> {
         self.channel.request_finish().map_err(root_io)?;
         self.channel.publish_end().map_err(root_io)?;
         self.authority.close();
@@ -443,8 +442,9 @@ impl RootResultSession for CountSession {
         // its original input authority and channel before reporting the actual
         // encoder return; never overwrite the originating preparation failure.
         self.authority.close();
-        self.channel
-            .close(novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextAborted);
+        self.channel.close(
+            novarocks_execution_contract::root_lifetime::RootRetentionClose::ParticipationAborted,
+        );
         let encoder = self.encoder.lock().unwrap().take();
         if let Some(encoder) = encoder {
             let _original_failure = encoder.finish_encoder();
@@ -453,14 +453,14 @@ impl RootResultSession for CountSession {
     }
 }
 struct Ports;
-struct CommitLease;
-impl FragmentCommitPort for Ports {
-    fn acquire(&self, _: UniqueId) -> ExecutionResult<Box<dyn FragmentCommitLease>> {
-        Ok(Box::new(CommitLease))
+struct NoopTaskCommitRegistration;
+impl TaskCommitPort for Ports {
+    fn acquire(&self, _: UniqueId) -> ExecutionResult<Box<dyn TaskCommitRegistration>> {
+        Ok(Box::new(NoopTaskCommitRegistration))
     }
 }
-impl FragmentCommitLease for CommitLease {
-    fn add_load_stats(&mut self, _: FragmentSinkLoadStats) -> ExecutionResult<()> {
+impl TaskCommitRegistration for NoopTaskCommitRegistration {
+    fn add_load_stats(&mut self, _: TaskSinkLoadStats) -> ExecutionResult<()> {
         panic!("Noop has no load stats")
     }
     fn add_tablet_commit_info(&mut self, _: TabletCommitInfo) -> ExecutionResult<()> {
@@ -469,8 +469,8 @@ impl FragmentCommitLease for CommitLease {
     fn add_tablet_fail_info(&mut self, _: TabletFailInfo) -> ExecutionResult<()> {
         panic!("Noop has no tablet failure")
     }
-    fn finish(&mut self) -> ExecutionResult<FragmentCommitReport> {
-        Ok(FragmentCommitReport::default())
+    fn finish(&mut self) -> ExecutionResult<TaskCommitReport> {
+        Ok(TaskCommitReport::default())
     }
     fn handoff(&mut self) -> ExecutionResult<()> {
         Ok(())
@@ -485,19 +485,19 @@ impl FragmentCommitLease for CommitLease {
 impl ExchangeFrameTransmitter for Ports {
     fn deliver_unit(
         &self,
-        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         _: tokio_util::sync::CancellationToken,
-        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
         panic!("CountOnly Root fixture attempted Unit delivery")
     }
     fn register_unit_demands(
         &self,
         _: novarocks_execution_contract::RuntimeEndpoint,
-        _: Vec<novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        _: Vec<novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         _: tokio_util::sync::CancellationToken,
-        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         panic!("CountOnly Root fixture attempted demand registration")
     }
@@ -505,7 +505,7 @@ impl ExchangeFrameTransmitter for Ports {
         &self,
         _: novarocks_execution_contract::RuntimeEndpoint,
         _: novarocks_execution_contract::ExchangeStreamIdentity,
-        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
         panic!("CountOnly Root fixture attempted grant subscription")
     }
@@ -518,8 +518,8 @@ impl ExchangeFrameTransmitter for Ports {
         panic!("CountOnly Root fixture attempted Unit retry")
     }
 }
-impl FragmentResultWriter for Ports {
-    fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+impl TaskResultWriter for Ports {
+    fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
         panic!("Noop has no result output")
     }
 }
@@ -538,8 +538,8 @@ impl CreationContent for Assignment {
 }
 #[derive(Default)]
 struct RunnableState {
-    dormant: Option<DormantFragmentHandle>,
-    running: Option<RunningFragmentHandle>,
+    dormant: Option<PreparedTaskExecution>,
+    running: Option<RunningTaskExecution>,
     start: Option<crate::TaskStartPermit>,
     terminal: Option<crate::TaskTerminalPermit>,
     statistics: Option<crate::TaskStatisticsProducer>,
@@ -634,7 +634,7 @@ struct BundleFixture {
     stopped_before_host: bool,
     prepare: Arc<PreparationGate>,
     adoption: Arc<PreparationGate>,
-    original: Mutex<Option<(Weak<WorkerNodeHost>, QueryContextRef)>>,
+    original: Mutex<Option<(Weak<WorkerNodeHost>, ParticipationRef)>>,
     host_entries: AtomicUsize,
     whole_refusals: AtomicUsize,
     transfers: AtomicUsize,
@@ -657,7 +657,7 @@ impl BundleFixture {
         &self,
         task: TaskIdentity,
     ) -> crate::control_runtime::node::PreparationFixtureInventory {
-        let (node, context) = self
+        let (node, participation) = self
             .original
             .lock()
             .unwrap()
@@ -665,14 +665,14 @@ impl BundleFixture {
             .expect("same Node fixture binding");
         node.upgrade()
             .expect("actual Node still owns this preparation")
-            .preparation_fixture_inventory(context, task)
+            .preparation_fixture_inventory(participation, task)
             .expect("same original preparation inventory")
     }
-    fn take_original_roles(
+    fn take_original_capture(
         &self,
         preparation: &mut TaskPreparationContext<'_>,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
-    ) -> TaskPreparationRoles {
+    ) -> TaskPreparationCapture {
         self.host_entries.fetch_add(1, Ordering::SeqCst);
         assert!(
             !self.stopped_before_host,
@@ -683,7 +683,7 @@ impl BundleFixture {
         let (owner, cadence) = preparation.view().control();
         let owner = owner.expect("same original execution port");
         let waker = preparation.readiness_waker();
-        let roles = preparation.take_roles().unwrap();
+        let roles = preparation.take_capture().unwrap();
         let before = self.inventory(identity);
         let wrong_identity = TaskIdentity::new(
             identity.query_execution_id(),
@@ -722,15 +722,15 @@ impl BundleFixture {
             before,
             "rebinding moves originals without reserving replacement roles"
         );
-        let original = rebound.take_roles().unwrap();
+        let original = rebound.take_capture().unwrap();
         assert!(original.matches(identity));
         assert!(matches!(
-            rebound.take_roles(),
-            Err(crate::TaskPreparationRolesTaken)
+            rebound.take_capture(),
+            Err(crate::TaskPreparationCaptureTaken)
         ));
         assert!(matches!(
-            preparation.take_roles(),
-            Err(crate::TaskPreparationRolesTaken)
+            preparation.take_capture(),
+            Err(crate::TaskPreparationCaptureTaken)
         ));
         assert_eq!(
             self.inventory(identity),
@@ -743,7 +743,7 @@ impl BundleFixture {
     }
 }
 struct PreparedChild {
-    dormant: Mutex<Option<DormantFragmentHandle>>,
+    dormant: Mutex<Option<PreparedTaskExecution>>,
     target: Mutex<Weak<Runnable>>,
     root_exit: Mutex<Option<crate::root_result_channel::RootPhysicalExitObservation>>,
     rollback_requested: std::sync::atomic::AtomicBool,
@@ -818,7 +818,7 @@ impl RunnableTask for Runnable {
         let running = dormant.start();
         let observed = self.observed.clone();
         let mut publisher: Option<
-            novarocks_execution::runtime::fragment::handle::FragmentTerminalPublisher,
+            novarocks_execution::runtime::task::handle::LocalTaskTerminalPublisher,
         > = Some(Box::new(move |fact| {
             observed.kernel_published.fetch_add(1, Ordering::SeqCst);
             signal.publish(fact.clone());
@@ -830,13 +830,13 @@ impl RunnableTask for Runnable {
     fn cancel(&self, reason: CancelReason) {
         let running = self.state.lock().unwrap().running.clone();
         if let Some(running) = running {
-            running.cancel(FragmentCancelReason::new(format_args!("{reason:?}")));
+            running.cancel(TaskCancelDetail::new(format_args!("{reason:?}")));
         }
     }
     fn abort(&self, cause: AbortCause) {
         let running = self.state.lock().unwrap().running.clone();
         if let Some(running) = running {
-            running.cancel(FragmentCancelReason::new(format_args!("{cause:?}")));
+            running.cancel(TaskCancelDetail::new(format_args!("{cause:?}")));
         }
     }
 }
@@ -852,9 +852,9 @@ struct CompiledTaskHost {
     completion_contract: Mutex<Option<Arc<completion_contracts::CompletionFixture>>>,
 }
 impl TaskExecutionHost for CompiledTaskHost {
-    fn close_context_admission(&self, _: QueryContextRef) {}
-    fn retire_context_execution(&self, _: QueryContextRef) {}
-    fn forget_context_admission(&self, _: QueryContextRef) {}
+    fn close_participation_admission(&self, _: ParticipationRef) {}
+    fn retire_participation_execution(&self, _: ParticipationRef) {}
+    fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,
         descriptor: &TaskDescriptor,
@@ -865,16 +865,16 @@ impl TaskExecutionHost for CompiledTaskHost {
         // its source still belongs to this original physical preparation.
         let original_roles = match &self.bundle {
             Some(bundle) => {
-                bundle.take_original_roles(&mut preparation, self.execution.execution_health())
+                bundle.take_original_capture(&mut preparation, self.execution.execution_health())
             }
-            None => preparation.take_roles().unwrap(),
+            None => preparation.take_capture().unwrap(),
         };
         let (fragment, assignment) = input.into_parts();
         assert_eq!(fragment.bytes().as_ref(), b"root");
         assert!(assignment.into_stored().downcast::<Assignment>().is_ok());
         let control = preparation.runtime_control();
-        let TaskPreparationRoles {
-            fragments,
+        let TaskPreparationCapture {
+            completion_work,
             start,
             terminal,
             statistics,
@@ -893,18 +893,18 @@ impl TaskExecutionHost for CompiledTaskHost {
         // Register the same physical child before opening output. Construction
         // unwind cannot turn a lost, already-born Root into NoOutputCreated.
         preparation.register_child(child.clone()).unwrap();
-        let instance = FragmentInstanceSpec::new_native(
+        let instance = TaskInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
             descriptor.identity().query_execution_id().query_id(),
-            FragmentInstanceId::new(descriptor.fragment_instance_id()),
+            TaskKey::new(descriptor.task_key()),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
-            FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), false),
+            TaskSinkAssignment::None,
+            TaskRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).unwrap(),
-            BackendNum::try_new(1).unwrap(),
+            InstanceOrdinal::try_new(1).unwrap(),
         );
-        let submission = CompiledFragmentSubmission::try_new(
+        let submission = CompiledTaskSubmission::try_new(
             self.program.clone(),
             CompiledScanSources::new(),
             instance,
@@ -925,21 +925,21 @@ impl TaskExecutionHost for CompiledTaskHost {
         root.bind_preparation_exit_waker(preparation.readiness_waker())
             .unwrap_or_else(|_| panic!("the original preparation wake binds this Root once"));
         let session = CountSession::open(root.clone(), health, self.observed.clone());
-        let context = FragmentPrepareContext::new(
+        let context = LocalTaskPrepareContext::new(
             None,
             None,
             None,
             Arc::new(Ports),
             Arc::new(Ports),
-            Arc::new(NoopFragmentEventSink),
+            Arc::new(NoopTaskEventSink),
         )
         .with_root_result_session(session)
         .with_execution_runtime(self.execution.clone())
-        .with_fragment_commit_port(Arc::new(Ports))
+        .with_task_commit_port(Arc::new(Ports))
         .with_result_identity(descriptor.identity())
         .with_task_control(control)
-        .with_completion_roles(fragments);
-        let dormant = prepare_compiled_fragment(submission, context).unwrap();
+        .with_completion_work(completion_work);
+        let dormant = prepare_compiled_task(submission, context).unwrap();
         let runnable = Arc::new(Runnable {
             identity: descriptor.identity(),
             state: Mutex::new(RunnableState {
@@ -1015,12 +1015,7 @@ impl TaskExecutionHost for CompiledTaskHost {
             Some(contract) => contract.reserve(&self.completion, descriptor, reporter, exit),
             None => self
                 .completion
-                .reserve_task_slot(
-                    descriptor.identity(),
-                    descriptor.fragment_instance_id(),
-                    reporter,
-                    exit,
-                )
+                .reserve_task_slot(descriptor.identity(), descriptor.task_key(), reporter, exit)
                 .unwrap(),
         };
         let original_capture = contract.as_ref().and_then(|contract| contract.capture());
@@ -1039,7 +1034,7 @@ impl TaskExecutionHost for CompiledTaskHost {
                     if let Some(capture) = &original_capture {
                         capture.observe_body();
                     }
-                    assert!(matches!(fact.outcome(), FragmentOutcome::Succeeded));
+                    assert!(matches!(fact.outcome(), LocalTaskOutcome::Succeeded));
                     let final_statistics = final_statistics.take().unwrap().seal_for_terminal(None);
                     let (statistics, dynamic_filters, running) = {
                         let mut state = runnable.state.lock().unwrap();
@@ -1057,7 +1052,7 @@ impl TaskExecutionHost for CompiledTaskHost {
                             intent: crate::TaskTerminalIntent::SuccessfulProduction {
                                 completed_output: Some(TaskOutputFacts::new(matches!(
                                     root.producer_state(),
-                                    RootProducerState::ContextHeld
+                                    RootProducerState::ParticipationHeld
                                 ))),
                             },
                             normal_close_validated: false,
@@ -1086,15 +1081,15 @@ impl TaskExecutionHost for CompiledTaskHost {
 fn loading_body(job: LoadingHostJob) {
     job.run_on_host();
 }
-fn preparation_body(job: TaskDriverHostJob) {
+fn preparation_body(job: TaskIoHostJob) {
     job.run_on_host();
 }
-type PreparationRunner = Box<dyn Fn(TaskDriverHostJob) + Send + Sync>;
+type PreparationRunner = Box<dyn Fn(TaskIoHostJob) + Send + Sync>;
 pub(super) struct TaskResources {
     host: Arc<CompiledTaskHost>,
     loading: HostExecutor<LoadingHostJob, fn(LoadingHostJob)>,
-    preparation: HostExecutor<TaskDriverHostJob, PreparationRunner>,
-    lifecycle: HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>,
+    preparation: HostExecutor<TaskIoHostJob, PreparationRunner>,
+    lifecycle: HostExecutor<TaskIoHostJob, fn(TaskIoHostJob)>,
     _async_runtime: tokio::runtime::Runtime,
 }
 fn observation_projection() -> crate::ObservationProjection {
@@ -1122,7 +1117,7 @@ fn observation_fact_bytes(
         Fact::Gone(value) => WireFact::Gone(*value),
         Fact::TaskConvergence(value) => WireFact::TaskConvergence(*value),
         Fact::TaskConvergenceUnchanged(value) => WireFact::TaskConvergenceUnchanged(*value),
-        Fact::ContextConvergence(value) => WireFact::ContextConvergence(*value),
+        Fact::ParticipationConvergence(value) => WireFact::ParticipationConvergence(*value),
         Fact::Quiesce(receipt) => {
             return covered_quiesce_fact_size_bound(receipt)
                 .ok_or(crate::ObservationProjectionError::InvalidFact);
@@ -1137,23 +1132,23 @@ fn observation_fact_bytes(
 }
 pub(super) fn start_tasks(
     root: &mut ProcessControlOwner,
-) -> Result<(TaskDriverPorts, TaskResources), Failure> {
+) -> Result<(TaskIoPorts, TaskResources), Failure> {
     start_tasks_with_bundle(root, None)
 }
 fn start_tasks_with_bundle(
     root: &mut ProcessControlOwner,
     mode: Option<bool>,
-) -> Result<(TaskDriverPorts, TaskResources), Failure> {
+) -> Result<(TaskIoPorts, TaskResources), Failure> {
     let bundle = mode.map(|stopped| Arc::new(BundleFixture::new(stopped)));
     let capacity = root
         .task_capacity_signal()
         .map_err(|original| Box::new(original) as Failure)?;
     let one = NonZeroUsize::new(1).unwrap();
-    // One admitted Task plus one physical tail; two contexts are metadata
+    // One admitted Task plus one physical tail; two participations are metadata
     // groups, and no pool-size choice signs a Task exit.
     let limits = HostExecutorLimits {
         jobs: NonZeroUsize::new(2).unwrap(),
-        per_context: NonZeroUsize::new(2).unwrap(),
+        per_group: NonZeroUsize::new(2).unwrap(),
         workers: one,
     };
     let loading =
@@ -1163,7 +1158,7 @@ fn start_tasks_with_bundle(
         };
     let original_bundle = bundle.clone();
     let runner: PreparationRunner = Box::new(move |job| {
-        if matches!(&job, TaskDriverHostJob::Prepare { .. })
+        if matches!(&job, TaskIoHostJob::Prepare { .. })
             && let Some(bundle) = &original_bundle
         {
             bundle.prepare.wait();
@@ -1210,7 +1205,7 @@ fn start_tasks_with_bundle(
         bundle,
         completion_contract: Mutex::new(None),
     });
-    let ports = TaskDriverPorts {
+    let ports = TaskIoPorts {
         protocol_events: Some(crate::TaskExecutionPorts::new(
             host.observed.clone(),
             host.observed.clone(),
@@ -1238,21 +1233,21 @@ fn start_tasks_with_bundle(
 }
 fn exercise(
     scene: &Scenario<TaskResources>,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     resources: &mut TaskResources,
 ) -> Result<Option<HeldTaskDelivery>, Failure> {
-    exercise_root(scene, context, resources, true)
+    exercise_root(scene, participation, resources, true)
 }
 fn exercise_unread_root(
     scene: &Scenario<TaskResources>,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     resources: &mut TaskResources,
 ) -> Result<Option<HeldTaskDelivery>, Failure> {
-    exercise_root(scene, context, resources, false)
+    exercise_root(scene, participation, resources, false)
 }
 fn trace_original_preparation_stage(
     scene: &Scenario<TaskResources>,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     task: TaskIdentity,
     bundle: &BundleFixture,
     stage: &'static str,
@@ -1265,24 +1260,28 @@ fn trace_original_preparation_stage(
         scene.ledger.used(Dimension::Requests.id()),
         scene.ledger.used(Dimension::PreparingTasks.id()),
         scene.ledger.used(Dimension::PreparingBytes.id()),
-        scene.node.preparation_fixture_inventory(context, task),
+        scene
+            .node
+            .preparation_fixture_inventory(participation, task),
     );
     eprintln!(
         "original stopped preparation stage={stage} original_request_inventory={:?}",
-        scene.node.original_request_inventory_for_test(context),
+        scene
+            .node
+            .original_request_inventory_for_test(participation),
     );
 }
 fn exercise_root(
     scene: &Scenario<TaskResources>,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     resources: &mut TaskResources,
     read_root: bool,
 ) -> Result<Option<HeldTaskDelivery>, Failure> {
     let task = TaskIdentity::new(
-        context.query_execution_id(),
+        participation.query_execution_id(),
         StageId::new(1).unwrap(),
         TaskId::new(1).unwrap(),
-        context.backend_process_id(),
+        participation.backend_process_id(),
     );
     let _prepare_release = resources
         .host
@@ -1295,9 +1294,9 @@ fn exercise_root(
         .as_ref()
         .map(|bundle| ReleasePreparationGate(bundle.adoption.clone()));
     if let Some(bundle) = &resources.host.bundle {
-        *bundle.original.lock().unwrap() = Some((Arc::downgrade(&scene.node), context));
+        *bundle.original.lock().unwrap() = Some((Arc::downgrade(&scene.node), participation));
     }
-    *scene.diagnostic_task.lock().unwrap() = Some((context, task));
+    *scene.diagnostic_task.lock().unwrap() = Some((participation, task));
     let descriptor = TaskDescriptor::try_new(
         task,
         UniqueId::new(77, 88),
@@ -1306,8 +1305,9 @@ fn exercise_root(
         ExchangeTopology::default(),
     )
     .unwrap();
-    let request =
-        Arc::new(CreateTask::try_new(operation_number(21), context, descriptor, vec![]).unwrap());
+    let request = Arc::new(
+        CreateTask::try_new(operation_number(21), participation, descriptor, vec![]).unwrap(),
+    );
     let payload = TaskCreatePayload {
         id: PayloadId(9),
         request,
@@ -1334,10 +1334,10 @@ fn exercise_root(
         )
         .map_err(|original| Box::new(original) as Failure)?;
     let mut handle = match handle {
-        crate::control_runtime::node::NodeCreateHandle::Context(handle) => handle,
+        crate::control_runtime::node::NodeCreateHandle::Participation(handle) => handle,
         original => {
             return Err(Box::new((
-                "Create unexpectedly routed before Context adoption",
+                "Create unexpectedly routed before Participation adoption",
                 original,
             )));
         }
@@ -1347,7 +1347,7 @@ fn exercise_root(
     };
     if !matches!(
         delivery.body(),
-        novarocks_worker_protocol::context::ContextReplyBody::Create {
+        novarocks_worker_protocol::participation::ParticipationReplyBody::Create {
             outcome: OperationOutcome::Accepted, receipt,
         } if receipt.identity() == task
     ) {
@@ -1359,7 +1359,7 @@ fn exercise_root(
     if let Some(bundle) = &resources.host.bundle {
         trace_original_preparation_stage(
             scene,
-            context,
+            participation,
             task,
             bundle,
             "before preparation-entry/Create-R-retirement wait",
@@ -1369,7 +1369,7 @@ fn exercise_root(
         }) {
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "ERR preparation-entry/Create-R-retirement wait",
@@ -1388,7 +1388,7 @@ fn exercise_root(
         if bundle.stopped_before_host {
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "before GetFinalInfo admission",
@@ -1397,15 +1397,15 @@ fn exercise_root(
             let mut final_info = scene
                 .node
                 .submit_task_command(
-                    context,
+                    participation,
                     operation,
                     MonotonicInstant::from_origin(Duration::from_secs(100)),
-                    ContextCommand::GetFinalInfo { task },
+                    ParticipationCommand::GetFinalInfo { task },
                 )
                 .map_err(|original| {
                     trace_original_preparation_stage(
                         scene,
-                        context,
+                        participation,
                         task,
                         bundle,
                         "ERR GetFinalInfo admission/submission",
@@ -1417,13 +1417,13 @@ fn exercise_root(
                 .endpoint
                 .external
                 .slot()
-                .context_author()
+                .participation_author()
                 .expect("the actual Task R has a registered address");
-            assert_eq!(actual_actor, context_actor());
+            assert_eq!(actual_actor, participation_actor());
             let original_metadata = final_info.request();
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "before GetFinalInfo delivery wait",
@@ -1431,7 +1431,7 @@ fn exercise_root(
             let Some(final_delivery) = wait_delivery(&mut final_info) else {
                 trace_original_preparation_stage(
                     scene,
-                    context,
+                    participation,
                     task,
                     bundle,
                     "ERR GetFinalInfo delivery wait",
@@ -1440,7 +1440,7 @@ fn exercise_root(
                     "original GetFinalInfo address={original_work:?} metadata={original_metadata:?} saved_request={:?}",
                     scene
                         .node
-                        .original_task_request_for_test(context, original_work)
+                        .original_task_request_for_test(participation, original_work)
                 );
                 return Err(Box::new((
                     "original GetFinalInfo delivery timeout",
@@ -1449,16 +1449,16 @@ fn exercise_root(
             };
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "GetFinalInfo delivery taken before Cancel",
             );
             match final_delivery.body() {
-                ContextReplyBody::Verdict(result) => eprintln!(
+                ParticipationReplyBody::Verdict(result) => eprintln!(
                     "original GetFinalInfo actual verdict={result:?} work={original_work:?} metadata={original_metadata:?}"
                 ),
-                ContextReplyBody::FinalInfo(_) => eprintln!(
+                ParticipationReplyBody::FinalInfo(_) => eprintln!(
                     "original GetFinalInfo actual body=FinalInfo work={original_work:?} metadata={original_metadata:?}"
                 ),
                 _ => eprintln!(
@@ -1470,8 +1470,8 @@ fn exercise_root(
             assert!(
                 matches!(
                     final_delivery.body(),
-                    ContextReplyBody::Verdict(
-                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                    ParticipationReplyBody::Verdict(
+                        novarocks_worker_protocol::participation::RequestResult::Outcome(
                             OperationOutcome::InvalidStateOrRequest
                         )
                     )
@@ -1482,7 +1482,7 @@ fn exercise_root(
             // input retired. Neither Work nor operation can synthesize it.
             let original_request = scene
                 .node
-                .original_task_request_for_test(context, original_work)
+                .original_task_request_for_test(participation, original_work)
                 .expect("the same live Task R remains owned");
             assert_eq!(original_request.0.author, original_work);
             assert_eq!(original_request.0.operation, operation);
@@ -1493,10 +1493,10 @@ fn exercise_root(
             let mut cancel = scene
                 .node
                 .submit_task_command(
-                    context,
+                    participation,
                     operation_number(25),
                     MonotonicInstant::from_origin(Duration::from_secs(100)),
-                    ContextCommand::Cancel {
+                    ParticipationCommand::Cancel {
                         task,
                         reason: CancelReason::UpstreamNoLongerNeeded,
                     },
@@ -1504,7 +1504,7 @@ fn exercise_root(
                 .map_err(|original| {
                     trace_original_preparation_stage(
                         scene,
-                        context,
+                        participation,
                         task,
                         bundle,
                         "ERR Cancel admission/submission",
@@ -1515,7 +1515,7 @@ fn exercise_root(
             let Some(delivery) = wait_delivery(&mut cancel) else {
                 trace_original_preparation_stage(
                     scene,
-                    context,
+                    participation,
                     task,
                     bundle,
                     "ERR Cancel delivery wait",
@@ -1523,14 +1523,14 @@ fn exercise_root(
                 return Err(Box::new(("original Cancel delivery timeout", cancel)));
             };
             assert!(
-                matches!(delivery.body(), ContextReplyBody::Task { outcome: OperationOutcome::Accepted, status }
+                matches!(delivery.body(), ParticipationReplyBody::Task { outcome: OperationOutcome::Accepted, status }
                 if status.identity() == task)
             );
             drop(delivery);
             drop(cancel);
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "before actual Stop observation wait",
@@ -1538,12 +1538,12 @@ fn exercise_root(
             if !wait_until(|| {
                 scene
                     .node
-                    .preparation_fixture_inventory(context, task)
+                    .preparation_fixture_inventory(participation, task)
                     .is_some_and(|current| current.stopped && current.stop_call_exited)
             }) {
                 trace_original_preparation_stage(
                     scene,
-                    context,
+                    participation,
                     task,
                     bundle,
                     "ERR actual Stop observation wait",
@@ -1560,7 +1560,7 @@ fn exercise_root(
             );
             trace_original_preparation_stage(
                 scene,
-                context,
+                participation,
                 task,
                 bundle,
                 "explicit gate release after actual Stop observed",
@@ -1575,10 +1575,10 @@ fn exercise_root(
                     matches!(event, crate::TaskProtocolEvent::TaskTerminalRetained { identity, state }
                         if *identity == task && *state == TaskState::Canceled))
             }) {
-                scene.node.print_neutral_task_inventory(context, task);
+                scene.node.print_neutral_task_inventory(participation, task);
                 trace_original_preparation_stage(
                     scene,
-                    context,
+                    participation,
                     task,
                     bundle,
                     "ERR stopped actual physical retirement wait",
@@ -1626,7 +1626,7 @@ fn exercise_root(
     }
     let completion_contract = resources.host.completion_contract.lock().unwrap().clone();
     if let Some(contract) = &completion_contract {
-        contract.observe_before_exit(scene, context, task, resources)?;
+        contract.observe_before_exit(scene, participation, task, resources)?;
     }
     let expected_state = completion_contract
         .as_ref()
@@ -1691,7 +1691,7 @@ fn exercise_root(
                 .completion_entered
                 .load(Ordering::SeqCst),
         );
-        scene.node.print_neutral_task_inventory(context, task);
+        scene.node.print_neutral_task_inventory(participation, task);
         return Err(Box::new(
             "real execution / installed / preparation whole-exit timeout",
         ));
@@ -1718,7 +1718,7 @@ fn exercise_root(
     let read = scene
         .node
         .begin_root_read(
-            context,
+            participation,
             ActorId::new(3).unwrap(),
             operation_number(22),
             MonotonicInstant::from_origin(Duration::from_secs(100)),
@@ -1767,7 +1767,7 @@ fn exercise_root(
     let read = scene
         .node
         .begin_root_read(
-            context,
+            participation,
             ActorId::new(3).unwrap(),
             operation_number(23),
             MonotonicInstant::from_origin(Duration::from_secs(100)),
@@ -1810,7 +1810,7 @@ fn exercise_root(
             )));
         }
     };
-    // Native successful Context handoff already completed this Task before
+    // Native successful Participation handoff already completed this Task before
     // the ACK. RootDrained adjudicates AlreadyTerminal(Finished), rather than
     // inventing another status publication or reversing the terminal state.
     if !matches!(
@@ -1872,7 +1872,7 @@ pub(super) fn shutdown(resources: TaskResources) -> Result<(), Failure> {
     Ok(())
 }
 pub(super) fn compiled_task_geometry() -> ReservationResources {
-    let policy = ControlRuntimePolicy::try_new(IngressRoleLimits {
+    let policy = ControlRuntimePolicy::try_new(IngressPositionLimits {
         ordinary_running: 1,
         ordinary_waiting: 0,
         control_running: 1,
@@ -1955,12 +1955,15 @@ impl Drop for LateUpdateContent {
 
 fn exercise_retired_task_update(
     scene: &Scenario<TaskResources>,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     failures: &mut Vec<String>,
 ) {
     let task = scene.diagnostic_task.lock().unwrap().unwrap().1;
     if !wait_until(|| {
-        scene.node.task_update_retirement_for_test(context, task) == Some((false, true))
+        scene
+            .node
+            .task_update_retirement_for_test(participation, task)
+            == Some((false, true))
     }) {
         failures.push("the original Task did not physically retire before late Update".into());
         return;
@@ -1992,7 +1995,7 @@ fn exercise_retired_task_update(
     let deadline = MonotonicInstant::from_origin(Duration::from_secs(100));
     let submitted = scene
         .node
-        .submit_task_domain(context, original, deadline, ingress);
+        .submit_task_domain(participation, original, deadline, ingress);
     match submitted {
         Ok(mut handle) => {
             let request = handle.request();
@@ -2004,8 +2007,8 @@ fn exercise_retired_task_update(
                 delivery.request() == request
                     && matches!(
                         delivery.body(),
-                        ContextReplyBody::Verdict(
-                            novarocks_worker_protocol::context::RequestResult::Outcome(
+                        ParticipationReplyBody::Verdict(
+                            novarocks_worker_protocol::participation::RequestResult::Outcome(
                                 OperationOutcome::TerminalRejected
                             )
                         )
@@ -2062,9 +2065,9 @@ fn late_update_after_real_task_retirement_keeps_core_verdict_and_original_raw_ex
         NodeClose::Release,
         compiled_task_geometry(),
         start_tasks,
-        |scene, context, resources| {
-            let held = exercise(scene, context, resources)?;
-            exercise_retired_task_update(scene, context, &mut failures);
+        |scene, participation, resources| {
+            let held = exercise(scene, participation, resources)?;
+            exercise_retired_task_update(scene, participation, &mut failures);
             Ok(held)
         },
         shutdown,

@@ -139,7 +139,7 @@ impl MvRefreshPreparationIo {
         controls: &dyn ConnectorControlResolver,
         table: &TableIdentity,
         context: &ConnectorRequestContext,
-    ) -> Result<(ConnectorControlPlanningLease, ConnectorTableMetadata), ConnectorError> {
+    ) -> Result<(ConnectorControlPlanningPin, ConnectorTableMetadata), ConnectorError> {
         let lease = crate::connector::metadata_binding_typed(controls, &table.catalog)?;
         let metadata = self
             .metadata(
@@ -156,7 +156,7 @@ impl MvRefreshPreparationIo {
         &self,
         storage: &dyn MvStorageObservationPort,
         table: &TableIdentity,
-        lease: ConnectorControlPlanningLease,
+        lease: ConnectorControlPlanningPin,
         context: &ConnectorRequestContext,
     ) -> Result<MvTargetBinding, ConnectorError> {
         crate::mv::domain::refresh::target_binding::validate_target_lease(table, &lease)?;
@@ -198,9 +198,9 @@ impl MvRefreshPreparationIo {
         context.original_operation_control().check_active()?;
         let captured = self.captured_sources().require(table)?;
         let (lease, metadata) = if captured.snapshot.is_some() {
-            (captured.lease.clone(), captured.metadata()?)
+            (captured.planning_pin.clone(), captured.metadata()?)
         } else {
-            (captured.lease.clone(), captured.observed.clone())
+            (captured.planning_pin.clone(), captured.observed.clone())
         };
         let observed = crate::mv::domain::storage_observation::observe_source_schema(
             source.storage_observation(),
@@ -226,7 +226,7 @@ impl MvRefreshPreparationIo {
         let captured = self.captured_sources().require(table)?;
         let observed = crate::mv::domain::storage_observation::observe_source_schema(
             source.storage_observation(),
-            &captured.lease,
+            &captured.planning_pin,
             &captured.observed,
             context.clone(),
         )?;
@@ -464,7 +464,7 @@ impl MvRefreshPreparationIo {
                 ),
             };
             let receipt = self
-                .source_read(source, &captured.lease, request, context.clone())
+                .source_read(source, &captured.planning_pin, request, context.clone())
                 .await?;
             captured.install(receipt)?;
         }

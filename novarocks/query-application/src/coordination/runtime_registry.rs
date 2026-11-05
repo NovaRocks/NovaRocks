@@ -33,7 +33,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use super::original_exit::{OriginalAssociation, OriginalLogicalExit};
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::identity::{QueryExecutionId, QueryId};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -42,7 +42,7 @@ use tokio::task::{JoinError, JoinHandle};
 use crate::coordination::{
     AttemptInstantiationPermit, LogicalExecutionActor, LogicalExecutionActorConfig,
     LogicalExecutionActorError, LogicalExecutionOutputTransfer, RegistryClose,
-    RegistryContextConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
+    RegistryParticipationConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
 };
 use novarocks_coordination_contract::LogicalExecutionActorId;
 
@@ -136,7 +136,7 @@ pub struct LogicalExecutionRegistryEntryGeometry {
     actor_join_wake: std::alloc::Layout,
     close_wait_frame: std::alloc::Layout,
     native_active_slot: std::alloc::Layout,
-    native_consumer_task_frame: std::alloc::Layout,
+    native_consumer_future_frame: std::alloc::Layout,
     native_tail_wake: std::alloc::Layout,
 }
 impl LogicalExecutionRegistryEntryGeometry {
@@ -158,8 +158,8 @@ impl LogicalExecutionRegistryEntryGeometry {
     pub const fn close_wait_frame_layout(self) -> std::alloc::Layout {
         self.close_wait_frame
     }
-    pub const fn native_consumer_task_frame_layout(self) -> std::alloc::Layout {
-        self.native_consumer_task_frame
+    pub const fn native_consumer_future_layout(self) -> std::alloc::Layout {
+        self.native_consumer_future_frame
     }
     pub const fn native_tail_wake_layout(self) -> std::alloc::Layout {
         self.native_tail_wake
@@ -199,7 +199,7 @@ impl LogicalExecutionRuntimeRegistry {
             .expect("fixed original join failure layout"),
             close_wait_frame: original_close_wait_layout(original_close_wait),
             native_active_slot: super::NativeActiveCustodyRegistry::slot_layout(),
-            native_consumer_task_frame:
+            native_consumer_future_frame:
                 super::NativeActiveCustodyRegistry::consumer_task_frame_layout(),
             native_tail_wake: super::NativeActiveCustodyRegistry::tail_wake_layout(),
         }
@@ -239,7 +239,7 @@ struct OriginalActorJoinState {
     unwound: bool,
     waiting: bool,
 }
-struct OriginalActorJoinLease {
+struct OriginalActorJoinLoan {
     owner: Arc<OriginalActorJoin>,
     handle: Option<JoinHandle<()>>,
     completed: bool,
@@ -273,7 +273,7 @@ impl OriginalActorJoin {
                 .take()
         };
         if let Some(handle) = handle {
-            let lease = OriginalActorJoinLease {
+            let lease = OriginalActorJoinLoan {
                 owner: Arc::clone(self),
                 handle: Some(handle),
                 completed: false,
@@ -285,7 +285,7 @@ impl OriginalActorJoin {
     fn poll(
         self: &Arc<Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<(Result<(), JoinError>, OriginalActorJoinLease)> {
+    ) -> Poll<(Result<(), JoinError>, OriginalActorJoinLoan)> {
         self.wake.forward.register(cx.waker());
         let handle = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -298,7 +298,7 @@ impl OriginalActorJoin {
             };
             handle
         };
-        let mut lease = OriginalActorJoinLease {
+        let mut lease = OriginalActorJoinLoan {
             owner: Arc::clone(self),
             handle: Some(handle),
             completed: false,
@@ -317,7 +317,7 @@ impl OriginalActorJoin {
         }
     }
 }
-impl Drop for OriginalActorJoinLease {
+impl Drop for OriginalActorJoinLoan {
     fn drop(&mut self) {
         let wake = {
             let mut s = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,7 +361,7 @@ enum RegistryEntry {
 struct ReservedEntry {
     generation: u64,
     initial_execution: QueryExecutionId,
-    contexts: BTreeSet<QueryContextRef>,
+    participations: BTreeSet<ParticipationRef>,
     original_exit: Option<Arc<OriginalLogicalExit>>,
     spawn_started: bool,
 }
@@ -401,8 +401,8 @@ pub enum LogicalExecutionRuntimeRegistryError {
     UnknownRegistration,
     ForeignRegistry,
     StaleGeneration,
-    InvalidContextSet,
-    ContextNotRegistered,
+    InvalidParticipationSet,
+    ParticipationNotRegistered,
     ConfigDoesNotMatchReservation,
     Actor(LogicalExecutionActorError),
     JoinNotReady,
@@ -465,8 +465,8 @@ impl novarocks_execution_contract::failure::FailureProjection
             Self::UnknownRegistration => (FailureClass::Control, 64, true),
             Self::ForeignRegistry => (FailureClass::Invariant, 65, false),
             Self::StaleGeneration => (FailureClass::Control, 66, true),
-            Self::InvalidContextSet => (FailureClass::Invariant, 67, false),
-            Self::ContextNotRegistered => (FailureClass::Invariant, 68, false),
+            Self::InvalidParticipationSet => (FailureClass::Invariant, 67, false),
+            Self::ParticipationNotRegistered => (FailureClass::Invariant, 68, false),
             Self::ConfigDoesNotMatchReservation => (FailureClass::Invariant, 69, false),
             Self::JoinNotReady => (FailureClass::Control, 70, false),
             Self::JoinAlreadyCompleted => (FailureClass::Control, 71, true),
@@ -505,10 +505,12 @@ impl LogicalExecutionRuntimeRegistryError {
             Self::StaleGeneration => {
                 "logical execution registration generation is no longer current"
             }
-            Self::InvalidContextSet => {
-                "runtime reservation has duplicate or foreign execution contexts"
+            Self::InvalidParticipationSet => {
+                "runtime reservation has duplicate or foreign execution participations"
             }
-            Self::ContextNotRegistered => "context convergence names an unregistered query context",
+            Self::ParticipationNotRegistered => {
+                "participation convergence names an unregistered participation"
+            }
             Self::ConfigDoesNotMatchReservation => {
                 "actor configuration does not match its runtime reservation"
             }
@@ -689,7 +691,7 @@ impl LogicalExecutionRuntimeRegistry {
     /// This method borrows the unique owner so cancelling the wait or reaching
     /// the deadline cannot detach an actor task or lose its join handle. On an
     /// error the caller must retain this owner and may retry with a later
-    /// deadline after additional context-convergence facts arrive.
+    /// deadline after additional participation-convergence facts arrive.
     pub async fn shutdown_until(
         &mut self,
         deadline: Instant,
@@ -907,7 +909,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         &self,
         registration: &LogicalExecutionRegistration,
         execution: QueryExecutionId,
-        contexts: &[QueryContextRef],
+        participations: &[ParticipationRef],
     ) -> Result<super::NativeActiveCustodyReservation, LogicalExecutionRuntimeRegistryError> {
         self.validate_registry(registration)?;
         // Serialize the original custody insertion with begin_shutdown's
@@ -927,7 +929,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
         };
         validate_generation(entry.generation, registration.generation)?;
         if execution.query_id() != registration.initial_execution.query_id() {
-            return Err(LogicalExecutionRuntimeRegistryError::InvalidContextSet);
+            return Err(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet);
         }
         let reserved = self.inner.active_native.reserve_with_original_exit(
             super::NativeActiveCustodyKey {
@@ -935,7 +937,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 generation: registration.generation,
                 execution,
             },
-            contexts,
+            participations,
             self.clone(),
             entry
                 .original_exit
@@ -948,7 +950,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             source.native_reserved_silent();
         }
         drop(state);
-        reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidContextSet)
+        reserved.ok_or(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet)
     }
 
     pub(crate) async fn record_native_custody_closure(
@@ -964,16 +966,19 @@ impl LogicalExecutionRuntimeRegistryHandle {
         let mut first_error = None;
         match closure {
             crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::AllWorkersStoppedAndContextsFenced,
+                crate::api::NativeAttemptConvergence::AllWorkersStoppedAndParticipationsFenced,
             ) => {
-                let contexts = self
+                let participations = self
                     .inner
                     .active_native
-                    .contexts(key)
+                    .participations(key)
                     .ok_or(LogicalExecutionRuntimeRegistryError::UnknownRegistration)?;
-                for context in contexts {
+                for participation in participations {
                     if let Err(error) = self
-                        .observe_worker_stopped_and_context_fenced(&registration, context)
+                        .observe_worker_stopped_and_participation_fenced(
+                            &registration,
+                            participation,
+                        )
                         .await
                     {
                         first_error.get_or_insert(error);
@@ -981,23 +986,23 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 }
             }
             crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::Contexts(facts),
+                crate::api::NativeAttemptConvergence::Participations(facts),
             ) => {
                 for fact in facts {
                     let result = match fact.kind() {
-                        crate::api::NativeContextConvergenceKind::NeverEstablished => {
-                            self.observe_context_never_established(&registration, fact.context())
+                        crate::api::NativeParticipationConvergenceKind::NeverEstablished => {
+                            self.observe_participation_never_established(&registration, fact.participation())
                                 .await
                         }
-                        crate::api::NativeContextConvergenceKind::WorkerStoppedAndContextFenced => {
-                            self.observe_worker_stopped_and_context_fenced(
+                        crate::api::NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced => {
+                            self.observe_worker_stopped_and_participation_fenced(
                                 &registration,
-                                fact.context(),
+                                fact.participation(),
                             )
                             .await
                         }
-                        crate::api::NativeContextConvergenceKind::WorkerProcessReplaced => {
-                            self.observe_worker_process_replaced(&registration, fact.context())
+                        crate::api::NativeParticipationConvergenceKind::WorkerProcessReplaced => {
+                            self.observe_worker_process_replaced(&registration, fact.participation())
                                 .await
                         }
                     };
@@ -1006,10 +1011,12 @@ impl LogicalExecutionRuntimeRegistryHandle {
                     }
                 }
             }
-            crate::api::NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts } => {
-                for &context in exact_contexts {
+            crate::api::NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            } => {
+                for &participation in exact_participations {
                     if let Err(error) = self
-                        .end_remote_context_tracking(&registration, context)
+                        .end_remote_participation_tracking(&registration, participation)
                         .await
                     {
                         first_error.get_or_insert(error);
@@ -1257,24 +1264,24 @@ impl LogicalExecutionRuntimeRegistryHandle {
     pub(crate) fn reserve(
         &self,
         initial_execution: QueryExecutionId,
-        frozen_contexts: Vec<QueryContextRef>,
+        frozen_participations: Vec<ParticipationRef>,
     ) -> Result<LogicalExecutionRuntimeReservation, LogicalExecutionRuntimeRegistryError> {
-        self.reserve_with_original_exit(initial_execution, frozen_contexts, None)
+        self.reserve_with_original_exit(initial_execution, frozen_participations, None)
     }
 
     pub(super) fn reserve_with_original_exit(
         &self,
         initial_execution: QueryExecutionId,
-        frozen_contexts: Vec<QueryContextRef>,
+        frozen_participations: Vec<ParticipationRef>,
         original_exit: Option<Arc<OriginalLogicalExit>>,
     ) -> Result<LogicalExecutionRuntimeReservation, LogicalExecutionRuntimeRegistryError> {
-        let contexts: BTreeSet<_> = frozen_contexts.iter().copied().collect();
-        if contexts.len() != frozen_contexts.len()
-            || contexts
+        let participations: BTreeSet<_> = frozen_participations.iter().copied().collect();
+        if participations.len() != frozen_participations.len()
+            || participations
                 .iter()
-                .any(|context| context.query_execution_id() != initial_execution)
+                .any(|participation| participation.query_execution_id() != initial_execution)
         {
-            return Err(LogicalExecutionRuntimeRegistryError::InvalidContextSet);
+            return Err(LogicalExecutionRuntimeRegistryError::InvalidParticipationSet);
         }
         let query = initial_execution.query_id();
         let mut state = self.lock();
@@ -1301,7 +1308,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             RegistryEntry::Reserved(ReservedEntry {
                 generation,
                 initial_execution,
-                contexts,
+                participations,
                 original_exit,
                 spawn_started: false,
             }),
@@ -1340,28 +1347,28 @@ impl LogicalExecutionRuntimeRegistryHandle {
         }
     }
 
-    pub(crate) async fn observe_worker_stopped_and_context_fenced(
+    pub(crate) async fn observe_worker_stopped_and_participation_fenced(
         &self,
         registration: &LogicalExecutionRegistration,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_context_convergence(
+        self.observe_participation_convergence(
             registration,
-            context,
-            RegistryContextConvergence::WorkerStoppedAndContextFenced,
+            participation,
+            RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced,
         )
         .await
     }
 
-    pub(crate) async fn observe_context_never_established(
+    pub(crate) async fn observe_participation_never_established(
         &self,
         registration: &LogicalExecutionRegistration,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_context_convergence(
+        self.observe_participation_convergence(
             registration,
-            context,
-            RegistryContextConvergence::NeverEstablished,
+            participation,
+            RegistryParticipationConvergence::NeverEstablished,
         )
         .await
     }
@@ -1369,28 +1376,28 @@ impl LogicalExecutionRuntimeRegistryHandle {
     pub(crate) async fn observe_worker_process_replaced(
         &self,
         registration: &LogicalExecutionRegistration,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_context_convergence(
+        self.observe_participation_convergence(
             registration,
-            context,
-            RegistryContextConvergence::WorkerProcessReplaced,
+            participation,
+            RegistryParticipationConvergence::WorkerProcessReplaced,
         )
         .await
     }
 
-    /// Ends the FE's bounded observation of this context without asserting
+    /// Ends the FE's bounded observation of this participation without asserting
     /// that the Worker stopped or released its resources. The actor records a
     /// distinct retirement reason and returns only its governance tracking.
-    pub(crate) async fn end_remote_context_tracking(
+    pub(crate) async fn end_remote_participation_tracking(
         &self,
         registration: &LogicalExecutionRegistration,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
-        self.observe_context_convergence(
+        self.observe_participation_convergence(
             registration,
-            context,
-            RegistryContextConvergence::RemoteTrackingEnded,
+            participation,
+            RegistryParticipationConvergence::RemoteTrackingEnded,
         )
         .await
     }
@@ -1826,11 +1833,11 @@ impl LogicalExecutionRuntimeRegistryHandle {
         }
     }
 
-    async fn observe_context_convergence(
+    async fn observe_participation_convergence(
         &self,
         registration: &LogicalExecutionRegistration,
-        context: QueryContextRef,
-        convergence: RegistryContextConvergence,
+        participation: ParticipationRef,
+        convergence: RegistryParticipationConvergence,
     ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
         let actor = {
             self.validate_registry(registration)?;
@@ -1842,14 +1849,16 @@ impl LogicalExecutionRuntimeRegistryHandle {
                 Some(RegistryEntry::Installed(entry)) => {
                     validate_generation(entry.generation, registration.generation)?;
                     // The reservation freezes only the initial attempt's
-                    // contexts. Replacement attempts keep the same logical
-                    // query identity but may select a different exact context
+                    // participations. Replacement attempts keep the same logical
+                    // query identity but may select a different exact participation
                     // set. The actor owns every current and residual attempt
-                    // ledger and performs the final exact-context check.
-                    if context.query_execution_id().query_id()
+                    // ledger and performs the final exact-participation check.
+                    if participation.query_execution_id().query_id()
                         != registration.initial_execution.query_id()
                     {
-                        return Err(LogicalExecutionRuntimeRegistryError::ContextNotRegistered);
+                        return Err(
+                            LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered,
+                        );
                     }
                     entry.actor.clone()
                 }
@@ -1857,7 +1866,7 @@ impl LogicalExecutionRuntimeRegistryHandle {
             }
         };
         actor
-            .observe_registry_context_convergence(context, convergence)
+            .observe_registry_participation_convergence(participation, convergence)
             .await
             .map_err(Into::into)
     }
@@ -1895,13 +1904,13 @@ impl LogicalExecutionRuntimeReservation {
             if entry.generation != self.generation {
                 return Err(LogicalExecutionRuntimeRegistryError::StaleGeneration);
             }
-            let config_contexts: BTreeSet<_> = config
-                .required_establish_contexts()
+            let config_participations: BTreeSet<_> = config
+                .required_establish_participations()
                 .iter()
                 .copied()
                 .collect();
             if config.initial_execution() != entry.initial_execution
-                || config_contexts != entry.contexts
+                || config_participations != entry.participations
             {
                 return Err(LogicalExecutionRuntimeRegistryError::ConfigDoesNotMatchReservation);
             }
@@ -2002,15 +2011,15 @@ mod tests {
 
     fn config(
         execution: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> LogicalExecutionActorConfig {
-        config_observing_cancellation(execution, contexts).0
+        config_observing_cancellation(execution, participations).0
     }
 
     /// Also returns a view of the work cancellation the actor owns.
     fn config_observing_cancellation(
         execution: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> (
         LogicalExecutionActorConfig,
         novarocks_workload_control::CancellationView,
@@ -2035,7 +2044,7 @@ mod tests {
             execution,
             ExecutionEffect::None,
             NonZeroUsize::new(4).unwrap(),
-            contexts,
+            participations,
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             root.owner,
@@ -2068,8 +2077,8 @@ mod tests {
         }
     }
 
-    fn native_test_context(execution: QueryExecutionId) -> QueryContextRef {
-        QueryContextRef::new(
+    fn native_test_participation(execution: QueryExecutionId) -> ParticipationRef {
+        ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -2080,26 +2089,26 @@ mod tests {
     struct NeverEstablishedAbortPort {
         capacity: tokio::sync::watch::Sender<u64>,
     }
-    impl crate::coordination::AbortQueryContextEffectPort for NeverEstablishedAbortPort {
+    impl crate::coordination::AbortParticipationEffectPort for NeverEstablishedAbortPort {
         fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
             self.capacity.subscribe()
         }
         fn try_reserve(
             &self,
-            identity: crate::coordination::AbortQueryContextIssueIdentity,
-        ) -> crate::coordination::AbortQueryContextEffectAdmission {
+            identity: crate::coordination::AbortParticipationIssueIdentity,
+        ) -> crate::coordination::AbortParticipationEffectAdmission {
             panic!("a never-established custody fixture must not issue Abort: {identity:?}")
         }
     }
     fn native_custody_config(
         execution: QueryExecutionId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> LogicalExecutionActorConfig {
         let (capacity, _) = tokio::sync::watch::channel(0);
-        // A real nonempty context manifest requires an Abort port before actor
+        // A real nonempty participation manifest requires an Abort port before actor
         // installation. These fixtures issue no admission or Establish, so any
         // actual Abort request is a fixture violation, never a fabricated ACK.
-        config(execution, vec![context]).with_abort_query_context_effect_port(
+        config(execution, vec![participation]).with_abort_participation_effect_port(
             Arc::new(NeverEstablishedAbortPort { capacity }),
             NonZeroUsize::new(2).unwrap(),
         )
@@ -2109,17 +2118,17 @@ mod tests {
     async fn unpolled_active_residual_returns_same_box_without_blocking_another_registration() {
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(71);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let owner = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         let actor = registry.actor(&registration).unwrap();
@@ -2171,17 +2180,17 @@ mod tests {
     async fn original_active_custody_retires_only_after_exact_actor_observations() {
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(73);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut owner = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         registry
@@ -2192,8 +2201,8 @@ mod tests {
             .unwrap();
         owner
             .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::contexts(vec![
-                    crate::api::NativeContextConvergence::never_established(context),
+                crate::api::NativeAttemptConvergence::participations(vec![
+                    crate::api::NativeParticipationConvergence::never_established(participation),
                 ]),
             ))
             .await
@@ -2212,17 +2221,17 @@ mod tests {
     async fn duplicate_active_closure_keeps_original_box_and_custody_until_process_exit() {
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(74);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut owner = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         registry
@@ -2231,11 +2240,11 @@ mod tests {
             .initialization_failed(initial)
             .await
             .unwrap();
-        let fact = crate::api::NativeContextConvergence::never_established(context);
+        let fact = crate::api::NativeParticipationConvergence::never_established(participation);
         assert!(
             owner
                 .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                    crate::api::NativeAttemptConvergence::contexts(vec![fact, fact]),
+                    crate::api::NativeAttemptConvergence::participations(vec![fact, fact]),
                 ))
                 .await
                 .is_err()
@@ -2687,7 +2696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_rejects_an_unregistered_context_after_logical_identity_validation() {
+    async fn actor_rejects_an_unregistered_participation_after_logical_identity_validation() {
         let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let execution = execution(3);
         let (mut registration, initial, _output) = registry
@@ -2698,18 +2707,18 @@ mod tests {
             .into_parts();
         let foreign_execution =
             QueryExecutionId::new(QueryId::new(91, 99), AttemptId::new(1).unwrap()).unwrap();
-        let foreign_logical_context = QueryContextRef::new(
+        let foreign_logical_participation = ParticipationRef::new(
             foreign_execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
         assert_eq!(
             registry
-                .observe_worker_process_replaced(&registration, foreign_logical_context)
+                .observe_worker_process_replaced(&registration, foreign_logical_participation)
                 .await,
-            Err(LogicalExecutionRuntimeRegistryError::ContextNotRegistered)
+            Err(LogicalExecutionRuntimeRegistryError::ParticipationNotRegistered)
         );
-        let foreign = QueryContextRef::new(
+        let foreign = ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -2720,7 +2729,7 @@ mod tests {
                 .await,
             Err(LogicalExecutionRuntimeRegistryError::Actor(
                 LogicalExecutionActorError::StandDown(
-                    crate::coordination::ContextStandDownError::StandDownNotStarted,
+                    crate::coordination::ParticipationStandDownError::StandDownNotStarted,
                 ),
             ))
         );
@@ -2796,17 +2805,17 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(75);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(AtomicUsize::new(0));
         let original = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         registry
@@ -2881,17 +2890,17 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(77);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(AtomicUsize::new(0));
         let mut original = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         registry
@@ -2916,8 +2925,8 @@ mod tests {
         // This exact author receipt settles its same pre-reserved Native slot.
         original
             .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::contexts(vec![
-                    crate::api::NativeContextConvergence::never_established(context),
+                crate::api::NativeAttemptConvergence::participations(vec![
+                    crate::api::NativeParticipationConvergence::never_established(participation),
                 ]),
             ))
             .await
@@ -2942,17 +2951,17 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(78);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let drops = Arc::new(AtomicUsize::new(0));
         let mut original = registry
-            .reserve_active_native_owner(&registration, exact, &[context])
+            .reserve_active_native_owner(&registration, exact, &[participation])
             .unwrap()
             .bind(Box::new(DropTrackedActiveOwner(Arc::clone(&drops))));
         registry
@@ -2976,8 +2985,8 @@ mod tests {
         // This exact author receipt settles its same pre-reserved Native slot.
         original
             .record_and_close(crate::api::NativeActiveConvergenceClosure::Evidence(
-                crate::api::NativeAttemptConvergence::contexts(vec![
-                    crate::api::NativeContextConvergence::never_established(context),
+                crate::api::NativeAttemptConvergence::participations(vec![
+                    crate::api::NativeParticipationConvergence::never_established(participation),
                 ]),
             ))
             .await
@@ -3006,17 +3015,17 @@ mod tests {
     async fn shutdown_cut_refuses_late_native_custody_before_activation() {
         let mut registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
         let exact = execution(79);
-        let context = native_test_context(exact);
+        let participation = native_test_participation(exact);
         let installed = registry
-            .reserve(exact, vec![context])
+            .reserve(exact, vec![participation])
             .unwrap()
-            .spawn_and_install(native_custody_config(exact, context))
+            .spawn_and_install(native_custody_config(exact, participation))
             .unwrap();
         let (registration, initial, output) = installed.into_parts();
         let _output = output.into_output();
         let handle = registry.handle();
         handle.begin_shutdown();
-        let refused = handle.reserve_active_native_owner(&registration, exact, &[context]);
+        let refused = handle.reserve_active_native_owner(&registration, exact, &[participation]);
         assert!(matches!(
             refused,
             Err(LogicalExecutionRuntimeRegistryError::RegistryClosing)
@@ -3031,7 +3040,7 @@ mod tests {
             .await
             .unwrap();
         handle
-            .observe_context_never_established(&registration, context)
+            .observe_participation_never_established(&registration, participation)
             .await
             .unwrap();
         registry

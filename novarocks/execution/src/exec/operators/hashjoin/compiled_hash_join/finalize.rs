@@ -378,7 +378,7 @@ impl SourceKernel for JoinFinalizeSource {
             .as_ref()
             .map(|frame| frame.completion.observable())
     }
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         let frame = self.frame()?;
         self.control
             .checkpoint(0)
@@ -393,7 +393,7 @@ impl SourceKernel for JoinFinalizeSource {
             Ok(ControlStep::Active)
         }
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let frame = Arc::clone(self.frame()?);
         let observable = frame.completion.observable();
         let observed_generation = observable.generation();

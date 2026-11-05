@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::exec::hash_table::allocation::AggregateVec;
 use crate::exec::operators::aggregate::topn_boundary::OwnedAggregateTopNBoundaryState;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter as execution;
 use crate::runtime_filter::RuntimeFilterExecutionContract;
 use crate::runtime_filter::contribution::ContributionCodecError;
@@ -61,12 +61,12 @@ enum SessionFailure {
     Execution(ExecutionFailure),
 }
 #[derive(Debug)]
-struct AggregateTopNFailureContext<E> {
+struct AggregateTopNOperatorFailure<E> {
     binding: u32,
     operation: &'static str,
     cause: E,
 }
-impl<E: std::fmt::Display> std::fmt::Display for AggregateTopNFailureContext<E> {
+impl<E: std::fmt::Display> std::fmt::Display for AggregateTopNOperatorFailure<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
@@ -75,13 +75,13 @@ impl<E: std::fmt::Display> std::fmt::Display for AggregateTopNFailureContext<E> 
         )
     }
 }
-impl<E: std::error::Error + 'static> std::error::Error for AggregateTopNFailureContext<E> {
+impl<E: std::error::Error + 'static> std::error::Error for AggregateTopNOperatorFailure<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
     }
 }
 impl<E: novarocks_failure_contract::FailureProjection> novarocks_failure_contract::FailureProjection
-    for AggregateTopNFailureContext<E>
+    for AggregateTopNOperatorFailure<E>
 {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         self.cause.failure_fact()
@@ -101,13 +101,13 @@ impl SessionFailure {
                 binding,
                 operation,
                 cause,
-            } => ExecutionFailure::from_domain(AggregateTopNFailureContext {
+            } => ExecutionFailure::from_domain(AggregateTopNOperatorFailure {
                 binding,
                 operation,
                 cause,
             }),
             Self::Codec { binding, cause } => {
-                ExecutionFailure::from_domain(AggregateTopNFailureContext {
+                ExecutionFailure::from_domain(AggregateTopNOperatorFailure {
                     binding,
                     operation: "encode ordered contribution",
                     cause,
@@ -553,7 +553,7 @@ struct AggregateTopNProducerStream {
     local_partition_count: u32,
     next_sequence: u64,
     terminal: bool,
-    producer: Option<execution::RuntimeFilterProducerHandle>,
+    producer: Option<execution::SharedRuntimeFilterProducer>,
 }
 impl AggregateTopNProducerStream {
     fn new(
@@ -903,7 +903,7 @@ mod tests {
             &self,
             request: execution::RuntimeFilterProducerOpenRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterProducer>,
             execution::RuntimeFilterContractViolation,
         > {
             self.state.record(Event::Open {
@@ -934,7 +934,7 @@ mod tests {
             &self,
             _: execution::RuntimeFilterSubscriptionRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
             execution::RuntimeFilterContractViolation,
         > {
             Err(execution::RuntimeFilterContractViolation::new(
@@ -948,7 +948,7 @@ mod tests {
             _: execution::RuntimeFilterFinalDomainOpenRequest,
         ) -> Result<
             execution::RuntimeFilterBindOutcome<
-                execution::RuntimeFilterFinalDomainCompletionHandle,
+                execution::SharedRuntimeFilterFinalDomainCompletion,
             >,
             execution::RuntimeFilterContractViolation,
         > {
@@ -976,7 +976,7 @@ mod tests {
             specs: &[novarocks_local_program::AggregateTopNFilter],
             session: execution::RuntimeFilterSessionRef,
             dop: i32,
-        ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        ) -> crate::runtime::task::ExecutionResult<Self> {
             let (_tracker, host) = owned_host();
             let control = OwnedControl::pass();
             let actual = AggregateTopNProducerSessionFactory::try_from_compiled(
@@ -995,7 +995,7 @@ mod tests {
             &self,
             dop: i32,
             index: i32,
-        ) -> crate::runtime::fragment::ExecutionResult<TestSession> {
+        ) -> crate::runtime::task::ExecutionResult<TestSession> {
             Ok(TestSession {
                 actual: self
                     .actual
@@ -1009,25 +1009,25 @@ mod tests {
         control: OwnedControl,
     }
     impl TestSession {
-        fn bind(&mut self) -> crate::runtime::fragment::ExecutionResult<()> {
+        fn bind(&mut self) -> crate::runtime::task::ExecutionResult<()> {
             self.actual.bind_owned(&self.control)
         }
         fn submit_pending(
             &mut self,
             boundaries: &mut [super::OwnedAggregateTopNBoundaryState],
-        ) -> crate::runtime::fragment::ExecutionResult<()> {
+        ) -> crate::runtime::task::ExecutionResult<()> {
             self.actual.submit_pending_owned(boundaries, &self.control)
         }
         fn finish(
             &mut self,
             boundaries: &mut [super::OwnedAggregateTopNBoundaryState],
-        ) -> crate::runtime::fragment::ExecutionResult<()> {
+        ) -> crate::runtime::task::ExecutionResult<()> {
             self.actual.finish_owned(boundaries, &self.control)
         }
         fn fail(
             &mut self,
             reason: execution::RuntimeFilterProducerFailure,
-        ) -> crate::runtime::fragment::ExecutionResult<()> {
+        ) -> crate::runtime::task::ExecutionResult<()> {
             self.actual.fail_owned(reason)
         }
     }
@@ -1516,11 +1516,11 @@ mod tests {
         .unwrap();
         let mut session = factory.create_for_driver_owned(1, 0, &control).unwrap();
         let cause = session.bind_owned(&control).unwrap_err();
-        let crate::runtime::fragment::ExecutionFailureCause::Domain(shared) = cause.cause() else {
+        let crate::runtime::task::ExecutionFailureCause::Domain(shared) = cause.cause() else {
             panic!("the contextual failure must retain its original domain source: {cause:?}");
         };
         let context = shared
-            .downcast_ref::<super::AggregateTopNFailureContext<
+            .downcast_ref::<super::AggregateTopNOperatorFailure<
                 execution::RuntimeFilterContractViolation,
             >>()
             .expect("context retains the nominal runtime-filter cause");
@@ -1594,7 +1594,7 @@ mod tests {
                 .unwrap_err();
                 assert_eq!(
                     error.cause(),
-                    &crate::runtime::fragment::ExecutionFailureCause::Kernel(cause.clone())
+                    &crate::runtime::task::ExecutionFailureCause::Kernel(cause.clone())
                 );
                 assert_eq!(control.calls.load(Ordering::SeqCst), refuse_at + 1);
                 assert_eq!(
@@ -1642,9 +1642,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::Kernel(
-                KernelFailure::DeadlineExceeded
-            )
+            &crate::runtime::task::ExecutionFailureCause::Kernel(KernelFailure::DeadlineExceeded)
         );
         session
             .finish_owned(std::slice::from_mut(&mut boundary), &control)
@@ -1684,9 +1682,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.cause(),
-            &crate::runtime::fragment::ExecutionFailureCause::Kernel(
-                KernelFailure::ResourceExhausted
-            )
+            &crate::runtime::task::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
         );
         assert!(state.events().is_empty());
         assert_eq!(tracker.current(), 0);

@@ -45,9 +45,9 @@ use super::aggregate_fixture::{
 };
 use super::family_fixture::{FixtureControl, cell, int64, int64_rows};
 use crate::exec::chunk::Chunk;
-use crate::exec::operators::ResultSinkHandle;
+use crate::exec::operators::ResultSinkBuffer;
 use crate::exec::pipeline::binding::ExchangeBindings;
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
+use crate::runtime::task::io::exchange::test_support::Fixture;
 
 const SOURCE: FragmentId = FragmentId::new(1);
 const PARTIAL: FragmentId = FragmentId::new(2);
@@ -433,7 +433,7 @@ fn try_run_two_phase(
     }
     let mut results = Vec::new();
     for (instance, bindings) in finals.iter().zip(final_bindings) {
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         try_run_in_fixture(
             &fixture,
             &last,
@@ -588,7 +588,7 @@ fn run_single(
     let mut packages = packages(plan, catalog);
     let program = compile(packages.remove(&SOURCE).unwrap(), catalog, DOP, true);
     assert_eq!(grouping(&program), CompiledAggregateGrouping::Complete);
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     try_run(
         &program,
         result_sink(&program, SOURCE_FINST, &output),
@@ -885,7 +885,7 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
         aggregate_catalog, compile_with_providers, packages_with_reads, try_run_with_scans,
     };
     use crate::exec::pipeline::binding::ScanBindings;
-    use crate::runtime::fragment::scan::compiled_fixture::{
+    use crate::runtime::task::scan::compiled_fixture::{
         FixtureScanOp, add_typed_scan, providers, scan_chunk,
     };
     use novarocks_connector_contract::FrozenConnectorRead;
@@ -985,8 +985,8 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
             let keys = bindings
                 .node_ids()
                 .map(
-                    |node| crate::runtime::fragment::io::exchange_receiver::ExchangeReceiverKey {
-                        fragment_instance_id: final_instance,
+                    |node| crate::runtime::task::io::exchange_receiver::ExchangeReceiverKey {
+                        task_key: final_instance,
                         node_id: node,
                     },
                 )
@@ -1042,7 +1042,7 @@ fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two(
                     "the empty sibling's EOS participates too"
                 );
             }
-            let output = ResultSinkHandle::new();
+            let output = ResultSinkBuffer::new();
             try_run_in_fixture(
                 &fixture,
                 &last,

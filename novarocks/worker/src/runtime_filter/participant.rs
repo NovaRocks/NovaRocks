@@ -190,11 +190,11 @@ impl WorkerRuntimeFilterParticipant {
 
     pub fn session_for_fragment(
         &self,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         outbound: Arc<dyn RuntimeFilterParticipantOutbound>,
     ) -> RuntimeFilterSessionRef {
         Arc::new(WorkerRuntimeFilterExecutionSession::new(
-            fragment_instance_id,
+            task_key,
             self.install.participant(),
             self.producer_sessions.clone(),
             self.consumer_sessions.clone(),
@@ -236,14 +236,14 @@ impl WorkerRuntimeFilterParticipant {
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     ) -> BackendIngressResult {
         dispatch_producer_failure(
             &self.install,
             &self.producer_sessions,
             channel_id,
             binding_id,
-            fragment_instance_id,
+            task_key,
         )
     }
 
@@ -281,13 +281,8 @@ impl WorkerRuntimeFilterParticipant {
         }
     }
 
-    pub fn record_row_effect(
-        &self,
-        fragment_instance_id: UniqueId,
-        effect: RuntimeFilterRowEffect,
-    ) {
-        let Some(identity) = self.consumer_identity(effect.binding_id(), fragment_instance_id)
-        else {
+    pub fn record_row_effect(&self, task_key: UniqueId, effect: RuntimeFilterRowEffect) {
+        let Some(identity) = self.consumer_identity(effect.binding_id(), task_key) else {
             return;
         };
         self.observation
@@ -302,7 +297,7 @@ impl WorkerRuntimeFilterParticipant {
     fn consumer_identity(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     ) -> Option<BackendConsumerSubscriptionIdentity> {
         let session = self.consumer_sessions.get(&binding_id)?;
         Some(BackendConsumerSubscriptionIdentity::new(
@@ -312,7 +307,7 @@ impl WorkerRuntimeFilterParticipant {
                 session.channel().channel_id(),
             ),
             binding_id,
-            fragment_instance_id,
+            task_key,
         ))
     }
 }

@@ -169,7 +169,7 @@ fn topn_type_description(value: &DataType) -> novarocks_failure_contract::Bounde
 }
 impl novarocks_failure_contract::FailureProjection for AggregateTopNBoundaryError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let reason = match self {
             Self::UnsupportedKeyArity { .. } => ExecutionReason::TopNKeyArity,
             Self::NonOrderedContract => ExecutionReason::TopNNonOrdered,
@@ -649,8 +649,8 @@ pub(crate) fn visit_key_read_page<'a>(
     visitor: &mut impl FnMut(
         usize,
         Option<OrderedScalarRef<'a>>,
-    ) -> crate::runtime::fragment::ExecutionResult<()>,
-) -> crate::runtime::fragment::ExecutionResult<()> {
+    ) -> crate::runtime::task::ExecutionResult<()>,
+) -> crate::runtime::task::ExecutionResult<()> {
     use crate::exec::hash_table::key_index::KeyReadValues;
     control.checkpoint(0)?;
     if contract.keys().len() != 1 {

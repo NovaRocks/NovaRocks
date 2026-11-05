@@ -26,7 +26,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+use novarocks_spi::connector::read_stack::ConnectorReadRegistrationPin;
 use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
 use novarocks_spi::connector::{
     CatalogProperties, ConnectorControlFactoryRequest, ConnectorDocumentStorageBinding,
@@ -242,7 +242,7 @@ fn materialize_control_blocking(
                         "Iceberg control generation installed more than one typed read group",
                     ));
                 }
-                Ok(Arc::new(RoleReadRegistrationLease))
+                Ok(Arc::new(RoleReadRegistrationPin))
             },
         ));
     let request = ConnectorControlFactoryRequest::try_new(
@@ -448,9 +448,9 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
 
 /// Marker retained by the control generation while the named read group is
 /// alive. The role host, rather than this provider, owns registry retirement.
-struct RoleReadRegistrationLease;
+struct RoleReadRegistrationPin;
 
-impl ConnectorReadRegistrationLease for RoleReadRegistrationLease {}
+impl ConnectorReadRegistrationPin for RoleReadRegistrationPin {}
 
 fn ensure_iceberg(properties: &CatalogProperties) -> Result<(), ConnectorMaterializationError> {
     if properties.provider_id().as_str() == "iceberg" {
@@ -477,7 +477,7 @@ mod tests {
 
     use super::*;
     use novarocks_fs::{
-        FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::connector_write::{
@@ -545,13 +545,13 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(scan_runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(scan_runtime.handle().clone())),
         );
         let write_access = crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(data_runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(data_runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(data_runtime.handle().clone())),
         );
         let read_context = read_access
             .file_read_context(
@@ -567,8 +567,8 @@ mod tests {
             .expect("write context");
         assert!(!Arc::ptr_eq(&read_context.runtime, &write_context.runtime));
         assert!(!Arc::ptr_eq(
-            &read_context.task_spawner,
-            &write_context.task_spawner
+            &read_context.io_spawner,
+            &write_context.io_spawner
         ));
         let factory = IcebergExecutionRoleBindingFactory::new(
             IcebergExecutionResources::new(
@@ -679,7 +679,7 @@ mod tests {
             Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+            Arc::new(TokioFileIoSpawner::new(handle.clone())),
         );
         let access = crate::access_binding::IcebergReadBinding::with_metadata_credential_resolver(
             fs,
@@ -774,7 +774,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
-            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current())),
+            Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current())),
         );
         let factory = IcebergControlRoleBindingFactory::new(
             IcebergMetadataResources::new(access, tokio::runtime::Handle::current()),

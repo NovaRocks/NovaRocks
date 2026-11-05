@@ -82,14 +82,14 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{HydrateInput, Source, SourceKernel, Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 /// Target bytes of one state backing block of the finish's target groups.
@@ -201,10 +201,10 @@ fn writer_binding_matches(
         })
         .map_err(|failure| match failure {
             Failure::Creator(cause) => ExecutionFailure::from(cause),
-            Failure::Source(cause) => ConstructionFailure::Source(
-                crate::runtime::fragment::SharedDomainFailure::new(cause),
-            )
-            .into(),
+            Failure::Source(cause) => {
+                ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(cause))
+                    .into()
+            }
         })
 }
 
@@ -752,9 +752,7 @@ impl CompiledWriterPartialProcessor {
                     .clone(),
             )
             .map_err(|cause| {
-                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
-                    cause,
-                ))
+                ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(cause))
             })?;
             let encoding = call.handle.argument_encoding(0)?;
             let input = SelectedAggregateUpdateInput::try_new_with_typed_sources(
@@ -849,9 +847,9 @@ impl OperatorLifecycle for CompiledWriterPartialProcessor {
                         actual_input.clone(),
                     )
                     .map_err(|cause| {
-                        ConstructionFailure::Source(
-                            crate::runtime::fragment::SharedDomainFailure::new(cause),
-                        )
+                        ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(
+                            cause,
+                        ))
                     })?;
                 if !writer_binding_matches(expected_input, &actual_input, owner.as_ref())?
                     || actual_input.nullable() && !expected_input.nullable()
@@ -880,7 +878,7 @@ impl OperatorLifecycle for CompiledWriterPartialProcessor {
                     output.clone(),
                 )
                 .map_err(|cause| {
-                    ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                    ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(
                         cause,
                     ))
                 })?;
@@ -947,13 +945,13 @@ impl InputEncodingPolicy for CompiledWriterPartialProcessor {
 impl TransformKernel for CompiledWriterPartialProcessor {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.input = Some(input.into_uncovered_chunk()?);
         self.drive(ctx)
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
@@ -971,7 +969,7 @@ impl TransformKernel for CompiledWriterPartialProcessor {
         }
         Ok(StepResult::new(None, NextStep::NeedInput, 0))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.finishing = true;
         self.drive(ctx)
     }
@@ -1400,8 +1398,12 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                     "table finish final aggregate produced a null grouping key",
                 )));
             }
-            let target = target_ordinal_from_wire(groups.value(row))
-                .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?;
+            let target = target_ordinal_from_wire(groups.value(row)).map_err(|cause| {
+                crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                    crate::runtime::task::connector_failure::ConnectorOperation::DecodeWriteTarget,
+                    cause,
+                )
+            })?;
             if !seen.insert(target.get()) {
                 return Err(ExecutionFailure::from(FragmentBindingError::new(
                     FragmentBindingTarget::Program,
@@ -1849,7 +1851,7 @@ impl CompiledWriterFinalAggregate {
                 )));
             }
             let target = target_ordinal_from_wire(targets.value(row))
-                .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?
+                .map_err(|cause| crate::runtime::task::connector_failure::ConnectorCallFailure::new(crate::runtime::task::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?
                 .get();
             let next = self.groups.len();
             let group = *self.groups.entry(target).or_insert(next);
@@ -2129,7 +2131,7 @@ impl InputEncodingPolicy for CompiledWriterFinalAggregate {}
 impl TransformKernel for CompiledWriterFinalAggregate {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -2142,7 +2144,7 @@ impl TransformKernel for CompiledWriterFinalAggregate {
         }
         Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.output
             .as_ref()
             .ok_or(ConstructionFailure::MissingOwner)?;
@@ -2254,7 +2256,7 @@ impl GroupedUnpivotKernel for CompiledGroupedUnpivot {
     }
 }
 impl SourceKernel for CompiledGroupedUnpivot {
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if self.next == self.targets.len() {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         }

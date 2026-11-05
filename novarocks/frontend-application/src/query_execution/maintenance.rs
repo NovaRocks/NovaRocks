@@ -427,9 +427,9 @@ impl RequestScopedMaintenanceEngine {
     pub(crate) async fn reject_direct_rewrite_on_mv(
         &self,
         target: &MaintenanceTarget,
-        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
     ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
             self.kernel.mv_storage_observation().as_ref(),
             exact_lease,
             self.kernel.mv_readiness().as_ref(),
@@ -448,10 +448,10 @@ impl RequestScopedMaintenanceEngine {
     pub(crate) async fn reject_direct_rewrite_on_mv_governed(
         &self,
         target: &MaintenanceTarget,
-        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        exact_lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
         cpu: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
     ) -> Result<(), novarocks_query_application::session_error::QueryServiceError> {
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(
             self.kernel.mv_storage_observation().as_ref(),
             exact_lease,
             self.kernel.mv_readiness().as_ref(),
@@ -566,7 +566,7 @@ fn capture_admitted_optimize_target_with_ports(
         ConnectorTableJobAdmission::Detached => OptimizeCompletionMode::Detached,
         ConnectorTableJobAdmission::AwaitTerminal => OptimizeCompletionMode::AwaitTerminal,
     };
-    let context = crate::connector::context_for_planning_lease(&lease, context)?;
+    let context = crate::connector::context_for_planning_pin(&lease, context)?;
     let captured = lease
         .binding()
         .metadata()
@@ -1202,7 +1202,7 @@ fn prepare_rewrite_cohort_recipe(
             let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
                 frozen_source: None,
-                planning_lease: session.lease().planning_lease(),
+                planning_pin: session.rewrite().planning_pin(),
                 _original: None,
             };
             let source_binding =
@@ -1228,7 +1228,7 @@ fn prepare_rewrite_cohort_recipe(
             let read = crate::query_execution::cohort_read::QueryRewriteGroupRead {
                 group: group.clone(),
                 group_digest: cohort.group_digest(),
-                planning_lease: session.lease().planning_lease(),
+                planning_pin: session.rewrite().planning_pin(),
             };
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
@@ -1262,7 +1262,7 @@ fn prepare_rewrite_cohort_recipe(
             table_bindings.as_ref(),
             rewrite_target_identity(session, cohort_id),
             write_target,
-            session.lease().planning_lease(),
+            session.rewrite().planning_pin(),
         )?;
     let sink =
         crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
@@ -1457,7 +1457,7 @@ fn rewrite_target_identity(
 ) -> novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity {
     novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
         session
-            .lease()
+            .rewrite()
             .descriptor()
             .instance_id
             .as_str()
@@ -1653,9 +1653,9 @@ mod maintenance_attempt_context_tests {
             fn acquire_current(
                 &self,
                 _: &ConnectorInstanceId,
-            ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+            ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
                 let index = self.acquired.fetch_add(1, Ordering::AcqRel);
-                Ok(ConnectorControlPlanningLease::new(
+                Ok(ConnectorControlPlanningPin::new(
                     Arc::clone(&self.generations[index.min(1)]),
                     || {},
                 ))

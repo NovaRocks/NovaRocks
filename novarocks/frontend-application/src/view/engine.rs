@@ -152,11 +152,11 @@ impl ViewEngine for FrontendViewEngine {
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalViewResolution, String> {
-        let lease = crate::connector::acquire_metadata_planning_lease(
+        let lease = crate::connector::acquire_metadata_planning_pin(
             self.connector_control(),
             &target.catalog,
         )?;
-        if crate::connector::metadata_table_exists_with_planning_lease(
+        if crate::connector::metadata_table_exists_with_planning_pin(
             lease.clone(),
             context.clone(),
             &target.database,
@@ -208,11 +208,11 @@ impl ViewEngine for FrontendViewEngine {
         Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let lease = crate::connector::acquire_metadata_planning_lease(
+            let lease = crate::connector::acquire_metadata_planning_pin(
                 self.connector_control(),
                 &target.catalog,
             )?;
-            if crate::connector::metadata_table_exists_with_planning_lease_async(
+            if crate::connector::metadata_table_exists_with_planning_pin_async(
                 lease.clone(),
                 context.clone(),
                 &target.database,
@@ -350,7 +350,7 @@ impl ViewEngine for FrontendViewEngine {
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String> {
-        let lease = crate::connector::acquire_metadata_planning_lease(
+        let lease = crate::connector::acquire_metadata_planning_pin(
             self.connector_control(),
             &target.catalog,
         )?;

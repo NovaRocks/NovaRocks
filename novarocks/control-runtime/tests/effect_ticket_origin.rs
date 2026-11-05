@@ -18,9 +18,9 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, EffectTicket},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket},
+    obligation::{ReservationObligation, WorkObligation},
     publication::{PublishedReply, PublishedSnapshot},
     transaction::{RuntimeLedger, ScopeHandle},
 };
@@ -49,7 +49,7 @@ impl Actor for Publisher {
         _now: Tick,
         _input: InputEnvelope,
         value: u64,
-        step: &mut StepContext<'_, u64>,
+        step: &mut ActorStep<'_, u64>,
     ) {
         step.effect(
             EffectDescriptor {
@@ -69,7 +69,7 @@ impl Actor for Publisher {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        _step: &mut StepContext<'_, u64>,
+        _step: &mut ActorStep<'_, u64>,
     ) {
     }
 }
@@ -81,8 +81,8 @@ struct Fixture {
     scope: ScopeHandle,
     runtime: ActorRuntime<Publisher>,
     input: InputId,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
 }
 impl Fixture {
     fn new() -> (Self, EffectTicket<u64>) {
@@ -197,15 +197,18 @@ fn same_numeric_runtime_records_cannot_borrow_foreign_publication_authority() {
     first.finish(ticket);
     second.finish(second_ticket);
     let (error, returned_snapshot) = snapshot_result.unwrap_err();
-    assert_eq!(error, DriverError::EffectTicketOriginMismatch);
+    assert_eq!(error, ActorTurnError::EffectTicketOriginMismatch);
     assert!(Arc::ptr_eq(&returned_snapshot, &next_snapshot));
     let (error, returned_reply) = reply_result.unwrap_err();
-    assert_eq!(error, DriverError::EffectTicketOriginMismatch);
+    assert_eq!(error, ActorTurnError::EffectTicketOriginMismatch);
     assert!(Arc::ptr_eq(&returned_reply, &next_reply));
-    assert_eq!(validation, Err(DriverError::EffectTicketOriginMismatch));
-    assert_eq!(reservation, Some(DriverError::EffectTicketOriginMismatch));
-    assert_eq!(failure, Some(DriverError::EffectTicketOriginMismatch));
-    assert_eq!(external, Err(DriverError::EffectTicketOriginMismatch));
+    assert_eq!(validation, Err(ActorTurnError::EffectTicketOriginMismatch));
+    assert_eq!(
+        reservation,
+        Some(ActorTurnError::EffectTicketOriginMismatch)
+    );
+    assert_eq!(failure, Some(ActorTurnError::EffectTicketOriginMismatch));
+    assert_eq!(external, Err(ActorTurnError::EffectTicketOriginMismatch));
     assert_eq!(snapshot_value, 0);
     assert!(!reply_committed);
 }
@@ -228,7 +231,7 @@ fn refused_foreign_completion_returns_original_ticket_to_its_actual_runtime() {
                 .unwrap();
             first.finish(refusal.ticket);
             second.finish(second_ticket);
-            assert_eq!(error, DriverError::EffectTicketOriginMismatch);
+            assert_eq!(error, ActorTurnError::EffectTicketOriginMismatch);
             assert_eq!(original_effect, 7);
         }
         Ok(()) => {
@@ -251,6 +254,6 @@ fn current_validation_does_not_reject_original_late_external_fact_or_exit() {
     let current = fixture.runtime.validate_effect_ticket(&ticket);
     let external = fixture.runtime.observe_external_publication(&ticket);
     fixture.finish(ticket);
-    assert_eq!(current, Err(DriverError::FailurePublicationRequired));
+    assert_eq!(current, Err(ActorTurnError::FailurePublicationRequired));
     assert_eq!(external, Ok(()));
 }

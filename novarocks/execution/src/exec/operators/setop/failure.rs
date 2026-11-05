@@ -16,8 +16,8 @@
 // under the License.
 
 //! Set-operation state facts; callees keep their own construction causes.
-use crate::runtime::fragment::ExecutionFailure;
-use crate::runtime::fragment::ExecutionReason;
+use crate::runtime::task::ExecutionFailure;
+use crate::runtime::task::ExecutionReason;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use std::fmt;
 #[derive(Debug)]

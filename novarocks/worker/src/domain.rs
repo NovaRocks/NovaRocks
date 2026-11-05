@@ -22,10 +22,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_execution_contract::{
-    ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
+    ConfidentialContent, ContentFingerprint, CredentialDomainId, CredentialEpoch, CredentialUpdate,
     DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion, EdgeSendPermission,
-    ExchangeEdgeId, PlanNodeId, PlanNodeSplitReceipt, QueryContextDomainReceipt,
-    QueryContextDomainUpdate, SplitOffer, SplitSequence, SplitWatermark, TaskDescriptor,
+    ExchangeEdgeId, ParticipationDomainReceipt, ParticipationDomainUpdate, PlanNodeId,
+    PlanNodeSplitReceipt, SplitOffer, SplitSequence, SplitWatermark, TaskDescriptor,
     TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
 };
 
@@ -198,7 +198,7 @@ impl SplitDomain {
 /// Accepted credential epoch and its exact confidential replay material.
 #[derive(Clone)]
 struct CredentialDomain {
-    lease_id: CredentialLeaseId,
+    credential_domain_id: CredentialDomainId,
     accepted_epoch: CredentialEpoch,
     material: Arc<dyn ConfidentialContent>,
 }
@@ -207,7 +207,7 @@ impl fmt::Debug for CredentialDomain {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CredentialDomain")
-            .field("lease_id", &self.lease_id)
+            .field("credential_domain_id", &self.credential_domain_id)
             .field("accepted_epoch", &self.accepted_epoch)
             .field("material", &"[REDACTED]")
             .finish()
@@ -216,12 +216,12 @@ impl fmt::Debug for CredentialDomain {
 
 impl CredentialDomain {
     pub fn install(
-        lease_id: CredentialLeaseId,
+        credential_domain_id: CredentialDomainId,
         epoch: CredentialEpoch,
         material: Arc<dyn ConfidentialContent>,
     ) -> Self {
         Self {
-            lease_id,
+            credential_domain_id,
             accepted_epoch: epoch,
             material,
         }
@@ -232,13 +232,13 @@ impl CredentialDomain {
     }
 
     pub fn matches(&self, update: &CredentialUpdate) -> bool {
-        self.lease_id == update.lease_id()
+        self.credential_domain_id == update.credential_domain_id()
             && self.accepted_epoch == update.epoch()
             && update.matches_installed(&*self.material)
     }
 
     fn classify(&self, update: &CredentialUpdate) -> DomainProgression {
-        if update.lease_id() != self.lease_id {
+        if update.credential_domain_id() != self.credential_domain_id {
             return DomainProgression::Conflict(DomainConflict::UnknownMember);
         }
         if update.epoch() == self.accepted_epoch {
@@ -407,13 +407,13 @@ impl TaskDomains {
 
 /// Worker-owned shared domain state for one query context.
 #[derive(Clone, Debug, Default)]
-pub struct QueryContextDomains {
+pub struct ParticipationDomains {
     catalog: ScalarDomain,
     shared_filter: ScalarDomain,
     credential: Option<CredentialDomain>,
 }
 
-impl QueryContextDomains {
+impl ParticipationDomains {
     pub fn empty() -> Self {
         Self::default()
     }
@@ -421,7 +421,7 @@ impl QueryContextDomains {
     pub fn install_initial(
         catalog: ContentFingerprint,
         shared_filter: ContentFingerprint,
-        credential_lease: CredentialLeaseId,
+        credential_domain_id: CredentialDomainId,
         credential_epoch: CredentialEpoch,
         credential_material: Arc<dyn ConfidentialContent>,
     ) -> Self {
@@ -429,7 +429,7 @@ impl QueryContextDomains {
             catalog: ScalarDomain::empty().apply(DomainVersion::FIRST, catalog),
             shared_filter: ScalarDomain::empty().apply(DomainVersion::FIRST, shared_filter),
             credential: Some(CredentialDomain::install(
-                credential_lease,
+                credential_domain_id,
                 credential_epoch,
                 credential_material,
             )),
@@ -442,30 +442,30 @@ impl QueryContextDomains {
             .is_none_or(|credential| credential.matches(update))
     }
 
-    pub fn classify(&self, update: &QueryContextDomainUpdate) -> DomainProgression {
+    pub fn classify(&self, update: &ParticipationDomainUpdate) -> DomainProgression {
         match update {
-            QueryContextDomainUpdate::CatalogBinding { version, payload } => {
+            ParticipationDomainUpdate::CatalogBinding { version, payload } => {
                 self.catalog.classify(*version, payload.fingerprint())
             }
-            QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
+            ParticipationDomainUpdate::SharedDynamicFilter { version, payload } => {
                 self.shared_filter.classify(*version, payload.fingerprint())
             }
-            QueryContextDomainUpdate::Credential(update) => self.credential.as_ref().map_or(
+            ParticipationDomainUpdate::Credential(update) => self.credential.as_ref().map_or(
                 DomainProgression::Conflict(DomainConflict::UnknownMember),
                 |credential| credential.classify(update),
             ),
         }
     }
 
-    pub fn apply(&mut self, update: &QueryContextDomainUpdate) {
+    pub fn apply(&mut self, update: &ParticipationDomainUpdate) {
         match update {
-            QueryContextDomainUpdate::CatalogBinding { version, payload } => {
+            ParticipationDomainUpdate::CatalogBinding { version, payload } => {
                 self.catalog = self.catalog.apply(*version, payload.fingerprint());
             }
-            QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
+            ParticipationDomainUpdate::SharedDynamicFilter { version, payload } => {
                 self.shared_filter = self.shared_filter.apply(*version, payload.fingerprint());
             }
-            QueryContextDomainUpdate::Credential(update) => {
+            ParticipationDomainUpdate::Credential(update) => {
                 if let Some(credential) = &mut self.credential {
                     credential.apply(update);
                 }
@@ -475,30 +475,32 @@ impl QueryContextDomains {
 
     pub fn receipt(
         &self,
-        update: &QueryContextDomainUpdate,
+        update: &ParticipationDomainUpdate,
         progression: DomainProgression,
-    ) -> QueryContextDomainReceipt {
+    ) -> ParticipationDomainReceipt {
         match update {
-            QueryContextDomainUpdate::CatalogBinding { .. } => {
-                QueryContextDomainReceipt::CatalogBinding {
+            ParticipationDomainUpdate::CatalogBinding { .. } => {
+                ParticipationDomainReceipt::CatalogBinding {
                     accepted_version: self.catalog.accepted_version(),
                     progression,
                 }
             }
-            QueryContextDomainUpdate::SharedDynamicFilter { .. } => {
-                QueryContextDomainReceipt::SharedDynamicFilter {
+            ParticipationDomainUpdate::SharedDynamicFilter { .. } => {
+                ParticipationDomainReceipt::SharedDynamicFilter {
                     accepted_version: self.shared_filter.accepted_version(),
                     progression,
                 }
             }
-            QueryContextDomainUpdate::Credential(update) => QueryContextDomainReceipt::Credential {
-                lease_id: update.lease_id(),
-                accepted_epoch: self
-                    .credential
-                    .as_ref()
-                    .map_or(update.epoch(), CredentialDomain::accepted_epoch),
-                progression,
-            },
+            ParticipationDomainUpdate::Credential(update) => {
+                ParticipationDomainReceipt::Credential {
+                    credential_domain_id: update.credential_domain_id(),
+                    accepted_epoch: self
+                        .credential
+                        .as_ref()
+                        .map_or(update.epoch(), CredentialDomain::accepted_epoch),
+                    progression,
+                }
+            }
         }
     }
 }
@@ -859,7 +861,7 @@ mod tests {
         ExchangeEdgeDomain, ScalarDomain,
     };
     use novarocks_execution_contract::{
-        ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
+        ConfidentialContent, ContentFingerprint, CredentialDomainId, CredentialEpoch,
         CredentialUpdate, DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion,
         EdgeSendPermission, ExchangeEdgeId, SplitOffer, SplitSequence, TaskIdentity,
     };
@@ -963,7 +965,7 @@ mod tests {
 
     #[test]
     fn credential_equality_stays_with_the_worker_owner() {
-        let lease = CredentialLeaseId::new(7);
+        let lease = CredentialDomainId::new(7);
         let mut domain = CredentialDomain::install(lease, CredentialEpoch::FIRST, secret(1));
         let replay = CredentialUpdate::new(lease, CredentialEpoch::FIRST, secret(1));
         assert_eq!(domain.classify(&replay), DomainProgression::Idempotent);

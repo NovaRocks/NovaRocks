@@ -69,7 +69,7 @@ fn mem_a1_task_binding_preserves_full_attempt_and_exact_authority_without_grant(
 #[test]
 fn mem_a1_driver_bindings_share_the_installed_account_and_never_mint_domains() {
     use crate::exec::pipeline::driver::PipelineDriverBindings;
-    use crate::runtime::fragment::io::NoopFragmentEventSink;
+    use crate::runtime::task::io::NoopTaskEventSink;
     let authority = authority();
     let account = authority
         .create_account(AccountKind::Work, ExternalRef::NONE)
@@ -77,10 +77,10 @@ fn mem_a1_driver_bindings_share_the_installed_account_and_never_mint_domains() {
     let binding =
         QueryMemoryBinding::try_new(execution(1), authority.clone(), account.clone()).unwrap();
     let before = authority.root().committed_bytes();
-    let first = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
+    let first = PipelineDriverBindings::new(Arc::new(NoopTaskEventSink))
         .with_query_memory(Some(binding.clone()));
-    let second = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
-        .with_query_memory(Some(binding));
+    let second =
+        PipelineDriverBindings::new(Arc::new(NoopTaskEventSink)).with_query_memory(Some(binding));
     // Constructing bindings retains account capabilities only, not grants.
     drop(first);
     drop(second);
@@ -92,8 +92,8 @@ fn mem_a1_driver_bindings_share_the_installed_account_and_never_mint_domains() {
 fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_use() {
     use crate::exec::pipeline::driver::{PipelineDriver, PipelineDriverBindings};
     use crate::runtime::execution_runtime::test_execution_runtime;
-    use crate::runtime::fragment::io::NoopFragmentEventSink;
-    use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+    use crate::runtime::task::io::NoopTaskEventSink;
+    use crate::runtime::task::runtime_state::{RuntimeStateInputs, build_runtime_state};
     let runtime = test_execution_runtime();
     let account = runtime
         .memory_authority()
@@ -108,7 +108,7 @@ fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_u
     let inputs = |task: Option<TaskIdentity>, query: Option<QueryId>| RuntimeStateInputs {
         query_options: None,
         query_id: query,
-        fragment_instance_id: None,
+        task_key: None,
         backend_num: None,
         mem_tracker: None,
         runtime_filter_session: None,
@@ -153,7 +153,7 @@ fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_u
             .id(),
         account.id()
     );
-    let bindings = PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink))
+    let bindings = PipelineDriverBindings::new(Arc::new(NoopTaskEventSink))
         .with_query_memory(state.query_memory().cloned());
     assert_eq!(
         bindings.query_memory().unwrap().account().id(),

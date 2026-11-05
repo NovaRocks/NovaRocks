@@ -43,7 +43,7 @@ impl ConnectorResourceCheckpoint {
     }
 }
 
-pub trait ConnectorResourceLease: Send {
+pub trait ConnectorReservationBackend: Send {
     fn bytes(&self) -> u64;
     fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError>;
     fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError>;
@@ -56,7 +56,7 @@ pub trait ConnectorResourceLedger: Send + Sync {
         &self,
         class: ConnectorResourceClass,
         bytes: u64,
-    ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError>;
+    ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError>;
 }
 
 /// Mandatory resource capability for a backend reader or page source.
@@ -100,14 +100,14 @@ fn reserve(
     }
     Ok(ConnectorResourceReservation {
         class,
-        lease: ledger.try_reserve(class, bytes)?,
+        backend: ledger.try_reserve(class, bytes)?,
     })
 }
 
 #[must_use = "dropping a connector reservation releases its host charge"]
 pub struct ConnectorResourceReservation {
     class: ConnectorResourceClass,
-    lease: Box<dyn ConnectorResourceLease>,
+    backend: Box<dyn ConnectorReservationBackend>,
 }
 
 impl ConnectorResourceReservation {
@@ -116,14 +116,14 @@ impl ConnectorResourceReservation {
     }
 
     pub fn bytes(&self) -> u64 {
-        self.lease.bytes()
+        self.backend.bytes()
     }
 
     pub fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
         if additional == 0 {
             return Ok(());
         }
-        self.lease.try_grow(additional)
+        self.backend.try_grow(additional)
     }
 
     pub fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
@@ -133,7 +133,7 @@ impl ConnectorResourceReservation {
                 "connector reservation cannot grow through shrink_to",
             ));
         }
-        self.lease.shrink_to(bytes)
+        self.backend.shrink_to(bytes)
     }
 
     pub fn release(self) {}
@@ -212,21 +212,21 @@ mod tests {
             &self,
             _class: ConnectorResourceClass,
             bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+        ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
             self.retained.fetch_add(bytes, Ordering::AcqRel);
-            Ok(Box::new(Lease {
+            Ok(Box::new(TestReservation {
                 bytes,
                 retained: Arc::clone(&self.retained),
             }))
         }
     }
 
-    struct Lease {
+    struct TestReservation {
         bytes: u64,
         retained: Arc<AtomicU64>,
     }
 
-    impl ConnectorResourceLease for Lease {
+    impl ConnectorReservationBackend for TestReservation {
         fn bytes(&self) -> u64 {
             self.bytes
         }
@@ -245,7 +245,7 @@ mod tests {
         }
     }
 
-    impl Drop for Lease {
+    impl Drop for TestReservation {
         fn drop(&mut self) {
             self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
         }

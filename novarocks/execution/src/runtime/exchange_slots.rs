@@ -40,15 +40,15 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeAdmissionStart, ExchangeAdmissionVerdict, ExchangeDecodeCommit, ExchangeDecodeToken,
-    ExchangeReceiptError, ExchangeStreamFacts, ExchangeStreamReceipt, ExchangeUnitCloseDisposition,
-    ExchangeUnitDemand, ExchangeUnitItem, ExchangeUnitSequence,
+    ExchangeReceiptError, ExchangeStreamFacts, ExchangeStreamReceiverState,
+    ExchangeUnitCloseDisposition, ExchangeUnitDemand, ExchangeUnitItem, ExchangeUnitSequence,
 };
 use novarocks_execution_contract::{ExchangeStreamIdentity, FragmentNodeId, TaskIdentity};
 use novarocks_types::{BackendProcessId, QueryExecutionId, UniqueId};
 
 use super::execution_runtime::ExchangeFlowLimits;
-use super::fragment::io::exchange_receiver::ExchangeReceiverKey;
-use super::fragment::io::exchange_unit::{
+use super::task::io::exchange_receiver::ExchangeReceiverKey;
+use super::task::io::exchange_unit::{
     ExchangeStreamObservation, ExchangeUnitReceipt, ExchangeUnitStateListener,
 };
 
@@ -106,7 +106,7 @@ impl novarocks_failure_contract::FailureProjection for ExchangeSlotError {
             Self::Receipt(source) => source.failure_fact(),
             _ => FailureFact::new(
                 FailureClass::Invariant,
-                super::fragment::ExecutionReason::ExchangeStreamContract.reason(),
+                super::task::ExecutionReason::ExchangeStreamContract.reason(),
             ),
         }
     }
@@ -116,7 +116,7 @@ impl novarocks_failure_contract::FailureProjection for ExchangeSlotError {
 #[derive(Clone, Debug)]
 pub struct ExchangeSlotRegistration {
     pub task: TaskIdentity,
-    pub fragment_instance_id: UniqueId,
+    pub task_key: UniqueId,
     pub node: FragmentNodeId,
     pub streams: Vec<ExchangeStreamIdentity>,
     pub grantable_unit_bytes: u64,
@@ -125,13 +125,13 @@ pub struct ExchangeSlotRegistration {
 impl ExchangeSlotRegistration {
     pub fn key(&self) -> ExchangeReceiverKey {
         ExchangeReceiverKey {
-            fragment_instance_id: self.fragment_instance_id,
+            task_key: self.task_key,
             node_id: self.node.get(),
         }
     }
 
     fn validate(&self) -> Result<(), ExchangeSlotError> {
-        if self.fragment_instance_id == UniqueId::new(0, 0) || self.node.get() < 0 {
+        if self.task_key == UniqueId::new(0, 0) || self.node.get() < 0 {
             return Err(ExchangeSlotError::InvalidRegistration(
                 "the destination kernel and node must be exact",
             ));
@@ -144,7 +144,7 @@ impl ExchangeSlotRegistration {
         let mut seen = HashSet::new();
         for stream in &self.streams {
             if stream.destination() != self.task
-                || stream.destination_fragment_instance_id() != self.fragment_instance_id
+                || stream.destination_task_key() != self.task_key
                 || stream.destination_node() != self.node
                 || !seen.insert(*stream)
             {
@@ -186,7 +186,7 @@ impl Drop for SlotInstance {
 }
 
 struct InstanceLedger {
-    streams: BTreeMap<ExchangeStreamIdentity, ExchangeStreamReceipt>,
+    streams: BTreeMap<ExchangeStreamIdentity, ExchangeStreamReceiverState>,
     demand: VecDeque<ExchangeStreamIdentity>,
     queued: HashSet<ExchangeStreamIdentity>,
     in_use: usize,
@@ -198,7 +198,7 @@ impl InstanceLedger {
     fn receipt_mut(
         &mut self,
         stream: ExchangeStreamIdentity,
-    ) -> Result<&mut ExchangeStreamReceipt, ExchangeSlotError> {
+    ) -> Result<&mut ExchangeStreamReceiverState, ExchangeSlotError> {
         self.streams
             .get_mut(&stream)
             .ok_or(ExchangeSlotError::UnknownStream(stream))
@@ -543,7 +543,7 @@ impl ExchangeSlotRegistry {
                 .map(|stream| {
                     (
                         stream,
-                        ExchangeStreamReceipt::try_new(self.core.limits.instance_max_slots())
+                        ExchangeStreamReceiverState::try_new(self.core.limits.instance_max_slots())
                             .expect("validated instance limit"),
                     )
                 })
@@ -735,7 +735,7 @@ impl ExchangeSlotInstance {
             decoding: state
                 .streams
                 .values()
-                .map(ExchangeStreamReceipt::decoding_positions)
+                .map(ExchangeStreamReceiverState::decoding_positions)
                 .sum(),
             pending_demands: state.queued.len(),
             closed: state.closed,
@@ -821,7 +821,7 @@ impl ExchangeSlotInstance {
         }
         match start {
             ExchangeAdmissionStart::Decode(token) => {
-                Ok(ExchangeSlotAdmission::Decode(ExchangeSlotDecodeLease {
+                Ok(ExchangeSlotAdmission::Decode(ExchangeDecodeSlotPermit {
                     core: Arc::clone(&self.core),
                     instance: Arc::clone(&self.instance),
                     stream,
@@ -1067,23 +1067,23 @@ impl ExchangeSlotInstance {
 
 #[derive(Debug)]
 pub enum ExchangeSlotAdmission {
-    Decode(ExchangeSlotDecodeLease),
+    Decode(ExchangeDecodeSlotPermit),
     Observed(ExchangeUnitReceipt),
 }
 
 /// The exact instance and stream are private, so a pure token from stream A
 /// cannot accidentally complete stream B. The lease also survives directory
 /// removal and returns a decoding slot when its actual work owner exits.
-pub struct ExchangeSlotDecodeLease {
+pub struct ExchangeDecodeSlotPermit {
     core: Arc<RegistryCore>,
     instance: Arc<SlotInstance>,
     stream: ExchangeStreamIdentity,
     token: Option<ExchangeDecodeToken>,
 }
 
-impl fmt::Debug for ExchangeSlotDecodeLease {
+impl fmt::Debug for ExchangeDecodeSlotPermit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExchangeSlotDecodeLease")
+        f.debug_struct("ExchangeDecodeSlotPermit")
             .field("stream", &self.stream)
             .field("sequence", &self.sequence())
             .finish()
@@ -1096,7 +1096,7 @@ pub struct ExchangeSlotDecodeResult {
     pub receipt: ExchangeUnitReceipt,
 }
 
-impl ExchangeSlotDecodeLease {
+impl ExchangeDecodeSlotPermit {
     pub const fn stream(&self) -> ExchangeStreamIdentity {
         self.stream
     }
@@ -1152,7 +1152,7 @@ impl ExchangeSlotDecodeLease {
     }
 }
 
-impl Drop for ExchangeSlotDecodeLease {
+impl Drop for ExchangeDecodeSlotPermit {
     fn drop(&mut self) {
         let Some(token) = self.token.take() else {
             return;

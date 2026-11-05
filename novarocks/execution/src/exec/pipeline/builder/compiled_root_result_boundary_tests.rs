@@ -121,9 +121,9 @@ fn compiled_root_result_boundary_covers_nonproject_values_root() {
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::operators::compiled_expression::CompiledProjectProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
 use crate::runtime::preparation_metadata::{CompiledSchemaPreparationScope, CompiledSchemaSite};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::{ExecutionFailureCause, ExecutionResult};
 use novarocks_local_program::{ProgramNodeId, StaticLayout};
 
 struct RecordingSchemaScope {

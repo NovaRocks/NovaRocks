@@ -132,7 +132,7 @@ impl CellCursor {
             N::List(_) if !key => {
                 let (values, start, end) = list_values(&array, row)?;
                 self.literal(b"]")?;
-                self.push(Task::List {
+                self.push(EncodeStep::List {
                     array: values,
                     next: start,
                     end,
@@ -149,7 +149,7 @@ impl CellCursor {
                     return Err(invalid());
                 }
                 self.literal(b"}")?;
-                self.push(Task::Map {
+                self.push(EncodeStep::Map {
                     array,
                     next: start,
                     end,
@@ -161,7 +161,7 @@ impl CellCursor {
             }
             N::Struct(_) if !key => {
                 self.literal(b"]")?;
-                self.push(Task::Struct {
+                self.push(EncodeStep::Struct {
                     array,
                     row,
                     path,
@@ -186,7 +186,7 @@ impl CellCursor {
                     stream.utf8 = Some(Utf8::default());
                 }
                 self.literal(b"\"")?;
-                self.push(Task::Stream(stream))?;
+                self.push(EncodeStep::Stream(stream))?;
                 self.literal(b"\"")?;
             }
             N::Variant if key => {
@@ -230,7 +230,7 @@ impl CellCursor {
                 } else {
                     "null"
                 };
-                self.push(Task::Atom(atom!(
+                self.push(EncodeStep::Atom(atom!(
                     "\"Variant[basicType={basic}, primitiveType={primitive}]\""
                 )))?;
             }
@@ -240,12 +240,12 @@ impl CellCursor {
                 let view = VariantView::parse(data)?;
                 if facts.variant_binary {
                     self.literal(b"\"}")?;
-                    self.push(Task::Stream(Stream::new(
+                    self.push(EncodeStep::Stream(Stream::new(
                         source.slice(view.metadata_end..data.len())?,
                         Mode::Base64,
                     )))?;
                     self.literal(b"\",\"value\":\"")?;
-                    self.push(Task::Stream(Stream::new(
+                    self.push(EncodeStep::Stream(Stream::new(
                         source.slice(4..view.metadata_end)?,
                         Mode::Base64,
                     )))?;
@@ -253,16 +253,16 @@ impl CellCursor {
                 } else {
                     if !facts.variant {
                         self.literal(b"\"")?;
-                        self.push(Task::JsonEscape(false))?;
+                        self.push(EncodeStep::JsonEscape(false))?;
                     }
-                    self.push(Task::Variant(Variant {
+                    self.push(EncodeStep::Variant(Variant {
                         source: source.clone(),
                         view,
                         range: view.metadata_end..data.len(),
                         depth: path.depth as usize,
                         offset: 0,
                     }))?;
-                    self.push(Task::Metadata {
+                    self.push(EncodeStep::Metadata {
                         source,
                         view,
                         next: 0,
@@ -270,7 +270,7 @@ impl CellCursor {
                         utf8: Utf8::default(),
                     })?;
                     if !facts.variant {
-                        self.push(Task::JsonEscape(true))?;
+                        self.push(EncodeStep::JsonEscape(true))?;
                         self.literal(b"\"")?;
                     }
                 }
@@ -287,7 +287,7 @@ impl CellCursor {
             | N::Timestamp { .. } => {
                 let atom = scalar(&array, row, field, facts.parametric_datetime, key, budget)?;
                 budget.scan(atom.len * 2 + 32);
-                self.push(Task::Atom(atom))?;
+                self.push(EncodeStep::Atom(atom))?;
             }
             _ => return Err(error(E::UnsupportedPresentation)),
         }

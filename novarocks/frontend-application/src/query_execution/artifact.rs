@@ -29,7 +29,7 @@ mod task_manifest_binding;
     reason = "These move-only bindings form the internal Native adapter contract."
 )]
 pub(crate) use task_manifest_binding::{
-    BoundManifestBackend, BoundManifestContext, BoundManifestEdge, BoundManifestFrozenUnits,
+    BoundManifestBackend, BoundManifestEdge, BoundManifestFrozenUnits, BoundManifestParticipation,
     BoundManifestPartitionKind, BoundManifestProducer, BoundManifestScanAssignment,
     BoundManifestScanWork, BoundManifestTask, BoundWriterCohort, FrozenAttemptTopology,
     TaskManifestBinding,
@@ -48,10 +48,10 @@ use sha2::{Digest, Sha256};
 
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
+use crate::query_execution::lifecycle_plan::{QueryCatalogPin, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterDeploymentFactsView;
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+use crate::query_execution::schedule::{SchedulingPlan, TaskPlacement};
 #[cfg(test)]
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -95,7 +95,7 @@ impl RuntimeFilterDeploymentAttachment {
 }
 
 /// Static Native plan/projection shared by every attempt of one logical
-/// execution. It owns no Connector access capability or planning lease.
+/// execution. It owns no Connector access capability or planning pin.
 pub(crate) struct PreparedDistributedNativeTemplate {
     identity: PreparedDistributedTemplateIdentity,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
@@ -626,8 +626,8 @@ impl PreparedDistributedQuery {
 
         let mut frozen_live_backends = BTreeMap::new();
         let mut backend_by_process = BTreeMap::new();
-        for context in manifest.contexts() {
-            let backend = context.backend();
+        for participation in manifest.participations() {
+            let backend = participation.backend();
             backend_by_process.insert(backend.process_id(), backend);
             match frozen_live_backends.insert(backend.backend_idx(), backend.target().clone()) {
                 Some(previous) if previous != *backend.target() => {
@@ -641,7 +641,7 @@ impl PreparedDistributedQuery {
         }
 
         let scheduling = self.scheduling_facts();
-        let mut by_fragment = BTreeMap::<FragmentId, Vec<FragmentInstancePlacement>>::new();
+        let mut by_fragment = BTreeMap::<FragmentId, Vec<TaskPlacement>>::new();
         let mut task_location = BTreeMap::new();
         for task in manifest.tasks() {
             let backend = backend_by_process
@@ -699,10 +699,10 @@ impl PreparedDistributedQuery {
                 )));
             }
             task_location.insert(task.identity(), (task.fragment_id(), task.instance_index()));
-            placements.push(FragmentInstancePlacement {
+            placements.push(TaskPlacement {
                 fragment_id: task.fragment_id(),
                 instance_index: task.instance_index(),
-                finst_id: task.fragment_instance_id(),
+                task_key: task.task_key(),
                 backend_idx: backend.backend_idx(),
                 #[cfg(test)]
                 endpoint: backend.endpoint().clone(),
@@ -714,7 +714,7 @@ impl PreparedDistributedQuery {
             .get(&manifest.root())
             .copied()
             .ok_or_else(|| contract_error("Task manifest root has no placement"))?;
-        let root_finst_id = by_fragment[&root_fragment_id][root_instance_index].finst_id;
+        let root_task_key = by_fragment[&root_fragment_id][root_instance_index].task_key;
         let root_backend_idx = by_fragment[&root_fragment_id][root_instance_index].backend_idx;
         Ok(ValidatedFragmentSchedule {
             handoff_id: self.handoff_id,
@@ -722,7 +722,7 @@ impl PreparedDistributedQuery {
             inner: SchedulingPlan {
                 root_fragment_id,
                 by_fragment,
-                root_finst_id,
+                root_task_key,
                 root_backend_idx,
             },
             frozen_live_backends,
@@ -1014,7 +1014,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
     /// It performs the same admission the lifecycle path performs before it
     /// may encode a submission -- the execution-id check and the query-wide
     /// catalog freeze -- and deliberately stops there: on the task path a
-    /// query context is established by the substrate itself, so there is no
+    /// participation is established by the substrate itself, so there is no
     /// barrier to enter and no participant manifest to compile.
     pub fn prepare_task_execution(
         self,
@@ -1028,16 +1028,15 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "task execution preparation execution id does not match validated schedule",
             ));
         }
-        let catalog_lease =
-            freeze_query_catalog_lease(&self.attempt_access, options.catalog_set())?;
-        let options = options.with_catalog_set(catalog_lease.catalog_set().clone());
+        let catalog_pin = freeze_query_catalog_lease(&self.attempt_access, options.catalog_set())?;
+        let options = options.with_catalog_set(catalog_pin.catalog_set().clone());
         Ok(TaskExecutionPreparedQuery {
             handoff_id: self.handoff_id,
             plan_facts: self.plan_facts,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options,
-            _catalog_lease: catalog_lease,
+            _catalog_pin: catalog_pin,
             runtime_filter_contributions: self.runtime_filter_contributions,
             _attempt_access: self.attempt_access,
         })
@@ -1047,8 +1046,8 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// One attempt's frozen inputs for the task protocol.
 ///
 /// It exists so that the execution-id check, the query-wide catalog freeze and
-/// the retained planning leases are done once here rather than duplicated at
-/// the call site. A query context is established by the substrate itself, so
+/// the retained planning pins are done once here rather than duplicated at
+/// the call site. A participation is established by the substrate itself, so
 /// this value goes straight from frozen facts to task creation: there is no
 /// barrier between the two for it to sit behind.
 pub struct TaskExecutionPreparedQuery {
@@ -1061,7 +1060,7 @@ pub struct TaskExecutionPreparedQuery {
     /// drops, and this value is what keeps them alive for the whole attempt.
     /// A backend still resolving a catalog through one of them must not find
     /// its planning ownership already gone.
-    _catalog_lease: QueryCatalogLease,
+    _catalog_pin: QueryCatalogPin,
     runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
     _attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
@@ -1082,7 +1081,7 @@ impl TaskExecutionPreparedQuery {
         )
     }
 
-    /// The query-wide catalog contribution every query context establishes.
+    /// The query-wide catalog contribution every participation establishes.
     pub(crate) fn catalog_set(&self) -> &CatalogSet {
         self.options.catalog_set()
     }
@@ -1162,7 +1161,7 @@ impl TaskExecutionSubmission {
 fn freeze_query_catalog_lease(
     attempt_access: &crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     existing: &CatalogSet,
-) -> Result<QueryCatalogLease, DistributedQueryError> {
+) -> Result<QueryCatalogPin, DistributedQueryError> {
     let typed_reads = attempt_access
         .iter()
         .map(|(_, _, access)| {
@@ -1177,7 +1176,7 @@ fn freeze_query_catalog_lease(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let catalog_set = merge_catalog_properties(existing, typed_reads)?;
-    Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
+    Ok(QueryCatalogPin::new(catalog_set, Vec::new()))
 }
 
 /// Add the original sealed writer's BE materialization input without resolving
@@ -1246,8 +1245,7 @@ impl ValidatedFragmentSchedule {
     /// routing decisions this schedule already froze.
     pub(crate) fn fragment_placements(
         &self,
-    ) -> &BTreeMap<FragmentId, Vec<crate::query_execution::schedule::FragmentInstancePlacement>>
-    {
+    ) -> &BTreeMap<FragmentId, Vec<crate::query_execution::schedule::TaskPlacement>> {
         &self.inner.by_fragment
     }
 
@@ -1279,9 +1277,9 @@ impl ValidatedFragmentSchedule {
     }
 }
 
-const FRAGMENT_INSTANCE_ID_DOMAIN: &[u8] = b"novarocks.query-lifecycle.fragment-instance.v1\0";
+const TASK_KEY_DOMAIN: &[u8] = b"novarocks.query-lifecycle.fragment-instance.v1\0";
 
-fn derive_fragment_instance_id(
+fn derive_task_key(
     execution_id: QueryExecutionId,
     fragment_id: FragmentId,
     instance_index: usize,
@@ -1289,7 +1287,7 @@ fn derive_fragment_instance_id(
     let instance_index = u64::try_from(instance_index)
         .map_err(|_| contract_error("fragment instance index exceeds u64 width"))?;
     let mut digest = Sha256::new();
-    digest.update(FRAGMENT_INSTANCE_ID_DOMAIN);
+    digest.update(TASK_KEY_DOMAIN);
     digest.update(execution_id.query_id().high().to_be_bytes());
     digest.update(execution_id.query_id().low().to_be_bytes());
     digest.update(execution_id.attempt_id().get().to_be_bytes());
@@ -1313,7 +1311,7 @@ fn derive_fragment_instance_id(
 }
 
 #[cfg(test)]
-pub fn fragment_instance_id_for_contract_test(
+pub fn task_key_for_contract_test(
     query_id: QueryId,
     fragment_id: FragmentId,
     instance_index: usize,
@@ -1324,7 +1322,7 @@ pub fn fragment_instance_id_for_contract_test(
             .expect("contract fixtures use a nonzero initial attempt"),
     )
     .expect("contract fixtures use a nonzero query id");
-    derive_fragment_instance_id(execution_id, fragment_id, instance_index)
+    derive_task_key(execution_id, fragment_id, instance_index)
         .expect("contract fixture fragment identity is representable")
 }
 
@@ -1335,7 +1333,7 @@ pub fn fragment_instance_id_for_contract_test(
 /// the instance's position in its fragment, the task width its fragment was
 /// given, and the scan ranges frozen into it. Identity, kernel key and
 /// topology come from the task graph, and query-wide options from the
-/// established context, so none of them is repeated here.
+/// established participation, so none of them is repeated here.
 #[derive(Clone, Debug)]
 pub(crate) struct NativePlacementAssignment {
     instance_ordinal: u32,
@@ -1381,7 +1379,7 @@ impl NativePlacementAssignment {
 
 pub struct ValidatedNativeSubmission {
     backend_idx: usize,
-    finst_id: UniqueId,
+    task_key: UniqueId,
     execution_id: QueryExecutionId,
     fragment: Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
     assignment: NativePlacementAssignment,
@@ -1390,14 +1388,14 @@ pub struct ValidatedNativeSubmission {
 impl ValidatedNativeSubmission {
     pub(crate) fn new(
         backend_idx: usize,
-        fragment_instance_id: UniqueId,
+        submission_task_key: UniqueId,
         execution_id: QueryExecutionId,
         fragment: Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
         assignment: NativePlacementAssignment,
     ) -> Self {
         Self {
             backend_idx,
-            finst_id: fragment_instance_id,
+            task_key: submission_task_key,
             execution_id,
             fragment,
             assignment,
@@ -1408,8 +1406,8 @@ impl ValidatedNativeSubmission {
         self.backend_idx
     }
 
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.finst_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub fn fragment_id(&self) -> FragmentId {
@@ -1440,7 +1438,7 @@ impl ValidatedNativeSubmission {
 pub struct RootFetchMetadata {
     fragment_id: FragmentId,
     backend_idx: usize,
-    finst_id: UniqueId,
+    task_key: UniqueId,
     uses_result_buffer: bool,
 }
 
@@ -1453,8 +1451,8 @@ impl RootFetchMetadata {
         self.backend_idx
     }
 
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.finst_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn uses_result_buffer(&self) -> bool {
@@ -1516,14 +1514,14 @@ fn native_submission_encoding_view<'a>(
         .iter()
         .flat_map(|(&fragment_id, placements)| {
             placements.iter().map(move |placement| {
-                NativeSubmissionKey::new(placement.backend_idx, fragment_id, placement.finst_id)
+                NativeSubmissionKey::new(placement.backend_idx, fragment_id, placement.task_key)
             })
         })
         .collect::<Vec<_>>();
     let root = NativeSubmissionKey::new(
         schedule.root_backend_idx,
         schedule.root_fragment_id,
-        schedule.root_finst_id,
+        schedule.root_task_key,
     );
     let plan_root = plan.fragment(schedule.root_fragment_id).ok_or_else(|| {
         contract_error(format!(
@@ -1534,7 +1532,7 @@ fn native_submission_encoding_view<'a>(
     let root_fetch = RootFetchMetadata {
         fragment_id: schedule.root_fragment_id,
         backend_idx: schedule.root_backend_idx,
-        finst_id: schedule.root_finst_id,
+        task_key: schedule.root_task_key,
         uses_result_buffer: plan_root.role().uses_result_buffer(),
     };
     validate_root_output_columns(plan_root.output_columns())?;
@@ -1613,8 +1611,8 @@ mod tests {
         };
         let registry = ExecutionExchangeRegistry::default();
         let key = ExchangeKey {
-            finst_id_hi: 47,
-            finst_id_lo: 83,
+            task_key_hi: 47,
+            task_key_lo: 83,
             node_id: 1,
         };
         let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
@@ -1848,7 +1846,7 @@ mod tests {
 
     use super::{
         PreparedDistributedAttemptAffinity, PreparedDistributedTemplateIdentity,
-        RuntimeFilterArtifactId, RuntimeFilterDeploymentAttachment, derive_fragment_instance_id,
+        RuntimeFilterArtifactId, RuntimeFilterDeploymentAttachment, derive_task_key,
         merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
         validate_prepared_template_affinity,
     };
@@ -2024,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn fragment_instance_identity_is_stable_and_attempt_bound() {
+    fn task_key_is_stable_and_attempt_bound() {
         let query_id = QueryId::new(41, 73);
         let first_attempt =
             QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid attempt"))
@@ -2033,15 +2031,13 @@ mod tests {
             QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid attempt"))
                 .expect("valid execution id");
 
-        let first =
-            derive_fragment_instance_id(first_attempt, 9, 3).expect("first fragment instance id");
+        let first = derive_task_key(first_attempt, 9, 3).expect("first task key");
         assert_eq!(
-            derive_fragment_instance_id(first_attempt, 9, 3)
-                .expect("repeated fragment instance id"),
+            derive_task_key(first_attempt, 9, 3).expect("repeated task key"),
             first
         );
         assert_ne!(
-            derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
+            derive_task_key(second_attempt, 9, 3).expect("second task key"),
             first
         );
     }

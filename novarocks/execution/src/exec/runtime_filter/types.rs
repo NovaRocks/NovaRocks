@@ -53,7 +53,7 @@ pub enum RuntimeDecimalWidth {
 impl RuntimeFilterType {
     pub fn from_arrow_data_type(
         data_type: &DataType,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let ty = match data_type {
             DataType::Boolean => Self::Boolean,
             DataType::Int8 => Self::Int8,
@@ -102,9 +102,7 @@ impl RuntimeFilterType {
 }
 
 impl RuntimeDecimalWidth {
-    pub fn for_precision(
-        precision: u8,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    pub fn for_precision(precision: u8) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         match precision {
             1..=9 => Ok(Self::Decimal32),
             10..=18 => Ok(Self::Decimal64),

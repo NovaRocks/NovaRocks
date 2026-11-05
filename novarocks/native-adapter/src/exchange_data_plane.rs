@@ -16,7 +16,7 @@
 // under the License.
 //! Native Exchange Unit wire projection and Worker-owned route settlement.
 
-use novarocks_execution::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverPort};
+use novarocks_execution::runtime::task::io::{ExchangeReceiverKey, ExchangeReceiverPort};
 use novarocks_execution_contract::ExchangeStreamIdentity;
 use novarocks_proto_models as proto;
 use novarocks_worker::{InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities};
@@ -83,7 +83,7 @@ impl NativeExchangeDataPlane {
         raw: proto::novarocks::DeliverExchangeUnitRequest,
         caller: novarocks_types::BackendProcessId,
     ) -> Result<proto::novarocks::DeliverExchangeUnitResponse, tonic::Status> {
-        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+        use novarocks_execution::runtime::task::io::exchange_unit::{
             ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitReceiverFrame,
         };
         use novarocks_task_codec::exchange_unit_codec as codec;
@@ -99,7 +99,7 @@ impl NativeExchangeDataPlane {
         let outcome = {
             let capabilities = &self.unit_capabilities;
             let key = ExchangeReceiverKey {
-                fragment_instance_id: stream.destination_fragment_instance_id(),
+                task_key: stream.destination_task_key(),
                 node_id: stream.destination_node().get(),
             };
             let next = frame.next_demand;
@@ -163,7 +163,7 @@ impl NativeExchangeDataPlane {
         raw: proto::novarocks::RegisterExchangeDemandRequest,
         caller: novarocks_types::BackendProcessId,
     ) -> Result<proto::novarocks::RegisterExchangeDemandResponse, tonic::Status> {
-        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+        use novarocks_execution::runtime::task::io::exchange_unit::{
             ExchangeDemandEntry, ExchangeDemandOperation,
         };
         use novarocks_task_codec::exchange_unit_codec as codec;
@@ -179,7 +179,7 @@ impl NativeExchangeDataPlane {
             let outcome = match self.unit_capabilities.with_claimed_stream(stream, |_| {
                 let observation = self.receiver_port.register_unit_demand(
                     ExchangeReceiverKey {
-                        fragment_instance_id: stream.destination_fragment_instance_id(),
+                        task_key: stream.destination_task_key(),
                         node_id: stream.destination_node().get(),
                     },
                     ExchangeDemandEntry {
@@ -335,7 +335,7 @@ fn validate_unit_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_execution::runtime::fragment::io::UnavailableExchangeReceiverPort;
+    use novarocks_execution::runtime::task::io::UnavailableExchangeReceiverPort;
     use novarocks_proto_codec::FieldPath;
     use novarocks_task_codec::exchange_unit_codec as codec;
 
@@ -387,7 +387,7 @@ mod tests {
             let mut raw = codec::encode_delivery_request(frame.clone());
             match mutation {
                 0 => raw.stream = None,
-                1 => raw.stream.as_mut().unwrap().destination_finst_id_lo += 1,
+                1 => raw.stream.as_mut().unwrap().destination_task_key_lo += 1,
                 2 => raw.stream.as_mut().unwrap().sender_ordinal += 1,
                 3 => raw.sender_count = 0,
                 4 => raw.sender_count = raw.sender_ordinal,

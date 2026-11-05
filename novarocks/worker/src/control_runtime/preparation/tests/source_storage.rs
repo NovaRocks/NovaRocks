@@ -22,9 +22,9 @@ use novarocks_control_runtime_core::{
     capacity::ReservationResources, owned_storage::OwnedSlotNeed,
 };
 
-fn role_storage(roles: usize) -> ReservationResources {
-    crate::control_runtime_policy::StorageNeed::role(false)
-        .checked_mul(roles)
+fn source_slot_storage(cut_count: usize) -> ReservationResources {
+    crate::control_runtime_policy::StorageNeed::causal_cut_storage(false)
+        .checked_mul(cut_count)
         .unwrap()
         .resources()
         .unwrap()
@@ -43,7 +43,7 @@ fn accepted_resources() -> ReservationResources {
             ..OwnedSlotNeed::default()
         },
     )
-    .checked_add(&role_storage(3))
+    .checked_add(&source_slot_storage(3))
     .unwrap()
 }
 fn admitted() -> (
@@ -109,13 +109,13 @@ fn assert_preparing(f: &Fixture, count: u64, bytes: u64) {
 #[test]
 fn source_split_moves_only_original_storage_and_stays_owned_after_preparation_returns() {
     let (fixture, owner, job, drops) = admitted();
-    let need = role_storage(2);
-    let mut storage = owner.take_task_role_storage(&need).unwrap();
+    let need = source_slot_storage(2);
+    let mut storage = owner.take_task_source_storage(&need).unwrap();
     assert_eq!(storage.resources().unwrap(), need);
     assert_preparing(&fixture, 1, 10);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        owner.take_task_role_storage(&need),
+        owner.take_task_source_storage(&need),
         Err(PreparationStorageSplitError::AlreadyTransferred)
     ));
     assert!(job.dispose());
@@ -129,7 +129,7 @@ fn source_split_moves_only_original_storage_and_stays_owned_after_preparation_re
     }
     let mut remainder = owner.take_after_exit().unwrap().unwrap();
     assert_preparing(&fixture, 0, 0);
-    assert_eq!(remainder.resources().unwrap(), role_storage(1));
+    assert_eq!(remainder.resources().unwrap(), source_slot_storage(1));
     remainder.finish().unwrap();
     assert_eq!(
         storage.resources().unwrap(),
@@ -144,7 +144,7 @@ fn source_split_moves_only_original_storage_and_stays_owned_after_preparation_re
 #[test]
 fn invalid_and_failed_splits_keep_the_original_storage_and_single_transfer_opportunity() {
     let (fixture, owner, job, drops) = admitted();
-    let valid = role_storage(2);
+    let valid = source_slot_storage(2);
     let mut invalid = vec![
         ReservationResources::default(),
         ReservationResources::work_only(),
@@ -163,16 +163,16 @@ fn invalid_and_failed_splits_keep_the_original_storage_and_single_transfer_oppor
     }
     for need in invalid {
         assert!(matches!(
-            owner.take_task_role_storage(&need),
+            owner.take_task_source_storage(&need),
             Err(PreparationStorageSplitError::InvalidResources)
         ));
         assert_preparing(&fixture, 1, 10);
     }
     assert!(matches!(
-        owner.take_task_role_storage(&role_storage(4)),
+        owner.take_task_source_storage(&source_slot_storage(4)),
         Err(PreparationStorageSplitError::Runtime(_))
     ));
-    let mut storage = owner.take_task_role_storage(&valid).unwrap();
+    let mut storage = owner.take_task_source_storage(&valid).unwrap();
     assert_eq!(storage.resources().unwrap(), valid);
     assert!(job.dispose());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -190,7 +190,7 @@ fn preparation_exit_closes_an_unused_source_storage_transfer() {
     assert!(job.dispose());
     assert!(owner.publish_whole_exit().unwrap());
     assert!(matches!(
-        owner.take_task_role_storage(&role_storage(2)),
+        owner.take_task_source_storage(&source_slot_storage(2)),
         Err(PreparationStorageSplitError::Unavailable)
     ));
     assert_preparing(&fixture, 1, 10);

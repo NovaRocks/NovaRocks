@@ -44,8 +44,8 @@ async fn fixture() -> (
             .expect("existing controller fixture");
     (directory, host, controller)
 }
-struct TaskExit(Arc<AtomicBool>);
-impl Drop for TaskExit {
+struct JobExit(Arc<AtomicBool>);
+impl Drop for JobExit {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Release);
     }
@@ -58,7 +58,7 @@ async fn cancelled_shutdown_and_outer_timeout_reborrow_the_same_installed_join()
     let exited = Arc::new(AtomicBool::new(false));
     let actual_exit = exited.clone();
     let task = tokio::spawn(async move {
-        let _actual_exit = TaskExit(actual_exit);
+        let _actual_exit = JobExit(actual_exit);
         let _ = entered.send(());
         let _ = held.await;
     });

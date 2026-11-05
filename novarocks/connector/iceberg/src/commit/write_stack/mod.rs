@@ -18,7 +18,7 @@
 //! Iceberg's implementation of the provider-neutral connector write stack.
 //!
 //! ```text
-//! FE begin_write   -> IcebergCommitHandle + [WriteTargetOrdinal -> IcebergWriterHandle]
+//! FE begin_write   -> IcebergWriteCommitSession + [WriteTargetOrdinal -> IcebergWriterHandle]
 //! BE open_writer   -> one writer per driver
 //!    writer.finish -> zero or more IcebergCommitFragment values, one per artifact
 //! FE finish_write  -> exactly one Iceberg snapshot commit
@@ -34,7 +34,7 @@
 //!   through its own query-leased storage resolver (NCP-6 D10).
 //!
 //! The adapter that converts between these concrete values and the neutral
-//! `ConnectorWriteCommitHandle` / `ConnectorWriterHandle` /
+//! `ConnectorWriteCommitSession` / `ConnectorWriterHandle` /
 //! `ConnectorCommitFragment` is `pub(crate)` and is never handed to a role
 //! host. `codec` holds it privately too: it is the only module that turns a
 //! central-IDL write carrier into one of these values, and it does so only
@@ -64,10 +64,11 @@ pub use control::{
 };
 pub use domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
-    IcebergCommitHandle, IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
+    IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
     IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergPositionDeleteFileArtifact,
-    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
-    IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
+    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterHandle,
+    IcebergWriterOutput,
 };
 pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
 pub use old_delete::{

@@ -28,15 +28,15 @@ use super::{
 use novarocks_execution_contract::operation::OperationResult;
 use novarocks_execution_contract::{
     AdmissionEpochCapability, AdmissionTicketId, LeaseReceipt, LeaseSequence, LeaseValidFor,
-    OperationOutcome, QueryContextReceipt, QueryContextRef, QueryContextState,
-    QuiesceQueryContextReceipt, ReleaseOutcome, SafeDetail, TaskIdentity, TaskOperationId,
+    OperationOutcome, ParticipationReceipt, ParticipationRef, ParticipationState,
+    QuiesceParticipationReceipt, ReleaseOutcome, SafeDetail, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_models::{catalog, novarocks as proto};
 use novarocks_task_codec::identity::{
-    encode_query_context_ref, encode_task_identity, encode_task_operation_id,
+    encode_participation_ref, encode_task_identity, encode_task_operation_id,
 };
 use novarocks_task_codec::operation::{
-    DecodedOperation, DecodedUpdateQueryContext, encode_query_context_ack, encode_quiesce_ack,
+    DecodedOperation, DecodedUpdateParticipation, encode_participation_ack, encode_quiesce_ack,
     encode_receipt, encode_release_ack,
 };
 use novarocks_types::{
@@ -53,32 +53,32 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Input {
-    Acquire(QueryContextRef, NativeCompatibilityId),
-    Establish(QueryContextRef, AdmissionTicketId, NativeCompatibilityId),
-    Renew(QueryContextRef),
-    Quiesce(QueryContextRef),
-    Release(QueryContextRef),
+    Acquire(ParticipationRef, NativeCompatibilityId),
+    Establish(ParticipationRef, AdmissionTicketId, NativeCompatibilityId),
+    Renew(ParticipationRef),
+    Quiesce(ParticipationRef),
+    Release(ParticipationRef),
     Cancel(TaskIdentity),
 }
 impl Input {
     fn of(operation: &DecodedOperation) -> Self {
         match operation {
-            DecodedOperation::AcquireQueryContextAdmissionTicket(r) => {
-                Self::Acquire(r.context(), r.native_compatibility_id())
+            DecodedOperation::AcquireParticipationAdmissionTicket(r) => {
+                Self::Acquire(r.participation(), r.native_compatibility_id())
             }
-            DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(r)) => {
+            DecodedOperation::UpdateParticipation(DecodedUpdateParticipation::Establish(r)) => {
                 Self::Establish(
-                    r.context(),
+                    r.participation(),
                     r.admission_ticket_id(),
                     r.native_compatibility_id(),
                 )
             }
-            DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::RenewLease {
-                context,
+            DecodedOperation::UpdateParticipation(DecodedUpdateParticipation::RenewLease {
+                participation,
                 ..
-            }) => Self::Renew(*context),
-            DecodedOperation::QuiesceQueryContext(r) => Self::Quiesce(r.context()),
-            DecodedOperation::ReleaseQueryContext(r) => Self::Release(r.context()),
+            }) => Self::Renew(*participation),
+            DecodedOperation::QuiesceParticipation(r) => Self::Quiesce(r.participation()),
+            DecodedOperation::ReleaseParticipation(r) => Self::Release(r.participation()),
             DecodedOperation::CancelTask(r) => Self::Cancel(r.identity()),
             other => panic!("unexpected author input: {other:?}"),
         }
@@ -95,14 +95,14 @@ enum Call {
     Observe {
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: Instant,
         answer: NodeAdmissionTicketObservation,
     },
     Preflight {
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         compatibility: NativeCompatibilityId,
         deadline: Instant,
         reply: Option<Box<proto::TaskOperationReceipt>>,
@@ -178,34 +178,34 @@ impl TaskOperationBatchApplier for RecordingAuthor {
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: Instant,
     ) -> Result<NodeAdmissionTicketObservation, tonic::Status> {
         let Call::Observe {
             operation: op,
             ticket: t,
-            context: c,
+            participation: c,
             deadline: d,
             answer,
         } = self.next()
         else {
             panic!("unexpected observation")
         };
-        assert_eq!((operation, ticket, context, deadline), (op, t, c, d));
+        assert_eq!((operation, ticket, participation, deadline), (op, t, c, d));
         Ok(answer)
     }
     async fn preflight_expired_establish_ticket(
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         compatibility: Option<&proto::NativeCompatibilityId>,
         deadline: Instant,
     ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status> {
         let Call::Preflight {
             operation: op,
             ticket: t,
-            context: c,
+            participation: c,
             compatibility: expected,
             deadline: d,
             reply,
@@ -213,7 +213,7 @@ impl TaskOperationBatchApplier for RecordingAuthor {
         else {
             panic!("unexpected preflight")
         };
-        assert_eq!((operation, ticket, context, deadline), (op, t, c, d));
+        assert_eq!((operation, ticket, participation, deadline), (op, t, c, d));
         assert_eq!(
             compatibility
                 .expect("original compatibility")
@@ -224,8 +224,8 @@ impl TaskOperationBatchApplier for RecordingAuthor {
         Ok(reply.map(|reply| *reply))
     }
 }
-fn context() -> QueryContextRef {
-    QueryContextRef::new(
+fn participation() -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(31, 32), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
@@ -262,15 +262,15 @@ fn reply(
         },
     )
 }
-fn active_ack(c: QueryContextRef) -> Ack {
+fn active_ack(c: ParticipationRef) -> Ack {
     let lease = LeaseReceipt::new(
         LeaseSequence::INITIAL,
         LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
         Duration::from_secs(30),
     );
-    Ack::QueryContext(
-        encode_query_context_ack(
-            &QueryContextReceipt::new(c, QueryContextState::Active).with_lease(lease),
+    Ack::Participation(
+        encode_participation_ack(
+            &ParticipationReceipt::new(c, ParticipationState::Active).with_lease(lease),
             None,
         )
         .unwrap(),
@@ -279,14 +279,14 @@ fn active_ack(c: QueryContextRef) -> Ack {
 fn observe(
     op: TaskOperationId,
     t: AdmissionTicketId,
-    c: QueryContextRef,
+    c: ParticipationRef,
     d: Instant,
     answer: NodeAdmissionTicketObservation,
 ) -> Call {
     Call::Observe {
         operation: op,
         ticket: t,
-        context: c,
+        participation: c,
         deadline: d,
         answer,
     }
@@ -302,7 +302,7 @@ fn apply(op: TaskOperationId, input: Input, d: Instant, r: proto::TaskOperationR
 fn preflight(
     op: TaskOperationId,
     t: AdmissionTicketId,
-    c: QueryContextRef,
+    c: ParticipationRef,
     compat: NativeCompatibilityId,
     d: Instant,
     r: Option<proto::TaskOperationReceipt>,
@@ -310,7 +310,7 @@ fn preflight(
     Call::Preflight {
         operation: op,
         ticket: t,
-        context: c,
+        participation: c,
         compatibility: compat,
         deadline: d,
         reply: r.map(Box::new),
@@ -333,12 +333,12 @@ fn outcome(r: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
     proto::TaskOperationOutcome::try_from(v.outcome).unwrap()
 }
 fn malformed_lease(operation: &mut proto::TaskOperation) {
-    let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+    let Some(proto::task_operation::Operation::UpdateParticipation(update)) =
         operation.operation.as_mut()
     else {
         panic!("Establish")
     };
-    let Some(proto::update_query_context_request::Command::Establish(establish)) =
+    let Some(proto::update_participation_request::Command::Establish(establish)) =
         update.command.as_mut()
     else {
         panic!("Establish")
@@ -347,25 +347,25 @@ fn malformed_lease(operation: &mut proto::TaskOperation) {
 }
 fn to_control_operation(operation: proto::TaskOperation) -> proto::TaskControlOperation {
     let control = match operation.operation.expect("a control command") {
-        proto::task_operation::Operation::UpdateQueryContext(update) => {
-            let Some(proto::update_query_context_request::Command::RenewLease(renew)) =
+        proto::task_operation::Operation::UpdateParticipation(update) => {
+            let Some(proto::update_participation_request::Command::RenewLease(renew)) =
                 update.command
             else {
-                panic!("only renewal uses control UpdateQueryContext");
+                panic!("only renewal uses control UpdateParticipation");
             };
             proto::task_control_operation::Control::RenewLease(renew)
         }
         proto::task_operation::Operation::CancelTask(cancel) => {
             proto::task_control_operation::Control::CancelTask(cancel)
         }
-        proto::task_operation::Operation::AbortQueryContext(abort) => {
-            proto::task_control_operation::Control::AbortQueryContext(abort)
+        proto::task_operation::Operation::AbortParticipation(abort) => {
+            proto::task_control_operation::Control::AbortParticipation(abort)
         }
-        proto::task_operation::Operation::QuiesceQueryContext(quiesce) => {
-            proto::task_control_operation::Control::QuiesceQueryContext(quiesce)
+        proto::task_operation::Operation::QuiesceParticipation(quiesce) => {
+            proto::task_control_operation::Control::QuiesceParticipation(quiesce)
         }
-        proto::task_operation::Operation::ReleaseQueryContext(release) => {
-            proto::task_control_operation::Control::ReleaseQueryContext(release)
+        proto::task_operation::Operation::ReleaseParticipation(release) => {
+            proto::task_control_operation::Control::ReleaseParticipation(release)
         }
         _ => panic!("ordinary operation cannot be sent to control method"),
     };
@@ -383,7 +383,7 @@ fn envelope(operation: TaskOperationId) -> proto::TaskOperationEnvelope {
 }
 
 fn acquire_ticket(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     operation: TaskOperationId,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: novarocks_execution_contract::AdmissionEpochCapability,
@@ -391,9 +391,9 @@ fn acquire_ticket(
     proto::TaskOperation {
         envelope: Some(envelope(operation)),
         operation: Some(
-            proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
-                proto::AcquireQueryContextAdmissionTicketRequest {
-                    query_context: Some(encode_query_context_ref(context)),
+            proto::task_operation::Operation::AcquireParticipationAdmissionTicket(
+                proto::AcquireParticipationAdmissionTicketRequest {
+                    participation: Some(encode_participation_ref(participation)),
                     valid_for_millis: 10_000,
                     native_compatibility_id: Some(proto::NativeCompatibilityId {
                         value: native_compatibility_id.as_bytes().to_vec(),
@@ -408,26 +408,26 @@ fn acquire_ticket(
 }
 
 fn establish_with_compatibility(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     operation: TaskOperationId,
     admission_ticket_id: AdmissionTicketId,
     native_compatibility_id: NativeCompatibilityId,
 ) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(envelope(operation)),
-        operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-            proto::UpdateQueryContextRequest {
-                command: Some(proto::update_query_context_request::Command::Establish(
-                    proto::EstablishQueryContextRequest {
-                        query_context: Some(encode_query_context_ref(context)),
+        operation: Some(proto::task_operation::Operation::UpdateParticipation(
+            proto::UpdateParticipationRequest {
+                command: Some(proto::update_participation_request::Command::Establish(
+                    proto::EstablishParticipationRequest {
+                        participation: Some(encode_participation_ref(participation)),
                         catalog_set: Some(catalog::CatalogSet::default()),
                         initial_runtime_filter: Some(proto::RuntimeFilterContribution::default()),
-                        initial_credential: Some(proto::QueryContextCredentialDomain {
-                            lease_id: 1,
+                        initial_credential: Some(proto::ParticipationCredentialDomain {
+                            credential_domain_id: 1,
                             epoch: 1,
                             descriptors: Vec::new(),
                         }),
-                        initial_lease: Some(proto::QueryExecutionLeaseGrant {
+                        initial_lease: Some(proto::ParticipationLeaseGrant {
                             sequence: 0,
                             valid_for_millis: 30_000,
                         }),
@@ -446,18 +446,18 @@ fn establish_with_compatibility(
 }
 
 fn renew_lease(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     operation: TaskOperationId,
     sequence: u64,
 ) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(envelope(operation)),
-        operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-            proto::UpdateQueryContextRequest {
-                command: Some(proto::update_query_context_request::Command::RenewLease(
-                    proto::RenewQueryExecutionLeaseRequest {
-                        query_context: Some(encode_query_context_ref(context)),
-                        lease: Some(proto::QueryExecutionLeaseGrant {
+        operation: Some(proto::task_operation::Operation::UpdateParticipation(
+            proto::UpdateParticipationRequest {
+                command: Some(proto::update_participation_request::Command::RenewLease(
+                    proto::RenewParticipationLeaseRequest {
+                        participation: Some(encode_participation_ref(participation)),
+                        lease: Some(proto::ParticipationLeaseGrant {
                             sequence,
                             valid_for_millis: 5_000,
                         }),
@@ -468,23 +468,23 @@ fn renew_lease(
     }
 }
 
-fn release(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
+fn release(participation: ParticipationRef, operation: TaskOperationId) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(envelope(operation)),
-        operation: Some(proto::task_operation::Operation::ReleaseQueryContext(
-            proto::ReleaseQueryContextRequest {
-                query_context: Some(encode_query_context_ref(context)),
+        operation: Some(proto::task_operation::Operation::ReleaseParticipation(
+            proto::ReleaseParticipationRequest {
+                participation: Some(encode_participation_ref(participation)),
             },
         )),
     }
 }
 
-fn quiesce(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
+fn quiesce(participation: ParticipationRef, operation: TaskOperationId) -> proto::TaskOperation {
     proto::TaskOperation {
         envelope: Some(envelope(operation)),
-        operation: Some(proto::task_operation::Operation::QuiesceQueryContext(
-            proto::QuiesceQueryContextRequest {
-                query_context: Some(encode_query_context_ref(context)),
+        operation: Some(proto::task_operation::Operation::QuiesceParticipation(
+            proto::QuiesceParticipationRequest {
+                participation: Some(encode_participation_ref(participation)),
             },
         )),
     }
@@ -511,7 +511,7 @@ fn query_options() -> proto::QueryOptions {
 
 #[tokio::test]
 async fn ordinary_then_control_methods_preserve_receipt_order() {
-    let c = context();
+    let c = participation();
     let t = ticket(1);
     let ids = [
         TaskOperationId::new_v7(),
@@ -527,12 +527,12 @@ async fn ordinary_then_control_methods_preserve_receipt_order() {
         reply(
             ids[2],
             OperationOutcome::Accepted,
-            Some(Ack::QuiesceQueryContext(
-                encode_quiesce_ack(&QuiesceQueryContextReceipt::new(
+            Some(Ack::QuiesceParticipation(
+                encode_quiesce_ack(&QuiesceParticipationReceipt::new(
                     c,
                     1,
                     Vec::new(),
-                    QueryContextState::Quiescing,
+                    ParticipationState::Quiescing,
                 ))
                 .unwrap(),
             )),
@@ -540,11 +540,11 @@ async fn ordinary_then_control_methods_preserve_receipt_order() {
         reply(
             ids[3],
             OperationOutcome::Accepted,
-            Some(Ack::ReleaseQueryContext(
+            Some(Ack::ReleaseParticipation(
                 encode_release_ack(
                     c,
                     ReleaseOutcome::Released,
-                    QueryContextState::TerminalRetained,
+                    ParticipationState::TerminalRetained,
                     None,
                 )
                 .unwrap(),
@@ -609,7 +609,7 @@ async fn ordinary_then_control_methods_preserve_receipt_order() {
 
 #[tokio::test]
 async fn one_refused_control_item_leaves_renewal_receipt_untouched() {
-    let c = context();
+    let c = participation();
     let a = TaskOperationId::new_v7();
     let b = TaskOperationId::new_v7();
     let clock = timing();
@@ -639,7 +639,7 @@ async fn one_refused_control_item_leaves_renewal_receipt_untouched() {
 
 #[tokio::test]
 async fn operation_waits_are_measured_from_tower_arrival_per_item() {
-    let c = context();
+    let c = participation();
     let a = TaskOperationId::new_v7();
     let b = TaskOperationId::new_v7();
     let now = Instant::now();
@@ -648,9 +648,9 @@ async fn operation_waits_are_measured_from_tower_arrival_per_item() {
     first.envelope.as_mut().unwrap().max_wait_millis = 1000;
     let mut second = acquire_ticket(c, b, compatibility(), epoch());
     second.envelope.as_mut().unwrap().max_wait_millis = 30000;
-    let grant = Ack::QueryContextAdmissionTicket(
-        novarocks_task_codec::operation::encode_query_context_admission_ticket_ack(
-            novarocks_execution_contract::QueryContextAdmissionTicketReceipt::new(
+    let grant = Ack::ParticipationAdmissionTicket(
+        novarocks_task_codec::operation::encode_participation_admission_ticket_ack(
+            novarocks_execution_contract::ParticipationAdmissionTicketReceipt::new(
                 ticket(8),
                 c,
                 LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
@@ -683,7 +683,7 @@ async fn operation_waits_are_measured_from_tower_arrival_per_item() {
 
 #[tokio::test]
 async fn single_expired_establish_is_refused_before_deep_content_decode() {
-    let c = context();
+    let c = participation();
     let t = ticket(1);
     let op = TaskOperationId::new_v7();
     let clock = timing();
@@ -704,7 +704,7 @@ async fn single_expired_establish_is_refused_before_deep_content_decode() {
 
 #[tokio::test]
 async fn expired_establish_in_mixed_batch_keeps_whole_batch_validation() {
-    let c = context();
+    let c = participation();
     let t = ticket(1);
     let op = TaskOperationId::new_v7();
     let clock = timing();
@@ -741,8 +741,8 @@ async fn expired_establish_in_mixed_batch_keeps_whole_batch_validation() {
 
 #[tokio::test]
 async fn expired_establish_in_mixed_batch_keeps_other_item_and_receipt_order() {
-    let c = context();
-    let other = context();
+    let c = participation();
+    let other = participation();
     let t = ticket(1);
     let a = TaskOperationId::new_v7();
     let b = TaskOperationId::new_v7();
@@ -752,9 +752,9 @@ async fn expired_establish_in_mixed_batch_keeps_other_item_and_receipt_order() {
     let accepted = reply(
         b,
         OperationOutcome::Accepted,
-        Some(Ack::QueryContextAdmissionTicket(
-            novarocks_task_codec::operation::encode_query_context_admission_ticket_ack(
-                novarocks_execution_contract::QueryContextAdmissionTicketReceipt::new(
+        Some(Ack::ParticipationAdmissionTicket(
+            novarocks_task_codec::operation::encode_participation_admission_ticket_ack(
+                novarocks_execution_contract::ParticipationAdmissionTicketReceipt::new(
                     ticket(9),
                     other,
                     LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
@@ -787,8 +787,8 @@ async fn expired_establish_in_mixed_batch_keeps_other_item_and_receipt_order() {
 }
 
 #[tokio::test]
-async fn later_expired_establish_waits_for_earlier_context_effect() {
-    let c = context();
+async fn later_expired_establish_waits_for_earlier_participation_effect() {
+    let c = participation();
     let live = ticket(1);
     let expired = ticket(2);
     let a = TaskOperationId::new_v7();
@@ -796,7 +796,7 @@ async fn later_expired_establish_waits_for_earlier_context_effect() {
     let clock = timing();
     let d = limit(clock);
     let accepted = reply(a, OperationOutcome::Accepted, Some(active_ack(c)));
-    let conflict = reply(b, OperationOutcome::ContextConflict, None);
+    let conflict = reply(b, OperationOutcome::ParticipationConflict, None);
     let author = RecordingAuthor::new(vec![
         observe(
             a,
@@ -846,7 +846,7 @@ async fn later_expired_establish_waits_for_earlier_context_effect() {
 
 #[tokio::test]
 async fn expired_ticket_cannot_override_compatibility_or_operation_deadline() {
-    let c = context();
+    let c = participation();
     let t = ticket(1);
     let op = TaskOperationId::new_v7();
     let foreign = NativeCompatibilityId::new([0x99; 32]);
@@ -905,7 +905,7 @@ async fn expired_ticket_cannot_override_compatibility_or_operation_deadline() {
 #[tokio::test]
 async fn malformed_establish_wait_is_rejected_before_ticket_observation() {
     for invalid_wait in [0, 300001] {
-        let c = context();
+        let c = participation();
         let mut request =
             establish_with_compatibility(c, TaskOperationId::new_v7(), ticket(1), compatibility());
         request.envelope.as_mut().unwrap().max_wait_millis = invalid_wait;

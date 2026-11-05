@@ -34,12 +34,12 @@ use std::sync::Arc;
 
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_execution_contract::task_execution::domain::{
-    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitSequence,
-    SplitWatermark,
+    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
+    SplitSequence, SplitWatermark,
 };
 use novarocks_execution_contract::task_execution::operation::{
-    CredentialUpdate, PlanNodeSplitReceipt, QueryContextDomainUpdate, SplitAssignmentIntent,
+    CredentialUpdate, ParticipationDomainUpdate, PlanNodeSplitReceipt, SplitAssignmentIntent,
     TaskDomainUpdate,
 };
 use novarocks_proto_models::novarocks;
@@ -534,12 +534,12 @@ pub fn encode_task_domain(value: &DecodedTaskDomain) -> novarocks::TaskDomainUpd
 /// sibling: its payload is a secret, so it is recovered through the
 /// confidential projection rather than the ordinary one, and the whole lease
 /// table travels with every rotation.
-pub fn encode_neutral_query_context_domain(
-    value: &QueryContextDomainUpdate,
+pub fn encode_neutral_participation_domain(
+    value: &ParticipationDomainUpdate,
     path: FieldPath,
-) -> Result<novarocks::QueryContextDomainUpdate, ProtocolError> {
+) -> Result<novarocks::ParticipationDomainUpdate, ProtocolError> {
     let domain = match value {
-        QueryContextDomainUpdate::CatalogBinding { version, payload } => {
+        ParticipationDomainUpdate::CatalogBinding { version, payload } => {
             let catalog_set =
                 stored_message::<novarocks_proto_models::catalog::CatalogSet>(payload.as_ref())
                     .ok_or_else(|| {
@@ -548,14 +548,14 @@ pub fn encode_neutral_query_context_domain(
                             "catalog binding payload is not a codec-produced catalog set",
                         )
                     })?;
-            novarocks::query_context_domain_update::Domain::CatalogBinding(
-                novarocks::QueryContextCatalogDomain {
+            novarocks::participation_domain_update::Domain::CatalogBinding(
+                novarocks::ParticipationCatalogDomain {
                     version: version.get(),
                     catalog_set: Some(catalog_set.clone()),
                 },
             )
         }
-        QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
+        ParticipationDomainUpdate::SharedDynamicFilter { version, payload } => {
             let contribution =
                 stored_message::<novarocks::RuntimeFilterContribution>(payload.as_ref())
                     .ok_or_else(|| {
@@ -564,30 +564,30 @@ pub fn encode_neutral_query_context_domain(
                             "shared filter payload is not a codec-produced contribution",
                         )
                     })?;
-            novarocks::query_context_domain_update::Domain::SharedDynamicFilter(
-                novarocks::QueryContextSharedDynamicFilterDomain {
+            novarocks::participation_domain_update::Domain::SharedDynamicFilter(
+                novarocks::ParticipationSharedDynamicFilterDomain {
                     version: version.get(),
                     contribution: Some(contribution.clone()),
                 },
             )
         }
-        QueryContextDomainUpdate::Credential(update) => {
+        ParticipationDomainUpdate::Credential(update) => {
             let material = stored_credential(update.material().as_ref()).ok_or_else(|| {
                 invalid(
                     path.field("credential"),
                     "credential payload is not codec-produced material",
                 )
             })?;
-            novarocks::query_context_domain_update::Domain::Credential(
-                novarocks::QueryContextCredentialDomain {
-                    lease_id: update.lease_id().get(),
+            novarocks::participation_domain_update::Domain::Credential(
+                novarocks::ParticipationCredentialDomain {
+                    credential_domain_id: update.credential_domain_id().get(),
                     epoch: update.epoch().get(),
                     descriptors: material.descriptors().to_vec(),
                 },
             )
         }
     };
-    Ok(novarocks::QueryContextDomainUpdate {
+    Ok(novarocks::ParticipationDomainUpdate {
         domain: Some(domain),
     })
 }
@@ -689,7 +689,7 @@ pub fn encode_neutral_task_domain(
 }
 
 /// One decoded query-context domain change, with its typed content retained.
-pub enum DecodedQueryContextDomain {
+pub enum DecodedParticipationDomain {
     CatalogBinding {
         version: DomainVersion,
         content: Arc<WireContent<novarocks_proto_models::catalog::CatalogSet>>,
@@ -705,30 +705,34 @@ pub enum DecodedQueryContextDomain {
     },
 }
 
-impl DecodedQueryContextDomain {
+impl DecodedParticipationDomain {
     /// The neutral view the domain classifier consumes.
-    pub fn as_neutral(&self) -> QueryContextDomainUpdate {
+    pub fn as_neutral(&self) -> ParticipationDomainUpdate {
         match self {
-            Self::CatalogBinding { version, content } => QueryContextDomainUpdate::CatalogBinding {
-                version: *version,
-                payload: Arc::clone(content) as Arc<dyn CodecOwnedContent>,
-            },
-            Self::SharedDynamicFilter { version, content } => {
-                QueryContextDomainUpdate::SharedDynamicFilter {
+            Self::CatalogBinding { version, content } => {
+                ParticipationDomainUpdate::CatalogBinding {
                     version: *version,
                     payload: Arc::clone(content) as Arc<dyn CodecOwnedContent>,
                 }
             }
-            Self::Credential { update, .. } => QueryContextDomainUpdate::Credential(update.clone()),
+            Self::SharedDynamicFilter { version, content } => {
+                ParticipationDomainUpdate::SharedDynamicFilter {
+                    version: *version,
+                    payload: Arc::clone(content) as Arc<dyn CodecOwnedContent>,
+                }
+            }
+            Self::Credential { update, .. } => {
+                ParticipationDomainUpdate::Credential(update.clone())
+            }
         }
     }
 }
 
 /// Decodes a credential rotation.
 pub fn decode_credential_domain(
-    src: &novarocks::QueryContextCredentialDomain,
+    src: &novarocks::ParticipationCredentialDomain,
     path: FieldPath,
-) -> Result<DecodedQueryContextDomain, ProtocolError> {
+) -> Result<DecodedParticipationDomain, ProtocolError> {
     let epoch = CredentialEpoch::new(src.epoch)
         .map_err(|error| invalid(path.clone().field("epoch"), error.to_string()))?;
     if src.descriptors.len() > MAX_CREDENTIAL_DESCRIPTORS {
@@ -743,11 +747,11 @@ pub fn decode_credential_domain(
     // discovered at first use.
     let material = Arc::new(WireCredential::decode(&src.descriptors, path.clone())?);
     let update = CredentialUpdate::new(
-        CredentialLeaseId::new(src.lease_id),
+        CredentialDomainId::new(src.credential_domain_id),
         epoch,
         Arc::clone(&material) as Arc<dyn ConfidentialContent>,
     );
-    Ok(DecodedQueryContextDomain::Credential {
+    Ok(DecodedParticipationDomain::Credential {
         update,
         descriptors: src.descriptors.clone(),
         material,
@@ -755,18 +759,18 @@ pub fn decode_credential_domain(
 }
 
 /// Decodes one query-context domain change.
-pub fn decode_query_context_domain(
-    src: &novarocks::QueryContextDomainUpdate,
+pub fn decode_participation_domain(
+    src: &novarocks::ParticipationDomainUpdate,
     path: FieldPath,
-) -> Result<DecodedQueryContextDomain, ProtocolError> {
+) -> Result<DecodedParticipationDomain, ProtocolError> {
     let domain = src.domain.as_ref().ok_or_else(|| {
         missing(
             path.clone(),
-            "query context domain update requires a domain",
+            "participation domain update requires a domain",
         )
     })?;
     match domain {
-        novarocks::query_context_domain_update::Domain::CatalogBinding(catalog) => {
+        novarocks::participation_domain_update::Domain::CatalogBinding(catalog) => {
             let catalog_path = path.field("catalog_binding");
             let version = DomainVersion::new(catalog.version).map_err(|error| {
                 invalid(catalog_path.clone().field("version"), error.to_string())
@@ -777,12 +781,12 @@ pub fn decode_query_context_domain(
                     "catalog binding requires a catalog set",
                 )
             })?;
-            Ok(DecodedQueryContextDomain::CatalogBinding {
+            Ok(DecodedParticipationDomain::CatalogBinding {
                 version,
                 content: Arc::new(WireContent::new(CATALOG_DOMAIN_TAG, catalog_set)),
             })
         }
-        novarocks::query_context_domain_update::Domain::SharedDynamicFilter(filter) => {
+        novarocks::participation_domain_update::Domain::SharedDynamicFilter(filter) => {
             let filter_path = path.field("shared_dynamic_filter");
             let version = DomainVersion::new(filter.version).map_err(|error| {
                 invalid(filter_path.clone().field("version"), error.to_string())
@@ -793,12 +797,12 @@ pub fn decode_query_context_domain(
                     "shared dynamic filter requires a contribution",
                 )
             })?;
-            Ok(DecodedQueryContextDomain::SharedDynamicFilter {
+            Ok(DecodedParticipationDomain::SharedDynamicFilter {
                 version,
                 content: Arc::new(WireContent::new(SHARED_FILTER_DOMAIN_TAG, contribution)),
             })
         }
-        novarocks::query_context_domain_update::Domain::Credential(credential) => {
+        novarocks::participation_domain_update::Domain::Credential(credential) => {
             decode_credential_domain(credential, path.field("credential"))
         }
     }

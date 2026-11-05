@@ -37,7 +37,7 @@ use parquet::file::statistics::Statistics;
 use super::chunk_reader::{BoundChunkReader, ReaderMetrics, SmallFileBuffer};
 use super::range_io::{coalesce_ranges, read_decoder_ranges, read_decoder_ranges_async};
 use crate::{
-    BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
+    BoundFile, DataCachePolicy, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
     FileIdentity, FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange,
     FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue,
     ParquetInterpretationPolicy, PreparedFileInput, ScanPredicate, ScanPredicateDomain,
@@ -551,7 +551,7 @@ pub fn plan_parquet_input_ranges(
     let cache_enabled = request
         .cache
         .as_ref()
-        .is_some_and(crate::DataCacheContext::datacache_requested);
+        .is_some_and(crate::DataCachePolicy::datacache_requested);
     let chunk_reader = BoundChunkReader::new(
         request.file.clone(),
         request.context.clone(),
@@ -676,7 +676,7 @@ pub fn plan_parquet_input_ranges(
 /// reading data pages.
 pub fn inspect_parquet_metadata(
     file: BoundFile,
-    cache: Option<DataCacheContext>,
+    cache: Option<DataCachePolicy>,
     context: FileReadContext,
     policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
@@ -688,7 +688,7 @@ pub fn inspect_parquet_metadata(
 /// the source's range service.
 pub async fn inspect_parquet_metadata_async(
     file: BoundFile,
-    cache: Option<DataCacheContext>,
+    cache: Option<DataCachePolicy>,
     context: FileReadContext,
     policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
@@ -784,7 +784,7 @@ pub fn inspect_parquet_metadata_from_prepared(
 
 fn inspect_parquet_metadata_inner(
     file: BoundFile,
-    cache: Option<DataCacheContext>,
+    cache: Option<DataCachePolicy>,
     context: FileReadContext,
     prepared: Option<PreparedFileInput>,
     policy: ParquetInterpretationPolicy,
@@ -820,7 +820,7 @@ struct InspectionReader {
 impl InspectionReader {
     fn try_new(
         file: BoundFile,
-        cache: Option<DataCacheContext>,
+        cache: Option<DataCachePolicy>,
         context: FileReadContext,
         prepared: Option<PreparedFileInput>,
         policy: ParquetInterpretationPolicy,
@@ -828,7 +828,7 @@ impl InspectionReader {
         context.check_active()?;
         let cache_enabled = cache
             .as_ref()
-            .is_some_and(crate::DataCacheContext::datacache_requested);
+            .is_some_and(crate::DataCachePolicy::datacache_requested);
         let access_domain = file.access_domain();
         let identity = file.identity().clone();
         let chunk_reader = BoundChunkReader::new(
@@ -1091,7 +1091,7 @@ impl ReaderOpen {
         let cache_enabled = request
             .cache
             .as_ref()
-            .is_some_and(crate::DataCacheContext::datacache_requested);
+            .is_some_and(crate::DataCachePolicy::datacache_requested);
         let access_domain = request.file.access_domain();
         let identity = request.file.identity().clone();
         let chunk_reader = BoundChunkReader::new(

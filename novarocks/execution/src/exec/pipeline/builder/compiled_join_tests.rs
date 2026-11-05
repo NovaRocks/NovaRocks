@@ -57,17 +57,17 @@ use super::aggregate_fixture::{
 };
 use super::family_fixture::{FixtureControl, cell, int64, int64_rows, values};
 use crate::exec::fragment::program::FragmentNodeId;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
-use crate::runtime::fragment::ExecutionFailureCause;
-use crate::runtime::fragment::exchange::{
+use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::ExecutionFailureCause;
+use crate::runtime::task::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
-use crate::runtime::fragment::instance::{ExchangeInputAssignment, ExchangeInputAssignments};
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
-use crate::runtime::fragment::io::{ExchangeReceiverPort, NoopFragmentEventSink};
-use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::instance::{ExchangeInputAssignment, ExchangeInputAssignments};
+use crate::runtime::task::io::exchange::test_support::Fixture;
+use crate::runtime::task::io::{ExchangeReceiverPort, NoopTaskEventSink};
 
 pub(super) type Row = (Option<i64>, Option<i64>);
 pub(super) type Rows = Vec<Vec<Option<i64>>>;
@@ -977,7 +977,7 @@ pub(super) fn sorted(mut rows: Rows) -> Rows {
 fn try_run_single(spec: Spec, left: &[Row], right: &[Row]) -> Result<Rows, String> {
     let mut packages = packages(&single_plan(spec, left, right));
     let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     try_run(
         &program,
         result_sink(&program, SINGLE_FINST, &output),
@@ -1067,7 +1067,7 @@ fn run_exchanged(spec: Spec, placement: Placement, left: &[Row], right: &[Row]) 
         try_run_in_fixture(&fixture, &join, sink, bindings, instance)
             .unwrap_or_else(|error| panic!("{spec:?} join instance runs: {error}"));
     }
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     try_run_in_fixture(
         &fixture,
         &result,
@@ -1449,7 +1449,7 @@ fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
         let mut packages = packages(&overflow_plan(at));
         let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
         let join = program.graph().root();
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let prepared = prepare_compiled_program_pipeline_execution(
             Arc::clone(&program),
             Duration::from_millis(10),
@@ -1468,7 +1468,7 @@ fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
                 )),
                 Some(crate::runtime::execution_runtime::test_execution_runtime()),
             )),
-            Arc::new(NoopFragmentEventSink),
+            Arc::new(NoopTaskEventSink),
         )
         .expect("the join prepares its drivers");
         let failure = prepared
@@ -2089,15 +2089,15 @@ fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
     ));
     assert_eq!(build.prepare().unwrap_err(), first);
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::InputResult,
-        step_context::{StepContext, TurnWork},
     };
     let state = RuntimeState::default();
     let control = state.error_state();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
     let original = input.columns()[0].clone();
     let step = build.as_mut();
     let InputResult::Rejected {
@@ -2122,9 +2122,9 @@ fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
 #[test]
 fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
@@ -2149,7 +2149,7 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     {
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&error, &mut turn, &mut value_conversions);
         let allocated = tracker.allocated();
         let InputResult::Deferred {
             input,
@@ -2228,9 +2228,9 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
 fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_cursor() {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
@@ -2284,7 +2284,7 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     {
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&error, &mut turn, &mut value_conversions);
         let allocated = tracker.allocated();
         let original = input.columns()[0].clone();
         let InputResult::Deferred {
@@ -2359,9 +2359,9 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
         },
     };
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         operator_factory::OperatorFactory,
         step::{NextStep, WaitReason},
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
@@ -2424,7 +2424,7 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
     let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
     let before = operators[0]
-        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+        .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
         .unwrap();
     let NextStep::Wait(wait) = before.next else {
         panic!("missing real E receipts requires a dependency wait");
@@ -2457,7 +2457,7 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
     let mut empty = TurnWork::new(NonZeroU64::MIN, 0);
     assert!(matches!(
         operators[0]
-            .drive(&mut StepContext::new(&error, &mut empty, &mut conversions))
+            .drive(&mut DriverStep::new(&error, &mut empty, &mut conversions))
             .unwrap()
             .next,
         NextStep::Yield
@@ -2471,7 +2471,7 @@ fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_complet
             }
             let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
             let step = operator
-                .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                 .unwrap();
             assert!(
                 step.output.is_none(),
@@ -2578,10 +2578,10 @@ fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
         },
     };
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         operator_factory::OperatorFactory,
         shape::ControlStep,
         step::NextStep,
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
@@ -2634,11 +2634,11 @@ fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
             for _ in 0..3 {
                 let mut turn = TurnWork::new(NonZeroU64::MIN, 2);
                 operator
-                    .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                    .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                     .unwrap();
             }
             assert!(frame.completion.published().unwrap().is_none());
-            let original: crate::runtime::fragment::ExecutionFailure =
+            let original: crate::runtime::task::ExecutionFailure =
                 novarocks_functions::KernelFailure::DeadlineExceeded.into();
             error.set_error(original.clone());
             operator.on_driver_failure();
@@ -2659,7 +2659,7 @@ fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
             frame.completion.withdraw(1).unwrap();
             let mut turn = TurnWork::new(NonZeroU64::MIN, 0);
             let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-            let mut context = StepContext::new(&error, &mut turn, &mut conversions);
+            let mut context = DriverStep::new(&error, &mut turn, &mut conversions);
             assert!(matches!(
                 operator.poll_control(&mut context).unwrap(),
                 ControlStep::Runnable
@@ -2689,9 +2689,9 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
         },
     };
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         operator_factory::OperatorFactory,
         step::NextStep,
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::task_control::test_support::Owner;
@@ -2809,7 +2809,7 @@ fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() 
                     }
                     let mut turn = TurnWork::new(NonZeroU64::MIN, 11);
                     let step = source
-                        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                        .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                         .unwrap();
                     assert!(step.output.is_none());
                     finished[id] = matches!(step.next, NextStep::Finished);
@@ -3263,7 +3263,7 @@ fn authored_naa_plan(
 fn run_authored_naa(plan: &PhysicalPlan, dop: usize) -> Rows {
     let mut packages = packages(plan);
     let program = compile(packages.remove(&SINGLE).unwrap(), dop, true);
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     try_run(
         &program,
         result_sink(&program, SINGLE_FINST, &output),
@@ -3304,7 +3304,7 @@ fn b3_production_right_full_and_both_orientations_match_physical_occurrence_orac
                 ] {
                     let mut packages = packages(&single_plan_with_dop(spec, left, right, 4));
                     let program = compile(packages.remove(&SINGLE).unwrap(), 4, true);
-                    let output = ResultSinkHandle::new();
+                    let output = ResultSinkBuffer::new();
                     try_run(
                         &program,
                         result_sink(&program, SINGLE_FINST, &output),
@@ -3431,7 +3431,7 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
     let prepared = prepare_compiled_program_pipeline_execution(
         program.clone(),
         Duration::from_millis(10),
-        Box::new(ResultSinkFactory::new(ResultSinkHandle::new())),
+        Box::new(ResultSinkFactory::new(ResultSinkBuffer::new())),
         ExchangeBindings::default(),
         None,
         1,
@@ -3446,7 +3446,7 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
             )),
             Some(crate::runtime::execution_runtime::test_execution_runtime()),
         )),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .unwrap();
     let failure = prepared
@@ -3606,7 +3606,7 @@ fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() 
         let plan = plan.finish_observed(&FixtureControl).unwrap();
         let mut packages = packages(&plan);
         let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         try_run(
             &program,
             result_sink(&program, SINGLE_FINST, &output),

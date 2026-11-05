@@ -18,23 +18,23 @@
 //! Lane access ownership and allocation facts, independent of funding rights.
 use super::{CoverageError, RecordOwner, RecordRef, ResponsibilityClass, SlotCore};
 use crate::{
-    AccountHandle, AccountId,
+    Account, AccountId,
     sync::{Arc, Mutex, Ordering},
 };
 
 #[derive(Debug)]
 pub(crate) struct LaneShared {
     pub record: RecordOwner,
-    pub affiliation: Mutex<AccountHandle>,
+    pub affiliation: Mutex<Account>,
     pub member: Mutex<Option<Arc<crate::membership::MemberNode>>>,
     pub query_origin: bool,
 }
 /// Sharing a lane retains access responsibility; it mints no authorization.
 #[derive(Clone, Debug)]
-pub struct LaneHandle(pub(crate) Arc<LaneShared>);
-impl LaneHandle {
+pub struct Lane(pub(crate) Arc<LaneShared>);
+impl Lane {
     pub(crate) fn new(
-        account: &AccountHandle,
+        account: &Account,
         region: super::RecordRegion,
     ) -> Result<Self, CoverageError> {
         let query = crate::account::Path::new(account)
@@ -70,10 +70,10 @@ impl LaneHandle {
     pub fn origin(&self) -> AccountId {
         AccountId::new(self.record().origin.load(Ordering::Acquire))
     }
-    pub fn affiliation(&self) -> AccountHandle {
+    pub fn affiliation(&self) -> Account {
         self.0.affiliation.lock().unwrap().clone()
     }
-    pub(crate) fn set_affiliation(&self, account: AccountHandle) {
+    pub(crate) fn set_affiliation(&self, account: Account) {
         let member = self.detach_member();
         *self.0.affiliation.lock().unwrap() = account;
         if let Some(member) = &member {
@@ -239,13 +239,13 @@ impl Drop for LaneShared {
         }
     }
 }
-impl AccountHandle {
+impl Account {
     /// Creates attribution access only. This performs no capacity qualification,
     /// stock consumption or funding-ledger commitment.
     #[cfg(all(test, loom))]
-    pub(crate) fn create_lane(&self) -> Result<LaneHandle, CoverageError> {
+    pub(crate) fn create_lane(&self) -> Result<Lane, CoverageError> {
         self.0.shared.prune_observations(16);
-        let lane = LaneHandle::new(self, super::RecordRegion::Observation)?;
+        let lane = Lane::new(self, super::RecordRegion::Observation)?;
         let member = crate::membership::MemberNode::lane(&lane.0, None);
         let path = crate::account::Path::new(self);
         let _gates = path.shared_gates();

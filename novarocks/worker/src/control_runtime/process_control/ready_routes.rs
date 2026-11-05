@@ -15,48 +15,48 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Coalesced runnable Context addresses in actual readiness order. The
+//! Coalesced runnable Participation addresses in actual readiness order. The
 //! existing pure fair queue stores a unit marker, never Work or an RPC owner.
 
 use novarocks_control_runtime_core::fair_queue::{FairQueueError, FairWorkQueue};
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use std::num::NonZeroUsize;
 
 pub(super) struct ReadyRoutes {
-    queue: FairWorkQueue<QueryContextRef, ()>,
+    queue: FairWorkQueue<ParticipationRef, ()>,
 }
 impl ReadyRoutes {
     pub(super) fn new(request_positions: NonZeroUsize) -> Self {
-        // Every runnable Context retains at least one original pending R.
+        // Every runnable Participation retains at least one original pending R.
         // This is the existing admitted-R bound, not a separate quota.
         let positions = request_positions.get();
         Self {
             queue: FairWorkQueue::new(positions, 1),
         }
     }
-    pub(super) fn mark(&mut self, context: QueryContextRef) {
-        match self.queue.enqueue(context, ()) {
+    pub(super) fn mark(&mut self, participation: ParticipationRef) {
+        match self.queue.enqueue(participation, ()) {
             Ok(()) | Err(FairQueueError::DuplicateWork) => {}
             Err(error) => {
                 panic!("Root route readiness exceeded its original R inventory: {error:?}")
             }
         }
     }
-    pub(super) fn forget(&mut self, context: QueryContextRef) {
-        match self.queue.remove_queued(context, ()) {
+    pub(super) fn forget(&mut self, participation: ParticipationRef) {
+        match self.queue.remove_queued(participation, ()) {
             Ok(()) | Err(FairQueueError::UnknownWork) => {}
             Err(error) => panic!("Root route readiness lost its original marker: {error:?}"),
         }
     }
-    pub(super) fn pop(&mut self) -> Option<QueryContextRef> {
-        let (context, ()) = self.queue.pop()?;
+    pub(super) fn pop(&mut self) -> Option<ParticipationRef> {
+        let (participation, ()) = self.queue.pop()?;
         // Finish only the selected metadata marker before the owner attempts
         // its route. A still-runnable owner is re-enqueued at the tail. This
         // neither starts nor exits the original R, source, callback or Work.
         self.queue
-            .finish(context, ())
+            .finish(participation, ())
             .expect("the selected readiness marker exists");
-        Some(context)
+        Some(participation)
     }
     pub(super) fn is_empty(&self) -> bool {
         self.queue.is_empty()

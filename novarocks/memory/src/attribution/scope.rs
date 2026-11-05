@@ -17,7 +17,7 @@
 
 //! Synchronous, same-thread attribution steps with structural restoration.
 use super::binding;
-use crate::lane::{LaneHandle, RecordRef};
+use crate::lane::{Lane, RecordRef};
 use std::{marker::PhantomData, rc::Rc};
 
 /// Funding-lane entry facts retain their original fallback contract.
@@ -106,14 +106,14 @@ impl Observation<'_> {
 // No public guard: restoration always happens on this synchronous stack,
 // before returning to an executor or releasing the installed lane owner.
 pub(crate) struct AmbientStep<'lane, 'observation> {
-    lane: Option<&'lane LaneHandle>,
+    lane: Option<&'lane Lane>,
     previous: RecordRef,
     observation: Option<Observation<'observation>>,
     _thread: PhantomData<Rc<()>>,
 }
 impl<'lane, 'observation> AmbientStep<'lane, 'observation> {
     fn enter(
-        lane: &'lane LaneHandle,
+        lane: &'lane Lane,
         mut observation: Option<Observation<'observation>>,
         shadow_on_refusal: bool,
     ) -> Option<Self> {
@@ -205,7 +205,7 @@ impl Drop for AmbientStep<'_, '_> {
         }
     }
 }
-impl LaneHandle {
+impl Lane {
     /// Attributes one synchronous funding step. An await must not occur inside.
     /// Entry refusal records coverage failure and keeps the existing outer
     /// binding; this policy neither admits nor refuses the submitted work.

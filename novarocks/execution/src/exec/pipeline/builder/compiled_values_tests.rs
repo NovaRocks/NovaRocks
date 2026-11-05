@@ -51,12 +51,12 @@ use novarocks_type_contract::{
 use super::family_fixture::{FixtureControl, compile, constant_policy, int64_rows, run};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
-use crate::runtime::fragment::io::NoopFragmentEventSink;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::io::NoopTaskEventSink;
+use crate::runtime::task::{ExecutionFailure, ExecutionFailureCause};
 
 const ALLOW: SemanticParameterRef = SemanticParameterRef {
     id: SemanticParameterId::new(3),
@@ -440,7 +440,7 @@ fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
         )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let prepared = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
         Duration::from_millis(10),
@@ -449,7 +449,7 @@ fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
         None,
         1,
         state,
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .expect("compiled program prepares drivers");
     let failure = prepared

@@ -61,7 +61,7 @@ use tokio::time::{Instant, timeout_at};
 use super::codec::{KeyspaceCodec, REVISION_BYTES};
 use super::metrics::{ProviderMetrics, ProviderOperation, ProviderOutcome};
 use super::txn::create_raw_transaction_with_observer;
-use crate::runtime::{OperationHandle, ProviderHandle};
+use crate::runtime::{FoundationDbDatabaseRegistration, FoundationDbOperationPermit};
 use novarocks_state_store_api::{
     AttemptId, AttemptOutcome, CommitOutcome, CommitReceipt, InDoubtAdjudicator, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StoreRevision, WriteAttempt,
@@ -328,7 +328,7 @@ pub(super) struct PreparedCommit {
     pub limits: StateStoreLimits,
     pub deadline: Instant,
     pub metrics: Arc<ProviderMetrics>,
-    pub operation: OperationHandle,
+    pub operation: FoundationDbOperationPermit,
     pub attempt: WriteAttempt,
 }
 
@@ -526,7 +526,7 @@ async fn publish_and_release(
 /// needs an adjudicator at construction while the store needs the supervisor,
 /// so both share the opened instance's lease rather than one owning the other.
 pub(super) struct FoundationDbEvidence {
-    lease: Arc<ProviderHandle>,
+    database_registration: Arc<FoundationDbDatabaseRegistration>,
     codec: KeyspaceCodec,
     limits: StateStoreLimits,
     metrics: Arc<ProviderMetrics>,
@@ -534,13 +534,13 @@ pub(super) struct FoundationDbEvidence {
 
 impl FoundationDbEvidence {
     pub(super) fn new(
-        lease: Arc<ProviderHandle>,
+        database_registration: Arc<FoundationDbDatabaseRegistration>,
         codec: KeyspaceCodec,
         limits: StateStoreLimits,
         metrics: Arc<ProviderMetrics>,
     ) -> Self {
         Self {
-            lease,
+            database_registration,
             codec,
             limits,
             metrics,
@@ -554,10 +554,10 @@ impl InDoubtAdjudicator for FoundationDbEvidence {
         // A read that cannot even be started is not proof that nothing
         // happened, so a draining or unavailable runtime answers "undecided"
         // rather than "denied".
-        let Ok(_operation) = self.lease.acquire_operation() else {
+        let Ok(_operation) = self.database_registration.acquire_operation() else {
             return Ok(AttemptOutcome::Unresolved);
         };
-        let Ok(database) = self.lease.database() else {
+        let Ok(database) = self.database_registration.database() else {
             return Ok(AttemptOutcome::Unresolved);
         };
         match load_commit_evidence(
@@ -585,8 +585,8 @@ impl InDoubtAdjudicator for FoundationDbEvidence {
     }
 
     async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        let database = self.lease.database()?;
+        let _operation = self.database_registration.acquire_operation()?;
+        let database = self.database_registration.database()?;
         clear_commit_evidence(
             database.as_ref(),
             &self.codec,

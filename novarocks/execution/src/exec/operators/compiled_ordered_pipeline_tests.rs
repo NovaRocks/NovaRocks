@@ -20,10 +20,10 @@
 //! ports remain the authors. The artifact is local literal membership only;
 //! this does not attest Worker materialization, Hosted preparation or Native.
 use super::*;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
-use crate::runtime::fragment::CompiledWriterBindings;
+use crate::runtime::task::CompiledWriterBindings;
 use std::time::Duration;
 
 struct BothPorts {
@@ -35,7 +35,7 @@ impl rf::RuntimeFilterSession for BothPorts {
         &self,
         request: rf::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterProducerHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterProducer>,
         rf::RuntimeFilterContractViolation,
     > {
         rf::RuntimeFilterSession::open_producer(self.producer.as_ref(), request)
@@ -44,7 +44,7 @@ impl rf::RuntimeFilterSession for BothPorts {
         &self,
         request: rf::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionPin>,
         rf::RuntimeFilterContractViolation,
     > {
         rf::RuntimeFilterSession::subscribe(self.consumer.as_ref(), request)
@@ -53,7 +53,7 @@ impl rf::RuntimeFilterSession for BothPorts {
         &self,
         _: rf::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterFinalDomainCompletionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterFinalDomainCompletion>,
         rf::RuntimeFilterContractViolation,
     > {
         panic!("this checked ordered-bound fixture has no FinalDomain route")
@@ -96,13 +96,13 @@ fn compiled_ordered_pipeline_direct_checked_scan_runs_the_actual_two_partition_c
         ProgramNodeKind::Scan { .. }
     ));
     let scan_address = i32::try_from(input.scan_node).unwrap();
-    let scan = crate::runtime::fragment::scan::compiled_fixture::FixtureScanOp::new(
+    let scan = crate::runtime::task::scan::compiled_fixture::FixtureScanOp::new(
         vec![consumer.fixture.input.clone()],
         false,
     );
     let mut scans = ScanBindings::default();
     scans.insert(scan_address, scan.clone());
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let prepared = prepare_compiled_program_pipeline_execution_with_profiler(
         program.clone(),
         Duration::from_millis(10),

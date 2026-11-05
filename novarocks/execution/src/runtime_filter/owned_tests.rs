@@ -538,7 +538,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
                 ..Control::pass()
             };
             assert!(
-                matches!(host.order_contract(&contract, &refusal), Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(cause.clone()))
+                matches!(host.order_contract(&contract, &refusal), Err(e) if e.cause() == &crate::runtime::task::ExecutionFailureCause::Kernel(cause.clone()))
             );
             assert_eq!(
                 tracker.current(),
@@ -589,7 +589,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     ] {
         let control = Control::pass();
         assert!(
-            matches!(host.order_contract(&shape, &control), Err(e) if matches!(e.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(d)) if d.message() == detail))
+            matches!(host.order_contract(&shape, &control), Err(e) if matches!(e.cause(), crate::runtime::task::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(d)) if d.message() == detail))
         );
         assert_eq!(control.calls.load(Ordering::SeqCst), 0);
         assert_eq!(tracker.current(), 0);
@@ -600,7 +600,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
 // the new paid-slot entry. Corrupting either digest must never publish slots.
 #[test]
 fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_typed_cause() {
-    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::task::ExecutionFailureCause;
 
     use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
     for direction in [
@@ -663,7 +663,7 @@ fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_type
                     &ExecutionFailureCause::RuntimeFilter(expected.clone())
                 );
                 assert_eq!(actual.to_string(), expected.to_string());
-                assert_eq!(actual.context(), None);
+                assert_eq!(actual.site(), None);
                 assert_eq!(tracker.current(), 0);
             }
         }

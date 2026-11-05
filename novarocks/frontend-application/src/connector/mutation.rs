@@ -99,7 +99,7 @@ pub fn execute_catalog_mutation(
 /// Executes and presents a mutation through the exact lease retained during
 /// admission and metadata guards, including its one permitted reconciliation.
 pub(crate) fn execute_catalog_mutation_with_lease(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationSession,
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
@@ -173,7 +173,7 @@ pub fn resolve_catalog_mutation(
 /// must not silently acquire a newer current generation for the external
 /// mutation.
 pub fn resolve_catalog_mutation_with_lease(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationSession,
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
@@ -197,7 +197,7 @@ pub fn resolve_catalog_mutation_with_lease(
 /// outcome unchanged and must not inspect, replay, clean up, or project after
 /// an unknown result.
 pub fn dispatch_catalog_mutation_once_with_lease(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationSession,
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
@@ -228,7 +228,7 @@ pub fn dispatch_catalog_mutation_once_with_lease(
 /// this future and receiving across cancelled borrows, then reads the original
 /// validated outcome without taking or replaying it. No reconciliation occurs.
 pub async fn dispatch_catalog_mutation_once_with_lease_async_in(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationSession,
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
@@ -240,7 +240,7 @@ pub async fn dispatch_catalog_mutation_once_with_lease_async_in(
 }
 
 fn resolve_outcome(
-    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationSession,
     outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
     context: ConnectorRequestContext,
 ) -> ResolvedCatalogMutation {
@@ -361,9 +361,9 @@ mod tests {
         fn acquire_current_mutation(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
-            novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            novarocks_spi::connector::ConnectorCatalogMutationSession::new(
                 self.0.descriptor.clone(),
                 ConnectorControlRuntimeId::from_bytes([1; 16]),
                 self.0.incarnation,
@@ -375,7 +375,7 @@ mod tests {
         fn acquire_exact_mutation(
             &self,
             _control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
             unreachable!()
         }
@@ -386,7 +386,7 @@ mod tests {
         fn acquire_current_mutation(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
             Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::Unsupported,
@@ -397,7 +397,7 @@ mod tests {
         fn acquire_exact_mutation(
             &self,
             _control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
             unreachable!()
         }
@@ -439,9 +439,9 @@ mod tests {
         fn acquire_current_mutation(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
-            novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            novarocks_spi::connector::ConnectorCatalogMutationSession::new(
                 self.0.descriptor.clone(),
                 ConnectorControlRuntimeId::from_bytes([2; 16]),
                 self.0.incarnation,
@@ -453,7 +453,7 @@ mod tests {
         fn acquire_exact_mutation(
             &self,
             _control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationSession, ConnectorError>
         {
             unreachable!()
         }

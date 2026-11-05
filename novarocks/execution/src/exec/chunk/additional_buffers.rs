@@ -227,7 +227,7 @@ mod tests {
             .begin_typed_construction(output.chunk_schema())
             .unwrap();
         let view = output
-            .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            .slice_typed_observed::<crate::runtime::task::ExecutionFailure, _>(
                 1,
                 1,
                 owner.storage_lifetime(),

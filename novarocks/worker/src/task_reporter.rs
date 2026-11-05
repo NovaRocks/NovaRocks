@@ -22,7 +22,7 @@ use crate::{
     control_runtime::lifecycle_read::{TaskReadBinding, TaskReadError},
     task_port::TaskExecutionView,
 };
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::task::ExecutionFailure;
 use novarocks_execution_contract::{
     AbortCause, CancelReason, TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
     TaskIdentity, TaskStatus,

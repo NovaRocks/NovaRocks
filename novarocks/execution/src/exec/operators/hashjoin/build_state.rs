@@ -45,7 +45,7 @@ impl NaaValueMode {
         null_safe: &[bool],
         eligibility: bool,
         control: &dyn novarocks_functions::KernelEvaluationControl,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         if probe.is_empty() || probe.len() != build.len() || build.len() != null_safe.len() {
             return Err(build_contract(
                 "NAA value mode has no complete original signed declaration",
@@ -107,14 +107,14 @@ impl novarocks_failure_contract::FailureProjection for JoinBuildStateContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::JoinBuildStateContract.reason(),
+            crate::runtime::task::ExecutionReason::JoinBuildStateContract.reason(),
         )
     }
 }
 pub(super) fn build_contract(
     detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(JoinBuildStateContract(
+) -> crate::runtime::task::ExecutionFailure {
+    crate::runtime::task::ExecutionFailure::from_domain(JoinBuildStateContract(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
     ))
 }

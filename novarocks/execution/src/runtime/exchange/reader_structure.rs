@@ -24,7 +24,7 @@ pub(super) fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> Exc
         ReaderStructureFailure::Layout(cause) => cause.into(),
         ReaderStructureFailure::Map(cause) => cause.into(),
         ReaderStructureFailure::BTree(cause) => {
-            ExchangeFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(cause))
+            ExchangeFailure::Source(crate::runtime::task::SharedDomainFailure::new(cause))
         }
         ReaderStructureFailure::Vector(novarocks_type_contract::ControlResourceError::Control(
             cause,
@@ -631,7 +631,7 @@ mod tests {
         tracker.install_limit_once(baseline + 1).unwrap();
         let error = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap_err();
         assert!(
-            matches!(error, ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))))
+            matches!(error, ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))))
         );
         assert_eq!(tracker.current(), baseline);
         drop(recipe);

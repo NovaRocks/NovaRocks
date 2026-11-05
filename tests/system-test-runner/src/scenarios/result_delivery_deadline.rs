@@ -24,7 +24,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};

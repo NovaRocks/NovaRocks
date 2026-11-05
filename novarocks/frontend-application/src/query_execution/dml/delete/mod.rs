@@ -119,7 +119,7 @@ pub(crate) async fn prepare_delete_write_async(
     statement: &OwnedDeleteStatement,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
@@ -132,7 +132,7 @@ pub(crate) async fn prepare_delete_write_async(
                 statement,
                 target,
                 target_ref,
-                planning_lease,
+                planning_pin,
                 execution,
                 connector_context,
                 operation_id,
@@ -146,7 +146,7 @@ pub(crate) async fn prepare_delete_write_async(
                 statement,
                 target,
                 target_ref,
-                planning_lease,
+                planning_pin,
                 execution,
                 connector_context,
                 begin_receiving,
@@ -160,16 +160,16 @@ pub(crate) async fn prepare_delete_write_async(
 /// or using a synchronous joining metadata wrapper.
 async fn load_delete_target_async(
     target: &crate::catalog_application::resolver::TargetBackend,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::connector::write_target::ConnectorWriteTargetBinding, String> {
     let context =
-        crate::connector::context_for_planning_lease(&planning_lease, connector_context.clone())?;
+        crate::connector::context_for_planning_pin(&planning_pin, connector_context.clone())?;
     let metadata = crate::connector::schema_creation::load_frontend_table_async(
-        planning_lease.binding().metadata().as_ref(),
+        planning_pin.binding().metadata().as_ref(),
         novarocks_spi::connector::ConnectorTableRequest {
             table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: planning_lease.binding().descriptor().instance_id.clone(),
+                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(target.namespace.as_str()),
                 table: Arc::from(target.table.as_str()),
             },
@@ -179,13 +179,13 @@ async fn load_delete_target_async(
     )
     .await
     .map_err(|error| error.to_string())?;
-    Ok(crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_lease))
+    Ok(crate::connector::write_target::ConnectorWriteTargetBinding::new(metadata, planning_pin))
 }
 
 async fn begin_delete_write_session_async(
     state: &DmlExecutionKernel,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
+    write_lease: &novarocks_spi::connector::ConnectorWrite,
     request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
     begin_receiving: &crate::query_execution::write_session::WriteBeginReceiving,
 ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
@@ -195,7 +195,7 @@ async fn begin_delete_write_session_async(
     crate::query_execution::write_session::ConnectorWriteSession::begin_async_in(
         crate::connector::write_target::derive_write_stack_lease(
             state.typed_connector_control(),
-            planning_lease,
+            planning_pin,
         )?,
         catalog_properties,
         request,

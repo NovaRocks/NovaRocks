@@ -38,7 +38,7 @@ impl StatementCommandCompletion {
 
 /// An action cannot return a second governed owner through its value slot.
 pub enum StatementActionValue {
-    Rows(crate::api::ExecutionHandle),
+    Rows(crate::api::ExecutionOutputObligation),
     Local(crate::api::OwnedLocalResult),
     Ok(StatementCommandCompletion),
     SessionChanges(crate::session_effects::SessionEffects),

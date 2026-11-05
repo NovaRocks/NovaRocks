@@ -20,6 +20,7 @@
 //! Unknown Driver Drop assertions require real production owner custody.
 use super::{DriverState, PipelineDriver};
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     operator::{
         ExitFailure, ExitObservation, FinishWatch, InputConstructionFactory, InputEncodingPolicy,
@@ -30,13 +31,12 @@ use crate::exec::pipeline::{
         fanout::{Fanout, FanoutRouter, RouteStep},
     },
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
 use crate::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    fragment::{ExecutionFailure, ExecutionResult},
     observable::Observable,
     runtime_state::{RuntimeErrorState, RuntimeState},
+    task::{ExecutionFailure, ExecutionResult},
     task_control::{TaskExecutionControl, TaskExecutionPort, test_support::Owner as TaskOwner},
 };
 use novarocks_execution_contract::{
@@ -61,7 +61,7 @@ impl FanoutRouter for ExitRouter {
         &mut self,
         _: PreparedInput,
         _: &dyn InputConstructionFactory,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
     ) -> ExecutionResult<()> {
         unreachable!("exit-only fanout fixture")
     }
@@ -69,7 +69,7 @@ impl FanoutRouter for ExitRouter {
         &mut self,
         _: &mut (),
         _: &dyn InputConstructionFactory,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
     ) -> ExecutionResult<RouteStep> {
         unreachable!("exit-only fanout fixture")
     }
@@ -271,7 +271,7 @@ impl SourceKernel for BranchOwner {
     fn start(&self) -> SourceStart {
         SourceStart::Finished
     }
-    fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }
 }

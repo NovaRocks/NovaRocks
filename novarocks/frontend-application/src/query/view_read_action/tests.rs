@@ -192,7 +192,7 @@ impl Fixture {
                 context: Some(context),
                 turn: Turn::Prepare,
                 prepared: None,
-                lease: None,
+                planning_pin: None,
                 names: None,
                 raw: None,
                 producer: Some(
@@ -724,7 +724,7 @@ async fn raw_error_ready_inside_the_poll_that_admits_root_stop_is_not_reclassifi
 }
 
 /// The existing adapter-error regression uses this same positive Root,
-/// planning lease, exact author and closed factory rather than a dummy port.
+/// planning pin, exact author and closed factory rather than a dummy port.
 pub(crate) async fn assert_listing_error_text(kind: ConnectorErrorKind) {
     let provider = ListingFixture::new(FailurePoint::Views, kind);
     let mut fixture = Fixture::for_input(Some(&provider), false).await;
@@ -802,7 +802,7 @@ async fn exact_provider_metadata_factory_exits_before_view_input_aliases_retire(
     {
         let body = state.original.as_ref().unwrap().body.lock().unwrap();
         assert!(body.as_ref().unwrap().input.is_none());
-        assert!(body.as_ref().unwrap().lease.is_none());
+        assert!(body.as_ref().unwrap().planning_pin.is_none());
     }
     drop(fixture.state.as_mut().unwrap().origin.take());
     drop(fixture.local.take());
@@ -881,7 +881,7 @@ async fn held_actual_provider_cpu_keeps_the_action_and_local_until_its_footer() 
         );
         assert!(body.input.is_some());
         assert!(
-            body.lease.is_some(),
+            body.planning_pin.is_some(),
             "exact generation retained until the actual CPU footer"
         );
     }
@@ -934,7 +934,7 @@ async fn held_actual_provider_cpu_keeps_the_action_and_local_until_its_footer() 
             "original post-CPU raw outcome is still retained"
         );
         assert!(body.as_ref().unwrap().input.is_none());
-        assert!(body.as_ref().unwrap().lease.is_none());
+        assert!(body.as_ref().unwrap().planning_pin.is_none());
     }
     let calls = provider.calls();
     assert_eq!(

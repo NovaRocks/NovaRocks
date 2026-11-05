@@ -595,7 +595,7 @@ impl ProductionSourceOpening {
             .planning_metadata_cpu_port(
                 capacity.scope(),
                 capacity.try_window_alias().map_err(admission_error)?,
-                recipe.source.planning_lease(),
+                recipe.source.planning_pin(),
                 novarocks_query_application::cancellation::QueryCancellationView::governed(
                     recipe.cancellation.clone(),
                     None,

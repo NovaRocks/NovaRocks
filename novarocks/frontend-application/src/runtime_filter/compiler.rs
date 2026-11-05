@@ -509,7 +509,7 @@ fn materialize_bindings(
                 placement.backend_idx()
             )));
         }
-        let instance = placement.fragment_instance_id();
+        let instance = placement.task_key();
         if instance.high() == 0 && instance.low() == 0 {
             return Err(compilation_error(
                 "runtime filter placement has a zero fragment instance id",
@@ -1155,7 +1155,7 @@ fn core_channel(
         producers.push(filter::RuntimeFilterProducerDeployment {
             binding_id,
             coverage_witness_id: witness,
-            expected_fragment_instances: expected.into_iter().map(unique_id_wire).collect(),
+            expected_tasks: expected.into_iter().map(unique_id_wire).collect(),
         });
     }
     let mut consumers = Vec::new();
@@ -1212,7 +1212,7 @@ fn core_channel(
             capabilities: capabilities.iter().copied().map(capability_wire).collect(),
             artifact_profile: Some(profile.clone()),
             route_edge_ids: route_ids.iter().copied().collect(),
-            expected_fragment_instances: expected.into_iter().map(unique_id_wire).collect(),
+            expected_tasks: expected.into_iter().map(unique_id_wire).collect(),
         });
         for route in role.routes.iter().filter(|route| {
             route.to_binding == *binding_id
@@ -1380,10 +1380,10 @@ fn routing_channel(
         local_roles: local_roles.into_iter().map(route_role_wire).collect(),
         producer_instances: producer_instances
             .into_iter()
-            .map(|((binding_id, fragment_instance_id), participant_id)| {
+            .map(|((binding_id, task_key), participant_id)| {
                 filter::RuntimeFilterProducerInstanceRoute {
                     binding_id,
-                    fragment_instance_id: Some(unique_id_wire(fragment_instance_id)),
+                    task_key: Some(unique_id_wire(task_key)),
                     participant_id,
                 }
             })

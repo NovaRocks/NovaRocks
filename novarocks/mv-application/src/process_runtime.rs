@@ -39,17 +39,17 @@ use tokio::{
 
 /// One event in either of the two original process-wide worker slots.
 pub type MvBackgroundFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub type MvRefreshBackgroundTask =
+pub type MvRefreshBackgroundJob =
     Box<dyn FnMut(MvBackgroundStop, mpsc::Sender<()>) -> MvBackgroundFuture + Send + 'static>;
-pub type MvMaintenanceBackgroundTask =
+pub type MvMaintenanceBackgroundJob =
     Box<dyn FnMut(MvBackgroundStop) -> MvBackgroundFuture + Send + 'static>;
 
-pub struct MvBackgroundTasks {
-    refresh: MvRefreshBackgroundTask,
-    maintenance: MvMaintenanceBackgroundTask,
+pub struct MvBackgroundJobs {
+    refresh: MvRefreshBackgroundJob,
+    maintenance: MvMaintenanceBackgroundJob,
 }
-impl MvBackgroundTasks {
-    pub fn new(refresh: MvRefreshBackgroundTask, maintenance: MvMaintenanceBackgroundTask) -> Self {
+impl MvBackgroundJobs {
+    pub fn new(refresh: MvRefreshBackgroundJob, maintenance: MvMaintenanceBackgroundJob) -> Self {
         Self {
             refresh,
             maintenance,
@@ -163,8 +163,8 @@ impl MvBackgroundStop {
 }
 
 enum EventFactory {
-    Refresh(MvRefreshBackgroundTask),
-    Maintenance(MvMaintenanceBackgroundTask),
+    Refresh(MvRefreshBackgroundJob),
+    Maintenance(MvMaintenanceBackgroundJob),
 }
 struct OriginalEvent {
     // A callback whose destructor unwound is not a valid callback again.
@@ -307,7 +307,7 @@ impl MvBackgroundRuntime {
         health: Arc<dyn MvBackgroundHealthPort>,
         refresh_interval: Duration,
         maintenance_interval: Duration,
-        tasks: MvBackgroundTasks,
+        tasks: MvBackgroundJobs,
     ) -> Result<Self, String> {
         // Preserve the original coalescing wake channel, not a job queue.
         let (maintenance_wakeup_tx, mut maintenance_wakeup_rx) = mpsc::channel(1);
@@ -1000,8 +1000,8 @@ mod tests {
         assert_eq!(runtime.readiness(&target), TargetReadiness::Ready);
     }
 
-    fn empty_tasks() -> super::MvBackgroundTasks {
-        super::MvBackgroundTasks::new(
+    fn empty_tasks() -> super::MvBackgroundJobs {
+        super::MvBackgroundJobs::new(
             Box::new(|_, _| Box::pin(async {})),
             Box::new(|_| Box::pin(async {})),
         )
@@ -1063,7 +1063,7 @@ mod tests {
             health.clone(),
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |stop, _| {
                     Box::pin(OriginalStopWait {
                         stop,
@@ -1104,7 +1104,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |stop, _| {
                     let turn = source_turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if turn == 0 {
@@ -1168,7 +1168,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |stop, _| -> super::MvBackgroundFuture {
                     if source_turns.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Box::pin(StopAfterReady { stop, ready: false });
@@ -1239,7 +1239,7 @@ mod tests {
             health.clone(),
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |_, _| {
                     let _original = &primary;
                     Box::pin(async {})
@@ -1338,7 +1338,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(60),
             Duration::from_secs(60),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |_, _| {
                     refresh_seen.send(()).unwrap();
                     Box::pin(async {})
@@ -1429,7 +1429,7 @@ mod tests {
             health.clone(),
             Duration::from_secs(60),
             Duration::from_secs(60),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |_, _| {
                     let _probe = &probe;
                     counted.fetch_add(1, Ordering::SeqCst);
@@ -1504,7 +1504,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(60),
             Duration::from_secs(60),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(|_, _| Box::pin(async {})),
                 Box::new(move |_| {
                     let source = Arc::clone(&source);
@@ -1574,7 +1574,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(60),
             Duration::from_secs(60),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |_, _| {
                     let primary = primary.take().unwrap();
                     Box::pin(async move { std::panic::panic_any(primary) })
@@ -1646,7 +1646,7 @@ mod tests {
             crate::process_runtime::test_health_port(),
             Duration::from_secs(60),
             Duration::from_secs(60),
-            super::MvBackgroundTasks::new(
+            super::MvBackgroundJobs::new(
                 Box::new(move |_, _| {
                     let (entered, release) = refresh.take().unwrap();
                     Box::pin(async move {

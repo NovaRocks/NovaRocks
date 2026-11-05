@@ -21,28 +21,27 @@
 //! neither accepts a conclusion nor creates replacement preparation authority.
 
 use novarocks_execution::runtime::{
-    execution_health::ExecutionHealth, fragment::ExecutionFailure,
-    task_control::TaskExecutionControl,
+    execution_health::ExecutionHealth, task::ExecutionFailure, task_control::TaskExecutionControl,
 };
 use novarocks_execution_contract::{
-    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
+    AbortCause, AbortParticipation, AcquireParticipationAdmissionTicket, AdmissionEpochCapability,
     AdmissionTicketId, CancelReason, CancelTask, CodecOwnedContent, ConfidentialContent,
-    ContentFingerprint, CreateTask, CreationContent, CredentialEpoch, CredentialLeaseId,
-    CredentialUpdate, EstablishQueryContext, ExchangeTopology, FrozenBytes, LeaseValidFor,
-    OperationOutcome, QueryContextRef, TaskCreationInput, TaskDescriptor, TaskDomainUpdate,
+    ContentFingerprint, CreateTask, CreationContent, CredentialDomainId, CredentialEpoch,
+    CredentialUpdate, EstablishParticipation, ExchangeTopology, FrozenBytes, LeaseValidFor,
+    OperationOutcome, ParticipationRef, TaskCreationInput, TaskDescriptor, TaskDomainUpdate,
     TaskFailureCategory, TaskIdentity, TaskOperationId,
 };
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, UniqueId};
 use novarocks_worker::{
-    HostRejection, LeaseBounds, ManualClock, NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET,
-    NodeAdmissionTicketConfig, NodeContextCoreConfig, NodeControlConfig, NodeGeometry,
-    NodeGeometryInputs, NodeWorkers, PreparationControlLoan, PreparedTaskInstallation,
-    QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence, RequestHorizon,
-    RunnableTask, SharedFactsRequest, TaskExecutionHost, TaskIngressRetirement,
-    TaskPreparationContext, TaskPreparationView, TaskStatusReporter, WorkerAdmissionEpochAuthority,
-    WorkerContextReplyBody, WorkerControlReplyBody, WorkerCreateReply, WorkerNodeConfig,
-    WorkerNodeRuntime, WorkerTaskControl,
-    control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits},
+    HostRejection, LeaseBounds, ManualClock, NODE_CONTROL_STEP_BUDGET,
+    NODE_PARTICIPATION_STEP_BUDGET, NodeAdmissionTicketConfig, NodeControlConfig, NodeGeometry,
+    NodeGeometryInputs, NodeParticipationCoreConfig, NodeWorkers, ParticipationHostFactory,
+    ParticipationHostInstance, PreparationControlLoan, PreparedTaskInstallation,
+    ReleasedParticipationEvidence, RequestHorizon, RunnableTask, SharedFactsRequest,
+    TaskExecutionHost, TaskIngressRetirement, TaskPreparationContext, TaskPreparationView,
+    TaskStatusReporter, WorkerAdmissionEpochAuthority, WorkerControlReplyBody, WorkerCreateReply,
+    WorkerNodeConfig, WorkerNodeRuntime, WorkerParticipationReplyBody, WorkerTaskControl,
+    control_runtime_policy::{ControlRuntimePolicy, IngressPositionLimits},
 };
 use std::{
     collections::BTreeMap,
@@ -105,16 +104,16 @@ pub struct NativeNodeFixture {
 impl NativeNodeFixture {
     pub fn start(
         backend: novarocks_types::BackendProcessId,
-        factory: Arc<dyn QueryContextHostFactory>,
+        factory: Arc<dyn ParticipationHostFactory>,
         execution: Arc<dyn TaskExecutionHost>,
         health: Arc<ExecutionHealth>,
         tasks: usize,
         preparing: usize,
     ) -> Self {
-        // The fixture declares its actual owners: one Context, one loader and
+        // The fixture declares its actual owners: one Participation, one loader and
         // one preparation body; cleanup and protocol polling remain independent.
         let policy = ControlRuntimePolicy::try_new_with_request_sources(
-            IngressRoleLimits {
+            IngressPositionLimits {
                 ordinary_running: 1,
                 ordinary_waiting: 1,
                 control_running: 1,
@@ -132,7 +131,7 @@ impl NativeNodeFixture {
         )
         .unwrap();
         let geometry = NodeGeometry::try_new(NodeGeometryInputs {
-            tasks_per_context: nz(tasks),
+            tasks_per_participation: nz(tasks),
             active_tasks: nz(tasks),
             preparing_tasks: nz(preparing),
             preparing_bytes: nz(64 << 20),
@@ -149,7 +148,7 @@ impl NativeNodeFixture {
             compatibility: NativeCompatibilityId::new([0x71; 32]),
             initial_admission_epoch: AdmissionEpochCapability::try_from_bytes([1; 16]).unwrap(),
             clock: clock.clone(),
-            context_factory: factory,
+            participation_factory: factory,
             execution,
             execution_ports: crate::task_execution_observation::backend_task_execution_ports(
                 health,
@@ -160,14 +159,14 @@ impl NativeNodeFixture {
                 max_pending_requests: requests,
                 step_budget: NODE_CONTROL_STEP_BUDGET,
             },
-            context: NodeContextCoreConfig {
+            participation: NodeParticipationCoreConfig {
                 request_horizon: RequestHorizon::DEFAULT,
                 max_tasks: tasks,
                 max_creation_waiters: requests,
                 max_pending_requests: requests,
                 max_preparing: preparing,
                 max_task_bytes: 64 << 20,
-                step_budget: NODE_CONTEXT_STEP_BUDGET,
+                step_budget: NODE_PARTICIPATION_STEP_BUDGET,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: novarocks_worker::METRIC_PUBLISH_MIN_INTERVAL,
             },
@@ -175,8 +174,8 @@ impl NativeNodeFixture {
             geometry,
             workers: NodeWorkers {
                 pollers: nz(1),
-                context_materialization: nz(1),
-                context_cleanup: nz(1),
+                participation_materialization: nz(1),
+                participation_cleanup: nz(1),
                 establish_getters: nz(1),
                 establish_cleanup: nz(1),
                 loading: nz(1),
@@ -233,14 +232,14 @@ impl NativeNodeFixture {
     }
     pub fn status(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
     ) -> novarocks_execution_contract::TaskStatus {
-        self.wait_status(context, task, Duration::from_secs(10), |_| true)
+        self.wait_status(participation, task, Duration::from_secs(10), |_| true)
     }
     pub fn wait_status(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
         budget: Duration,
         accepted: impl Fn(&novarocks_execution_contract::TaskStatus) -> bool,
@@ -249,7 +248,7 @@ impl NativeNodeFixture {
         let mut source = self
             .control
             .begin_status_subscription(
-                context,
+                participation,
                 TaskOperationId::new_v7(),
                 self.deadline(),
                 1,
@@ -281,7 +280,7 @@ impl NativeNodeFixture {
                 panic!("the actual selected frame was not accepted")
             });
             // `required` names mandatory coverage, not an exclusive feed:
-            // CatchUp may include other Tasks in this same Context. Deliver
+            // CatchUp may include other Tasks in this same Participation. Deliver
             // every selected frame, but match this exact requested identity.
             if let Some(status) = status
                 && status.identity() == task
@@ -291,27 +290,27 @@ impl NativeNodeFixture {
             }
         }
     }
-    pub fn establish(&self, context: QueryContextRef) {
+    pub fn establish(&self, participation: ParticipationRef) {
         self.establish_with(
-            context,
-            ContextContents {
+            participation,
+            ParticipationContents {
                 catalog: Arc::new(Content),
                 filters: Arc::new(Content),
                 options: Arc::new(Content),
                 credential: CredentialUpdate::new(
-                    CredentialLeaseId::new(1),
+                    CredentialDomainId::new(1),
                     CredentialEpoch::FIRST,
                     Arc::new(Secret),
                 ),
             },
         );
     }
-    pub fn establish_with(&self, context: QueryContextRef, contents: ContextContents) {
+    pub fn establish_with(&self, participation: ParticipationRef, contents: ParticipationContents) {
         let ticket =
             AdmissionTicketId::try_from_bytes(TaskOperationId::new_v7().to_bytes()).unwrap();
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([0x71; 32]),
             self.control.admission_epoch_capability(),
@@ -325,9 +324,9 @@ impl NativeNodeFixture {
         );
         drop(admitted);
         let result = await_original(self.control.establish(
-            EstablishQueryContext::new(
+            EstablishParticipation::new(
                 TaskOperationId::new_v7(),
-                context,
+                participation,
                 ticket,
                 contents.catalog,
                 contents.filters,
@@ -339,7 +338,7 @@ impl NativeNodeFixture {
         ))
         .unwrap();
         assert!(
-            matches!(result.body(), WorkerControlReplyBody::Context(ack)
+            matches!(result.body(), WorkerControlReplyBody::Participation(ack)
             if ack.outcome == OperationOutcome::Accepted),
             "{:?}",
             result.body()
@@ -383,7 +382,7 @@ impl Drop for NativeNodeFixture {
     }
 }
 
-pub struct ContextContents {
+pub struct ParticipationContents {
     pub catalog: Arc<dyn CodecOwnedContent>,
     pub filters: Arc<dyn CodecOwnedContent>,
     pub options: Arc<dyn CodecOwnedContent>,
@@ -423,69 +422,70 @@ impl CreationContent for Assignment {
     }
 }
 pub fn factory_from_host(
-    host: Arc<dyn novarocks_worker::QueryContextHost>,
-) -> Arc<dyn QueryContextHostFactory> {
-    struct Factory(Arc<dyn novarocks_worker::QueryContextHost>);
+    host: Arc<dyn novarocks_worker::ParticipationHost>,
+) -> Arc<dyn ParticipationHostFactory> {
+    struct Factory(Arc<dyn novarocks_worker::ParticipationHost>);
     struct Instance {
-        context: QueryContextRef,
-        original: Arc<dyn novarocks_worker::QueryContextHost>,
+        participation: ParticipationRef,
+        original: Arc<dyn novarocks_worker::ParticipationHost>,
     }
-    impl QueryContextHostFactory for Factory {
+    impl ParticipationHostFactory for Factory {
         fn create_instance(
             self: Arc<Self>,
-            context: QueryContextRef,
-        ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection> {
+            participation: ParticipationRef,
+        ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
             Ok(Arc::new(Instance {
-                context,
+                participation,
                 original: self.0.clone(),
             }))
         }
     }
-    impl QueryContextHostInstance for Instance {
-        fn context(&self) -> QueryContextRef {
-            self.context
+    impl ParticipationHostInstance for Instance {
+        fn participation(&self) -> ParticipationRef {
+            self.participation
         }
         fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
-            assert_eq!(request.context(), self.context);
+            assert_eq!(request.participation(), self.participation);
             self.original.materialize(request)
         }
-        fn release(&self) -> ReleasedContextEvidence {
-            self.original.release(self.context)
+        fn release(&self) -> ReleasedParticipationEvidence {
+            self.original.release(self.participation)
         }
         fn advance_shared_domain(
             &self,
-            domain: &novarocks_execution_contract::QueryContextDomainUpdate,
+            domain: &novarocks_execution_contract::ParticipationDomainUpdate,
         ) -> Result<(), HostRejection> {
-            self.original.advance_shared_domain(self.context, domain)
+            self.original
+                .advance_shared_domain(self.participation, domain)
         }
     }
     Arc::new(Factory(host))
 }
 
 struct MetadataFactory;
-struct MetadataContext(QueryContextRef);
-impl QueryContextHostFactory for MetadataFactory {
+struct MetadataParticipationHost(ParticipationRef);
+impl ParticipationHostFactory for MetadataFactory {
     fn create_instance(
         self: Arc<Self>,
-        context: QueryContextRef,
-    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection> {
-        Ok(Arc::new(MetadataContext(context)))
+        participation: ParticipationRef,
+    ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
+        Ok(Arc::new(MetadataParticipationHost(participation)))
     }
 }
-impl QueryContextHostInstance for MetadataContext {
-    fn context(&self) -> QueryContextRef {
+impl ParticipationHostInstance for MetadataParticipationHost {
+    fn participation(&self) -> ParticipationRef {
         self.0
     }
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
-        assert_eq!(request.context(), self.0);
+        assert_eq!(request.participation(), self.0);
         Ok(())
     }
-    fn release(&self) -> ReleasedContextEvidence {
-        ReleasedContextEvidence::none()
+    fn release(&self) -> ReleasedParticipationEvidence {
+        ReleasedParticipationEvidence::none()
     }
     fn advance_shared_domain(
         &self,
-        _: &novarocks_execution_contract::QueryContextDomainUpdate,
+        _: &novarocks_execution_contract::ParticipationDomainUpdate,
     ) -> Result<(), HostRejection> {
         unreachable!("metadata fixture has no domain update")
     }
@@ -521,9 +521,9 @@ struct PreparationGate {
 }
 struct MetadataExecution(BTreeMap<TaskIdentity, Arc<PreparationGate>>);
 impl TaskExecutionHost for MetadataExecution {
-    fn close_context_admission(&self, _: QueryContextRef) {}
-    fn retire_context_execution(&self, _: QueryContextRef) {}
-    fn forget_context_admission(&self, _: QueryContextRef) {}
+    fn close_participation_admission(&self, _: ParticipationRef) {}
+    fn retire_participation_execution(&self, _: ParticipationRef) {}
+    fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,
         descriptor: &TaskDescriptor,
@@ -536,7 +536,7 @@ impl TaskExecutionHost for MetadataExecution {
             .expect("the admitted original Task gate");
         let control = preparation.runtime_control();
         let roles = preparation
-            .take_roles()
+            .take_capture()
             .expect("one original physical preparation");
         let mut state = gate.state.lock().unwrap();
         state.0 = Some(preparation.view());
@@ -597,25 +597,25 @@ pub struct NativeNodePreparation {
     gate: Arc<PreparationGate>,
     node: Rc<NativeNodeFixture>,
     task: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     writer: novarocks_worker::TaskDynamicFilterWriter,
 }
 impl NativeNodePreparation {
     pub fn new(task: TaskIdentity) -> Self {
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             task.query_execution_id(),
             FrontendProcessId::new_v7(),
             task.backend_process_id(),
         );
-        Self::with_context(
-            context,
+        Self::with_participation(
+            participation,
             Arc::new(MetadataFactory),
-            ContextContents {
+            ParticipationContents {
                 catalog: Arc::new(Content),
                 filters: Arc::new(Content),
                 options: Arc::new(Content),
                 credential: CredentialUpdate::new(
-                    CredentialLeaseId::new(1),
+                    CredentialDomainId::new(1),
                     CredentialEpoch::FIRST,
                     Arc::new(Secret),
                 ),
@@ -625,21 +625,21 @@ impl NativeNodePreparation {
         .pop()
         .unwrap()
     }
-    pub fn with_context(
-        context: QueryContextRef,
-        factory: Arc<dyn QueryContextHostFactory>,
-        contents: ContextContents,
+    pub fn with_participation(
+        participation: ParticipationRef,
+        factory: Arc<dyn ParticipationHostFactory>,
+        contents: ParticipationContents,
         tasks: &[TaskIdentity],
     ) -> Vec<Self> {
-        Self::with_context_each(context, factory, contents, tasks, |_, _| {})
+        Self::with_participation_each(participation, factory, contents, tasks, |_, _| {})
     }
     /// Each Task enters its own actual preparation callback. The observer
     /// borrows that Task's original writer while its unique gate is held;
     /// then that callback may return before the next same-scope body runs.
-    pub fn with_context_each(
-        context: QueryContextRef,
-        factory: Arc<dyn QueryContextHostFactory>,
-        contents: ContextContents,
+    pub fn with_participation_each(
+        participation: ParticipationRef,
+        factory: Arc<dyn ParticipationHostFactory>,
+        contents: ParticipationContents,
         tasks: &[TaskIdentity],
         mut observe: impl FnMut(usize, &Self),
     ) -> Vec<Self> {
@@ -648,20 +648,20 @@ impl NativeNodePreparation {
             .iter()
             .copied()
             .map(|task| {
-                task.verify_query_context(context).unwrap();
+                task.verify_participation(participation).unwrap();
                 (task, Arc::new(PreparationGate::default()))
             })
             .collect();
         assert_eq!(gates.len(), tasks.len());
         let node = Rc::new(NativeNodeFixture::start(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             factory,
             Arc::new(MetadataExecution(gates.clone())),
             Arc::new(ExecutionHealth::default()),
             tasks.len(),
             tasks.len(),
         ));
-        node.establish_with(context, contents);
+        node.establish_with(participation, contents);
         let mut originals = Vec::new();
         for (ordinal, &task) in tasks.iter().enumerate() {
             let descriptor = TaskDescriptor::try_new(
@@ -676,7 +676,7 @@ impl NativeNodePreparation {
             )
             .unwrap();
             let request = Arc::new(
-                CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, vec![])
+                CreateTask::try_new(TaskOperationId::new_v7(), participation, descriptor, vec![])
                     .unwrap(),
             );
             let delivery = await_original(node.control.create(
@@ -693,7 +693,7 @@ impl NativeNodePreparation {
             assert!(
                 matches!(
                     delivery.reply(),
-                    WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+                    WorkerCreateReply::Participation(WorkerParticipationReplyBody::Create {
                         outcome: OperationOutcome::Accepted,
                         ..
                     })
@@ -723,7 +723,7 @@ impl NativeNodePreparation {
                 gate,
                 node: node.clone(),
                 task,
-                context,
+                participation,
                 writer,
             });
             let original = originals.last().unwrap();
@@ -740,18 +740,22 @@ impl NativeNodePreparation {
         originals
     }
     pub fn status(&self) -> novarocks_execution_contract::TaskStatus {
-        self.node.status(self.context, self.task)
+        self.node.status(self.participation, self.task)
     }
     pub fn wait_status(
         &self,
         accepted: impl Fn(&novarocks_execution_contract::TaskStatus) -> bool,
     ) -> novarocks_execution_contract::TaskStatus {
-        self.node
-            .wait_status(self.context, self.task, Duration::from_secs(10), accepted)
+        self.node.wait_status(
+            self.participation,
+            self.task,
+            Duration::from_secs(10),
+            accepted,
+        )
     }
     pub fn dynamic_filters(&self) -> novarocks_worker::WorkerTaskReadDelivery {
         await_original(self.node.control.get_dynamic_filters(
-            self.context,
+            self.participation,
             novarocks_execution_contract::FetchTaskDynamicFilters::new(
                 TaskOperationId::new_v7(),
                 self.task,
@@ -764,26 +768,28 @@ impl NativeNodePreparation {
     pub fn dynamic_filter_writer(&self) -> novarocks_worker::TaskDynamicFilterWriter {
         self.writer.clone()
     }
-    pub fn release_context(originals: &[Self]) {
-        let first = originals.first().expect("the original Context members");
+    pub fn release_participation(originals: &[Self]) {
+        let first = originals
+            .first()
+            .expect("the original Participation members");
         let quiesce = await_original(first.node.control.quiesce(
-            novarocks_execution_contract::QuiesceQueryContext::new(
+            novarocks_execution_contract::QuiesceParticipation::new(
                 TaskOperationId::new_v7(),
-                first.context,
+                first.participation,
             ),
             first.node.deadline(),
         ))
         .unwrap();
         assert!(matches!(
             quiesce.body(),
-            WorkerContextReplyBody::Quiesce {
+            WorkerParticipationReplyBody::Quiesce {
                 outcome: OperationOutcome::Accepted | OperationOutcome::Idempotent,
                 ..
             }
         ));
         drop(quiesce);
         for original in originals {
-            assert_eq!(original.context, first.context);
+            assert_eq!(original.participation, first.participation);
             assert!(Rc::ptr_eq(&original.node, &first.node));
             let mut state = original.gate.state.lock().unwrap();
             state.2 = true;
@@ -792,21 +798,21 @@ impl NativeNodePreparation {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
             let release = await_original(first.node.control.release(
-                novarocks_execution_contract::ReleaseQueryContext::new(
+                novarocks_execution_contract::ReleaseParticipation::new(
                     TaskOperationId::new_v7(),
-                    first.context,
+                    first.participation,
                 ),
                 first.node.deadline(),
             ))
             .unwrap();
             match release.body() {
-                WorkerContextReplyBody::Release {
+                WorkerParticipationReplyBody::Release {
                     release:
                         novarocks_execution_contract::ReleaseOutcome::Released
                         | novarocks_execution_contract::ReleaseOutcome::AlreadyTerminal,
                     ..
                 } => return,
-                WorkerContextReplyBody::Release {
+                WorkerParticipationReplyBody::Release {
                     release: novarocks_execution_contract::ReleaseOutcome::NotReady,
                     ..
                 } => {}
@@ -815,7 +821,7 @@ impl NativeNodePreparation {
             drop(release);
             assert!(
                 Instant::now() < until,
-                "original Task/Context did not release"
+                "original Task/Participation did not release"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -867,7 +873,11 @@ impl NativeNodePreparation {
             PreparationStop::Abort(cause) => {
                 drop(
                     await_original(self.node.control.abort(
-                        AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause),
+                        AbortParticipation::new(
+                            TaskOperationId::new_v7(),
+                            self.participation,
+                            cause,
+                        ),
                         self.node.deadline(),
                     ))
                     .unwrap(),
@@ -896,20 +906,20 @@ struct InspectInstall {
     foreign_descriptor: Option<TaskDescriptor>,
 }
 impl TaskExecutionHost for InspectInstall {
-    fn close_context_admission(&self, context: QueryContextRef) {
-        self.original.close_context_admission(context)
+    fn close_participation_admission(&self, participation: ParticipationRef) {
+        self.original.close_participation_admission(participation)
     }
-    fn abort_context_admission(&self, context: QueryContextRef) {
-        self.original.abort_context_admission(context)
+    fn abort_participation_admission(&self, participation: ParticipationRef) {
+        self.original.abort_participation_admission(participation)
     }
-    fn retire_context_execution(&self, context: QueryContextRef) {
-        self.original.retire_context_execution(context)
+    fn retire_participation_execution(&self, participation: ParticipationRef) {
+        self.original.retire_participation_execution(participation)
     }
-    fn forget_context_admission(&self, context: QueryContextRef) {
-        self.original.forget_context_admission(context)
+    fn forget_participation_admission(&self, participation: ParticipationRef) {
+        self.original.forget_participation_admission(participation)
     }
-    fn retains_normal_close(&self, context: QueryContextRef) -> bool {
-        self.original.retains_normal_close(context)
+    fn retains_normal_close(&self, participation: ParticipationRef) -> bool {
+        self.original.retains_normal_close(participation)
     }
     fn install_receiver(
         &self,
@@ -974,7 +984,7 @@ impl TaskExecutionHost for InspectInstall {
 
 pub fn inspect_install(
     original: Arc<dyn TaskExecutionHost>,
-    factory: Arc<dyn QueryContextHostFactory>,
+    factory: Arc<dyn ParticipationHostFactory>,
     health: Arc<ExecutionHealth>,
     descriptor: TaskDescriptor,
     input: TaskCreationInput,
@@ -996,20 +1006,20 @@ pub fn inspect_install(
         1,
         1,
     );
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         task.query_execution_id(),
         FrontendProcessId::new_v7(),
         task.backend_process_id(),
     );
-    node.establish(context);
+    node.establish(participation);
     let result = node.create(
-        CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, vec![]).unwrap(),
+        CreateTask::try_new(TaskOperationId::new_v7(), participation, descriptor, vec![]).unwrap(),
         input,
     );
     assert!(
         matches!(
             result.reply(),
-            WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+            WorkerCreateReply::Participation(WorkerParticipationReplyBody::Create {
                 outcome: OperationOutcome::Accepted,
                 ..
             })

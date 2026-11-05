@@ -52,7 +52,7 @@ use novarocks_query_application::{
     },
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
+    ConnectorControlPlanningPin, ConnectorMetadataCleanupResponsibility, ConnectorRequestContext,
     ConnectorRowMutationSelection, ConnectorWriteOperationId,
 };
 use novarocks_workload_control::{WorkError, WorkScope};
@@ -133,7 +133,7 @@ struct OriginalInput {
     statement: OwnedMutationStatement,
     target: crate::catalog_application::resolver::TargetBackend,
     reference: String,
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     operation: ConnectorWriteOperationId,
     request: novarocks_query_application::admitted_query_context::RequestContext,
     options: QueryOptions,
@@ -180,7 +180,7 @@ async fn prepare_phase(
             &input.target,
             &input.reference,
             input.request.session().current_catalog(),
-            input.lease.clone(),
+            input.planning_pin.clone(),
             execution,
             &context,
             input.operation,
@@ -1169,13 +1169,13 @@ pub(crate) fn prepare(
         input.context.session().current_catalog(),
         input.context.session().current_database(),
     )?;
-    let lease = crate::connector::acquire_metadata_planning_lease(
+    let planning_pin = crate::connector::acquire_metadata_planning_pin(
         kernel.connector_control().as_ref(),
         &target.catalog,
     )?;
     let stack = kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.control_runtime_id())
+        .acquire_exact_write_stack(planning_pin.control_runtime_id())
         .map_err(|e| e.to_string())?;
     let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
     drop(stack);
@@ -1227,7 +1227,7 @@ pub(crate) fn prepare(
         statement: input.statement,
         target,
         reference,
-        lease,
+        planning_pin,
         operation: publication_id.into(),
         request: input.context,
         options: input.query_options,

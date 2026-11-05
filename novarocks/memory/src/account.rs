@@ -30,8 +30,8 @@ use crate::{
 pub(crate) const MAX_DEPTH: usize = 16;
 /// Physical account boxes are common accounting storage, not workload rights.
 pub(crate) const ROOT_ACCOUNT_METADATA_BYTES: u64 =
-    (std::mem::size_of::<Account>() + 2 * std::mem::size_of::<usize>()) as u64;
-pub const ACCOUNT_METADATA_BYTES: u64 = (std::mem::size_of::<Account>()
+    (std::mem::size_of::<AccountState>() + 2 * std::mem::size_of::<usize>()) as u64;
+pub const ACCOUNT_METADATA_BYTES: u64 = (std::mem::size_of::<AccountState>()
     + std::mem::size_of::<crate::membership::MemberNode>()
     + 4 * std::mem::size_of::<usize>()) as u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,14 +158,14 @@ pub(crate) struct Ledger {
     pub revision: u64,
 }
 #[derive(Debug)]
-pub(crate) struct Account {
+pub(crate) struct AccountState {
     pub members: crate::membership::Membership,
     pub membership: Mutex<Option<Arc<crate::membership::MemberNode>>>,
     pub retired: AtomicU64,
     pub id: AccountId,
     pub kind: AccountKind,
     pub external: ExternalRef,
-    pub parent: Option<AccountHandle>,
+    pub parent: Option<Account>,
     pub shared: Arc<Shared>,
     pub gate: RwLock<()>,
     pub ledger: Mutex<Ledger>,
@@ -181,7 +181,7 @@ pub(crate) struct Account {
     pub storage_backed: AtomicU64,
 }
 #[derive(Debug, Clone)]
-pub struct AccountHandle(pub(crate) Arc<Account>);
+pub struct Account(pub(crate) Arc<AccountState>);
 
 /// Control-path counters exclude funded local attach/settle/detach and hooks.
 /// Relaxed observation counters are outside the modeled decision state.
@@ -200,7 +200,7 @@ pub struct InteractionSnapshot {
 }
 pub(crate) struct MeasuredGuard<'a, T> {
     guard: T,
-    account: &'a Account,
+    account: &'a AccountState,
     acquired_at: std::time::Instant,
     metric_base: usize,
 }
@@ -224,7 +224,7 @@ impl<T> Drop for MeasuredGuard<'_, T> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
-impl Account {
+impl AccountState {
     fn measured<T>(&self, base: usize, acquire: impl FnOnce() -> T) -> MeasuredGuard<'_, T> {
         let start = std::time::Instant::now();
         let guard = acquire();
@@ -256,11 +256,11 @@ fn duration_bin(ns: u64) -> usize {
 }
 pub(crate) type LedgerGuard<'a> = MeasuredGuard<'a, MutexGuard<'a, Ledger>>;
 pub(crate) struct Path {
-    pub nodes: [Option<AccountHandle>; MAX_DEPTH],
+    pub nodes: [Option<Account>; MAX_DEPTH],
     pub len: usize,
 }
 impl Path {
-    pub fn new(account: &AccountHandle) -> Self {
+    pub fn new(account: &Account) -> Self {
         let mut nodes = std::array::from_fn(|_| None);
         let mut next = Some(account.clone());
         let mut len = 0;
@@ -272,7 +272,7 @@ impl Path {
         }
         Self { nodes, len }
     }
-    pub fn node(&self, i: usize) -> &AccountHandle {
+    pub fn node(&self, i: usize) -> &Account {
         self.nodes[i].as_ref().unwrap()
     }
     pub fn growth_locks(&self, bytes: u64) -> [Option<LedgerGuard<'_>>; MAX_DEPTH] {
@@ -347,7 +347,7 @@ impl Path {
     }
 }
 
-impl AccountHandle {
+impl Account {
     pub fn id(&self) -> AccountId {
         self.0.id
     }
@@ -358,7 +358,7 @@ impl AccountHandle {
         self.0.external
     }
     pub(crate) fn new_root(shared: Arc<Shared>) -> Self {
-        Self(Arc::new(Account {
+        Self(Arc::new(AccountState {
             members: crate::membership::Membership::default(),
             membership: Mutex::new(None),
             retired: AtomicU64::new(0),
@@ -401,7 +401,7 @@ impl AccountHandle {
         }
         // Allocation precedes admission locks. Only a weak entry is published
         // while the parent lifecycle gate prevents closing underneath it.
-        let child = Self(Arc::new(Account {
+        let child = Self(Arc::new(AccountState {
             members: crate::membership::Membership::default(),
             membership: Mutex::new(None),
             retired: AtomicU64::new(0),
@@ -633,7 +633,7 @@ impl AccountHandle {
 
 // Design: ADR-0166 (docs/adr/ADR-0166-hierarchical-funding-and-stable-allocation-origins.md)
 pub(crate) fn grow_locked(
-    request: &AccountHandle,
+    request: &Account,
     path: &Path,
     states: &mut [Option<LedgerGuard<'_>>; MAX_DEPTH],
     bytes: u64,
@@ -708,11 +708,11 @@ pub(crate) fn release_locked(
     }
 }
 
-pub(crate) fn node_publish(node: &AccountHandle, committed: u64) {
+pub(crate) fn node_publish(node: &Account, committed: u64) {
     node.0.committed.store(committed, Ordering::Release);
 }
 pub(crate) fn qualify(
-    request: &AccountHandle,
+    request: &Account,
     path: &Path,
     bytes: u64,
     spare: bool,
@@ -737,7 +737,7 @@ pub(crate) fn qualify(
     Ok(())
 }
 
-impl Drop for Account {
+impl Drop for AccountState {
     fn drop(&mut self) {
         if let Some(parent) = &self.parent
             && let Some(member) = self.membership.lock().unwrap().take()

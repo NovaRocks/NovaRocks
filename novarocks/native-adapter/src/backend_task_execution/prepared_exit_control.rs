@@ -18,7 +18,7 @@
 //! Exact prepared-kernel drain hold. Polling never parks a Worker or driver.
 
 use crate::test_controls::{NativeHoldClaim, NativeTestControls};
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::task::ExecutionFailure;
 use novarocks_execution_contract::TaskIdentity;
 use std::{
     future::Future,
@@ -121,7 +121,8 @@ impl PreparedExitGate {
             self.open = true;
             let execution = self.identity.query_execution_id();
             eprintln!(
-                "NOVAROCKS_PREPARED_FAILURE_EXIT_RELEASED backend={} execution_id={}:{}:{} stage={} task={} token={} reason={reason}",
+                "{} backend={} execution_id={}:{}:{} stage={} task={} token={} reason={reason}",
+                novarocks_failpoint::observation_marker::PREPARED_FAILURE_EXIT_RELEASED,
                 self.identity.backend_process_id(),
                 execution.query_id().high(),
                 execution.query_id().low(),

@@ -24,7 +24,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail, ensure};
 #[cfg(test)]
 use arrow_array::{Array, Int64Array};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
@@ -102,7 +102,7 @@ impl ExchangeObservationOwner {
                 vec![DomainGrant {
                     domain: "native-observation".into(),
                     grant_id: format!("exchange-q1-be{index}"),
-                    parameters: json!({"action":"exchange-snapshot", "root":root,
+                    parameters: json!({"action":novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), "root":root,
                     "backend_index":index, "target_session_id":reference.session_id,
                     "max_events":16384, "query_execution":{
                         "query_id_hi":identity.0.hi, "query_id_lo":identity.0.lo, "attempt_id":1}}),
@@ -230,10 +230,10 @@ impl Scenario for SameProducerNormalClose {
             let p = &sessions[2];
             let producer_base = RawCreate::values(p, 3);
             let producer_identity = proto::TaskIdentity {
-                query_execution_id: producer_base.context.query_execution_id,
+                query_execution_id: producer_base.participation.query_execution_id,
                 stage_id: 2,
                 task_id: 3,
-                backend_process_id: producer_base.context.backend_process_id.clone(),
+                backend_process_id: producer_base.participation.backend_process_id.clone(),
             };
             let producer_finst = common::UniqueId {
                 hi: 0x5b,
@@ -275,13 +275,13 @@ impl Scenario for SameProducerNormalClose {
                 producer.accept_and_await_installed(context, p)?;
             }
             context.action(format!(
-                "froze attempt={:?} P={:?} finst={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
+                "froze attempt={:?} P={:?} task_key={producer_finst:?} A={:?} B={:?}; P Installed with edges Closed; multicast={}",
                 producer.identity.query_execution_id, producer.identity, receiver_a.identity, receiver_b.identity, self.multicast,
             ));
             context.action(if self.multicast {
-                "frozen P edge 1 -> exact A; P edge 2 -> exact B; both edges use the same P source finst and sender ordinal 0/count 1"
+                "frozen P edge 1 -> exact A; P edge 2 -> exact B; both edges use the same P source task_key and sender ordinal 0/count 1"
             } else {
-                "frozen P edge 1 -> exact A and B; both destinations use the same P source finst and sender ordinal 0/count 1"
+                "frozen P edge 1 -> exact A and B; both destinations use the same P source task_key and sender ordinal 0/count 1"
             });
             let cancel = session_control(
                 a,
@@ -361,10 +361,10 @@ impl Scenario for SameProducerNormalClose {
             for session in &sessions {
                 if let Err(error) = session_control(
                     session,
-                    proto::task_control_operation::Control::AbortQueryContext(
-                        proto::AbortQueryContextRequest {
-                            query_context: Some(session.context_under(session.frontend, 1)),
-                            cause: proto::QueryContextAbortCause::QueryFailed as i32,
+                    proto::task_control_operation::Control::AbortParticipation(
+                        proto::AbortParticipationRequest {
+                            participation: Some(session.participation_under(session.frontend, 1)),
+                            cause: proto::ParticipationAbortCause::QueryFailed as i32,
                         },
                     ),
                 ) {
@@ -389,7 +389,7 @@ impl Scenario for SameProducerNormalClose {
 struct FrozenTask {
     operation: proto::TaskOperation,
     identity: proto::TaskIdentity,
-    finst: common::UniqueId,
+    task_key: common::UniqueId,
 }
 
 impl FrozenTask {
@@ -456,7 +456,7 @@ fn freeze(frozen: proto::FrozenFragment, metadata: proto::CreationMetadata) -> F
     let descriptor = metadata.descriptor.as_ref().expect("fixture descriptor");
     FrozenTask {
         identity: descriptor.identity.clone().expect("fixture identity"),
-        finst: descriptor.fragment_instance_id.expect("fixture finst"),
+        task_key: descriptor.task_key.expect("fixture task_key"),
         operation: proto::TaskOperation {
             envelope: Some(raw_operation_envelope(15_000)),
             operation: Some(proto::task_operation::Operation::CreateTask(
@@ -474,7 +474,7 @@ fn receiver(
     id: u32,
     result: bool,
     source: &proto::TaskIdentity,
-    source_finst: common::UniqueId,
+    source_task_key: common::UniqueId,
     multicast: bool,
 ) -> Result<FrozenTask> {
     let mut base = RawCreate::values(session, id);
@@ -512,7 +512,7 @@ fn receiver(
         .inbound[0];
     inbound.sources = vec![proto::TaskExchangeSource {
         task: Some(source.clone()),
-        fragment_instance_id: Some(source_finst),
+        task_key: Some(source_task_key),
         sender_ordinal: 0,
     }];
     Ok(freeze(frozen, metadata))
@@ -521,7 +521,7 @@ fn receiver(
 fn producer(
     base: &RawCreate,
     identity: proto::TaskIdentity,
-    finst: common::UniqueId,
+    task_key: common::UniqueId,
     a: &FrozenTask,
     b: &FrozenTask,
     context: &mut ScenarioContext,
@@ -533,11 +533,11 @@ fn producer(
     let frozen = compiled_fragment(2, 1, None, RawSink::Stream { multicast }, &ROWS);
     let descriptor = metadata.descriptor.as_mut().expect("fixture descriptor");
     descriptor.identity = Some(identity);
-    descriptor.fragment_instance_id = Some(finst);
+    descriptor.task_key = Some(task_key);
     let mut destination = |task: &FrozenTask, index: usize| -> proto::TaskExchangeDestination {
         proto::TaskExchangeDestination {
             task: Some(task.identity.clone()),
-            fragment_instance_id: Some(task.finst),
+            task_key: Some(task.task_key),
             destination_node_id: 10,
             endpoint: Some(proto::QueryControlEndpoint {
                 host: "127.0.0.1".into(),
@@ -790,12 +790,12 @@ fn await_normal_close_marker(
     loop {
         let log = context.handle().be_log_contents(session.index)?;
         let destination = format!(
-            "dest_finst={} ",
-            novarocks_types::UniqueId::new(a.finst.hi, a.finst.lo)
+            "destination_task_key={} ",
+            novarocks_types::UniqueId::new(a.task_key.hi, a.task_key.lo)
         );
         let source = format!(
-            "sender_finst={} ",
-            novarocks_types::UniqueId::new(p.finst.hi, p.finst.lo)
+            "sender_task_key={} ",
+            novarocks_types::UniqueId::new(p.task_key.hi, p.task_key.lo)
         );
         let query = a
             .identity

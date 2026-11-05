@@ -16,8 +16,8 @@
 // under the License.
 //! Nested-loop join owns its build/probe contracts and actual batch filters.
 //! Expression and construction causes are forwarded without rendering them.
-use crate::runtime::fragment::ExecutionFailure;
-use crate::runtime::fragment::ExecutionReason;
+use crate::runtime::task::ExecutionFailure;
+use crate::runtime::task::ExecutionReason;
 use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
 use std::{error::Error, fmt};
 #[derive(Debug)]

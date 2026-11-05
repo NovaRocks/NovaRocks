@@ -21,7 +21,7 @@ use novarocks_types::naming::TableIdentity;
 // This inspector is pure over the sealed metadata loaded by its caller.
 pub(crate) fn observe_loaded_refresh_base(
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     table_ref: &TableIdentity,
     connector_context: &ConnectorRequestContext,

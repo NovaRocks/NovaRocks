@@ -1293,11 +1293,11 @@ impl InternalResultCpu {
 // Only this original forwarder borrows its action fields. A short poll lease
 // restores the same fields before any await or unwind. No foreign callback or
 // destructor runs under retirement.state, and the input remains in the packet.
-struct CpuActionLease<'a> {
+struct CpuActionLoan<'a> {
     packet: &'a InternalCpuRetirement<OperationOutput>,
     value: Option<CpuActionState>,
 }
-impl<'a> CpuActionLease<'a> {
+impl<'a> CpuActionLoan<'a> {
     fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {
         let value = packet
             .state
@@ -1312,7 +1312,7 @@ impl<'a> CpuActionLease<'a> {
         self.value.as_mut().expect("same original CPU action")
     }
 }
-impl Drop for CpuActionLease<'_> {
+impl Drop for CpuActionLoan<'_> {
     fn drop(&mut self) {
         let mut state = self.packet.state.lock().unwrap_or_else(|e| e.into_inner());
         assert!(state.action.is_none(), "same original CPU action return");
@@ -1484,7 +1484,7 @@ fn poll_cpu_offer(
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<Result<bool, ExecutionFailureInput>> {
     use std::task::Poll;
-    let mut lease = CpuActionLease::take(packet);
+    let mut lease = CpuActionLoan::take(packet);
     let mut notification = None;
     let mut reserve_refusal = None;
     let result = (|| {
@@ -1579,11 +1579,11 @@ async fn acquire_cpu_offer(
 
 // Publication borrows only the physical field: the original receipt must
 // already remain in the packet while the row becomes visible to a worker.
-struct CpuPublicationLease<'a> {
+struct CpuPublicationLoan<'a> {
     packet: &'a InternalCpuRetirement<OperationOutput>,
     physical: Option<JointLocalGrant<QueryBlockingReservation>>,
 }
-impl<'a> CpuPublicationLease<'a> {
+impl<'a> CpuPublicationLoan<'a> {
     fn take(packet: &'a InternalCpuRetirement<OperationOutput>) -> Self {
         let physical = packet
             .state
@@ -1597,7 +1597,7 @@ impl<'a> CpuPublicationLease<'a> {
         Self { packet, physical }
     }
 }
-impl Drop for CpuPublicationLease<'_> {
+impl Drop for CpuPublicationLoan<'_> {
     fn drop(&mut self) {
         let mut state = self.packet.state.lock().unwrap_or_else(|e| e.into_inner());
         let action = state
@@ -1614,7 +1614,7 @@ fn publish_cpu_work(
     executor: &QueryBlockingExecutor,
     control: &CpuWorkControl,
 ) -> Result<(), ExecutionFailureInput> {
-    let mut lease = CpuActionLease::take(packet);
+    let mut lease = CpuActionLoan::take(packet);
     let state = lease.state();
     let work = make_cpu_work(Arc::downgrade(packet), control.clone());
     let prepared = match executor.prepare_preserving_in(
@@ -1645,7 +1645,7 @@ fn publish_cpu_work(
     // Restore the receipt to the original packet before making its row
     // visible. The publication lease takes only the original physical field.
     drop(lease);
-    let mut publication = CpuPublicationLease::take(packet);
+    let mut publication = CpuPublicationLoan::take(packet);
     // This local frame owns only a Weak packet call, never its original input.
     let mut prepared = Some(prepared);
     let result = executor.publish_joint_in(&mut publication.physical, &mut prepared);
@@ -1689,7 +1689,7 @@ fn publish_cpu_work(
 // then drop the accepted reservation outside locks; original business input
 // stays in its packet through the same forwarder join and explicit retirement.
 fn finish_unpublished(packet: &InternalCpuRetirement<OperationOutput>) {
-    let mut lease = CpuActionLease::take(packet);
+    let mut lease = CpuActionLoan::take(packet);
     assert!(!lease.state().published, "unpublished original CPU action");
     let admission = lease.state().admission.take();
     let physical = lease.state().physical.take();
@@ -1702,7 +1702,7 @@ fn poll_cpu_result(
     packet: &InternalCpuRetirement<OperationOutput>,
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<Result<OperationResult, QueryBlockingFailure>> {
-    let mut lease = CpuActionLease::take(packet);
+    let mut lease = CpuActionLoan::take(packet);
     lease
         .state()
         .receipt
@@ -1715,7 +1715,7 @@ fn poll_cpu_actual_exit(
     cx: &mut std::task::Context<'_>,
 ) -> std::task::Poll<()> {
     use std::task::Poll;
-    let mut lease = CpuActionLease::take(packet);
+    let mut lease = CpuActionLoan::take(packet);
     let receipt = lease
         .state()
         .receipt

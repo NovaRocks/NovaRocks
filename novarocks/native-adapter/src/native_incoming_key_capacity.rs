@@ -126,7 +126,7 @@ struct State {
 /// Tokens refer to their exact issuing StockCore, retained by the caller.
 /// They neither own a position nor prove that its physical aliases have exited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct NativeIncomingKeyToken {
+pub(crate) struct NativeIncomingKeySlot {
     index: usize,
     generation: u64,
 }
@@ -178,7 +178,7 @@ fn limits(key: NativeIncomingKey) -> (usize, usize) {
 }
 
 impl State {
-    fn row(&self, token: NativeIncomingKeyToken) -> io::Result<Row> {
+    fn row(&self, token: NativeIncomingKeySlot) -> io::Result<Row> {
         self.rows
             .get(token.index)
             .copied()
@@ -241,7 +241,7 @@ impl NativeIncomingKeyCapacity {
     }
     /// Seal one authenticated physical connection as Live. No Connecting row
     /// is created here, and Closing/Retiring rows still retain peer identity.
-    pub(crate) fn claim(&self, key: NativeIncomingKey) -> io::Result<NativeIncomingKeyToken> {
+    pub(crate) fn claim(&self, key: NativeIncomingKey) -> io::Result<NativeIncomingKeySlot> {
         let mut state = self.lock()?;
         if !state.admits_peer(key)
             || state.count(key, &[Phase::Live, Phase::RetiringLive]) >= limits(key).0
@@ -262,11 +262,11 @@ impl NativeIncomingKeyCapacity {
             generation,
             phase: Phase::Live,
         };
-        Ok(NativeIncomingKeyToken { index, generation })
+        Ok(NativeIncomingKeySlot { index, generation })
     }
     /// Closing may free a live charge, but never the physical position. If its
     /// single Closing row is occupied, keep the retiring live charge instead.
-    pub(crate) fn retire(&self, token: NativeIncomingKeyToken) -> io::Result<()> {
+    pub(crate) fn retire(&self, token: NativeIncomingKeySlot) -> io::Result<()> {
         let mut state = self.lock()?;
         let row = state.row(token)?;
         match row.phase {
@@ -284,7 +284,7 @@ impl NativeIncomingKeyCapacity {
     }
     /// Call only after the exact physical generation's last original alias
     /// exits. A stale or already-exited token cannot alter a replacement row.
-    pub(crate) fn exit(&self, token: NativeIncomingKeyToken) -> io::Result<()> {
+    pub(crate) fn exit(&self, token: NativeIncomingKeySlot) -> io::Result<()> {
         let mut state = self.lock()?;
         state.row(token)?;
         state.rows[token.index].key = None;
@@ -507,7 +507,7 @@ mod tests {
             capacity.lock().unwrap().rows[new.index].key,
             Some(key(false, 2, Exchange))
         );
-        let forged = NativeIncomingKeyToken {
+        let forged = NativeIncomingKeySlot {
             index: usize::MAX,
             generation: new.generation,
         };

@@ -1046,7 +1046,22 @@ fn cardinality_every_small_runtime_callback_keeps_seven_causes_and_failed_latch(
             let result = instance(&source).evaluate(Selection::all(1), &args, &good);
             assert_eq!(result.is_ok(), success);
             if !success {
-                assert!(matches!(result, Err(KernelFailure::Internal(_))));
+                use novarocks_failure_contract::FailureProjection;
+                use novarocks_value_arrays::{ValueError, ValueViolation};
+
+                let failure = result.unwrap_err();
+                assert_eq!(
+                    failure.failure_fact(),
+                    ValueError::Invariant(ValueViolation::Carrier).failure_fact()
+                );
+                let KernelFailure::Source(source) = failure else {
+                    panic!("foreign collection must retain its original carrier source");
+                };
+                assert!(matches!(
+                    std::error::Error::source(&source)
+                        .and_then(|cause| cause.downcast_ref::<ValueError>()),
+                    Some(ValueError::Invariant(ValueViolation::Carrier))
+                ));
             }
             let trace = good.trace.lock().unwrap().clone();
             assert!(!trace.is_empty());

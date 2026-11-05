@@ -208,9 +208,9 @@ fn capture(
             &mut |layout| {
                 work.owner
                     .request(layout)
-                    .map_err(crate::runtime::fragment::ExecutionFailure::from)
+                    .map_err(crate::runtime::task::ExecutionFailure::from)
             },
-            &mut |_| Ok::<_, crate::runtime::fragment::ExecutionFailure>(()),
+            &mut |_| Ok::<_, crate::runtime::task::ExecutionFailure>(()),
         )
         .unwrap();
     KeyInput::new_for_spec(

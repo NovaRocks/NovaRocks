@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_execution::runtime::fragment::io::ExchangeFrameTransmitter;
+use novarocks_execution::runtime::task::io::ExchangeFrameTransmitter;
 
 use novarocks_proto_codec::FieldPath;
 #[cfg(test)]
@@ -43,7 +43,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
     #[cfg(novarocks_dev_controls)]
     fn normal_close_accepted(
         &self,
-        notice: novarocks_execution::runtime::fragment::io::exchange::ExchangeNormalCloseAccepted,
+        notice: novarocks_execution::runtime::task::io::exchange::ExchangeNormalCloseAccepted,
     ) {
         let stream = notice.stream;
         if notice.facts.receiver_closed.is_none()
@@ -63,16 +63,16 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         // authorization can suppress diagnostics, but cannot roll back that
         // acceptance or turn it into a new protocol failure.
         let Ok(Some(observer)) = controls.observation_for(
-            "exchange-snapshot",
+            novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(),
             stream.source().task().query_execution_id(),
         ) else {
             return;
         };
         observer.observe(&format!(
-            "NOVAROCKS_EXCHANGE_SNAPSHOT event=normal_close_validated destination_task={} attempt={} dest_finst={} node_id={} sender_finst={} sender_ordinal={} sender_count={} custody_through={} granted_through={} close={:?}",
+            "{} event=normal_close_validated destination_task={} attempt={} destination_task_key={} node_id={} sender_task_key={} sender_ordinal={} sender_count={} custody_through={} granted_through={} close={:?}", novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT,
             stream.destination(), stream.destination().query_execution_id().attempt_id().get(),
-            stream.destination_fragment_instance_id(), stream.destination_node().get(),
-            stream.source().fragment_instance_id(), stream.source().sender_ordinal(),
+            stream.destination_task_key(), stream.destination_node().get(),
+            stream.source().task_key(), stream.source().sender_ordinal(),
             notice.sender_count, notice.facts.custody_through, notice.facts.granted_through,
             notice.facts.receiver_closed,
         ));
@@ -80,12 +80,12 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
 
     fn deliver_unit(
         &self,
-        frame: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        frame: novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         stop: CancellationToken,
-        activity: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        done: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        activity: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        done: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
-        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+        use novarocks_execution::runtime::task::io::exchange_unit::{
             ExchangeCallOutcome, ExchangeUnitReceipt,
         };
         use novarocks_task_codec::exchange_unit_codec as codec;
@@ -99,7 +99,8 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             .as_deref()
             .map(|controls| {
                 controls.observation_for(
-                    "exchange-snapshot",
+                    novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot
+                        .as_str(),
                     stream.source().task().query_execution_id(),
                 )
             })
@@ -203,13 +204,11 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
     fn register_unit_demands(
         &self,
         destination: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
-        entries: Vec<
-            novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
-        >,
+        entries: Vec<novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: CancellationToken,
-        done: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        done: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
-        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+        use novarocks_execution::runtime::task::io::exchange_unit::{
             ExchangeDemandCallOutcome, ExchangeDemandOperation,
         };
         use novarocks_task_codec::exchange_unit_codec as codec;
@@ -307,7 +306,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         &self,
         destination: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        wake: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        wake: novarocks_execution::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
         self.grants.watch(destination, stream, wake)
     }
@@ -354,7 +353,7 @@ fn checked_envelope(
 pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
-    use novarocks_execution::runtime::fragment::io::exchange_unit::{
+    use novarocks_execution::runtime::task::io::exchange_unit::{
         ExchangeCallActivity, ExchangeCallOutcome, ExchangeUnitFrame, ExchangeUnitReceiverFrame,
     };
     use novarocks_execution_contract::ordered_retained_stream::exchange::{
@@ -521,7 +520,7 @@ pub(crate) mod tests {
                         .stream
                         .as_mut()
                         .unwrap()
-                        .source_finst_id_lo += 1
+                        .source_task_key_lo += 1
                 }
                 _ => reply.item_sequence += 1,
             }

@@ -26,16 +26,14 @@ pub(in crate::control_runtime) mod rejected_ingress;
 mod request_partial;
 mod source_io;
 mod teardown;
-pub(crate) use host_cell::RootHostCell;
+pub(crate) use host_cell::ControlHostCell;
 use ready_routes::ReadyRoutes;
-pub(crate) use source_io::RootRequestAdvanceError;
+pub(crate) use source_io::ControlRequestAdvanceError;
 
 #[cfg(test)]
 use super::effect_dispatch::EffectRef;
 use super::{
     actors::{ControlActor, WorkerActor},
-    context_host::{ContextHostBinding, ContextMetadataRole},
-    context_host_jobs::ContextHostJobs,
     control_internal::{
         ControlInternal, ControlInternalError, ControlInternalPartial, InternalAdvance,
     },
@@ -48,14 +46,16 @@ use super::{
     establish_executors::{
         EstablishExecutorStartError, EstablishExecutorStartRefusal, EstablishExecutors,
     },
+    participation_host::{HostMetadataResources, ParticipationHostBinding},
+    participation_host_jobs::ParticipationHostJobs,
     service::{ServiceHostError, WorkerService},
 };
 use crate::{control_admission::AdmissionStorage, control_runtime_policy::StorageNeed};
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorFailurePolicy},
-    driver::{
-        ActorRegistration, ActorRuntime, CompletedEffect, DriverError, EffectCompletionRefusal,
-        EffectTicket, InputRoleId,
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectCompletionRefusal,
+        EffectTicket, StandingInputId,
     },
     header_readiness::HeaderReadyNotice,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
@@ -65,7 +65,7 @@ use novarocks_control_runtime_core::{
     identity::{ActorId, Generation, InputId, ScopedWorkRef},
     scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::{QueryContextRef, TaskOperationId};
+use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_worker_protocol::{
     control::{ControlCore, ControlInput},
     lease::MonotonicInstant,
@@ -103,7 +103,7 @@ pub(crate) struct ProcessControlBinding {
 pub(crate) enum ProcessBootstrapError {
     InvalidGeometry,
     Runtime(RuntimeError),
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Control(ControlRequestError),
 }
 impl std::fmt::Display for ProcessBootstrapError {
@@ -114,7 +114,9 @@ impl std::fmt::Display for ProcessBootstrapError {
                 f,
                 "Process control bootstrap runtime operation failed: {error}"
             ),
-            Self::Driver(error) => write!(f, "Process control actor registration failed: {error}"),
+            Self::ActorTurn(error) => {
+                write!(f, "Process control actor registration failed: {error}")
+            }
             Self::Control(error) => write!(f, "Process control request setup failed: {error}"),
         }
     }
@@ -124,7 +126,7 @@ impl std::error::Error for ProcessBootstrapError {
         match self {
             Self::InvalidGeometry => None,
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Control(error) => Some(error),
         }
     }
@@ -192,7 +194,7 @@ pub(crate) struct ProcessControlResources {
         super::node_metrics::ControlAdmissionProjection,
     >,
     pub scope: ScopeHandle,
-    pub roles: Vec<ContextMetadataRole>,
+    pub metadata_resources: Vec<HostMetadataResources>,
     pub registered: bool,
     pub request_ready: ControlRequestReady,
     pub requests: BTreeMap<InputId, ControlRequestCustody>,
@@ -208,12 +210,12 @@ pub(crate) struct ProcessControlResources {
     task_capacity: Option<super::task_capacity::TaskCapacitySignal>,
     // Addresses of the original R owners, never decisions or obligations.
     // Keys follow actual metadata handoff order, not request token order.
-    route_waiters: BTreeMap<QueryContextRef, BTreeMap<u64, InputId>>,
+    route_waiters: BTreeMap<ParticipationRef, BTreeMap<u64, InputId>>,
     ready_routes: ReadyRoutes,
     next_route_order: u64,
     // Original paid return-role addresses. Repeated occurrence InputIds are
     // not RPC tokens; even an empty callback batch must wake its same R.
-    return_routes: BTreeMap<InputRoleId, InputId>,
+    return_routes: BTreeMap<StandingInputId, InputId>,
 }
 
 /// Construction evidence from the actual successful registration. It is not
@@ -223,7 +225,7 @@ pub(super) struct RegisteredControl {
     ledger: RuntimeLedger,
     actor: ActorId,
     requests: NonZeroUsize,
-    process_source_parent: novarocks_control_runtime::lease::WorkChildAuthority,
+    process_source_parent: novarocks_control_runtime::obligation::WorkChildAuthority,
 }
 impl RegisteredControl {
     pub(super) fn into_parts(
@@ -233,7 +235,7 @@ impl RegisteredControl {
         RuntimeLedger,
         ActorId,
         NonZeroUsize,
-        novarocks_control_runtime::lease::WorkChildAuthority,
+        novarocks_control_runtime::obligation::WorkChildAuthority,
     ) {
         (
             self.runtime,
@@ -253,13 +255,16 @@ impl std::fmt::Debug for ProcessBootstrapRefusal {
         f.debug_struct("ProcessBootstrapRefusal")
             .field("error", &self.error)
             .field("scope", &self.resources.as_ref().map(|r| r.scope.id()))
-            .field("roles", &self.resources.as_ref().map(|r| r.roles.len()))
+            .field(
+                "roles",
+                &self.resources.as_ref().map(|r| r.metadata_resources.len()),
+            )
             .finish()
     }
 }
 
 /// Service is constructed only after this same Control registration succeeds.
-/// Directory metadata follows actual admitted Context objects. The host owns
+/// Directory metadata follows actual admitted Participation objects. The host owns
 /// the original root outside the pure actor, so a
 /// failed Core cannot destroy or recreate its cleanup authority.
 #[must_use = "The actual process owner must drain before its resources can retire"]
@@ -324,7 +329,7 @@ impl ProcessControlOwner {
                 }),
             ),
             scope: scope.clone(),
-            roles: Vec::with_capacity(KINDS.len()),
+            metadata_resources: Vec::with_capacity(KINDS.len()),
             registered: false,
             request_ready: ControlRequestReady::new(binding.request_positions, runtime.clone()),
             requests: BTreeMap::new(),
@@ -358,14 +363,16 @@ impl ProcessControlOwner {
                     std::process::abort();
                 }
             };
-            resources.roles.push(ContextMetadataRole { work, capacity });
+            resources
+                .metadata_resources
+                .push(HostMetadataResources { work, capacity });
             for kind in KINDS.into_iter().skip(1) {
                 let guard = scope
                     .reserve_next(
                         binding.generation,
                         ReservationResources::work_only(),
                         kind,
-                        WorkAdmission::Derived(resources.roles[LIFETIME].work.id()),
+                        WorkAdmission::Derived(resources.metadata_resources[LIFETIME].work.id()),
                     )
                     .map_err(ProcessBootstrapError::Runtime)?;
                 let (work, capacity) = match guard.bind(kind) {
@@ -374,9 +381,11 @@ impl ProcessControlOwner {
                         std::process::abort();
                     }
                 };
-                resources.roles.push(ContextMetadataRole { work, capacity });
+                resources
+                    .metadata_resources
+                    .push(HostMetadataResources { work, capacity });
             }
-            resources.roles[TIMER]
+            resources.metadata_resources[TIMER]
                 .work
                 .start()
                 .map_err(ProcessBootstrapError::Runtime)?;
@@ -384,8 +393,8 @@ impl ProcessControlOwner {
                 core,
                 scope.clone(),
                 binding.admission_storage,
-                resources.roles[TIMER].work.reference(),
-                resources.roles[LIFETIME].work.reference(),
+                resources.metadata_resources[TIMER].work.reference(),
+                resources.metadata_resources[LIFETIME].work.reference(),
             );
             let registration = runtime
                 .register_supervised_bound_with_policy(
@@ -393,10 +402,10 @@ impl ProcessControlOwner {
                     scope.clone(),
                     WorkerActor::Control(Box::new(actor)),
                     binding.actor_config,
-                    &resources.roles[FAILURE].work,
+                    &resources.metadata_resources[FAILURE].work,
                     ActorFailurePolicy::ProcessFailStop,
                 )
-                .map_err(|(error, _pure_actor)| ProcessBootstrapError::Driver(error))?;
+                .map_err(|(error, _pure_actor)| ProcessBootstrapError::ActorTurn(error))?;
             resources.registered = true;
             Ok(registration)
         })();
@@ -427,7 +436,10 @@ impl ProcessControlOwner {
             scope,
             resources.request_ready.clone(),
         ));
-        let process_source_parent = match resources.roles[LIFETIME].work.child_authority() {
+        let process_source_parent = match resources.metadata_resources[LIFETIME]
+            .work
+            .child_authority()
+        {
             Ok(authority) => authority,
             Err(error) => {
                 return Err(ProcessBootstrapRefusal {
@@ -496,8 +508,10 @@ impl ProcessControlOwner {
     pub(crate) fn establish_source_phase(
         &self,
         input: InputId,
-    ) -> Result<Option<novarocks_control_runtime::exit_role::ExitRolePhase>, ControlRequestError>
-    {
+    ) -> Result<
+        Option<novarocks_control_runtime::exit_custody::ExitCustodyPhase>,
+        ControlRequestError,
+    > {
         self.resources
             .requests
             .get(&input)
@@ -514,12 +528,12 @@ impl ProcessControlOwner {
         &self.resources.request_ready
     }
     pub(super) fn lifetime_work(&self) -> novarocks_control_runtime_core::identity::WorkId {
-        self.resources.roles[LIFETIME].work.id()
+        self.resources.metadata_resources[LIFETIME].work.id()
     }
     pub(in crate::control_runtime) fn lifetime_author(
         &self,
-    ) -> &novarocks_control_runtime::lease::WorkLease {
-        &self.resources.roles[LIFETIME].work
+    ) -> &novarocks_control_runtime::obligation::WorkObligation {
+        &self.resources.metadata_resources[LIFETIME].work
     }
     /// This independent source is paid before any production facade opens.
     /// The metadata bootstrap alone never promised an internally ready host.
@@ -586,10 +600,10 @@ impl ProcessControlOwner {
     }
     pub(crate) fn enqueue_failed_lifecycle(
         &mut self,
-        proof: &novarocks_control_runtime::driver::ActorFailureProof,
-        fact: super::control_internal::RootLifecycleFact,
-        notice: super::context_ready::ContextReadyNotice,
-    ) -> Result<super::control_internal::RootLifecycleReceipt, ControlInternalError> {
+        proof: &novarocks_control_runtime::actor_turn::ActorFailureProof,
+        fact: super::control_internal::ControlLifecycleFact,
+        notice: super::participation_ready::ParticipationReadyNotice,
+    ) -> Result<super::control_internal::ControlLifecycleReceipt, ControlInternalError> {
         if self.resources.teardown.internal_closed {
             return Err(ControlInternalError::Closed);
         }
@@ -603,9 +617,9 @@ impl ProcessControlOwner {
     /// existing Source has consumed and retired the same HostRemoved input.
     pub(crate) fn enqueue_host_removed(
         &mut self,
-        original: &novarocks_control_runtime::lease::WorkLease,
-        context: QueryContextRef,
-    ) -> Result<super::control_internal::RootLifecycleReceipt, ControlInternalError> {
+        original: &novarocks_control_runtime::obligation::WorkObligation,
+        participation: ParticipationRef,
+    ) -> Result<super::control_internal::ControlLifecycleReceipt, ControlInternalError> {
         if self.resources.teardown.internal_closed {
             return Err(ControlInternalError::Closed);
         }
@@ -613,7 +627,7 @@ impl ProcessControlOwner {
             .internal
             .as_mut()
             .ok_or(ControlInternalError::NotEnabled)?
-            .enqueue_host_removed(original, context)
+            .enqueue_host_removed(original, participation)
     }
     /// Store the actual request before any command capture. Ready's R bound
     /// is the single address bound; this map contains the original owners,
@@ -654,7 +668,7 @@ impl ProcessControlOwner {
     ) -> Result<bool, ControlRequestError> {
         self.runtime()
             .validate_registration(self.registration())
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let Some(input) = self.resources.request_header_routes.get(&notice.work()) else {
             return Ok(false);
         };
@@ -688,14 +702,14 @@ impl ProcessControlOwner {
         &mut self,
         input: InputId,
         ticket: novarocks_execution_contract::AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         preflight: bool,
     ) -> Result<(), ControlRequestError> {
         self.resources
             .requests
             .get_mut(&input)
             .ok_or(ControlRequestError::WrongRequest)?
-            .submit_ticket_observation(ticket, context, preflight)
+            .submit_ticket_observation(ticket, participation, preflight)
     }
     pub(crate) fn admit_establish_request(
         &mut self,
@@ -714,7 +728,7 @@ impl ProcessControlOwner {
     pub(crate) fn begin_establish_ingress(
         &mut self,
         input: InputId,
-        request: novarocks_execution_contract::EstablishQueryContext,
+        request: novarocks_execution_contract::EstablishParticipation,
         payload: novarocks_worker_protocol::creation::PayloadId,
     ) -> Result<
         super::establish_ingress::EstablishIngressJob,
@@ -751,21 +765,25 @@ impl ProcessControlOwner {
             .ok_or(ControlRequestError::WrongRequest)?
             .begin_unsubmitted_withdrawal()
     }
-    /// Bind the original Root return without borrowing the Context owner.
-    /// The caller prepared these same Jobs under its separate Context cell.
+    /// Bind the original Root return without borrowing the Participation owner.
+    /// The caller prepared these same Jobs under its separate Participation cell.
     pub(crate) fn bind_materialization_return(
         &mut self,
         ticket: &EffectTicket<super::actors::WorkerAction>,
-        jobs: ContextHostJobs,
+        jobs: ParticipationHostJobs,
     ) -> Result<(), ControlRequestError> {
         let custody = self
             .resources
             .requests
             .get_mut(&ticket.input)
             .ok_or(ControlRequestError::WrongRequest)?;
-        let result = custody.bind_creator_return(ticket, jobs, &self.resources.roles[FAILURE].work);
-        if let Some(role) = custody.route_return_role() {
-            match self.resources.return_routes.entry(role) {
+        let result = custody.bind_creator_return(
+            ticket,
+            jobs,
+            &self.resources.metadata_resources[FAILURE].work,
+        );
+        if let Some(return_input_id) = custody.route_return_input_id() {
+            match self.resources.return_routes.entry(return_input_id) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(ticket.input);
                 }
@@ -776,7 +794,7 @@ impl ProcessControlOwner {
         }
         result
     }
-    /// Borrow the elected original R only after the Context issuer has
+    /// Borrow the elected original R only after the Participation issuer has
     /// admitted its independent M call and all of its return positions.
     pub(crate) fn take_materialization_source(
         &self,
@@ -827,7 +845,7 @@ impl ProcessControlOwner {
         };
         custody.submit(command)
     }
-    /// Completing this metadata handoff never waits for a Context response.
+    /// Completing this metadata handoff never waits for a Participation response.
     /// A construction refusal after registration returns its retained partial
     /// to the live cleanup inventory and still releases this ordering lane.
     pub(crate) fn handoff_establish_route(
@@ -855,23 +873,23 @@ impl ProcessControlOwner {
         let Some(order) = self.resources.next_route_order.checked_add(1) else {
             std::process::abort();
         };
-        let context = match custody.prepare_establish_route(&ticket, order) {
-            Ok(context) => context,
+        let participation = match custody.prepare_establish_route(&ticket, order) {
+            Ok(participation) => participation,
             Err(error) => return Err(ControlRouteHandoffRefusal::Rejected { error, ticket }),
         };
         self.resources.next_route_order = order;
         assert!(
             self.resources
                 .route_waiters
-                .entry(context)
+                .entry(participation)
                 .or_default()
                 .insert(order, request.request.token)
                 .is_none()
         );
         // Always bind this pair's head, including when a newer R encounters
         // an actor that appeared after an older R had already been deferred.
-        if self.service.context(context).is_some() {
-            self.resources.ready_routes.mark(context);
+        if self.service.participation(participation).is_some() {
+            self.resources.ready_routes.mark(participation);
             self.runtime()
                 .notify_host_actor(&self.registration)
                 .unwrap_or_else(|_| std::process::abort());
@@ -888,22 +906,22 @@ impl ProcessControlOwner {
         }
         Ok(())
     }
-    fn prepare_context_route(
+    fn prepare_participation_route(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<Option<PreparedEstablishRoute>, ControlRequestError> {
         let Some((&order, &input)) = self
             .resources
             .route_waiters
-            .get(&context)
+            .get(&participation)
             .and_then(|rows| rows.first_key_value())
         else {
-            self.resources.ready_routes.forget(context);
+            self.resources.ready_routes.forget(participation);
             return Ok(None);
         };
-        let Some(address) = self.service.context(context) else {
-            // Await actual publication. No poller waits for a Context mutex.
-            self.resources.ready_routes.forget(context);
+        let Some(address) = self.service.participation(participation) else {
+            // Await actual publication. No poller waits for a Participation mutex.
+            self.resources.ready_routes.forget(participation);
             return Ok(None);
         };
         let custody = self
@@ -911,23 +929,30 @@ impl ProcessControlOwner {
             .requests
             .get_mut(&input)
             .expect("route address retains its original R owner");
-        assert_eq!(custody.pending_route(), Some((context, order)));
-        let transfer = custody
-            .prepare_pending_establish_route(address, &self.resources.roles[FAILURE].work)?;
-        if let Some(role) = custody.route_return_role() {
-            assert!(self.resources.return_routes.insert(role, input).is_none());
+        assert_eq!(custody.pending_route(), Some((participation, order)));
+        let transfer = custody.prepare_pending_establish_route(
+            address,
+            &self.resources.metadata_resources[FAILURE].work,
+        )?;
+        if let Some(return_input_id) = custody.route_return_input_id() {
+            assert!(
+                self.resources
+                    .return_routes
+                    .insert(return_input_id, input)
+                    .is_none()
+            );
         }
         let rows = self
             .resources
             .route_waiters
-            .get_mut(&context)
+            .get_mut(&participation)
             .expect("original route address");
         rows.remove(&order);
         if rows.is_empty() {
-            self.resources.route_waiters.remove(&context);
-            self.resources.ready_routes.forget(context);
+            self.resources.route_waiters.remove(&participation);
+            self.resources.ready_routes.forget(participation);
         } else {
-            self.resources.ready_routes.mark(context);
+            self.resources.ready_routes.mark(participation);
         }
         Ok(Some(transfer))
     }
@@ -936,20 +961,20 @@ impl ProcessControlOwner {
     pub(crate) fn take_ready_route_binding(
         &mut self,
     ) -> Result<Option<PreparedEstablishRoute>, ControlRequestError> {
-        let Some(context) = self.resources.ready_routes.pop() else {
+        let Some(participation) = self.resources.ready_routes.pop() else {
             return Ok(None);
         };
-        self.prepare_context_route(context)
+        self.prepare_participation_route(participation)
     }
-    pub(crate) fn adopt_context(
+    pub(crate) fn adopt_participation(
         &mut self,
         ticket: &EffectTicket<super::actors::WorkerAction>,
-        binding: ContextHostBinding,
+        binding: ParticipationHostBinding,
     ) -> Result<(), ServiceHostError> {
-        let context = binding.core.identity();
-        self.service.adopt_context(ticket, binding)?;
-        if self.resources.route_waiters.contains_key(&context) {
-            self.resources.ready_routes.mark(context);
+        let participation = binding.core.identity();
+        self.service.adopt_participation(ticket, binding)?;
+        if self.resources.route_waiters.contains_key(&participation) {
+            self.resources.ready_routes.mark(participation);
             self.runtime()
                 .notify_host_actor(&self.registration)
                 .unwrap_or_else(|_| std::process::abort());
@@ -982,16 +1007,16 @@ impl ProcessControlOwner {
         if let Err(error) = custody.cancel_establish_route(&ticket) {
             return Err(ControlRouteHandoffRefusal::Rejected { error, ticket });
         }
-        if let Some((context, order)) = pending {
+        if let Some((participation, order)) = pending {
             let rows = self
                 .resources
                 .route_waiters
-                .get_mut(&context)
+                .get_mut(&participation)
                 .expect("cancel retains original route address");
             assert_eq!(rows.remove(&order), Some(request.token));
             if rows.is_empty() {
-                self.resources.route_waiters.remove(&context);
-                self.resources.ready_routes.forget(context);
+                self.resources.route_waiters.remove(&participation);
+                self.resources.ready_routes.forget(participation);
             }
         }
         let completed = self
@@ -1032,8 +1057,11 @@ impl ProcessControlOwner {
                 std::process::abort();
             };
             if custody.try_retire()? {
-                if let Some(role) = custody.route_return_role() {
-                    assert_eq!(self.resources.return_routes.remove(&role), Some(input));
+                if let Some(return_input_id) = custody.route_return_input_id() {
+                    assert_eq!(
+                        self.resources.return_routes.remove(&return_input_id),
+                        Some(input)
+                    );
                 }
                 self.remove_retired_request(input);
                 retired += 1;
@@ -1142,7 +1170,7 @@ impl ProcessControlOwner {
         // Look up the real still-resident input header, not a guessed token
         // or a scan of requests. Absence supplies no retirement/exit fact.
         if let Ok(Some(header)) = self.runtime().input_custody(self.actor, input)
-            && let Some(role) = header.role
+            && let Some(role) = header.standing_input_id
             && let Some(original) = self.resources.return_routes.get(&role)
             && let Some(custody) = self.resources.requests.get(original)
         {
@@ -1204,12 +1232,12 @@ mod tests {
                 turn_budget: crate::control_runtime::actors::ControlActor::TURN_BUDGET,
                 max_step_work: crate::control_runtime::actors::ControlActor::MAX_STEP_WORK,
             },
-            // This bootstrap submits no request, ticket or Context effect.
+            // This bootstrap submits no request, ticket or Participation effect.
             // It cannot claim any such unpaid capability from these vectors.
             admission_storage: AdmissionStorage {
                 loading: Default::default(),
                 accepted: Default::default(),
-                context: Default::default(),
+                participation: Default::default(),
             },
         }
     }
@@ -1237,7 +1265,7 @@ mod tests {
         // Sealing first cancels the actual timer source and forbids any new
         // input. These pure metadata owners then end; their payer remains live
         // until the real actor attachment has detached as well.
-        for role in resources.roles.iter_mut().rev() {
+        for role in resources.metadata_resources.iter_mut().rev() {
             role.work.body_exited().unwrap();
             role.work.captures_exited().unwrap();
         }
@@ -1252,7 +1280,7 @@ mod tests {
             }
             resources.registered = false;
         }
-        for role in resources.roles.iter_mut().rev() {
+        for role in resources.metadata_resources.iter_mut().rev() {
             role.capacity
                 .release_quota(&role.capacity.resources().unwrap().quota)
                 .unwrap();
@@ -1270,7 +1298,7 @@ mod tests {
             ProcessControlOwner::bootstrap(&runtime, &ledger, core(), binding()).unwrap();
         assert_eq!(owner.actor(), actor());
         assert!(!owner.service().runtime().snapshot(actor()).unwrap().failed);
-        assert_eq!(owner.resources().roles.len(), KINDS.len());
+        assert_eq!(owner.resources().metadata_resources.len(), KINDS.len());
         assert_eq!(
             owner.resources().scope.snapshot().unwrap().work,
             KINDS.len()
@@ -1289,7 +1317,7 @@ mod tests {
             actors::{ControlMessage, WorkerAction, WorkerMessage},
             control_internal::{CONTROL_INTERNAL_STORAGE, InternalAdvance},
         };
-        use novarocks_control_runtime::driver::TimerSourceState;
+        use novarocks_control_runtime::actor_turn::TimerSourceState;
         use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass};
         use novarocks_types::FrontendProcessId;
         use novarocks_worker_protocol::control::ControlEffect;
@@ -1330,7 +1358,7 @@ mod tests {
         let mut seed_role = runtime
             .reserve_input(actor(), actor(), InputClass::Lifecycle)
             .unwrap()
-            .into_role()
+            .into_standing_input()
             .unwrap();
         for _ in 0..2 {
             let input = seed_role
@@ -1422,7 +1450,7 @@ mod tests {
         assert!(owner.take_control_effect(64).unwrap().is_none());
         assert_eq!(owner.advance_internal().unwrap(), InternalAdvance::Idle);
         assert_eq!(owner.resources().scope.snapshot().unwrap().work, 4);
-        assert_eq!(runtime.snapshot(actor()).unwrap().roles, 1);
+        assert_eq!(runtime.snapshot(actor()).unwrap().standing_inputs, 1);
         assert!(
             owner.resources().internal.is_some()
                 || owner
@@ -1509,7 +1537,9 @@ mod tests {
             .collect();
         assert!(matches!(
             owner.enable_internal_source(),
-            Err(ControlInternalError::Driver(DriverError::InputCapacity))
+            Err(ControlInternalError::ActorTurn(
+                ActorTurnError::InputCapacity
+            ))
         ));
         assert!(owner.resources().internal.is_none());
         assert!(owner.resources().internal_partial.is_some());
@@ -1534,7 +1564,7 @@ mod tests {
         ));
         let mut partial = owner.resources.internal_partial.take().unwrap();
         assert!(partial.permit.is_none());
-        assert!(partial.role.is_none());
+        assert!(partial.input_obligation.is_none());
         // The refused source never captured a command. These exact bound
         // metadata holders end unused; no input consumption is fabricated.
         partial.work.body_exited().unwrap();
@@ -1579,8 +1609,8 @@ mod tests {
         };
         use novarocks_control_runtime_core::identity::Tick;
         use novarocks_execution_contract::{
-            AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor, QueryContextRef,
-            TaskOperationId,
+            AcquireParticipationAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+            ParticipationRef, TaskOperationId,
         };
         use novarocks_types::{
             AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId,
@@ -1622,7 +1652,7 @@ mod tests {
             owner.control_completion_observed(reference).unwrap();
         }
         let mut advanced_expiry = None;
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(7101, 7102), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -1644,9 +1674,9 @@ mod tests {
                 .submit_request(
                     input,
                     ControlInput::Acquire {
-                        request: AcquireQueryContextAdmissionTicket::new(
+                        request: AcquireParticipationAdmissionTicket::new(
                             operation,
-                            context,
+                            participation,
                             LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                             NativeCompatibilityId::new([3; 32]),
                             capability,
@@ -1853,11 +1883,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             refusal.error,
-            ProcessBootstrapError::Driver(DriverError::Closed)
+            ProcessBootstrapError::ActorTurn(ActorTurnError::Closed)
         ));
         let resources = refusal.resources.unwrap();
         assert!(!resources.registered);
-        assert_eq!(resources.roles.len(), KINDS.len());
+        assert_eq!(resources.metadata_resources.len(), KINDS.len());
         assert_eq!(resources.scope.snapshot().unwrap().storage, 0);
         assert_eq!(resources.scope.snapshot().unwrap().work, KINDS.len());
         finish(&ledger, &runtime, resources);
@@ -1880,7 +1910,7 @@ mod tests {
         assert!(ledger.is_empty());
         assert!(matches!(
             runtime.snapshot(actor()),
-            Err(DriverError::UnknownActor)
+            Err(ActorTurnError::UnknownActor)
         ));
     }
     #[cfg(unix)]
@@ -1888,7 +1918,7 @@ mod tests {
     fn an_actual_control_core_panic_uses_the_process_policy_with_a_separately_paid_input() {
         use super::super::actors::{ControlMessage, WorkerMessage};
         use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass};
-        use novarocks_execution_contract::QueryContextRef;
+        use novarocks_execution_contract::ParticipationRef;
         use novarocks_types::{
             AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
         };
@@ -1917,13 +1947,15 @@ mod tests {
                     generation(),
                     request_need.resources().unwrap(),
                     WorkKind::Step,
-                    WorkAdmission::Derived(owner.resources().roles[LIFETIME].work.id()),
+                    WorkAdmission::Derived(
+                        owner.resources().metadata_resources[LIFETIME].work.id(),
+                    ),
                 )
                 .unwrap()
                 .bind(WorkKind::Step)
                 .unwrap();
             request.start().unwrap();
-            let unknown = QueryContextRef::new(
+            let unknown = ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(9901, 9902), AttemptId::new(1).unwrap())
                     .unwrap(),
                 FrontendProcessId::new_v7(),
@@ -1938,8 +1970,8 @@ mod tests {
                     // An impossible internal host report models a Core bug.
                     // It is not a supported I/O refusal or a query failure.
                     command: ControlInput::ExecutionRetired {
-                        context: unknown,
-                        retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        participation: unknown,
+                        retirement: novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                             close_epoch: generation(),
                         },
                     },

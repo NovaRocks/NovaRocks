@@ -22,7 +22,7 @@ use novarocks_memory::attribution::{
     register_thread_role, set_current_thread_role,
 };
 use novarocks_memory::lane::{
-    RecordRef, ResponsibilityClass, StoreHandle, UNATTRIBUTED_SHARDS, global_store,
+    RecordRef, RecordStorePin, ResponsibilityClass, UNATTRIBUTED_SHARDS, global_store,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ptr::NonNull;
@@ -52,7 +52,7 @@ static GLOBAL: MetadataProbe = MetadataProbe;
 #[test]
 fn hooks_make_no_nested_metadata_allocations_including_first_tls_access() {
     let a = AttributingAllocator::new(System);
-    let o = StoreHandle::global()
+    let o = RecordStorePin::global()
         .acquire(
             7,
             ResponsibilityClass::Query,

@@ -20,10 +20,10 @@
 //! Deadlines use the same process-clock origin as the node's actual pollers.
 
 use super::{
-    context_host::{NodeRootDelivery, NodeRootRead, RootReadError},
     control_request::ControlRequestDelivery,
     loading::TaskCreatePayload,
     node::{NodeCreateHandle, NodeHostRefusal, WorkerNodeHost},
+    participation_host::{NodeRootDelivery, NodeRootRead, RootReadError},
     request_endpoint::RequestDelivery,
 };
 use crate::{
@@ -32,20 +32,23 @@ use crate::{
         RootCapacityRefusal, RootChannelError, RootDeliveryOwner, RootMetadataReservation,
     },
 };
-use novarocks_execution::runtime::fragment::io::ResultWriteAdmission;
+use novarocks_execution::runtime::task::io::ResultWriteAdmission;
 use novarocks_execution_contract::{
-    AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionTicketId, CreateTask,
-    EstablishQueryContext, QueryContextRef, QuiesceQueryContext, ReleaseQueryContext,
-    RenewQueryExecutionLease, TaskCreationInput, TaskOperationId,
+    AbortParticipation, AcquireParticipationAdmissionTicket, AdmissionTicketId, CreateTask,
+    EstablishParticipation, ParticipationRef, QuiesceParticipation, ReleaseParticipation,
+    RenewParticipationLease, TaskCreationInput, TaskOperationId,
     root_result::{RootResultRead, RootResultReply},
 };
-use novarocks_worker_protocol::{context::ContextCommand, control::ControlInput};
+use novarocks_worker_protocol::{control::ControlInput, participation::ParticipationCommand};
 use std::{fmt, mem::ManuallyDrop, sync::Arc};
 
 pub use novarocks_worker_protocol::{
-    context::{ContextReplyBody as WorkerContextReplyBody, RequestResult as WorkerRequestResult},
     control::ControlReplyBody as WorkerControlReplyBody,
     lease::MonotonicInstant as WorkerMonotonicInstant,
+    participation::{
+        ParticipationReplyBody as WorkerParticipationReplyBody,
+        RequestResult as WorkerRequestResult,
+    },
 };
 
 /// The original admitted transport responsibility, not a new request permit.
@@ -158,57 +161,59 @@ impl WorkerControlDelivery {
     }
 }
 #[must_use = "Hold the original delivery through its actual response lifetime"]
-pub struct WorkerContextDelivery {
+pub struct WorkerParticipationDelivery {
     // Original borrowed evidence exits before the R external-delivery leg.
-    evidence: Option<crate::ReleasedContextEvidence>,
-    original: RequestDelivery<WorkerContextReplyBody>,
+    evidence: Option<crate::ReleasedParticipationEvidence>,
+    original: RequestDelivery<WorkerParticipationReplyBody>,
 }
-/// A Create uses the Context R only after its actual address exists. Before
+/// A Create uses the Participation R only after its actual address exists. Before
 /// that, the same call receives the Root's original retry/closing decision.
 pub enum WorkerCreateDelivery {
-    Context(WorkerContextDelivery),
-    BeforeContext(WorkerControlDelivery),
+    Participation(WorkerParticipationDelivery),
+    BeforeParticipation(WorkerControlDelivery),
 }
 pub enum WorkerCreateReply<'a> {
-    Context(&'a WorkerContextReplyBody),
+    Participation(&'a WorkerParticipationReplyBody),
     Root(&'a WorkerControlReplyBody),
 }
 impl WorkerCreateDelivery {
     pub fn operation(&self) -> TaskOperationId {
         match self {
-            Self::Context(original) => original.operation(),
-            Self::BeforeContext(original) => original.operation(),
+            Self::Participation(original) => original.operation(),
+            Self::BeforeParticipation(original) => original.operation(),
         }
     }
     pub fn reply(&self) -> WorkerCreateReply<'_> {
         match self {
-            Self::Context(original) => WorkerCreateReply::Context(original.body()),
-            Self::BeforeContext(original) => WorkerCreateReply::Root(original.body()),
+            Self::Participation(original) => WorkerCreateReply::Participation(original.body()),
+            Self::BeforeParticipation(original) => WorkerCreateReply::Root(original.body()),
         }
     }
 }
-impl WorkerContextDelivery {
+impl WorkerParticipationDelivery {
     pub fn operation(&self) -> TaskOperationId {
         self.original.request().operation
     }
-    pub fn body(&self) -> &WorkerContextReplyBody {
+    pub fn body(&self) -> &WorkerParticipationReplyBody {
         self.original.body()
     }
-    pub fn released_evidence(&self) -> Option<&crate::ReleasedContextEvidence> {
+    pub fn released_evidence(&self) -> Option<&crate::ReleasedParticipationEvidence> {
         self.evidence.as_ref()
     }
 }
 
 #[must_use = "Hold the original Task-causal R through its actual response lifetime"]
 pub struct WorkerTaskDelivery {
-    original:
-        RequestDelivery<WorkerContextReplyBody, crate::task_proposal_ingress::RequestMetadata>,
+    original: RequestDelivery<
+        WorkerParticipationReplyBody,
+        crate::task_proposal_ingress::RequestMetadata,
+    >,
 }
 impl WorkerTaskDelivery {
     pub fn operation(&self) -> TaskOperationId {
         self.original.request().operation
     }
-    pub fn body(&self) -> &WorkerContextReplyBody {
+    pub fn body(&self) -> &WorkerParticipationReplyBody {
         self.original.body()
     }
 }
@@ -217,10 +222,10 @@ impl WorkerTaskDelivery {
 #[must_use = "Project the original cancellation decision without discarding its delivery"]
 pub enum WorkerCancelOutcome {
     Task(WorkerTaskDelivery),
-    Context(WorkerContextDelivery),
+    Participation(WorkerParticipationDelivery),
     Refused {
         operation: TaskOperationId,
-        reason: novarocks_worker_protocol::context::TaskControlRefusal,
+        reason: novarocks_worker_protocol::participation::TaskControlRefusal,
     },
 }
 
@@ -245,28 +250,28 @@ impl WorkerTaskControl {
 
     pub async fn update_task(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         original: novarocks_execution_contract::UpdateTask,
         deadline: WorkerMonotonicInstant,
         ingress: WorkerIngressResponsibility,
     ) -> Result<WorkerTaskDelivery, WorkerRequestError> {
         let handle = self
             .node
-            .submit_task_domain(context, original, deadline, ingress)?;
+            .submit_task_domain(participation, original, deadline, ingress)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
         Ok(WorkerTaskDelivery { original })
     }
-    pub async fn advance_query_context_domain(
+    pub async fn advance_participation_domain(
         &self,
-        original: novarocks_execution_contract::AdvanceQueryContextDomain,
+        original: novarocks_execution_contract::AdvanceParticipationDomain,
         deadline: WorkerMonotonicInstant,
         ingress: WorkerIngressResponsibility,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
         let handle = self
             .node
-            .submit_context_domain(original, deadline, ingress)?;
+            .submit_participation_domain(original, deadline, ingress)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-        Ok(WorkerContextDelivery {
+        Ok(WorkerParticipationDelivery {
             evidence: None,
             original,
         })
@@ -275,12 +280,12 @@ impl WorkerTaskControl {
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerControlDelivery, WorkerRequestError> {
         let handle = self
             .node
-            .observe_ticket(operation, deadline, ticket, context, false)?;
+            .observe_ticket(operation, deadline, ticket, participation, false)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
         Ok(WorkerControlDelivery { original })
     }
@@ -288,21 +293,21 @@ impl WorkerTaskControl {
         &self,
         operation: TaskOperationId,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerControlDelivery, WorkerRequestError> {
         let handle = self
             .node
-            .observe_ticket(operation, deadline, ticket, context, true)?;
+            .observe_ticket(operation, deadline, ticket, participation, true)?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
         Ok(WorkerControlDelivery { original })
     }
 
-    pub fn context_for_task(
+    pub fn participation_for_task(
         &self,
         task: novarocks_execution_contract::TaskIdentity,
-    ) -> Option<QueryContextRef> {
-        self.node.task_context(task)
+    ) -> Option<ParticipationRef> {
+        self.node.task_participation(task)
     }
     #[cfg(novarocks_dev_controls)]
     pub fn live_task_execution_control_for_test(
@@ -323,12 +328,14 @@ impl WorkerTaskControl {
                 let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
                 Ok(WorkerCancelOutcome::Task(WorkerTaskDelivery { original }))
             }
-            super::node::NodeCancelHandle::Context(handle) => {
+            super::node::NodeCancelHandle::Participation(handle) => {
                 let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-                Ok(WorkerCancelOutcome::Context(WorkerContextDelivery {
-                    evidence: None,
-                    original,
-                }))
+                Ok(WorkerCancelOutcome::Participation(
+                    WorkerParticipationDelivery {
+                        evidence: None,
+                        original,
+                    },
+                ))
             }
             super::node::NodeCancelHandle::Refused(reason) => {
                 Ok(WorkerCancelOutcome::Refused { operation, reason })
@@ -338,7 +345,7 @@ impl WorkerTaskControl {
 
     pub async fn acquire(
         &self,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
         ticket: AdmissionTicketId,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerControlDelivery, WorkerRequestError> {
@@ -353,7 +360,7 @@ impl WorkerTaskControl {
     }
     pub async fn establish(
         &self,
-        request: EstablishQueryContext,
+        request: EstablishParticipation,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerControlDelivery, WorkerRequestError> {
         let operation = request.envelope().operation_id();
@@ -382,69 +389,71 @@ impl WorkerTaskControl {
             ingress_retained_bytes,
         };
         // Node constructs the actual TaskHostBinding from its own held
-        // Context, original runtime generation, ports and identity issuer.
+        // Participation, original runtime generation, ports and identity issuer.
         let handle =
             self.node
                 .submit_task_create(self.node.next_source(), deadline, payload, ingress)?;
         match handle {
-            NodeCreateHandle::Context(handle) => {
+            NodeCreateHandle::Participation(handle) => {
                 let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-                Ok(WorkerCreateDelivery::Context(WorkerContextDelivery {
-                    evidence: None,
-                    original,
-                }))
+                Ok(WorkerCreateDelivery::Participation(
+                    WorkerParticipationDelivery {
+                        evidence: None,
+                        original,
+                    },
+                ))
             }
-            NodeCreateHandle::BeforeContext(handle) => {
+            NodeCreateHandle::BeforeParticipation(handle) => {
                 let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-                Ok(WorkerCreateDelivery::BeforeContext(WorkerControlDelivery {
-                    original,
-                }))
+                Ok(WorkerCreateDelivery::BeforeParticipation(
+                    WorkerControlDelivery { original },
+                ))
             }
         }
     }
-    async fn context_request(
+    async fn participation_request(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation: TaskOperationId,
         deadline: WorkerMonotonicInstant,
-        command: ContextCommand,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        let handle = self.node.submit_context(
-            context,
+        command: ParticipationCommand,
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
+        let handle = self.node.submit_participation(
+            participation,
             self.node.next_source(),
             operation,
             deadline,
             command,
         )?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-        Ok(WorkerContextDelivery {
+        Ok(WorkerParticipationDelivery {
             evidence: None,
             original,
         })
     }
     pub async fn quiesce(
         &self,
-        request: QuiesceQueryContext,
+        request: QuiesceParticipation,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        self.context_request(
-            request.context(),
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
+        self.participation_request(
+            request.participation(),
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::Quiesce,
+            ParticipationCommand::Quiesce,
         )
         .await
     }
     pub async fn abort(
         &self,
-        request: AbortQueryContext,
+        request: AbortParticipation,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        self.context_request(
-            request.context(),
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
+        self.participation_request(
+            request.participation(),
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: request.cause(),
             },
         )
@@ -452,34 +461,34 @@ impl WorkerTaskControl {
     }
     pub async fn release(
         &self,
-        request: ReleaseQueryContext,
+        request: ReleaseParticipation,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
         let mut delivery = self
-            .context_request(
-                request.context(),
+            .participation_request(
+                request.participation(),
                 request.envelope().operation_id(),
                 deadline,
-                ContextCommand::Release,
+                ParticipationCommand::Release,
             )
             .await?;
-        if matches!(delivery.body(), WorkerContextReplyBody::Release { release, .. }
+        if matches!(delivery.body(), WorkerParticipationReplyBody::Release { release, .. }
             if *release != novarocks_execution_contract::ReleaseOutcome::NotReady)
         {
-            delivery.evidence = Some(self.node.released_evidence(request.context())?);
+            delivery.evidence = Some(self.node.released_evidence(request.participation())?);
         }
         Ok(delivery)
     }
     pub async fn renew(
         &self,
-        request: RenewQueryExecutionLease,
+        request: RenewParticipationLease,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        self.context_request(
-            request.context(),
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
+        self.participation_request(
+            request.participation(),
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::Renew {
+            ParticipationCommand::Renew {
                 sequence: request.sequence(),
                 valid_for: request.valid_for(),
             },
@@ -489,23 +498,23 @@ impl WorkerTaskControl {
     /// A declared Native experimental action selects the same real Renew R.
     /// There is no extra fault request, input, Work or protocol command.
     #[cfg(novarocks_dev_controls)]
-    pub async fn renew_with_context_owner_panic(
+    pub async fn renew_with_participation_owner_panic(
         &self,
-        request: RenewQueryExecutionLease,
+        request: RenewParticipationLease,
         deadline: WorkerMonotonicInstant,
-    ) -> Result<WorkerContextDelivery, WorkerRequestError> {
-        let handle = self.node.submit_context_owner_panic(
-            request.context(),
+    ) -> Result<WorkerParticipationDelivery, WorkerRequestError> {
+        let handle = self.node.submit_participation_owner_panic(
+            request.participation(),
             self.node.next_source(),
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::Renew {
+            ParticipationCommand::Renew {
                 sequence: request.sequence(),
                 valid_for: request.valid_for(),
             },
         )?;
         let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-        Ok(WorkerContextDelivery {
+        Ok(WorkerParticipationDelivery {
             evidence: None,
             original,
         })
@@ -514,7 +523,7 @@ impl WorkerTaskControl {
     /// Only the returned admitted owner can perform the subsequent async read.
     pub fn begin_root_read(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation: TaskOperationId,
         deadline: WorkerMonotonicInstant,
         request: &RootResultRead,
@@ -527,7 +536,7 @@ impl WorkerTaskControl {
         let original = self
             .node
             .begin_root_read(
-                context,
+                participation,
                 self.node.next_source(),
                 operation,
                 deadline,
@@ -547,11 +556,11 @@ impl WorkerTaskControl {
                 RootReadError::ForeignProcess,
             ));
         }
-        let context = self
+        let participation = self
             .node
-            .task_context(request.root_task())
+            .task_participation(request.root_task())
             .ok_or_else(|| WorkerRootReadError::from_original(RootReadError::UnknownTask))?;
-        self.begin_root_read(context, operation, deadline, request)
+        self.begin_root_read(participation, operation, deadline, request)
     }
 }
 
@@ -560,8 +569,8 @@ impl WorkerTaskControl {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerRootReadErrorKind {
     ForeignProcess,
-    UnknownContext,
-    ContextRemoved,
+    UnknownParticipation,
+    ParticipationRemoved,
     AdmissionRefused,
     TaskNotReady,
     NoRoot,
@@ -582,8 +591,8 @@ impl WorkerRootReadError {
         use super::task::TaskRootReadError;
         let kind = match &original {
             RootReadError::ForeignProcess => WorkerRootReadErrorKind::ForeignProcess,
-            RootReadError::UnknownContext => WorkerRootReadErrorKind::UnknownContext,
-            RootReadError::ContextRemoved => WorkerRootReadErrorKind::ContextRemoved,
+            RootReadError::UnknownParticipation => WorkerRootReadErrorKind::UnknownParticipation,
+            RootReadError::ParticipationRemoved => WorkerRootReadErrorKind::ParticipationRemoved,
             RootReadError::Request(_) => WorkerRootReadErrorKind::AdmissionRefused,
             RootReadError::Task(
                 TaskRootReadError::NotInstalled | TaskRootReadError::OwnerNotReady,
@@ -641,7 +650,7 @@ impl fmt::Display for WorkerRootReadError {
 impl std::error::Error for WorkerRootReadError {}
 impl novarocks_execution_contract::failure::FailureProjection for WorkerRootReadError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use super::context_host::ContextRequestError;
+        use super::participation_host::ParticipationRequestError;
         use super::task::TaskRootReadError;
         use crate::failure_reason::WorkerFailureReason as R;
         use novarocks_control_runtime::transaction::RuntimeError;
@@ -656,8 +665,8 @@ impl novarocks_execution_contract::failure::FailureProjection for WorkerRootRead
             | RootReadError::Task(TaskRootReadError::Channel(error)) => {
                 return error.failure_fact();
             }
-            RootReadError::UnknownContext | RootReadError::ContextRemoved => {
-                (FailureClass::Data, R::QueryContextMissing)
+            RootReadError::UnknownParticipation | RootReadError::ParticipationRemoved => {
+                (FailureClass::Data, R::ParticipationMissing)
             }
             RootReadError::UnknownTask | RootReadError::Task(TaskRootReadError::NoRoot) => {
                 (FailureClass::Data, R::RootReadUnknown)
@@ -673,14 +682,14 @@ impl novarocks_execution_contract::failure::FailureProjection for WorkerRootRead
                 .with_resource(*facts);
             }
             RootReadError::Request(original) => match &original.error {
-                ContextRequestError::Runtime(RuntimeError::Capacity(CapacityError::Exhausted(
-                    _,
-                ))) => (FailureClass::Resource, R::RootControlReadCapacity),
-                ContextRequestError::AdmissionClosed => {
+                ParticipationRequestError::Runtime(RuntimeError::Capacity(
+                    CapacityError::Exhausted(_),
+                )) => (FailureClass::Resource, R::RootControlReadCapacity),
+                ParticipationRequestError::AdmissionClosed => {
                     (FailureClass::Control, R::RootControlReadAdmission)
                 }
-                ContextRequestError::UnknownTask => (FailureClass::Data, R::RootReadUnknown),
-                ContextRequestError::TaskNotReady => {
+                ParticipationRequestError::UnknownTask => (FailureClass::Data, R::RootReadUnknown),
+                ParticipationRequestError::TaskNotReady => {
                     (FailureClass::Control, R::RootControlReadAdmission)
                 }
                 _ => (FailureClass::Invariant, R::ProtocolOwnerFailed),
@@ -749,11 +758,11 @@ impl WorkerRootDelivery {
 /// The one admitted covered observation R. Frames borrow its original external
 /// delivery; neither polling nor dropping a frame advances source coverage.
 pub struct WorkerObservationStream {
-    original: super::context_host::requests::observation::ContextObservationStream,
+    original: super::participation_host::requests::observation::ParticipationObservationStream,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerObservationErrorKind {
-    ContextRemoved,
+    ParticipationRemoved,
     OwnerFailed,
     FrameOutstanding,
     IntakeRejected,
@@ -761,13 +770,13 @@ pub enum WorkerObservationErrorKind {
 }
 #[derive(Debug)]
 pub struct WorkerObservationError {
-    original: super::context_host::requests::observation::ContextObservationStreamError,
+    original: super::participation_host::requests::observation::ParticipationObservationStreamError,
 }
 impl WorkerObservationError {
     pub fn kind(&self) -> WorkerObservationErrorKind {
-        use super::context_host::requests::observation::ContextObservationStreamError as E;
+        use super::participation_host::requests::observation::ParticipationObservationStreamError as E;
         match &self.original {
-            E::ContextRemoved => WorkerObservationErrorKind::ContextRemoved,
+            E::ParticipationRemoved => WorkerObservationErrorKind::ParticipationRemoved,
             E::FrameOutstanding => WorkerObservationErrorKind::FrameOutstanding,
             E::IntakeRejected(_) => WorkerObservationErrorKind::IntakeRejected,
             E::Source(_) => WorkerObservationErrorKind::SourceRejected,
@@ -780,8 +789,8 @@ impl WorkerObservationError {
         &self,
     ) -> Option<&novarocks_worker_protocol::observation::CoveredSubscriptionError> {
         use super::{
-            context_host::observation::ContextObservationError as S,
-            context_host::requests::observation::ContextObservationStreamError as E,
+            participation_host::observation::ParticipationObservationError as S,
+            participation_host::requests::observation::ParticipationObservationStreamError as E,
         };
         match &self.original {
             E::Source(error) => match error.as_ref() {
@@ -791,9 +800,9 @@ impl WorkerObservationError {
             _ => None,
         }
     }
-    pub fn intake_reply(&self) -> Option<&WorkerContextReplyBody> {
+    pub fn intake_reply(&self) -> Option<&WorkerParticipationReplyBody> {
         match &self.original {
-            super::context_host::requests::observation::ContextObservationStreamError::IntakeRejected(body) => Some(body),
+            super::participation_host::requests::observation::ParticipationObservationStreamError::IntakeRejected(body) => Some(body),
             _ => None,
         }
     }
@@ -806,7 +815,7 @@ impl fmt::Display for WorkerObservationError {
 impl std::error::Error for WorkerObservationError {}
 #[must_use = "A selected frame is acknowledged only after actual ordered transport acceptance"]
 pub struct WorkerObservationFrameDelivery {
-    original: super::context_host::requests::observation::ObservationFrameDelivery,
+    original: super::participation_host::requests::observation::ObservationFrameDelivery,
 }
 impl WorkerObservationFrameDelivery {
     pub fn selected(&self) -> &novarocks_worker_protocol::observation::SelectedCoveredObservation {
@@ -857,14 +866,14 @@ impl WorkerObservationStream {
 impl WorkerTaskControl {
     pub fn begin_status_subscription(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation: TaskOperationId,
         deadline: WorkerMonotonicInstant,
         generation: u64,
         position: novarocks_worker_protocol::observation::CoveredSubscriptionRequest,
     ) -> Result<WorkerObservationStream, WorkerRequestError> {
         let original = self.node.begin_status_subscription(
-            context,
+            participation,
             self.node.next_source(),
             operation,
             deadline,
@@ -884,8 +893,13 @@ pub struct WorkerTaskReadDelivery {
     original: TaskReadDelivery,
 }
 enum TaskReadDelivery {
-    Live(RequestDelivery<WorkerContextReplyBody, crate::task_proposal_ingress::RequestMetadata>),
-    Sealed(RequestDelivery<WorkerContextReplyBody>),
+    Live(
+        RequestDelivery<
+            WorkerParticipationReplyBody,
+            crate::task_proposal_ingress::RequestMetadata,
+        >,
+    ),
+    Sealed(RequestDelivery<WorkerParticipationReplyBody>),
 }
 impl WorkerTaskReadDelivery {
     pub fn dynamic_filter_payload(
@@ -904,7 +918,7 @@ impl WorkerTaskReadDelivery {
             TaskReadDelivery::Sealed(original) => original.request().operation,
         }
     }
-    pub fn body(&self) -> &WorkerContextReplyBody {
+    pub fn body(&self) -> &WorkerParticipationReplyBody {
         match &self.original {
             TaskReadDelivery::Live(original) => original.body(),
             TaskReadDelivery::Sealed(original) => original.body(),
@@ -914,60 +928,61 @@ impl WorkerTaskReadDelivery {
 impl WorkerTaskControl {
     async fn task_read(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation: TaskOperationId,
         deadline: WorkerMonotonicInstant,
-        command: ContextCommand,
+        command: ParticipationCommand,
     ) -> Result<WorkerTaskReadDelivery, WorkerRequestError> {
         use super::node::NodeTaskReadHandle;
-        let (original, payload) = match self
-            .node
-            .submit_task_read(context, operation, deadline, command)?
-        {
-            NodeTaskReadHandle::Live(handle, shared) => {
-                let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
-                let payload = match &shared {
-                    Some(shared) => shared
-                        .take_ready()
-                        .map_err(|_| WorkerRequestError::OwnerFailed)?,
-                    None => None,
-                };
-                match (original.body(), &payload) {
-                    (
-                        WorkerContextReplyBody::ReadPayload {
-                            version,
-                            payload: id,
-                            ..
-                        },
-                        Some(loan),
-                    ) if *version == loan.version() && *id == loan.payload_id() => {}
-                    (WorkerContextReplyBody::ReadPayload { .. }, _) | (_, Some(_)) => {
-                        return Err(WorkerRequestError::OwnerFailed);
+        let (original, payload) =
+            match self
+                .node
+                .submit_task_read(participation, operation, deadline, command)?
+            {
+                NodeTaskReadHandle::Live(handle, shared) => {
+                    let original = handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?;
+                    let payload = match &shared {
+                        Some(shared) => shared
+                            .take_ready()
+                            .map_err(|_| WorkerRequestError::OwnerFailed)?,
+                        None => None,
+                    };
+                    match (original.body(), &payload) {
+                        (
+                            WorkerParticipationReplyBody::ReadPayload {
+                                version,
+                                payload: id,
+                                ..
+                            },
+                            Some(loan),
+                        ) if *version == loan.version() && *id == loan.payload_id() => {}
+                        (WorkerParticipationReplyBody::ReadPayload { .. }, _) | (_, Some(_)) => {
+                            return Err(WorkerRequestError::OwnerFailed);
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    (TaskReadDelivery::Live(original), payload)
                 }
-                (TaskReadDelivery::Live(original), payload)
-            }
-            NodeTaskReadHandle::Sealed(handle) => (
-                TaskReadDelivery::Sealed(
-                    handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?,
+                NodeTaskReadHandle::Sealed(handle) => (
+                    TaskReadDelivery::Sealed(
+                        handle.await.map_err(|_| WorkerRequestError::OwnerFailed)?,
+                    ),
+                    None,
                 ),
-                None,
-            ),
-        };
+            };
         Ok(WorkerTaskReadDelivery { payload, original })
     }
     pub async fn get_final_task_info(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         request: novarocks_execution_contract::GetFinalTaskInfo,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerTaskReadDelivery, WorkerRequestError> {
         self.task_read(
-            context,
+            participation,
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::GetFinalInfo {
+            ParticipationCommand::GetFinalInfo {
                 task: request.identity(),
             },
         )
@@ -975,15 +990,15 @@ impl WorkerTaskControl {
     }
     pub async fn get_dynamic_filters(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         request: novarocks_execution_contract::FetchTaskDynamicFilters,
         deadline: WorkerMonotonicInstant,
     ) -> Result<WorkerTaskReadDelivery, WorkerRequestError> {
         self.task_read(
-            context,
+            participation,
             request.envelope().operation_id(),
             deadline,
-            ContextCommand::GetDynamicFilters {
+            ParticipationCommand::GetDynamicFilters {
                 task: request.identity(),
                 acknowledged: request.acknowledged_version(),
             },

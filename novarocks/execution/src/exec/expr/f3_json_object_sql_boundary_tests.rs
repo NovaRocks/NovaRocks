@@ -35,7 +35,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use serde_json::{Value, json};
 
 use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 
 fn result() -> FunctionValueType {
     FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()

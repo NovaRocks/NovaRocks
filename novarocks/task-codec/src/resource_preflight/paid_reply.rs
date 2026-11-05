@@ -104,12 +104,12 @@ fn scan_object(layout: &ObjectLayout, raw: &[u8], charge: &mut Charge, depth: us
     // same envelope; terminal telemetry is moved into its canonical cell.
     use novarocks_execution_contract::{
         identity::TaskIdentity,
-        operation::{PlanNodeSplitReceipt, QueryContextDomainReceipt, TaskDomainReceipt},
+        operation::{ParticipationDomainReceipt, PlanNodeSplitReceipt, TaskDomainReceipt},
     };
     let typed = match layout.schema_id {
         "novarocks.TaskDomainReceipt" => size_of::<TaskDomainReceipt>(),
         "novarocks.TaskSplitPlanNodeReceipt" => size_of::<PlanNodeSplitReceipt>(),
-        "novarocks.QueryContextDomainReceipt" => size_of::<QueryContextDomainReceipt>(),
+        "novarocks.ParticipationDomainReceipt" => size_of::<ParticipationDomainReceipt>(),
         "novarocks.TaskIdentity" => size_of::<TaskIdentity>(),
         _ => 0,
     };

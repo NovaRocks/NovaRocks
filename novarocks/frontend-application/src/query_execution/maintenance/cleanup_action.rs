@@ -37,10 +37,10 @@ use novarocks_spi::connector::{
     ConnectorCleanupAsyncOutput as Output, ConnectorCleanupAsyncStart,
     ConnectorCleanupAsyncStep as Step, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest,
-    ConnectorCleanupMaintenanceLease, ConnectorCleanupOperationId,
-    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPrepareRequest,
-    ConnectorControlPlanningLease, ConnectorError, ConnectorOriginalResultScope,
-    ConnectorRequestContext, LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
+    ConnectorCleanupMaintenanceSession, ConnectorCleanupOperationId,
+    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPrepareRequest, ConnectorControlPlanningPin,
+    ConnectorError, ConnectorOriginalResultScope, ConnectorRequestContext,
+    LakePublicationDisposition, ProviderMetadataCpuPort, SharedDependency,
 };
 use novarocks_state_store_api::StateStoreExecutionContext;
 use novarocks_table_maintenance::gc_observation::{
@@ -85,8 +85,8 @@ struct Body {
     product: Arc<TableMaintenanceProduct>,
     target: MaintenanceTarget,
     older_than: i64,
-    lease: ConnectorCleanupMaintenanceLease,
-    planning: ConnectorControlPlanningLease,
+    cleanup_session: ConnectorCleanupMaintenanceSession,
+    planning: ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     cpu: Option<Arc<dyn ProviderMetadataCpuPort>>,
     original: Option<ConnectorOriginalResultScope>,
@@ -175,11 +175,11 @@ pub(crate) fn prepare(
         .connector_control()
         .acquire_current(&identity.instance_id)
         .map_err(TerminalError::from_original_cause)?;
-    let lease = kernel
+    let cleanup_session = kernel
         .connector_control()
         .acquire_exact_cleanup_maintenance(planning.control_runtime_id())
         .map_err(TerminalError::from_original_cause)?;
-    let dependencies = lease
+    let dependencies = cleanup_session
         .initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;
     let product = kernel
@@ -197,7 +197,7 @@ pub(crate) fn prepare(
         product,
         target,
         older_than,
-        lease,
+        cleanup_session,
         planning,
         context: connector.clone(),
         cpu: None,
@@ -359,7 +359,7 @@ impl State {
                 .cleanup_metadata_cpu_port(
                     &scope,
                     capacity.try_window_alias().map_err(original_service)?,
-                    &body.lease,
+                    &body.cleanup_session,
                     body.engine.execution.cancellation().clone(),
                     runtime.execution.0.runtime().clone(),
                     self.wake.clone(),
@@ -777,7 +777,7 @@ async fn start_plan(
             .ok_or("cleanup original paid scope is absent")?
             .clone(),
     });
-    let installed = body.lease.begin_async_in(
+    let installed = body.cleanup_session.begin_async_in(
         &mut body.start,
         body.cpu
             .as_ref()
@@ -826,7 +826,7 @@ async fn reject_mv(
     target: &MaintenanceTarget,
 ) -> Result<(), TerminalError> {
     let body = original.lock().await;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(body.engine.kernel.mv_storage_observation().as_ref(),&body.planning,body.engine.kernel.mv_readiness().as_ref(),&crate::catalog_application::resolver::TargetBackend{provider_id:body.lease.descriptor().provider_id.clone(),catalog:target.catalog.clone(),namespace:target.namespace.clone(),table:target.table.clone()},crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,body.context.clone(),body.cpu.as_ref().ok_or_else(|| TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent"))?.clone()).await.map_err(super::rewrite_job::guard_terminal_error)
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(body.engine.kernel.mv_storage_observation().as_ref(),&body.planning,body.engine.kernel.mv_readiness().as_ref(),&crate::catalog_application::resolver::TargetBackend{provider_id:body.cleanup_session.descriptor().provider_id.clone(),catalog:target.catalog.clone(),namespace:target.namespace.clone(),table:target.table.clone()},crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,body.context.clone(),body.cpu.as_ref().ok_or_else(|| TerminalError::pre_dispatch_failed("cleanup original metadata CPU is absent"))?.clone()).await.map_err(super::rewrite_job::guard_terminal_error)
 }
 
 async fn begin_cleanup_original(

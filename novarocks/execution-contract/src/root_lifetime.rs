@@ -23,8 +23,8 @@ use crate::root_result::RootResultEnd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootRetentionClose {
-    ContextReleased,
-    ContextAborted,
+    ParticipationReleased,
+    ParticipationAborted,
     LeaseExpired,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +33,7 @@ pub enum RootLifetimeError {
     ConflictingEnd,
     ProducerStillRunning,
     EndNotPublished,
-    ContextNotHolding,
+    ParticipationNotHolding,
     ReadNotConverged,
 }
 impl std::fmt::Display for RootLifetimeError {
@@ -43,7 +43,7 @@ impl std::fmt::Display for RootLifetimeError {
             Self::ConflictingEnd => "root terminal publication is immutable",
             Self::ProducerStillRunning => "root encoder has not actually exited",
             Self::EndNotPublished => "root End has not been published",
-            Self::ContextNotHolding => "root result has not been handed to its context",
+            Self::ParticipationNotHolding => "root result has not been handed to its context",
             Self::ReadNotConverged => {
                 "root read cannot seal before local End and root terminal evidence"
             }
@@ -59,7 +59,7 @@ pub struct RootResultLifetime {
     task: TaskIdentity,
     end: Option<RootResultEnd>,
     encoder_exited: bool,
-    context_holding: bool,
+    participation_holding: bool,
     closed: Option<RootRetentionClose>,
 }
 impl RootResultLifetime {
@@ -68,7 +68,7 @@ impl RootResultLifetime {
             task,
             end: None,
             encoder_exited: false,
-            context_holding: false,
+            participation_holding: false,
             closed: None,
         }
     }
@@ -85,7 +85,7 @@ impl RootResultLifetime {
         self.closed.is_none()
     }
     pub const fn root_finished(&self) -> bool {
-        self.end.is_some() && self.encoder_exited && self.context_holding
+        self.end.is_some() && self.encoder_exited && self.participation_holding
     }
     /// Called only after the host has published the immutable End item.
     pub fn end_published(&mut self, end: RootResultEnd) -> Result<(), RootLifetimeError> {
@@ -104,7 +104,7 @@ impl RootResultLifetime {
         self.encoder_exited = true;
     }
     /// The context owner calls this after taking the retained root channel.
-    pub fn handoff_to_context(&mut self) -> Result<(), RootLifetimeError> {
+    pub fn handoff_to_participation(&mut self) -> Result<(), RootLifetimeError> {
         if self.closed.is_some() {
             return Err(RootLifetimeError::Closed);
         }
@@ -114,14 +114,14 @@ impl RootResultLifetime {
         if !self.encoder_exited {
             return Err(RootLifetimeError::ProducerStillRunning);
         }
-        self.context_holding = true;
+        self.participation_holding = true;
         Ok(())
     }
     pub fn validate_task_retirement(&self) -> Result<(), RootLifetimeError> {
         if self.closed.is_some() || self.root_finished() {
             Ok(())
         } else {
-            Err(RootLifetimeError::ContextNotHolding)
+            Err(RootLifetimeError::ParticipationNotHolding)
         }
     }
     /// This is a logical close, not proof that aliases physically released.
@@ -202,7 +202,7 @@ impl novarocks_failure_contract::FailureProjection for RootLifetimeError {
             Self::ConflictingEnd => (FailureClass::Invariant, 221),
             Self::ProducerStillRunning => (FailureClass::Invariant, 222),
             Self::EndNotPublished => (FailureClass::Invariant, 223),
-            Self::ContextNotHolding => (FailureClass::Invariant, 224),
+            Self::ParticipationNotHolding => (FailureClass::Invariant, 224),
             Self::ReadNotConverged => (FailureClass::Invariant, 225),
         };
         FailureFact::new(
@@ -234,22 +234,22 @@ mod tests {
         }
     }
     #[test]
-    fn finished_requires_publication_actual_exit_and_context_handoff() {
+    fn finished_requires_publication_actual_exit_and_participation_handoff() {
         let mut root = RootResultLifetime::new(task());
         assert_eq!(
-            root.handoff_to_context(),
+            root.handoff_to_participation(),
             Err(RootLifetimeError::EndNotPublished)
         );
         root.end_published(end()).unwrap();
         assert_eq!(
-            root.handoff_to_context(),
+            root.handoff_to_participation(),
             Err(RootLifetimeError::ProducerStillRunning)
         );
         assert!(!root.root_finished());
         assert!(root.validate_task_retirement().is_err());
         root.encoder_exited();
         assert!(!root.root_finished());
-        root.handoff_to_context().unwrap();
+        root.handoff_to_participation().unwrap();
         assert!(root.root_finished());
         root.validate_task_retirement().unwrap();
         assert!(
@@ -263,7 +263,7 @@ mod tests {
             })
             .is_err()
         );
-        root.close(RootRetentionClose::ContextReleased);
+        root.close(RootRetentionClose::ParticipationReleased);
         assert!(!root.allows_read());
         assert!(
             root.root_finished(),
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn abort_and_lease_close_reads_before_late_encoder_exit() {
         for reason in [
-            RootRetentionClose::ContextAborted,
+            RootRetentionClose::ParticipationAborted,
             RootRetentionClose::LeaseExpired,
         ] {
             let mut root = RootResultLifetime::new(task());

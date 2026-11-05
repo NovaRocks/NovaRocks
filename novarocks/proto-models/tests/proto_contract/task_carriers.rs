@@ -138,7 +138,7 @@ fn destination() -> novarocks::TaskExchangeDestination {
                 value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1],
             }),
         }),
-        fragment_instance_id: Some(id(3, 4)),
+        task_key: Some(id(3, 4)),
         endpoint: Some(novarocks::QueryControlEndpoint {
             host: "10.0.0.8".to_string(),
             port: 8060,
@@ -257,7 +257,7 @@ fn create_task_carriers_separate_frozen_plan_from_task_assignment() {
         package: b"opaque package".to_vec().into(),
     };
     let metadata = novarocks::CreationMetadata {
-        query_context: None,
+        participation: None,
         descriptor: Some(novarocks::TaskDescriptor {
             topology: Some(topology()),
             ..Default::default()

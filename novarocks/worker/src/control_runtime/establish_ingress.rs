@@ -21,11 +21,11 @@
 
 use super::actors::WorkerActor;
 use super::{control_request::ControlRequestNotice, preparation::QueuedPreparation};
-use novarocks_control_runtime::driver::ActorRuntime;
+use novarocks_control_runtime::actor_turn::ActorRuntime;
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{ReservationBundle, WorkLease},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::{ReservationObligation, WorkObligation},
     owned_return::{OwnedReturnReader, OwnedReturnSender},
     reported_work::ReportedWork,
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
@@ -37,10 +37,10 @@ use novarocks_control_runtime_core::{
     scope::WorkKind,
 };
 use novarocks_execution_contract::{
-    AdmissionTicketId, CodecOwnedContent, CredentialUpdate, EstablishQueryContext,
-    EstablishQueryContextParts, LeaseValidFor, QueryContextRef, TaskOperationId,
+    AdmissionTicketId, CodecOwnedContent, CredentialUpdate, EstablishParticipation,
+    EstablishParticipationParts, LeaseValidFor, ParticipationRef, TaskOperationId,
 };
-use novarocks_worker_protocol::context::ContextEstablishment;
+use novarocks_worker_protocol::participation::ParticipationEstablishment;
 use novarocks_worker_protocol::{control::EstablishSemanticFacts, creation::PayloadId};
 use std::{
     any::Any,
@@ -57,7 +57,7 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EstablishProjection {
     pub operation: TaskOperationId,
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub ticket: AdmissionTicketId,
     pub payload: PayloadId,
     pub semantics: EstablishSemanticFacts,
@@ -65,7 +65,7 @@ pub(crate) struct EstablishProjection {
 
 struct Sources {
     operation: TaskOperationId,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     ticket: AdmissionTicketId,
     payload: PayloadId,
     lease: LeaseValidFor,
@@ -76,10 +76,10 @@ struct Sources {
     credential: ManuallyDrop<CredentialUpdate>,
 }
 impl Sources {
-    fn new(request: EstablishQueryContext, payload: PayloadId) -> Self {
-        let EstablishQueryContextParts {
+    fn new(request: EstablishParticipation, payload: PayloadId) -> Self {
+        let EstablishParticipationParts {
             envelope,
-            context,
+            participation,
             admission_ticket_id,
             catalog_binding,
             initial_runtime_filter,
@@ -89,7 +89,7 @@ impl Sources {
         } = request.into_owned_parts();
         Self {
             operation: envelope.operation_id(),
-            context,
+            participation,
             ticket: admission_ticket_id,
             payload,
             lease: initial_lease_valid_for,
@@ -102,14 +102,14 @@ impl Sources {
     fn project(&self) -> EstablishProjection {
         EstablishProjection {
             operation: self.operation,
-            context: self.context,
+            participation: self.participation,
             ticket: self.ticket,
             payload: self.payload,
             semantics: EstablishSemanticFacts {
                 catalog: self.catalog.fingerprint(),
                 shared_filter: self.filter.fingerprint(),
                 query_options: self.options.fingerprint(),
-                credential_lease: self.credential.lease_id(),
+                credential_domain_id: self.credential.credential_domain_id(),
                 credential_epoch: self.credential.epoch(),
                 initial_lease_valid_for: self.lease,
             },
@@ -117,7 +117,7 @@ impl Sources {
     }
     fn shared_facts(&self) -> crate::SharedFactsRequest<'_> {
         crate::SharedFactsRequest::new(
-            self.context,
+            self.participation,
             &self.catalog,
             &self.filter,
             &self.options,
@@ -155,7 +155,7 @@ impl Sources {
 
 struct SourceState {
     sources: Option<Sources>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     // The loan is exclusive; a source cannot be disposed during a getter.
     getter_finished: bool,
     materialization_issued: bool,
@@ -171,7 +171,7 @@ struct Custody {
     parent: ScopeId,
     parent_scope: ScopeHandle,
     parent_generation: Generation,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
     state: Mutex<SourceState>,
     notice: ControlRequestNotice,
@@ -184,11 +184,11 @@ pub(crate) struct EstablishIngressOwner(Arc<Custody>);
 #[must_use = "Retain every actually created partial child before capture"]
 pub(crate) struct EstablishIngressPartial {
     pub scope: ScopeHandle,
-    pub work: WorkLease,
-    pub capacity: ReservationBundle,
+    pub work: WorkObligation,
+    pub capacity: ReservationObligation,
 }
 pub(crate) struct EstablishIngressBootstrapRefusal {
-    pub error: ExitRoleError,
+    pub error: ExitCustodyError,
     pub partial: Option<EstablishIngressPartial>,
 }
 
@@ -196,7 +196,7 @@ pub(crate) struct EstablishIngressBootstrapRefusal {
 pub(crate) enum EstablishIngressOutcome {
     Projected(EstablishProjection),
     StartRefused {
-        _original_error: ExitRoleError,
+        _original_error: ExitCustodyError,
     },
     #[cfg(test)]
     CancelledBeforeStart,
@@ -204,20 +204,20 @@ pub(crate) enum EstablishIngressOutcome {
 }
 #[must_use = "Restore the same original source authority before continuing cleanup"]
 pub(crate) struct EstablishIngressReturned {
-    pub authority: Option<ExitAuthority>,
+    pub authority: Option<ExitObligation>,
     pub outcome: EstablishIngressOutcome,
 }
 #[must_use = "A queue refusal returns this same original authority and sender"]
 pub(crate) struct EstablishIngressJob {
     owner: EstablishIngressOwner,
-    context: QueryContextRef,
-    authority: Option<ExitAuthority>,
+    participation: ParticipationRef,
+    authority: Option<ExitObligation>,
     sender: Option<OwnedReturnSender<EstablishIngressReturned>>,
 }
 #[must_use = "Run raw field disposal only on the actual cleanup host"]
 pub(crate) struct EstablishDisposalJob {
     owner: EstablishIngressOwner,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     sources: Option<Sources>,
     active: bool,
 }
@@ -233,13 +233,13 @@ pub(crate) struct EstablishMaterializationLoan {
 }
 /// Selection authority from the actual original Root, kept separate from the
 /// raw borrow. A same-shaped request from another runtime cannot enter a
-/// Context's independently admitted host roles.
+/// Participation's independently admitted host roles.
 pub(crate) struct ValidatedMaterializationSource {
     runtime: ActorRuntime<WorkerActor>,
     root: ActorId,
     generation: Generation,
-    establishment: ContextEstablishment,
-    request: novarocks_worker_protocol::creation::RequestContext,
+    establishment: ParticipationEstablishment,
+    request: novarocks_worker_protocol::creation::RequestReplyTag,
     loan: EstablishMaterializationLoan,
 }
 impl ValidatedMaterializationSource {
@@ -247,8 +247,8 @@ impl ValidatedMaterializationSource {
         runtime: ActorRuntime<WorkerActor>,
         root: ActorId,
         generation: Generation,
-        establishment: ContextEstablishment,
-        request: novarocks_worker_protocol::creation::RequestContext,
+        establishment: ParticipationEstablishment,
+        request: novarocks_worker_protocol::creation::RequestReplyTag,
         loan: EstablishMaterializationLoan,
     ) -> Self {
         Self {
@@ -263,22 +263,22 @@ impl ValidatedMaterializationSource {
     pub(crate) fn shared_facts(&self) -> crate::SharedFactsRequest<'_> {
         self.loan.shared_facts()
     }
-    pub(super) fn request(&self) -> novarocks_worker_protocol::creation::RequestContext {
+    pub(super) fn request(&self) -> novarocks_worker_protocol::creation::RequestReplyTag {
         self.request
     }
     pub(super) fn matches(
         &self,
         runtime: &ActorRuntime<WorkerActor>,
         root: ActorId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         generation: Generation,
-        establishment: ContextEstablishment,
+        establishment: ParticipationEstablishment,
     ) -> bool {
         self.runtime.same_runtime(runtime)
             && self.root == root
             && self.generation == generation
             && self.establishment == establishment
-            && self.shared_facts().context() == context
+            && self.shared_facts().participation() == participation
     }
 }
 impl EstablishMaterializationLoan {
@@ -310,13 +310,13 @@ impl EstablishIngressOwner {
     pub(super) fn belongs_to(&self, ready: &super::control_request::ControlRequestReady) -> bool {
         self.0.notice.belongs_to(ready)
     }
-    pub(super) fn phase(&self) -> ExitRolePhase {
-        self.0.role.phase()
+    pub(super) fn phase(&self) -> ExitCustodyPhase {
+        self.0.exit_custody.phase()
     }
     /// No request has been captured yet. Parent-link/root/report headers are
     /// drawn only from the original RPC's prepaid, fixed child inventory.
     pub(super) fn bootstrap(
-        authority: &mut ExitAuthority,
+        authority: &mut ExitObligation,
         generation: Generation,
         ledger: &RuntimeLedger,
         parent: &ScopeHandle,
@@ -353,7 +353,7 @@ impl EstablishIngressOwner {
             Ok(report) => report,
             Err(error) => {
                 return Err(EstablishIngressBootstrapRefusal {
-                    error: ExitRoleError::Runtime(error),
+                    error: ExitCustodyError::Runtime(error),
                     partial: Some(EstablishIngressPartial {
                         scope,
                         work,
@@ -370,7 +370,7 @@ impl EstablishIngressOwner {
                 std::process::abort();
             }
         };
-        let (role, authority) = ExitRole::from_admitted(reported);
+        let (exit_custody, authority) = ExitCustody::from_admitted(reported);
         let shared = Arc::new(Custody {
             scope,
             work: work_id,
@@ -378,7 +378,7 @@ impl EstablishIngressOwner {
             parent: parent.id(),
             parent_scope: parent.clone(),
             parent_generation: generation,
-            role,
+            exit_custody,
             report,
             state: Mutex::new(SourceState {
                 sources: None,
@@ -398,7 +398,7 @@ impl EstablishIngressOwner {
     }
     pub(super) fn capture(
         &self,
-        request: EstablishQueryContext,
+        request: EstablishParticipation,
         payload: PayloadId,
     ) -> (
         EstablishIngressJob,
@@ -406,7 +406,7 @@ impl EstablishIngressOwner {
     ) {
         // Splitting the owned transport fields invokes no getter or Drop.
         let sources = Sources::new(request, payload);
-        let context = sources.context;
+        let participation = sources.participation;
         // The child owns the getter return; R's report remains its terminal report.
         let (sender, reader) = self
             .0
@@ -424,7 +424,7 @@ impl EstablishIngressOwner {
         (
             EstablishIngressJob {
                 owner: self.clone(),
-                context,
+                participation,
                 authority: Some(authority),
                 sender: Some(sender),
             },
@@ -453,11 +453,11 @@ impl EstablishIngressOwner {
             return None;
         }
         let sources = state.sources.take()?;
-        let context = sources.context;
+        let participation = sources.participation;
         state.disposal_issued = true;
         Some(EstablishDisposalJob {
             owner: self.clone(),
-            context,
+            participation,
             sources: Some(sources),
             active: true,
         })
@@ -489,14 +489,14 @@ impl EstablishIngressOwner {
             sources: Some(state.sources.take()?),
         })
     }
-    pub(super) fn try_close(&self) -> Result<bool, ExitRoleError> {
+    pub(super) fn try_close(&self) -> Result<bool, ExitCustodyError> {
         let mut state = self.0.state.lock().expect("ingress source metadata");
         if state.scope_removed {
             return Ok(true);
         }
         if !matches!(
-            self.0.role.phase(),
-            ExitRolePhase::Exited | ExitRolePhase::Retired
+            self.0.exit_custody.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
         ) {
             return Ok(false);
         }
@@ -504,7 +504,9 @@ impl EstablishIngressOwner {
             self.0.report.consume(source_consumer())?;
             state.consumer_retired = true;
         }
-        if self.0.role.phase() != ExitRolePhase::Retired && !self.0.role.try_retire()? {
+        if self.0.exit_custody.phase() != ExitCustodyPhase::Retired
+            && !self.0.exit_custody.try_retire()?
+        {
             return Ok(false);
         }
         self.0.scope.close_external()?;
@@ -546,7 +548,7 @@ impl QueuedPreparation for EstablishIngressJob {
         (self.owner.0.scope.id(), self.owner.0.work)
     }
     fn fairness_group(&self, _scope: ScopeId) -> super::preparation::HostFairnessGroup {
-        super::preparation::HostFairnessGroup::Context(self.context)
+        super::preparation::HostFairnessGroup::Participation(self.participation)
     }
 }
 impl QueuedPreparation for EstablishDisposalJob {
@@ -554,7 +556,7 @@ impl QueuedPreparation for EstablishDisposalJob {
         (self.owner.0.scope.id(), self.owner.0.work)
     }
     fn fairness_group(&self, _scope: ScopeId) -> super::preparation::HostFairnessGroup {
-        super::preparation::HostFairnessGroup::Context(self.context)
+        super::preparation::HostFairnessGroup::Participation(self.participation)
     }
 }
 impl EstablishIngressJob {
@@ -675,9 +677,9 @@ impl EstablishDisposalJob {
             .expect("one original source cleanup authority");
         // Continue the getter's same child. Only a never-started cancellation
         // or refused getter needs to start its original Cleanup work here.
-        let started = match self.owner.0.role.phase() {
-            ExitRolePhase::Started => true,
-            ExitRolePhase::Admitted => authority.start().is_ok(),
+        let started = match self.owner.0.exit_custody.phase() {
+            ExitCustodyPhase::Started => true,
+            ExitCustodyPhase::Admitted => authority.start().is_ok(),
             _ => false,
         };
         if !started {

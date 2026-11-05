@@ -32,7 +32,7 @@ use std::task::{Context, Poll};
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorOriginalResultScope,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorOriginalResultScope,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTablePreparation, ConnectorTableRequest, ConnectorTableResolution,
     ProviderMetadataCpuPort,
@@ -49,7 +49,7 @@ use novarocks_mv_application::persistence::keyed_documents::{
 };
 use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_spi::connector::document_storage::{
-    ConnectorDocumentStorageLease, KeyedDocumentObservationRequest,
+    ConnectorDocumentStorage, KeyedDocumentObservationRequest,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorPreparedSourceRead, ConnectorReadSourcePreparationRequest,
@@ -65,7 +65,7 @@ enum Request {
     },
     RebuildReadOnly {
         source: IcebergMvCorePorts,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         catalog: novarocks_spi::connector::CatalogHandle,
         target: novarocks_mv_application::product::MvTarget,
         table: ConnectorTableIdentity,
@@ -78,17 +78,17 @@ enum Request {
     },
     ObserveCurrent {
         source: IcebergMvCorePorts,
-        lease: ConnectorDocumentStorageLease,
+        documents: ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
     },
     CloseMismatch {
         source: IcebergMvCorePorts,
-        lease: ConnectorDocumentStorageLease,
+        documents: ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
     },
     Admit {
         source: IcebergMvCorePorts,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         projection: StoredKeyedMvProjection,
         id: novarocks_spi::connector::LakePublicationId,
         context: ConnectorRequestContext,
@@ -102,16 +102,16 @@ enum Request {
     },
 
     Metadata {
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         request: ConnectorTableRequest,
     },
     SourceMetadata {
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         request: ConnectorTableRequest,
     },
     SourceRead {
         source: IcebergMvCorePorts,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         request: ConnectorReadSourcePreparationRequest,
         context: ConnectorRequestContext,
     },
@@ -395,7 +395,7 @@ impl MvRefreshPreparationIo {
                     }
                     Request::RebuildReadOnly {
                         source,
-                        lease,
+                        planning_pin,
                         catalog,
                         target,
                         table,
@@ -406,7 +406,7 @@ impl MvRefreshPreparationIo {
                             .readiness()
                             .in_requests(Arc::clone(&services.requests));
                         Response::RebuildReadOnly(crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_verified_original(
-                            &view,&lease,catalog,target,table,object,context).await.map_err(projection_error))
+                            &view,&planning_pin,catalog,target,table,object,context).await.map_err(projection_error))
                     }
                     Request::LoadReady { source, target } => {
                         let view = source
@@ -418,7 +418,7 @@ impl MvRefreshPreparationIo {
                     }
                     Request::ObserveCurrent {
                         source,
-                        lease,
+                        documents,
                         request,
                     } => {
                         let reader = source
@@ -427,19 +427,21 @@ impl MvRefreshPreparationIo {
                             .candidate_reader();
                         Response::ObserveCurrent(
                             reader
-                                .observe_current_application_async(&lease, request)
+                                .observe_current_application_async(&documents, request)
                                 .await
                                 .map_err(query_error),
                         )
                     }
                     Request::CloseMismatch {
                         source,
-                        lease,
+                        documents,
                         request,
                     } => {
                         let result = match source.management_entrance() {
                             Ok(entrance) => entrance
-                                .close_on_keyed_current_management_mismatch_async(&lease, request)
+                                .close_on_keyed_current_management_mismatch_async(
+                                    &documents, request,
+                                )
                                 .await
                                 .map_err(document_error),
                             Err(error) => Err(contract_error(error)),
@@ -448,7 +450,7 @@ impl MvRefreshPreparationIo {
                     }
                     Request::Admit {
                         source,
-                        lease,
+                        planning_pin,
                         projection,
                         id,
                         context,
@@ -457,7 +459,7 @@ impl MvRefreshPreparationIo {
                             Ok(entrance) => {
                                 crate::mv::domain::staged_create::admit_mv_publication_async_in(
                                     entrance,
-                                    &lease,
+                                    &planning_pin,
                                     &projection,
                                     id,
                                     &context,
@@ -490,15 +492,24 @@ impl MvRefreshPreparationIo {
                         Response::InstallCurrent(result)
                     }
                     request @ (Request::Metadata { .. } | Request::SourceMetadata { .. }) => {
-                        let (lease, request, source_only) = match request {
-                            Request::Metadata { lease, request } => (lease, request, false),
-                            Request::SourceMetadata { lease, request } => (lease, request, true),
+                        let (planning_pin, request, source_only) = match request {
+                            Request::Metadata {
+                                planning_pin,
+                                request,
+                            } => (planning_pin, request, false),
+                            Request::SourceMetadata {
+                                planning_pin,
+                                request,
+                            } => (planning_pin, request, true),
                             _ => unreachable!(),
                         };
                         let mut child = if source_only {
-                            lease.binding().metadata().prepare_source_table(request)
+                            planning_pin
+                                .binding()
+                                .metadata()
+                                .prepare_source_table(request)
                         } else {
-                            lease.binding().metadata().prepare_table(request)
+                            planning_pin.binding().metadata().prepare_table(request)
                         };
                         let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
                         {
@@ -522,7 +533,7 @@ impl MvRefreshPreparationIo {
                     }
                     Request::SourceRead {
                         source,
-                        lease,
+                        planning_pin,
                         request,
                         context,
                     } => {
@@ -553,7 +564,7 @@ impl MvRefreshPreparationIo {
                         let cpu = match services.cpu.planning_metadata_cpu_port(
                             &services.scope,
                             services.window.clone(),
-                            &lease,
+                            &planning_pin,
                             services.cancellation.clone(),
                             services.runtime.clone(),
                             Arc::clone(&services.wake),
@@ -585,7 +596,7 @@ impl MvRefreshPreparationIo {
                         };
                         let control = match source
                             .typed_connector_control()
-                            .typed_read_for_planning_lease(&lease)
+                            .typed_read_for_planning_pin(&planning_pin)
                         {
                             Ok(control) => control,
                             Err(error) => return Response::SourceRead(Err(error)),
@@ -676,7 +687,7 @@ impl MvRefreshPreparationIo {
     pub(crate) async fn rebuild_read_only(
         &self,
         source: &IcebergMvCorePorts,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         catalog: novarocks_spi::connector::CatalogHandle,
         target: novarocks_mv_application::product::MvTarget,
         table: ConnectorTableIdentity,
@@ -686,7 +697,7 @@ impl MvRefreshPreparationIo {
         let Response::RebuildReadOnly(result) = self
             .exchange(Request::RebuildReadOnly {
                 source: source.clone(),
-                lease,
+                planning_pin,
                 catalog,
                 target,
                 table,
@@ -743,13 +754,13 @@ impl MvRefreshPreparationIo {
     pub(crate) async fn observe_current(
         &self,
         source: &IcebergMvCorePorts,
-        lease: &ConnectorDocumentStorageLease,
+        documents: &ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
     ) -> Result<MvKeyedObservedCurrentDocuments, MvApplicationError> {
         let Response::ObserveCurrent(result) = self
             .exchange(Request::ObserveCurrent {
                 source: source.clone(),
-                lease: lease.clone(),
+                documents: documents.clone(),
                 request,
             })
             .await
@@ -761,13 +772,13 @@ impl MvRefreshPreparationIo {
     pub(crate) async fn close_mismatch(
         &self,
         source: &IcebergMvCorePorts,
-        lease: &ConnectorDocumentStorageLease,
+        documents: &ConnectorDocumentStorage,
         request: KeyedDocumentObservationRequest,
     ) -> Result<bool, MvApplicationError> {
         let Response::CloseMismatch(result) = self
             .exchange(Request::CloseMismatch {
                 source: source.clone(),
-                lease: lease.clone(),
+                documents: documents.clone(),
                 request,
             })
             .await
@@ -779,7 +790,7 @@ impl MvRefreshPreparationIo {
     pub(crate) async fn admit(
         &self,
         source: &IcebergMvCorePorts,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         projection: &StoredKeyedMvProjection,
         id: novarocks_spi::connector::LakePublicationId,
         context: &ConnectorRequestContext,
@@ -787,7 +798,7 @@ impl MvRefreshPreparationIo {
         let Response::Admit(result) = self
             .exchange(Request::Admit {
                 source: source.clone(),
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 projection: projection.clone(),
                 id,
                 context: context.clone(),
@@ -836,17 +847,17 @@ impl MvRefreshPreparationIo {
     /// all application projection below execute in the original CPU turn.
     pub(crate) async fn metadata(
         &self,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         context: ConnectorRequestContext,
         namespace: &str,
         table: &str,
         resolution: ConnectorTableResolution,
     ) -> Result<ConnectorTableMetadata, ConnectorError> {
-        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
         context.original_operation_control().check_active()?;
         let request = ConnectorTableRequest {
             table: ConnectorTableIdentity {
-                instance_id: lease.binding().descriptor().instance_id.clone(),
+                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(namespace),
                 table: Arc::from(table),
             },
@@ -855,7 +866,7 @@ impl MvRefreshPreparationIo {
         };
         let Response::MetadataReady = self
             .exchange(Request::Metadata {
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 request,
             })
             .await
@@ -869,7 +880,7 @@ impl MvRefreshPreparationIo {
             .take()
             .expect("original metadata result was received before its child exited")?;
         crate::connector::schema_creation::with_schema_creation(&context, |creation| {
-            lease
+            planning_pin
                 .binding()
                 .metadata()
                 .create_prepared_table(preparation, creation)
@@ -884,16 +895,16 @@ impl MvRefreshPreparationIo {
     pub(crate) async fn source_read(
         &self,
         source: &IcebergMvCorePorts,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         request: ConnectorReadSourcePreparationRequest,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorPreparedSourceRead, MvApplicationError> {
-        let context = crate::connector::context_for_planning_lease_typed(lease, context)
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)
             .map_err(provider_error)?;
         let Response::SourceRead(closed) = self
             .exchange(Request::SourceRead {
                 source: source.clone(),
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 request,
                 context,
             })
@@ -906,16 +917,16 @@ impl MvRefreshPreparationIo {
 
     pub(crate) async fn source_table_metadata(
         &self,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         context: ConnectorRequestContext,
         namespace: &str,
         table: &str,
     ) -> Result<ConnectorTableMetadata, ConnectorError> {
-        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
         context.original_operation_control().check_active()?;
         let request = ConnectorTableRequest {
             table: ConnectorTableIdentity {
-                instance_id: lease.binding().descriptor().instance_id.clone(),
+                instance_id: planning_pin.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(namespace),
                 table: Arc::from(table),
             },
@@ -924,7 +935,7 @@ impl MvRefreshPreparationIo {
         };
         let Response::MetadataReady = self
             .exchange(Request::SourceMetadata {
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 request,
             })
             .await
@@ -938,7 +949,7 @@ impl MvRefreshPreparationIo {
             .take()
             .expect("original metadata result preceded its child exit")?;
         crate::connector::schema_creation::with_schema_creation(&context, |creation| {
-            lease
+            planning_pin
                 .binding()
                 .metadata()
                 .create_prepared_table(preparation, creation)

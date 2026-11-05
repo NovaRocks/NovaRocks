@@ -97,7 +97,7 @@ fn step_restarts_fe(meta: &QueryMeta) -> bool {
             .is_some_and(|fault| fault.fault.requires_inflight_frontend_kill())
 }
 fn step_restarts_be(meta: &QueryMeta) -> Option<usize> {
-    meta.restart_be_after_establish_context_index
+    meta.restart_be_after_establish_participation_index
 }
 /// Checked serial upper budget using the already finite query/retry/helper/startup
 /// contracts. Each transport also consumes this same absolute deadline at runtime.
@@ -330,7 +330,7 @@ impl SqlContext {
 fn mv_parameters(action: &str, target: &MvDocumentDemand) -> Value {
     json!({"action":action,"catalog":target.catalog,"namespace":target.namespace,"mv":target.mv,"level":target.level})
 }
-fn marker_actions(meta: &QueryMeta) -> Vec<&'static str> {
+fn marker_actions(meta: &QueryMeta) -> Result<Vec<&'static str>> {
     let mut actions = Vec::new();
     for marker in meta
         .be_log_contains
@@ -350,35 +350,17 @@ fn marker_actions(meta: &QueryMeta) -> Vec<&'static str> {
                 .map(|fault| &fault.pattern),
         )
     {
-        for (prefix, action) in [
-            ("NOVAROCKS_CONNECTOR_UNIT_READER_", "reader-marker"),
-            ("NOVAROCKS_CONNECTOR_PAGE_SOURCE_", "reader-marker"),
-            ("NOVAROCKS_READER_", "reader-marker"),
-            ("NOVAROCKS_CONNECTOR_WRITER_", "writer-marker"),
-            ("NOVAROCKS_WRITER_", "writer-marker"),
-            ("NOVAROCKS_GRPC_", "grpc-fragment"),
-            ("NOVAROCKS_TASK_CONTEXT_", "grpc-fragment"),
-            ("NOVAROCKS_TASK_CREATE_", "grpc-fragment"),
-            ("NOVAROCKS_TASK_PREPARED_", "grpc-fragment"),
-            ("NOVAROCKS_TASK_LEASE_RENEWED", "grpc-fragment"),
-            ("NOVAROCKS_TASK_SPLIT_", "reader-marker"),
-            ("NOVAROCKS_TASK_ABORT_", "grpc-fragment"),
-            ("NOVAROCKS_TASK_TERMINATION_", "grpc-fragment"),
-            (
-                "NOVAROCKS_CATALOG_MATERIALIZATION",
-                "catalog-materialization",
-            ),
-            ("NOVAROCKS_CATALOG_INSTALL_", "catalog-lifecycle"),
-            ("NOVAROCKS_CATALOG_LOADING", "catalog-lifecycle"),
-            ("NOVAROCKS_CATALOG_LIFECYCLE", "catalog-lifecycle"),
-            ("NOVAROCKS_EXCHANGE_", "exchange-snapshot"),
-        ] {
-            if marker.starts_with(prefix) && !actions.contains(&action) {
+        let registered = crate::parser::parse_observation_marker(marker)?;
+        if let novarocks_failpoint::observation_marker::MarkerActivation::Observation(action) =
+            registered.activation
+        {
+            let action = action.as_str();
+            if !actions.contains(&action) {
                 actions.push(action);
             }
         }
     }
-    actions
+    Ok(actions)
 }
 
 fn observation_attempt_slots(meta: &QueryMeta) -> Result<Vec<Option<u64>>> {
@@ -432,7 +414,10 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
         .any(|step| {
             step.meta
                 .kill_fe_after_mv_known_committed_before_projector_cas
-                || step.meta.restart_be_after_establish_context_index.is_some()
+                || step
+                    .meta
+                    .restart_be_after_establish_participation_index
+                    .is_some()
                 || step.meta.query_lifecycle_fault.is_some()
                 || !step.meta.query_lifecycle_faults.is_empty()
                 || step.meta.query_lifecycle_structured_assertion.is_some()
@@ -445,7 +430,7 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
                     .tags
                     .iter()
                     .any(|tag| tag == crate::parser::MV_DOCUMENT_OBSERVATION_TAG)
-                || !marker_actions(&step.meta).is_empty()
+                || !marker_actions(&step.meta).is_ok_and(|actions| actions.is_empty())
         })
 }
 
@@ -645,8 +630,8 @@ pub(crate) fn build(
                     .into_iter()
                     .map(|fault| (fault.be_index, fault.kind.as_str()))
                     .collect::<Vec<_>>();
-                if let Some(index) = meta.restart_be_after_establish_context_index {
-                    faults.push((index, "restart-after-establish-context"));
+                if let Some(index) = meta.restart_be_after_establish_participation_index {
+                    faults.push((index, "restart-after-establish-participation"));
                 }
                 ensure!(
                     meta.terminal_snapshot_conflict_be_index.is_none(),
@@ -657,7 +642,7 @@ pub(crate) fn build(
                         || (faults.len() == 1 && faults[0].1 == "task-update-terminal-ack-drop"),
                     "task_update_replay_barrier requires exactly one task-update-terminal-ack-drop fault"
                 );
-                let observations = marker_actions(meta);
+                let observations = marker_actions(meta)?;
                 let observation_attempts = observation_attempt_slots(meta)?;
                 ensure!(
                     meta.native_observation_attempts.is_none() || !observations.is_empty(),
@@ -996,7 +981,9 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         for meta in [
             QueryMeta {
-                cancel_query_after_be_log_contains: Some("NOVAROCKS_TASK_CREATE_APPLIED".into()),
+                cancel_query_after_be_log_contains: Some(
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.into(),
+                ),
                 ..Default::default()
             },
             QueryMeta {
@@ -1027,7 +1014,9 @@ mod tests {
             1,
             "SELECT ';' AS value",
             QueryMeta {
-                cancel_query_after_be_log_contains: Some("NOVAROCKS_TASK_CREATE_APPLIED".into()),
+                cancel_query_after_be_log_contains: Some(
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.into(),
+                ),
                 ..Default::default()
             },
         )]);
@@ -1036,7 +1025,9 @@ mod tests {
             1,
             "SELECT 1; SELECT 2",
             QueryMeta {
-                be_log_contains: vec!["NOVAROCKS_TASK_CREATE_APPLIED".into()],
+                be_log_contains: vec![
+                    novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.into(),
+                ],
                 ..Default::default()
             },
         )]);
@@ -1051,8 +1042,8 @@ mod tests {
             "SELECT 1",
             QueryMeta {
                 be_log_contains: vec![
-                    "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED".into(),
-                    "NOVAROCKS_TASK_SPLIT_NO_MORE".into(),
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED.into(),
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE.into(),
                 ],
                 ..Default::default()
             },
@@ -1102,7 +1093,9 @@ mod tests {
             QueryMeta {
                 kill_be_index: Some(0),
                 restart_be_delay_ms: Some(0),
-                be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".into()],
+                be_log_not_contains: vec![
+                    novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED.into(),
+                ],
                 ..Default::default()
             },
         )]);
@@ -1192,7 +1185,10 @@ mod tests {
                         number,
                         "SELECT 1",
                         QueryMeta {
-                            be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".into()],
+                            be_log_not_contains: vec![
+                                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
+                                    .into(),
+                            ],
                             ..Default::default()
                         },
                     )
@@ -1328,7 +1324,7 @@ mod tests {
                             .insert(submission.run_token.as_str(), backend_generations);
                     }
                 }
-                if let Some(index) = source.meta.restart_be_after_establish_context_index {
+                if let Some(index) = source.meta.restart_be_after_establish_participation_index {
                     backend_generations[index] += 1;
                 }
             }
@@ -1432,7 +1428,9 @@ mod tests {
             7,
             sql,
             QueryMeta {
-                be_log_contains: vec!["NOVAROCKS_GRPC_FETCH_TYPED".into()],
+                be_log_contains: vec![
+                    novarocks_failpoint::observation_marker::GRPC_FETCH_TYPED.into(),
+                ],
                 retry_count: Some(2),
                 ..Default::default()
             },
@@ -1466,7 +1464,7 @@ mod tests {
             };
             for attempt in [None, Some(1), Some(2)] {
                 let (bind, observe) = native_observation_grants(
-                    "grpc-fragment",
+                    "task-protocol",
                     root,
                     index,
                     "selected-submission",
@@ -1487,8 +1485,8 @@ mod tests {
                     bind["target_process_receipt"],
                     json!(target.process_receipt)
                 );
-                assert_eq!(bind["action"], "bind-grpc-fragment");
-                assert_eq!(observe["action"], "grpc-fragment");
+                assert_eq!(bind["action"], "bind-task-protocol");
+                assert_eq!(observe["action"], "task-protocol");
                 assert_eq!(observe["max_events"], 16384);
             }
         }
@@ -1503,7 +1501,7 @@ mod tests {
             QueryMeta {
                 kill_be_after_be_log_contains: Some(KillBeAfterBeLogDirective {
                     be_index: 1,
-                    pattern: "NOVAROCKS_TASK_CREATE_APPLIED".into(),
+                    pattern: novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.into(),
                 }),
                 native_observation_attempts: Some(vec![1, 2]),
                 ..Default::default()
@@ -1614,7 +1612,7 @@ mod tests {
                 kill_be_index: Some(1),
                 restart_be_delay_ms: Some(0),
                 restart_fe_after_step: true,
-                restart_be_after_establish_context_index: Some(1),
+                restart_be_after_establish_participation_index: Some(1),
                 ..Default::default()
             },
         )]);
@@ -1651,5 +1649,33 @@ mod tests {
             }
         }
         assert_eq!(all_references.len(), 6);
+    }
+}
+
+#[cfg(test)]
+mod observation_marker_tests {
+    use super::*;
+    use novarocks_failpoint::observation_marker::{
+        PARTICIPATION_RELEASE_APPLIED, TASK_TERMINAL_RETAINED,
+    };
+
+    #[test]
+    fn registered_release_and_terminal_markers_enable_task_observation() {
+        for marker in [PARTICIPATION_RELEASE_APPLIED, TASK_TERMINAL_RETAINED] {
+            let meta = QueryMeta {
+                be_log_not_contains: vec![marker.into()],
+                ..QueryMeta::default()
+            };
+            assert_eq!(marker_actions(&meta).unwrap(), vec!["task-protocol"]);
+        }
+    }
+
+    #[test]
+    fn invalid_programmatic_marker_cannot_silently_disable_observation() {
+        let meta = QueryMeta {
+            be_log_not_contains: vec!["NOVAROCKS_UNKNOWN".into()],
+            ..QueryMeta::default()
+        };
+        assert!(marker_actions(&meta).is_err());
     }
 }
