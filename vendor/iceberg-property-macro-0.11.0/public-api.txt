@@ -1,3 +1,0 @@
-pub mod iceberg_property_macro
-pub proc macro iceberg_property_macro::#[derive(Properties)]
-pub proc macro iceberg_property_macro::properties_view!()

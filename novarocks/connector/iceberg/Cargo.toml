@@ -74,7 +74,7 @@ novarocks-type-contract.workspace = true
 [dev-dependencies]
 novarocks-cluster-harness.workspace = true
 novarocks-test-support.workspace = true
-iceberg-catalog-rest = { path = "../../../vendor/iceberg-catalog-rest-0.11.0" }
+iceberg-catalog-rest = "0.11.0"
 faststr = "0.2"
 hive_metastore = "0.2"
 tempfile.workspace = true

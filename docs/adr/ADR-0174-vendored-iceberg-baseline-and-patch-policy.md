@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0215
+    scope: "Official release provenance, macro registry exit and the four-path-package advisory compromise"
+    link: "ADR-0215-released-iceberg-package-provenance.md"
   - id: ADR-0204
     scope: "Ruling 2 protocol-only divergence: additionally allow bounded exact upstream Iceberg dependency backports with provenance and exit conditions"
     link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"

@@ -783,6 +783,96 @@ async fn statistics(attempt: &IcebergCommitAttempt, snapshot: &Snapshot) -> Stat
     .unwrap()
 }
 
+async fn probe_writer_sizes(java: &Java, metadata: &TableMetadata) {
+    // This operation is never frozen or dispatched. Its test-only objects cannot
+    // become publication references, and only its own ledger authorizes cleanup.
+    let operation = java.operation(metadata);
+    let attempt = operation.begin_attempt().unwrap();
+    let mut objects = Vec::new();
+    let observed: Result<Vec<Value>> = async {
+        let cases = [
+            ("empty", vec![]),
+            ("single", vec![Bytes::from_static(b"single-write")]),
+            (
+                "multiple",
+                vec![Bytes::from_static(b"first-"), Bytes::from_static(b"second")],
+            ),
+        ];
+        let mut observations = Vec::new();
+        for (label, chunks) in cases {
+            let object = attempt.allocate(ArtifactClass::Attempt, ArtifactKind::Metadata)?;
+            assert_original_storage(object.path());
+            objects.push(object.clone());
+            let mut writer = attempt.file_io().new_output(object.path())?.writer().await?;
+            let mut expected = Vec::new();
+            for chunk in chunks {
+                expected.extend_from_slice(&chunk);
+                writer.write(chunk).await?;
+            }
+            let closed = writer.close().await?;
+            drop(writer);
+            let input = attempt.file_io().new_input(object.path())?;
+            let stored = input.metadata().await?;
+            let actual = input.read().await?;
+            let expected_size = u64::try_from(expected.len())
+                .map_err(|e| error(format!("Probe input length is not representable: {e}")))?;
+            if closed.size != expected_size
+                || stored.size != expected_size
+                || actual.as_ref() != expected.as_slice()
+            {
+                return Err(error(format!(
+                    "MinIO writer size differs for {label}: expected={expected_size}, close={}, stat={}, read={}",
+                    closed.size, stored.size, actual.len()
+                )));
+            }
+            observations.push(json!({
+                "case": label,
+                "path": object.path(),
+                "expected-size": expected_size,
+                "close-size": closed.size,
+                "stat-size": stored.size,
+                "read-size": actual.len(),
+            }));
+        }
+        let artifacts = operation.artifacts()?;
+        if artifacts.len() != 3
+            || artifacts.iter().any(|record| record.write_state != ArtifactWriteState::Written)
+        {
+            return Err(error("MinIO probes must retain all three completed objects in their original ledger"));
+        }
+        Ok(observations)
+    }
+    .await;
+    // Every writer above has actually exited before the original operation
+    // cleans its never-published objects, including after a probe I/O failure.
+    drop(attempt);
+    let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+    java.record(
+        "writer-size-probes",
+        &json!({
+            "operation": operation.token().path_component(),
+            "observed": observed.as_ref().ok(),
+            "error": observed.as_ref().err().map(ToString::to_string),
+            "cleanup": format!("{cleanup:?}"),
+        }),
+    );
+    let _ = observed.unwrap();
+    assert_eq!(cleanup, IcebergCleanupReport::Complete { deleted: 3 });
+    assert!(operation.artifacts().unwrap().is_empty());
+    let independent_io =
+        crate::fs_io::build_file_io_for_location(metadata.location(), java.binding.clone());
+    for object in objects {
+        assert!(
+            !independent_io
+                .new_input(object.path())
+                .unwrap()
+                .exists()
+                .await
+                .unwrap()
+        );
+    }
+}
+
 async fn physical(
     java: &Java,
     label: &str,
@@ -795,14 +885,30 @@ async fn physical(
         .await
         .unwrap();
     let mut raw = Vec::new();
+    let mut lengths = Vec::new();
     for manifest in list.entries() {
-        let bytes = attempt
+        let input = attempt
             .file_io()
             .new_input(&manifest.manifest_path)
-            .unwrap()
-            .read()
-            .await
             .unwrap();
+        let stored = input.metadata().await.unwrap();
+        let bytes = input.read().await.unwrap();
+        let recorded = u64::try_from(manifest.manifest_length).unwrap();
+        assert_eq!(
+            recorded, stored.size,
+            "Manifest length must match MinIO stat"
+        );
+        assert_eq!(
+            recorded,
+            u64::try_from(bytes.len()).unwrap(),
+            "Manifest length must match actual bytes"
+        );
+        lengths.push(json!({
+            "path": manifest.manifest_path,
+            "manifest-length": recorded,
+            "stat-size": stored.size,
+            "read-size": bytes.len(),
+        }));
         for entry in Manifest::parse_avro(&bytes).unwrap().entries() {
             raw.push((manifest.clone(), entry.as_ref().clone()));
         }
@@ -810,6 +916,7 @@ async fn physical(
     java.record(
         label,
         &json!({
+            "manifest-sizes": lengths,
             "snapshot": {
                 "snapshot-id": snapshot.snapshot_id(),
                 "parent-snapshot-id": snapshot.parent_snapshot_id(),
@@ -857,6 +964,7 @@ async fn physical(
 async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
     let java = Java::new("shapes").await;
     let staged = java.create("created", true).await;
+    probe_writer_sizes(&java, &staged.metadata).await;
     let operation = java.operation(&staged.metadata);
     let file = java.data(&operation, &staged.metadata, &[10, 11]).await;
     let create = intent(

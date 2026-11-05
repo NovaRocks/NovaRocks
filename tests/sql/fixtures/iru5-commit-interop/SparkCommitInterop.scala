@@ -39,7 +39,19 @@ object Iru5SparkCommitInterop {
     require(IcebergBuild.version() == "1.11.0", "The fixture oracle requires pinned Iceberg 1.11.0")
     val t = Spark3Util.loadIcebergTable(spark, qualified)
     t.refresh()
+    Option(t.currentSnapshot()).foreach(snapshot => assertManifestLengths(t, snapshot))
     t
+  }
+
+  def assertManifestLengths(t: Table, snapshot: Snapshot): Unit = {
+    // allManifests includes delete manifests; FileIO obtains storage length
+    // independently before Java scan planning or Spark row reads consume them.
+    snapshot.allManifests(t.io()).asScala.foreach { manifest =>
+      val actual = t.io().newInputFile(manifest.path()).getLength()
+      require(manifest.length() == actual,
+        "Manifest length differs from storage: path=" + manifest.path() +
+          " recorded=" + manifest.length() + " actual=" + actual)
+    }
   }
 
   def metadata(t: Table): TableMetadata =
@@ -62,6 +74,7 @@ object Iru5SparkCommitInterop {
   }
 
   def dvs(t: Table, snapshot: Snapshot): Set[Dv] = {
+    assertManifestLengths(t, snapshot)
     val tasks = t.newScan().useSnapshot(snapshot.snapshotId()).planFiles()
     try tasks.asScala.toVector.flatMap(_.deletes().asScala).map { d =>
       require(d.format() == FileFormat.PUFFIN && d.contentOffset() != null &&
@@ -156,6 +169,7 @@ object Iru5SparkCommitInterop {
     val t = table(spark, qualified)
     val snapshot = t.currentSnapshot()
     val parent = t.snapshot(snapshot.parentId())
+    assertManifestLengths(t, parent)
     val prior = lineage(spark, qualified, Some(parent.snapshotId())).map(r => r.id -> r).toMap
     val now = lineage(spark, qualified)
     val changed = phase match {

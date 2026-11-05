@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "859048563bc71a3167d0545cb66756d26c64e4ca"
+    "sha1": "20eb0feddac8f40bb9e9108a0744b7f356d69480"
   },
   "path_in_vcs": "crates/catalog/hms"
 }

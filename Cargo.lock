@@ -2577,6 +2577,8 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6adef6989310849467f1d8fdccf4bdb78c736db7c06d302a3b1663a32236373b"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2596,6 +2598,8 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6de7eea6577fed2290867f7604483e3649297514b873cdac108e0cc7f783c9e1"
 dependencies = [
  "proc-macro2",
  "quote",

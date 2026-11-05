@@ -26,7 +26,7 @@ code-anchors:
   - "novarocks/fs/src/list_body_limit.rs (ListBodyLimitFetch)"
   - "novarocks/connector/iceberg/src/metadata.rs (frozen_copy_on_write_source_payload)"
   - "vendor/iceberg-0.11.0/src/spec/table_metadata.rs (TableMetadata::serialize)"
-  - "vendor/iceberg-catalog-rest-0.11.0/PATCH.md (single-page REST protocol extension and upstream exit)"
+  - "novarocks/connector/iceberg/src/rest_protocol/mod.rs (Connector-owned REST request vocabulary)"
 ---
 
 ## 问题

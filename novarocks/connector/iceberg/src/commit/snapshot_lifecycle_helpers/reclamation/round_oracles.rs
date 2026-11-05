@@ -423,7 +423,17 @@ impl Fixture {
         let root = url::Url::from_directory_path(std::fs::canonicalize(dir.path()).unwrap())
             .unwrap()
             .to_string();
+        let handle = tokio::runtime::Handle::current();
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
         let original_io = FileIO::new_with_fs();
+        // Retired manifests use the production writer's close metadata. Keep
+        // the original SDK FileIO for the read/delete and missing-path oracles.
+        let writer_io = crate::fs_io::build_file_io_for_location(&root, binding.clone());
         let clock = Arc::new(ManualClock::new());
         let events = Arc::new(Events {
             clock,
@@ -449,7 +459,7 @@ impl Fixture {
         let mut manifests = Vec::new();
         for group in 0..groups {
             let mut writer = ManifestWriterBuilder::new(
-                original_io
+                writer_io
                     .new_output(format!("{root}retired-{group}.avro"))
                     .unwrap(),
                 Some(1),
@@ -483,7 +493,17 @@ impl Fixture {
                     )
                     .unwrap();
             }
-            manifests.push(writer.write_manifest_file().await.unwrap());
+            let manifest = writer.write_manifest_file().await.unwrap();
+            let path = dir.path().join(format!("retired-{group}.avro"));
+            let stored = std::fs::metadata(&path).unwrap().len();
+            let actual = std::fs::read(&path).unwrap();
+            assert!(
+                stored > 0,
+                "Retired manifest must contain actual Avro bytes"
+            );
+            assert_eq!(u64::try_from(manifest.manifest_length).unwrap(), stored);
+            assert_eq!(stored, u64::try_from(actual.len()).unwrap());
+            manifests.push(manifest);
         }
         let retired_list = format!("{root}retired-list.avro");
         let mut list = ManifestListWriter::v2(
@@ -616,13 +636,6 @@ impl Fixture {
                     }
                 }),
         );
-        let handle = tokio::runtime::Handle::current();
-        let binding = IcebergReadBinding::new(
-            None,
-            novarocks_fs::FsAccessResolver::new(),
-            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
-        );
         let configuration = crate::catalog_config::parse_catalog_configuration(
             "gc",
             &[
@@ -739,7 +752,10 @@ async fn real_round_revalidates_after_scan_and_stat_wait_and_each_delete_is_with
     let f = Fixture::new(false, 11, 11, 4, 0, Duration::ZERO).await;
     let (result, cache, report) = f.run().await;
     result.unwrap();
+    assert_eq!(report.candidates, 6);
     assert_eq!(report.deleted, 6);
+    assert_eq!(report.delete_requests, 6);
+    assert_eq!(report.failed, 0);
     assert_eq!(report.pending, 0);
     let log = f.events.log.lock().unwrap().clone();
     let mut request = 0;
@@ -767,8 +783,25 @@ async fn real_round_revalidates_after_scan_and_stat_wait_and_each_delete_is_with
     assert_eq!(cache.manifest_reads, 1);
     assert_eq!(cache.list_reads, 2);
     assert_eq!(f.events.count("READ_HEAD"), 0);
+    assert!(
+        log.iter()
+            .any(|e| e.kind == "STAT" && e.path == "retired-0.avro")
+    );
+    assert!(
+        log.iter()
+            .any(|e| e.kind == "DELETE" && e.path == "retired-0.avro")
+    );
     for p in &f.data {
         assert!(!f.storage.io.new_input(p).unwrap().exists().await.unwrap());
+    }
+    // Independent filesystem stats confirm all six acknowledged deletes,
+    // beyond the report and event projection.
+    for location in f.data.iter().chain([&f.retired_manifest, &f.retired_list]) {
+        let path = url::Url::parse(location).unwrap().to_file_path().unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

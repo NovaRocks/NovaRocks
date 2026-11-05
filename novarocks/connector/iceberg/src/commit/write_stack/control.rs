@@ -4504,7 +4504,7 @@ mod eager_attempt_io_tests {
             Ok(())
         }
 
-        async fn close(&mut self) -> crate::iceberg::Result<()> {
+        async fn close(&mut self) -> crate::iceberg::Result<crate::iceberg::io::FileMetadata> {
             self.inner.close().await
         }
     }

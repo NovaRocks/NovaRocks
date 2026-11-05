@@ -880,7 +880,8 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 
 ### 8.3 Code Quality
 
-- `cargo fmt`
+- `python3 tools/ci/fmt-workspace.py --check`；开发时去掉 `--check` 执行格式化。开发与 CI 共用此入口：从 `cargo metadata --locked --no-deps` 的 `workspace_members` 读取第一方包，再显式传给 `cargo fmt --package`。
+- 禁止 `cargo fmt --all` 和直接对 `vendor/` 运行 rustfmt，也不得格式化 vendor 后把差异当成本地补丁。`--all` 会递归选择本地 path 依赖；第一方代码通过 `#[path]` 引用 vendor 源码时，必须在第一方模块声明上加 `#[rustfmt::skip]` 阻止递归，不能向 vendor 加格式化专用补丁。
 - `cargo clippy --workspace --all-targets -- -D warnings`（CI 严格 Clippy 阶段；CI wrapper 另固定 `--profile dev --locked --target-dir target`）
 - `cargo build`
 - 全局基线只放宽 Databend 与 RisingWave 共同放宽的项：`Cargo.toml` 的 `[workspace.lints.clippy] result_large_err = "allow"`，根 `clippy.toml` 的 `too-many-arguments-threshold = 10`；`large_enum_variant` 与 `type_complexity` 保持默认。新增局部例外使用带理由的 `#[expect(lint, reason = "...")]`，不新增 `#[allow]`。升级 `rust-toolchain.toml` 时，负责修复新诊断，或按相同对齐规则调整并写明理由。

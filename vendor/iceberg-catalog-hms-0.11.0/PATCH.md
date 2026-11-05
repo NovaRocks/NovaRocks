@@ -1,30 +1,28 @@
-# NovaRocks patches over apache/iceberg-rust 0.11.0-rc.2
+# NovaRocks patches over apache/iceberg-rust 0.11.0
 
-Upstream tag: `v0.11.0-rc.2`
-Upstream commit: `859048563bc71a3167d0545cb66756d26c64e4ca`
+Upstream tag: `v0.11.0`
+Upstream commit: `20eb0feddac8f40bb9e9108a0744b7f356d69480`
 Upstream repository: https://github.com/apache/iceberg-rust
-Normalized package: `iceberg-catalog-hms-0.11.0.crate`
-Package SHA-256: `d934fc971b51044affb2b183a19f4fefcddaa513deb3350af6b361d6970010c0`
+Registry package: `iceberg-catalog-hms-0.11.0.crate`
+Registry SHA-256: `b377f757ed01d7e08bd4dfc0dfdfecaf00d50576b8942c205a6565ac1b2df172`
 
-Generation command (Rust/Cargo 1.98.1, from the verified upstream checkout):
+The original registry archive was checked against the index/API checksum and
+its VCS commit/path. Source differences were checked against the rc.2-to-release
+upstream changes; normalized manifests and package-generated files were checked
+separately. The original archive was not regenerated from Git.
 
-```sh
-cargo +1.98.1 package --no-verify --exclude-lockfile --offline \
-  -p iceberg-property-macro -p iceberg -p iceberg-catalog-rest -p iceberg-catalog-hms
-```
-
-`--exclude-lockfile` avoids resolving unrelated unpublished/workspace development
-dependencies while preserving Cargo's normalized manifest and original published
-source files. Each extracted file was compared byte-for-byte with this package.
-The initial source commit is unmodified except for this inventory.
+The published Cargo.lock, Cargo.toml.orig and license inventory retain their
+release bytes. Standalone checks use a candidate source copy and a separate
+validation lock; the root workspace alone owns the production dependency lock.
+Do not format vendor sources. Design: ADR-0215
+(docs/adr/ADR-0215-released-iceberg-package-provenance.md).
 
 ## Dependency policy
 
 Retain upstream registry dependency versions and lints. The root
-`[patch.crates-io]` selects `iceberg`, `iceberg-catalog-hms` and
-`iceberg-property-macro` at version `0.11.0`; the macro has no source patches.
-The unpatched REST SDK is a connector dev-only path dependency, outside the
-production normal/build dependency closures. Do not vendor runtime/network/Arrow
+`[patch.crates-io]` selects `iceberg` and `iceberg-catalog-hms` at version `0.11.0`.
+The unmodified property macro and dev-only REST SDK use crates.io; the REST SDK
+is outside production normal/build dependency closures. Do not vendor runtime/network/Arrow
 crates or add resource accounting hooks. Only the approved protocol/API patch
 inventory may diverge.
 
@@ -43,7 +41,7 @@ inventory may diverge.
   `TableNotFound`; other declared Thrift exceptions and transport failures retain
   `Unexpected`. The upstream runtime/KMS table construction is unchanged.
 - Files: `src/catalog.rs` (`HmsCatalog::load_table`).
-- Upstream status: no PR/issue tracked. rc.2 still classifies this load error as
+- Upstream status: no PR/issue tracked. 0.11.0 still classifies this load error as
   `Unexpected`; `get_namespace`'s corresponding namespace mapping is already
   upstream and has no local patch.
 - Production dependency/owner: NovaRocks Iceberg connector's HMS catalog control
@@ -66,11 +64,11 @@ inventory may diverge.
   is `iceberg` ignoring ASCII case, validate the entire returned batch before
   projection, and omit entities that disappeared after the initial name list.
   This is an RPC item-count bound; it does not claim allocation or response-byte
-  accounting. rc.2's namespace-existence precheck remains in place.
+  accounting. 0.11.0's namespace-existence precheck remains in place.
 - Files: `src/catalog.rs` (`HmsCatalog::list_tables`), `src/lib.rs`,
   `src/table_projection.rs` (copied unchanged from the 0.9 vendor).
 - Upstream status: no upstream PR/issue tracked; NovaRocks M07 PR #1173 introduced
-  this classification. rc.2's `get_all_tables` still returns unclassified names.
+  this classification. 0.11.0's `get_all_tables` still returns unclassified names.
 - Production dependency/owner: NovaRocks Iceberg connector's catalog listing
   contract; Iceberg connector/MEM-1 maintainers own classification and listing
   admission. No metadata-file loads, retries, client owners, view capability,
