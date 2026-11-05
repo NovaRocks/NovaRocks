@@ -370,13 +370,13 @@ mod tests {
     ///
     /// The owner classifies reads purely by `iceberg::ErrorKind`; the
     /// message-sniffing fallback that used to recognize a missing table from
-    /// wording like "does not exist" is gone. That only works if every backend
-    /// tags absence honestly, and two of them did not: the vendored REST client
-    /// reported a 404 as the generic `Unexpected`, and the vendored HMS client
-    /// funnelled `NoSuchObjectException` into it. Both are patched. This pins
-    /// the contract for the backend that can be exercised in-process, so a
-    /// regression shows up as a failing test rather than as `IF EXISTS`
-    /// reporting an unavailable control plane.
+    /// wording like "does not exist" is gone. This pins the contract for the
+    /// backend that can be exercised in-process, so a regression shows up as a
+    /// failing test rather than as `IF EXISTS` reporting an unavailable control
+    /// plane. The read-only HMS entry is the accepted exception for loads: the
+    /// upstream HMS catalog reports `NoSuchObjectException` as `Unexpected`, so
+    /// a missing HMS table is reported as unavailable (ADR-0216). HMS existence
+    /// checks use `table_exists`, which the upstream catalog maps precisely.
     #[tokio::test]
     async fn absence_is_reported_as_not_found_rather_than_unavailable() {
         let warehouse = tempfile::tempdir().expect("warehouse");

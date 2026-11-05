@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0216
+    scope: "HMS H3 and H4 retention rows and their deletion conditions: both patches exit with the vendored HMS package, and the HMS consumer accepts read fallbacks instead of delivering an equivalent seam"
+    link: "ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md"
   - id: ADR-0215
     scope: "Official release provenance, macro registry exit and the four-path-package advisory compromise"
     link: "ADR-0215-released-iceberg-package-provenance.md"
@@ -50,7 +53,7 @@ NovaRocks 的 Iceberg Connector 使用 SDK 的元数据、格式与 catalog 接�
 |---|---|---|
 | [iceberg](../../vendor/iceberg-0.11.0/PATCH.md) | `83bd584247a59b6ce2d2f6ce08188640977568aff9b7240c4a5e45a1c6214142` | 元数据/API 协议接缝 |
 | [iceberg-catalog-rest](../../vendor/iceberg-catalog-rest-0.11.0/PATCH.md) | `fde7674c80f19dc54ae2b0b3fb95f0715a4407df615fa63fe42801bc3ec2d2d4` | 单页列举、view、stage/commit、委派与脱敏 |
-| [iceberg-catalog-hms](../../vendor/iceberg-catalog-hms-0.11.0/PATCH.md) | `d934fc971b51044affb2b183a19f4fefcddaa513deb3350af6b361d6970010c0` | 缺表类型与实体列表分类 |
+| iceberg-catalog-hms | `d934fc971b51044affb2b183a19f4fefcddaa513deb3350af6b361d6970010c0` | 缺表类型与实体列表分类 |
 | [iceberg-property-macro](../../vendor/iceberg-property-macro-0.11.0/PATCH.md) | `23215cd7fcefd7d7c02f2590052cf1dc5311f7867b2e626d8b7b0b77692e4dd3` | 无源码补丁；与 core 同版本的构建依赖 |
 
 生成命令在已核对的上游 checkout 中执行：

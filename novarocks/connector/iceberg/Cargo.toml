@@ -75,8 +75,6 @@ novarocks-type-contract.workspace = true
 novarocks-cluster-harness.workspace = true
 novarocks-test-support.workspace = true
 iceberg-catalog-rest = "0.11.0"
-faststr = "0.2"
-hive_metastore = "0.2"
 tempfile.workspace = true
 
 [build-dependencies]
@@ -107,9 +105,6 @@ ignored = [
 
 [package.metadata.cargo-machete]
 ignored = [
-    # The test module includes the vendored HMS table_projection.rs via #[path].
-    "faststr",
-    "hive_metastore",
     # build.rs generates the private Iceberg connector protobuf DTOs.
     "prost-build",
     # build.rs locates protoc for Iceberg connector DTO generation.

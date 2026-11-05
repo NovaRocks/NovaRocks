@@ -33,11 +33,14 @@ use super::{CatalogNamespaceName, CatalogTableName, NovaRocksCatalog};
 ///
 /// HMS is a permanently read-only compatibility entry. Every mutation and
 /// transaction constructor uses the same local refusal rule before catalog or
-/// filesystem effects. Read operations retain the vendored HMS compatibility.
+/// filesystem effects. Reads use the unmodified upstream HMS catalog and accept
+/// its behavior: a missing table is reported as unavailable, listings return
+/// every name in the metastore database, and metadata reads use the catalog's
+/// own FileIO rather than the request's.
+// Design: ADR-0216 (docs/adr/ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md)
 #[derive(Debug)]
 pub(super) struct NovaRocksHiveCatalog {
     delegate: CatalogDelegate,
-    client: Arc<crate::iceberg_catalog_hms::HmsCatalog>,
     selected: novarocks_spi::connector::ThriftServiceOrigin,
 }
 
@@ -72,8 +75,7 @@ impl NovaRocksHiveCatalog {
         selected: novarocks_spi::connector::ThriftServiceOrigin,
     ) -> Self {
         Self {
-            delegate: CatalogDelegate::new(client.clone()),
-            client,
+            delegate: CatalogDelegate::new(client),
             selected,
         }
     }
@@ -324,19 +326,16 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 self.selected.clone(),
             ))
             .await?;
-        let ident = super::delegate::table_ident(&table)?;
-        // Same Thrift owner; only the metadata FileIO borrows this exact
-        // request's original FS/vended gate instead of the generation's view.
-        let io = crate::fs_io::build_file_io_for_location("", binding);
-        let table = self
-            .client
-            .load_table_with_file_io(&ident, &io)
-            .await
-            .map_err(|e| super::error::map_read_error(&e))?;
-        Ok(crate::loaded_table::IcebergLoadedTable::new(
-            table,
-            crate::loaded_table::IcebergAccessDelegation::static_binding(),
-        ))
+        // The Thrift call stays admitted for this request. The upstream catalog
+        // reads metadata through its own catalog-level FileIO, so these reads
+        // are outside the request's storage admission and accounting; this is
+        // an accepted fallback of the read-only HMS entry (ADR-0216).
+        self.delegate.load_table(&table).await.map(|table| {
+            crate::loaded_table::IcebergLoadedTable::new(
+                table,
+                crate::loaded_table::IcebergAccessDelegation::static_binding(),
+            )
+        })
     }
     async fn load_table(
         &self,
