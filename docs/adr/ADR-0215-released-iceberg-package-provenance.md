@@ -5,6 +5,10 @@ domain: [crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0216
+    scope: "HMS as a retained vendored package with registered divergences: HMS uses the unmodified registry release, and core is the only retained Iceberg vendor package"
+    link: "ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md"
 partially-supersedes:
   - id: ADR-0174
     scope: "Official release provenance and generation method; property macro retention/allowlist; four-path-package advisory compromise"
@@ -15,7 +19,6 @@ provenance:
 code-anchors:
   - "Cargo.toml ([patch.crates-io])"
   - "vendor/iceberg-0.11.0/PATCH.md"
-  - "vendor/iceberg-catalog-hms-0.11.0/PATCH.md"
 ---
 
 ## 问题

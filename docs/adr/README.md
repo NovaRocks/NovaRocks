@@ -150,6 +150,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor）
 - [ADR-0214](ADR-0214-iceberg-schema-depth-by-decoder-owner.md) — Iceberg schema 为何按解码作者区分逻辑深度、文法物理深度与 SDK manifest 能力边界，并在 DDL 发布前和实际 manifest 解码前准确拒绝（active；部分替代 ADR-0213 的经验深度推导，运行验证状态独立核对）
 - [ADR-0213](ADR-0213-iceberg-read-interpretation-and-current-write-authority.md) — Iceberg 读取为何先选 Parquet 解释政策、分开原始与解释缓存，并把历史只读事实与当前写权限分离（active；经验物理深度推导由 ADR-0214 部分替代，读取政策与 Current/Historical 责任保留，运行验证状态独立核对）
 - [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
@@ -510,7 +511,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### crate-boundary
 
-- [ADR-0215](ADR-0215-released-iceberg-package-provenance.md) — Iceberg 正式发布为何以 registry 原包为来源、无分歧包退出 vendor，并分离发布与验证 lock（active；部分替代 ADR-0174 来源、macro 保留与四 path 妥协）
+- [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor）
+- [ADR-0215](ADR-0215-released-iceberg-package-provenance.md) — Iceberg 正式发布为何以 registry 原包为来源、无分歧包退出 vendor，并分离发布与验证 lock（active；部分替代 ADR-0174 来源、macro 保留与四 path 妥协；HMS 继续 vendor 的部分由 ADR-0216 部分替代，core 的保留规则仍有效）
 
 领域哲学：crate 结构表达依赖事实，编译器拒绝未声明的 crate 使用；哪些边可以新增、optional/feature/target 与传递能力是否符合 owner 边界，由 review 判断。CI 保留供应链与通用 lint，不增加依赖边界、源码形状或产品前提检查。迁移期临时检查随迁移完成一并删除。
 
@@ -535,7 +537,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active；版本/checksum 字面值规则由 ADR-0168 替换；永久图/lockfile 守卫与第 5 道结构性 benchmark 验收门由 ADR-0190 部分替代；精确正式版锁定、最小 feature 由 review 维持，格式所有权与第 1–4 道门保留；第 5 道门按当前阶段政策不作为验收门，恢复性能工作时重评）
 - ADR-0168 — CI 依赖守卫为何从 Cargo 权威派生版本与 checksum、同时保护来源身份和封闭依赖面（active；部分替代 ADR-0150；身份与测试权威守卫规则由 ADR-0190 部分替代，版本仅由根 manifest 与 Cargo.lock 表达的规则保留）
 - ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，Paimon 暂停期间的 allowlist 由 ADR-0204 部分替代，其余规则保留）
-- [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170；REST crate 补丁清单、裁决 4 的临时结果收窄与 SDK 认证妥协由 ADR-0175 部分替代，core U2/P8/View API 保留项由 ADR-0176 部分替代，U8 与 Variant 读取暂缓由 ADR-0178 部分替代，P2 退出和 U4 交接由 ADR-0179 部分替代，仅协议分歧限制由 ADR-0204 部分替代以允许有界上游依赖移植，基线可重建与其余 core 补丁的消费方退出仍有效）；正式发布来源、macro 保留与四 path 妥协由 ADR-0215 部分替代
+- [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170；REST crate 补丁清单、裁决 4 的临时结果收窄与 SDK 认证妥协由 ADR-0175 部分替代，core U2/P8/View API 保留项由 ADR-0176 部分替代，U8 与 Variant 读取暂缓由 ADR-0178 部分替代，P2 退出和 U4 交接由 ADR-0179 部分替代，仅协议分歧限制由 ADR-0204 部分替代以允许有界上游依赖移植，基线可重建与其余 core 补丁的消费方退出仍有效）；正式发布来源、macro 保留与四 path 妥协由 ADR-0215 部分替代；HMS H3/H4 保留行及其删除条件由 ADR-0216 部分替代
 - [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
 - [ADR-0176](ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md) — Iceberg REST 请求词汇为何归连接器、`add-schema` 为何不带 `last-column-id`（支持下限为 Iceberg Java 1.9 语义），view 替换为何总是新增带操作身份的版本并以 `-1` 选择、语义校验为何在派发之前（active；部分替代 ADR-0174 的 core U2/P8/View API 保留项与 ADR-0175 的 core REST 补丁妥协）
 
