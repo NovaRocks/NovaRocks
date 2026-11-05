@@ -33,7 +33,7 @@ doctest = false
 [dependencies]
 
 [target.'cfg(loom)'.dev-dependencies]
-loom = "0.7.2"
+loom.workspace = true
 
 [dev-dependencies]
 hashbrown.workspace = true

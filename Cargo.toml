@@ -46,9 +46,9 @@ unimplemented = "deny"
 result_large_err = "allow"
 
 [workspace.dependencies]
-novarocks-control-runtime-core = { path = "novarocks/control-runtime-core" }
-novarocks-control-runtime = { path = "novarocks/control-runtime" }
-novarocks-worker-protocol = { path = "novarocks/worker-protocol" }
+novarocks-control-runtime-core = { path = "novarocks/control-runtime-core", version = "0.1.0" }
+novarocks-control-runtime = { path = "novarocks/control-runtime", version = "0.1.0" }
+novarocks-worker-protocol = { path = "novarocks/worker-protocol", version = "0.1.0" }
 allocator-api2 = "0.2"
 anyhow = "1"
 apache-avro = "0.21"
@@ -78,6 +78,7 @@ http = "1"
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = "0.1"
 libc = "0.2"
+loom = "0.7.2"
 md-5 = "0.10"
 mysql = "25.0.1"
 num-traits = "0.2"
