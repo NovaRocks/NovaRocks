@@ -158,6 +158,75 @@ pub(in crate::exec::operators::hashjoin) fn copy_column(
     control.checkpoint(0).map_err(JoinGatherError::Kernel)?;
     Ok(result)
 }
+// This join already owns the complete target binding. Align source carrier
+// fields before mixing original pages with exact-target null extension.
+fn project_source(
+    source: &ArrayRef,
+    target: &ChunkSlotSchema,
+    storage: &ValueTypeStorageLifetime,
+    owner: &dyn InputConstructionOwner,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, JoinGatherError> {
+    use novarocks_value_arrays::{
+        ValueFailure,
+        decode::ValueConversionContext,
+        hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+    };
+    control.checkpoint(0).map_err(JoinGatherError::Kernel)?;
+    if source.data_type() == target.data_type() {
+        return Ok(Arc::clone(source));
+    }
+    let original = |failure| match failure {
+        ValueFailure::Caller(cause) => JoinGatherError::Source(cause),
+        ValueFailure::Value(cause) => JoinGatherError::Source(ExecutionFailure::from_domain(cause)),
+    };
+    let mut conversions = ValueConversionContext::default();
+    let mut growth = |layout| owner.request(layout).map_err(ExecutionFailure::from);
+    let mut work = |units| {
+        control.checkpoint(0).map_err(ExecutionFailure::from)?;
+        owner
+            .observe(
+                0,
+                &[],
+                ArrayNormalizationStep::InspectConstructionWork { units },
+            )
+            .map_err(ExecutionFailure::from)
+    };
+    let mut observe = |event: novarocks_value_arrays::hydrate::HydrateEvent<'_>| {
+        novarocks_functions::array_projection::observe_value_hydration(event, &mut |step| {
+            owner.observe(0, &[], step).map_err(ExecutionFailure::from)
+        })
+    };
+    let plan = HydratePlan::plan_with_options_and_storage_observed(
+        source,
+        target.typed_binding(),
+        HydrateOptions {
+            dictionary_value_layout: None,
+            projection: HydrateProjection::FrozenNamesAndNullability,
+        },
+        &mut conversions,
+        storage,
+        &mut |_, _| true,
+        &mut growth,
+        &mut work,
+        &mut observe,
+    )
+    .map_err(original)?;
+    plan.require_complete()
+        .map_err(ExecutionFailure::from_domain)?;
+    let projected = plan
+        .execute_observed(&mut conversions, &mut growth, &mut work, &mut observe)
+        .map_err(original)?;
+    control.checkpoint(0).map_err(JoinGatherError::Kernel)?;
+    if projected.data_type() != target.data_type() {
+        return Err(gather_contract(
+            "join source projection differs from its frozen target carrier",
+        )
+        .into());
+    }
+    Ok(projected)
+}
+
 fn null_source(
     target: &ChunkSlotSchema,
     owner: &dyn InputConstructionOwner,
@@ -428,7 +497,13 @@ impl PagedJoinGather {
                             .get(*column)
                             .ok_or_else(|| gather_contract("join probe column is absent"))?;
                         binding(slot, target, owner)?;
-                        sources.push(Arc::clone(&probe.columns()[*column]));
+                        sources.push(project_source(
+                            &probe.columns()[*column],
+                            target,
+                            &storage,
+                            owner,
+                            control,
+                        )?);
                     }
                 }
                 Column::Build(column) => {
@@ -436,7 +511,13 @@ impl PagedJoinGather {
                         let payload = page.payload().expect("validated original payload");
                         let source = payload.column(*column)?;
                         binding(source.slot, target, owner)?;
-                        sources.push(Arc::clone(source.array));
+                        sources.push(project_source(
+                            source.array,
+                            target,
+                            &storage,
+                            owner,
+                            control,
+                        )?);
                     }
                 }
             }
