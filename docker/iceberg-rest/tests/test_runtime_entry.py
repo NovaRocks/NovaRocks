@@ -902,25 +902,47 @@ class DownPurgeTests(RendererCase):
 
 
 class PrivateCreationTests(RendererCase):
-    def create_private(self, states=None, wait_codes=None, missing=(), shared=False):
+    def create_private(self, states=None, wait_codes=None, missing=(), shared=False,
+                       http_states=None, work_seconds=300, http_seconds=0):
+        from scratch import ScratchIdentity, RunBudget
+        clock = [1000.0]
+        identity = ScratchIdentity.create('s3://novarocks/test-worktree')
+        self.private_budget = RunBudget.admit(self.snapshot, identity,
+            seconds=work_seconds + 300, monotonic=lambda: clock[0])
         config = copy.deepcopy(self.config)
         config.update(shared_docker=False, update_current=False)
         if shared:
-            from scratch import ScratchIdentity, RunBudget
-            identity = ScratchIdentity.create('s3://novarocks/test-worktree')
             config['shared_minio'] = self.snapshot
             config['warehouses'] = {name: identity.scope_root + '/' + name for name in config['warehouses']}
-            config['run_context'] = RunBudget.admit(self.snapshot, identity).as_dict()
+            config['run_context'] = self.private_budget.as_dict()
         states = copy.deepcopy(states or {})
         wait_codes = wait_codes or {}
         self.creation_events = []
+        http_states = copy.deepcopy(http_states or {})
+        self.creation_http_calls = []
         self.private_backend = backend = mock.Mock()
+        backend.timeout = min(120, work_seconds)
         backend.image_id.side_effect = lambda reference: reference
         backend.inspect.side_effect = lambda kind, reference: {
             'Id': reference, 'Config': {'Entrypoint': ['java'], 'Cmd': ['-jar', '/rest.jar']}}
         backend.attach.return_value = 'original-minio'
         backend.healthy.side_effect = AssertionError('no environment health probe')
-        backend.http_ready.side_effect = AssertionError('no HTTP readiness probe')
+
+        def compose(record, args):
+            self.creation_record = record
+
+        def http_ready(url):
+            record = self.creation_record
+            service = next(service for service in runtime.rest_services(record)
+                if url == f"http://127.0.0.1:{record['ports'][service.replace('-', '_')]}/v1/config")
+            saved = json.loads((self.entry / 'manifest.json').read_text())
+            self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+            self.assertLessEqual(backend.operation_deadline, 1000 + min(120, work_seconds))
+            self.creation_events.append(('http', service))
+            self.creation_http_calls.append((service, backend.operation_deadline))
+            clock[0] += http_seconds
+            state = http_states.get(service, True)
+            return state.pop(0) if isinstance(state, list) else state
 
         def container(record, service):
             if service in missing:
@@ -945,11 +967,13 @@ class PrivateCreationTests(RendererCase):
 
         backend.container.side_effect = container
         backend.command.side_effect = command
-        self.private_budget = mock.Mock(deadline=entry.time.monotonic() + 600, cleanup_grace_seconds=300)
-        self.private_budget.remaining_seconds.return_value = 120
+        backend.compose.side_effect = compose
+        backend.http_ready.side_effect = http_ready
         render = entry.render_entry
         with mock.patch.object(runtime, 'Docker', return_value=backend), \
-                mock.patch.object(entry, 'render_entry', side_effect=publish):
+                mock.patch.object(entry, 'render_entry', side_effect=publish), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(entry.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
             return entry.start_private_stack(config, 'nr-isolated-rest-test', self.entry,
                 'stock', None, bom(), budget=self.private_budget)
 
@@ -957,7 +981,7 @@ class PrivateCreationTests(RendererCase):
         result = self.create_private(states={name: {'Status': 'running'} for name in ('mc-init', 'mc')})
         self.assertEqual(self.creation_events, [
             ('publish', 'starting'), ('wait', 'original-mc-init'),
-            ('wait', 'original-mc'), ('publish', 'ready')])
+            ('wait', 'original-mc'), ('http', 'rest'), ('http', 'rest-mv'), ('publish', 'ready')])
         self.assertEqual(result['private_record']['creation_state'], 'ready')
         self.assertEqual(self.private_backend.operation_deadline,
                          self.private_budget.deadline - self.private_budget.cleanup_grace_seconds)
@@ -993,7 +1017,41 @@ class PrivateCreationTests(RendererCase):
     def test_successful_exit_facts_do_not_start_another_wait(self):
         self.create_private()
         self.assertFalse(self.private_backend.command.called)
+        self.assertEqual([service for service, _ in self.creation_http_calls], ['rest', 'rest-mv'])
         self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+
+    def test_new_rest_services_handoff_only_after_both_serve(self):
+        self.create_private(http_states={'rest': [False, True], 'rest-mv': [False, True]}, shared=True)
+        self.assertEqual([service for service, _ in self.creation_http_calls],
+                         ['rest', 'rest', 'rest-mv', 'rest-mv'])
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+        self.assertEqual(self.private_backend.operation_deadline, 1300)
+
+    def test_new_rest_timeout_keeps_partial_record_and_original_deadline(self):
+        for service, work_seconds in [('rest', 300), ('rest-mv', 5)]:
+            with self.subTest(service=service, work_seconds=work_seconds):
+                with self.assertRaises(runtime.RuntimeFailure) as raised:
+                    self.create_private(http_states={service: False}, work_seconds=work_seconds)
+                self.assertEqual(raised.exception.code,
+                                 'RunBudgetExpired' if work_seconds < 120 else 'ReadinessTimeout')
+                self.assertEqual(self.private_backend.operation_deadline, 1000 + work_seconds)
+                self.assertNotIn(('publish', 'ready'), self.creation_events)
+                saved = json.loads((self.entry / 'manifest.json').read_text())
+                self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+
+    def test_late_http_success_cannot_extend_creation_window(self):
+        with self.assertRaises(runtime.RuntimeFailure) as raised:
+            self.create_private(http_seconds=121)
+        self.assertEqual(raised.exception.code, 'ReadinessTimeout')
+        self.assertEqual(self.private_backend.operation_deadline, 1300)
+        self.assertNotIn(('publish', 'ready'), self.creation_events)
+
+    def test_http_success_cannot_hide_original_work_budget_expiry(self):
+        with self.assertRaises(runtime.RuntimeFailure) as raised:
+            self.create_private(work_seconds=5, http_seconds=6)
+        self.assertEqual(raised.exception.code, 'RunBudgetExpired')
+        self.assertEqual(self.private_backend.operation_deadline, 1005)
+        self.assertNotIn(('publish', 'ready'), self.creation_events)
 
 
 class IsolatedEntryTests(RendererCase):
@@ -1008,7 +1066,9 @@ class IsolatedEntryTests(RendererCase):
         result = self.isolated()
         result['record'].update(creation_state='ready', containers={'rest': 'original-rest'})
         entry.render_entry(result['context'], self.entry)
-        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')):
+        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')), \
+                mock.patch.object(runtime.Docker, 'http_ready', side_effect=AssertionError('no existing target HTTP probe')), \
+                mock.patch.object(runtime.Docker, 'healthy', side_effect=AssertionError('no existing target health probe')):
             saved = entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
         self.assertEqual(saved['private_record']['containers'], {'rest': 'original-rest'})
 

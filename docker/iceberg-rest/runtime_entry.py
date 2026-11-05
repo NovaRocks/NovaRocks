@@ -727,27 +727,53 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
         record["object_store_container"] = backend.attach(config["shared_minio"], record)
         render_entry(context, entry)
     backend.compose(record, ['up', '-d'])
-    record['containers'] = {}
-    for service in record['required_services']:
-        container = backend.container(record, service)
-        if not container:
-            raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
-        record['containers'][service] = container['Id']
-    # Bucket initialization belongs to this owner, alongside the mc one-shot.
-    # Shared MinIO has no private initializer in its required services.
-    for service in ('mc-init', 'mc'):
-        if service == 'mc-init' and service not in record['required_services']:
-            continue
-        container = backend.container(record, service)
-        if not container:
-            raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
-        if container.get('State', {}).get('Status') != 'exited':
-            result = backend.command(['wait', container['Id']]).strip()
-            if result != '0':
+    previous_deadline = getattr(backend, 'operation_deadline', None)
+    deadline = time.monotonic() + min(120, backend.timeout)
+    if previous_deadline is not None:
+        deadline = min(deadline, previous_deadline)
+    backend.operation_deadline = deadline
+    try:
+        record['containers'] = {}
+        for service in record['required_services']:
+            container = backend.container(record, service)
+            if not container:
+                raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+            record['containers'][service] = container['Id']
+        # Bucket initialization belongs to this owner, alongside the mc one-shot.
+        # Shared MinIO has no private initializer in its required services.
+        for service in ('mc-init', 'mc'):
+            if service == 'mc-init' and service not in record['required_services']:
+                continue
+            container = backend.container(record, service)
+            if not container:
+                raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+            if container.get('State', {}).get('Status') != 'exited':
+                result = backend.command(['wait', container['Id']]).strip()
+                if result != '0':
+                    raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
+            elif container.get('State', {}).get('ExitCode') != 0:
                 raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
-        elif container.get('State', {}).get('ExitCode') != 0:
-            raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
-        record['containers'][service] = container['Id']
+            record['containers'][service] = container['Id']
+        # Only newly created REST services need their first serving handoff.
+        # Existing fixtures do not pass through this creation owner.
+        for service in runtime.rest_services(record):
+            url = f'http://127.0.0.1:{record["ports"][service.replace("-", "_")]}/v1/config'
+            while True:
+                if budget:
+                    budget.check(work=True)
+                if time.monotonic() >= deadline:
+                    raise runtime.RuntimeFailure('ReadinessTimeout', project)
+                serving = backend.http_ready(url)
+                if budget:
+                    budget.check(work=True)
+                now = time.monotonic()
+                if now >= deadline:
+                    raise runtime.RuntimeFailure('ReadinessTimeout', project)
+                if serving:
+                    break
+                time.sleep(min(0.1, deadline - now))
+    finally:
+        backend.operation_deadline = previous_deadline
     record['creation_state'] = 'ready'
     render_entry(context, entry)
     return {'published_dir': str(entry), 'private_record': record, 'producer_receipt': context['producer_receipt']}
