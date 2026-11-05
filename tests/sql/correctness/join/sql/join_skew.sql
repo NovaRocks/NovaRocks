@@ -188,11 +188,11 @@ INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, CAST('1844674407
 
 -- query 31
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_largeint(1,18446744073709551620,4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- query 32
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_largeint(1,18446744073709551620,4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DOUBLE skew join
