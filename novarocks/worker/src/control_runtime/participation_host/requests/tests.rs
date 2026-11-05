@@ -2156,3 +2156,65 @@ mod task_host_calls;
 
 #[path = "tests/internal.rs"]
 mod internal;
+
+#[test]
+fn unused_task_domain_sources_and_direct_return_finish_from_original_ready_notices() {
+    let mut f = original_participation(1);
+    let ready = ready(&f, 1);
+    let (work, handle) = admit(&mut f, &ready, operation(91));
+    // This real external Drop is the only initial R notification. No timer,
+    // extra producer event or manual retry contributes to the observed drain.
+    drop(handle);
+    let settled = f
+        .service
+        .participation(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .domain_funding_ready_drain_for_test(work, &ready, false);
+    finish(f);
+    assert!(
+        settled,
+        "ready Domain Source2/direct funding parked with an empty R ready queue"
+    );
+}
+
+#[test]
+fn ready_direct_domain_return_finishes_when_an_earlier_sibling_is_also_ready() {
+    let mut f = original_participation(1);
+    let ready = ready(&f, 1);
+    let (work, handle) = admit(&mut f, &ready, operation(92));
+    drop(handle);
+    let settled = f
+        .service
+        .participation(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .domain_funding_ready_drain_for_test(work, &ready, true);
+    finish(f);
+    assert!(
+        settled,
+        "original direct return parked after an unrelated ready sibling won the reaper turn"
+    );
+}
+
+#[test]
+fn pending_task_domain_funding_finishes_from_original_ready_notices() {
+    let mut f = original_participation(1);
+    let ready = ready(&f, 1);
+    let (work, handle) = admit(&mut f, &ready, operation(93));
+    drop(handle);
+    let settled = f
+        .service
+        .participation(f.identity)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .pending_domain_funding_ready_drain_for_test(work, &ready);
+    finish(f);
+    assert!(
+        settled,
+        "untaken Task domain funding parked after the original ready queue drained"
+    );
+}
