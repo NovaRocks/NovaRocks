@@ -901,6 +901,101 @@ class DownPurgeTests(RendererCase):
         self.assertTrue((Path(first['published_dir']) / 'env.sh').is_file())
 
 
+class PrivateCreationTests(RendererCase):
+    def create_private(self, states=None, wait_codes=None, missing=(), shared=False):
+        config = copy.deepcopy(self.config)
+        config.update(shared_docker=False, update_current=False)
+        if shared:
+            from scratch import ScratchIdentity, RunBudget
+            identity = ScratchIdentity.create('s3://novarocks/test-worktree')
+            config['shared_minio'] = self.snapshot
+            config['warehouses'] = {name: identity.scope_root + '/' + name for name in config['warehouses']}
+            config['run_context'] = RunBudget.admit(self.snapshot, identity).as_dict()
+        states = copy.deepcopy(states or {})
+        wait_codes = wait_codes or {}
+        self.creation_events = []
+        self.private_backend = backend = mock.Mock()
+        backend.image_id.side_effect = lambda reference: reference
+        backend.inspect.side_effect = lambda kind, reference: {
+            'Id': reference, 'Config': {'Entrypoint': ['java'], 'Cmd': ['-jar', '/rest.jar']}}
+        backend.attach.return_value = 'original-minio'
+        backend.healthy.side_effect = AssertionError('no environment health probe')
+        backend.http_ready.side_effect = AssertionError('no HTTP readiness probe')
+
+        def container(record, service):
+            if service in missing:
+                return None
+            state = states.get(service, {'Status': 'exited', 'ExitCode': 0})
+            return {'Id': 'original-' + service, 'State': copy.deepcopy(state)}
+
+        def command(args):
+            self.assertEqual(args[0], 'wait')
+            service = args[1].removeprefix('original-')
+            self.assertIn(service, ('mc-init', 'mc'))
+            saved = json.loads((self.entry / 'manifest.json').read_text())
+            self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+            self.creation_events.append(('wait', args[1]))
+            code = wait_codes.get(service, 0)
+            states[service] = {'Status': 'exited', 'ExitCode': code}
+            return str(code)
+
+        def publish(context, directory):
+            self.creation_events.append(('publish', context['private_record']['creation_state']))
+            return render(context, directory)
+
+        backend.container.side_effect = container
+        backend.command.side_effect = command
+        self.private_budget = mock.Mock(deadline=entry.time.monotonic() + 600, cleanup_grace_seconds=300)
+        self.private_budget.remaining_seconds.return_value = 120
+        render = entry.render_entry
+        with mock.patch.object(runtime, 'Docker', return_value=backend), \
+                mock.patch.object(entry, 'render_entry', side_effect=publish):
+            return entry.start_private_stack(config, 'nr-isolated-rest-test', self.entry,
+                'stock', None, bom(), budget=self.private_budget)
+
+    def test_bucket_initializer_and_mc_exit_before_ready(self):
+        result = self.create_private(states={name: {'Status': 'running'} for name in ('mc-init', 'mc')})
+        self.assertEqual(self.creation_events, [
+            ('publish', 'starting'), ('wait', 'original-mc-init'),
+            ('wait', 'original-mc'), ('publish', 'ready')])
+        self.assertEqual(result['private_record']['creation_state'], 'ready')
+        self.assertEqual(self.private_backend.operation_deadline,
+                         self.private_budget.deadline - self.private_budget.cleanup_grace_seconds)
+
+    def test_failed_one_shot_never_publishes_ready(self):
+        for service in ('mc-init', 'mc'):
+            for status in ('running', 'exited'):
+                with self.subTest(service=service, status=status):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, 'did not exit successfully') as raised:
+                        self.create_private(states={service: {'Status': status, 'ExitCode': 17}},
+                                            wait_codes={service: 17})
+                    self.assertEqual(raised.exception.code, 'RuntimeCreationFailed')
+                    self.assertNotIn(('publish', 'ready'), self.creation_events)
+                    saved = json.loads((self.entry / 'manifest.json').read_text())
+                    self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+
+    def test_missing_required_or_mc_container_is_not_ready(self):
+        for service in ('mc-init', 'rest', 'mc'):
+            with self.subTest(service=service):
+                with self.assertRaises(runtime.RuntimeFailure) as raised:
+                    self.create_private(missing=(service,))
+                self.assertEqual(raised.exception.code, 'RuntimeStateUnreadable')
+                self.assertNotIn(('publish', 'ready'), self.creation_events)
+
+    def test_shared_minio_waits_only_for_its_original_mc(self):
+        result = self.create_private(states={'mc': {'Status': 'running'}}, shared=True)
+        self.assertEqual([event for event in self.creation_events if event[0] == 'wait'],
+                         [('wait', 'original-mc')])
+        self.assertNotIn('mc-init', result['private_record']['required_services'])
+        self.assertNotIn('mc-init', [call.args[1] for call in self.private_backend.container.call_args_list])
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+
+    def test_successful_exit_facts_do_not_start_another_wait(self):
+        self.create_private()
+        self.assertFalse(self.private_backend.command.called)
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+
+
 class IsolatedEntryTests(RendererCase):
     def isolated(self, profile='stock'):
         config = copy.deepcopy(self.config)

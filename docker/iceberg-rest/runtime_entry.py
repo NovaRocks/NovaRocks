@@ -727,18 +727,27 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
         record["object_store_container"] = backend.attach(config["shared_minio"], record)
         render_entry(context, entry)
     backend.compose(record, ['up', '-d'])
-    record['containers'] = {name: backend.container(record, name)['Id'] for name in record['required_services']}
-    # Join the actual one-shot command, not a readiness probe of the whole stack.
-    mc = backend.container(record, 'mc')
-    if not mc:
-        raise runtime.RuntimeFailure('RuntimeStateUnreadable', 'private creation omitted its mc container')
-    if mc.get('State', {}).get('Status') != 'exited':
-        result = backend.command(['wait', mc['Id']]).strip()
-        if result != '0':
-            raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
-    elif mc.get('State', {}).get('ExitCode') != 0:
-        raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
-    record['containers']['mc'] = mc['Id']
+    record['containers'] = {}
+    for service in record['required_services']:
+        container = backend.container(record, service)
+        if not container:
+            raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+        record['containers'][service] = container['Id']
+    # Bucket initialization belongs to this owner, alongside the mc one-shot.
+    # Shared MinIO has no private initializer in its required services.
+    for service in ('mc-init', 'mc'):
+        if service == 'mc-init' and service not in record['required_services']:
+            continue
+        container = backend.container(record, service)
+        if not container:
+            raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+        if container.get('State', {}).get('Status') != 'exited':
+            result = backend.command(['wait', container['Id']]).strip()
+            if result != '0':
+                raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
+        elif container.get('State', {}).get('ExitCode') != 0:
+            raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
+        record['containers'][service] = container['Id']
     record['creation_state'] = 'ready'
     render_entry(context, entry)
     return {'published_dir': str(entry), 'private_record': record, 'producer_receipt': context['producer_receipt']}
