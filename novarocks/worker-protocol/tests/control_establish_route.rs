@@ -125,7 +125,7 @@ struct Fixture {
 impl Fixture {
     fn new(max_pending: usize, original_deadline: u64) -> Self {
         let root = ControlCore::new(
-            context(1).backend_process_id(),
+            participation(1).backend_process_id(),
             ControlConfig {
                 max_pending_requests: max_pending,
                 step_budget: ControlCore::MAX_STEP_WORK,
@@ -692,7 +692,7 @@ fn a_routed_domain_failure_keeps_its_exact_token_body_and_original_decision_time
 #[test]
 fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() {
     let mut f = Fixture::new(2, 100);
-    let local = context(1);
+    let local = participation(1);
     let foreign = ParticipationRef::new(
         local.query_execution_id(),
         local.frontend_process_id(),
@@ -733,7 +733,7 @@ fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() 
             request(4, operation(4), 100),
             ControlInput::Establish {
                 request: operation(4),
-                context: foreign,
+                participation: foreign,
                 ticket: f.ticket,
                 payload: PayloadId(4),
                 semantics: semantics(),
@@ -759,8 +759,8 @@ fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() 
         .handle_request(
             at(2),
             request(5, operation(5), 100),
-            ControlInput::CreateWithoutContextAddress {
-                context: foreign,
+            ControlInput::CreateWithoutParticipationAddress {
+                participation: foreign,
                 task,
             },
             &mut f.capacity,
@@ -784,7 +784,7 @@ fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() 
             request(6, operation(6), 100),
             ControlInput::Establish {
                 request: operation(6),
-                context: context(2),
+                participation: participation(2),
                 ticket: ticket(99),
                 payload: PayloadId(6),
                 semantics: semantics(),
@@ -804,7 +804,7 @@ fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() 
 #[test]
 fn administrative_control_inputs_keep_the_same_process_fence() {
     let mut f = Fixture::new(2, 100);
-    let local = context(1);
+    let local = participation(1);
     let foreign = ParticipationRef::new(
         local.query_execution_id(),
         local.frontend_process_id(),
@@ -843,7 +843,7 @@ fn administrative_control_inputs_keep_the_same_process_fence() {
             at(2),
             ControlInput::Establish {
                 request: operation(4),
-                context: foreign,
+                participation: foreign,
                 ticket: f.ticket,
                 payload: PayloadId(4),
                 semantics: semantics(),

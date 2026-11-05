@@ -2393,7 +2393,7 @@ fn control_with_pending_limit(
 ) -> novarocks_worker_protocol::control::ControlCore {
     use novarocks_worker_protocol::control::{ControlConfig, ControlCore};
     ControlCore::new(
-        context().backend_process_id(),
+        participation().backend_process_id(),
         ControlConfig {
             max_pending_requests,
             step_budget: ControlCore::MAX_STEP_WORK,
@@ -5359,7 +5359,7 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         },
     ] {
         let mut control = ControlCore::new(
-            context().backend_process_id(),
+            participation().backend_process_id(),
             ControlConfig {
                 max_pending_requests: 16,
                 step_budget: ControlCore::MAX_STEP_WORK,
@@ -7364,7 +7364,7 @@ fn next_internal_empty_frontend_fences_each_take_one_step_without_a_global_fence
         ControlConfig, ControlCore, ControlEffect, ControlInput,
     };
     let mut control = ControlCore::new(
-        context().backend_process_id(),
+        participation().backend_process_id(),
         ControlConfig {
             max_pending_requests: 2,
             step_budget: ControlCore::MAX_STEP_WORK,
