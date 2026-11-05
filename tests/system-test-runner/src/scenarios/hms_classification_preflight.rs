@@ -86,10 +86,6 @@ fn identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-fn sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
-}
-
 fn safe_sql_error(error: &mysql::Error) -> anyhow::Error {
     // Only a digest is retained; unexpected provider payloads can contain secrets.
     let code = match error {
@@ -292,29 +288,9 @@ impl Scenario for HmsClassificationPreflight {
             client
                 .query_drop(format!("USE {catalog}.{namespace}"))
                 .map_err(|error| safe_sql_error(&error))?;
-            facts["phase"] = json!("table-names");
-            self.remaining()?;
-            let names: Vec<String> = client
-                .query(format!(
-                    "SELECT table_name FROM {catalog}.information_schema.tables WHERE table_schema={} ORDER BY table_name",
-                    sql_string(namespace)
-                ))
-                .map_err(|error| safe_sql_error(&error))?;
-            facts["table_names"] = json!(names);
-            ensure!(
-                names == ["cap_table"],
-                "HMS table list included a view, omitted a table or duplicated a name"
-            );
-            facts["phase"] = json!("information-schema");
-            self.remaining()?;
-            let rows: Vec<(String,String)> = client.query(format!(
-                "SELECT table_name,table_type FROM {catalog}.information_schema.tables WHERE table_catalog={} AND table_schema={} ORDER BY table_name",
-                sql_string(catalog), sql_string(namespace))).map_err(|error| safe_sql_error(&error))?;
-            facts["information_schema"] = json!(rows);
-            ensure!(
-                rows == [("cap_table".into(), "BASE TABLE".into())],
-                "HMS information_schema classification differs"
-            );
+            // HMS table listings return every name in the metastore database
+            // (ADR-0216), so this preflight no longer asserts an Iceberg-only
+            // table list or table types for its externally prepared namespace.
             facts["phase"] = json!("show-views");
             self.remaining()?;
             facts["show_views"] = require_view_refusal(client.query_drop("SHOW VIEWS"))?;
@@ -343,7 +319,7 @@ impl Scenario for HmsClassificationPreflight {
             .map_err(anyhow::Error::from)
             .and_then(|raw| std::fs::write(receipt, raw).map_err(Into::into));
         finish_evidence_errors(primary, diagnostic, saved)?;
-        context.action("small readonly HMS exact table projection and precise view refusal passed; HMS mutations excluded for IRU-7");
+        context.action("small readonly HMS namespace selection and precise view refusal passed; HMS mutations excluded for IRU-7");
         Ok(())
     }
 }
