@@ -674,6 +674,23 @@ impl ParticipationHostRecord {
                     self.resources.pending_host_jobs.effect_scan_remaining = 0;
                     break;
                 }
+                #[cfg(test)]
+                if let WorkerAction::Participation(ParticipationEffect::ApplyTaskClose {
+                    task,
+                    generation,
+                    intent,
+                }) = &original.effect
+                    && tasks.close_handoff_gate.as_ref().is_some_and(|gate| {
+                        gate.hold(*task, *generation, *intent, self.ready_notice())
+                    })
+                {
+                    // Keep the same uncompleted ticket in its original
+                    // paid slot; Task I/O and causal inputs still progress.
+                    assert!(self.resources.pending_host_jobs.actor_effect.is_none());
+                    self.resources.pending_host_jobs.actor_effect = Some(original);
+                    self.resources.pending_host_jobs.effect_scan_remaining = 0;
+                    break;
+                }
                 self.handoff_actor_effect(original, tasks)?;
                 self.resources.pending_host_jobs.effect_scan_remaining =
                     self.dispatch.ready_positions();

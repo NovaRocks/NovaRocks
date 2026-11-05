@@ -79,6 +79,9 @@ pub struct TaskRecord {
     /// original completion work must actually exit before this can become a
     /// success proposal, and output responsibility remains independent.
     pub completion_success_pending: bool,
+    /// An original rollback observation may precede its Task's Abort cut.
+    /// Keep that exact close generation without granting a success or exit.
+    pub(crate) completion_termination_generation: Option<Generation>,
     pub preparation_exit_holds: [bool; 4],
     pub output_released: bool,
     pub output: TaskOutputFacts,
@@ -142,6 +145,7 @@ impl TaskRecord {
             runtime_actual_stopped_received: false,
             runtime_resources_converged_received: false,
             completion_success_pending: false,
+            completion_termination_generation: None,
             preparation_exit_holds: [false; 4],
             output_released: false,
             output: TaskOutputFacts::new(false),
