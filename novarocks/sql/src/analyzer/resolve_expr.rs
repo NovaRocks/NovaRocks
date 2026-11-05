@@ -28,7 +28,7 @@ use novarocks_type_contract::{
     ArithmeticOperator, arithmetic_result_value_type_with_op, comparison_common_value_type,
     is_integer_value_type, is_numeric_value_type, wider_comparison_value_type,
 };
-use novarocks_types::{comparison_common_type, wider_type};
+use novarocks_types::comparison_common_type;
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
@@ -387,23 +387,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
+            // Signed INTEGER unary plus is a value identity. Keep the original
+            // producer, full binding and failure effects of the operand.
+            ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Plus) => {
+                let inner_typed = self.analyze_expr(&unary.expression, scope)?;
+                signed_unary_plus_identity(inner_typed, expr)
+            }
+
             // Unary minus
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Minus) => {
-                if let ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Number(number),
-                    span,
-                }) = unary.expression.as_ref()
-                    && !number.contains('.')
-                    && !number.contains('e')
-                    && !number.contains('E')
-                {
-                    // Check the signed value before the positive magnitude:
-                    // the absolute value of an integer minimum is out of range.
-                    return self.analyze_literal(&ast::Literal {
-                        kind: ast::LiteralKind::Number(format!("-{number}")),
-                        span: *span,
-                    });
-                }
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
                 if !is_numeric_value_type(&inner_typed.value_type)
                     && !is_strict_null_value_type(&inner_typed.value_type)
@@ -1239,27 +1231,23 @@ impl<'a> super::AnalyzerContext<'a> {
                 ..
             } => {
                 if let Ok(v) = n.parse::<i64>() {
-                    // Integer without decimal point → Int64
+                    // Ordinary signed integer syntax has the Trino INTEGER/BIGINT domain.
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(v)),
                         value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Int64,
+                            if i32::try_from(v).is_ok() {
+                                DataType::Int32
+                            } else {
+                                DataType::Int64
+                            },
                             false,
                         ),
                     })
                 } else if !n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    let v = n.parse::<i128>().map_err(|_| {
-                        AnalyzeError::invalid_literal(
-                            format!("invalid numeric literal: {n}"),
-                            value.span,
-                        )
-                    })?;
-                    Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
-                        value_type: novarocks_type_contract::FunctionValueType::try_from_legacy_declared_projection(DataType::FixedSizeBinary(
-                                novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
-                            ), false, novarocks_type_contract::ValueLogicalType::LargeInt).expect("valid temporary legacy value projection"),
-                    })
+                    Err(AnalyzeError::invalid_literal(
+                        format!("invalid integer literal: {n}"),
+                        value.span,
+                    ))
                 } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
                     let data_type = infer_decimal_literal_type(n)
                         .map_err(|message| AnalyzeError::invalid_literal(message, value.span))?;
@@ -1354,13 +1342,6 @@ impl<'a> super::AnalyzerContext<'a> {
             .transpose()?;
         for item in &array.elements {
             let mut typed = self.analyze_expr(item, scope)?;
-            // The existing literal width rule is authored by this syntax owner.
-            if let ExprKind::Literal(LiteralValue::Int(v)) = &typed.kind {
-                typed.value_type = novarocks_type_contract::FunctionValueType::new(
-                    narrow_int_literal_type(*v),
-                    typed.value_type.nullable(),
-                );
-            }
             if let Some(target) = &explicit_item_type
                 && !typed.value_type.same_value_domain(target)
             {
@@ -2077,6 +2058,9 @@ impl<'a> super::AnalyzerContext<'a> {
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
         let original_name = print_object_name(&func.name).to_ascii_lowercase();
+        if matches!(original_name.as_str(), "grouping" | "grouping_id") {
+            return self.analyze_grouping_function(func, scope);
+        }
         if original_name == "ds_theta_count_distinct" {
             return Err(AnalyzeError::unsupported_expression(
                 "unsupported agg function: ds_theta_count_distinct",
@@ -2233,7 +2217,7 @@ impl<'a> super::AnalyzerContext<'a> {
             });
         }
         // typeof(<expr>) on a non-CAST argument: analyze the argument with
-        // StarRocks' narrowest-integer-literal-type rule applied, then map
+        // the ordinary integer-literal rule applied, then map
         // the resulting Arrow type to its StarRocks spelling. Some function
         // families return BINARY/VARCHAR at the Arrow level but carry a
         // distinct logical type (BITMAP/HLL/JSON/null literal) in
@@ -2250,8 +2234,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 });
             }
             let typed_arg = self.analyze_expr(arg_exprs[0], scope)?;
-            let narrowed = narrow_int_literals_in_typed_expr(typed_arg);
-            let type_name = arrow_type_to_starrocks_name(narrowed.value_type.data_type());
+            let type_name = arrow_type_to_starrocks_name(typed_arg.value_type.data_type());
             return Ok(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::String(type_name)),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
@@ -5415,13 +5398,51 @@ pub(super) fn resolved_scalar_call_at(
     })
 }
 
+/// Unary plus has no new evaluator or conversion. Its admitted signed domain
+/// is a semantic fact; a physical layout alone cannot authorize the identity.
+fn signed_unary_plus_identity(
+    source: TypedExpr,
+    syntax: &ast::Expr,
+) -> Result<TypedExpr, AnalyzeError> {
+    if source.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && matches!(
+            source.value_type.value_type().kind(),
+            novarocks_type_contract::ValueKind::Scalar(
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            )
+        )
+    {
+        Ok(source)
+    } else {
+        Err(AnalyzeError::unsupported_expression(
+            format!("unsupported expression: {}", print_expr(syntax)),
+            syntax.span(),
+        ))
+    }
+}
+
 fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
     match &expr.kind {
         ExprKind::Literal(LiteralValue::Int(value)) => Some(*value),
         ExprKind::UnaryOp {
             op: UnOp::Negate,
             expr: inner,
-        } => signed_int_literal_value(inner).and_then(i64::checked_neg),
+        } => {
+            // Keep the existing safe unary-literal normalization, but first
+            // preserve each original signed operation's declared-width error.
+            // A later BIGINT parameter cannot legalize an INTEGER overflow.
+            let value = signed_int_literal_value(inner)?.checked_neg()?;
+            if expr.value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+                || !matches!(
+                    expr.value_type.data_type(),
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                )
+            {
+                return None;
+            }
+            checked_int_literal_for_target(value, expr.value_type.data_type()).ok()?;
+            Some(value)
+        }
         _ => None,
     }
 }
@@ -6247,15 +6268,7 @@ fn infer_literal_signature_type(args: &[TypedExpr]) -> Option<String> {
 }
 
 fn integer_literal_signature_rank(value: i64) -> usize {
-    if i8::try_from(value).is_ok() {
-        0
-    } else if i16::try_from(value).is_ok() {
-        1
-    } else if i32::try_from(value).is_ok() {
-        2
-    } else {
-        3
-    }
+    if i32::try_from(value).is_ok() { 2 } else { 3 }
 }
 
 fn integer_literal_signature_type(rank: usize) -> String {
@@ -6768,187 +6781,6 @@ fn syntactic_array_literal_len(expr: &ast::Expr) -> Option<usize> {
         ast::Expr::Nested(inner) => syntactic_array_literal_len(&inner.expression),
         ast::Expr::Cast(cast) => syntactic_array_literal_len(&cast.expr),
         _ => None,
-    }
-}
-
-/// Narrow an integer literal value to the smallest signed integer width
-/// that contains it (TINYINT/SMALLINT/INT/BIGINT). Used in array literal
-/// and `typeof()` contexts to match StarRocks' literal-width inference.
-fn narrow_int_literal_type(value: i64) -> DataType {
-    if i8::try_from(value).is_ok() {
-        DataType::Int8
-    } else if i16::try_from(value).is_ok() {
-        DataType::Int16
-    } else if i32::try_from(value).is_ok() {
-        DataType::Int32
-    } else {
-        DataType::Int64
-    }
-}
-
-/// Walk a `TypedExpr` tree, narrowing every integer literal to its
-/// smallest signed integer width and recomputing the result types of
-/// function calls whose return type depends on argument widths
-/// (greatest/least/coalesce/nvl/ifnull, array/map/struct literals).
-/// The original `kind` is preserved so codegen sees the same shape;
-/// only `data_type` is updated so `typeof()` can report the narrow
-/// spelling.
-fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
-    let kind = expr.kind.clone();
-    match kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                narrow_int_literal_type(v),
-                expr.value_type.nullable(),
-            ),
-
-            kind: expr.kind,
-        },
-        ExprKind::UnaryOp { op, expr: inner } => {
-            let inner = narrow_int_literals_in_typed_expr(*inner);
-            let data_type = inner.value_type.data_type().clone();
-            TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    data_type,
-                    expr.value_type.nullable(),
-                ),
-
-                kind: ExprKind::UnaryOp {
-                    op,
-                    expr: Box::new(inner),
-                },
-            }
-        }
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-            binding,
-            volatility,
-        } => {
-            let args: Vec<TypedExpr> = args
-                .into_iter()
-                .map(narrow_int_literals_in_typed_expr)
-                .collect();
-            let arg_types: Vec<DataType> = args
-                .iter()
-                .map(|a| a.value_type.data_type().clone())
-                .collect();
-            let new_type = match name.as_str() {
-                "greatest" | "least" | "coalesce" | "nvl" | "ifnull" => {
-                    if let Some(first) = arg_types.first() {
-                        let mut result = first.clone();
-                        for t in &arg_types[1..] {
-                            result = wider_type(&result, t);
-                        }
-                        if matches!(name.as_str(), "greatest" | "least")
-                            && matches!(result, DataType::Date32)
-                        {
-                            result =
-                                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
-                        }
-                        result
-                    } else {
-                        expr.value_type.data_type().clone()
-                    }
-                }
-                "__array_literal" => {
-                    let mut item = DataType::Null;
-                    for t in &arg_types {
-                        item = wider_type(&item, t);
-                    }
-                    DataType::List(arrow::datatypes::Field::new("item", item, true).into())
-                }
-                "map" if !arg_types.is_empty() && arg_types.len().is_multiple_of(2) => {
-                    let mut key_t = DataType::Null;
-                    let mut val_t = DataType::Null;
-                    for (i, t) in arg_types.iter().enumerate() {
-                        if i % 2 == 0 {
-                            key_t = wider_type(&key_t, t);
-                        } else {
-                            val_t = wider_type(&val_t, t);
-                        }
-                    }
-                    DataType::Map(
-                        std::sync::Arc::new(arrow::datatypes::Field::new(
-                            "entries",
-                            DataType::Struct(
-                                vec![
-                                    std::sync::Arc::new(arrow::datatypes::Field::new(
-                                        "key", key_t, false,
-                                    )),
-                                    std::sync::Arc::new(arrow::datatypes::Field::new(
-                                        "value", val_t, true,
-                                    )),
-                                ]
-                                .into(),
-                            ),
-                            false,
-                        )),
-                        false,
-                    )
-                }
-                "row" | "struct" => {
-                    let fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
-                            std::sync::Arc::new(arrow::datatypes::Field::new(
-                                format!("col{}", i + 1),
-                                a.value_type.data_type().clone(),
-                                true,
-                            ))
-                        })
-                        .collect();
-                    DataType::Struct(fields.into())
-                }
-                // `named_struct(name0, val0, name1, val1, …)` — the field
-                // names come from the *odd-indexed* string-literal arguments,
-                // not from auto-generated `col1/col2/…` names. The initial
-                // return-type inference in `functions.rs::infer_named_struct_return_type`
-                // can't see the arg expressions (only types), so it falls back
-                // to `col{i+1}`; this refinement pass has the full TypedExpr
-                // args available and fixes the field names properly.
-                "named_struct" => {
-                    let fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = args
-                        .chunks(2)
-                        .enumerate()
-                        .map(|(i, chunk)| {
-                            let (field_name, value_type) = match chunk {
-                                [name_expr, value_expr] => {
-                                    let name = match &name_expr.kind {
-                                        ExprKind::Literal(LiteralValue::String(s)) => s.clone(),
-                                        _ => format!("col{}", i + 1),
-                                    };
-                                    (name, value_expr.value_type.data_type().clone())
-                                }
-                                _ => (format!("col{}", i + 1), DataType::Null),
-                            };
-                            std::sync::Arc::new(arrow::datatypes::Field::new(
-                                field_name, value_type, true,
-                            ))
-                        })
-                        .collect();
-                    DataType::Struct(fields.into())
-                }
-                _ => expr.value_type.data_type().clone(),
-            };
-            TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    new_type.clone(),
-                    expr.value_type.nullable(),
-                ),
-
-                kind: ExprKind::FunctionCall {
-                    name,
-                    args,
-                    distinct,
-                    binding,
-                    volatility,
-                },
-            }
-        }
-        _ => expr,
     }
 }
 
@@ -7481,7 +7313,7 @@ mod tests {
             let DataType::List(element) = &expression.value_type.data_type() else {
                 panic!("mixed array literal must produce a list");
             };
-            assert_eq!(element.data_type(), &DataType::Decimal128(4, 1), "{sql}");
+            assert_eq!(element.data_type(), &DataType::Decimal128(11, 1), "{sql}");
             assert!(element.is_nullable(), "{sql}");
             let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
                 panic!("array literal must retain its exact function binding");
@@ -8588,7 +8420,7 @@ mod tests {
                     expression.value_type.logical_type(),
                     ValueLogicalType::Physical
                 );
-                assert_eq!(expression.value_type.data_type().clone(), DataType::Int64);
+                assert_eq!(expression.value_type.data_type().clone(), DataType::Int32);
                 assert!(expression.value_type.nullable());
             } else {
                 assert_eq!(expression.value_type.data_type().clone(), DataType::Boolean);
@@ -8783,6 +8615,7 @@ mod tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         let context = super::super::AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             catalog: &EmptyCatalog,
             current_database: "default",
@@ -8858,6 +8691,217 @@ mod tests {
     }
 
     #[test]
+    fn signed_unary_plus_preserves_literals_nulls_and_real_negate_effects() {
+        for (sql, carrier) in [
+            ("SELECT +1", DataType::Int32),
+            ("SELECT +2147483648", DataType::Int64),
+            ("SELECT +(-2147483648)", DataType::Int32),
+            ("SELECT +CAST(7 AS TINYINT)", DataType::Int8),
+            ("SELECT +CAST(7 AS SMALLINT)", DataType::Int16),
+            ("SELECT +CAST(NULL AS INTEGER)", DataType::Int32),
+            ("SELECT +CAST(NULL AS BIGINT)", DataType::Int64),
+        ] {
+            let expected =
+                analyze_projection_expr(&sql.replacen("SELECT +", "SELECT ", 1)).unwrap();
+            let actual = analyze_projection_expr(sql).unwrap();
+            assert_eq!(actual.value_type, expected.value_type, "{sql}");
+            assert_eq!(actual.value_type.data_type(), &carrier, "{sql}");
+            assert!(
+                crate::analysis::expr_identity::typed_expr_semantically_eq(
+                    &actual,
+                    &expected,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap(),
+                "original expression identity: {sql}"
+            );
+        }
+        let expression = analyze_projection_expr("SELECT + - -2147483648").unwrap();
+        assert_eq!(expression.value_type.data_type(), &DataType::Int32);
+        assert!(
+            matches!(&expression.kind, ExprKind::UnaryOp { op: UnOp::Negate, expr } if matches!(expr.kind, ExprKind::Literal(LiteralValue::Int(-2147483648)))),
+            "positive identity cannot erase the original INTEGER negate overflow"
+        );
+        assert_eq!(super::signed_int_literal_value(&expression), None);
+    }
+
+    #[test]
+    fn signed_unary_plus_keeps_column_ids_and_anonymous_frozen_output_names() {
+        for carrier in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            for nullable in [false, true] {
+                let catalog = UnaryInputCatalog {
+                    key_type: carrier.clone(),
+                    nullable,
+                    logical_type: None,
+                };
+                let statements = novarocks_parser::parse("SELECT k, +k FROM unary_input").unwrap();
+                let ast::Statement::Query(query) = &statements[0] else {
+                    panic!("query");
+                };
+                let (resolved, ctes, mut factory) =
+                    super::super::analyze(query, &catalog, "default").unwrap();
+                let fields = resolved.output_columns.clone();
+                assert_eq!(fields[0].field_name.as_deref(), Some("k"));
+                assert_eq!(
+                    fields[1].field_name, None,
+                    "AST positive expression remains anonymous"
+                );
+                let QueryBody::Select(select) = &resolved.body else {
+                    panic!("select");
+                };
+                let ExprKind::ColumnRef {
+                    column_id: first, ..
+                } = select.projection[0].expr.kind
+                else {
+                    panic!("original column");
+                };
+                let ExprKind::ColumnRef {
+                    column_id: positive,
+                    ..
+                } = select.projection[1].expr.kind
+                else {
+                    panic!("identity keeps original reference");
+                };
+                assert_eq!(first, positive);
+                assert_eq!(
+                    select.projection[0].expr.value_type,
+                    select.projection[1].expr.value_type
+                );
+                assert_eq!(fields[1].value_type.data_type(), &carrier);
+                assert_eq!(fields[1].value_type.nullable(), nullable);
+                let plan = crate::planner::plan_query(
+                    resolved,
+                    ctes,
+                    &mut factory,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
+                let columns = crate::planner::plan_output_columns(&plan).unwrap();
+                let root = crate::compiler::root_output::RootOutputSemantics::bind_analyzed(
+                    &fields, &columns, &factory,
+                )
+                .unwrap();
+                assert_eq!(
+                    root.field_names(&columns).unwrap(),
+                    &[Some("k".to_owned()), None]
+                );
+                let statements =
+                    novarocks_parser::parse("SELECT k FROM (SELECT +k FROM unary_input) p")
+                        .unwrap();
+                let ast::Statement::Query(query) = &statements[0] else {
+                    panic!("query");
+                };
+                let error = super::super::analyze(query, &catalog, "default").unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                    "source identity cannot grant the anonymous output a field name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signed_unary_plus_retains_admitted_constant_creator_field_and_selected_ordinal() {
+        use arrow::array::Array;
+        let value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int32, true);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            std::sync::Arc::new(value_type.try_to_field("original_positive").unwrap()),
+            value_type.clone(),
+            arrow::array::Int32Array::from(vec![None, Some(7), None]).to_data(),
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            &control,
+        )
+        .unwrap();
+        let statements = novarocks_parser::parse("SELECT +1").unwrap();
+        let ast::Statement::Query(query) = &statements[0] else {
+            panic!("query");
+        };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select");
+        };
+        let ast::SelectItem::UnnamedExpr(syntax) = &select.projection[0] else {
+            panic!("expression");
+        };
+        for ordinal in [1, 2] {
+            let original = pool.value(ordinal).unwrap();
+            let source = TypedExpr {
+                kind: ExprKind::Constant(original.clone()),
+                value_type: value_type.clone(),
+            };
+            let actual = super::signed_unary_plus_identity(source, syntax).unwrap();
+            assert_eq!(
+                actual.value_type, value_type,
+                "do not strengthen the original NULL promise"
+            );
+            let ExprKind::Constant(value) = actual.kind else {
+                panic!("original CV, no new pool or cast");
+            };
+            assert_eq!(value.ordinal(), ordinal);
+            assert!(std::sync::Arc::ptr_eq(
+                value.pool().array(),
+                original.pool().array()
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                value.pool().field_ref(),
+                original.pool().field_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn signed_unary_plus_keeps_noninteger_domains_explicitly_unsupported() {
+        for sql in [
+            "SELECT +1.5",
+            "SELECT +1e0",
+            "SELECT +'x'",
+            "SELECT +true",
+            "SELECT +NULL",
+            "SELECT +CAST(1 AS LARGEINT)",
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let ast::Statement::Query(query) = &statements[0] else {
+                panic!("query");
+            };
+            let error = super::super::analyze(query, &EmptyCatalog, "default").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+                "{sql}"
+            );
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("select");
+            };
+            assert_eq!(
+                error.span(),
+                Some(select.projection[0].span()),
+                "original unary source span"
+            );
+        }
+        let catalog = UnaryInputCatalog {
+            key_type: DataType::FixedSizeBinary(16),
+            nullable: false,
+            logical_type: None,
+        };
+        assert!(
+            analyze_projection_expr_with_catalog(
+                "SELECT +k FROM unary_input",
+                &catalog,
+                crate::functions::builtin_sql_function_catalog()
+            )
+            .unwrap_err()
+            .contains("unsupported expression")
+        );
+    }
+
+    #[test]
     fn strict_unary_typed_null_and_nonnull_literal_controls() {
         for (sql, data_type, nullable) in [
             (
@@ -8868,7 +8912,7 @@ mod tests {
             ("select ~cast(null as bigint)", DataType::Int64, true),
             ("select -1.25", DataType::Decimal128(3, 2), false),
             ("select -1.25e2", DataType::Float64, false),
-            ("select ~1", DataType::Int64, false),
+            ("select ~1", DataType::Int32, false),
         ] {
             let expression = analyze_projection_expr(sql).unwrap();
             assert_eq!(
@@ -8947,39 +8991,62 @@ mod tests {
             i64::MIN as i128 - 1,
             i64::MAX as i128 + 1,
         ] {
-            let expr = analyze_projection_expr(&format!("select {value}"))
-                .expect("signed LARGEINT boundary should analyze");
+            let expr = analyze_projection_expr(&format!("select cast('{value}' as largeint)"))
+                .expect("explicit signed LARGEINT boundary should analyze");
             assert_eq!(
                 expr.value_type.data_type().clone(),
                 DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
             );
-            assert!(!expr.value_type.nullable());
             assert!(
-                matches!(expr.kind, ExprKind::Literal(LiteralValue::LargeInt(actual)) if actual == value)
+                expr.value_type.nullable(),
+                "explicit text CAST keeps the original parse-failure NULL law"
+            );
+            let ExprKind::FunctionCall { binding, args, .. } = expr.kind else {
+                panic!("exact LARGEINT domain converter");
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                "builtin.scalar/value_domain_conversion/v1"
+            );
+            assert!(
+                matches!(&args[0].kind, ExprKind::Literal(LiteralValue::String(text)) if text == &value.to_string())
             );
         }
     }
 
     #[test]
-    fn signed_integer_literal_overflow_reports_the_original_numeric_span() {
-        for literal in [
-            "170141183460469231731687303715884105728",
-            "-170141183460469231731687303715884105729",
+    fn ordinary_integer_boundaries_are_shared_by_arrays_and_typeof() {
+        for (literal, expected) in [
+            ("-2147483648", DataType::Int32),
+            ("2147483647", DataType::Int32),
+            ("2147483648", DataType::Int64),
+            ("-2147483649", DataType::Int64),
+            ("-(2147483648)", DataType::Int64),
+            ("-(-2147483648)", DataType::Int32),
         ] {
-            let sql = format!("select {literal}");
-            let statements = novarocks_parser::parse(&sql).expect("test query should parse");
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                panic!("expected query");
+            let expression = analyze_projection_expr(&format!("select {literal}")).unwrap();
+            assert_eq!(expression.value_type.data_type(), &expected, "{literal}");
+            let array = analyze_projection_expr(&format!("select [{literal}]")).unwrap();
+            let DataType::List(item) = array.value_type.data_type() else {
+                panic!("list");
             };
-            let error = analyze(query, &EmptyCatalog, "default")
-                .expect_err("numeric literal outside LARGEINT range must be rejected");
-            assert_eq!(error.code().as_str(), "sql.analyze.invalid_literal");
-            let numeric_start = "select ".len() + usize::from(literal.starts_with('-'));
+            assert_eq!(item.data_type(), &expected, "{literal}");
+            let typeof_expression =
+                analyze_projection_expr(&format!("select typeof({literal})")).unwrap();
+            let ExprKind::Literal(LiteralValue::String(name)) = typeof_expression.kind else {
+                panic!("type name");
+            };
             assert_eq!(
-                error.span(),
-                Some(novarocks_parser::Span::new(numeric_start, sql.len()))
+                name,
+                if expected == DataType::Int32 {
+                    "int"
+                } else {
+                    "bigint"
+                }
             );
-            assert!(error.message().contains(literal), "{error}");
+        }
+        for literal in ["9223372036854775808", "-9223372036854775809"] {
+            assert!(novarocks_parser::parse(&format!("select {literal}")).is_err());
         }
     }
 
@@ -9576,19 +9643,169 @@ mod tests {
     }
 
     #[test]
+    fn generic_fixed_offset_binding_uses_the_original_checked_literal_normalization() {
+        let expression = analyze_projection_expr("SELECT lead('a', 1, 'b') OVER ()").unwrap();
+        let ExprKind::WindowCall { args, binding, .. } = expression.kind else {
+            panic!("window");
+        };
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        assert!(!args[1].value_type.nullable());
+        // The existing syntax-literal author normalizes a checked value before
+        // its first canonical CV admission; already-admitted ConstantValue and
+        // nonliteral inputs never enter signed_int_literal_value.
+        assert!(matches!(
+            args[1].kind,
+            ExprKind::Literal(LiteralValue::Int(1))
+        ));
+        assert_eq!(
+            binding.resolved().selected.argument_types[1],
+            novarocks_functions::FunctionArgumentType::Value(args[1].value_type.clone())
+        );
+        // An already-admitted CV follows the separate runtime-cast path.
+        // Keep its original creator's Field, array, and selected ordinal.
+        use arrow::array::Array;
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let policy = crate::constant::test_constant_policy();
+        let source_type = novarocks_type_contract::FunctionValueType::new(DataType::Int32, false);
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            std::sync::Arc::new(source_type.try_to_field("original").unwrap()),
+            source_type.clone(),
+            arrow::array::Int32Array::from(vec![99, 7]).to_data(),
+            policy,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            &control,
+        )
+        .unwrap();
+        let original = pool.value(1).unwrap();
+        let source = TypedExpr {
+            kind: ExprKind::Constant(original.clone()),
+            value_type: source_type.clone(),
+        };
+        let target = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let converted = super::coerce_selected_function_argument(
+            crate::functions::builtin_sql_function_catalog(),
+            source,
+            &target,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            policy,
+            &control,
+        )
+        .unwrap();
+        assert_eq!(converted.value_type, target);
+        let ExprKind::Cast { expr: source, .. } = converted.kind else {
+            panic!("admitted CV needs an actual runtime cast");
+        };
+        assert_eq!(source.value_type, source_type);
+        let ExprKind::Constant(actual) = source.kind else {
+            panic!("original admitted constant");
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert!(std::sync::Arc::ptr_eq(
+            actual.pool().array(),
+            original.pool().array()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            actual.pool().field_ref(),
+            original.pool().field_ref()
+        ));
+    }
+
+    #[test]
+    fn fixed_wide_parameters_do_not_erase_original_unary_integer_overflow() {
+        let safe = analyze_projection_expr("SELECT lead('a', - -1, 'b') OVER ()").unwrap();
+        let ExprKind::WindowCall { args, .. } = safe.kind else {
+            panic!("window");
+        };
+        assert!(
+            matches!(args[1].kind, ExprKind::Literal(LiteralValue::Int(1))),
+            "existing safe normalization remains"
+        );
+        assert_eq!(args[1].value_type.data_type(), &DataType::Int64);
+        for sql in [
+            "SELECT lead('a', - -2147483648, 'b') OVER ()",
+            "SELECT lead('a', -(-2147483648), 'b') OVER ()",
+        ] {
+            let expression = analyze_projection_expr(sql).unwrap();
+            let ExprKind::WindowCall { args, .. } = expression.kind else {
+                panic!("window");
+            };
+            let ExprKind::Cast {
+                expr: source,
+                target,
+                ..
+            } = &args[1].kind
+            else {
+                panic!("runtime conversion keeps the original operation");
+            };
+            assert_eq!(target, &DataType::Int64);
+            assert_eq!(source.value_type.data_type(), &DataType::Int32);
+            let ExprKind::UnaryOp {
+                op: crate::analysis::UnOp::Negate,
+                expr: inner,
+            } = &source.kind
+            else {
+                panic!("original unary");
+            };
+            let literal = if let ExprKind::Nested(inner) = &inner.kind {
+                inner.as_ref()
+            } else {
+                inner.as_ref()
+            };
+            assert!(matches!(
+                literal.kind,
+                ExprKind::Literal(LiteralValue::Int(-2147483648))
+            ));
+            assert_eq!(
+                super::signed_int_literal_value(source),
+                None,
+                "the original INTEGER overflow cannot become a BIGINT constant"
+            );
+        }
+        for (carrier, minimum) in [
+            (DataType::Int8, i64::from(i8::MIN)),
+            (DataType::Int16, i64::from(i16::MIN)),
+            (DataType::Int32, i64::from(i32::MIN)),
+            (DataType::Int64, i64::MIN),
+        ] {
+            let literal = TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(minimum)),
+                value_type: novarocks_type_contract::FunctionValueType::new(carrier.clone(), false),
+            };
+            let unary = TypedExpr {
+                kind: ExprKind::UnaryOp {
+                    op: crate::analysis::UnOp::Negate,
+                    expr: Box::new(literal),
+                },
+                value_type: novarocks_type_contract::FunctionValueType::new(carrier, false),
+            };
+            assert_eq!(super::signed_int_literal_value(&unary), None);
+        }
+    }
+
+    #[test]
     fn substring_does_not_constant_fold_arithmetic_for_literal_range_checking() {
         let expr = analyze_projection_expr("select substring('x', 2147483647 + 1)")
-            .expect("arithmetic expression should bind through a runtime cast");
+            .expect("arithmetic expression should retain its runtime INTEGER arithmetic");
         let crate::analysis::ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected FunctionCall, got {:?}", expr.kind);
         };
         assert_eq!(args[1].value_type.data_type().clone(), DataType::Int32);
+        let crate::analysis::ExprKind::BinaryOp {
+            left, op, right, ..
+        } = &args[1].kind
+        else {
+            panic!("runtime arithmetic must not fold into a literal");
+        };
+        assert_eq!(*op, crate::analysis::BinOp::Add);
+        assert_eq!(left.value_type.data_type(), &DataType::Int32);
+        assert_eq!(right.value_type.data_type(), &DataType::Int32);
         assert!(matches!(
-            args[1].kind,
-            crate::analysis::ExprKind::Cast {
-                target: DataType::Int32,
-                ..
-            }
+            left.kind,
+            crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(2147483647))
+        ));
+        assert!(matches!(
+            right.kind,
+            crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(1))
         ));
     }
 
@@ -9919,7 +10136,7 @@ mod tests {
             ),
             ("select field(NULL, NULL)", DataType::Int32),
             ("select field(NULL, 2147483648)", DataType::Int64),
-            ("select field(NULL, NULL, 1)", DataType::Int64),
+            ("select field(NULL, NULL, 1)", DataType::Int32),
             ("select field(NULL, 2147483648, 'bad')", DataType::Float64),
         ] {
             let expr = analyze_projection_expr(sql).unwrap();

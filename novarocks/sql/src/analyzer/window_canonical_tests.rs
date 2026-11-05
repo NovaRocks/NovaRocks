@@ -658,21 +658,59 @@ fn window_canonical_exact_rebind_and_catalog_first_control_cause_never_retry() {
 }
 
 #[test]
-fn window_builtin_narrow_offsets_fail_before_canonical_coercion() {
-    for (name, offset, carrier) in [("lead", "off", "Int32"), ("lag", "off16", "Int16")] {
-        let error = analyze(
+fn window_builtin_narrow_offsets_keep_original_columns_and_nullable_canonical_casts() {
+    for (name, offset, source_type, nullable) in [
+        ("lead", "off", DataType::Int32, true),
+        ("lag", "off16", DataType::Int16, false),
+    ] {
+        let query = analyze(
             &format!("SELECT {name}(v,{offset}) OVER () FROM source"),
             &SourceCatalog {
                 offset_nullable: true,
             },
             crate::functions::builtin_sql_function_catalog(),
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), AnalyzeErrorKind::TypeMismatch);
-        assert!(error.message().contains(&format!("[Int64, {carrier}]")));
-        assert!(error.message().contains("no matching declared overload"));
-        assert!(error.span().is_some());
-        assert_eq!(error.control_error(), None);
+        .unwrap();
+        let expr = projection(&query, 0);
+        let arguments = args(expr);
+        assert_eq!(
+            arguments[1].value_type,
+            FunctionValueType::new(DataType::Int64, nullable)
+        );
+        let ExprKind::Cast {
+            expr: source,
+            target,
+            ..
+        } = &arguments[1].kind
+        else {
+            panic!("canonical column offset conversion");
+        };
+        assert_eq!(target, &DataType::Int64);
+        assert_eq!(
+            source.value_type,
+            FunctionValueType::new(source_type, nullable)
+        );
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &source.kind
+        else {
+            panic!("original offset column");
+        };
+        assert_eq!(column, offset);
+        let QueryBody::Select(select) = &query.body else {
+            panic!("select");
+        };
+        let Some(crate::analysis::Relation::Scan(scan)) = &select.from else {
+            panic!("original scan");
+        };
+        let ordinal = scan
+            .table
+            .columns
+            .iter()
+            .position(|column| column.name == offset)
+            .unwrap();
+        assert_eq!(*column_id, scan.column_ids[ordinal]);
+        assert_eq!(query.output_columns[0].value_type, expr.value_type);
     }
 }
 

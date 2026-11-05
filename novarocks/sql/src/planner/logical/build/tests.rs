@@ -1213,6 +1213,9 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
 
 #[test]
 fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
+    // Computed GROUPING arguments remain the existing Nova grammar extension.
+    // Trino 483 requires qualifiedName here; that grammar flip belongs to 5e.
+    // The public width still follows the approved INTEGER/BIGINT rule.
     let plan = plan_test_query(
         "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
              FROM t GROUP BY ROLLUP(a + 1)",
@@ -1239,7 +1242,28 @@ fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
         "Aggregate output_columns prefix must match group_by physical output order"
     );
 
-    let g_id = column_ref_id(&project.items[0].expr);
+    let grouping = &project.items[0].expr;
+    assert_eq!(
+        grouping.value_type.data_type(),
+        &arrow::datatypes::DataType::Int32
+    );
+    assert!(
+        grouping.value_type.nullable(),
+        "original narrowing CAST NULL law"
+    );
+    let ExprKind::Cast {
+        expr: mask, target, ..
+    } = &grouping.kind
+    else {
+        panic!("public GROUPING needs a real typed INTEGER projection");
+    };
+    assert_eq!(target, &arrow::datatypes::DataType::Int32);
+    assert_eq!(
+        mask.value_type.data_type(),
+        &arrow::datatypes::DataType::Int64
+    );
+    assert!(!mask.value_type.nullable());
+    let g_id = column_ref_id(mask);
     let k_id = column_ref_id(&project.items[1].expr);
     assert_eq!(
         g_id, group_ids[1],

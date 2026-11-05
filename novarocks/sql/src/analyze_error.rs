@@ -55,6 +55,11 @@ const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const TOO_MANY_ARGUMENTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.too_many_arguments"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_QUERY_SHAPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_query_shape"),
     phase: ErrorPhase::Analyze,
@@ -120,6 +125,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
+    TOO_MANY_ARGUMENTS,
     INVALID_QUERY_SHAPE,
     UNSUPPORTED_EXPRESSION,
     UNAVAILABLE_IMPLEMENTATION,
@@ -142,6 +148,7 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     InvalidLiteral,
     InvalidArgument,
+    TooManyArguments,
     InvalidQueryShape,
     UnsupportedExpression,
     /// A bound overload has no installed pure implementation.
@@ -166,6 +173,7 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
+            Self::TooManyArguments => TOO_MANY_ARGUMENTS,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
             Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
             Self::UnavailableImplementation => UNAVAILABLE_IMPLEMENTATION,
@@ -361,7 +369,12 @@ impl AnalyzeError {
             + Sync
             + 'static,
     {
-        let source = novarocks_failure_contract::SharedFailureCause::new(cause);
+        Self::shared_domain_source(novarocks_failure_contract::SharedFailureCause::new(cause))
+    }
+
+    pub(crate) fn shared_domain_source(
+        source: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
         Self {
             kind: AnalyzeErrorKind::Internal,
             message: source.detail().to_owned(),
@@ -390,6 +403,10 @@ impl AnalyzeError {
     }
     pub fn invalid_literal(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidLiteral, message, span)
+    }
+
+    pub fn too_many_arguments(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::TooManyArguments, message, span)
     }
 
     pub fn invalid_argument(message: impl Into<String>, span: Span) -> Self {
@@ -668,6 +685,7 @@ mod tests {
                 "sql.analyze.type_mismatch",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
+                "sql.analyze.too_many_arguments",
                 "sql.analyze.invalid_query_shape",
                 "sql.analyze.unsupported_expression",
                 "sql.analyze.unavailable_implementation",

@@ -79,6 +79,7 @@ impl AnalyzerContext<'_> {
             catalog: &view.default_catalog,
         };
         let child = AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: None,
@@ -875,7 +876,7 @@ mod tests {
                 D::Int64,
                 true,
             ),
-            ("SELECT 1 AS x UNION ALL SELECT 2", D::Int64, false),
+            ("SELECT 1 AS x UNION ALL SELECT 2", D::Int64, true),
         ] {
             let catalog = catalog(declaration(
                 sql,
@@ -977,7 +978,7 @@ mod tests {
 
     #[test]
     fn public_view_type_does_not_freeze_a_row_child_nonnull_fact() {
-        let body = "SELECT ROW(1) AS x";
+        let body = "SELECT ROW(CAST(1 AS BIGINT)) AS x";
         let empty = Catalog::default();
         let original = analyze(body, &empty).unwrap();
         let mut catalog = catalog(declaration(

@@ -222,6 +222,86 @@ pub(crate) fn bool_literal(
     )
 }
 
+/// Observe a fixed signed widening without changing either original binding.
+/// This is the existing six total, order/NULL-preserving signed conversions;
+/// narrowing, nominal, unsigned, temporal and floating domains are excluded.
+pub(crate) fn lossless_signed_widening(
+    source: &novarocks_type_contract::FunctionValueType,
+    result: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    source.nullable() == result.nullable() && signed_widening_domains(source, result)
+}
+
+/// A non-null source cannot acquire a NULL value through this total widening.
+/// A wider result NULL promise still belongs to its original cast author.
+pub(crate) fn nonnull_signed_literal_widening(
+    source: &novarocks_type_contract::FunctionValueType,
+    result: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    !source.nullable() && signed_widening_domains(source, result)
+}
+
+fn signed_widening_domains(
+    source: &novarocks_type_contract::FunctionValueType,
+    result: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    use novarocks_type_contract::ValueLogicalType;
+    source.logical_type() == ValueLogicalType::Physical
+        && result.logical_type() == ValueLogicalType::Physical
+        && matches!(
+            (source.data_type(), result.data_type()),
+            (
+                DataType::Int8,
+                DataType::Int16 | DataType::Int32 | DataType::Int64
+            ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
+                | (DataType::Int32, DataType::Int64)
+        )
+}
+
+pub(crate) fn signed_integer_fits(value: i64, data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Int8 => i8::try_from(value).is_ok(),
+        DataType::Int16 => i16::try_from(value).is_ok(),
+        DataType::Int32 => i32::try_from(value).is_ok(),
+        DataType::Int64 => true,
+        _ => false,
+    }
+}
+
+/// An optimization fact about an already signed literal/constant, not a fold.
+/// Leave the source and every CAST in place. Strict widening permits at most
+/// three CAST edges; no expression evaluation, allocation or failure retry.
+pub(crate) fn signed_integer_literal(arena: &ScalarArena, mut expression: ScalarId) -> Option<i64> {
+    loop {
+        let value_type = arena.value_type(expression);
+        if value_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
+            return None;
+        }
+        match arena.node(expression) {
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value)))
+                if !value_type.nullable()
+                    && signed_integer_fits(*value, value_type.data_type()) =>
+            {
+                return Some(*value);
+            }
+            ScalarNode::Constant(value)
+                if !value_type.nullable()
+                    && signed_integer_fits(0, value_type.data_type())
+                    && value.value_type() == value_type =>
+            {
+                return value.try_i64().ok().flatten();
+            }
+            ScalarNode::Cast { child, target, .. }
+                if target == value_type.data_type()
+                    && nonnull_signed_literal_widening(arena.value_type(*child), value_type) =>
+            {
+                expression = *child
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn int_literal(
     arena: &mut ScalarArena,
     value: i64,
@@ -967,6 +1047,70 @@ mod tests {
             ScalarNode::ColumnRef(ColumnId(id)),
             novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         )
+    }
+
+    #[test]
+    fn signed_literal_widening_observation_keeps_sources_and_refuses_other_domains() {
+        use novarocks_type_contract::FunctionValueType as V;
+        let mut arena = ScalarArena::new();
+        let source = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(127))),
+            V::new(DataType::Int32, false),
+        );
+        let cast = arena.intern(
+            ScalarNode::Cast {
+                child: source,
+                target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            V::new(DataType::Int64, false),
+        );
+        assert_eq!(signed_integer_literal(&arena, cast), Some(127));
+        let nullable_cast = arena.intern(
+            ScalarNode::Cast {
+                child: source,
+                target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            V::new(DataType::Int64, true),
+        );
+        assert!(
+            !lossless_signed_widening(arena.value_type(source), arena.value_type(nullable_cast)),
+            "column contract remains strict"
+        );
+        assert_eq!(
+            signed_integer_literal(&arena, nullable_cast),
+            Some(127),
+            "the result's NULL promise does not turn a known non-null source into NULL"
+        );
+        assert!(matches!(arena.node(cast), ScalarNode::Cast { child, .. } if *child == source));
+        assert_eq!(arena.value_type(source), &V::new(DataType::Int32, false));
+        for (input, output, nullable) in [
+            (DataType::Int64, DataType::Int32, false),
+            (DataType::Int32, DataType::Float64, false),
+            (DataType::Date32, DataType::Int64, false),
+            (DataType::Int32, DataType::Int64, true),
+        ] {
+            let child = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+                V::new(input, nullable),
+            );
+            let cast = arena.intern(
+                ScalarNode::Cast {
+                    child,
+                    target: output.clone(),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+                V::new(output, nullable),
+            );
+            assert_eq!(signed_integer_literal(&arena, cast), None);
+        }
+        let null = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            V::new(DataType::Int32, true),
+        );
+        assert_eq!(signed_integer_literal(&arena, null), None);
     }
 
     #[test]

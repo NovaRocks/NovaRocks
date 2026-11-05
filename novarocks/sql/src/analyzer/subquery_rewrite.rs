@@ -3014,6 +3014,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
             control: self.control,
             constant_policy: self.constant_policy,
@@ -3081,13 +3082,20 @@ impl<'a> AnalyzerContext<'a> {
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         let body = query.body.as_ref();
-        let result = match body {
+        let select = match body {
+            ast::SetExpr::Select(select) => Some(select.as_ref()),
+            _ => None,
+        };
+        let result = ctx.with_grouping_scope(select, |ctx| match body {
             ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
                 let body = QueryBody::Select(sel);
 
                 let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                if let QueryBody::Select(select) = &body {
+                    ctx.validate_grouping_calls(&select.group_by)?;
+                }
                 let limit = super::helpers::extract_limit(query)?;
                 let offset = super::helpers::extract_offset(query)?;
 
@@ -3121,7 +3129,7 @@ impl<'a> AnalyzerContext<'a> {
                     self.new_scope(),
                 ))
             }
-        };
+        });
 
         if let Some(child_ctx) = maybe_child_ctx {
             self.absorb_semantic_scope(&child_ctx);
@@ -3192,6 +3200,10 @@ impl<'a> AnalyzerContext<'a> {
             None => None,
         };
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            *state.from_scope.borrow_mut() = Some(merged_scope.clone());
+            state.enabled.set(true);
+        }
         // --- SELECT list ---
         // Use inner_scope for wildcard expansion (SELECT * should only produce
         // the subquery's own columns, not outer scope columns) but use
@@ -3208,6 +3220,9 @@ impl<'a> AnalyzerContext<'a> {
                 qualify_inner_shadowing_column_refs(item.expr.clone(), &inner_scope, outer_scope);
         }
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(false);
+        }
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
             ast::GroupBy::None => Vec::new(),
@@ -3256,6 +3271,9 @@ impl<'a> AnalyzerContext<'a> {
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
         let has_aggregation = !group_by.is_empty() || has_agg_in_select;
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(true);
+        }
         // --- HAVING ---
         let having = match &select.having {
             Some(expr) => {
@@ -3289,6 +3307,8 @@ impl<'a> AnalyzerContext<'a> {
             }
             None => None,
         };
+
+        self.validate_grouping_calls(&group_by)?;
 
         let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
 

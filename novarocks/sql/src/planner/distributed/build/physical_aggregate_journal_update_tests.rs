@@ -266,7 +266,7 @@ fn journal_update_literal_keeps_original_captured_constant_and_physical_pool_bac
     let control = Control::default();
     assert_eq!(
         value
-            .int64_observed(CompilePhase::FunctionSpecialization, &control)
+            .signed_integer_observed(CompilePhase::FunctionSpecialization, &control)
             .unwrap(),
         Some(7)
     );

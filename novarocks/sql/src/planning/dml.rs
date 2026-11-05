@@ -4622,7 +4622,7 @@ mod tests {
         assert_eq!(source.output_columns()[0].name, "ID");
         assert_eq!(
             source.output_columns()[0].value_type.data_type(),
-            &arrow::datatypes::DataType::Int64
+            &arrow::datatypes::DataType::Int32
         );
         let lower = compile("SELECT id FROM (SELECT 1 AS id) t").unwrap();
         assert_ne!(source.capture_fingerprint(), lower.capture_fingerprint());

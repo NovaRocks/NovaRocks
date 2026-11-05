@@ -180,11 +180,11 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 29
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES (1, 1), (2, 1), (3, 1), (4, 18446744073709551620), (5, 18446744073709551620), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES (1, 1), (2, 1), (3, 1), (4, CAST('18446744073709551620' AS LARGEINT)), (5, CAST('18446744073709551620' AS LARGEINT)), (6, 3);
 
 -- query 30
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, 18446744073709551620), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, CAST('18446744073709551620' AS LARGEINT)), (3, 3);
 
 -- query 31
 -- @order_sensitive=true

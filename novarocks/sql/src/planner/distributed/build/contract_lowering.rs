@@ -19548,6 +19548,44 @@ mod tests {
     }
 
     #[test]
+    fn analyzed_integer_literals_freeze_as_exact_constant_references() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        for (literal, carrier, expected) in [
+            ("-2147483648", DataType::Int32, i64::from(i32::MIN)),
+            ("2147483647", DataType::Int32, i64::from(i32::MAX)),
+            ("2147483648", DataType::Int64, i64::from(i32::MAX) + 1),
+            ("-9223372036854775808", DataType::Int64, i64::MIN),
+        ] {
+            let sql = format!("SELECT {literal}");
+            let statements = novarocks_parser::parse(&sql).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query");
+            };
+            let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            let crate::analysis::QueryBody::Select(select) = resolved.body else {
+                panic!("select");
+            };
+            let source = select.projection[0].expr.clone();
+            assert_eq!(source.value_type.data_type(), &carrier);
+            let plan = finish_for_test(&values(
+                vec![column(1, "value", carrier.clone(), false)],
+                vec![vec![source]],
+            ))
+            .unwrap();
+            let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+            let root = fragment.nodes().get(&fragment.root()).unwrap();
+            let NodeKind::Values { rows } = &root.kind else {
+                panic!("values");
+            };
+            let expression = fragment.expressions().get(rows[0][0]).unwrap();
+            assert_eq!(expression.ty, ValueType::new(carrier.clone(), false));
+            let constant = checked_constant_for_test(&plan, expression);
+            assert_eq!(constant.pool().array().data_type(), &carrier);
+            assert_eq!(constant.try_i64().unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
     fn narrowed_integer_literal_keeps_its_checked_width_without_guessed_source_cast() {
         let output = column(1, "small", DataType::Int32, false);
         let final_plan =

@@ -351,7 +351,7 @@ mod view_definition_tests {
         assert_eq!(columns[0].name.as_ref(), "FirstName");
         assert_eq!(
             columns[0].value_type.data_type(),
-            &arrow::datatypes::DataType::Int64
+            &arrow::datatypes::DataType::Int32
         );
     }
 

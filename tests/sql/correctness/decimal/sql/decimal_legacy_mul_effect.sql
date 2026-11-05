@@ -24,7 +24,7 @@
 SET sql_mode=32;
 SET decimal_overflow_to_double=false;
 CREATE TABLE ${case_db}.legacy_mul_effect (k INT,a DECIMAL(38,0)) TBLPROPERTIES ("format-version"="3");
-INSERT INTO ${case_db}.legacy_mul_effect VALUES (1,1),(2,99999999999999999999999999999999999999),(3,NULL);
+INSERT INTO ${case_db}.legacy_mul_effect VALUES (1,1),(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))),(3,NULL);
 
 -- query 2
 SELECT k,CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect ORDER BY k;

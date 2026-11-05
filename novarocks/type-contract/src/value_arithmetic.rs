@@ -111,6 +111,33 @@ mod tests {
     }
 
     #[test]
+    fn signed_common_width_keeps_the_original_domain_and_nullable_union() {
+        let small = FunctionValueType::new(DataType::Int16, false);
+        for nullable in [false, true] {
+            let integer = FunctionValueType::new(DataType::Int32, nullable);
+            for (left, right) in [(&small, &integer), (&integer, &small)] {
+                for op in [
+                    ArithmeticOperator::Add,
+                    ArithmeticOperator::Subtract,
+                    ArithmeticOperator::Multiply,
+                    ArithmeticOperator::Divide,
+                    ArithmeticOperator::Modulo,
+                ] {
+                    let expected = FunctionValueType::new(DataType::Int32, nullable);
+                    assert_eq!(
+                        arithmetic_result_value_type_with_op(left, right, op),
+                        Some(expected)
+                    );
+                    assert_eq!(
+                        arithmetic_result_value_shape_with_op(left, right, op),
+                        Some((DataType::Int32, ValueLogicalType::Physical))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn classifications_preserve_all_physical_numeric_carriers_and_exact_largeint() {
         for data_type in [
             DataType::Int8,

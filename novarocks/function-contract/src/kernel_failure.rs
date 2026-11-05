@@ -26,6 +26,8 @@ use std::num::NonZeroU16;
 
 pub const NUMERIC_OUT_OF_RANGE: FailureReason =
     FailureReason::new(domain::KERNEL, NonZeroU16::new(41).unwrap());
+pub const DIVISION_BY_ZERO: FailureReason =
+    FailureReason::new(domain::KERNEL, NonZeroU16::new(43).unwrap());
 
 // These reasons belong to the actual pure-function preparation authors.
 // Consumers may preserve their identity; the constants select no SQL policy.

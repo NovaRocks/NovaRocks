@@ -556,6 +556,12 @@ fn ensure_comparable_literal(arena: &ScalarArena, expr: ScalarId) -> Option<()> 
 }
 
 fn compare_literals(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> Option<Ordering> {
+    if let (Some(left), Some(right)) = (
+        scalar_expr::signed_integer_literal(arena, left),
+        scalar_expr::signed_integer_literal(arena, right),
+    ) {
+        return Some(left.cmp(&right));
+    }
     // Only the checked signed family is new. Keep every legacy literal-only
     // numeric algorithm below unchanged, including exact decimal strings.
     if matches!(arena.node(left), ScalarNode::Constant(_))
@@ -801,31 +807,14 @@ fn is_constraint_operand(arena: &ScalarArena, expr: ScalarId) -> bool {
 /// Source dependency only: callers must retain the original comparison operand.
 /// Six signed widenings are total, NULL-preserving and strictly order-preserving.
 fn widening_source(arena: &ScalarArena, expr: ScalarId) -> Option<ScalarId> {
-    use novarocks_type_contract::ValueLogicalType;
     let ScalarNode::Cast { child, target, .. } = arena.node(expr) else {
         return None;
     };
-    if !is_column_ref(arena, *child) {
+    if !is_column_ref(arena, *child) || arena.data_type(expr) != target {
         return None;
     }
-    let source = arena.value_type(*child);
-    let result = arena.value_type(expr);
-    if source.logical_type() != ValueLogicalType::Physical
-        || result.logical_type() != ValueLogicalType::Physical
-        || source.nullable() != result.nullable()
-        || result.data_type() != target
-    {
-        return None;
-    }
-    matches!(
-        (source.data_type(), target),
-        (
-            DataType::Int8,
-            DataType::Int16 | DataType::Int32 | DataType::Int64
-        ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
-            | (DataType::Int32, DataType::Int64)
-    )
-    .then_some(*child)
+    scalar_expr::lossless_signed_widening(arena.value_type(*child), arena.value_type(expr))
+        .then_some(*child)
 }
 
 fn same_complete_type(
@@ -947,10 +936,11 @@ fn checked_signed_bound(arena: &ScalarArena, id: ScalarId) -> Option<i64> {
 }
 
 fn is_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
-    matches!(
-        arena.node(expr),
-        ScalarNode::Literal(_) | ScalarNode::Constant(_)
-    )
+    scalar_expr::signed_integer_literal(arena, expr).is_some()
+        || matches!(
+            arena.node(expr),
+            ScalarNode::Literal(_) | ScalarNode::Constant(_)
+        )
 }
 
 fn binary_bool(

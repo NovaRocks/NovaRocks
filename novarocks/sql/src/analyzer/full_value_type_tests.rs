@@ -189,7 +189,7 @@ fn unnest_uses_complete_selected_relation_domain() {
 #[test]
 fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
     for sql in [
-        "SELECT 9223372036854775808",
+        "SELECT CAST('9223372036854775808' AS LARGEINT)",
         "SELECT CAST(NULL AS LARGEINT)",
     ] {
         let resolved = analyze(sql);

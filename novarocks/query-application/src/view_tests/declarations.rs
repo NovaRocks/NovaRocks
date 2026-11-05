@@ -110,7 +110,7 @@ fn local_declarations_keep_natural_names_complete_types_and_immutable_versions()
     assert_eq!(view.raw_sql.as_ref(), "SELECT /* original */ 1 AS public_x");
     assert_eq!(
         view.columns[0].value_type.data_type(),
-        &arrow::datatypes::DataType::Int64
+        &arrow::datatypes::DataType::Int32
     );
     assert_eq!(view.columns[0].name.as_ref(), "public_x");
     assert!(view.columns[0].value_type.nullable());

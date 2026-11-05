@@ -299,7 +299,7 @@ fn public_arithmetic_recipe_equals_frozen_program_recipe_for_every_operator() {
         (
             BinaryOperator::Divide,
             ArithmeticOperator::Divide,
-            DataType::Float64,
+            DataType::Int64,
         ),
         (
             BinaryOperator::Modulo,

@@ -37,6 +37,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("PERMISSION_DENIED", 4, "USER_ERROR"),
     ("NOT_FOUND", 5, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
+    ("DIVISION_BY_ZERO", 8, "USER_ERROR"),
     ("INVALID_VIEW", 11, "USER_ERROR"),
     ("ALREADY_EXISTS", 12, "USER_ERROR"),
     ("NOT_SUPPORTED", 13, "USER_ERROR"),
@@ -55,6 +56,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("INVALID_LITERAL", 59, "USER_ERROR"),
     ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
+    ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
@@ -122,6 +124,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
         "sql.parse.unsupported_statement"
         | "sql.analyze.unsupported_expression"
@@ -147,6 +150,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.control"
         | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
         "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
+        "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
         "query.execution.cancelled" => "USER_CANCELED",
         "query.execution.deadline_exceeded" => "EXCEEDED_TIME_LIMIT",
         "query.execution.resource_exhausted" | "query.execution.representation" => {
@@ -185,6 +189,10 @@ fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
         (
             AnalyzeError::view_is_recursive(detail, span),
             "VIEW_IS_RECURSIVE",
+        ),
+        (
+            AnalyzeError::too_many_arguments(detail, span),
+            "TOO_MANY_ARGUMENTS",
         ),
     ] {
         let service = QueryServiceError::from_user_error(analysis.to_user_error(Some(sql)));
@@ -507,6 +515,38 @@ fn already_exists_requires_the_original_connector_data_fact() {
             wire
         );
         assert_eq!(service.execution_failure(), Some(&input));
+    }
+}
+
+#[test]
+fn integer_data_reasons_survive_execution_and_service_projection() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    // Stable function facts, independently paired with the Trino 483 oracle.
+    for (reason, expected) in [(41, "NUMERIC_VALUE_OUT_OF_RANGE"), (43, "DIVISION_BY_ZERO")] {
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(reason).unwrap()),
+            ),
+            SafeDetail::truncating("unrelated safe detail"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1 / 0",
+        });
+        assert_wire(&wire, expected);
+        let service =
+            QueryServiceError::from_execution_failure(error.execution_failure().unwrap().clone());
+        assert_eq!(
+            wire,
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "SELECT 1 / 0"
+            })
+        );
     }
 }
 

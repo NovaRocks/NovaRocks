@@ -336,6 +336,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
+        grouping_scope: std::cell::RefCell::new(None),
         catalog,
         current_database,
         function_catalog,
@@ -365,7 +366,29 @@ fn analyze_with_factory_and_function_catalog_inner(
 // Analyzer context
 // ---------------------------------------------------------------------------
 
+/// Analysis state belongs to one SELECT, never to an enclosing query's children.
+struct GroupingAnalysis {
+    select_span: novarocks_parser::Span,
+    keys: Vec<ast::Expr>,
+    repeat: bool,
+    enabled: std::cell::Cell<bool>,
+    next_mask_index: std::cell::Cell<usize>,
+    from_scope: std::cell::RefCell<Option<AnalyzerScope>>,
+    resolved_keys: std::cell::RefCell<Option<Vec<TypedExpr>>>,
+    calls: std::cell::RefCell<Vec<GroupingCall>>,
+}
+
+#[derive(Clone)]
+struct GroupingCall {
+    syntax: ast::FunctionCall,
+    name: String,
+    columns: Vec<String>,
+    typed_arguments: Vec<TypedExpr>,
+    column_id: Option<ColumnId>,
+}
+
 pub(super) struct AnalyzerContext<'a> {
+    grouping_scope: std::cell::RefCell<Option<std::rc::Rc<GroupingAnalysis>>>,
     view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
@@ -403,6 +426,269 @@ impl<'a> AnalyzerContext<'a> {
         .map_err(AnalyzeError::control)
     }
 
+    /// The closure ensures restoration on every ordinary success/error exit.
+    /// Owned AST/state avoids a borrow into a nested query or a RefCell loan
+    /// across recursive expression analysis.
+    fn with_grouping_scope<T>(
+        &self,
+        select: Option<&ast::Select>,
+        analyze: impl FnOnce(&Self) -> Result<T, AnalyzeError>,
+    ) -> Result<T, AnalyzeError> {
+        let state = select.map(|select| {
+            let repeat = self.extract_repeat_from_group_by(select);
+            let keys = if let Some(spec) = &repeat {
+                spec.all_group_by_exprs.clone()
+            } else if let ast::GroupBy::Expressions { expressions, .. } = &select.group_by {
+                expressions.clone()
+            } else {
+                Vec::new()
+            };
+            std::rc::Rc::new(GroupingAnalysis {
+                select_span: select.span,
+                keys,
+                repeat: repeat.is_some(),
+                enabled: std::cell::Cell::new(false),
+                next_mask_index: std::cell::Cell::new(0),
+                from_scope: std::cell::RefCell::new(None),
+                resolved_keys: std::cell::RefCell::new(None),
+                calls: std::cell::RefCell::new(Vec::new()),
+            })
+        });
+        let previous = self.grouping_scope.replace(state);
+        let result = analyze(self);
+        self.grouping_scope.replace(previous);
+        result
+    }
+
+    fn analyze_grouping_function(
+        &self,
+        function: &ast::FunctionCall,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        use crate::analysis::LiteralValue;
+        use novarocks_type_contract::FunctionValueType;
+        let grouping = function.name.parts[0]
+            .value
+            .eq_ignore_ascii_case("grouping");
+        let count = function.arguments.len();
+        // Count occurrences, including duplicate arguments, before analyzing
+        // an argument. This is Trino's GROUPING width/arity decision point.
+        if grouping && count > 63 {
+            return Err(AnalyzeError::too_many_arguments(
+                "GROUPING supports at most 63 arguments",
+                function.span,
+            ));
+        }
+        if count == 0 {
+            return Err(AnalyzeError::invalid_argument(
+                "GROUPING requires at least one argument",
+                function.span,
+            ));
+        }
+        let state = self.grouping_scope.borrow().clone().ok_or_else(|| {
+            AnalyzeError::invalid_argument("GROUPING requires a GROUP BY clause", function.span)
+        })?;
+        if !state.enabled.get() || state.keys.is_empty() {
+            return Err(AnalyzeError::invalid_argument(
+                "GROUPING arguments must be grouping columns",
+                function.span,
+            ));
+        }
+        let from_scope = state.from_scope.borrow().clone();
+        let argument_scope = from_scope.as_ref().unwrap_or(scope);
+        let mut typed_arguments = Vec::with_capacity(count);
+        for argument in &function.arguments {
+            self.check_control()?;
+            typed_arguments.push(self.analyze_expr(argument, argument_scope)?);
+        }
+        let public_type = if grouping && count <= 31 {
+            DataType::Int32
+        } else {
+            DataType::Int64
+        };
+        // Retries for alias/HAVING/ORDER BY resolution reuse only the same
+        // original call occurrence, including its arguments and source span.
+        let existing = state
+            .calls
+            .borrow()
+            .iter()
+            .find(|call| call.syntax == *function)
+            .cloned();
+        let call = if let Some(call) = existing {
+            call
+        } else {
+            let index = state.next_mask_index.get();
+            state.next_mask_index.set(index + 1);
+            let name = format!("__grouping_fn_{index}");
+            let column_id = state.repeat.then(|| {
+                self.alloc_column_id(
+                    None,
+                    name.clone(),
+                    FunctionValueType::new(DataType::Int64, false),
+                )
+            });
+            let call = GroupingCall {
+                syntax: function.clone(),
+                name,
+                columns: Vec::new(),
+                typed_arguments,
+                column_id,
+            };
+            state.calls.borrow_mut().push(call.clone());
+            call
+        };
+        if !state.repeat {
+            return Ok(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(0)),
+                value_type: FunctionValueType::new(public_type, false),
+            });
+        }
+        let mask = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: call.column_id.expect("Repeat call has an internal mask"),
+                qualifier: None,
+                column: call.name,
+            },
+            value_type: FunctionValueType::new(DataType::Int64, false),
+        };
+        if public_type == DataType::Int64 {
+            return Ok(mask);
+        }
+        // The public INTEGER is a real typed conversion. Preserve its author's
+        // NULL law and the original internal non-null BIGINT Repeat slot.
+        let target = helpers::declared_cast_value_type(
+            &mask,
+            FunctionValueType::new(public_type, true),
+            self.control,
+        )?;
+        self.cast_to_value_type(mask, target, function.span)
+    }
+
+    /// Reuse the completed GROUP BY author's actual expressions, including
+    /// ordinal/alias expansion. Public types are already fixed before parent
+    /// binding; this step grants membership and canonical Repeat key identity.
+    fn validate_grouping_calls(&self, group_by: &[TypedExpr]) -> Result<(), AnalyzeError> {
+        let Some(state) = self.grouping_scope.borrow().clone() else {
+            return Ok(());
+        };
+        let existing = state.resolved_keys.borrow().clone();
+        let keys = if let Some(keys) = existing {
+            keys
+        } else {
+            let keys = group_by.to_vec();
+            *state.resolved_keys.borrow_mut() = Some(keys.clone());
+            keys
+        };
+        let mut calls = state.calls.borrow().clone();
+        for call in &mut calls {
+            call.columns.clear();
+            for (argument, syntax) in call.typed_arguments.iter().zip(&call.syntax.arguments) {
+                let mut matched = None;
+                for (index, key) in keys.iter().enumerate() {
+                    self.check_control()?;
+                    let equal = match (&argument.kind, &key.kind) {
+                        (
+                            ExprKind::ColumnRef {
+                                column_id: left, ..
+                            },
+                            ExprKind::ColumnRef {
+                                column_id: right, ..
+                            },
+                        ) => left == right,
+                        _ => crate::analysis::expr_identity::typed_expr_semantically_eq(
+                            argument,
+                            key,
+                            self.control,
+                        )
+                        .map_err(|error| {
+                            use crate::compiler::SqlCompileError;
+                            use novarocks_type_contract::CompileControlError;
+                            match error {
+                                SqlCompileError::Cancelled => {
+                                    AnalyzeError::control(CompileControlError::Cancelled)
+                                }
+                                SqlCompileError::DeadlineExceeded => {
+                                    AnalyzeError::control(CompileControlError::DeadlineExceeded)
+                                }
+                                SqlCompileError::ResourceExhausted => {
+                                    AnalyzeError::control(CompileControlError::ResourceExhausted)
+                                }
+                                SqlCompileError::Analyze(error) => error,
+                                SqlCompileError::CompilationSource(source) => {
+                                    AnalyzeError::shared_domain_source(source)
+                                }
+                                other => AnalyzeError::internal(other.to_string()),
+                            }
+                        })?,
+                    };
+                    if equal {
+                        matched = Some(index);
+                        break;
+                    }
+                }
+                let Some(index) = matched else {
+                    return Err(AnalyzeError::invalid_argument(
+                        "GROUPING arguments must be grouping columns",
+                        syntax.span(),
+                    ));
+                };
+                let canonical = state.keys.get(index).map(expr_syntax_key).ok_or_else(|| {
+                    AnalyzeError::internal("GROUP BY key ordinal is missing its original syntax")
+                })?;
+                call.columns.push(canonical);
+            }
+        }
+        *state.calls.borrow_mut() = calls;
+        Ok(())
+    }
+
+    fn append_grouping_calls(&self, select: &mut ResolvedSelect) {
+        let state = self.grouping_scope.borrow().clone();
+        let Some(state) = state else {
+            return;
+        };
+        let Some(repeat) = &mut select.repeat else {
+            return;
+        };
+        for call in state.calls.borrow().iter() {
+            if repeat
+                .grouping_fn_ids
+                .iter()
+                .any(|(_, id)| Some(*id) == call.column_id)
+            {
+                continue;
+            }
+            let Some(column_id) = call.column_id else {
+                continue;
+            };
+            repeat
+                .grouping_fn_args
+                .push((call.name.clone(), call.columns.clone()));
+            repeat.grouping_fn_ids.push((call.name.clone(), column_id));
+            select.group_by.push(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier: None,
+                    column: call.name.clone(),
+                },
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            });
+        }
+    }
+
+    fn grouping_display_name(&self, expression: &ast::Expr) -> String {
+        let state = self.grouping_scope.borrow().clone();
+        let Some(state) = state else {
+            return expr_display_name(expression);
+        };
+        if !state.repeat {
+            return expr_display_name(expression);
+        }
+        let calls = state.calls.borrow().clone();
+        let mut display = GroupingDisplayFolder { calls: &calls };
+        expr_display_name(&ast::Fold::fold_expr(&mut display, expression.clone()))
+    }
+
     fn with_sql_semantics_scope<T>(
         &self,
         settings: crate::sql_mode::SqlSemanticSettings,
@@ -412,6 +698,7 @@ impl<'a> AnalyzerContext<'a> {
             return analyze(self);
         }
         let child = AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(self.grouping_scope.borrow().clone()),
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
@@ -489,6 +776,7 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         let mut child_ctx = AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             control: self.control,
             constant_policy: self.constant_policy,
             materialized_values: self.materialized_values,
@@ -552,32 +840,41 @@ impl<'a> AnalyzerContext<'a> {
             (None, Vec::new())
         };
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
+        let select = match query.body.as_ref() {
+            ast::SetExpr::Select(select) => Some(select.as_ref()),
+            _ => None,
+        };
+        let result = ctx.with_grouping_scope(select, |ctx| {
+            // Analyze body (SELECT / SetOperation / VALUES)
+            let (mut body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
 
-        // Analyze body (SELECT / SetOperation / VALUES)
-        let (body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
+            // Analyze ORDER BY
+            let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+            if let QueryBody::Select(select) = &mut body {
+                ctx.validate_grouping_calls(&select.group_by)?;
+                ctx.append_grouping_calls(select);
+            }
 
-        // Analyze ORDER BY
-        let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+            // Extract LIMIT / OFFSET
+            let limit = extract_limit(query)?;
+            let offset = extract_offset(query)?;
 
-        // Extract LIMIT / OFFSET
-        let limit = extract_limit(query)?;
-        let offset = extract_offset(query)?;
+            // Build output columns from the body
+            let output_columns = body_output;
 
+            Ok(ResolvedQuery {
+                body,
+                order_by,
+                limit,
+                offset,
+                output_columns,
+                local_cte_ids,
+            })
+        });
         if let Some(child_ctx) = maybe_child_ctx {
             self.absorb_semantic_scope(&child_ctx);
         }
-
-        // Build output columns from the body
-        let output_columns = body_output;
-
-        Ok(ResolvedQuery {
-            body,
-            order_by,
-            limit,
-            offset,
-            output_columns,
-            local_cte_ids,
-        })
+        result
     }
 
     /// Analyze a SetExpr and return (QueryBody, output_columns).
@@ -587,6 +884,14 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
         match set_expr {
             ast::SetExpr::Select(s) => {
+                let same_select = self
+                    .grouping_scope
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|state| state.select_span == s.span);
+                if !same_select {
+                    return self.with_grouping_scope(Some(s), |ctx| ctx.analyze_set_expr(set_expr));
+                }
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
                 if let Some(repeat_spec) = self.extract_repeat_from_group_by(s) {
                     return self.resolve_repeat_group_by(s, &repeat_spec);
@@ -947,10 +1252,17 @@ impl<'a> AnalyzerContext<'a> {
             None => None,
         };
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            *state.from_scope.borrow_mut() = Some(scope.clone());
+            state.enabled.set(true);
+        }
         // --- SELECT list (before GROUP BY so aliases are available) ---
         let (projection, mut output_columns) =
             self.analyze_projection(&select.projection, &scope)?;
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(false);
+        }
         // --- GROUP BY (with SELECT alias fallback) ---
         let group_by_exprs = match &select.group_by {
             ast::GroupBy::None => Vec::new(),
@@ -1067,6 +1379,9 @@ impl<'a> AnalyzerContext<'a> {
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
         let has_aggregation = !group_by.is_empty() || has_agg_in_select;
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(true);
+        }
         // --- HAVING ---
         // Resolve against the FROM scope. If a HAVING reference matches a SELECT
         // alias, substitute with the aliased expression so the emitter sees the
@@ -1096,6 +1411,8 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // --- DISTINCT ---
+        self.validate_grouping_calls(&group_by)?;
+
         let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
 
         let mut resolved_select = ResolvedSelect {
@@ -1637,128 +1954,48 @@ impl<'a> AnalyzerContext<'a> {
             grouping_ids.push(bitmap);
         }
 
-        // Scan ALL GROUPING() calls (top-level and nested) in projection,
-        // assign each a unique marker value, and record metadata for RepeatInfo.
-        // Use negative marker values (-9000, -9001, ...) so they're distinguishable
-        // from real literals after analysis.
-        let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
-        let mut next_marker: i64 = -9000;
-
-        let replace_grouping_with_marker =
-            |expr: &ast::Expr,
-             args: &mut Vec<(String, Vec<String>)>,
-             marker: &mut i64|
-             -> ast::Expr { replace_grouping_calls_with_markers(expr, args, marker) };
-
-        let mut modified_projection = Vec::new();
-        for item in &select.projection {
-            match item {
-                ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
-                    let rewritten =
-                        replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
-                    modified_projection.push(ast::SelectItem::ExprWithAlias {
-                        expr: rewritten,
-                        alias: alias.clone(),
-                        explicit_as: true,
-                        span: item.span(),
-                    });
-                }
-                ast::SelectItem::UnnamedExpr(expr) => {
-                    let rewritten =
-                        replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
-                    modified_projection.push(ast::SelectItem::UnnamedExpr(rewritten));
-                }
-                other => modified_projection.push(other.clone()),
-            }
-        }
-
-        // Build modified SELECT with the union of all grouping keys in GROUP BY.
+        // Analyze the original expressions with real, query-local mask
+        // references. Only the GROUP BY key union is expanded for Repeat.
         let mut modified_select = select.clone();
         modified_select.group_by = ast::GroupBy::Expressions {
             expressions: repeat_spec.all_group_by_exprs.clone(),
             span: select.span,
         };
-        modified_select.projection = modified_projection;
-
-        // Replace GROUPING() in HAVING too.
-        if let Some(ref having_expr) = modified_select.having {
-            modified_select.having = Some(replace_grouping_calls_with_markers(
-                having_expr,
-                &mut grouping_fn_args,
-                &mut next_marker,
-            ));
-        }
-        let emitted_grouping_marker_count = grouping_fn_args.len();
-
-        // Analyze the SELECT once with all GROUP BY keys active.
         let (mut sel, mut cols) = self.analyze_select(&modified_select)?;
-
-        // When no GROUPING() calls exist, synthesize one for the first rollup
-        // column so that __grouping_fn_0 is always in the GROUP BY.  This
-        // ensures ROLLUP levels are distinguishable even when grouped columns
-        // happen to have the same values (e.g., all NULLs).
-        if grouping_fn_args.is_empty() && !all_rollup_columns.is_empty() {
-            let virtual_name = "__grouping_fn_0".to_string();
-            grouping_fn_args.push((virtual_name, all_rollup_columns.clone()));
-        }
-        // Also add each GROUPING() virtual column as a GROUP BY key so it
-        // passes through the Aggregate operator.
-        let mut grouping_fn_ids: Vec<(String, ColumnId)> =
-            Vec::with_capacity(grouping_fn_args.len());
-        for (fn_name, _) in &grouping_fn_args {
-            let column_id = self.alloc_column_id(
+        let state = self
+            .grouping_scope
+            .borrow()
+            .clone()
+            .expect("SELECT grouping scope installed");
+        let calls = state.calls.borrow().clone();
+        let mut grouping_fn_args: Vec<_> = calls
+            .iter()
+            .map(|call| (call.name.clone(), call.columns.clone()))
+            .collect();
+        let mut grouping_fn_ids: Vec<_> = calls
+            .iter()
+            .map(|call| (call.name.clone(), call.column_id.expect("Repeat call mask")))
+            .collect();
+        if calls.is_empty() && !all_rollup_columns.is_empty() {
+            let name = "__grouping_fn_0".to_string();
+            state.next_mask_index.set(1);
+            let id = self.alloc_column_id(
                 None,
-                fn_name.clone(),
+                name.clone(),
                 novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
-            grouping_fn_ids.push((fn_name.clone(), column_id));
+            grouping_fn_args.push((name.clone(), all_rollup_columns.clone()));
+            grouping_fn_ids.push((name, id));
+        }
+        for (name, column_id) in &grouping_fn_ids {
             sel.group_by.push(TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id,
+                    column_id: *column_id,
                     qualifier: None,
-                    column: fn_name.clone(),
+                    column: name.clone(),
                 },
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             });
-        }
-
-        // Post-analysis fixup: replace GROUPING() marker literals in the
-        // resolved projection with ColumnRef to the virtual slot names.
-        // Markers are Literal(Int(-9000)), Literal(Int(-9001)), etc.
-        // Each maps to grouping_fn_args[marker - (-9000)].
-        for item in &mut sel.projection {
-            item.expr = replace_grouping_markers_in_typed_expr(
-                &item.expr,
-                &grouping_fn_args,
-                &grouping_fn_ids,
-                emitted_grouping_marker_count,
-            );
-        }
-        if let Some(having) = sel.having.as_mut() {
-            *having = replace_grouping_markers_in_typed_expr(
-                having,
-                &grouping_fn_args,
-                &grouping_fn_ids,
-                emitted_grouping_marker_count,
-            );
-        }
-        if let Some(from) = sel.from.as_mut() {
-            replace_grouping_markers_in_relation(
-                from,
-                &grouping_fn_args,
-                &grouping_fn_ids,
-                emitted_grouping_marker_count,
-            );
-        }
-        for spec in &mut sel.predicate_apply_specs {
-            if let Some(in_lhs) = spec.in_lhs.as_mut() {
-                *in_lhs = replace_grouping_markers_in_typed_expr(
-                    in_lhs,
-                    &grouping_fn_args,
-                    &grouping_fn_ids,
-                    emitted_grouping_marker_count,
-                );
-            }
         }
 
         // A grouping key that some level's grouping set leaves out holds NULL
@@ -1862,9 +2099,11 @@ impl<'a> AnalyzerContext<'a> {
                     let (name, column_id) = match &typed.kind {
                         ExprKind::ColumnRef {
                             column_id, column, ..
-                        } if !matches!(expr, ast::Expr::Cast(_)) => (column.clone(), *column_id),
+                        } if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) => {
+                            (column.clone(), *column_id)
+                        }
                         _ => {
-                            let n = expr_display_name(expr);
+                            let n = self.grouping_display_name(expr);
                             let id =
                                 self.alloc_column_id(None, n.clone(), typed.value_type.clone());
                             (n, id)
@@ -1877,6 +2116,7 @@ impl<'a> AnalyzerContext<'a> {
                     // but still owns a separate output domain occurrence.
                     if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                         || matches!(expr, ast::Expr::Cast(_))
+                        || is_grouping_call(expr)
                     {
                         let logical =
                             self.logical_output_type(Some(expr), &typed, &effective_scope)?;
@@ -1906,7 +2146,7 @@ impl<'a> AnalyzerContext<'a> {
                     let name = alias.value.clone();
                     let column_id = match &typed.kind {
                         ExprKind::ColumnRef { column_id, .. }
-                            if !matches!(expr, ast::Expr::Cast(_)) =>
+                            if !matches!(expr, ast::Expr::Cast(_)) && !is_grouping_call(expr) =>
                         {
                             *column_id
                         }
@@ -1919,6 +2159,7 @@ impl<'a> AnalyzerContext<'a> {
                     // but still owns a separate output domain occurrence.
                     if !matches!(&typed.kind, ExprKind::ColumnRef { .. })
                         || matches!(expr, ast::Expr::Cast(_))
+                        || is_grouping_call(expr)
                     {
                         let logical =
                             self.logical_output_type(Some(expr), &typed, &effective_scope)?;
@@ -2853,53 +3094,36 @@ fn select_item_output_column_id(
     }
 }
 
+fn is_grouping_call(expression: &ast::Expr) -> bool {
+    matches!(expression, ast::Expr::FunctionCall(function)
+        if function.name.parts.len() == 1
+        && matches!(function.name.parts[0].value.to_ascii_lowercase().as_str(), "grouping" | "grouping_id"))
+}
+
 fn expr_syntax_key(expr: &ast::Expr) -> String {
     novarocks_parser::printer::print_expr(expr).to_lowercase()
 }
 
-struct GroupingMarkerFolder<'a> {
-    args: &'a mut Vec<(String, Vec<String>)>,
-    next_marker: &'a mut i64,
+/// Keep historical planner labels while all value/type binding uses the
+/// original GROUPING call. Numeric user syntax never enters this substitution.
+struct GroupingDisplayFolder<'a> {
+    calls: &'a [GroupingCall],
 }
-
-impl ast::Fold for GroupingMarkerFolder<'_> {
-    fn fold_expr(&mut self, expr: ast::Expr) -> ast::Expr {
-        let span = expr.span();
-        let expr = ast::fold_expr(self, expr);
-        let ast::Expr::FunctionCall(function) = &expr else {
-            return expr;
-        };
-        if function.name.parts.len() != 1
-            || !matches!(
-                function.name.parts[0].value.to_ascii_lowercase().as_str(),
-                "grouping" | "grouping_id"
-            )
-        {
-            return expr;
-        }
-
-        let index = self.args.len();
-        let columns = function.arguments.iter().map(expr_syntax_key).collect();
-        self.args.push((format!("__grouping_fn_{index}"), columns));
-        let marker = *self.next_marker;
-        *self.next_marker -= 1;
-        ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Number(marker.to_string()),
-            span,
-        })
+impl ast::Fold for GroupingDisplayFolder<'_> {
+    fn fold_query(&mut self, query: ast::Query) -> ast::Query {
+        query
     }
-}
-
-/// Replace GROUPING/GROUPING_ID calls with negative literal markers. The
-/// typed analyzer turns those markers into synthetic output columns after the
-/// grouping set expansion is complete.
-fn replace_grouping_calls_with_markers(
-    expr: &ast::Expr,
-    args: &mut Vec<(String, Vec<String>)>,
-    next_marker: &mut i64,
-) -> ast::Expr {
-    let mut folder = GroupingMarkerFolder { args, next_marker };
-    ast::Fold::fold_expr(&mut folder, expr.clone())
+    fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
+        if let ast::Expr::FunctionCall(function) = &expression
+            && let Some(index) = self.calls.iter().position(|call| call.syntax == *function)
+        {
+            return ast::Expr::Literal(ast::Literal {
+                kind: ast::LiteralKind::Number((-9000 - index as i64).to_string()),
+                span: function.span,
+            });
+        }
+        ast::fold_expr(self, expression)
+    }
 }
 
 fn flatten_grouping_groups(groups: &[Vec<ast::Expr>]) -> Vec<ast::Expr> {
@@ -2951,510 +3175,6 @@ fn cube_grouping_sets(groups: &[Vec<ast::Expr>]) -> Vec<Vec<ast::Expr>> {
         grouping_sets.push(grouping_set);
     }
     grouping_sets
-}
-
-/// Walk a resolved TypedExpr tree and replace marker literals (Int(-9000), Int(-9001), ...)
-/// with ColumnRef to the corresponding GROUPING/GROUPING_ID virtual slot name.
-fn replace_grouping_markers_in_sort_item(
-    item: &SortItem,
-    grouping_fn_args: &[(String, Vec<String>)],
-    grouping_fn_ids: &[(String, ColumnId)],
-    emitted_marker_count: usize,
-) -> SortItem {
-    SortItem {
-        expr: replace_grouping_markers_in_typed_expr(
-            &item.expr,
-            grouping_fn_args,
-            grouping_fn_ids,
-            emitted_marker_count,
-        ),
-        asc: item.asc,
-        nulls_first: item.nulls_first,
-    }
-}
-
-fn grouping_marker_index(value: i64, emitted_marker_count: usize) -> Option<usize> {
-    let offset = (-9000i128).checked_sub(value as i128)?;
-    if offset < 0 {
-        return None;
-    }
-    let idx = usize::try_from(offset).ok()?;
-    (idx < emitted_marker_count).then_some(idx)
-}
-
-fn replace_grouping_markers_in_typed_expr(
-    expr: &TypedExpr,
-    grouping_fn_args: &[(String, Vec<String>)],
-    grouping_fn_ids: &[(String, ColumnId)],
-    emitted_marker_count: usize,
-) -> TypedExpr {
-    match &expr.kind {
-        ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) => {
-            if let Some(idx) = grouping_marker_index(*v, emitted_marker_count)
-                && let (Some((fn_name, _)), Some((_, column_id))) =
-                    (grouping_fn_args.get(idx), grouping_fn_ids.get(idx))
-            {
-                return TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: *column_id,
-                        qualifier: None,
-                        column: fn_name.clone(),
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Int64,
-                        false,
-                    ),
-                };
-            }
-            expr.clone()
-        }
-        ExprKind::BinaryOp {
-            left,
-            op,
-            right,
-            decimal_overflow_policy,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::BinaryOp {
-                left: Box::new(replace_grouping_markers_in_typed_expr(
-                    left,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                op: *op,
-                right: Box::new(replace_grouping_markers_in_typed_expr(
-                    right,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                decimal_overflow_policy: *decimal_overflow_policy,
-            },
-        },
-        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::UnaryOp {
-                op: *op,
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-            },
-        },
-        ExprKind::FunctionCall {
-            name,
-            args,
-            distinct,
-            binding,
-            volatility,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::FunctionCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| {
-                        replace_grouping_markers_in_typed_expr(
-                            arg,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                distinct: *distinct,
-                binding: binding.clone(),
-                volatility: *volatility,
-            },
-        },
-        ExprKind::LambdaFunction { params, body } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::LambdaFunction {
-                params: params.clone(),
-                body: Box::new(replace_grouping_markers_in_typed_expr(
-                    body,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-            },
-        },
-        ExprKind::AggregateCall {
-            name,
-            args,
-            distinct,
-            order_by,
-            resolved,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::AggregateCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| {
-                        replace_grouping_markers_in_typed_expr(
-                            arg,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                distinct: *distinct,
-                order_by: order_by
-                    .iter()
-                    .map(|item| {
-                        replace_grouping_markers_in_sort_item(
-                            item,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                resolved: resolved.clone(),
-            },
-        },
-        ExprKind::Cast {
-            expr: inner,
-            target,
-            decimal_overflow_policy,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Cast {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                target: target.clone(),
-                decimal_overflow_policy: *decimal_overflow_policy,
-            },
-        },
-        ExprKind::IsNull {
-            expr: inner,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::IsNull {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                negated: *negated,
-            },
-        },
-        ExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::InList {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                list: list
-                    .iter()
-                    .map(|item| {
-                        replace_grouping_markers_in_typed_expr(
-                            item,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                negated: *negated,
-            },
-        },
-        ExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Between {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                low: Box::new(replace_grouping_markers_in_typed_expr(
-                    low,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                high: Box::new(replace_grouping_markers_in_typed_expr(
-                    high,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                negated: *negated,
-            },
-        },
-        ExprKind::Like {
-            expr: inner,
-            pattern,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Like {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                pattern: Box::new(replace_grouping_markers_in_typed_expr(
-                    pattern,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                negated: *negated,
-            },
-        },
-        ExprKind::Nested(inner) => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Nested(Box::new(replace_grouping_markers_in_typed_expr(
-                inner,
-                grouping_fn_args,
-                grouping_fn_ids,
-                emitted_marker_count,
-            ))),
-        },
-        ExprKind::WindowCall {
-            name,
-            args,
-            distinct,
-            binding,
-            function_order_by,
-            aggregate_binding,
-            partition_by,
-            order_by,
-            window_frame,
-            ignore_nulls,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::WindowCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| {
-                        replace_grouping_markers_in_typed_expr(
-                            a,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                distinct: *distinct,
-                binding: binding.clone(),
-                function_order_by: function_order_by
-                    .iter()
-                    .map(|ob| {
-                        replace_grouping_markers_in_sort_item(
-                            ob,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                aggregate_binding: aggregate_binding.clone(),
-                partition_by: partition_by
-                    .iter()
-                    .map(|p| {
-                        replace_grouping_markers_in_typed_expr(
-                            p,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                order_by: order_by
-                    .iter()
-                    .map(|ob| {
-                        replace_grouping_markers_in_sort_item(
-                            ob,
-                            grouping_fn_args,
-                            grouping_fn_ids,
-                            emitted_marker_count,
-                        )
-                    })
-                    .collect(),
-                window_frame: window_frame.clone(),
-                ignore_nulls: *ignore_nulls,
-            },
-        },
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Case {
-                operand: operand.as_ref().map(|o| {
-                    Box::new(replace_grouping_markers_in_typed_expr(
-                        o,
-                        grouping_fn_args,
-                        grouping_fn_ids,
-                        emitted_marker_count,
-                    ))
-                }),
-                when_then: when_then
-                    .iter()
-                    .map(|(w, t)| {
-                        (
-                            replace_grouping_markers_in_typed_expr(
-                                w,
-                                grouping_fn_args,
-                                grouping_fn_ids,
-                                emitted_marker_count,
-                            ),
-                            replace_grouping_markers_in_typed_expr(
-                                t,
-                                grouping_fn_args,
-                                grouping_fn_ids,
-                                emitted_marker_count,
-                            ),
-                        )
-                    })
-                    .collect(),
-                else_expr: else_expr.as_ref().map(|e| {
-                    Box::new(replace_grouping_markers_in_typed_expr(
-                        e,
-                        grouping_fn_args,
-                        grouping_fn_ids,
-                        emitted_marker_count,
-                    ))
-                }),
-            },
-        },
-        ExprKind::IsTruthValue {
-            expr: inner,
-            value,
-            negated,
-        } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::IsTruthValue {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(
-                    inner,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-                value: *value,
-                negated: *negated,
-            },
-        },
-        ExprKind::Lambda { params, body } => TypedExpr {
-            value_type: expr.value_type.clone(),
-
-            kind: ExprKind::Lambda {
-                params: params.clone(),
-                body: Box::new(replace_grouping_markers_in_typed_expr(
-                    body,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                )),
-            },
-        },
-        ExprKind::ColumnRef { .. }
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::Literal(_)
-        | ExprKind::Constant(_)
-        | ExprKind::SubqueryPlaceholder { .. } => expr.clone(),
-    }
-}
-
-fn replace_grouping_markers_in_relation(
-    rel: &mut Relation,
-    grouping_fn_args: &[(String, Vec<String>)],
-    grouping_fn_ids: &[(String, ColumnId)],
-    emitted_marker_count: usize,
-) {
-    match rel {
-        Relation::Join(join) => {
-            replace_grouping_markers_in_relation(
-                &mut join.left,
-                grouping_fn_args,
-                grouping_fn_ids,
-                emitted_marker_count,
-            );
-            replace_grouping_markers_in_relation(
-                &mut join.right,
-                grouping_fn_args,
-                grouping_fn_ids,
-                emitted_marker_count,
-            );
-            if let Some(condition) = join.condition.as_mut() {
-                *condition = replace_grouping_markers_in_typed_expr(
-                    condition,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                );
-            }
-            join.naa_author = join.naa_author.take().map(|facts| {
-                facts.map(|expr| {
-                    replace_grouping_markers_in_typed_expr(
-                        &expr,
-                        grouping_fn_args,
-                        grouping_fn_ids,
-                        emitted_marker_count,
-                    )
-                })
-            });
-        }
-        Relation::Unnest(unnest) => {
-            for arg in &mut unnest.args {
-                *arg = replace_grouping_markers_in_typed_expr(
-                    arg,
-                    grouping_fn_args,
-                    grouping_fn_ids,
-                    emitted_marker_count,
-                );
-            }
-        }
-        Relation::Scan(_)
-        | Relation::IcebergMetadataScan(_)
-        | Relation::IcebergDeltaScan(_)
-        | Relation::Subquery { .. }
-        | Relation::GenerateSeries(_)
-        | Relation::CTEConsume { .. } => {}
-    }
 }
 
 fn is_bitmap_or_hll_type(sql_type: &novarocks_types::schema::SqlType) -> bool {
@@ -5583,7 +5303,7 @@ mod tests {
             .expect_err("group_concat should reject array input");
         assert!(
             err.contains(
-                "No matching function with signature: group_concat(array<tinyint(4)>, varchar)."
+                "No matching function with signature: group_concat(array<int(11)>, varchar)."
             ),
             "unexpected error: {err}"
         );
@@ -5595,7 +5315,7 @@ mod tests {
             .expect_err("group_concat should reject map input");
         assert!(
             err.contains(
-                "No matching function with signature: group_concat(map<tinyint(4),tinyint(4)>, varchar)."
+                "No matching function with signature: group_concat(map<int(11),int(11)>, varchar)."
             ),
             "unexpected error: {err}"
         );
@@ -5623,10 +5343,8 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         match &resolved.output_columns[0].value_type.data_type() {
             arrow::datatypes::DataType::List(item) => {
-                // StarRocks narrows array literal element types to the
-                // smallest signed integer width (TINYINT for `[1, 2]`),
-                // so `x + y` widens to SMALLINT under the arithmetic
-                // promotion rules.
+                // Ordinary integer array elements use the same INTEGER
+                // declaration as scalar syntax. Lambda binding consumes it.
                 assert!(
                     matches!(
                         item.data_type(),
@@ -5878,13 +5596,8 @@ mod tests {
         let proj_id = sel
             .projection
             .iter()
-            .find_map(|item| match &item.expr.kind {
-                ExprKind::ColumnRef {
-                    column_id, column, ..
-                } if column == "__grouping_fn_0" => Some(*column_id),
-                _ => None,
-            })
-            .expect("expected projection grouping ColumnRef");
+            .find_map(|item| find_grouping_ref_id(&item.expr, "__grouping_fn_0"))
+            .expect("expected projection grouping ColumnRef under its public cast");
         let gb_id = sel
             .group_by
             .iter()
@@ -6178,6 +5891,183 @@ mod tests {
     }
 
     #[test]
+    fn grouping_public_width_is_bound_before_parent_expressions() {
+        for group_by in ["GROUP BY a", "GROUP BY ROLLUP(a)"] {
+            for (count, carrier) in [
+                (1, DataType::Int32),
+                (31, DataType::Int32),
+                (32, DataType::Int64),
+                (63, DataType::Int64),
+            ] {
+                let args = vec!["a"; count].join(",");
+                let sql = format!(
+                    "SELECT grouping({args}), grouping_id({args}), abs(grouping({args})), grouping({args}) + CAST(1 AS INTEGER) FROM (VALUES (CAST(1 AS INTEGER))) t(a) {group_by}"
+                );
+                let resolved = parse_raw_and_analyze(&sql).unwrap();
+                assert_eq!(resolved.output_columns[0].field_name, None);
+                assert_eq!(
+                    resolved.output_columns[0].value_type.data_type(),
+                    &carrier,
+                    "{sql}"
+                );
+                assert_eq!(
+                    resolved.output_columns[1].value_type.data_type(),
+                    &DataType::Int64
+                );
+                let QueryBody::Select(select) = &resolved.body else {
+                    panic!("select");
+                };
+                let ExprKind::FunctionCall { args, binding, .. } = &select.projection[2].expr.kind
+                else {
+                    panic!("bound ABS");
+                };
+                assert_eq!(
+                    args[0].value_type.data_type(),
+                    &carrier,
+                    "ABS receives the actual public GROUPING type: {sql}"
+                );
+                let novarocks_functions::FunctionArgumentType::Value(argument) =
+                    &binding.selected.argument_types[0]
+                else {
+                    panic!("value argument");
+                };
+                assert_eq!(argument.data_type(), &carrier);
+                assert_eq!(
+                    resolved.output_columns[2].value_type.data_type(),
+                    if carrier == DataType::Int32 {
+                        &DataType::Int64
+                    } else {
+                        &DataType::FixedSizeBinary(16)
+                    },
+                    "existing ABS promotion remains unchanged"
+                );
+                assert_eq!(
+                    resolved.output_columns[3].value_type.data_type(),
+                    &carrier,
+                    "parent add: {sql}"
+                );
+                let QueryBody::Select(select) = resolved.body else {
+                    panic!("select");
+                };
+                if group_by.contains("ROLLUP") {
+                    for (name, id) in &select.repeat.as_ref().unwrap().grouping_fn_ids {
+                        let mask = select.group_by.iter().find(|key| matches!(&key.kind, ExprKind::ColumnRef { column_id, .. } if column_id == id)).unwrap();
+                        assert_eq!(mask.value_type.data_type(), &DataType::Int64, "{name}");
+                        assert!(!mask.value_type.nullable());
+                    }
+                    if count <= 31 {
+                        assert!(
+                            matches!(&select.projection[0].expr.kind, ExprKind::Cast { expr, .. } if matches!(expr.kind, ExprKind::ColumnRef { .. }))
+                        );
+                        assert!(
+                            select.projection[0].expr.value_type.nullable(),
+                            "original narrowing CAST NULL law"
+                        );
+                    }
+                } else {
+                    assert!(matches!(
+                        select.projection[0].expr.kind,
+                        ExprKind::Literal(crate::analysis::LiteralValue::Int(0))
+                    ));
+                    assert!(!select.projection[0].expr.value_type.nullable());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouping_arity_error_and_query_boundaries_are_original_and_local() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        let args = vec!["missing"; 64].join(",");
+        let sql = format!("SELECT grouping({args}) FROM (VALUES (1)) t(a) GROUP BY a");
+        let statements = novarocks_parser::parse(&sql).unwrap();
+        let ast::Statement::Query(query) = &statements[0] else {
+            panic!("query");
+        };
+        let error = analyze(query, &catalog, "default").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::TooManyArguments
+        );
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("select");
+        };
+        assert_eq!(error.span(), Some(select.projection[0].span()));
+        assert_eq!(error.code().as_str(), "sql.analyze.too_many_arguments");
+        for sql in [
+            "SELECT grouping(a), (SELECT grouping(a)) FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a)",
+            "SELECT grouping(a) FROM (VALUES (1)) t(a) WHERE grouping(a)=0 GROUP BY ROLLUP(a)",
+            "SELECT grouping(a) FROM (VALUES (1)) t(a) GROUP BY grouping(a)",
+            "SELECT a FROM (VALUES (1)) t(a) GROUP BY grouping(a)",
+            "SELECT (SELECT grouping(b) FROM (VALUES (1)) s(b)), grouping(a) FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a)",
+        ] {
+            assert!(
+                parse_raw_and_analyze(sql).is_err(),
+                "must not borrow GROUPING qualification: {sql}"
+            );
+        }
+        let resolved = parse_raw_and_analyze(
+            "WITH c(g) AS (SELECT grouping(a) FROM (VALUES (1)) t(a) GROUP BY a) SELECT g FROM c",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.output_columns[0].value_type.data_type(),
+            &DataType::Int32
+        );
+        for sql in [
+            "SELECT a, grouping(a) FROM (VALUES (1)) t(a) GROUP BY 1",
+            "SELECT a AS x, grouping(a) FROM (VALUES (1)) t(a) GROUP BY x",
+        ] {
+            assert!(
+                parse_raw_and_analyze(sql).is_ok(),
+                "original GROUP BY author: {sql}"
+            );
+        }
+        // GROUPING_ID keeps its existing Nova BIGINT extension, including 64 occurrences.
+        let args = vec!["a"; 64].join(",");
+        let resolved = parse_raw_and_analyze(&format!(
+            "SELECT grouping_id({args}) FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a)"
+        ))
+        .unwrap();
+        assert_eq!(
+            resolved.output_columns[0].value_type.data_type(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn grouping_order_by_late_call_keeps_distinct_default_mask_and_user_literal() {
+        let resolved = parse_raw_and_analyze(
+            "SELECT -9000, a FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a) ORDER BY grouping(a)",
+        )
+        .unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("select");
+        };
+        let repeat = select.repeat.as_ref().unwrap();
+        assert_eq!(repeat.grouping_fn_ids.len(), 2);
+        assert_ne!(repeat.grouping_fn_ids[0].0, repeat.grouping_fn_ids[1].0);
+        assert_ne!(repeat.grouping_fn_ids[0].1, repeat.grouping_fn_ids[1].1);
+        assert!(find_grouping_ref_id(&resolved.order_by[0].expr, "__grouping_fn_1").is_some());
+        assert!(matches!(
+            select.projection[0].expr.kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::Int(-9000))
+        ));
+        let resolved = parse_raw_and_analyze(
+            "SELECT -9000, grouping(a) FROM (VALUES (1)) t(a) GROUP BY ROLLUP(a)",
+        )
+        .unwrap();
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("select");
+        };
+        assert!(matches!(
+            select.projection[0].expr.kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::Int(-9000))
+        ));
+        assert!(find_grouping_ref_id(&select.projection[1].expr, "__grouping_fn_0").is_some());
+    }
+
+    #[test]
     fn p1_grouping_marker_carries_group_by_id() {
         let resolved =
             parse_and_analyze("SELECT k1, grouping(k1) AS g FROM t1 GROUP BY ROLLUP(k1)")
@@ -6385,27 +6275,6 @@ mod tests {
                 other => panic!("expected numeric literal under unary op, got {other:?}"),
             },
             other => panic!("expected real -9000 literal to remain literal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn p1_typed_marker_replacement_ignores_synthetic_grouping_entry() {
-        let expr = TypedExpr {
-            kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(-9000)),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-        };
-        let grouping_fn_args = vec![("__grouping_fn_0".to_string(), vec!["k1".to_string()])];
-        let grouping_fn_ids = vec![(
-            "__grouping_fn_0".to_string(),
-            crate::column_id::ColumnId::new_for_test(99),
-        )];
-
-        let replaced =
-            replace_grouping_markers_in_typed_expr(&expr, &grouping_fn_args, &grouping_fn_ids, 0);
-
-        match replaced.kind {
-            ExprKind::Literal(crate::analysis::LiteralValue::Int(v)) => assert_eq!(v, -9000),
-            other => panic!("real -9000 literal must remain literal, got {other:?}"),
         }
     }
 

@@ -7,6 +7,7 @@ query.execution.commit_unknown	Execution	Active
 query.execution.control	Execution	Active
 query.execution.deadline_exceeded	Execution	Active
 query.execution.dependency	Execution	Active
+query.execution.division_by_zero	Execution	Active
 query.execution.invalid_data	Execution	Active
 query.execution.invariant	Execution	Active
 query.execution.numeric_out_of_range	Execution	Active
@@ -34,6 +35,7 @@ sql.analyze.invalid_query_shape	Analyze	Active
 sql.analyze.invalid_view	Analyze	Active
 sql.analyze.mismatched_column_aliases	Analyze	Active
 sql.analyze.missing_column_name	Analyze	Active
+sql.analyze.too_many_arguments	Analyze	Active
 sql.analyze.type_mismatch	Analyze	Active
 sql.analyze.unavailable_implementation	Analyze	Active
 sql.analyze.unknown_column	Analyze	Active

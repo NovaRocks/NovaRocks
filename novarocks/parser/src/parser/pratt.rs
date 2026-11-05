@@ -687,6 +687,25 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if let Some(binding) = self.current().and_then(|token| prefix_binding(&token.kind)) {
             let start = self.current_span().start();
             self.advance();
+            self.skip_trivia();
+            if binding.operator == UnaryOperator::Minus
+                && let Some(Token {
+                    kind: TokenKind::Number,
+                    span,
+                }) = self.current().cloned()
+                && super::is_integer_number(self.token_text(span))
+            {
+                let literal_span = Span::new(start, span.end());
+                let kind = super::number_literal_kind(
+                    format!("-{}", self.token_text(span)),
+                    literal_span,
+                )?;
+                self.advance();
+                return Ok(Expr::Literal(Literal {
+                    kind,
+                    span: literal_span,
+                }));
+            }
             let expression = self.parse_binding_power(binding.precedence)?;
             let span = Span::new(start, expression.span().end());
             return Ok(Expr::Unary(UnaryExpr {
@@ -742,7 +761,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             }) => {
                 self.advance();
                 Ok(Expr::Literal(Literal {
-                    kind: LiteralKind::Number(self.token_text(span).to_owned()),
+                    kind: super::number_literal_kind(self.token_text(span).to_owned(), span)?,
                     span,
                 }))
             }
@@ -1250,7 +1269,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                         self.advance();
                         self.skip_trivia();
                         Literal {
-                            kind: LiteralKind::Number(value),
+                            kind: super::number_literal_kind(value, span)?,
                             span,
                         }
                     }

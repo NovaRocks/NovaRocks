@@ -33,9 +33,9 @@ CREATE TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largein
 -- query 3
 -- @skip_result_check=true
 INSERT INTO statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0} VALUES
-    (-170141183460469231731687303715884105728),
+    (CAST('-170141183460469231731687303715884105728' AS LARGEINT)),
     (0),
-    (170141183460469231731687303715884105727);
+    (CAST('170141183460469231731687303715884105727' AS LARGEINT));
 
 -- query 4
 -- @skip_result_check=true

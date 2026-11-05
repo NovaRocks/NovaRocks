@@ -203,10 +203,49 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
 
 fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
     let expression = unnest(expression);
-    if expression.value_type.nullable()
+    if (expression.value_type.nullable() && !matches!(expression.kind, ExprKind::Cast { .. }))
         || exact_predicate_value_type(expression.value_type.data_type())? != expected
     {
         return None;
+    }
+    // The original analyzer retains its real I32 -> I64 conversion. A fixed
+    // signed widening of a non-null integer literal has the same exact value
+    // in the declared provider domain, without evaluating a scalar function.
+    let mut source = expression;
+    while let ExprKind::Cast { expr, target, .. } = &source.kind {
+        if target != source.value_type.data_type()
+            || !crate::optimizer::scalar_expr::nonnull_signed_literal_widening(
+                &expr.value_type,
+                &source.value_type,
+            )
+        {
+            return None;
+        }
+        source = unnest(expr);
+    }
+    if !std::ptr::eq(source, expression) {
+        let ExprKind::Literal(LiteralValue::Int(value)) = &source.kind else {
+            return None;
+        };
+        if !crate::optimizer::scalar_expr::signed_integer_fits(
+            *value,
+            source.value_type.data_type(),
+        ) {
+            return None;
+        }
+        return match expected {
+            ConnectorValueType::TinyInt => {
+                Some(ConnectorValue::TinyInt(i8::try_from(*value).ok()?))
+            }
+            ConnectorValueType::SmallInt => {
+                Some(ConnectorValue::SmallInt(i16::try_from(*value).ok()?))
+            }
+            ConnectorValueType::Integer => {
+                Some(ConnectorValue::Integer(i32::try_from(*value).ok()?))
+            }
+            ConnectorValueType::BigInt => Some(ConnectorValue::BigInt(*value)),
+            _ => None,
+        };
     }
     let ExprKind::Literal(literal) = &expression.kind else {
         return None;
@@ -317,6 +356,35 @@ mod tests {
     use crate::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
     };
+
+    #[test]
+    fn provider_signed_literal_widening_keeps_exact_value_and_rejects_narrowing() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        for (sql, expected) in [
+            (
+                "SELECT CAST(2147483647 AS BIGINT)",
+                Some(ConnectorValue::BigInt(2147483647)),
+            ),
+            ("SELECT CAST(2147483648 AS INTEGER)", None),
+            ("SELECT CAST(1.0 AS BIGINT)", None),
+            ("SELECT CAST(NULL AS BIGINT)", None),
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query");
+            };
+            let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            let crate::analysis::QueryBody::Select(select) = resolved.body else {
+                panic!("select");
+            };
+            let expression = &select.projection[0].expr;
+            assert_eq!(
+                lower_literal(expression, ConnectorValueType::BigInt),
+                expected,
+                "{sql}"
+            );
+        }
+    }
 
     fn column() -> OutputColumn {
         OutputColumn {

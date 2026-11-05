@@ -455,8 +455,8 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
             .unwrap()
             .unwrap();
         let computed = source.plan().result_port().unwrap();
-        assert!(original.fields()[0].ty.nullable());
-        assert!(computed.fields[0].ty.nullable());
+        assert!(!original.fields()[0].ty.nullable());
+        assert!(!computed.fields[0].ty.nullable());
         assert_eq!(original.fields()[0].ty, computed.fields[0].ty);
         assert_eq!(computed.output, original.original_port().output);
         assert_eq!(computed.fields[0].name, original.fields()[0].name);
@@ -465,7 +465,7 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
         for edge in source.plan().edges().values() {
             for &value in edge.source.projection.iter() {
                 assert!(
-                    source.plan().fragments()[&edge.source.fragment].values()[&value]
+                    !source.plan().fragments()[&edge.source.fragment].values()[&value]
                         .ty
                         .nullable()
                 );
@@ -477,7 +477,12 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
         let mut frame =
             CompiledExpressionInstance::try_new(program.clone(), root, &Control).unwrap();
         let selected = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
-        assert!(selected.errors().is_empty());
+        assert_eq!(selected.errors().len(), 1);
+        assert_eq!(selected.errors()[0].selected_ordinal(), 0);
+        assert_eq!(
+            selected.errors()[0].reason(),
+            DataFailureReason::NumericOutOfRange
+        );
         assert!(selected.values().is_null(0));
         assert_eq!(selected.values().null_count(), 1);
         let rows = [1];
@@ -513,19 +518,34 @@ fn numeric_unary_owned_transaction_actual_coalesce_isnull_and_if_are_consumers_o
         let data = batch(&program, root, Arc::new(Int8Array::from(vec![i8::MIN, 1])));
         let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
         let out = frame.evaluate(&data, Selection::all(2), &Control).unwrap();
-        assert!(out.errors().is_empty());
-        assert_eq!(out.values().null_count(), 0);
-        if sql.contains("IS NULL") {
-            let values = out
-                .values()
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .unwrap();
-            assert!(values.value(0));
-            assert!(!values.value(1));
-        } else {
+        if sql.contains("IF(") {
+            assert!(out.errors().is_empty(), "inactive MIN is not evaluated");
+            assert_eq!(out.values().null_count(), 0);
             let values = out.values().as_any().downcast_ref::<Int8Array>().unwrap();
             assert_eq!(values.values().as_ref(), &[0, -1]);
+        } else {
+            assert_eq!(out.errors().len(), 1);
+            assert_eq!(out.errors()[0].selected_ordinal(), 0);
+            assert_eq!(
+                out.errors()[0].reason(),
+                DataFailureReason::NumericOutOfRange
+            );
+            assert!(
+                out.values().is_null(0),
+                "required error has only a placeholder"
+            );
+            assert!(!out.values().is_null(1));
+            if sql.contains("IS NULL") {
+                let values = out
+                    .values()
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                assert!(!values.value(1));
+            } else {
+                let values = out.values().as_any().downcast_ref::<Int8Array>().unwrap();
+                assert_eq!(values.value(1), -1);
+            }
         }
     }
 }
@@ -635,7 +655,7 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
                     ..
                 } = &expr.kind
                 {
-                    assert!(expr.ty.nullable());
+                    assert!(!expr.ty.nullable());
                 }
             }
         }

@@ -2050,7 +2050,7 @@ mod tests {
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
                     .complete_for_test(request, &scope),
             )
-            .expect("the exact original Int64 payload completes from SQL");
+            .expect("the exact original INTEGER literal payload completes from SQL");
         let plan = paired.candidate().plan();
         assert_eq!(plan.version(), version);
         assert_eq!(plan.fragments().len(), 2, "distributed producer and gather");
@@ -2061,7 +2061,7 @@ mod tests {
         let root_fragment = result.fragment.get();
         assert!(plan.fragments().contains_key(&result.fragment));
         assert_eq!(result.fields.len(), 1);
-        assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int64, false));
+        assert_eq!(result.fields[0].ty, ValueType::new(DataType::Int32, false));
         // ResultField retains the expression label separately from the SQL
         // alias. Public rendering owns the column name seen by the client.
         let render = novarocks_sql::compiler::client_render_schema_from_port(

@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Float64Array, Int64Array};
+use arrow::array::{Float64Array, Int32Array, Int64Array};
 use novarocks_types::{QueryId, UniqueId};
 
 use super::*;
@@ -285,7 +285,7 @@ fn compiled_wire_recipe_and_local_schema_outlive_program_until_last_buffer_alias
     assert_eq!(wire.slots().len(), 1);
     assert_eq!(
         wire.slots()[0].data_type(),
-        &arrow::datatypes::DataType::Int64
+        &arrow::datatypes::DataType::Int32
     );
     let registry = ExecutionExchangeRegistry::default();
     let key = ExchangeKey {
@@ -309,7 +309,7 @@ fn compiled_wire_recipe_and_local_schema_outlive_program_until_last_buffer_alias
         "receiver facts cannot pin the whole Program"
     );
     let source =
-        Chunk::try_new_with_columns(wire.clone(), vec![Arc::new(Int64Array::from(vec![7, 19]))])
+        Chunk::try_new_with_columns(wire.clone(), vec![Arc::new(Int32Array::from(vec![7, 19]))])
             .unwrap();
     let recipe = online_unit::prepare_recipe(&wire, &[], factory.as_ref()).unwrap();
     let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(

@@ -503,6 +503,11 @@ mod tests {
             let fields = resolved.output_columns.clone();
             assert_eq!(fields.len(), 1, "{sql}");
             assert_eq!(fields[0].field_name, None, "{sql}");
+            assert_eq!(
+                fields[0].value_type.data_type(),
+                &arrow::datatypes::DataType::Int32,
+                "{sql}"
+            );
             let plan = crate::planner::plan_query(
                 resolved,
                 ctes,
