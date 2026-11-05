@@ -2556,6 +2556,8 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-hms"
 version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b377f757ed01d7e08bd4dfc0dfdfecaf00d50576b8942c205a6565ac1b2df172"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3618,10 +3620,8 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "crc32fast",
- "faststr",
  "flate2",
  "futures",
- "hive_metastore",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",

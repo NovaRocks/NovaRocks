@@ -211,6 +211,7 @@ lto = "thin"
 codegen-units = 1
 debug-assertions = false
 
+# Design: ADR-0216 (docs/adr/ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md)
 # Design: ADR-0215 (docs/adr/ADR-0215-released-iceberg-package-provenance.md)
 # Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 # Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
@@ -224,10 +225,8 @@ debug-assertions = false
 # inside a third-party crate. Design: ADR-0170
 # (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 iceberg = { path = "vendor/iceberg-0.11.0" }
-# Unmodified property macro and dev-only REST SDK use crates.io.
-# Preserve typed missing-table errors and entity-based table classification.
-# See vendor/iceberg-catalog-hms-0.11.0/PATCH.md.
-iceberg-catalog-hms = { path = "vendor/iceberg-catalog-hms-0.11.0" }
+# The property macro, the HMS catalog and the dev-only REST SDK use unmodified
+# crates.io packages. The HMS read fallbacks are recorded in ADR-0216.
 # Vendored to advertise and enforce negotiated COM_QUERY multi-statement /
 # multi-result capability. NovaRocks consumes the negotiated bits to preserve
 # fail-closed behavior for clients that did not request this protocol surface.

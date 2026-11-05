@@ -142,13 +142,6 @@ pub use novarocks_spi;
 
 mod contract_revision;
 
-// Compile the provider's actual projection source in workspace C0; vendor
-// packages cannot run their own dev-dependency tests as workspace dependencies.
-#[cfg(test)]
-#[rustfmt::skip]
-#[path = "../../../../vendor/iceberg-catalog-hms-0.11.0/src/table_projection.rs"]
-mod hms_table_projection_contract_tests;
-
 #[cfg(novarocks_dev_controls)]
 pub mod test_observation;
 
