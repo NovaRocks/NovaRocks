@@ -69,13 +69,13 @@ struct ConfigPair {
     runtime: TempDir,
     fe_config: NamedTempFile,
     be_config: NamedTempFile,
-    fe_mysql_port: u16,
+    fe_trino_port: u16,
     fe_http_port: u16,
     fe_grpc_port: u16,
     be_http_port: u16,
     be_grpc_port: u16,
     be_control_grpc_port: u16,
-    fe_mysql: Option<ReservedTcpPort>,
+    fe_trino: Option<ReservedTcpPort>,
     fe_http: Option<ReservedTcpPort>,
     fe_grpc: Option<ReservedTcpPort>,
     be_http: Option<ReservedTcpPort>,
@@ -87,13 +87,13 @@ struct ConfigPair {
 impl ConfigPair {
     fn new() -> Self {
         let runtime = tempfile::tempdir_in(runtime_dir()).expect("create smoke runtime");
-        let fe_mysql = reserve_port();
+        let fe_trino = reserve_port();
         let fe_http = reserve_port();
         let fe_grpc = reserve_port();
         let be_http = reserve_port();
         let be_grpc = reserve_port();
         let be_control_grpc = reserve_port();
-        let fe_mysql_port = fe_mysql.port();
+        let fe_trino_port = fe_trino.port();
         let fe_http_port = fe_http.port();
         let fe_grpc_port = fe_grpc.port();
         let be_http_port = be_http.port();
@@ -121,8 +121,7 @@ http_port = {fe_http_port}
 grpc_port = {fe_grpc_port}
 
 [standalone_server]
-mysql_port = {fe_mysql_port}
-trino_port = 0
+trino_port = {fe_trino_port}
 user = "root"
 
 [cluster]
@@ -183,13 +182,13 @@ frontend_endpoint = "127.0.0.1:{fe_grpc_port}"
             runtime,
             fe_config,
             be_config,
-            fe_mysql_port,
+            fe_trino_port,
             fe_http_port,
             fe_grpc_port,
             be_http_port,
             be_grpc_port,
             be_control_grpc_port,
-            fe_mysql: Some(fe_mysql),
+            fe_trino: Some(fe_trino),
             fe_http: Some(fe_http),
             fe_grpc: Some(fe_grpc),
             be_http: Some(be_http),
@@ -206,7 +205,7 @@ frontend_endpoint = "127.0.0.1:{fe_grpc_port}"
     }
 
     fn release_fe(&mut self) {
-        drop(self.fe_mysql.take());
+        drop(self.fe_trino.take());
         drop(self.fe_http.take());
         drop(self.fe_grpc.take());
     }
@@ -265,7 +264,7 @@ fn spawn_all_in_one(pair: &ConfigPair, debug_env: &[(&str, &Path)]) -> ManagedPr
             pair.be_config.path().display()
         ),
         command,
-        ReadyMarker::StdoutContains("NOVAROCKS_READY mysql_port=".to_string()),
+        ReadyMarker::StdoutContains("NOVAROCKS_READY role=fe trino_port=".to_string()),
         PROCESS_READY_TIMEOUT,
         pair.fe_config
             .path()
@@ -358,6 +357,11 @@ fn assert_role_scoped_surfaces(pair: &ConfigPair) {
     const BE_OWNED_FAMILY: &str = "novarocks_backend_task_execution_tasks_created_total";
     const FE_OWNED_FAMILY: &str = "novarocks_backend_registry_entries";
 
+    let info = http_request(pair.fe_trino_port, "GET", "/v1/info");
+    assert!(
+        info.starts_with("HTTP/1.1 200") || info.starts_with("HTTP/1.0 200"),
+        "the configured client port must serve Trino info: {info}"
+    );
     assert_native_rejects_management(pair.fe_grpc_port, "/metrics");
     assert_native_rejects_management(pair.be_grpc_port, "/metrics");
     assert_native_rejects_management(pair.be_control_grpc_port, "/metrics");
@@ -471,7 +475,7 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
     let mut frontend = spawn_novarocks(
         "fe",
         pair.fe_config.path(),
-        "NOVAROCKS_READY mysql_port=",
+        "NOVAROCKS_READY role=fe trino_port=",
         &frontend_debug_env,
     );
     assert_role_scoped_surfaces(&pair);
@@ -495,7 +499,7 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
     assert_grantless_role_output(&all_in_one, "all-in-one");
 
     for port in [
-        pair.fe_mysql_port,
+        pair.fe_trino_port,
         pair.fe_http_port,
         pair.fe_grpc_port,
         pair.be_http_port,
@@ -607,6 +611,30 @@ fn binary_rejects_removed_and_ambiguous_launch_shapes() {
         ],
         "must be `fe` or `be`",
     );
+    for (role, source) in [("fe", pair.fe_config.path()), ("be", pair.be_config.path())] {
+        let text = std::fs::read_to_string(source).expect("read deployable config");
+        let text = if text.contains("[standalone_server]") {
+            text.replace(
+                "[standalone_server]",
+                "[standalone_server]\nmysql_port = 9030",
+            )
+        } else {
+            format!("{text}\n[standalone_server]\nmysql_port = 9030\n")
+        };
+        let retired = write_config(pair.runtime.path(), "retired-client-port", &text);
+        assert_rejected(
+            &[
+                "standalone",
+                "--role",
+                role,
+                "--config",
+                retired.path().to_str().expect("utf8 retired config"),
+            ],
+            "standalone_server.mysql_port is retired; use standalone_server.trino_port",
+        );
+        assert!(!pair.runtime.path().join("logs").exists());
+        assert!(!pair.runtime.path().join("frontend-state.sqlite").exists());
+    }
 }
 
 /// Cross-role bind overlap must fail in launch preflight, before logging,
@@ -665,8 +693,7 @@ http_port = {}
 grpc_port = {}
 
 [standalone_server]
-mysql_port = {}
-trino_port = 0
+trino_port = {}
 
 [cluster]
 role = "fe"
@@ -682,7 +709,7 @@ path = "{}"
             log_dir.display(),
             pair.fe_http_port,
             pair.fe_grpc_port,
-            pair.fe_mysql_port,
+            pair.fe_trino_port,
             state_store.display(),
         ),
     );
@@ -770,7 +797,7 @@ fn insufficient_native_fd_baseline_refuses_before_role_startup_side_effects() {
         for port in [
             pair.fe_grpc_port,
             pair.fe_http_port,
-            pair.fe_mysql_port,
+            pair.fe_trino_port,
             pair.be_grpc_port,
             pair.be_control_grpc_port,
             pair.be_http_port,

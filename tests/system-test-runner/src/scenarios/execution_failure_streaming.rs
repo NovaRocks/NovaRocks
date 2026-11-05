@@ -19,18 +19,8 @@
 
 use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use super::query_lifecycle;
-use crate::{
-    actors::{
-        mysql as mysql_actor,
-        mysql_stream::{
-            AsyncMysqlStream, BoundedErrorPrefix, BoundedNegativeTextObservation,
-            OwnedTextResultObservation,
-        },
-    },
-    scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig},
-};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
     LaunchProfile, QueryLifecycleFailureSite, QueryLifecycleStatementObservation,
     QueryLifecycleStructuredSnapshot, TestClusterOwner, test_sessions::ClusterTestSessionPlan,
@@ -40,13 +30,11 @@ use novarocks_execution_contract::{
     failure::{FailureClass, FailureFact, FailureReason, domain},
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     num::NonZeroU16,
     path::Path,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
 
 const ACTION: &str = "task-execution-failure-after-visible-prefix";
 const BEFORE_SCHEMA_ACTION: &str = "root-task-execution-failure-before-data";
@@ -97,12 +85,6 @@ impl Stage {
         match self {
             Self::AfterVisibleRow => TARGET,
             Self::BeforeSchema => HEALTHY,
-        }
-    }
-    fn prefix(self) -> BoundedErrorPrefix<'static> {
-        match self {
-            Self::AfterVisibleRow => BoundedErrorPrefix::AfterMetadata { rows: &[Some("1")] },
-            Self::BeforeSchema => BoundedErrorPrefix::BeforeSchema,
         }
     }
     fn evidence_file(self) -> &'static str {
@@ -182,343 +164,317 @@ impl Scenario for ExecutionFailureScene {
         .map(Some)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_failure_trino(context, &self.intent, self.stage)
+    }
+}
+
+/// Both original finite failure stages retain the exact Task cause and owners.
+/// The visible stage activates only after EOF and Join of its first complete
+/// one-row public page; the original wanted=2 hold provides that boundary.
+fn run_failure_trino(
+    context: &mut ScenarioContext,
+    intent: &SqlIntentOwner,
+    stage: Stage,
+) -> Result<()> {
+    use super::execution_failure::{
+        check_payload_columns, observe_zero_row_failure, run_original_pending,
+    };
+    use crate::actors::sql::{SqlSession, TrinoValue};
+    use crate::actors::trino_protocol::TrinoClient;
+    use novarocks_test_trino_client::TrinoError;
+    ensure!(
+        context.handle().be_count() == 3,
+        "failure requires real native 1FE+3BE"
+    );
+    let launches = context.recheck_live_process_launch_identities()?;
+    let baseline = query_lifecycle::resource_snapshot(context)?;
+    let deadline = context.deadline();
+    let selected = intent.take(0)?;
+    let mut observations = Vec::new();
+    let mut live = None;
+    let mut evidence = json!({"scenario":stage.name(),
+        "prefix_rows":if stage==Stage::AfterVisibleRow {vec!["1"]} else {vec![]},
+        "fault_enabled_after_prefix":false,
+        "reader_policy":"every original page reaches EOF/Drop/real reader Join"});
+    let primary = (|| -> Result<()> {
+        let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        let pending = session.submit(stage.sql())?;
+        let cancel = pending.cancel_handle();
+        let (pending, observation) = selected.arm_pending(context, pending, stage.sql())?;
+        observations.push(observation.clone());
+        live = Some(cancel);
+        let actor = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            deadline,
+            &context.scenario_root().join("execution-failure-pages"),
+        )?;
+        let query_id = pending.query_id.clone();
+        let mut uri = pending
+            .initial_next_uri
+            .clone()
+            .context("POST omitted original continuation")?;
+        if stage == Stage::AfterVisibleRow {
+            let (prefix, next) = await_original_visible_page(&actor, &query_id, uri)?;
+            // read_negative_page has already consumed the actual response EOF,
+            // dropped that body and joined its one original reader thread.
+            evidence["first_published_page"] = prefix;
+            context.action("verified the complete first Trino page contains exactly one VARCHAR row 1 and joined its original reader");
+            selected.activate_deferred_faults(context)?;
+            evidence["fault_enabled_after_prefix"] = json!(true);
+            uri = next;
+        }
+        let observed = observe_zero_row_failure(&actor, &query_id, uri)?;
+        live = None;
+        drop(pending);
+        evidence["negative"] = observed.clone();
+        if stage == Stage::BeforeSchema {
+            ensure!(
+                observed["columns"].is_null(),
+                "failure published metadata before schema refusal"
+            );
+        }
+        let error: TrinoError = serde_json::from_value(observed["error"].clone())?;
         ensure!(
-            context.handle().be_count() == 3,
-            "scenario requires real native 1FE+3BE"
+            error.error_code == 65536
+                && error.error_name == "GENERIC_INTERNAL_ERROR"
+                && error.error_type == "INTERNAL_ERROR",
+            "NATIVE20 Unexpected changed its independent Trino mapping: {error:?}"
         );
-        let launches = context.recheck_live_process_launch_identities()?;
-        let baseline = query_lifecycle::resource_snapshot(context)?;
-        let deadline = context.deadline();
-        let stage = self.stage;
-        let target = stage.sql();
-        let action = stage.action();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .context("create original raw client runtime")?;
-        let mut stream = runtime.block_on(AsyncMysqlStream::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect raw client")?,
-        ))?;
-        let connection = stream.connection_id()?;
-        let selected = self.intent.take(0)?;
-        let mut observations = Vec::new();
-        let prefix_rows: &[&str] = match stage {
-            Stage::AfterVisibleRow => &["1"],
-            Stage::BeforeSchema => &[],
+        let snapshot = await_converged(context, &observation, false)?;
+        let task = assert_failed_snapshot(&snapshot)?;
+        ensure!(
+            error.message
+                == format!(
+                    "[query.execution.unexpected] {}",
+                    snapshot
+                        .failure_detail
+                        .as_deref()
+                        .context("canonical failure omitted original safe detail")?
+                ),
+            "public typed error differs from the canonical Task failure"
+        );
+        evidence["selected_failure"] = snapshot_evidence(&snapshot);
+        if stage == Stage::BeforeSchema {
+            let statement = context
+                .handle()
+                .query_lifecycle_statement_token(&observation, deadline)?;
+            assert_trino_handoff_marker(context, &selected.token, statement)?;
+            evidence["original_failure_observed_before_protocol_handoff"] = json!(true);
+        }
+        let marker = if stage == Stage::AfterVisibleRow {
+            ACCEPTED
+        } else {
+            PROPOSED
         };
-        let mut evidence = json!({"scenario":self.name(), "prefix_rows":prefix_rows,
-            "fault_enabled_after_prefix":false, "actual_client_joined":false});
-        let mut next_command = None;
-        let mut client = None;
-        let primary = (|| -> Result<()> {
-            // The same exact statement arm registers the original cleanup.
-            // Only AfterVisibleRow is dormant until the verified client prefix.
-            observations.push(selected.arm(context, connection, target)?);
-            let (ready_tx, ready_rx) = oneshot::channel();
-            let (negative_tx, negative_rx) = oneshot::channel();
-            let (next_tx, next_rx) = oneshot::channel::<bool>();
-            next_command = Some(next_tx);
-            client = Some(runtime.spawn(async move {
-                let negative = stream
-                    .observe_bounded_execution_error(target, stage.prefix(), ready_tx, deadline)
-                    .await;
-                // A failed controller still drops this owned socket in this task.
-                let _ = negative_tx.send(negative);
-                let run_next =
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next_rx)
-                        .await
-                        .context("same-socket command original deadline")?
-                        .context("same-socket command owner disappeared")?;
-                let result = if run_next {
-                    Some(
-                        stream
-                            .observe_text_query_owned_until(HEALTHY, Duration::ZERO, None, deadline)
-                            .await,
-                    )
-                } else {
-                    None
-                };
-                drop(stream);
-                Ok::<_, anyhow::Error>(result)
-            }));
-            runtime.block_on(receive_until(ready_rx, deadline, "selected raw prefix"))?;
-            match stage {
-                Stage::AfterVisibleRow => {
-                    context.action("raw client parsed one exact complete payload/VARCHAR row before fault activation");
-                    selected.activate_deferred_faults(context)?;
-                    evidence["fault_enabled_after_prefix"] = json!(true);
-                }
-                Stage::BeforeSchema => {
-                    // BeforeSchema ready only acknowledges COM_QUERY sent. The
-                    // first complete ERR below independently proves the stage.
-                    context.action("raw client sent exact before-schema failure statement");
-                }
-            }
-            let negative = runtime.block_on(receive_until(
-                negative_rx,
-                deadline,
-                "complete execution ERR",
-            ))?;
-            evidence["negative"] = serde_json::to_value(&negative)?;
-            assert_negative(stage, &negative)?;
-            let snapshot = await_converged(context, &observations[0], false)?;
-            evidence["selected_failure"] = snapshot_evidence(&snapshot);
-            let task = assert_failed_snapshot(&snapshot)?;
-            if stage == Stage::BeforeSchema {
-                assert_handoff_terminal_marker(context, &selected.token, connection)?;
-                evidence["original_failure_observed_before_protocol_handoff"] = json!(true);
-            }
-            assert_raw_canonical(&negative, &snapshot)?;
-            evidence["selected_failure"] = snapshot_evidence(&snapshot);
-            let marker = match stage {
-                Stage::AfterVisibleRow => ACCEPTED,
-                Stage::BeforeSchema => PROPOSED,
-            };
-            let fault_backend = query_lifecycle::await_token_scoped_marker(
-                context,
-                marker,
-                std::slice::from_ref(&selected.token),
-            )?;
-            match stage {
-                Stage::AfterVisibleRow => {
-                    assert_accepted_marker(context, fault_backend, task, &selected.token)?
-                }
-                Stage::BeforeSchema => {
-                    assert_proposal_marker(context, fault_backend, task, &selected.token)?
-                }
-            }
-            let hits = (0..3)
-                .map(|index| {
-                    context
-                        .handle()
-                        .selected_query_lifecycle_fault_hit(index, action, &selected.token)
-                        .map(|hit| (index, hit))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            ensure!(
-                hits.iter().filter(|(_, hit)| *hit).count() == 1 && hits[fault_backend].1,
-                "expected one exact root Task action hit, got {hits:?}"
-            );
-            assert_no_replacement(context, &snapshot)?;
-            evidence[match stage {
-                Stage::AfterVisibleRow => "accepted_backend",
-                Stage::BeforeSchema => "proposal_backend",
-            }] = json!(fault_backend);
-            // Clear the same registered actions before checking the next statement.
-            context.handle().clear_query_lifecycle_faults()?;
-            // A connection has one exact observer. Retire its completed
-            // original binding before arming the same socket's next statement.
-            context
-                .handle()
-                .drain_query_lifecycle_statement_binding(&observations[0], deadline)?;
-            observations.remove(0);
-            let next = self.intent.take(1)?;
-            let next_observation = next.arm(context, connection, HEALTHY)?;
-            observations.push(next_observation.clone());
-            next_command
-                .take()
-                .context("missing same-socket command")?
-                .send(true)
-                .map_err(|_| anyhow::anyhow!("original raw client exited before next statement"))?;
-            let healthy = runtime
-                .block_on(client.take().context("missing original client task")?)
-                .context("join original raw client")??
-                .context("same-socket statement was not run")?;
-            evidence["actual_client_joined"] = json!(true);
-            assert_healthy_wire(&healthy)?;
-            evidence["next_statement"] = serde_json::to_value(&healthy.observation)?;
-            let next_snapshot = await_converged(context, &next_observation, true)?;
-            assert_independent_success(&snapshot, &next_snapshot)?;
-            // A separate real socket and statement binding rule out connection-local recovery.
-            let independent =
-                mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?;
-            let other = self.intent.take(2)?;
-            let other_observation = other.arm(context, independent.connection_id(), HEALTHY)?;
-            observations.push(other_observation.clone());
-            let value: Option<String> =
-                independent.run(|connection| Ok(connection.query_first(HEALTHY)?))?;
-            ensure!(
-                value.as_deref() == Some("5050"),
-                "independent query returned {value:?}"
-            );
-            let other_snapshot = await_converged(context, &other_observation, true)?;
-            assert_independent_success(&snapshot, &other_snapshot)?;
-            ensure!(
-                other_snapshot.execution_id != next_snapshot.execution_id,
-                "independent and next statements share an execution identity"
-            );
-            evidence["next_snapshot"] = snapshot_evidence(&next_snapshot);
-            evidence["independent_snapshot"] = snapshot_evidence(&other_snapshot);
-            assert_no_replacement(context, &snapshot)?;
-            ensure!(
-                launches == context.recheck_live_process_launch_identities()?,
-                "scenario changed native process launch identities"
-            );
-            Ok(())
-        })();
-        // Always release the finite command gate and actually join the client.
-        // The original absolute deadline bounds its query and command receive.
-        let mut cleanup = Vec::new();
-        if let Err(error) = context.handle().clear_query_lifecycle_faults() {
-            cleanup.push(format!("clear original fault actions: {error:#}"));
+        let backend = query_lifecycle::await_token_scoped_marker(
+            context,
+            marker,
+            std::slice::from_ref(&selected.token),
+        )?;
+        if stage == Stage::AfterVisibleRow {
+            assert_accepted_marker(context, backend, task, &selected.token)?;
+        } else {
+            assert_proposal_marker(context, backend, task, &selected.token)?;
         }
-        if let Some(command) = next_command.take() {
-            let _ = command.send(false);
+        let hits = (0..3)
+            .map(|index| {
+                context
+                    .handle()
+                    .selected_query_lifecycle_fault_hit(index, stage.action(), &selected.token)
+                    .map(|hit| (index, hit))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            hits.iter().filter(|(_, hit)| *hit).count() == 1 && hits[backend].1,
+            "failure stage lost its one exact root action hit"
+        );
+        assert_no_replacement(context, &snapshot)?;
+        evidence[if stage == Stage::AfterVisibleRow {
+            "accepted_backend"
+        } else {
+            "proposal_backend"
+        }] = json!(backend);
+        context.handle().clear_query_lifecycle_faults()?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, deadline)?;
+        observations.clear();
+        let next = intent.take(1)?;
+        let pending = session.submit(HEALTHY)?;
+        let (pending, next_observation) = next.arm_pending(context, pending, HEALTHY)?;
+        observations.push(next_observation.clone());
+        let result = run_original_pending(&mut session, pending, deadline)?;
+        check_payload_columns(&result.columns)?;
+        ensure!(
+            result.rows == [vec![TrinoValue::Text("5050".into())]],
+            "next explicit-session query changed its exact text/NULL/width result"
+        );
+        let next_snapshot = await_converged(context, &next_observation, true)?;
+        assert_independent_success(&snapshot, &next_snapshot)?;
+        let mut independent = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        let other = intent.take(2)?;
+        let pending = independent.submit(HEALTHY)?;
+        let (pending, other_observation) = other.arm_pending(context, pending, HEALTHY)?;
+        observations.push(other_observation.clone());
+        let result = run_original_pending(&mut independent, pending, deadline)?;
+        check_payload_columns(&result.columns)?;
+        ensure!(
+            result.rows == [vec![TrinoValue::Text("5050".into())]],
+            "independent query changed its complete typed result"
+        );
+        let other_snapshot = await_converged(context, &other_observation, true)?;
+        assert_independent_success(&snapshot, &other_snapshot)?;
+        ensure!(
+            other_snapshot.execution_id != next_snapshot.execution_id,
+            "independent and next queries share a logical execution"
+        );
+        evidence["next_snapshot"] = snapshot_evidence(&next_snapshot);
+        evidence["independent_snapshot"] = snapshot_evidence(&other_snapshot);
+        assert_no_replacement(context, &snapshot)?;
+        ensure!(
+            launches == context.recheck_live_process_launch_identities()?,
+            "execution failure changed Native process identities"
+        );
+        Ok(())
+    })();
+    let mut cleanup = Vec::new();
+    if let Some(cancel) = live
+        && let Err(error) = cancel.delete(deadline)
+    {
+        cleanup.push(format!("cancel original public query: {error}"));
+    }
+    if let Err(error) = context.handle().clear_query_lifecycle_faults() {
+        cleanup.push(format!("clear original fault actions: {error:#}"));
+    }
+    if let Err(error) = query_lifecycle::await_resource_convergence(context, &baseline) {
+        cleanup.push(format!("original resource convergence: {error:#}"));
+    }
+    for observation in &observations {
+        if let Err(error) = context
+            .handle()
+            .drain_query_lifecycle_statement_observation(observation)
+        {
+            cleanup.push(format!("drain original binding: {error:#}"));
         }
-        if let Some(job) = client.take() {
-            match runtime.block_on(job) {
-                Ok(Ok(_)) => evidence["actual_client_joined"] = json!(true),
-                Ok(Err(error)) => cleanup.push(format!("original client exit: {error:#}")),
-                Err(error) => cleanup.push(format!("original client join: {error}")),
-            }
+    }
+    evidence["primary_succeeded"] = json!(primary.is_ok());
+    evidence["cleanup"] = json!({"complete":cleanup.is_empty(),"errors":cleanup});
+    if let Err(error) = std::fs::write(
+        context.scenario_root().join(stage.evidence_file()),
+        serde_json::to_vec_pretty(&evidence)?,
+    ) {
+        cleanup.push(format!("save scene evidence: {error}"));
+    }
+    match (primary, cleanup.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Err(primary), true) => Err(primary),
+        (Ok(()), false) => {
+            anyhow::bail!("execution-failure cleanup failed: {}", cleanup.join("; "))
         }
-        if let Err(error) = query_lifecycle::await_resource_convergence(context, &baseline) {
-            cleanup.push(format!("original resource convergence: {error:#}"));
-        }
-        for observation in &observations {
-            if let Err(error) = context
-                .handle()
-                .drain_query_lifecycle_statement_observation(observation)
-            {
-                cleanup.push(format!("drain original statement observation: {error:#}"));
-            }
-        }
-        evidence["primary_succeeded"] = json!(primary.is_ok());
-        evidence["cleanup"] = json!({"error_count":cleanup.len(), "complete":cleanup.is_empty()});
-        // This retained evidence contains only exact public protocol/fact fields.
-        if let Err(error) = std::fs::write(
-            context.scenario_root().join(stage.evidence_file()),
-            serde_json::to_vec_pretty(&evidence)?,
-        ) {
-            cleanup.push(format!("save scene evidence: {error}"));
-        }
-        match (primary, cleanup.is_empty()) {
-            (Ok(()), true) => Ok(()),
-            (Err(error), true) => Err(error),
-            (Ok(()), false) => anyhow::bail!("scenario cleanup failed: {}", cleanup.join("; ")),
-            (Err(error), false) => anyhow::bail!("{error:#}; cleanup: {}", cleanup.join("; ")),
+        (Err(primary), false) => {
+            Err(primary.context(format!("execution-failure cleanup: {}", cleanup.join("; "))))
         }
     }
 }
 
-async fn receive_until<T>(
-    receiver: oneshot::Receiver<T>,
-    deadline: Instant,
-    phase: &str,
-) -> Result<T> {
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), receiver)
-        .await
-        .with_context(|| format!("{phase}: original deadline"))?
-        .with_context(|| format!("{phase}: original sender exited"))
-}
-
-fn assert_negative(stage: Stage, observed: &BoundedNegativeTextObservation) -> Result<()> {
-    ensure!(
-        observed.text.error.is_none() && observed.pending_packet.is_none(),
-        "bounded raw observer did not finish its exact prefix and ERR: {observed:?}"
-    );
-    match stage {
-        Stage::AfterVisibleRow => {
+fn await_original_visible_page(
+    actor: &crate::actors::trino_protocol::TrinoClient,
+    query: &str,
+    mut uri: String,
+) -> Result<(Value, String)> {
+    use super::execution_failure::{check_payload_columns, read_negative_page};
+    use novarocks_test_trino_client::Column;
+    let mut columns = None;
+    loop {
+        let raw = read_negative_page(actor, &uri)?;
+        ensure!(raw.status == 200, "visible-prefix page was not HTTP200");
+        let page = raw.json()?;
+        ensure!(
+            page["id"].as_str() == Some(query)
+                && page.get("error").is_none_or(Value::is_null)
+                && page.get("updateType").is_none_or(Value::is_null)
+                && page.get("updateCount").is_none_or(Value::is_null),
+            "original visible-prefix page changed identity, failed early or became completion"
+        );
+        if let Some(value) = page.get("columns").filter(|value| !value.is_null()) {
+            let actual: Vec<Column> = serde_json::from_value(value.clone())?;
+            check_payload_columns(&actual)?;
             ensure!(
-                observed.completed_metadata,
-                "visible-row metadata was not completed"
+                columns.as_ref().is_none_or(|previous| previous == &actual),
+                "original visible-prefix VARCHAR declaration changed between pages"
             );
-            ensure!(
-                observed.text.rows == 1
-                    && observed.text.columns == 1
-                    && observed.text.schema.len() == 1
-                    && observed.text.schema[0].name == "payload",
-                "bounded raw prefix differs from the exact one-row contract"
-            );
-            ensure!(
-                observed.text.row_sha256 == format!("{:x}", Sha256::digest([1, b'1'])),
-                "first visible row payload is not the independent text encoding of 1"
-            );
+            columns = Some(actual);
         }
-        Stage::BeforeSchema => {
-            ensure!(
-                !observed.completed_metadata
-                    && observed.metadata_payload_hex.is_empty()
-                    && observed.text.columns == 0
-                    && observed.text.schema.is_empty()
-                    && observed.text.rows == 0
-                    && observed.text.row_payload_bytes == 0
-                    && observed.text.first_row_micros.is_none()
-                    && observed.text.packets == 1,
-                "before-schema ERR was preceded by metadata or row data: {observed:?}"
-            );
-            ensure!(
-                observed
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|terminal| terminal.sequence == 1),
-                "before-schema ERR must be the first response packet"
-            );
+        let next = raw
+            .next_uri()?
+            .context("visible-prefix query reached success EOF before original fault activation")?;
+        if let Some(data) = page.get("data").filter(|data| !data.is_null()) {
+            let rows = data
+                .as_array()
+                .context("visible-prefix data was not an array")?;
+            if !rows.is_empty() {
+                ensure!(
+                    columns.is_some(),
+                    "visible row preceded its exact payload declaration"
+                );
+                ensure!(
+                    rows.len() == 1
+                        && rows[0]
+                            .as_array()
+                            .is_some_and(|row| row.len() == 1 && row[0].as_str() == Some("1")),
+                    "original wanted=2 hold did not retain exactly the one complete public row 1"
+                );
+                ensure!(
+                    page["stats"]["state"] == "RUNNING",
+                    "visible-prefix page was not the original in-flight result"
+                );
+                return Ok((page, next));
+            }
         }
+        uri = next;
     }
-    let terminal = observed
-        .terminal
-        .as_ref()
-        .context("missing complete ERR packet")?;
-    ensure!(
-        terminal.code == 1105 && terminal.sqlstate == "HY000",
-        "execution ERR has errno={} SQLSTATE={}",
-        terminal.code,
-        terminal.sqlstate
-    );
-    Ok(())
 }
 
-// This marker proves only that the finite FE handoff action observed its
-// original failure watch. The Task snapshot remains the acceptance authority.
-fn assert_handoff_terminal_marker(
+fn assert_trino_handoff_marker(
     context: &mut ScenarioContext,
     token: &str,
-    connection: u32,
+    expected: (u64, u64),
 ) -> Result<()> {
     const MARKER: &str = novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED;
+    let token = format!("token={token}");
     loop {
         let log = context.handle().fe_log_contents()?;
         let matches = log
             .lines()
             .filter(|line| {
-                line.starts_with(MARKER)
-                    && line
-                        .split_whitespace()
-                        .any(|field| field == format!("token={token}"))
+                line.split_whitespace().next() == Some(MARKER)
+                    && line.split_whitespace().any(|field| field == token)
             })
             .collect::<Vec<_>>();
-        if !matches.is_empty() {
-            ensure!(
-                matches.len() == 1,
-                "expected one exact FE terminal handoff marker, got {}",
-                matches.len()
+        if matches.is_empty() {
+            std::thread::sleep(
+                context
+                    .remaining("observe exact FE handoff action")?
+                    .min(Duration::from_millis(20)),
             );
-            let statement = matches[0]
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix("statement="))
-                .context("FE handoff marker has no original statement")?;
-            let parts = statement
-                .split(':')
-                .map(str::parse::<u64>)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            ensure!(
-                parts.len() == 3
-                    && parts[0] == u64::from(connection)
-                    && parts[1] > 0
-                    && parts[2] > 0,
-                "FE handoff marker names another statement: {statement}"
-            );
-            return Ok(());
+            continue;
         }
-        std::thread::sleep(
-            context
-                .remaining("observe exact FE handoff action")?
-                .min(Duration::from_millis(20)),
+        ensure!(
+            matches.len() == 1,
+            "expected one original before-schema handoff hit"
         );
+        let statement = matches[0]
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("statement="))
+            .context("original handoff omitted actual statement token")?;
+        ensure!(
+            expected.0 > 0
+                && expected.1 > 0
+                && statement == format!("{}:{}", expected.0, expected.1),
+            "handoff does not name the exact public-query observer's original statement"
+        );
+        return Ok(());
     }
 }
 
@@ -565,22 +521,6 @@ fn assert_failed_snapshot(snapshot: &QueryLifecycleStructuredSnapshot) -> Result
     Ok(*identity)
 }
 
-fn assert_raw_canonical(
-    raw: &BoundedNegativeTextObservation,
-    snapshot: &QueryLifecycleStructuredSnapshot,
-) -> Result<()> {
-    let terminal = raw.terminal.as_ref().context("missing complete raw ERR")?;
-    let detail = snapshot
-        .failure_detail
-        .as_ref()
-        .context("missing original safe detail")?;
-    ensure!(
-        terminal.message == format!("[query.execution.unexpected] {detail}"),
-        "raw SQL descriptor/detail differ from the canonical execution input"
-    );
-    Ok(())
-}
-
 fn await_converged(
     context: &mut ScenarioContext,
     observation: &QueryLifecycleStatementObservation,
@@ -617,31 +557,6 @@ fn assert_independent_success(
         "healthy statement did not acquire its own execution in the original FE process"
     );
     Ok(())
-}
-
-fn assert_healthy_wire(healthy: &OwnedTextResultObservation) -> Result<()> {
-    ensure!(
-        healthy.actual_failure.is_none()
-            && healthy.server_result_error_code.is_none()
-            && healthy.observation.error.is_none()
-            && healthy.observation.rows == 1
-            && healthy.observation.columns == 1,
-        "same socket failed to run the next exact healthy statement"
-    );
-    ensure!(
-        healthy.observation.row_sha256 == healthy_row_digest(),
-        "same socket next statement returned different row bytes"
-    );
-    Ok(())
-}
-
-fn healthy_row_digest() -> String {
-    // The original owned positive observer commits each row with its u64
-    // little-endian payload length after the complete row payload.
-    let mut digest = Sha256::new();
-    digest.update([4, b'5', b'0', b'5', b'0']);
-    digest.update(5u64.to_le_bytes());
-    format!("{:x}", digest.finalize())
 }
 
 fn execution_text(task: TaskIdentity) -> String {

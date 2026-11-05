@@ -454,7 +454,7 @@ fn nested_dictionary_ids_are_reconstructed_in_postorder() {
         Arc::new(StructArray::new(vec![child].into(), vec![dictionary], None)) as ArrayRef;
     let field = Arc::new(Field::new("root", structure.data_type().clone(), true));
     let mut observer = Observed::default();
-    let recipe = exact(&[field.clone()], &mut observer);
+    let recipe = exact(std::slice::from_ref(&field), &mut observer);
     let input = batch(vec![field], vec![structure]);
     let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
     let output = decode_unit(&recipe, &wire, &mut observer).unwrap();
@@ -473,7 +473,7 @@ fn sliced_struct_with_parent_null_round_trips() {
     .slice(1, 2);
     let field = Arc::new(Field::new("r", structure.data_type().clone(), true));
     let mut observer = Observed::default();
-    let recipe = exact(&[field.clone()], &mut observer);
+    let recipe = exact(std::slice::from_ref(&field), &mut observer);
     let input = batch(vec![field], vec![Arc::new(structure)]);
     let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
     assert_eq!(
@@ -554,7 +554,7 @@ fn depth_64_round_trips_and_65_is_rejected() {
     }
     let field = Arc::new(Field::new("root", array.data_type().clone(), true));
     let mut observer = Observed::default();
-    let recipe = exact(&[field.clone()], &mut observer);
+    let recipe = exact(std::slice::from_ref(&field), &mut observer);
     let input = batch(vec![field.clone()], vec![array]);
     let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
     assert_eq!(
@@ -609,7 +609,7 @@ fn logical_depth_64_maps_keep_entries_and_key_nodes() {
     }
     let field = Arc::new(Field::new("root", array.data_type().clone(), true));
     let mut observer = Observed::default();
-    let recipe = exact(&[field.clone()], &mut observer);
+    let recipe = exact(std::slice::from_ref(&field), &mut observer);
     let input = batch(vec![field], vec![array]);
     let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
     let output = decode_unit(&recipe, &wire, &mut observer).unwrap();

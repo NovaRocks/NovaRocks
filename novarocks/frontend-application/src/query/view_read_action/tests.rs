@@ -139,7 +139,15 @@ impl Fixture {
             cancellation.clone(),
             Default::default(),
             Default::default(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            Some(
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: true,
+                    },
+                ),
+            ),
         ))
         .with_result_capacity(QueryResultCapacityBinding::try_new(&scope, origin.clone()).unwrap())
         .unwrap();
@@ -199,7 +207,13 @@ impl Fixture {
                     LocalResultProducer::try_new(
                         &scope,
                         origin.clone(),
-                        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: true,
+                                variant_binary: true,
+                            },
+                        ),
                     )
                     .unwrap(),
                 ),

@@ -153,9 +153,9 @@ fn combine(
         (Err(primary), Ok(())) => Err(primary),
         (Ok(()), Err(cleanup)) => Err(cleanup),
         (Err(primary), Err(cleanup)) => {
-            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            #[cfg(novarocks_dev_controls)]
             return Err(primary.with_role_cleanup(cleanup));
-            #[cfg(not(feature = "mem-1-m07-closing-pressure"))]
+            #[cfg(not(novarocks_dev_controls))]
             Err(primary.with_application_cleanup(cleanup))
         }
     }

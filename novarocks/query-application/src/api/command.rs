@@ -148,8 +148,49 @@ pub enum StatementExternalEffectDisposition {
     KnownCommitted,
 }
 impl StatementExternalEffectDisposition {
+    /// Cumulative knowledge across the original statement's completed effects.
+    /// This is the existing MV fold: a known applied effect cannot be erased
+    /// by a later unknown or uncommitted operation.
+    pub const fn combine(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        use StatementExternalEffectDisposition::*;
+        match (a, b) {
+            (Some(KnownCommitted), _) | (_, Some(KnownCommitted)) => Some(KnownCommitted),
+            (Some(CommitUnknown), _) | (_, Some(CommitUnknown)) => Some(CommitUnknown),
+            (Some(KnownUncommitted), _) | (_, Some(KnownUncommitted)) => Some(KnownUncommitted),
+            _ => None,
+        }
+    }
+    /// Borrow the original public diagnostic; no copy or string parsing is
+    /// needed before a protocol applies its own display bound.
+    pub fn diagnostic<'a>(
+        message: &'a dyn std::fmt::Display,
+        disposition: Option<Self>,
+    ) -> impl std::fmt::Display + 'a {
+        ExternalEffectDiagnostic {
+            message,
+            disposition,
+        }
+    }
     pub const fn do_not_retry(self) -> bool {
         matches!(self, Self::CommitUnknown | Self::KnownCommitted)
+    }
+}
+
+struct ExternalEffectDiagnostic<'a> {
+    message: &'a dyn std::fmt::Display,
+    disposition: Option<StatementExternalEffectDisposition>,
+}
+impl std::fmt::Display for ExternalEffectDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.message, f)?;
+        if let Some(effect) = self.disposition {
+            write!(f, " (external effect disposition={effect:?}")?;
+            if effect.do_not_retry() {
+                f.write_str(" do_not_retry=true; do not retry statement")?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
     }
 }
 
@@ -581,6 +622,40 @@ mod compile_control_tests {
                 CommandError::from(control.to_string()).compile_control_error(),
                 None
             );
+        }
+    }
+    #[test]
+    fn cumulative_effect_truth_table_has_one_associative_idempotent_author() {
+        use StatementExternalEffectDisposition::{
+            CommitUnknown as X, KnownCommitted as C, KnownUncommitted as U,
+        };
+        let values = [None, Some(U), Some(X), Some(C)];
+        let expected = [
+            [None, Some(U), Some(X), Some(C)],
+            [Some(U), Some(U), Some(X), Some(C)],
+            [Some(X), Some(X), Some(X), Some(C)],
+            [Some(C), Some(C), Some(C), Some(C)],
+        ];
+        for (i, a) in values.into_iter().enumerate() {
+            assert_eq!(StatementExternalEffectDisposition::combine(a, a), a);
+            for (j, b) in values.into_iter().enumerate() {
+                assert_eq!(
+                    StatementExternalEffectDisposition::combine(a, b),
+                    expected[i][j]
+                );
+                for c in values {
+                    assert_eq!(
+                        StatementExternalEffectDisposition::combine(
+                            StatementExternalEffectDisposition::combine(a, b),
+                            c
+                        ),
+                        StatementExternalEffectDisposition::combine(
+                            a,
+                            StatementExternalEffectDisposition::combine(b, c)
+                        )
+                    );
+                }
+            }
         }
     }
 }

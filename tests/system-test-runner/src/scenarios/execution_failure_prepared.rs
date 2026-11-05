@@ -25,10 +25,9 @@ use super::native_creation::{
 use super::native_direct_controls::{DirectIntentOwner, close_hold, read_marker, release_hold};
 use super::preparation_capacity::await_snapshot_at;
 use super::query_lifecycle::{await_resource_convergence, resource_snapshot};
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{QueryExecutionResourceSnapshot, TestClusterOwner};
 use novarocks_execution_contract::{
     failure::{FailureClass, FailureEvidence, domain},
@@ -261,16 +260,13 @@ fn exercise(
         &raw_create_identity(&sibling),
         proto::TaskState::Finished,
     )?;
-    let connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
+    let mut connection =
+        sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    let rows = sql::integer_column(
+        &connection
+            .execute(HEALTHY_SQL)
+            .context("execute healthy public query while prepared failure is retained")?,
     )?;
-    let rows: Vec<i64> = connection.run(|connection| {
-        connection
-            .query(HEALTHY_SQL)
-            .context("execute healthy public query while prepared failure is retained")
-    })?;
     ensure!(
         rows == [1, 1],
         "healthy query changed complete rows while prepared failure waited: {rows:?}"
@@ -713,7 +709,7 @@ fn active_fragments(snapshot: &QueryExecutionResourceSnapshot, index: usize) -> 
         .resources
         .get("native_query_active_tasks")
         .copied()
-        .context("actual active-fragment measurement is unavailable")
+        .context("actual active-task measurement is unavailable")
 }
 fn await_retained_fragment(
     context: &mut ScenarioContext,
@@ -942,16 +938,13 @@ mod participation_owner_panic {
                 &raw_create_identity(&healthy),
                 proto::TaskState::Finished,
             )?;
-            let connection = mysql_actor::connect_until(
-                context.mysql_user(),
-                context.mysql_port(),
-                context.deadline(),
+            let mut connection =
+                sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+            let rows = sql::integer_column(
+                &connection
+                    .execute(HEALTHY_SQL)
+                    .context("healthy public SQL after actual Participation owner failure")?,
             )?;
-            let rows: Vec<i64> = connection.run(|connection| {
-                connection
-                    .query(HEALTHY_SQL)
-                    .context("healthy public SQL after actual Participation owner failure")
-            })?;
             ensure!(
                 rows == [1, 1],
                 "healthy SQL rows changed after owner isolation: {rows:?}"
@@ -1281,16 +1274,13 @@ mod participation_owner_panic {
                     == proto::ReleaseParticipationOutcome::Released,
                 "the same-BE sibling Participation did not normally release after the cold panic"
             );
-            let connection = mysql_actor::connect_until(
-                context.mysql_user(),
-                context.mysql_port(),
-                context.deadline(),
+            let mut connection =
+                sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+            let rows = sql::integer_column(
+                &connection
+                    .execute(HEALTHY_SQL)
+                    .context("healthy SQL after retained Context panic")?,
             )?;
-            let rows: Vec<i64> = connection.run(|connection| {
-                connection
-                    .query(HEALTHY_SQL)
-                    .context("healthy SQL after retained Participation panic")
-            })?;
             ensure!(
                 rows == [1, 1],
                 "healthy SQL changed after retained isolation: {rows:?}"

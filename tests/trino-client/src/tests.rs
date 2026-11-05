@@ -61,6 +61,12 @@ struct FakeServer {
 }
 impl FakeServer {
     fn new(replies: Vec<Reply>) -> Self {
+        Self::with_request_hook(replies, |_, _| false)
+    }
+    fn with_request_hook(
+        replies: Vec<Reply>,
+        mut before_reply: impl FnMut(&Request, &mut TcpStream) -> bool + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -88,7 +94,12 @@ impl FakeServer {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                requests.push(read_request(&mut stream));
+                let request = read_request(&mut stream);
+                let close_without_response = before_reply(&request, &mut stream);
+                requests.push(request);
+                if close_without_response {
+                    continue;
+                }
                 if reply.disconnect {
                     // A valid response prefix with an incomplete body exercises
                     // a read interruption, rather than a connection refusal.
@@ -126,6 +137,18 @@ impl FakeServer {
             user: "root".into(),
             source: "typed-tests".into(),
         })
+        .unwrap()
+    }
+    fn client_with_request_timeout_cap(&self, cap: Duration) -> TrinoClient {
+        TrinoClient::new_with_request_timeout_cap(
+            ClientConfig {
+                host: "127.0.0.1".into(),
+                port: self.port,
+                user: "root".into(),
+                source: "typed-tests".into(),
+            },
+            cap,
+        )
         .unwrap()
     }
     fn finish(mut self) -> Vec<Request> {
@@ -392,33 +415,37 @@ fn pages_include_empty_polls_late_columns_and_the_final_acknowledgment() {
 }
 #[test]
 fn every_page_contributes_session_effects_and_only_success_applies_them() {
-    let server = FakeServer::new(vec![
-        queued()
-            .header("X-Trino-Set-Catalog", "cat")
-            .header("X-Trino-Set-Session", "a=A%2CB"),
-        Reply::json(r#"{"id":"q","nextUri":"$BASE/next/1"}"#)
-            .header("X-Trino-Set-Schema", "db")
-            .header("X-Trino-Clear-Session", "old")
-            .header("X-Trino-Set-Session", "a=C+value"),
-        terminal().header("X-Trino-Set-Session", "last=hello%2Bworld"),
-    ]);
-    let mut state = session();
-    state.properties.insert("old".into(), "gone".into());
-    server
-        .client()
-        .execute(&mut state, "SET a=1", deadline())
-        .unwrap();
-    assert_eq!(state.catalog.as_deref(), Some("cat"));
-    assert_eq!(state.schema.as_deref(), Some("db"));
-    assert_eq!(
-        state.properties,
-        BTreeMap::from([
-            ("a".into(), "C value".into()),
-            ("last".into(), "hello+world".into())
-        ])
-    );
-    server.finish();
+    for cap in [None, Some(Duration::from_secs(2))] {
+        let server = FakeServer::new(vec![
+            queued()
+                .header("X-Trino-Set-Catalog", "cat")
+                .header("X-Trino-Set-Session", "a=A%2CB"),
+            Reply::json(r#"{"id":"q","nextUri":"$BASE/next/1"}"#)
+                .header("X-Trino-Set-Schema", "db")
+                .header("X-Trino-Clear-Session", "old")
+                .header("X-Trino-Set-Session", "a=C+value"),
+            terminal().header("X-Trino-Set-Session", "last=hello%2Bworld"),
+        ]);
+        let mut state = session();
+        state.properties.insert("old".into(), "gone".into());
+        let client = match cap {
+            Some(cap) => server.client_with_request_timeout_cap(cap),
+            None => server.client(),
+        };
+        client.execute(&mut state, "SET a=1", deadline()).unwrap();
+        assert_eq!(state.catalog.as_deref(), Some("cat"));
+        assert_eq!(state.schema.as_deref(), Some("db"));
+        assert_eq!(
+            state.properties,
+            BTreeMap::from([
+                ("a".into(), "C value".into()),
+                ("last".into(), "hello+world".into())
+            ])
+        );
+        server.finish();
+    }
 }
+
 #[test]
 fn failed_statement_discards_accumulated_effects_and_preserves_error_fields() {
     let server = FakeServer::new(vec![
@@ -1113,4 +1140,197 @@ fn observed_interrupted_response_retains_identity_without_a_retry() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[1].method, "GET");
+}
+
+#[test]
+fn counted_completion_rows_and_trace_retain_zero_through_terminal_ack() {
+    for n in [0, 3] {
+        let data = format!(
+            r#"{{"id":"q","updateType":"INSERT","columns":[{{"name":"rows","type":"bigint","typeSignature":{{"rawType":"bigint","arguments":[]}}}}],"data":[[{n}]],"updateCount":{n},"nextUri":"$BASE/next/2"}}"#
+        );
+        let end = format!(r#"{{"id":"q","updateType":"INSERT","updateCount":{n}}}"#);
+        let server = FakeServer::new(vec![
+            queued(),
+            Reply::json(r#"{"id":"q","updateType":"INSERT","nextUri":"$BASE/next/1"}"#),
+            Reply::json(&data),
+            Reply::json(&end),
+        ]);
+        let mut traces = vec![];
+        let pending = server
+            .client()
+            .submit(&session(), "INSERT INTO t VALUES (1)", deadline())
+            .unwrap();
+        let (result, _) = pending
+            .run_observed(deadline(), |trace| {
+                traces.push(serde_json::to_value(trace).unwrap())
+            })
+            .unwrap();
+        assert!(result.is_completion());
+        assert!(!result.is_result_set());
+        assert_eq!(result.update_count, Some(n));
+        assert_eq!(result.rows, vec![vec![TrinoValue::Integer(n as i64)]]);
+        assert_eq!(traces[0]["update_count"], n);
+        assert_eq!(result.pages, 4);
+        let requests = server.finish();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "GET", "GET", "GET"]
+        );
+        assert_eq!(requests[3].path, "/next/2");
+    }
+}
+#[test]
+fn unknown_completion_is_null_and_rows_named_query_remains_result_set() {
+    for command in [false, true] {
+        let kind = if command {
+            r#", "updateType":"ANALYZE""#
+        } else {
+            ""
+        };
+        let row = format!(
+            r#"{{"id":"q"{kind},"columns":[{{"name":"rows","type":"bigint","typeSignature":{{"rawType":"bigint","arguments":[]}}}}],"data":[[null]],"nextUri":"$BASE/next/1"}}"#
+        );
+        let end = format!(r#"{{"id":"q"{kind}}}"#);
+        let server = FakeServer::new(vec![queued(), Reply::json(&row), Reply::json(&end)]);
+        let (result, _) = server
+            .client()
+            .submit(&session(), "fixture", deadline())
+            .unwrap()
+            .run(deadline())
+            .unwrap();
+        assert_eq!(result.update_count, None);
+        assert_eq!(result.rows, vec![vec![TrinoValue::Null]]);
+        assert_eq!(result.is_completion(), command);
+        assert_eq!(result.is_result_set(), !command);
+        assert_eq!(server.finish().len(), 3);
+    }
+}
+
+/// The peer waits for actual connection retirement, never a scheduled sleep.
+/// A missing client timeout reaches the socket's finite observation timeout and fails.
+fn await_timed_out_request_close(stream: &mut TcpStream) {
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+        result => {
+            panic!("timed out HTTP request did not retire its original connection: {result:?}")
+        }
+    }
+}
+
+#[test]
+fn request_timeout_cap_applies_to_actual_post_get_and_delete() {
+    for method in ["POST", "GET", "DELETE"] {
+        let replies = match method {
+            "POST" => vec![Reply::json("")],
+            "GET" => vec![
+                queued(),
+                Reply::json(""),
+                Reply {
+                    status: 204,
+                    ..Reply::json("")
+                },
+            ],
+            "DELETE" => vec![
+                queued(),
+                Reply {
+                    status: 204,
+                    ..Reply::json("")
+                },
+            ],
+            _ => unreachable!(),
+        };
+        let server = FakeServer::with_request_hook(replies, move |request, stream| {
+            if request.method == method {
+                await_timed_out_request_close(stream);
+                true
+            } else {
+                false
+            }
+        });
+        let client = server.client_with_request_timeout_cap(Duration::from_millis(150));
+        let original_deadline = Instant::now() + Duration::from_secs(5);
+        let result = match method {
+            "POST" => client
+                .submit(&session(), "SELECT 1", original_deadline)
+                .map(|_| ()),
+            "GET" => client
+                .submit(&session(), "SELECT 1", original_deadline)
+                .unwrap()
+                .run(original_deadline)
+                .map(|_| ()),
+            "DELETE" => {
+                let pending = client
+                    .submit(&session(), "SELECT 1", original_deadline)
+                    .unwrap();
+                pending.cancel_handle().delete(original_deadline)
+            }
+            _ => unreachable!(),
+        };
+        let before_original_deadline = Instant::now() < original_deadline;
+        let requests = server.finish();
+        assert!(
+            matches!(result, Err(StatementFailure::Deadline)),
+            "{method}: {result:?}"
+        );
+        assert!(
+            before_original_deadline,
+            "the request cap did not beat the original global deadline"
+        );
+        let expected: &[&str] = match method {
+            "POST" => &["POST"],
+            // PendingStatement retains its existing best-effort cancellation owner.
+            "GET" => &["POST", "GET", "DELETE"],
+            "DELETE" => &["POST", "DELETE"],
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn original_global_deadline_wins_with_or_without_a_longer_request_cap() {
+    for cap in [None, Some(Duration::from_secs(3))] {
+        let server = FakeServer::with_request_hook(vec![Reply::json("")], |request, stream| {
+            assert_eq!(request.method, "POST");
+            await_timed_out_request_close(stream);
+            true
+        });
+        let client = match cap {
+            Some(cap) => server.client_with_request_timeout_cap(cap),
+            None => server.client(),
+        };
+        let started = Instant::now();
+        let original_deadline = started + Duration::from_millis(100);
+        let result = client.submit(&session(), "SELECT 1", original_deadline);
+        let before_longer_cap = Instant::now() < started + Duration::from_secs(3);
+        let requests = server.finish();
+        assert!(matches!(result, Err(StatementFailure::Deadline)));
+        assert!(before_longer_cap);
+        assert_eq!(requests.len(), 1);
+    }
+}
+
+#[test]
+fn a_zero_request_timeout_cap_is_refused_before_client_construction() {
+    let result = TrinoClient::new_with_request_timeout_cap(
+        ClientConfig {
+            host: "127.0.0.1".into(),
+            port: 12345,
+            user: "root".into(),
+            source: "typed-tests".into(),
+        },
+        Duration::ZERO,
+    );
+    assert!(matches!(result, Err(StatementFailure::Protocol(_))));
 }

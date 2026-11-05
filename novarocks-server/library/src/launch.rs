@@ -422,20 +422,6 @@ fn role_bind_endpoints(
         )?);
     }
     if role == ClusterRole::Fe {
-        let mysql_port = config
-            .standalone_server
-            .as_ref()
-            .map(|server| server.mysql_port)
-            .unwrap_or_else(|| crate::app_config::StandaloneServerConfig::default().mysql_port);
-        endpoints.push(resolve_endpoint(
-            role,
-            "MySQL",
-            &config.server.host,
-            mysql_port,
-            path,
-        )?);
-    }
-    if role == ClusterRole::Fe {
         let port = config
             .standalone_server
             .as_ref()
@@ -534,11 +520,11 @@ mod tests {
         host: &str,
         grpc: u16,
         http: u16,
-        mysql: Option<u16>,
+        trino: Option<u16>,
         extra: &str,
     ) {
-        let mysql = mysql
-            .map(|port| format!("\n[standalone_server]\nmysql_port = {port}\n"))
+        let trino = trino
+            .map(|port| format!("\n[standalone_server]\ntrino_port = {port}\n"))
             .unwrap_or_default();
         let frontend_endpoint = if role == "be" {
             "frontend_endpoint = \"127.0.0.1:19080\"\n"
@@ -564,7 +550,7 @@ mod tests {
         } else {
             String::new()
         };
-        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\n{control_port}http_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}{catalog_source}")).expect("write config");
+        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\n{control_port}http_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{trino}{catalog_source}")).expect("write config");
     }
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -780,11 +766,15 @@ mod tests {
         write_config(&fe, "fe", "127.0.0.1", 19080, 18040, Some(19030), "");
         let mut config: crate::app_config::NovaRocksConfig =
             toml::from_str(&std::fs::read_to_string(&fe).unwrap()).unwrap();
-        for port in [19080, 18040, 19030] {
+        for port in [19080, 18040] {
             config.standalone_server.as_mut().unwrap().trino_port = port;
             let endpoints = role_bind_endpoints(ClusterRole::Fe, &config, &fe).unwrap();
             assert!(ensure_no_endpoint_overlap(&endpoints, &[]).is_err());
         }
+        // The one client listener may reuse its own configured port.
+        config.standalone_server.as_mut().unwrap().trino_port = 19030;
+        let endpoints = role_bind_endpoints(ClusterRole::Fe, &config, &fe).unwrap();
+        ensure_no_endpoint_overlap(&endpoints, &[]).unwrap();
         config.standalone_server.as_mut().unwrap().trino_port = 8080;
         let endpoints = role_bind_endpoints(ClusterRole::Fe, &config, &fe).unwrap();
         let wildcard_be =
@@ -830,7 +820,7 @@ mod tests {
         let fe = fixture.path().join("fe.toml");
         let be = fixture.path().join("be.toml");
         write_config(&fe, "fe", "0.0.0.0", 19080, 18040, Some(19030), "");
-        for port in [19080, 18040, 19030] {
+        for port in [19080, 18040] {
             write_config(&be, "be", "127.0.0.1", 19081, 18041, None, "");
             let source = std::fs::read_to_string(&be).unwrap();
             std::fs::write(

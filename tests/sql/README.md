@@ -45,6 +45,8 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
 
 共享fixture由机器owner显式start/upgrade，普通up只附着ready同版本机器。SQL在首次scratch或私有fixture副作用前准入 `--fixture-budget-secs`（默认3600），继承原run ID与完整期限，工作期只能收窄，原完整期限内预留清理；超上限BLOCKED，准入后到期FAIL。namespace使用完整run身份与有限ordinal，保留原CREATE/golden；不写namespace location，JDBC默认表/view、rename、显式位置和CTAS统一验证属于固定三范围。独立原生运行确认角色及producer退出后按整运行catalog→IAM→文件顺序清理；嵌套/外部server保留原owner责任与deferred事实。嵌套shell/retry/role restart不续期；只读READY继续原warehouse与check-only。见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
 
+依赖 HMS fixture 的功能测试只维护在 `iceberg-hms` suite，除非明确要求，否则不运行。列举准入资源上界由默认 connector 组件测试保护。
+
 HMS 的 `iceberg-hms` suite 以封闭的 `hms-read-only-compatibility-v1` case 输入合同声明准备工作。runner 先做纯定义读取和 case 选择，由同一运行的 owner 在最终 SQL 绑定前准备真实表并冻结首个 append snapshot ID；只读发现入口不启动 producer，也不补造 snapshot ID。准备沿原 run 身份、namespace、storage 和截止时间执行，cloneable 的 SQL case 不携带清理权限。
 
 固定 recipe 的 q1 核验已准备的输入，q11 以 metadata 查询和独立行断言核验冻结 ID，q12 保留 numeric `VERSION AS OF` 和原三行期望。完整 59 步、38 个拒绝断言和 11 段旧期望继续受原比较规则约束。准备 receipt、绑定后每步实际 SQL 的 hash 以及输入 hash 保存在 `tests/sql/.runtime/hms-evidence/<namespace>/`。
@@ -115,7 +117,7 @@ time_zone = "Asia/Shanghai"
 
 声明缺失或有未知键即启动失败。runner 每次请求发送该时区，客户端能力固定为 `PARAMETRIC_DATETIME,VARIANT`。每个用例持有独立 catalog/schema/属性，逐页累积会话变化，成功结束才应用；每步覆盖 `query_timeout`。FE 重启后保留会话事实并重建 HTTP 连接池。固定请求时区不宣称已经交付新的 SQL 时区语义。
 
-[suite manifest](correctness/optimizer/suite.toml) 还可声明可选的初始会话输入，例如 optimizer 的 `[session] pipeline_dop = 5`。该正整数只影响声明它的 suite；缺省保留原默认，未知键和 0 明确拒绝。声明随原生 suite 输入及 hash 保留。Trino 将它写入每个用例的初始客户端属性，通过请求头发送，不插入隐藏的 SET；普通 SQL SET 可覆盖，重建 HTTP 连接池保留已经生效的值。旧 MySQL 基线适配读取同一版本化声明。CLI 外加 `--target-session-sql` 仍属于 DIAGNOSTIC，不能代替这项语料输入。
+[suite manifest](correctness/optimizer/suite.toml) 还可声明可选的初始会话输入，例如 optimizer 的 `[session] pipeline_dop = 5`。该正整数只影响声明它的 suite；缺省保留原默认，未知键和 0 明确拒绝。声明随原生 suite 输入及 hash 保留。Trino 将它写入每个用例的初始客户端属性，通过请求头发送，不插入隐藏的 SET；普通 SQL SET 可覆盖，重建 HTTP 连接池保留已经生效的值。历史 MySQL 基线适配曾读取同一版本化声明，当前 runner 仅使用 Trino。CLI 外加 `--target-session-sql` 仍属于 DIAGNOSTIC，不能代替这项语料输入。
 
 ### 旧格式块与转换
 

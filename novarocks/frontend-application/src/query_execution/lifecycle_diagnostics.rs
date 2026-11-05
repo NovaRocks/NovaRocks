@@ -90,6 +90,17 @@ impl FrontendLifecycleDiagnostics {
             .set(std::sync::Arc::downgrade(owner))
             .map_err(|_| "lifecycle observation already installed".into())
     }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn root_observer_for_execution(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Option<crate::preparation_diagnostics::StatementObservationHandle> {
+        self.observer
+            .get()?
+            .upgrade()?
+            .root_observer_for_execution(execution)
+    }
+
     pub(crate) fn is_enabled(&self) -> bool {
         #[cfg(test)]
         if self.whitebox.load(std::sync::atomic::Ordering::Acquire) {

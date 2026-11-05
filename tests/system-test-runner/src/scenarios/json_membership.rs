@@ -23,9 +23,11 @@ use super::{
     query_lifecycle::{await_resource_convergence, resource_snapshot},
     writer_statement_actor::{ReadSessionSettings, WriterActor, retain_write_result},
 };
-use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::{
+    actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue},
+    scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig},
+};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use std::{
     path::Path,
@@ -110,7 +112,7 @@ impl Scenario for JsonMembership {
             .map(str::to_owned),
         );
         declaration.basis = Some(
-            "Fresh native FE+3BE and private managed-runtime Hadoop Iceberg files. Fixed integer-key/object-order oracle; exact statement/Task build hold and scheduler WaitFact observations; original joined SQL actor, same-connection error reentry and resource convergence. Explicit relevant-change coverage; no external shared fixture.",
+            "Fresh native FE+3BE and private managed-runtime Hadoop Iceberg files. Fixed integer-key/object-order oracle; exact statement/Task build hold and scheduler WaitFact observations; original joined SQL actor, same-session error reentry and resource convergence. Explicit relevant-change coverage; no external shared fixture.",
         );
         declaration
     }
@@ -133,8 +135,8 @@ impl Scenario for JsonMembership {
             observations: (0..cluster_size)
                 .flat_map(|index| {
                     [
-                        (index, "grpc-fragment", None),
-                        (index, "exchange-snapshot", None),
+                        (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None),
+                        (index, novarocks_failpoint::observation_marker::ObservationAction::ExchangeSnapshot.as_str(), None),
                     ]
                 })
                 .collect(),
@@ -153,28 +155,25 @@ impl Scenario for JsonMembership {
             context.handle().be_count() == 3,
             "JSON membership requires native 1FE+3BE"
         );
-        let mut control = super::super::actors::mysql::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         let warehouse = create_warehouse(context, "json-mark")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
-        control.query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
-        control.query_drop(format!(
+        control.execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
+        control.execute(format!(
             "CREATE TABLE {CATALOG}.{DATABASE}.probe (id BIGINT, txt STRING)"
         ))?;
-        control.query_drop(format!(
+        control.execute(format!(
             "CREATE TABLE {CATALOG}.{DATABASE}.rhs (txt STRING)"
         ))?;
         for low in [1, 1025, 2049] {
             let high = low + 1023;
-            control.query_drop(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT generate_series, CASE WHEN generate_series % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(generate_series % 13 AS STRING),',\"b\":1}}') END FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.probe SELECT generate_series, CASE WHEN generate_series % 17=0 THEN NULL ELSE CONCAT('{{\"a\":',CAST(generate_series % 13 AS STRING),',\"b\":1}}') END FROM TABLE(generate_series({low},{high}))"))?;
         }
         for (low, high) in [(0, 4), (5, 8)] {
-            control.query_drop(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS STRING),'}}') FROM TABLE(generate_series({low},{high}))"))?;
+            control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.rhs SELECT CONCAT('{{\"b\":1,\"a\":',CAST(generate_series AS STRING),'}}') FROM TABLE(generate_series({low},{high}))"))?;
         }
-        control.query_drop(format!(
+        control.execute(format!(
             "INSERT INTO {CATALOG}.{DATABASE}.rhs VALUES(NULL),('{{\"b\":1,\"a\":0}}')"
         ))?;
         if matches!(self.case, Case::Capacity) {
@@ -191,12 +190,12 @@ impl Scenario for JsonMembership {
             matches!(self.case, Case::Capacity).then_some(CAPACITY_SETTINGS),
         )?;
         let mut ended = std::collections::BTreeSet::new();
-        let primary = (|| -> Result<mysql::Result<()>> {
+        let primary = (|| -> Result<std::result::Result<StatementResult, StatementFailure>> {
             let mut parked = None;
             if !matches!(self.case, Case::Capacity) {
                 parked = Some(await_held_probe(context, &selected, &actor)?);
                 if matches!(self.case, Case::Cancel) {
-                    control.query_drop(format!("KILL QUERY {}", actor.connection_id))?;
+                    actor.cancel(context.deadline())?;
                 } else {
                     end_hold(context, &selected, &mut ended)?;
                 }
@@ -229,30 +228,35 @@ impl Scenario for JsonMembership {
                         .take()
                         .context("successful JSON query has no rows")?;
                     ensure!(
-                        actual.len() == PROBES as usize,
-                        "mark join changed outer row multiplicity"
+                        actual.query_id == actor.client_query_id
+                            && result.as_ref().is_ok_and(|original| original == &actual),
+                        "JSON result handoff differs from its original completed response"
                     );
-                    for (ordinal, row) in actual.into_iter().enumerate() {
-                        let (id, present): (i64, Option<i64>) = mysql::from_row_opt(row)?;
-                        let expected = if id % 17 == 0 || id % 13 > 8 {
-                            None
-                        } else {
-                            Some(1)
-                        };
-                        ensure!(
-                            id == ordinal as i64 + 1 && present == expected,
-                            "id={id} actual={present:?} expected={expected:?}"
-                        );
-                    }
+                    require_membership_result(&actual, "full EOS")?;
                 }
-                Case::Cancel => ensure!(
-                    matches!(&result,Err(mysql::Error::MySqlError(error)) if error.code==1317),
-                    "KILL must interrupt original query: {result:?}"
-                ),
-                Case::Capacity => {
+                Case::Cancel => {
+                    let failure = result.as_ref().err().context(
+                        "DELETE must interrupt the original JSON query with a public SQL error",
+                    )?;
+                    let error = sql::expect_error(failure, 3, "USER_CANCELED")?;
                     ensure!(
-                        matches!(&result, Err(mysql::Error::MySqlError(error)) if error.code == 1041),
-                        "capacity query must fail publicly: {result:?}"
+                        error.error_type == "USER_ERROR",
+                        "original JSON cancellation changed typed identity: {error:?}"
+                    );
+                }
+                Case::Capacity => {
+                    let failure = result
+                        .as_ref()
+                        .err()
+                        .context("capacity query must fail publicly")?;
+                    let error =
+                        sql::expect_error(failure, 131072, "GENERIC_INSUFFICIENT_RESOURCES")?;
+                    ensure!(
+                        error.error_type == "INSUFFICIENT_RESOURCES"
+                            && error
+                                .message
+                                .starts_with("[query.execution.resource_exhausted] "),
+                        "original JSON capacity failure changed typed identity: {error:?}"
                     );
                     let fact = snapshot
                         .failure_fact
@@ -317,20 +321,22 @@ impl Scenario for JsonMembership {
         }
         await_resource_convergence(context, &baseline)?;
         // Empty RHS still preserves every outer occurrence, including SQL NULL.
-        let empty:Vec<i64>=control.query(format!("SELECT COUNT(*) FROM (SELECT id,parse_json(txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.rhs WHERE FALSE) AS m FROM {CATALOG}.{DATABASE}.probe) q WHERE m=FALSE"))?;
+        let empty_result = control.execute(format!("SELECT COUNT(*) FROM (SELECT id,parse_json(txt) IN (SELECT parse_json(txt) FROM {CATALOG}.{DATABASE}.rhs WHERE FALSE) AS m FROM {CATALOG}.{DATABASE}.probe) q WHERE m=FALSE"))?;
+        require_result_types(&empty_result, &["bigint"])?;
+        let empty = sql::integer_column(&empty_result)?;
         ensure!(
             empty == vec![PROBES],
             "empty RHS must yield FALSE for every probe"
         );
         for table in ["probe", "rhs"] {
-            control.query_drop(format!("DROP TABLE {CATALOG}.{DATABASE}.{table}"))?;
+            control.execute(format!("DROP TABLE {CATALOG}.{DATABASE}.{table}"))?;
         }
         if matches!(self.case, Case::Capacity) {
-            control.query_drop(format!("DROP TABLE {CATALOG}.{DATABASE}.big_rhs"))?;
+            control.execute(format!("DROP TABLE {CATALOG}.{DATABASE}.big_rhs"))?;
         }
-        control.query_drop(format!("DROP DATABASE {CATALOG}.{DATABASE}"))?;
-        control.query_drop(format!("DROP CATALOG {CATALOG}"))?;
-        control.finish()
+        control.execute(format!("DROP DATABASE {CATALOG}.{DATABASE}"))?;
+        control.execute(format!("DROP CATALOG {CATALOG}"))?;
+        Ok(())
     }
 }
 fn end_hold(
@@ -363,8 +369,13 @@ struct ProbePark {
 impl ProbePark {
     fn has_wake(&self, log: &str) -> bool {
         log.lines().any(|line| {
-            line.contains("NOVAROCKS_WRITER_DIAGNOSTIC event=driver_wake")
-                && line.contains(&self.task)
+            line.contains(
+                format!(
+                    "{} event=driver_wake",
+                    novarocks_failpoint::observation_marker::WRITER_DIAGNOSTIC
+                )
+                .as_str(),
+            ) && line.contains(&self.task)
                 && scalar(line, "driver_id").ok() == Some(self.driver)
                 && scalar(line, "block_epoch").ok() == Some(self.epoch)
         })
@@ -392,15 +403,19 @@ fn assert_retained_query_owner(
     for index in 0..context.handle().be_count() {
         let log = context.handle().be_log_contents(index)?;
         for line in log.lines().filter(|line| {
-            line.contains("NOVAROCKS_WRITER_DIAGNOSTIC event=join_build_keys_retained")
+            line.contains(
+                format!(
+                    "{} event=join_build_keys_retained",
+                    novarocks_failpoint::observation_marker::WRITER_DIAGNOSTIC
+                )
+                .as_str(),
+            )
         }) {
             let task = field(line, "task")?;
             if !task.starts_with(&execution) || !task.ends_with(&process) {
                 continue;
             }
-            if scalar(line, "attempt")?
-                != u64::from(failure.query_execution_id().attempt_id().get())
-            {
+            if scalar(line, "attempt")? != failure.query_execution_id().attempt_id().get() {
                 continue;
             }
             ensure!(
@@ -450,8 +465,13 @@ fn await_held_probe(
             let task_field = format!("task={identity}");
             let log = context.handle().be_log_contents(index)?;
             for line in log.lines().filter(|line| {
-                line.contains("NOVAROCKS_WRITER_DIAGNOSTIC event=driver_park")
-                    && line.contains(&task_field)
+                line.contains(
+                    format!(
+                        "{} event=driver_park",
+                        novarocks_failpoint::observation_marker::WRITER_DIAGNOSTIC
+                    )
+                    .as_str(),
+                ) && line.contains(&task_field)
                     && line.contains("mark_probe_dependency=true")
             }) {
                 let parked = ProbePark {
@@ -486,8 +506,8 @@ fn await_held_probe(
         }
     }
 }
-fn seed_capacity(context: &mut ScenarioContext, control: &mut mysql::Conn) -> Result<()> {
-    control.query_drop(format!(
+fn seed_capacity(context: &mut ScenarioContext, control: &mut SqlSession) -> Result<()> {
+    control.execute(format!(
         "CREATE TABLE {CATALOG}.{DATABASE}.big_rhs (txt STRING)"
     ))?;
     // Keep each JSON small: PARSE_JSON's original worst-case RawValue resource
@@ -497,7 +517,7 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut mysql::Conn) -> Re
     let seed_rows = 2 * 1024 * 1024 / BIG_TEXT;
     for low in (1..=BIG_ROWS).step_by(seed_rows as usize) {
         let high = (low + seed_rows - 1).min(BIG_ROWS);
-        control.query_drop(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{{\"key\":',CAST(generate_series AS STRING),',\"large\":\"',REPEAT('x',{BIG_TEXT}),'\"}}') FROM TABLE(generate_series({low},{high}))"))?;
+        control.execute(format!("INSERT INTO {CATALOG}.{DATABASE}.big_rhs SELECT CONCAT('{{\"key\":',CAST(generate_series AS STRING),',\"large\":\"',REPEAT('x',{BIG_TEXT}),'\"}}') FROM TABLE(generate_series({low},{high}))"))?;
     }
     context.action("bounded large RHS fixture written");
     CAPACITY_SETTINGS.apply(control)?;
@@ -505,43 +525,78 @@ fn seed_capacity(context: &mut ScenarioContext, control: &mut mysql::Conn) -> Re
     // SUM consumes every original PARSE_JSON result; COUNT alone could prune
     // that producer. The private snapshot and frozen execution options match
     // the target. No build is retained in this independent producer control.
-    let produced: Option<(i64, Option<i64>)> = control.query_first(format!(
+    let produced = control.execute(format!(
         "SELECT /*+ SET_VAR(query_mem_limit={CAPACITY_BYTES}) */ COUNT(*), SUM(LENGTH(CAST(parse_json(txt) AS STRING))) FROM {CATALOG}.{DATABASE}.big_rhs"))?;
+    require_result_types(&produced, &["bigint", "bigint"])?;
+    // Original renderer syntax has 22 bytes plus the decimal key digits.
+    // Each source key is distinct, so the canonical set cannot collapse it.
+    let expected_length = BIG_ROWS * (BIG_TEXT + 22) + decimal_digit_total(BIG_ROWS);
     ensure!(
-        // Original renderer syntax has 22 bytes plus the decimal key digits.
-        // Each source key is distinct, so the canonical set cannot collapse it.
-        produced
-            == Some((
-                BIG_ROWS,
-                Some(BIG_ROWS * (BIG_TEXT + 22) + decimal_digit_total(BIG_ROWS))
-            )),
+        produced.rows
+            == vec![vec![
+                TrinoValue::Integer(BIG_ROWS),
+                TrinoValue::Integer(expected_length),
+            ]],
         "same-budget complete original JSON producer control failed: {produced:?}"
     );
     context.action(
         "same-budget complete JSON producer control passed count and parsed-content length",
     );
     context.action("begin same-budget small mark control");
-    let small: Vec<(i64, Option<i64>)> = control.query(selected_sql(Case::FullEos).replacen(
+    let small = control.execute(selected_sql(Case::FullEos).replacen(
         "SELECT ",
         &format!("SELECT /*+ SET_VAR(query_mem_limit={CAPACITY_BYTES}) */ "),
         1,
     ))?;
+    require_membership_result(&small, "same-budget small RHS")?;
+    context.action("complete large fixture read; small mark build passed the target budget");
+    Ok(())
+}
+
+fn require_result_types(result: &StatementResult, types: &[&str]) -> Result<()> {
     ensure!(
-        small.len() == PROBES as usize,
-        "same-budget small RHS control failed"
+        result.is_result_set() && result.columns.len() == types.len(),
+        "expected a result set with {} columns: {result:?}",
+        types.len()
     );
-    for (ordinal, (id, present)) in small.into_iter().enumerate() {
+    for (column, expected) in result.columns.iter().zip(types) {
+        ensure!(
+            column.type_name == *expected
+                && column.type_signature.raw_type == *expected
+                && column.type_signature.arguments.is_empty(),
+            "expected {expected} result column, got {column:?}"
+        );
+    }
+    Ok(())
+}
+
+fn require_membership_result(result: &StatementResult, phase: &str) -> Result<()> {
+    require_result_types(result, &["bigint", "boolean"])?;
+    ensure!(
+        result.columns[0].name == "id" && result.columns[1].name == "present",
+        "{phase} changed the signed result names: {:?}",
+        result.columns
+    );
+    ensure!(
+        result.rows.len() == PROBES as usize,
+        "{phase} mark join changed outer row multiplicity"
+    );
+    for (ordinal, row) in result.rows.iter().enumerate() {
+        let (id, present) = match row.as_slice() {
+            [TrinoValue::Integer(id), TrinoValue::Boolean(present)] => (*id, Some(*present)),
+            [TrinoValue::Integer(id), TrinoValue::Null] => (*id, None),
+            _ => bail!("{phase} expected non-null bigint id and nullable boolean: {row:?}"),
+        };
         let expected = if id % 17 == 0 || id % 13 > 8 {
             None
         } else {
-            Some(1)
+            Some(true)
         };
         ensure!(
             id == ordinal as i64 + 1 && present == expected,
-            "same-budget small RHS id={id} actual={present:?} expected={expected:?}"
+            "{phase} id={id} actual={present:?} expected={expected:?}"
         );
     }
-    context.action("complete large fixture read; small mark build passed the target budget");
     Ok(())
 }
 

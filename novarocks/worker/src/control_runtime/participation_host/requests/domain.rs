@@ -805,7 +805,7 @@ impl DomainCustody {
     }
 }
 
-fn task_input(update: &TaskDomainUpdate) -> TaskDomainInput {
+pub(super) fn task_input(update: &TaskDomainUpdate) -> TaskDomainInput {
     match update {
         TaskDomainUpdate::SplitAssignment(intent) => TaskDomainInput::Split {
             node: intent.node(),

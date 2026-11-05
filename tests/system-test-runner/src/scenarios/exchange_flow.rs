@@ -24,10 +24,9 @@ use super::connector::{
     require_three_backends, resource_baseline,
 };
 use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::native_root_reply_fault::{
     ExchangeFaultAction, ExchangeFaultCandidate, ExchangeFaultObservation, ExchangeFaultSelector,
     RootReplyFaultBounds, RootReplyFaultControl,
@@ -36,6 +35,7 @@ use novarocks_cluster_harness::{
     CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
     QueryLifecycleStatementObservation, TestClusterOwner,
 };
+use novarocks_test_trino_client::{CancelHandle, TrinoError};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -227,21 +227,41 @@ fn combine<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => {
-            bail!("{primary:#}; original Exchange scenario cleanup: {cleanup:#}")
-        }
+        (Err(primary), Err(cleanup)) => Err(ExchangeFailure { primary, cleanup }.into()),
+    }
+}
+struct ExchangeFailure {
+    primary: anyhow::Error,
+    cleanup: anyhow::Error,
+}
+impl std::fmt::Display for ExchangeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; original Exchange scenario cleanup: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+impl std::fmt::Debug for ExchangeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for ExchangeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
     }
 }
 
-/// The scenario owns and joins this original socket job on every path.
+/// The scenario owns and joins this original query job on every path.
 struct QueryJob {
-    connection_id: u32,
+    client_query_id: String,
+    cancel: CancelHandle,
     selected: SelectedStatement,
     observation: QueryLifecycleStatementObservation,
-    result: Option<mpsc::Receiver<mysql::Result<Vec<i64>>>>,
+    result: Option<mpsc::Receiver<std::result::Result<StatementResult, StatementFailure>>>,
     actor: Option<JoinHandle<Result<()>>>,
-    user: String,
-    port: u16,
     deadline: Instant,
     settled: bool,
 }
@@ -252,81 +272,53 @@ impl QueryJob {
         selected: SelectedStatement,
         settings: Vec<String>,
     ) -> Result<Self> {
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (submit_tx, submit_rx) = mpsc::sync_channel(1);
-        let (result_tx, result) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
         let deadline = context.deadline();
-        let actor_user = user.clone();
-        let sql = selected.sql.clone();
-        let actor = thread::Builder::new()
+        let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        for setting in settings {
+            session.execute(setting)?;
+        }
+        // This exact query is registered before any GET. Save its cancellation
+        // owner immediately; dropping a Pending is not server cancellation.
+        let pending = session.submit(&selected.sql)?;
+        let cancel = pending.cancel_handle();
+        let client_query_id = pending.query_id.clone();
+        let (pending, observation) = selected.arm_pending(context, pending, &selected.sql)?;
+        let (result_tx, result) = mpsc::sync_channel(1);
+        let actor = match thread::Builder::new()
             .name("exchange-flow-selected-sql".into())
             .spawn(move || {
-                mysql_actor::connect_for_cancellation_until(&actor_user, port, deadline)?.run(
-                    |connection| {
-                        for setting in settings {
-                            connection.query_drop(setting)?;
-                        }
-                        ready_tx.send(connection.connection_id())?;
-                        match submit_rx
-                            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        {
-                            Ok(()) => {}
-                            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                            Err(error) => return Err(error.into()),
-                        }
-                        let outcome = connection.query::<i64, _>(&sql);
-                        match result_tx.send(outcome) {
-                            Ok(()) => Ok(()),
-                            Err(mpsc::SendError(Err(actual))) => Err(actual.into()),
-                            Err(mpsc::SendError(Ok(_))) => {
-                                bail!("original Exchange SQL result owner closed before delivery")
-                            }
-                        }
-                    },
-                )
-            })?;
-        let ready = (|| -> Result<(u32, QueryLifecycleStatementObservation)> {
-            let id = ready_rx
-                .recv_timeout(context.remaining("receive original Exchange SQL connection")?)?;
-            let observation = selected.arm(context, id, &selected.sql)?;
-            Ok((id, observation))
-        })();
-        let (connection_id, observation) = match ready {
-            Ok(value) => value,
+                let outcome = session.run_pending(pending);
+                match result_tx.send(outcome) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::SendError(Err(actual))) => Err(actual.into()),
+                    Err(mpsc::SendError(Ok(_))) => {
+                        bail!("original Exchange SQL result owner closed before delivery")
+                    }
+                }
+            }) {
+            Ok(actor) => actor,
             Err(primary) => {
-                drop(submit_tx);
-                return combine(Err(primary), join_actor(actor));
+                let cancelled = cancel.delete(deadline).map_err(Into::into);
+                let drained = context
+                    .handle()
+                    .drain_query_lifecycle_statement_binding(&observation, deadline);
+                return combine(Err(primary.into()), combine(cancelled, drained));
             }
         };
-        if let Err(primary) = submit_tx.send(()) {
-            let cleanup = combine(
-                join_actor(actor),
-                context
-                    .handle()
-                    .drain_query_lifecycle_statement_observation(&observation),
-            );
-            return combine(Err(primary.into()), cleanup);
-        }
         Ok(Self {
-            connection_id,
+            client_query_id,
+            cancel,
             selected,
             observation,
             result: Some(result),
             actor: Some(actor),
-            user,
-            port,
             deadline,
             settled: false,
         })
     }
 
-    fn kill(&self) -> Result<()> {
-        mysql_actor::connect_until(&self.user, self.port, self.deadline)?.run(|control| {
-            control.query_drop(format!("KILL QUERY {}", self.connection_id))?;
-            Ok(())
-        })
+    fn cancel(&self) -> Result<()> {
+        self.cancel.delete(self.deadline).map_err(Into::into)
     }
 
     fn finish(&mut self, context: &mut ScenarioContext, expected: Outcome) -> Result<Value> {
@@ -334,13 +326,16 @@ impl QueryJob {
             .result
             .take()
             .context("Exchange SQL outcome already consumed")?;
-        let mut sql_completed = false;
+        let mut sql_terminal = false;
+        let mut consumed = false;
         let primary = (|| -> Result<Value> {
             let actual = receiver
                 .recv_timeout(context.remaining("receive original Exchange SQL outcome")?)?;
-            sql_completed = true;
+            consumed = true;
+            sql_terminal = matches!(&actual, Ok(_) | Err(StatementFailure::Trino(_)));
             match (expected, actual) {
-                (Outcome::Rows, Ok(mut rows)) => {
+                (Outcome::Rows, Ok(result)) => {
+                    let mut rows = sql::integer_column(&result)?;
                     rows.sort_unstable();
                     ensure!(
                         rows.len() == ROWS as usize,
@@ -351,29 +346,26 @@ impl QueryJob {
                         "Exchange result contains a missing, repeated or wrong row"
                     );
                     Ok(
-                        json!({"outcome":"rows","rows":ROWS,"independent_oracle":"every integer 1..=24576 exactly once"}),
+                        json!({"outcome":"rows","client_query_id":self.client_query_id,"rows":ROWS,"independent_oracle":"every integer 1..=24576 exactly once"}),
                     )
                 }
-                (Outcome::Deadline, Err(mysql::Error::MySqlError(error))) => {
-                    ensure!(
-                        error.code == 1317
-                            && error.state == "70100"
-                            && error
-                                .message
-                                .starts_with("[query.execution.deadline_exceeded] "),
-                        "expected original QueryOwner deadline, got {error}"
-                    );
-                    Ok(json!({"outcome":"query_deadline","code":error.code,"sqlstate":error.state}))
-                }
-                (Outcome::Cancelled, Err(mysql::Error::MySqlError(error))) => {
-                    ensure!(
-                        error.code == 1317
-                            && error.state == "70100"
-                            && error.message.starts_with("[query.execution.cancelled] "),
-                        "expected original QueryOwner cancellation, got {error}"
-                    );
+                (Outcome::Deadline, Err(failure)) => {
+                    let error = expected_failure(failure, Outcome::Deadline)?;
                     Ok(
-                        json!({"outcome":"query_cancelled","code":error.code,"sqlstate":error.state}),
+                        json!({"outcome":"query_deadline","client_query_id":self.client_query_id,
+                        "trino_error_code":error.error_code,"trino_error_name":error.error_name,
+                        "trino_error_type":error.error_type,"message":error.message}),
+                    )
+                }
+                (Outcome::Cancelled, Err(failure)) => {
+                    let error = expected_failure(failure, Outcome::Cancelled)?;
+                    // Direct DELETE owns a typed protocol cancellation. Its
+                    // original public message has no promised NovaCode prefix;
+                    // the same-query Native observation proves owner exit.
+                    Ok(
+                        json!({"outcome":"query_cancelled","client_query_id":self.client_query_id,
+                        "trino_error_code":error.error_code,"trino_error_name":error.error_name,
+                        "trino_error_type":error.error_type,"message":error.message}),
                     )
                 }
                 (_, Err(error)) => Err(error.into()),
@@ -383,20 +375,19 @@ impl QueryJob {
             }
         })();
         let mut cleanup = Ok(());
-        if self
-            .actor
-            .as_ref()
-            .is_some_and(|actor| !actor.is_finished())
-            && primary.is_err()
-            && !sql_completed
-        {
-            cleanup = self.kill();
+        if primary.is_err() && !sql_terminal {
+            cleanup = self.cancel();
             if cleanup.is_err() {
                 cleanup = combine(cleanup, context.shutdown());
             }
         }
         if let Some(actor) = self.actor.take() {
             cleanup = combine(cleanup, join_actor(actor));
+        }
+        // Keep a late original result even when the original wait failed.
+        // It remains cleanup evidence after that earlier primary failure.
+        if !consumed && let Ok(Err(actual)) = receiver.try_recv() {
+            cleanup = combine(cleanup, Err(actual.into()));
         }
         let terminal = context
             .handle()
@@ -410,7 +401,7 @@ impl QueryJob {
             cleanup,
             context
                 .handle()
-                .drain_query_lifecycle_statement_observation(&self.observation),
+                .drain_query_lifecycle_statement_binding(&self.observation, self.deadline),
         );
         self.settled = true;
         combine(primary, cleanup)
@@ -421,15 +412,12 @@ impl QueryJob {
             return Ok(());
         }
         let mut cleanup = Ok(());
-        if self
-            .actor
-            .as_ref()
-            .is_some_and(|actor| !actor.is_finished())
-        {
-            cleanup = self.kill();
-            if cleanup.is_err() {
-                cleanup = combine(cleanup, context.shutdown());
-            }
+        // A finished local worker may still have an unknown HTTP/transport
+        // outcome. The original handle cancels only its known continuation;
+        // completed typed results have already cleared that URI.
+        cleanup = combine(cleanup, self.cancel());
+        if cleanup.is_err() {
+            cleanup = combine(cleanup, context.shutdown());
         }
         if let Some(actor) = self.actor.take() {
             cleanup = combine(cleanup, join_actor(actor));
@@ -453,8 +441,8 @@ impl QueryJob {
 impl Drop for QueryJob {
     fn drop(&mut self) {
         if let Some(actor) = self.actor.take() {
-            if !actor.is_finished() {
-                let _ = self.kill();
+            if !self.settled {
+                let _ = self.cancel();
             }
             let _ = join_actor(actor);
         }
@@ -464,7 +452,48 @@ impl Drop for QueryJob {
 fn join_actor(actor: JoinHandle<Result<()>>) -> Result<()> {
     actor
         .join()
-        .map_err(|_| anyhow::anyhow!("original Exchange SQL actor panicked"))?
+        .map_err(|payload| anyhow::Error::new(ExchangePanic(std::sync::Mutex::new(payload))))?
+}
+
+struct ExchangePanic(std::sync::Mutex<Box<dyn std::any::Any + Send>>);
+impl std::fmt::Display for ExchangePanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.0;
+        f.write_str("original Exchange SQL actor panicked; payload retained")
+    }
+}
+impl std::fmt::Debug for ExchangePanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for ExchangePanic {}
+
+fn expected_failure(failure: StatementFailure, expected: Outcome) -> Result<TrinoError> {
+    match failure {
+        StatementFailure::Trino(error)
+            if match expected {
+                Outcome::Deadline => {
+                    error.error_code == 131075
+                        && error.error_name == "EXCEEDED_TIME_LIMIT"
+                        && error.error_type == "INSUFFICIENT_RESOURCES"
+                        && error
+                            .message
+                            .starts_with("[query.execution.deadline_exceeded] ")
+                }
+                Outcome::Cancelled => {
+                    error.error_code == 3
+                        && error.error_name == "USER_CANCELED"
+                        && error.error_type == "USER_ERROR"
+                }
+                Outcome::Rows => false,
+            } =>
+        {
+            Ok(error)
+        }
+        actual => Err(anyhow::Error::new(actual)
+            .context("selected Exchange SQL did not return its original declared terminal")),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -474,24 +503,92 @@ enum Outcome {
     Cancelled,
 }
 
+type FileGeometryRow = (i32, String, String, i64, i64);
+
+fn file_geometry(result: &StatementResult) -> Result<Vec<FileGeometryRow>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 5,
+        "Exchange file geometry must be the original five-column result set"
+    );
+    let names = result
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        names
+            == [
+                "content",
+                "file_path",
+                "file_format",
+                "record_count",
+                "file_size_in_bytes"
+            ],
+        "Exchange file geometry declaration changed: {names:?}"
+    );
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(content),
+                TrinoValue::Text(path),
+                TrinoValue::Text(format),
+                TrinoValue::Integer(records),
+                TrinoValue::Integer(bytes),
+            ] => Ok((
+                i32::try_from(*content)?,
+                path.clone(),
+                format.clone(),
+                *records,
+                *bytes,
+            )),
+            _ => bail!("Exchange file geometry has NULL, wrong types or width: {row:?}"),
+        })
+        .collect()
+}
+fn plan_text(result: &StatementResult) -> Result<String> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 1,
+        "Exchange EXPLAIN must retain its one text column"
+    );
+    ensure!(
+        matches!(
+            result.columns[0].type_signature.raw_type.as_str(),
+            "varchar" | "char"
+        ),
+        "Exchange EXPLAIN column is not text"
+    );
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(text)] => Ok(text.clone()),
+            _ => bail!("Exchange EXPLAIN changed text/NULL/cardinality: {row:?}"),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|lines| lines.join("\n"))
+}
+
 fn seed(context: &mut ScenarioContext) -> Result<()> {
     let warehouse = create_warehouse(context, "exchange-flow")?;
-    let deadline = context.deadline();
-    let files: Vec<(i32, String, String, i64, i64)> = mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?.run(|control| {
-        create_catalog(control, CATALOG, &warehouse)?;
-        control.query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
-        control.query_drop(format!("CREATE TABLE {TABLE} (k BIGINT NOT NULL)"))?;
-        // Independent committed files make the scan eligible on the live BE
-        // roster. Actual selected participants are checked, never guessed.
-        for file in 0..FILES {
-            let first = file * ROWS_PER_FILE + 1;
-            let last = first + ROWS_PER_FILE - 1;
-            control.query_drop(format!("INSERT INTO {TABLE} SELECT generate_series FROM TABLE(generate_series({first},{last}))"))?;
-        }
-        control.query(format!(
-            "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {TABLE}$files ORDER BY file_path"
-        )).context("read original Exchange fixture file geometry")
-    })?;
+    let mut control =
+        SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    create_catalog(&mut control, CATALOG, &warehouse)?;
+    control.execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))?;
+    control.execute(format!("CREATE TABLE {TABLE} (k BIGINT NOT NULL)"))?;
+    // Independent committed files make the scan eligible on the live BE
+    // roster. Actual selected participants are checked, never guessed.
+    for file in 0..FILES {
+        let first = file * ROWS_PER_FILE + 1;
+        let last = first + ROWS_PER_FILE - 1;
+        control.execute(format!(
+            "INSERT INTO {TABLE} SELECT generate_series FROM TABLE(generate_series({first},{last}))"
+        ))?;
+    }
+    let files = file_geometry(&control.execute(format!(
+        "SELECT content,file_path,file_format,record_count,file_size_in_bytes FROM {TABLE}$files ORDER BY file_path"
+    )).context("read original Exchange fixture file geometry")?)?;
     retain(context, "exchange-seed-file-geometry.json", &files)?;
     // All six original files share Iceberg's minimum split weight (0.05 of
     // its 128 MiB target). The initial 256-split pump and least-total-weight
@@ -709,7 +806,7 @@ impl Scenario for ExchangeFlow {
             Case::Control => self.control(context, &fault, &mut jobs, &mut evidence),
         };
         // Release the original fault owner before joining failure cleanup.
-        // Every job is retained until its original socket thread actually exits.
+        // Every job is retained until its original query thread actually exits.
         fault.release_exchange();
         let mut cleanup = Ok(());
         for job in &mut jobs {
@@ -847,19 +944,13 @@ fn receiver_contract(plan: &str, node: i32) -> Result<ExplainedReceiver> {
 }
 
 fn explain(context: &mut ScenarioContext, sql: &str, partitioned: bool) -> Result<ExplainedPlan> {
-    let (physical_tree, contract) = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?
-    .run(|control| {
-        for setting in settings(partitioned, 120) {
-            control.query_drop(setting)?;
-        }
-        let tree: Vec<String> = control.query(format!("EXPLAIN VERBOSE {sql}"))?;
-        let contract: Vec<String> = control.query(format!("EXPLAIN CONTRACT {sql}"))?;
-        Ok((tree.join("\n"), contract.join("\n")))
-    })?;
+    let mut control =
+        SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    for setting in settings(partitioned, 120) {
+        control.execute(setting)?;
+    }
+    let physical_tree = plan_text(&control.execute(format!("EXPLAIN VERBOSE {sql}"))?)?;
+    let contract = plan_text(&control.execute(format!("EXPLAIN CONTRACT {sql}"))?)?;
     // Retain both original replies even if the subsequent format/identity
     // checks reject the fixture. No display ordinal is used as a wire ID.
     let input = format!("{partitioned}:{sql}");
@@ -1384,19 +1475,14 @@ fn applied_successor(observation: &ExchangeFaultObservation) -> bool {
 }
 
 fn short_query(context: &mut ScenarioContext) -> Result<()> {
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?
-    .run(|control| {
-        let actual: Vec<i64> = control.query("SELECT 17")?;
-        ensure!(
-            actual == [17],
-            "short query failed while Exchange positions were held"
-        );
-        Ok(())
-    })
+    let mut control =
+        SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    let actual = sql::integer_column(&control.execute("SELECT 17")?)?;
+    ensure!(
+        actual == [17],
+        "short query failed while Exchange positions were held"
+    );
+    Ok(())
 }
 
 fn require_wake(
@@ -1786,21 +1872,21 @@ impl ExchangeFlow {
             original_still_held(&fault.exchange_observation()),
             "control work ran only after releasing the held stream"
         );
-        jobs[0].kill()?;
+        jobs[0].cancel()?;
         let cancelled = jobs[0].finish(context, Outcome::Cancelled)?;
         // Cancellation does not release the actor's original target lease.
         // Observe its real exit separately before releasing the rule itself.
         let exited = await_fault_exit(context, fault)?;
         ensure!(
             exited.peer_cancels > 0,
-            "KILL did not reach the original held RPC owner"
+            "client query cancellation did not reach the original held RPC owner"
         );
         fault.release_exchange();
         short_query(context)?;
         phase(
             evidence,
             json!({"candidate":candidate,"actual_pressure":pressure,"short_query_before_release":true,
-            "healthy_query":other,"kill_query_owner":cancelled,"actual_rpc_exits_before_rule_release":exited}),
+            "healthy_query":other,"client_cancel_query_owner":cancelled,"actual_rpc_exits_before_rule_release":exited}),
         );
         Ok(())
     }
@@ -1809,6 +1895,116 @@ impl ExchangeFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_mismatch_keeps_original_wire_error_and_transport_object() {
+        let wire = r#"{"message":"source","errorCode":3,"errorName":"USER_CANCELED","errorType":"INTERNAL_ERROR","ownerExtra":{"original":true}}"#;
+        let actual = StatementFailure::Trino(serde_json::from_str(wire).unwrap());
+        let error = expected_failure(actual, Outcome::Cancelled).unwrap_err();
+        let actual = error.downcast_ref::<StatementFailure>().unwrap();
+        let StatementFailure::Trino(actual) = actual else {
+            panic!("typed source replaced");
+        };
+        assert_eq!(serde_json::to_string(actual).unwrap(), wire);
+        let error = expected_failure(
+            StatementFailure::Transport("original transport".into()),
+            Outcome::Deadline,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<StatementFailure>(), Some(StatementFailure::Transport(text)) if text == "original transport")
+        );
+    }
+    #[test]
+    fn multiple_failures_keep_both_actual_error_objects_in_order() {
+        let failure = combine::<()>(
+            Err(StatementFailure::Transport("original wait".into()).into()),
+            Err(StatementFailure::Deadline.into()),
+        )
+        .unwrap_err();
+        let pair = failure.downcast_ref::<ExchangeFailure>().unwrap();
+        assert!(
+            matches!(pair.primary.downcast_ref::<StatementFailure>(), Some(StatementFailure::Transport(text)) if text == "original wait")
+        );
+        assert!(matches!(
+            pair.cleanup.downcast_ref::<StatementFailure>(),
+            Some(StatementFailure::Deadline)
+        ));
+    }
+    fn typed_result(fields: &[(&str, &str)], rows: Vec<Vec<TrinoValue>>) -> StatementResult {
+        use novarocks_test_trino_client::{Column, TypeSignature};
+        StatementResult {
+            columns: fields
+                .iter()
+                .map(|(name, ty)| Column {
+                    name: (*name).into(),
+                    type_name: (*ty).into(),
+                    type_signature: TypeSignature::simple(*ty),
+                })
+                .collect(),
+            rows,
+            query_id: "local-typed-fixture".into(),
+            pages: 1,
+            update_type: None,
+            update_count: None,
+        }
+    }
+    #[test]
+    fn typed_file_geometry_preserves_original_values_and_rejects_null_or_overflow() {
+        let names = [
+            ("content", "integer"),
+            ("file_path", "varchar"),
+            ("file_format", "varchar"),
+            ("record_count", "bigint"),
+            ("file_size_in_bytes", "bigint"),
+        ];
+        let valid = vec![
+            TrinoValue::Integer(0),
+            TrinoValue::Text("original.parquet".into()),
+            TrinoValue::Text("PARQUET".into()),
+            TrinoValue::Integer(4096),
+            TrinoValue::Integer(1024),
+        ];
+        let result = typed_result(&names, vec![valid.clone()]);
+        assert_eq!(
+            file_geometry(&result).unwrap(),
+            vec![(0, "original.parquet".into(), "PARQUET".into(), 4096, 1024)]
+        );
+        let mut invalid = valid.clone();
+        invalid[3] = TrinoValue::Null;
+        assert!(file_geometry(&typed_result(&names, vec![invalid])).is_err());
+        let mut invalid = valid;
+        invalid[0] = TrinoValue::Integer(i64::from(i32::MAX) + 1);
+        assert!(file_geometry(&typed_result(&names, vec![invalid])).is_err());
+    }
+    #[test]
+    fn typed_explain_preserves_original_first_line_and_rejects_nontext() {
+        let result = typed_result(
+            &[("plan", "varchar")],
+            vec![
+                vec![TrinoValue::Text("PLAN FRAGMENT 0".into())],
+                vec![TrinoValue::Text("  original plan".into())],
+            ],
+        );
+        assert_eq!(
+            plan_text(&result).unwrap(),
+            "PLAN FRAGMENT 0\n  original plan"
+        );
+        assert!(
+            plan_text(&typed_result(
+                &[("plan", "varchar")],
+                vec![vec![TrinoValue::Null]]
+            ))
+            .is_err()
+        );
+        assert!(
+            plan_text(&typed_result(
+                &[("plan", "bigint")],
+                vec![vec![TrinoValue::Integer(1)]]
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn explicit_flow_overlay_preserves_the_original_connector_configuration() {

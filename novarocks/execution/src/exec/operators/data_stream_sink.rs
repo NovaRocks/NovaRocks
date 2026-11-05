@@ -2021,6 +2021,20 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         #[cfg(novarocks_dev_controls)]
         self.emit_writer_diagnostic("sink_observe_exit");
         if (self.exiting || self.aborting.load(Ordering::Acquire)) && !self.send_group.is_idle() {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let task = self
+                    .error_state
+                    .as_ref()
+                    .and_then(|state| state.task_identity());
+                // Sample only the original frozen sender roster. Busy locks
+                // mean unavailable, never an empty group or an exit proof.
+                let sender_state = self.send_group.try_diagnostic_state();
+                tracing::debug!(?task, finst = ?self.fragment_instance_id,
+                    driver_id = self.driver_id, dest_node = self.input.dest_node_id,
+                    exiting = self.exiting, aborting = self.aborting.load(Ordering::Acquire),
+                    finishing = self.finishing.load(Ordering::Acquire), ?sender_state,
+                    "DataStreamSink exit remains pending on its original sender group");
+            }
             ExitObservation::pending(FinishWatch::Notify(self.send_observable.clone()))
         } else {
             ExitObservation::exited()

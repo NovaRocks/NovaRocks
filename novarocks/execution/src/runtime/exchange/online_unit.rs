@@ -334,14 +334,14 @@ impl UnitObserver for UnitConstruction<'_> {
         use novarocks_arrow_batch_codec::construction::{
             ReaderArrayHeaderClass, ReaderArrayStructureObserver,
         };
-        if let DecodeKind::Dictionary { id } = kind {
-            if !dictionaries.contains_key(&id) {
-                let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ArrayRef, ExchangeFailure>(
-                    dictionaries.len(), dictionaries.capacity(), || observe_work(self.temporary),
-                )?;
-                if bytes != 0 {
-                    self.temporary.observe_opaque_upper_bound(bytes)?;
-                }
+        if let DecodeKind::Dictionary { id } = kind
+            && !dictionaries.contains_key(&id)
+        {
+            let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ArrayRef, ExchangeFailure>(
+                dictionaries.len(), dictionaries.capacity(), || observe_work(self.temporary),
+            )?;
+            if bytes != 0 {
+                self.temporary.observe_opaque_upper_bound(bytes)?;
             }
         }
         let mut request = |layout, class| -> Result<(), ExchangeFailure> {

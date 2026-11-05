@@ -21,7 +21,8 @@
 //! actual cursor exit. This interface alone advertises no runtime support.
 
 mod encoder;
-pub use encoder::{ArrowMysqlTextEncoder, ArrowTrinoJsonEncoder, ValidatedClientInput};
+pub use encoder::ArrowTrinoJsonEncoder as ClientRowEncoder;
+pub use encoder::{ArrowTrinoJsonEncoder, ValidatedClientInput};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderErrorKind {
@@ -49,7 +50,7 @@ pub struct RenderError {
 }
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bounded MySQL text encoding failed: {:?}", self.kind)?;
+        write!(f, "bounded client row encoding failed: {:?}", self.kind)?;
         if let Some(ordinal) = self.output_ordinal {
             write!(f, " at output occurrence {ordinal}")?;
         }
@@ -146,100 +147,5 @@ impl novarocks_failure_contract::FailureProjection for RenderError {
             }),
             _ => fact,
         }
-    }
-}
-
-/// Dispatches only on the frontend-frozen presentation family.
-pub enum ClientRowEncoder {
-    MysqlText(ArrowMysqlTextEncoder),
-    TrinoJson(ArrowTrinoJsonEncoder),
-}
-impl ClientRowEncoder {
-    /// Construction-independent bound for this renderer's fixed state and
-    /// scratch. Input arrays and the immutable render schema remain separately
-    /// owned. Observing this bound grants no result capacity.
-    pub const fn scratch_capacity_bound_bytes() -> usize {
-        encoder::scratch_capacity_bound_bytes() + std::mem::size_of::<Self>()
-            - std::mem::size_of::<ArrowMysqlTextEncoder>()
-    }
-
-    pub fn try_new(
-        schema: std::sync::Arc<novarocks_result_contract::ClientRenderSchema>,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<Self, RenderError> {
-        use novarocks_result_contract::ClientPresentationFamily as F;
-        match schema.family() {
-            F::MysqlText => ArrowMysqlTextEncoder::try_new(schema, batch).map(Self::MysqlText),
-            F::TrinoJson(_) => ArrowTrinoJsonEncoder::try_new(schema, batch).map(Self::TrinoJson),
-        }
-    }
-    pub fn try_new_root(
-        contract: std::sync::Arc<novarocks_result_contract::RootOutputContract>,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<Self, RenderError> {
-        use novarocks_result_contract::{ClientPresentationFamily as F, FrozenRootOutput};
-        let FrozenRootOutput::ClientRows(schema) = contract.output() else {
-            return Err(RenderError {
-                kind: RenderErrorKind::SchemaMismatch,
-                output_ordinal: None,
-                required: None,
-            });
-        };
-        match schema.family() {
-            F::MysqlText => {
-                ArrowMysqlTextEncoder::try_new_root(contract, batch).map(Self::MysqlText)
-            }
-            F::TrinoJson(_) => {
-                ArrowTrinoJsonEncoder::try_new_root(contract, batch).map(Self::TrinoJson)
-            }
-        }
-    }
-    pub fn try_new_typed_root(
-        input: ValidatedClientInput,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<Self, RenderError> {
-        use novarocks_result_contract::{ClientPresentationFamily as F, FrozenRootOutput};
-        let FrozenRootOutput::ClientRows(schema) = input.contract().output() else {
-            return Err(RenderError {
-                kind: RenderErrorKind::SchemaMismatch,
-                output_ordinal: None,
-                required: None,
-            });
-        };
-        match schema.family() {
-            F::MysqlText => {
-                ArrowMysqlTextEncoder::try_new_typed_root(input, batch).map(Self::MysqlText)
-            }
-            F::TrinoJson(_) => {
-                ArrowTrinoJsonEncoder::try_new_typed_root(input, batch).map(Self::TrinoJson)
-            }
-        }
-    }
-}
-impl BoundedClientRowEncoder for ClientRowEncoder {
-    fn step(&mut self, out: &mut [u8]) -> Result<RenderTurn, RenderError> {
-        match self {
-            Self::MysqlText(e) => e.step(out),
-            Self::TrinoJson(e) => e.step(out),
-        }
-    }
-    fn cancel(&mut self) {
-        match self {
-            Self::MysqlText(e) => e.cancel(),
-            Self::TrinoJson(e) => e.cancel(),
-        }
-    }
-    fn scratch_capacity_bytes(&self) -> usize {
-        let (inner, control) = match self {
-            Self::MysqlText(e) => (
-                e.scratch_capacity_bytes(),
-                std::mem::size_of::<ArrowMysqlTextEncoder>(),
-            ),
-            Self::TrinoJson(e) => (
-                e.scratch_capacity_bytes(),
-                std::mem::size_of::<ArrowTrinoJsonEncoder>(),
-            ),
-        };
-        inner + std::mem::size_of::<Self>() - control
     }
 }

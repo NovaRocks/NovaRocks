@@ -581,7 +581,15 @@ mod tests {
                 cancellation.view(),
                 novarocks_sql::compiler::SessionOptimizerSettings::default(),
                 admitted_semantics,
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                Some(
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: true,
+                            variant_binary: true,
+                        },
+                    ),
+                ),
             ));
             let options = super::synthetic_statement_query_options(context.execution());
             assert_eq!(options.as_proto().allow_throw_exception, expected_allow);

@@ -15,297 +15,165 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::actors::mysql as mysql_actor;
-use crate::actors::mysql_stream::{MysqlPacket, MysqlStream};
+//! Public typed layout, strict single-statement admission and explicit effects.
+//! MySQL packet sequencing and negotiated batches have no Trino carrier.
+
+use crate::actors::sql::{self, SqlSession};
+use crate::actors::trino_protocol::TrinoClient;
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
-use std::time::Duration;
 
-const REQUIRED_BACKENDS: usize = 3;
-const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const TWO_ROW_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![
-        Box::new(SchemaOnce),
-        Box::new(NonNegotiatedMultiStatement),
-        Box::new(NegotiatedMultiResult),
-        Box::new(ScalarSession),
-    ]
+    vec![Box::new(TypedLayout), Box::new(SingleStatementEffects)]
 }
 
-/// A public MySQL result must have exactly one schema prefix, then its rows,
-/// then one terminal success packet. The raw actor is intentional: a normal
-/// client library drains these packets before a scenario can prove their wire
-/// order or detect an accidental second schema prefix.
-struct SchemaOnce;
+struct TypedLayout;
+struct SingleStatementEffects;
 
-/// A negotiated COM_QUERY batch emits one result per executable statement.
-/// The first result must carry SERVER_MORE_RESULTS_EXISTS, while the final
-/// result owns the single terminal success packet without that status bit.
-struct NegotiatedMultiResult;
-
-/// A client that did not negotiate both multi-statement and multi-result
-/// capabilities remains on the strict single-statement protocol path.
-struct NonNegotiatedMultiStatement;
-
-/// Query-valued SET must publish its session value only after the native
-/// Scalar record and terminal success, including empty and rejected input.
-struct ScalarSession;
-
-impl Scenario for ScalarSession {
+impl Scenario for TypedLayout {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
-            "query_output",
-            self.name(),
-            self.is_explicit_stage(),
-            self.is_compatibility_stage(),
-        )
+        crate::scenarios::declarations::for_module("query_output", self.name(), false, false)
     }
-
     fn name(&self) -> &'static str {
-        "query-output/scalar-session"
+        "query-output/typed-layout"
     }
-
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = context
             .handle()
             .query_execution_resource_snapshot()?
-            .context("cross-process harness did not expose the query-resource oracle")?;
-        let timeout = context
-            .remaining("open Scalar session client")?
-            .min(IO_TIMEOUT_CAP);
-        let mut client = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-        client.query_drop("SET @m07_scalar = (SELECT 4)")?;
+            .context("native query-output resource baseline missing")?;
+        let mut session =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        let result = session.execute(TWO_ROW_QUERY)?;
         ensure!(
-            client.query_first::<i64, _>("SELECT @m07_scalar")? == Some(4),
-            "Scalar session lost its numeric value"
-        );
-        client.query_drop(
-            "SET @m07_scalar = (SELECT SUM(generate_series) FROM generate_series(1, 100))",
-        )?;
-        ensure!(
-            client.query_first::<i64, _>("SELECT @m07_scalar")? == Some(5050),
-            "Scalar session lost its aggregate value"
-        );
-        client.query_drop("SET @m07_scalar = (SELECT 4 WHERE FALSE)")?;
-        ensure!(
-            client.query_first::<Option<i64>, _>("SELECT @m07_scalar")? == Some(None),
-            "empty Scalar input must publish NULL"
-        );
-        client.query_drop("SET @m07_scalar = (SELECT 'retained')")?;
-        ensure!(
-            client
-                .query_drop("SET @m07_scalar = (SELECT generate_series FROM generate_series(1, 2))")
-                .is_err(),
-            "multirow Scalar input must fail"
+            result.is_result_set() && result.update_type.is_none() && result.update_count.is_none(),
+            "ordinary query changed its result shape: {result:?}"
         );
         ensure!(
-            client
-                .query_first::<String, _>("SELECT @m07_scalar")?
-                .as_deref()
-                == Some("retained"),
-            "failed Scalar input must preserve the previously committed session value"
+            result.columns.len() == 1
+                && result.columns[0].name == "v"
+                && result.columns[0].type_signature.raw_type == "bigint"
+                && result.columns[0].type_signature.arguments.is_empty(),
+            "original two-row query changed its column layout: {result:?}"
         );
-        context.action(
-            "verified native Scalar numeric, aggregate, empty, and failed session publication",
+        ensure!(
+            sql::integer_column(&result)? == [1, 2],
+            "original ordered two-row query changed its rows: {result:?}"
         );
-        drop(client);
+        context.action("verified original one-column ordered two-row typed result");
         let deadline = context.deadline();
         context
             .handle()
-            .await_query_execution_resource_convergence(&baseline, deadline)
-            .context("await Scalar session resource convergence")?;
-        context.action("verified Scalar session resources converged after success and failure");
+            .await_query_execution_resource_convergence(&baseline, deadline)?;
         Ok(())
     }
 }
 
-impl Scenario for NonNegotiatedMultiStatement {
+impl Scenario for SingleStatementEffects {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
-            "query_output",
-            self.name(),
-            self.is_explicit_stage(),
-            self.is_compatibility_stage(),
-        )
+        crate::scenarios::declarations::for_module("query_output", self.name(), false, false)
     }
-
     fn name(&self) -> &'static str {
-        "query-output/non-negotiated-multi-statement"
+        "query-output/single-statement-and-effects"
     }
-
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = context
             .handle()
             .query_execution_resource_snapshot()?
-            .context("cross-process harness did not expose the query-resource oracle")?;
-        let timeout = context
-            .remaining("open non-negotiated raw MySQL client")?
-            .min(IO_TIMEOUT_CAP);
-        let mut stream = MysqlStream::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-        stream.send_query("SET query_timeout = 60; SELECT 1")?;
-        let response = stream.read_packet("non-negotiated multi-statement rejection")?;
+            .context("native query-output resource baseline missing")?;
+        let mut session =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        let completion = session.execute("SET query_timeout = 61")?;
         ensure!(
-            response.is_error(),
-            "unnegotiated multi-statement query must be rejected before any result, got payload={:?}",
-            response.payload()
+            completion.is_completion()
+                && completion.columns.is_empty()
+                && completion.rows.is_empty()
+                && completion.update_count.is_none(),
+            "session effect changed its empty command shape: {completion:?}"
         );
-        context.action("verified unnegotiated multi-statement COM_QUERY is rejected");
+        ensure!(
+            session
+                .session()
+                .properties
+                .get("query_timeout")
+                .map(String::as_str)
+                == Some("61"),
+            "successful session effect was not applied explicitly"
+        );
+        let before = session.session().clone();
+        let raw = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            context.deadline(),
+            &context.scenario_root().join("batch-http"),
+        )?
+        .with_session(&[("x-trino-session", "query_timeout=61")]);
+        let pages = raw.execute("SET query_timeout = 60; SELECT 1")?;
+        let first = pages
+            .first()
+            .context("batch admission omitted its original response")?
+            .json()?;
+        let id = first["id"]
+            .as_str()
+            .context("batch admission omitted query id")?;
+        for page in &pages {
+            let value = page.json()?;
+            ensure!(
+                page.status == 200 && value["id"] == id,
+                "batch admission changed its original query identity/status"
+            );
+            for field in ["columns", "data", "updateType", "updateCount"] {
+                ensure!(
+                    value.get(field).is_none(),
+                    "rejected batch published a prefix success field {field}"
+                );
+            }
+            ensure!(
+                !page.headers.contains_key("x-trino-set-session")
+                    && !page.headers.contains_key("x-trino-clear-session"),
+                "rejected batch emitted prefix SessionEffects"
+            );
+        }
+        let terminal = pages.last().unwrap();
+        let value = terminal.json()?;
+        ensure!(
+            terminal.next_uri()?.is_none()
+                && value["stats"]["state"] == "FAILED"
+                && value["error"]["errorCode"] == 1
+                && value["error"]["errorName"] == "SYNTAX_ERROR"
+                && value["error"]["errorType"] == "USER_ERROR",
+            "single POST did not reach its typed multi-statement refusal"
+        );
+        ensure!(
+            session.session().properties == before.properties
+                && session.session().catalog == before.catalog
+                && session.session().schema == before.schema
+                && session.session().time_zone == before.time_zone,
+            "rejected batch applied a prefix SessionEffect"
+        );
+        ensure!(
+            sql::single_integer(&session.execute("SELECT 1")?)? == 1,
+            "query after rejected batch did not retain ordinary progress"
+        );
+        ensure!(
+            session
+                .session()
+                .properties
+                .get("query_timeout")
+                .map(String::as_str)
+                == Some("61"),
+            "original explicit SessionEffect changed after ordinary follow-up query"
+        );
+        context.action("verified single-POST batch refusal without prefix effects and successful explicit SessionEffects");
         let deadline = context.deadline();
         context
             .handle()
-            .await_query_execution_resource_convergence(&baseline, deadline)
-            .context("await non-negotiated multi-statement resource convergence")?;
-        context.action("verified rejected multi-statement resources converged");
-        Ok(())
-    }
-}
-
-impl Scenario for NegotiatedMultiResult {
-    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
-            "query_output",
-            self.name(),
-            self.is_explicit_stage(),
-            self.is_compatibility_stage(),
-        )
-    }
-
-    fn name(&self) -> &'static str {
-        "query-output/negotiated-multi-result"
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let baseline = context
-            .handle()
-            .query_execution_resource_snapshot()?
-            .context("cross-process harness did not expose the query-resource oracle")?;
-        let timeout = context
-            .remaining("open negotiated raw MySQL client")?
-            .min(IO_TIMEOUT_CAP);
-        let mut stream = MysqlStream::connect_with_multi_results(
-            context.mysql_user(),
-            context.mysql_port(),
-            timeout,
-        )?;
-        stream.send_query("SET query_timeout = 60; SELECT 1")?;
-        let first = stream.read_packet("first multi-result terminal")?;
-        ensure!(
-            first.is_result_terminator() && first.has_more_results(),
-            "first statement must end with SERVER_MORE_RESULTS_EXISTS, got payload={:?}",
-            first.payload()
-        );
-
-        let packets = [
-            stream.read_packet("second result column count")?,
-            stream.read_packet("second result column definition")?,
-            stream.read_packet("second result metadata terminator")?,
-            stream.read_packet("second result row")?,
-            stream.read_packet("second result terminal")?,
-        ];
-        assert_packet_sequence(&packets)?;
-        ensure!(packets[0].payload() == [1], "expected one result column");
-        ensure_normal_packet(&packets[1], "second result column definition")?;
-        ensure!(
-            packets[2].is_result_terminator(),
-            "expected metadata terminator"
-        );
-        ensure_normal_packet(&packets[3], "second result row")?;
-        ensure!(
-            packets[4].is_result_terminator() && !packets[4].has_more_results(),
-            "final result must terminate without more-results, got payload={:?}",
-            packets[4].payload()
-        );
-        context.action("verified negotiated multi-result wire order and terminal status flags");
-        let deadline = context.deadline();
-        context
-            .handle()
-            .await_query_execution_resource_convergence(&baseline, deadline)
-            .context("await negotiated multi-result resource convergence")?;
-        context.action("verified negotiated multi-result resources converged");
-        Ok(())
-    }
-}
-
-impl Scenario for SchemaOnce {
-    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
-        crate::scenarios::declarations::for_module(
-            "query_output",
-            self.name(),
-            self.is_explicit_stage(),
-            self.is_compatibility_stage(),
-        )
-    }
-
-    fn name(&self) -> &'static str {
-        "query-output/schema-once"
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let baseline = context
-            .handle()
-            .query_execution_resource_snapshot()?
-            .context("cross-process harness did not expose the query-resource oracle")?;
-        context.action("captured query-output resource baseline");
-
-        let timeout = context
-            .remaining("open raw MySQL query-output client")?
-            .min(IO_TIMEOUT_CAP);
-        let mut stream = MysqlStream::query(
-            context.mysql_user(),
-            context.mysql_port(),
-            TWO_ROW_QUERY,
-            timeout,
-        )?;
-        context.action("sent one-column two-row query through raw public MySQL stream");
-
-        let packets = [
-            stream.read_packet("result column count")?,
-            stream.read_packet("result column definition")?,
-            stream.read_packet("result metadata terminator")?,
-            stream.read_packet("first result row")?,
-            stream.read_packet("second result row")?,
-            stream.read_packet("result terminal")?,
-        ];
-        assert_packet_sequence(&packets)?;
-        ensure!(
-            packets[0].sequence() == 1,
-            "MySQL COM_QUERY response must begin at packet sequence 1, got {}",
-            packets[0].sequence()
-        );
-        ensure!(
-            packets[0].payload() == [1],
-            "expected exactly one result column, got payload={:?}",
-            packets[0].payload()
-        );
-        ensure_normal_packet(&packets[1], "single column definition")?;
-        ensure!(
-            packets[2].is_result_terminator(),
-            "expected one metadata terminator, got payload={:?}",
-            packets[2].payload()
-        );
-        ensure_normal_packet(&packets[3], "first result row")?;
-        ensure_normal_packet(&packets[4], "second result row")?;
-        ensure!(
-            packets[5].is_result_terminator(),
-            "expected one success terminal packet, got payload={:?}",
-            packets[5].payload()
-        );
-        context.action("verified one schema prefix, two rows, and one terminal success packet");
-
-        let deadline = context.deadline();
-        context
-            .handle()
-            .await_query_execution_resource_convergence(&baseline, deadline)
-            .context("await query-output resource convergence")?;
-        context.action("verified query-output resources converged after terminal packet");
+            .await_query_execution_resource_convergence(&baseline, deadline)?;
         Ok(())
     }
 }
@@ -313,31 +181,9 @@ impl Scenario for SchemaOnce {
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let actual = context.handle().be_count();
     ensure!(
-        actual == REQUIRED_BACKENDS,
-        "{} requires native 1FE+3BE, but the runner launched 1FE+{actual}BE",
+        actual == 3,
+        "{} requires native 1FE+3BE, got 1FE+{actual}BE",
         context.name()
     );
-    context.action("verified native 1FE+3BE topology");
-    Ok(())
-}
-
-fn ensure_normal_packet(packet: &MysqlPacket, label: &str) -> Result<()> {
-    ensure!(
-        !packet.is_error() && !packet.is_result_terminator(),
-        "expected {label}, got payload={:?}",
-        packet.payload()
-    );
-    Ok(())
-}
-
-fn assert_packet_sequence(packets: &[MysqlPacket]) -> Result<()> {
-    for pair in packets.windows(2) {
-        ensure!(
-            pair[1].sequence() == pair[0].sequence().wrapping_add(1),
-            "MySQL result packet sequence is not contiguous: {} then {}",
-            pair[0].sequence(),
-            pair[1].sequence()
-        );
-    }
     Ok(())
 }

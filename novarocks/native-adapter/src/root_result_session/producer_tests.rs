@@ -78,14 +78,20 @@ fn client(columns: usize) -> FrozenRootOutput {
             name: format!("value_{ordinal}"),
             field: RenderField {
                 native_type: NativeRenderType::String,
-                presentation: RenderPresentation::ScalarText,
+                presentation: RenderPresentation::TrinoValue,
                 nullable: true,
             },
         })
         .collect();
     FrozenRootOutput::ClientRows(
         ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             columns,
             1,
         )
@@ -479,12 +485,17 @@ async fn client_dictionary_repeated_occurrences_and_null_have_independent_exact_
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
     assert_eq!(fixture.channel.snapshot().offered_through, 0);
     let first = read(&fixture.channel, Some(1), 0).await;
-    // Each row begins with u32LE rowTotal; cells use MySQL length-encoded
-    // UTF-8 bytes (or 0xfb NULL). Expected bytes use no production encoder.
+    // Each row begins with its u32LE UTF-8 JSON payload length.
+    // Expected bytes use no production encoder.
     let expected = [
-        6, 0, 0, 0, 2, 0xc3, 0xa9, 2, 0xc3, 0xa9, 2, 0, 0, 0, 0xfb, 0xfb, 4, 0, 0, 0, 1, b'x', 1,
-        b'x',
-    ];
+        &[11, 0, 0, 0][..],
+        "[\"é\",\"é\"]".as_bytes(),
+        &[11, 0, 0, 0],
+        b"[null,null]",
+        &[9, 0, 0, 0],
+        b"[\"x\",\"x\"]",
+    ]
+    .concat();
     assert_eq!(body(&first), expected);
     drop(first);
     let replay = read(&fixture.channel, Some(1), 0).await;
@@ -626,7 +637,7 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
         RootProducerState::Accepting
     );
     let first = read(&fixture.channel, Some(1), 0).await;
-    assert_eq!(body(&first), [2, 0, 0, 0, 1, b'a']);
+    assert_eq!(body(&first), [5, 0, 0, 0, b'[', b'"', b'a', b'"', b']']);
     drop(first);
     {
         let mut submitted = Some(
@@ -647,7 +658,7 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     let second = read(&fixture.channel, Some(2), 0).await;
-    assert_eq!(body(&second), [2, 0, 0, 0, 1, b'b']);
+    assert_eq!(body(&second), [5, 0, 0, 0, b'[', b'"', b'b', b'"', b']']);
     drop(second);
     assert_end(&read(&fixture.channel, Some(3), 0).await, 3, 2);
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
@@ -682,11 +693,15 @@ async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
     .unwrap();
     let first = read(&fixture.channel, Some(1), 0).await;
     assert_eq!(body(&first).len(), RootProfileV1::SEGMENT_BYTES);
-    assert_eq!(
-        &body(&first)[..8],
-        &[0xfd, 0xff, 0x0f, 0x00, 0xfd, 0xf9, 0xff, 0x0f]
+    // SEGMENT_BYTES - 7 input bytes plus [" and "] gives a payload of
+    // SEGMENT_BYTES - 3; its u32 prefix leaves exactly the final ] to continue.
+    assert_eq!(&body(&first)[..6], &[0xfd, 0xff, 0x0f, 0x00, b'[', b'"']);
+    assert!(
+        body(&first)[6..body(&first).len() - 1]
+            .iter()
+            .all(|byte| *byte == b'x')
     );
-    assert!(body(&first)[8..].iter().all(|byte| *byte == b'x'));
+    assert_eq!(body(&first).last(), Some(&b'"'));
     let cursor = ClientRowStreamCursor::new()
         .validate_body(profile, body(&first))
         .unwrap()
@@ -695,7 +710,7 @@ async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
     assert_eq!(cursor.completed_rows(), 0);
     drop(first);
     let second = read(&fixture.channel, Some(2), 0).await;
-    assert_eq!(body(&second), b"x");
+    assert_eq!(body(&second), b"]");
     let validated = cursor.validate_body(profile, body(&second)).unwrap();
     let spans = validated.payload_spans().collect::<Vec<_>>();
     assert_eq!(spans.len(), 1);

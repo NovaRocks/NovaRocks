@@ -34,6 +34,7 @@ pub struct StatementTrace<'a> {
     pub initial_next_uri: Option<&'a str>,
     pub pages: usize,
     pub update_type: Option<&'a str>,
+    pub update_count: Option<u64>,
     pub state: StatementTraceState,
     pub failure: Option<&'a StatementFailure>,
 }
@@ -44,6 +45,7 @@ pub(crate) struct TraceProgress {
     pub initial_next_uri: Option<String>,
     pub pages: usize,
     pub update_type: Option<String>,
+    pub update_count: Option<u64>,
 }
 impl TraceProgress {
     pub fn observation<'a>(
@@ -56,6 +58,7 @@ impl TraceProgress {
             initial_next_uri: self.initial_next_uri.as_deref(),
             pages: self.pages,
             update_type: self.update_type.as_deref(),
+            update_count: self.update_count,
             state,
             failure,
         }

@@ -1,7 +1,6 @@
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{self, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 
 const REQUIRED_BACKENDS: usize = 3;
@@ -59,24 +58,24 @@ impl Scenario for WipeStartRebuild {
             .with_context(|| format!("create warehouse {}", warehouse.display()))?;
         let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
 
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect state family client")?,
-        )?;
+        context.remaining("connect state family client")?;
+        let mut connection =
+            sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         attach_catalog(&mut connection, "wipe_before", &warehouse)?;
         connection
-            .query_drop("CREATE DATABASE wipe_before.ns")
+            .execute("CREATE DATABASE wipe_before.ns")
             .context("create pre-wipe namespace")?;
         connection
-            .query_drop("CREATE TABLE wipe_before.ns.orders (id INT, amount INT)")
+            .execute("CREATE TABLE wipe_before.ns.orders (id INT, amount INT)")
             .context("create pre-wipe table")?;
         connection
-            .query_drop("INSERT INTO wipe_before.ns.orders VALUES (1, 10), (2, 20), (3, 30)")
+            .execute("INSERT INTO wipe_before.ns.orders VALUES (1, 10), (2, 20), (3, 30)")
             .context("write pre-wipe rows")?;
-        let before: Vec<(i32, i32)> = connection
-            .query("SELECT id, amount FROM wipe_before.ns.orders ORDER BY id")
-            .context("read pre-wipe rows")?;
+        let before = attachment_rows(
+            &connection
+                .execute("SELECT id, amount FROM wipe_before.ns.orders ORDER BY id")
+                .context("read pre-wipe rows")?,
+        )?;
         ensure!(
             before == vec![(1, 10), (2, 20), (3, 30)],
             "unexpected pre-wipe rows: {before:?}"
@@ -89,11 +88,13 @@ impl Scenario for WipeStartRebuild {
         // catalog-free on purpose, so its later absence is attributable to the
         // registry being process-local rather than to the attachment going away.
         connection
-            .query_drop("CREATE VIEW local_probe AS SELECT 1")
+            .execute("CREATE VIEW local_probe AS SELECT 1")
             .context("create a local view")?;
-        let local: Vec<i32> = connection
-            .query("SELECT * FROM local_probe")
-            .context("read through the local view before the wipe")?;
+        let local = sql::integer_column(
+            &connection
+                .execute("SELECT * FROM local_probe")
+                .context("read through the local view before the wipe")?,
+        )?;
         ensure!(
             local == vec![1],
             "unexpected local view rows before the wipe: {local:?}"
@@ -108,25 +109,24 @@ impl Scenario for WipeStartRebuild {
             .context("wipe the FE durable state store and restart")?;
         context.action("destroyed the FE durable state store and restarted the FE");
 
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("reconnect after wipe")?,
-        )?;
+        context.remaining("reconnect after wipe")?;
+        let mut connection =
+            sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
 
         // The wipe must be observable. Without this the rest of the scenario
         // would pass even if nothing had been destroyed. The identical query
         // succeeded above, so its failure now is attributable to the wipe, and
         // requiring the catalog name in the error keeps an unrelated failure
         // from being mistaken for the attachment being gone.
-        let survived: Result<Vec<(i32, i32)>, _> =
-            connection.query("SELECT id, amount FROM wipe_before.ns.orders ORDER BY id");
+        let survived =
+            connection.execute("SELECT id, amount FROM wipe_before.ns.orders ORDER BY id");
         let error = match survived {
             Ok(rows) => anyhow::bail!(
                 "the pre-wipe catalog attachment still served rows after its durable \
                  store was destroyed, so the wipe removed nothing: {rows:?}"
             ),
-            Err(error) => error.to_string(),
+            Err(StatementFailure::Trino(error)) => error.message,
+            Err(error) => return Err(error.into()),
         };
         ensure!(
             error.contains("wipe_before"),
@@ -136,9 +136,11 @@ impl Scenario for WipeStartRebuild {
 
         // Re-attaching the same warehouse must rebuild everything from the lake.
         attach_catalog(&mut connection, "wipe_after", &warehouse)?;
-        let restored: Vec<(i32, i32)> = connection
-            .query("SELECT id, amount FROM wipe_after.ns.orders ORDER BY id")
-            .context("read rows through a post-wipe attachment")?;
+        let restored = attachment_rows(
+            &connection
+                .execute("SELECT id, amount FROM wipe_after.ns.orders ORDER BY id")
+                .context("read rows through a post-wipe attachment")?,
+        )?;
         ensure!(
             restored == before,
             "rows rebuilt from the lake differ from the published rows: {restored:?}"
@@ -147,12 +149,13 @@ impl Scenario for WipeStartRebuild {
 
         // The local view must be gone, and for the right reason: the registry
         // never outlives its frontend.
-        let local_after = connection.query::<i32, _>("SELECT * FROM local_probe");
+        let local_after = connection.execute("SELECT * FROM local_probe");
         let local_error = match local_after {
             Ok(rows) => anyhow::bail!(
                 "a local view outlived the frontend incarnation that defined it: {rows:?}"
             ),
-            Err(error) => error.to_string(),
+            Err(StatementFailure::Trino(error)) => error.message,
+            Err(error) => return Err(error.into()),
         };
         ensure!(
             local_error.contains("local_probe"),
@@ -161,19 +164,47 @@ impl Scenario for WipeStartRebuild {
         context.action("verified the local view did not outlive its frontend");
 
         connection
-            .query_drop("DROP CATALOG wipe_after")
+            .execute("DROP CATALOG wipe_after")
             .context("drop the post-wipe catalog attachment")?;
         Ok(())
     }
 }
 
-fn attach_catalog(connection: &mut mysql::Conn, name: &str, warehouse: &str) -> Result<()> {
+fn attach_catalog(connection: &mut sql::SqlSession, name: &str, warehouse: &str) -> Result<()> {
     connection
-        .query_drop(format!(
+        .execute(format!(
             "CREATE EXTERNAL CATALOG {name} PROPERTIES(\"type\"=\"iceberg\",\
              \"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
         ))
         .with_context(|| format!("create catalog attachment {name}"))
+        .map(|_| ())
+}
+
+fn attachment_rows(result: &StatementResult) -> Result<Vec<(i32, i32)>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 2,
+        "state-family lake attachment requires two declared INT columns: {result:?}"
+    );
+    for column in &result.columns {
+        ensure!(
+            column.type_name == "integer"
+                && column.type_signature.raw_type == "integer"
+                && column.type_signature.arguments.is_empty(),
+            "state-family lake attachment column does not match its declared INT type: {column:?}"
+        );
+    }
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(id), TrinoValue::Integer(amount)] => {
+                Ok((i32::try_from(*id)?, i32::try_from(*amount)?))
+            }
+            row => anyhow::bail!(
+                "state-family lake attachment requires two non-null INT cells: {row:?}"
+            ),
+        })
+        .collect()
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {

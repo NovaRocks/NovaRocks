@@ -49,10 +49,11 @@ const S: usize = 1_048_576;
 const CAPTURE_BYTES: usize = 4096;
 const FRAME_BYTES: usize = 16_384;
 const CAPTURE_FRAMES: u32 = 16;
-// Immutable installed-root-protocol-freeze-v3 Data1 digest, not a reply-derived golden.
+// Independent first segment of the original ASCII JSON S+8 input.
+// This is not a historical MySQL receipt or a reply-derived golden.
 const DATA1_SHA: [u8; 32] = [
-    0xe1, 0x77, 0x8a, 0x1a, 0x63, 0xf0, 0xde, 0xff, 0x42, 0x3d, 0x34, 0xc2, 0x67, 0xbb, 0xc2, 0xbe,
-    0x60, 0xc0, 0x18, 0xad, 0xde, 0x82, 0xcf, 0x23, 0xdf, 0xcc, 0x99, 0x26, 0x58, 0x2d, 0x0b, 0x42,
+    0x70, 0x8e, 0x2b, 0x85, 0x5b, 0x16, 0x7d, 0x32, 0x46, 0x38, 0xa0, 0x13, 0x59, 0xfd, 0x1b, 0xe6,
+    0x10, 0x61, 0x51, 0xa1, 0x52, 0xce, 0x41, 0xad, 0x56, 0xdc, 0xb1, 0x58, 0x11, 0xe9, 0x3b, 0x0c,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -327,7 +328,7 @@ impl HeldRootResponse {
         );
         let backends = context
             .handle()
-            .original_exact_mysql_backend_process_ids(original_deadline)?;
+            .original_backend_process_ids(original_deadline)?;
         ensure!(
             backends[backend] == proof.root_task().backend_process_id(),
             "held Root differs from independently actual backend process"

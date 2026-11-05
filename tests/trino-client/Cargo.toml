@@ -31,6 +31,11 @@ reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value", "unbounded_depth"] }
 url.workspace = true
+tokio = { workspace = true, features = ["rt", "signal", "sync", "macros"] }
+
+[[bin]]
+name = "novarocks-trino-query"
+path = "src/bin/novarocks-trino-query.rs"
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

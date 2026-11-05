@@ -1927,40 +1927,6 @@ fn encode_typed_arrow_ipc_chunks_to<W: std::io::Write>(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn encode_chunks_with_creation(
-    chunks: &[Chunk],
-    include_slot_ids: bool,
-    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-    control: &dyn novarocks_functions::KernelEvaluationControl,
-) -> crate::runtime::task::ExecutionResult<Vec<u8>> {
-    use crate::exec::pipeline::operator::ConstructionFailure;
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-    let first = &chunks[0];
-    if !first.chunk_schema().is_typed() {
-        return Err(ConstructionFailure::InvalidSource(
-            "exchange sender requires complete value bindings".into(),
-        )
-        .into());
-    }
-    let owner = factory.begin_input_construction(first)?;
-    let mut buffer = Vec::new();
-    encode_typed_arrow_ipc_chunks_to(chunks, &mut buffer, owner.as_ref(), control)
-        .map_err(ExchangeFailure::into_execution)?;
-    // Envelope words are transient schema descriptors. Request the real header
-    // before copying its immutable slot IDs, not the already-accounted payload.
-    let wire_meta = if include_slot_ids {
-        owner.request(std::alloc::Layout::array::<SlotId>(first.columns().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
-        ExchangeWireMeta::from_chunks(chunks)?
-    } else {
-        None
-    };
-    encode_exchange_payload_envelope(&buffer, wire_meta.as_ref())
-        .map_err(ExchangeFailure::into_execution)
-}
-
 /// Encode a typed result directly into the original bounded payload backing.
 /// Result credit covers that unchanged backing; the actual BE creator covers
 /// only the new schema/writer structures, and remains independent of credit.

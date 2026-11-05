@@ -31,7 +31,8 @@ use super::{
 };
 use crate::{
     HostRejection, ParticipationHostFactory, ParticipationHostInstance,
-    ReleasedParticipationEvidence, task_completion_set::AdmittedCompletionTransfer,
+    ParticipationMaterializationControl, ReleasedParticipationEvidence,
+    task_completion_set::AdmittedCompletionTransfer,
 };
 use novarocks_control_runtime::{
     actor_turn::{
@@ -1343,6 +1344,15 @@ impl QueuedPreparation for ParticipationHostJob {
         HostFairnessGroup::Participation(self.owner.0.participation)
     }
 }
+impl ParticipationMaterializationControl for ParticipationHostJobs {
+    fn is_stopped(&self) -> bool {
+        self.0
+            .scope
+            .gates()
+            .expect("the original materialization retains its admitted Scope")
+            .stopped
+    }
+}
 impl ParticipationHostJob {
     pub(super) fn belongs_to_jobs(&self, original: &ParticipationHostJobs) -> bool {
         Arc::ptr_eq(&self.owner.0, &original.0)
@@ -1407,7 +1417,7 @@ impl ParticipationHostJob {
         if closing {
             return ParticipationHostReturned::MaterializationWithdrawn;
         }
-        match instance.materialize(request) {
+        match instance.materialize(request, &self.owner) {
             Ok(()) => ParticipationHostReturned::Materialized(Ok(ParticipationMaterialized {
                 initial_credential_resource: resource,
             })),

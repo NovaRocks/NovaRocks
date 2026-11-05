@@ -156,7 +156,11 @@ mod tests {
             Some("Removed_Schema"),
             vec![],
             None,
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
         )
         .unwrap();
         assert_eq!(value.catalog.as_deref(), Some("unknown_lake"));
@@ -167,7 +171,11 @@ mod tests {
                 None,
                 vec![],
                 None,
-                ClientPresentationFamily::MysqlText
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true
+                })
             )
             .unwrap()
             .catalog
@@ -199,7 +207,7 @@ mod tests {
         let state = SessionSqlState::from_session_value(value).unwrap();
         assert_eq!(state.current_catalog(), Some("unknown_lake"));
         assert_eq!(state.current_database(), "deleted_schema");
-        assert_eq!(state.presentation(), &family);
+        assert_eq!(state.presentation(), Some(&family));
         assert_eq!(
             state.time_zone(),
             Some(&SessionTimeZone::Region("Europe/Warsaw".into()))
@@ -226,7 +234,11 @@ mod tests {
                 schema,
                 vec![],
                 None,
-                ClientPresentationFamily::MysqlText,
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                }),
             )
             .unwrap_err();
             assert!(
@@ -239,7 +251,11 @@ mod tests {
                 None,
                 vec![],
                 Some(zone),
-                ClientPresentationFamily::MysqlText,
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                }),
             )
             .unwrap_err();
             assert!(
@@ -249,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_inputs_keep_existing_defaults_and_do_not_invent_time_zone() {
+    fn absent_names_and_zone_preserve_the_explicit_client_presentation() {
         use crate::sql::session::SessionSqlState;
         use novarocks_types::naming::DEFAULT_DATABASE;
 
@@ -258,13 +274,26 @@ mod tests {
             None,
             vec![],
             None,
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
         )
         .unwrap();
         let state = SessionSqlState::from_session_value(value).unwrap();
         assert_eq!(state.current_catalog(), None);
         assert_eq!(state.current_database(), DEFAULT_DATABASE);
-        assert_eq!(state.presentation(), &ClientPresentationFamily::MysqlText);
+        assert_eq!(
+            state.presentation(),
+            Some(&ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true
+                }
+            ))
+        );
         assert_eq!(state.time_zone(), None);
         for (zone, minutes) in [("+00:00", 0), ("-00:00", 0), ("-18:00", -1080)] {
             assert_eq!(

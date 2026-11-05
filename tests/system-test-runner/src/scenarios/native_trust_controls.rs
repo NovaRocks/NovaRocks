@@ -17,10 +17,10 @@
 
 //! Exact SQL observations consumed only by the Native trust scenarios.
 
+use crate::actors::sql::{self, SqlSession, StatementFailure};
 use crate::scenario::ScenarioContext;
 use crate::scenarios::native_sql_controls::{SelectedStatement, StatementSpec};
 use anyhow::{Context, Result};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{QueryLifecycleStructuredSnapshot, TestClusterOwner};
 
 pub(super) const BASELINE_SQL: &str =
@@ -54,38 +54,63 @@ pub(super) fn baseline_statements() -> Vec<StatementSpec> {
 pub(super) fn observed_query(
     context: &mut ScenarioContext,
     selected: &SelectedStatement,
-    connection: &mut mysql::Conn,
+    connection: &mut SqlSession,
     sql: &str,
     subject: &str,
 ) -> Result<(Vec<i64>, QueryLifecycleStructuredSnapshot)> {
-    // All ordinary connection setup has completed. No generation is guessed;
-    // the FE journal binds the next actual statement on this existing client.
-    let observation = selected.arm(context, connection.connection_id(), sql)?;
+    let pending = connection.submit(sql)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending(context, pending, sql)?;
+    let response = connection.run_pending(pending);
+    let nonterminal =
+        matches!(&response, Err(error) if !matches!(error, StatementFailure::Trino(_)));
     let result = (|| {
-        let rows: Vec<i64> = connection
-            .query(sql)
-            .with_context(|| format!("run {subject}"))?;
+        let response = response.with_context(|| format!("run {subject}"))?;
+        let rows = sql::integer_column(&response)?;
         let snapshot = context
             .handle()
             .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)
             .with_context(|| format!("read exact lifecycle journal for {subject}"))?;
         Ok((rows, snapshot))
     })();
-    // The SQL call is synchronous. On success the journal additionally proves
-    // the query owner's actual exit before observation teardown.
+    let cancelled = if nonterminal {
+        cancel
+            .delete(selected.deadline)
+            .map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
     let drained = context
         .handle()
-        .drain_query_lifecycle_statement_observation(&observation);
-    with_cleanup(result, drained)
+        .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+    with_cleanup(result, with_cleanup(cancelled, drained))
 }
 
 pub(super) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => {
-            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
-        }
+        (Err(primary), Err(cleanup)) => Err(TrustCleanupFailure { primary, cleanup }.into()),
+    }
+}
+
+#[derive(Debug)]
+struct TrustCleanupFailure {
+    primary: anyhow::Error,
+    cleanup: anyhow::Error,
+}
+impl std::fmt::Display for TrustCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}; actual Native trust cleanup failed: {:#}",
+            self.primary, self.cleanup
+        )
+    }
+}
+impl std::error::Error for TrustCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
     }
 }
 

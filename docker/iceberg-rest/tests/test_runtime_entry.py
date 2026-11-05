@@ -294,7 +294,10 @@ class RendererTests(RendererCase):
         def mysql_renderer(context, output):
             original_renderer(context, output)
             path = output / 'sql-test.toml'
-            ports = tomllib.loads((output / 'fe.toml').read_text())['standalone_server']
+            fe_path = output / 'fe.toml'
+            fe_text = fe_path.read_text().replace('[standalone_server]\n', '[standalone_server]\nmysql_port = 9030\n', 1)
+            fe_path.write_text(fe_text)
+            ports = tomllib.loads(fe_text)['standalone_server']
             text = path.read_text().replace(
                 'trino_port = ' + json.dumps(str(ports['trino_port'])),
                 'port = ' + json.dumps(str(ports['mysql_port'])), 1)
@@ -320,7 +323,9 @@ class RendererTests(RendererCase):
         self.assertEqual(set(cluster), {'host', 'trino_port', 'user'})
         fe = tomllib.loads((current_directory / 'fe.toml').read_text())
         self.assertEqual(cluster['trino_port'], str(fe['standalone_server']['trino_port']))
-        self.assertEqual(old_cluster['port'], str(fe['standalone_server']['mysql_port']))
+        self.assertNotIn('mysql_port', fe['standalone_server'])
+        old_fe = tomllib.loads((old_directory / 'fe.toml').read_text())
+        self.assertEqual(old_cluster['port'], str(old_fe['standalone_server']['mysql_port']))
         self.assertEqual(old_hashes, self.publication_hashes(old_directory))
         self.assertEqual(old_cluster, tomllib.loads((old_directory / 'sql-test.toml').read_text())['cluster'])
         self.assertEqual(runtime.digest(runtime.read_json(old_directory / 'entry.json')), old_directory.name)
@@ -383,7 +388,7 @@ class RendererTests(RendererCase):
 
     def test_renderer_and_interrupted_commit_preserve_previous_complete_publication(self):
         first = self.bind()
-        invalid = copy.deepcopy(self.config); del invalid['local_ports']['mysql']
+        invalid = copy.deepcopy(self.config); del invalid['local_ports']['trino']
         with self.assertRaises(KeyError):
             entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid)
         self.assertEqual(publication.read(self.entry), first)

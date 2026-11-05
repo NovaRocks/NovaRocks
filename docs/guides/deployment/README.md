@@ -47,12 +47,12 @@ application role 或生产拓扑。
 
 | 部署模式 | 适用场景 | 编译重点 | SQL 入口 | 计算节点 | 主要配置 |
 | --- | --- | --- | --- | --- | --- |
-| 分布式部署 | 多节点执行、分布式查询验证、生产或准生产环境 | `cargo build --release -p novarocks-server`，将同一 native 二进制部署到 FE/BE 节点 | NovaRocks FE 的 MySQL 协议端口 | 一个或多个 NovaRocks BE 进程 | 独立 `fe.toml` 与每个 `be.toml`，均含 `[cluster].role` |
-| all-in-one 部署 | 单机开发、快速试用、SQL 回归测试 | `cargo build -p novarocks-server` 用于本地验证；部署建议 release | 当前进程 FE 的 MySQL 协议端口 | 当前进程内的正常 native BE host | 一对普通 `fe.toml` / `be.toml`；命令显式传入 `--fe-config` 与 `--be-config` |
+| 分布式部署 | 多节点执行、分布式查询验证、生产或准生产环境 | `cargo build --release -p novarocks-server`，将同一 native 二进制部署到 FE/BE 节点 | NovaRocks FE 的 Trino HTTP 端口 | 一个或多个 NovaRocks BE 进程 | 独立 `fe.toml` 与每个 `be.toml`，均含 `[cluster].role` |
+| all-in-one 部署 | 单机开发、快速试用、SQL 回归测试 | `cargo build -p novarocks-server` 用于本地验证；部署建议 release | 当前进程 FE 的 Trino HTTP 端口 | 当前进程内的正常 native BE host | 一对普通 `fe.toml` / `be.toml`；命令显式传入 `--fe-config` 与 `--be-config` |
 
 ## 分布式部署
 
-分布式部署使用 `standalone` 的 `fe` / `be` 角色拆分执行链路。FE 角色负责 MySQL 协议、SQL 解析、优化和任务调度；BE 角色负责接收 fragment、执行算子并回传结果。
+分布式部署使用 `standalone` 的 `fe` / `be` 角色拆分执行链路。FE 角色负责 Trino HTTP 协议、SQL 解析、优化和任务调度；BE 角色负责接收 fragment、执行算子并回传结果。
 
 阅读：[分布式部署](distributed.md)
 

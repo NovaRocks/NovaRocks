@@ -434,7 +434,7 @@ fn prepare_compiled_task_in(
         let mut result_spec = context.result_spec.clone().unwrap_or_else(|| {
             ResultWriteSpec::new(
                 instance_task_key,
-                ResultPresentation::MysqlText,
+                ResultPresentation::ArrowIpc,
                 None,
                 instance.runtime_options().typed_result_sink(),
             )

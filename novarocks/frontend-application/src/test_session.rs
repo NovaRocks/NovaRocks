@@ -40,8 +40,6 @@ pub struct FrontendProviderTestBindings {
     pub pin_writer_input: Option<StatementInputHook>,
     pub nominate_writer: Option<StatementNominationHook>,
     pub close: Option<ProviderCloseHook>,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub hms_listing_observation: Option<crate::server::HmsListingObservationSetup>,
 }
 
 #[derive(Clone)]
@@ -74,8 +72,6 @@ impl FrontendTestSessionConfig {
             "native-observation",
             "iceberg-observation",
             "root-observation",
-            "hms-listing-observation",
-            "mysql-fixture",
             "table-maintenance",
         ];
         if scope.domain_names().any(|name| !allowed.contains(&name)) {
@@ -112,32 +108,17 @@ impl FrontendTestSessionConfig {
         if result_handoff.is_some() && statement.is_none() {
             return Err("result handoff control requires exact statement nomination".into());
         }
-        if !scope.grants_for("root-observation").is_empty()
-            && !cfg!(feature = "mem-1-m07-root-observation")
-        {
-            return Err("root observation requires its explicit build capability".into());
-        }
-        #[cfg(any(
-                feature = "mem-1-m07-closing-pressure",
-                feature = "mem-1-m07-exact-mysql-write"
-            ))]
-        let mysql_fixture = novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization::from_grants(scope.grants_for("mysql-fixture")).map_err(|error| error.to_string())?;
+
         let provider = match &self.provider_bind {
             Some(bind) => bind(scope)?,
             None => {
-                if !scope.grants_for("iceberg-observation").is_empty()
-                    || !scope.grants_for("hms-listing-observation").is_empty()
-                {
+                if !scope.grants_for("iceberg-observation").is_empty() {
                     return Err("provider test capabilities require the Server binding".into());
                 }
                 FrontendProviderTestBindings::default()
             }
         };
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let hms_admission_owner = provider
-            .hms_listing_observation
-            .as_ref()
-            .map(crate::server::hms_admission_observation::HmsAdmissionObservation::new);
+
         let mut session = FrontendTestSession {
             role,
             mv,
@@ -146,14 +127,9 @@ impl FrontendTestSessionConfig {
             observation,
             statement,
             result_handoff,
-            #[cfg(any(
-                feature = "mem-1-m07-closing-pressure",
-                feature = "mem-1-m07-exact-mysql-write"
-            ))]
-            mysql_fixture: std::sync::Mutex::new(mysql_fixture),
+
             provider,
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_admission_owner,
+
             cleanup: None,
             failures: Vec::new(),
         };
@@ -224,38 +200,13 @@ pub(crate) struct FrontendTestSession {
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
     pub(crate) statement: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
     pub(crate) result_handoff: Option<Arc<result_handoff::ResultHandoffControl>>,
-    #[cfg(any(
-        feature = "mem-1-m07-closing-pressure",
-        feature = "mem-1-m07-exact-mysql-write"
-    ))]
-    mysql_fixture: std::sync::Mutex<
-        Option<novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization>,
-    >,
+
     provider: FrontendProviderTestBindings,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) hms_admission_owner:
-        Option<Arc<crate::server::hms_admission_observation::HmsAdmissionObservation>>,
+
     cleanup: Option<std::thread::JoinHandle<Result<(), String>>>,
     failures: Vec<String>,
 }
 impl FrontendTestSession {
-    #[cfg(any(
-        feature = "mem-1-m07-closing-pressure",
-        feature = "mem-1-m07-exact-mysql-write"
-    ))]
-    pub(crate) fn take_mysql_fixture(
-        &self,
-    ) -> Result<
-        Option<novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization>,
-        String,
-    > {
-        self.mysql_fixture
-            .lock()
-            .map(|mut fixture| fixture.take())
-            .map_err(|_| "MySQL fixture ownership lock failed".into())
-    }
-
-    #[cfg(any(test, feature = "mem-1-m07-root-observation"))]
     pub(crate) fn scope(&self) -> &SessionScope {
         self.role.scope()
     }
@@ -276,9 +227,7 @@ impl FrontendTestSession {
                 .spawn(move || {
                     scope.wait_closed();
                     diagnostics.close_observation();
-                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                    projection.close_hms_admission_observation();
-                    #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+
                     let _ = projection;
                     if let Some(statement) = statement {
                         statement.close_observation();
@@ -301,12 +250,7 @@ impl FrontendTestSession {
         );
         Ok(())
     }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) fn hms_listing_observation(
-        &self,
-    ) -> Option<crate::server::HmsListingObservationSetup> {
-        self.provider.hms_listing_observation.clone()
-    }
+
     pub(crate) fn close_and_join(&mut self) -> Result<(), String> {
         if let Err(error) = self.role.close_and_join() {
             self.failures.push(error.to_string());

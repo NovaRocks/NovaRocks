@@ -33,7 +33,6 @@ h2.workspace = true
 http.workspace = true
 hmac.workspace = true
 libc.workspace = true
-mysql.workspace = true
 novarocks-test-support.workspace = true
 novarocks-test-trino-client.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }

@@ -31,7 +31,7 @@ Catalog 决定 Iceberg 元数据如何发现和提交。当前 provider 的 `Nov
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
-mysql -h 127.0.0.1 -P "$NOVA_ENV_MYSQL_PORT" -uroot < "$NOVAROCKS_ICE_REST_CATALOG_SQL"
+trino --server "http://127.0.0.1:$NOVA_ENV_TRINO_PORT" --user root --file "$NOVAROCKS_ICE_REST_CATALOG_SQL"
 ```
 
 最后一行要求已有按生成 FE/BE 配置启动的 NovaRocks 服务。生成 SQL 使用本次 `NOVAROCKS_ICEBERG_REST_URI`、客户端 warehouse 与对象存储端点。REST catalog 的每个 generation 由 `catalog_runtime.rs` 构造：先校验持久定义（`header.*`、`rest.auth.type`、`iceberg.rest.server-routing-headers`），再解析 FE 的 `CatalogControl` 身份，构造 FE 认证 owner 与 NovaRocks 的 HTTP 客户端（不跟随重定向、不重试、只用 HTTP/1.1），分别经 `with_auth_manager`、`with_client` 注入上游 `RestCatalog`。会话在第一次使用时经建立入口（`rest_protocol/attempt.rs`）建立一次，上游的读请求与 NovaRocks 自己发出的请求共用这一份会话与连接池；catalog 操作由 `NovaRocksRestCatalog` 承接，不是解析后仍走 Hadoop 的占位语法。

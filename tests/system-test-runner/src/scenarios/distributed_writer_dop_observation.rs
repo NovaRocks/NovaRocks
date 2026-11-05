@@ -32,7 +32,7 @@ const READER_CLOSE: &str = novarocks_failpoint::observation_marker::CONNECTOR_UN
 
 pub(super) fn mutate_observed(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     selected: &SelectedStatement,
     table: &str,
     sql: &str,
@@ -52,22 +52,18 @@ pub(super) fn mutate_observed(
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
-    let observation = selected.arm(context, control.connection_id(), sql)?;
+    let pending = control.submit(sql)?;
+    let (pending, observation) = selected.arm_pending(context, pending, sql)?;
     let (outcome, coordinated) =
-        super::super::small_slots::query_drop(context, control, selected, sql, dop);
-    // Preserve the actual DML OK packet before any subsequent SQL.
-    let actual_affected = matches!(&outcome, Some(Ok(()))).then(|| control.affected_rows());
-    let succeeded = matches!(&outcome, Some(Ok(())));
-    let public_error = matches!(&outcome, Some(Err(mysql::Error::MySqlError(_))));
+        super::super::small_slots::query_drop(context, control, selected, pending, dop);
+    let public_error = matches!(&outcome, Some(Err(StatementFailure::Trino(_))));
     let primary = (|| -> Result<()> {
         let query = outcome
             .context("original row-level SQL has no terminal outcome")
             .and_then(|outcome| outcome.with_context(|| subject.to_owned()));
-        super::super::writer_statement_actor::combine(coordinated, query)?;
-        anyhow::ensure!(
-            actual_affected == Some(affected),
-            "{subject}: affected_rows={actual_affected:?}, expected {affected}"
-        );
+        let result = super::super::writer_statement_actor::combine(query, coordinated)?;
+        sql::expect_update_count(&result, affected)
+            .with_context(|| format!("{subject}: expected logical I+U+D={affected}"))?;
         let snapshot = context
             .handle()
             .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)?;
@@ -177,17 +173,11 @@ pub(super) fn mutate_observed(
         )?;
         Ok(())
     })();
-    // Reuse the original journal's success drain or failure binding drain on
-    // every result path, including missing/malformed observation evidence.
-    let drained = if succeeded {
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&observation)
-    } else {
-        context
-            .handle()
-            .drain_query_lifecycle_statement_binding(&observation, selected.deadline)
-    };
+    // Drain the same original journal binding on every result path,
+    // including missing or malformed observation evidence.
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
     let reentry = if public_error {
         super::super::writer_statement_actor::require_public_error_reentry(control)
     } else {

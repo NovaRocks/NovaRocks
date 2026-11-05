@@ -275,6 +275,8 @@ pub(crate) struct TaskRound {
     pumps_sealed: bool,
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
+    #[cfg(novarocks_dev_controls)]
+    root_observer: Option<crate::preparation_diagnostics::StatementObservationHandle>,
     root_status_source: Option<AcceptedRootStatusSource>,
     protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsPublisher>,
     /// Result consumes root output; other intents retain their Task evidence.
@@ -342,6 +344,8 @@ impl TaskRound {
             pumps_sealed: false,
             connector_blocking_io: None,
             root_status_sender: Some(root_status_sender),
+            #[cfg(novarocks_dev_controls)]
+            root_observer: None,
             root_status_source: Some(root_status_source),
             protocol_facts: None,
             result_consumer_attached: false,
@@ -1509,6 +1513,9 @@ impl TaskRound {
     /// pending, then be refined at the same status version when another task
     /// supplies the authoritative non-derived cause on a later turn.
     fn publish_root_status(&mut self) -> Result<(), TaskExecutionError> {
+        // Product result sealing does not end the original diagnostic attempt.
+        #[cfg(novarocks_dev_controls)]
+        self.publish_root_observation();
         let Some(sender) = self.root_status_sender.as_ref() else {
             // Status ordered after the consumed seal is residual convergence
             // information. It cannot revise the already fixed business result.
@@ -1540,6 +1547,38 @@ impl TaskRound {
                     "publish accepted root Task status projection failed: {error}"
                 ))
             })
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_root_observer(
+        &mut self,
+        observer: crate::preparation_diagnostics::StatementObservationHandle,
+    ) {
+        self.root_observer = Some(observer);
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    fn publish_root_observation(&self) {
+        let Some(observer) = &self.root_observer else {
+            return;
+        };
+        let root = self.execution.graph().root_identity();
+        let Some(task) = self.execution.task(root.task_id()) else {
+            return;
+        };
+        let Some(status) = task.status() else {
+            return;
+        };
+        if status.identity() != root {
+            return;
+        }
+        observer.publish_root_status(
+            crate::preparation_diagnostics::StatementRootStatusObservation {
+                root,
+                installed: task.installed(),
+                status_version: status.version(),
+            },
+        );
     }
 
     fn try_settle_success_seal(&mut self) -> Result<(), TaskExecutionError> {

@@ -55,10 +55,9 @@ use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpe
 use super::paimon::scan_statement_actor::{ScanActor, combine};
 use super::paimon::{Fixture as PaimonFixture, create_paimon_catalog, load_shared_fixture};
 use super::uea4_catalog_planning::await_frontend_local_exit;
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::delayed_s3::{
     DelayedS3Config, DelayedS3ConnectionEventKind, DelayedS3EventKind, DelayedS3Proxy,
     DelayedS3ReadHold,
@@ -96,7 +95,6 @@ const MARKER_POLL: Duration = Duration::from_millis(25);
 const INDEPENDENT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const HELD_QUERY_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
-const MYSQL_QUERY_INTERRUPTED: u16 = 1317;
 /// Rows of the one-file table whose single row group decodes into many more
 /// pages than one turn's budget allows.
 const LONG_TABLE_ROWS: u64 = 400_000;
@@ -207,16 +205,19 @@ impl Catalogs {
             (HELD_ICEBERG, proxy.endpoint().to_owned()),
         ] {
             control
-                .query_drop(format!("DROP CATALOG IF EXISTS {name}"))
+                .execute(format!("DROP CATALOG IF EXISTS {name}"))
+                .map(|_| ())
                 .with_context(|| format!("remove stale catalog {name}"))?;
             control
-                .query_drop(environment.iceberg_catalog_sql(name, &endpoint))
+                .execute(environment.iceberg_catalog_sql(name, &endpoint))
+                .map(|_| ())
                 .with_context(|| format!("create Iceberg catalog {name}"))?;
         }
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE DATABASE IF NOT EXISTS {DIRECT_ICEBERG}.{DATABASE}"
             ))
+            .map(|_| ())
             .context("create the scenario's Iceberg namespace")?;
         if with_paimon {
             create_paimon_catalog(&mut control, DIRECT_PAIMON, &environment.paimon)?;
@@ -238,27 +239,31 @@ struct IcebergTable {
 }
 
 impl IcebergTable {
-    fn create(control: &mut mysql::Conn, name: &'static str, rows: u64) -> Result<Self> {
+    fn create(control: &mut SqlSession, name: &'static str, rows: u64) -> Result<Self> {
         let qualified = format!("{DIRECT_ICEBERG}.{DATABASE}.{name}");
         control
-            .query_drop(format!("DROP TABLE IF EXISTS {qualified}"))
+            .execute(format!("DROP TABLE IF EXISTS {qualified}"))
+            .map(|_| ())
             .with_context(|| format!("drop stale {qualified}"))?;
         control
-            .query_drop(format!("CREATE TABLE {qualified} (v BIGINT)"))
+            .execute(format!("CREATE TABLE {qualified} (v BIGINT)"))
+            .map(|_| ())
             .with_context(|| format!("create {qualified}"))?;
         // The writer starts a file for every chunk it is given. A sort is
         // gathered onto one driver and emits its input as one chunk, so the
         // ORDER BY is what makes this one data file of one row group.
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {qualified} SELECT generate_series FROM \
                  TABLE(generate_series(1, {rows})) ORDER BY generate_series"
             ))
+            .map(|_| ())
             .with_context(|| format!("write {qualified}"))?;
         let files: Vec<String> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT file_path FROM {qualified}$files WHERE content = 0"
             ))
+            .and_then(file_paths)
             .with_context(|| format!("list {qualified} data files"))?;
         let [file] = files.as_slice() else {
             bail!(
@@ -283,7 +288,13 @@ impl IcebergTable {
 
     fn expected_count_and_sum(&self) -> Rows {
         let rows = i64::try_from(self.rows).expect("fixture rows fit i64");
-        vec![vec![rows.to_string(), (rows * (rows + 1) / 2).to_string()]]
+        Rows {
+            signatures: vec![novarocks_test_trino_client::TypeSignature::simple("bigint"); 2],
+            rows: vec![vec![
+                TrinoValue::Integer(rows),
+                TrinoValue::Integer(rows * (rows + 1) / 2),
+            ]],
+        }
     }
 }
 
@@ -310,43 +321,133 @@ fn path_tail(location: &str) -> Result<String> {
         .with_context(|| format!("object location {location} has no file name"))
 }
 
-fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql_actor::DeadlineConnection> {
+fn connect(context: &ScenarioContext, operation: &str) -> Result<SqlSession> {
     context.remaining(operation)?;
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }
 
 fn sql_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// A result set as sorted rows of column texts, so results read through
-/// different catalogs compare as values.
-type Rows = Vec<Vec<String>>;
-
-fn value_text(value: &mysql::Value) -> String {
-    match value {
-        mysql::Value::NULL => "NULL".to_owned(),
-        mysql::Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        mysql::Value::Int(value) => value.to_string(),
-        mysql::Value::UInt(value) => value.to_string(),
-        mysql::Value::Float(value) => value.to_string(),
-        mysql::Value::Double(value) => value.to_string(),
-        other => other.as_sql(false),
+/// Preserve actual type declarations, NULL and typed values. Catalog names are
+/// intentionally excluded; unordered comparison retains duplicate rows.
+#[derive(Clone, Debug, PartialEq)]
+struct Rows {
+    signatures: Vec<novarocks_test_trino_client::TypeSignature>,
+    rows: Vec<Vec<TrinoValue>>,
+}
+impl Rows {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+    fn len(&self) -> usize {
+        self.rows.len()
     }
 }
-
-fn query_rows(connection: &mut mysql::Conn, sql: &str) -> mysql::Result<Rows> {
-    let mut rows: Rows = connection
-        .query::<mysql::Row, _>(sql)?
+fn value_order(left: &TrinoValue, right: &TrinoValue) -> std::cmp::Ordering {
+    use TrinoValue::*;
+    let tag = |value: &TrinoValue| match value {
+        Null => 0,
+        Boolean(_) => 1,
+        Integer(_) => 2,
+        Real(_) => 3,
+        Double(_) => 4,
+        Text(_) => 5,
+        Binary(_) => 6,
+        Array(_) => 7,
+        Row(_) => 8,
+        Map(_) => 9,
+        Variant(_) => 10,
+    };
+    match (left, right) {
+        (Null, Null) => std::cmp::Ordering::Equal,
+        (Boolean(a), Boolean(b)) => a.cmp(b),
+        (Integer(a), Integer(b)) => a.cmp(b),
+        (Real(a), Real(b)) => a.total_cmp(b),
+        (Double(a), Double(b)) => a.total_cmp(b),
+        (Text(a), Text(b)) | (Variant(a), Variant(b)) => a.cmp(b),
+        (Binary(a), Binary(b)) => a.cmp(b),
+        (Array(a), Array(b)) | (Row(a), Row(b)) => row_order(a, b),
+        (Map(a), Map(b)) => a
+            .iter()
+            .zip(b)
+            .map(|((ak, av), (bk, bv))| value_order(ak, bk).then_with(|| value_order(av, bv)))
+            .find(|order| !order.is_eq())
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        _ => tag(left).cmp(&tag(right)),
+    }
+}
+fn row_order(left: &[TrinoValue], right: &[TrinoValue]) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(a, b)| value_order(a, b))
+        .find(|order| !order.is_eq())
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+fn query_rows(result: StatementResult) -> std::result::Result<Rows, StatementFailure> {
+    if !result.is_result_set() {
+        return Err(StatementFailure::Protocol(format!(
+            "expected scan result set, got {result:?}"
+        )));
+    }
+    let mut rows = result.rows;
+    rows.sort_by(|a, b| row_order(a, b));
+    Ok(Rows {
+        signatures: result
+            .columns
+            .into_iter()
+            .map(|column| column.type_signature)
+            .collect(),
+        rows,
+    })
+}
+fn file_paths(result: StatementResult) -> std::result::Result<Vec<String>, StatementFailure> {
+    if !result.is_result_set()
+        || result.columns.len() != 1
+        || result.columns[0].type_signature.raw_type != "varchar"
+    {
+        return Err(StatementFailure::Protocol(format!(
+            "expected one text file_path column, got {result:?}"
+        )));
+    }
+    result
+        .rows
         .into_iter()
-        .map(|row| row.unwrap().iter().map(value_text).collect())
-        .collect();
-    rows.sort();
-    Ok(rows)
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(path)] => Ok(path.clone()),
+            other => Err(StatementFailure::Protocol(format!(
+                "expected non-null file_path, got {other:?}"
+            ))),
+        })
+        .collect()
+}
+/// Arm the original POST before its first GET; retain its exact cancellation
+/// capability even when the client has already returned a local reader failure.
+fn selected_result(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    selected: SelectedStatement,
+    sql: &str,
+) -> Result<StatementResult> {
+    let pending = session.submit(sql)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending(context, pending, sql)?;
+    let result = session.run_pending(pending);
+    let cancelled = if matches!(&result, Ok(_) | Err(StatementFailure::Trino(_))) {
+        Ok(())
+    } else {
+        cancel
+            .delete(context.deadline())
+            .map_err(anyhow::Error::from)
+    };
+    let result = combine(result.map_err(anyhow::Error::from), cancelled);
+    let deadline = context.deadline();
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    combine(result, drained)
 }
 
 // ------------------------------------------------------------------ evidence
@@ -460,7 +561,10 @@ fn still_running(held: &RunningQuery) -> Result<bool> {
         Err(mpsc::TryRecvError::Disconnected) => {
             bail!("held query actor exited without a result")
         }
-        Ok(result) => bail!("held query ended while its read was held: {result:?}"),
+        Ok(Err(error)) => {
+            Err(anyhow::Error::new(error).context("held query failed while its read was held"))
+        }
+        Ok(Ok(rows)) => bail!("held query ended while its read was held: {rows:?}"),
     }
 }
 
@@ -476,14 +580,14 @@ fn run_independent(
         .checked_add(INDEPENDENT_QUERY_TIMEOUT)
         .context("independent query deadline overflow")?
         .min(context.deadline());
-    let mut connection =
-        mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?;
-    if let Some(selected) = selected {
-        selected.arm(context, connection.connection_id(), sql)?;
-    }
-    let rows = query_rows(&mut connection, sql)
+    let mut connection = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let result = if let Some(selected) = selected {
+        selected_result(context, &mut connection, selected, sql)?
+    } else {
+        connection.execute(sql)?
+    };
+    let rows = query_rows(result)
         .with_context(|| format!("independent query `{sql}` did not complete"))?;
-    connection.finish()?;
     Ok((rows, started.elapsed()))
 }
 
@@ -714,11 +818,13 @@ fn one_split_paimon_table(
     for (index, name) in PAIMON_CANDIDATES.into_iter().enumerate() {
         let offsets = log_offsets(context)?;
         let sql = PaimonTable::sql(name, DIRECT_PAIMON);
-        intent
-            .take(index)?
-            .arm(context, control.connection_id(), &sql)?;
-        let expected = query_rows(&mut control, &sql)
-            .with_context(|| format!("probe Paimon fixture table {name}"))?;
+        let expected = query_rows(selected_result(
+            context,
+            &mut control,
+            intent.take(index)?,
+            &sql,
+        )?)
+        .with_context(|| format!("probe Paimon fixture table {name}"))?;
         // Only the probe runs, so every placement seen belongs to it.
         thread::sleep(Duration::from_millis(200));
         let placements = split_placements(&lines_since(context, &offsets)?);
@@ -849,12 +955,13 @@ impl Scenario for ScanProducerReadiness {
             "SELECT COUNT(*) FROM {} WHERE v * 3 = 1",
             long.qualified(DIRECT_ICEBERG)
         );
-        self.intent
-            .take(BUDGET_YIELD_STATEMENT)?
-            .arm(context, control.connection_id(), &sql)?;
-        let matched: Option<i64> = control
-            .query_first(&sql)
-            .context("run the all-filtered long scan")?;
+        let result = selected_result(
+            context,
+            &mut control,
+            self.intent.take(BUDGET_YIELD_STATEMENT)?,
+            &sql,
+        )?;
+        let matched = Some(sql::single_integer(&result)?);
         ensure!(
             matched == Some(0),
             "all-filtered scan matched {matched:?} rows"
@@ -941,10 +1048,8 @@ fn run_cancel_case(
             "{phase}: the held query is not running"
         );
         let killed = Instant::now();
-        let mut control = connect(context, "connect KILL QUERY session")?;
-        control
-            .query_drop(format!("KILL QUERY {}", held.connection_id))
-            .with_context(|| format!("{phase}: KILL QUERY"))?;
+        held.cancel()
+            .with_context(|| format!("{phase}: DELETE original query"))?;
         let result = held
             .done
             .recv_timeout(HELD_QUERY_EXIT_TIMEOUT)
@@ -952,10 +1057,15 @@ fn run_cancel_case(
                 format!("{phase}: the cancelled query did not end while its read was held")
             })?;
         let kill_to_error = killed.elapsed();
-        ensure!(
-            matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == MYSQL_QUERY_INTERRUPTED),
-            "{phase}: the cancelled query did not report its cancellation: {result:?}"
-        );
+        let error = result
+            .err()
+            .context("cancelled query unexpectedly succeeded while its read was held")?;
+        if !matches!(&error, StatementFailure::Trino(error) if error.error_code == 3 && error.error_name == "USER_CANCELED" && error.error_type == "USER_ERROR")
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "{phase}: the cancelled query did not report its cancellation"
+            )));
+        }
         // The read is still held: every owner must finish without its bytes.
         await_frontend_local_exit(context, &format!("{phase} while held"))?;
         let deadline = Instant::now() + CONVERGENCE_TIMEOUT;

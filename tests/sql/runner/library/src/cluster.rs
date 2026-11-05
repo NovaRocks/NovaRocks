@@ -300,7 +300,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noop_server_handle_rejects_be_process_controls() {
+    fn noop_cluster_owner_rejects_be_process_controls() {
         let mut handle = NoopServerHandle;
         assert!(handle.kill_be(0).is_err());
         assert!(handle.restart_be(0).is_err());

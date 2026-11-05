@@ -1611,8 +1611,54 @@ fn delivery_stage<T, E: Into<anyhow::Error>>(
         Some(scope) => {
             result.with_context(|| format!("Exchange delivery stage={stage} scope={scope:?}"))
         }
-        None => result,
+        None => result.with_context(|| format!("Exchange forwarding stage={stage}")),
     }
+}
+
+/// Called only after authenticated, fully decoded DEMAND pair validation and
+/// an actual failed response-header send. It cannot settle a Unit or watch.
+async fn recover_demand_cancel_after_failed_headers(
+    core: &Core,
+    downstream: u32,
+    response: &mut server::SendResponse<Bytes>,
+    inbound: &mut RecvStream,
+    sending: &mut SendStream<Bytes>,
+) -> (
+    bool,
+    std::task::Poll<std::result::Result<h2::Reason, h2::Error>>,
+) {
+    // Keep this one original-handle observation for both the decision and the
+    // retained failure diagnostic. The send error itself proves no reset.
+    let reset = poll_fn(|cx| std::task::Poll::Ready(response.poll_reset(cx))).await;
+    if response.stream_id().as_u32() != downstream
+        || inbound.stream_id() != response.stream_id()
+        || !matches!(&reset, std::task::Poll::Ready(Ok(reason)) if *reason == h2::Reason::CANCEL)
+    {
+        return (false, reset);
+    }
+    match poll_fn(|cx| std::task::Poll::Ready(inbound.poll_data(cx))).await {
+        std::task::Poll::Ready(None) => {}
+        std::task::Poll::Ready(Some(Err(error)))
+            if error.is_reset()
+                && error.is_remote()
+                && error.reason() == Some(h2::Reason::CANCEL) => {}
+        _ => return (false, reset),
+    }
+    // The downstream caller already cancelled this unary demand RPC. Reset
+    // only its original upstream stream; no application ACK is invented and
+    // no selected Unit/custody/subscription obligation is discharged.
+    sending.send_reset(h2::Reason::CANCEL);
+    if let Some(capture) = core
+        .state
+        .lock()
+        .expect("root fault state lock")
+        .exchange
+        .live_capture_mut()
+    {
+        capture.peer_cancels = capture.peer_cancels.saturating_add(1);
+    }
+    core.changed.notify_waiters();
+    (true, reset)
 }
 
 pub(super) async fn forward(
@@ -1970,7 +2016,31 @@ pub(super) async fn forward(
             )
             .await?;
         } else {
-            let output = response.send_response(Response::from_parts(reply_parts, ()), false)?;
+            let output = match response.send_response(Response::from_parts(reply_parts, ()), false)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    // This final branch is DEMAND: Unit and grant output have
+                    // their own protected authors above. Keep that separation.
+                    let reset = if path == DEMAND && verified {
+                        let (settled, reset) = recover_demand_cancel_after_failed_headers(
+                            &core,
+                            downstream,
+                            &mut response,
+                            &mut inbound,
+                            &mut sending,
+                        )
+                        .await;
+                        if settled {
+                            return Ok(());
+                        }
+                        reset
+                    } else {
+                        poll_fn(|cx| std::task::Poll::Ready(response.poll_reset(cx))).await
+                    };
+                    return Err(forwarding_output_failure("response-headers", reset, error));
+                }
+            };
             copy_body(reply_body, output, buffers.clone()).await?;
         }
         Ok::<_, anyhow::Error>(())
@@ -4635,6 +4705,398 @@ mod tests {
             ] {
                 delivery_reset_case(case, h2::Reason::CANCEL, phase).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn demand_failed_headers_wire(reason: h2::Reason) -> Result<()> {
+        let core = super::super::tests::core();
+        let control = RootReplyFaultControl { core: core.clone() };
+        let stream = stream();
+        control.bind_exchange_peers(peers(stream), Instant::now() + Duration::from_secs(5))?;
+        control.begin_exchange_capture(
+            ExchangeFaultAction::HoldDataBeforeForward,
+            Instant::now() + Duration::from_secs(3),
+        )?;
+        let expected = codec::DecodedExchangeDemandEntry {
+            stream,
+            operation: codec::ExchangeDemandOperation::StopSender,
+        };
+        let payload = encoded(codec::encode_demand_request(
+            &[expected],
+            FieldPath::root("demand_failed_headers_fixture"),
+        )?);
+        let mut drivers = JoinSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let result = tokio::time::timeout_at(deadline, async {
+            let (up_client, up_server) = tokio::io::duplex(65536);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+            let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+            let upstream_core = core.clone();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(up_server).await?;
+                let (request, mut response) = connection
+                    .accept()
+                    .await
+                    .context("original demand upstream request absent")??;
+                let work = async {
+                    assert_eq!(request.uri().path(), DEMAND);
+                    let caller = authenticate(&upstream_core, &request, 1)?;
+                    let (body, trailers) = unary_body(
+                        &mut request.into_body(),
+                        BufferContext::standalone(upstream_core.clone()),
+                    )
+                    .await?;
+                    assert!(trailers.is_none());
+                    let actual = codec::decode_demand_request(
+                        &wire::RegisterExchangeDemandRequest::decode(single_message(&body)?)?,
+                        FieldPath::root("original_demand_upstream"),
+                    )?;
+                    require_pair(&upstream_core, actual.pair, caller, 1)?;
+                    assert_eq!(actual.entries, [expected]);
+                    let _ = ready_tx.send(());
+                    headers_rx.await?;
+                    let mut output = response.send_response(Response::new(()), false)?;
+                    let actual_reset = poll_fn(|cx| output.poll_reset(cx)).await?;
+                    let _ = reset_tx.send(actual_reset);
+                    Ok::<_, anyhow::Error>(())
+                };
+                let healthy = async {
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("healthy original upstream successor absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-upstream");
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                let (work, healthy) = tokio::join!(work, healthy);
+                work?;
+                healthy
+            });
+            let (up_sender, up_driver) = client::handshake(up_client).await?;
+            let up_successor = up_sender.clone();
+            drivers.spawn(async move {
+                up_driver
+                    .await
+                    .context("original demand upstream H2 driver")
+            });
+            let (down_client, down_server) = tokio::io::duplex(65536);
+            let downstream_core = core.clone();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(down_server).await?;
+                let (request, response) = connection
+                    .accept()
+                    .await
+                    .context("original demand downstream request absent")??;
+                let work = async {
+                    let result = forward(
+                        request,
+                        response,
+                        up_sender,
+                        1,
+                        BufferContext::standalone(downstream_core),
+                    )
+                    .await;
+                    // Sending the outcome happens after the actual forward Future
+                    // and its captures returned; no synthetic callback settles it.
+                    let _ = outcome_tx.send(result);
+                    Ok::<_, anyhow::Error>(())
+                };
+                let healthy = async {
+                    let (request, mut response) = connection
+                        .accept()
+                        .await
+                        .context("healthy original downstream successor absent")??;
+                    assert_eq!(request.uri().path(), "/healthy-downstream");
+                    // This request follows RST in the same H2 byte stream. Its
+                    // acceptance proves the original connection processed RST
+                    // before the real upstream response headers are released.
+                    let _ = headers_tx.send(());
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                let (work, healthy) = tokio::join!(work, healthy);
+                work?;
+                healthy
+            });
+            let (mut sender, driver) = client::handshake(down_client).await?;
+            drivers
+                .spawn(async move { driver.await.context("original demand downstream H2 driver") });
+            let request = signed_request(
+                DEMAND,
+                peers(stream)[0].1.clone(),
+                NativeProcessIdentity::Backend(stream.source().task().backend_process_id()),
+            )?;
+            let (reply, mut send) = sender.send_request(request, false)?;
+            send.send_data(payload, true)?;
+            ready_rx.await?;
+            send.send_reset(reason);
+            let mut sender = sender.ready().await?;
+            let (healthy, healthy_send) = sender.send_request(
+                Request::builder().uri("/healthy-downstream").body(())?,
+                true,
+            )?;
+            healthy.await?;
+            let result = outcome_rx.await?;
+            if reason == h2::Reason::CANCEL {
+                result.context("verified Demand CANCEL must unwind the original proxy")?;
+                assert_eq!(control.exchange_observation().peer_cancels, 1);
+            } else {
+                let error =
+                    result.expect_err("a non-CANCEL reset cannot recover the failed header send");
+                let diagnostic = error
+                    .downcast_ref::<ForwardingOutputFailure>()
+                    .context("non-CANCEL failed headers lost their original typed diagnostic")?;
+                assert_eq!(diagnostic.stage, "response-headers");
+                assert!(
+                    matches!(diagnostic.reset, CapacityResetObservation::Reason(value)
+                    if value == u32::from(reason))
+                );
+                assert_eq!(control.exchange_observation().peer_cancels, 0);
+            }
+            assert_eq!(reset_rx.await?, h2::Reason::CANCEL);
+            let mut up_successor = up_successor.ready().await?;
+            let (healthy, up_healthy_send) = up_successor
+                .send_request(Request::builder().uri("/healthy-upstream").body(())?, true)?;
+            healthy.await?;
+            assert!(
+                control.exchange_observation().candidate.is_none(),
+                "DEMAND must not select or discharge a Unit/subscription target"
+            );
+            drop(up_healthy_send);
+            drop(up_successor);
+            drop(healthy_send);
+            drop(reply);
+            drop(send);
+            drop(sender);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("original demand failed-header fixture deadline")
+        .and_then(|r| r);
+        // Successful fixtures join their original actors and both connections.
+        // Failure-only abort is still joined and never recorded as success.
+        if result.is_err() {
+            drivers.abort_all();
+        }
+        let joined = tokio::time::timeout_at(deadline, async {
+            while let Some(task) = drivers.join_next().await {
+                task.context("original demand actor Join failed")??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("original demand actor Join deadline")
+        .and_then(|r| r);
+        if joined.is_err() {
+            drivers.abort_all();
+            while drivers.join_next().await.is_some() {}
+        }
+        result?;
+        joined?;
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        assert!(control.observation().failures.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn demand_peer_cancel_after_failed_headers_joins_original_forward_and_both_connections()
+    -> Result<()> {
+        demand_failed_headers_wire(h2::Reason::CANCEL).await
+    }
+
+    #[tokio::test]
+    async fn demand_non_cancel_reset_keeps_the_original_header_failure() -> Result<()> {
+        demand_failed_headers_wire(h2::Reason::REFUSED_STREAM).await
+    }
+
+    #[derive(Clone, Copy)]
+    enum DemandHeaderGuardCase {
+        PendingReset,
+        ObservationError,
+        WrongStream,
+        UnreadRequestData,
+    }
+
+    async fn demand_failed_headers_guard(case: DemandHeaderGuardCase) -> Result<()> {
+        let core = super::super::tests::core();
+        let mut drivers = JoinSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let result = tokio::time::timeout_at(deadline, async {
+            // A real separate upstream stream is retained across the guard.
+            let (up_client, up_server) = tokio::io::duplex(65536);
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(up_server).await?;
+                let (_, mut response) = connection
+                    .accept()
+                    .await
+                    .context("guard upstream absent")??;
+                response.send_response(Response::new(()), true)?;
+                while connection.accept().await.is_some() {}
+                Ok::<_, anyhow::Error>(())
+            });
+            let (mut up_sender, up_driver) = client::handshake(up_client).await?;
+            drivers.spawn(async move { up_driver.await.context("guard upstream driver") });
+            let (up_reply, sending) = up_sender.send_request(Request::new(()), true)?;
+            up_reply.await?;
+            let (client_io, server_io) = tokio::io::duplex(65536);
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let server_core = core.clone();
+            drivers.spawn(async move {
+                let mut connection = server::handshake::<_>(server_io).await?;
+                let (request, mut response) = connection
+                    .accept()
+                    .await
+                    .context("guard request absent")??;
+                let work = async {
+                    let mut inbound = request.into_body();
+                    if !matches!(case, DemandHeaderGuardCase::UnreadRequestData) {
+                        while let Some(data) = inbound.data().await {
+                            let data = data?;
+                            inbound.flow_control().release_capacity(data.len())?;
+                        }
+                        assert!(inbound.trailers().await?.is_none());
+                    }
+                    let _first_headers = if matches!(case, DemandHeaderGuardCase::ObservationError)
+                    {
+                        Some(response.send_response(Response::new(()), false)?)
+                    } else {
+                        None
+                    };
+                    let _ = ready_tx.send(());
+                    probe_rx.await?;
+                    let headers = if matches!(case, DemandHeaderGuardCase::PendingReset) {
+                        // Invalid response headers fail before the H2 state
+                        // transition; the real original reset remains Pending.
+                        Response::builder().header("connection", "close").body(())?
+                    } else {
+                        Response::new(())
+                    };
+                    assert!(
+                        response.send_response(headers, false).is_err(),
+                        "the guard must follow an actual failed header transition"
+                    );
+                    let downstream = response.stream_id().as_u32()
+                        + if matches!(case, DemandHeaderGuardCase::WrongStream) {
+                            2
+                        } else {
+                            0
+                        };
+                    let mut sending = sending;
+                    let (settled, reset) = recover_demand_cancel_after_failed_headers(
+                        &server_core,
+                        downstream,
+                        &mut response,
+                        &mut inbound,
+                        &mut sending,
+                    )
+                    .await;
+                    assert!(!settled);
+                    match case {
+                        DemandHeaderGuardCase::PendingReset => {
+                            assert!(matches!(reset, std::task::Poll::Pending))
+                        }
+                        DemandHeaderGuardCase::ObservationError => {
+                            assert!(matches!(reset, std::task::Poll::Ready(Err(_))))
+                        }
+                        _ => assert!(matches!(
+                            reset,
+                            std::task::Poll::Ready(Ok(h2::Reason::CANCEL))
+                        )),
+                    }
+                    let _ = outcome_tx.send(());
+                    Ok::<_, anyhow::Error>(())
+                };
+                let healthy = async {
+                    let (_, mut response) = connection
+                        .accept()
+                        .await
+                        .context("guard barrier request absent")??;
+                    let _ = probe_tx.send(());
+                    response.send_response(Response::new(()), true)?;
+                    while connection.accept().await.is_some() {}
+                    Ok::<_, anyhow::Error>(())
+                };
+                let (work, healthy) = tokio::join!(work, healthy);
+                work?;
+                healthy
+            });
+            let (mut sender, driver) = client::handshake(client_io).await?;
+            drivers.spawn(async move { driver.await.context("guard downstream driver") });
+            let (reply, mut send) = sender.send_request(Request::new(()), false)?;
+            send.send_data(
+                Bytes::from_static(b"unread-original-request"),
+                !matches!(case, DemandHeaderGuardCase::UnreadRequestData),
+            )?;
+            ready_rx.await?;
+            if !matches!(
+                case,
+                DemandHeaderGuardCase::PendingReset | DemandHeaderGuardCase::ObservationError
+            ) {
+                send.send_reset(h2::Reason::CANCEL);
+            }
+            let mut sender = sender.ready().await?;
+            let (barrier, barrier_send) = sender.send_request(Request::new(()), true)?;
+            barrier.await?;
+            outcome_rx.await?;
+            assert_eq!(
+                core.state
+                    .lock()
+                    .unwrap()
+                    .exchange
+                    .live_capture()
+                    .map_or(0, |capture| capture.peer_cancels),
+                0
+            );
+            drop(barrier_send);
+            drop(reply);
+            drop(send);
+            drop(sender);
+            drop(up_sender);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("failed demand header guard fixture deadline")
+        .and_then(|r| r);
+        if result.is_err() {
+            drivers.abort_all();
+        }
+        let joined = tokio::time::timeout_at(deadline, async {
+            while let Some(task) = drivers.join_next().await {
+                task.context("failed demand header guard actor Join")??;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("failed demand header guard Join deadline")
+        .and_then(|r| r);
+        if joined.is_err() {
+            drivers.abort_all();
+            while drivers.join_next().await.is_some() {}
+        }
+        result?;
+        joined?;
+        assert_eq!(core.bytes.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_demand_headers_preserve_pending_observation_error_wrong_stream_and_unread_request()
+    -> Result<()> {
+        for case in [
+            DemandHeaderGuardCase::PendingReset,
+            DemandHeaderGuardCase::ObservationError,
+            DemandHeaderGuardCase::WrongStream,
+            DemandHeaderGuardCase::UnreadRequestData,
+        ] {
+            demand_failed_headers_guard(case).await?;
         }
         Ok(())
     }

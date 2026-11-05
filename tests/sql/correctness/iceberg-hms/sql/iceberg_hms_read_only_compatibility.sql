@@ -309,11 +309,26 @@ SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 ORDER BY id;
 SELECT table_name FROM information_schema.materialized_views WHERE table_schema = 'iru7_${uuid0}' AND table_name = 'agg_mv';
 
 -- query 58
+-- Spark's prepare action creates exactly v1, v2 and v3, with no views.
+-- Static expectation: NOT_RECORDED / NOT_VERIFIED; HMS runs deferred by user.
+SELECT table_name AS table_name, table_type AS table_type
+FROM ice_hms_${uuid0}.information_schema.tables
+WHERE table_catalog = 'ice_hms_${uuid0}' AND table_schema = 'iru7_${uuid0}'
+ORDER BY table_name;
+
+-- query 59
+-- Preserve the catalog's explicit refusal instead of accepting an empty list.
+-- @expect_sql_code=query.execution.unsupported
+-- @expect_sql_phase=Execution
+-- @expect_error=TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }
+SHOW VIEWS;
+
+-- query 60
 -- @cleanup=true
 -- @result_contains=HMS_CLEANUP_OK
 shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fixture.py" cleanup iru7_${uuid0}
 
--- query 59
+-- query 61
 -- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG ice_hms_${uuid0};

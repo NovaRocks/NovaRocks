@@ -24,6 +24,61 @@ use novarocks_query_application::{
 use novarocks_result_contract::{ClientPresentationFamily, TrinoJsonFacts};
 use serde::Serialize;
 
+/// Trino 483 query.max-length, measured in Java UTF-16 code units.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryTextLimit {
+    units: u32,
+    byte_limit: usize,
+}
+impl QueryTextLimit {
+    pub const DEFAULT_UNITS: u32 = 1_000_000;
+    pub const MAX_UNITS: u32 = 1_000_000_000;
+
+    pub fn new(units: u32) -> Result<Self, &'static str> {
+        if units > Self::MAX_UNITS {
+            return Err(
+                "Trino query maximum length must be between 0 and 1000000000 UTF-16 code units",
+            );
+        }
+        let byte_limit = usize::try_from(units)
+            .ok()
+            .and_then(|units| units.checked_mul(3))
+            .ok_or("Trino query maximum length byte bound overflows usize")?;
+        Ok(Self { units, byte_limit })
+    }
+    pub fn units(self) -> u32 {
+        self.units
+    }
+    pub fn byte_limit(self) -> usize {
+        self.byte_limit
+    }
+}
+impl Default for QueryTextLimit {
+    fn default() -> Self {
+        Self {
+            units: Self::DEFAULT_UNITS,
+            byte_limit: 3 * Self::DEFAULT_UNITS as usize,
+        }
+    }
+}
+impl Serialize for QueryTextLimit {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.units)
+    }
+}
+impl<'de> serde::Deserialize<'de> for QueryTextLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let units = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(units).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StatementBody {
+    Complete(String),
+    ByteLimitExceeded,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedStatementRequest {
     sql: String,
@@ -33,6 +88,7 @@ pub(crate) struct ParsedStatementRequest {
     properties: Vec<(String, String)>,
     time_zone: Option<String>,
     facts: TrinoJsonFacts,
+    query_text_too_large: Option<String>,
     unsupported: Option<String>,
     observation: RequestObservation,
 }
@@ -68,12 +124,14 @@ impl std::error::Error for RequestRejection {}
 
 #[derive(Clone, Debug)]
 pub(crate) enum RequestSessionError {
+    QueryTextTooLarge(String),
     Unsupported(String),
     Session(StatementSessionError),
 }
 impl std::fmt::Display for RequestSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::QueryTextTooLarge(message) => f.write_str(message),
             Self::Unsupported(message) => f.write_str(message),
             Self::Session(error) => std::fmt::Display::fmt(error, f),
         }
@@ -82,10 +140,24 @@ impl std::fmt::Display for RequestSessionError {
 impl std::error::Error for RequestSessionError {}
 
 impl ParsedStatementRequest {
+    #[cfg(test)]
     pub fn parse(
         headers: &HeaderMap,
         sql: String,
         configured_user: &str,
+    ) -> Result<Self, RequestRejection> {
+        Self::parse_body(
+            headers,
+            StatementBody::Complete(sql),
+            configured_user,
+            QueryTextLimit::default(),
+        )
+    }
+    pub(crate) fn parse_body(
+        headers: &HeaderMap,
+        body: StatementBody,
+        configured_user: &str,
+        limit: QueryTextLimit,
     ) -> Result<Self, RequestRejection> {
         let user = singleton(headers, "x-trino-user")?.map(str::trim);
         if user != Some(configured_user) {
@@ -94,7 +166,28 @@ impl ParsedStatementRequest {
                 message: "Invalid Trino user".into(),
             });
         }
-        if sql.trim().is_empty() {
+        let (sql, query_text_too_large) = match body {
+            StatementBody::Complete(sql) => {
+                let units = sql.encode_utf16().count();
+                let error = (units > limit.units() as usize).then(|| {
+                    format!(
+                        "Query text length ({units}) exceeds the maximum length ({})",
+                        limit.units()
+                    )
+                });
+                (sql, error)
+            }
+            // No complete text or character count exists after early body stop.
+            // Keep an empty diagnostic view; typed refusal precedes Session creation.
+            StatementBody::ByteLimitExceeded => (
+                String::new(),
+                Some(format!(
+                    "Query text exceeds the maximum length ({})",
+                    limit.units()
+                )),
+            ),
+        };
+        if query_text_too_large.is_none() && sql.trim().is_empty() {
             return Err(RequestRejection::malformed("SQL statement is empty"));
         }
         let catalog = trim_empty(singleton(headers, "x-trino-catalog")?);
@@ -202,6 +295,7 @@ impl ParsedStatementRequest {
             properties,
             time_zone,
             facts,
+            query_text_too_large,
             unsupported,
             observation: RequestObservation {
                 source,
@@ -222,6 +316,9 @@ impl ParsedStatementRequest {
         &self.observation
     }
     pub fn session_value(&self) -> Result<SessionValue, RequestSessionError> {
+        if let Some(message) = &self.query_text_too_large {
+            return Err(RequestSessionError::QueryTextTooLarge(message.clone()));
+        }
         if let Some(message) = &self.unsupported {
             return Err(RequestSessionError::Unsupported(message.clone()));
         }
@@ -344,6 +441,137 @@ mod tests {
     }
     fn parse(headers: &HeaderMap) -> Result<ParsedStatementRequest, RequestRejection> {
         ParsedStatementRequest::parse(headers, "SELECT 1".into(), "root")
+    }
+    #[test]
+    fn query_length_accepts_the_exact_utf16_limit_and_rejects_one_more() {
+        let limit = QueryTextLimit::new(8).unwrap();
+        let exact = ParsedStatementRequest::parse_body(
+            &headers(),
+            StatementBody::Complete("SELECT 1".into()),
+            "root",
+            limit,
+        )
+        .unwrap();
+        assert!(exact.session_value().is_ok());
+        assert_eq!(exact.sql(), "SELECT 1");
+        let over = ParsedStatementRequest::parse_body(
+            &headers(),
+            StatementBody::Complete("SELECT 1 ".into()),
+            "root",
+            limit,
+        )
+        .unwrap();
+        let Err(RequestSessionError::QueryTextTooLarge(message)) = over.session_value() else {
+            panic!("one extra original code unit must be rejected before opening a Session");
+        };
+        assert_eq!(
+            message,
+            "Query text length (9) exceeds the maximum length (8)"
+        );
+    }
+    #[test]
+    fn query_length_counts_supplementary_characters_as_two_units() {
+        for (text, limit, accepted) in [("😀", 2, true), ("😀x", 2, false), ("\u{0800}", 1, true)]
+        {
+            let request = ParsedStatementRequest::parse_body(
+                &headers(),
+                StatementBody::Complete(text.into()),
+                "root",
+                QueryTextLimit::new(limit).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request.session_value().is_ok(), accepted, "{text:?}");
+        }
+    }
+    #[test]
+    fn zero_query_limit_is_not_unlimited_and_early_stop_has_no_invented_length() {
+        let limit = QueryTextLimit::new(0).unwrap();
+        for body in [
+            StatementBody::Complete("x".into()),
+            StatementBody::ByteLimitExceeded,
+        ] {
+            let request =
+                ParsedStatementRequest::parse_body(&headers(), body, "root", limit).unwrap();
+            assert!(matches!(
+                request.session_value(),
+                Err(RequestSessionError::QueryTextTooLarge(_))
+            ));
+        }
+        let stopped = ParsedStatementRequest::parse_body(
+            &headers(),
+            StatementBody::ByteLimitExceeded,
+            "root",
+            limit,
+        )
+        .unwrap();
+        assert_eq!(
+            stopped.sql(),
+            "",
+            "early stop retains only an empty diagnostic view"
+        );
+        assert_eq!(
+            stopped.session_value().unwrap_err().to_string(),
+            "Query text exceeds the maximum length (0)"
+        );
+        assert_eq!(
+            ParsedStatementRequest::parse_body(
+                &headers(),
+                StatementBody::Complete(String::new()),
+                "root",
+                limit,
+            )
+            .unwrap_err()
+            .message,
+            "SQL statement is empty"
+        );
+    }
+    #[test]
+    fn oversize_query_keeps_original_header_rejections() {
+        let limit = QueryTextLimit::new(0).unwrap();
+        assert_eq!(
+            ParsedStatementRequest::parse_body(
+                &HeaderMap::new(),
+                StatementBody::ByteLimitExceeded,
+                "root",
+                limit,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut input = headers();
+        input.insert("x-trino-schema", HeaderValue::from_static("sales"));
+        assert_eq!(
+            ParsedStatementRequest::parse_body(
+                &input,
+                StatementBody::ByteLimitExceeded,
+                "root",
+                limit,
+            )
+            .unwrap_err()
+            .message,
+            "Schema is set but catalog is not"
+        );
+    }
+    #[test]
+    fn query_text_limit_has_validated_serde_and_exact_default_and_bounds() {
+        let default = QueryTextLimit::default();
+        assert_eq!(
+            (default.units(), default.byte_limit()),
+            (1_000_000, 3_000_000)
+        );
+        for (units, bytes) in [(0, 0), (1_000_000_000, 3_000_000_000)] {
+            let limit: QueryTextLimit = serde_json::from_str(&units.to_string()).unwrap();
+            assert_eq!((limit.units(), limit.byte_limit()), (units, bytes));
+            assert_eq!(serde_json::to_string(&limit).unwrap(), units.to_string());
+        }
+        for text in ["-1", "1000000001", "4294967296", "1.5", "\"1000000\""] {
+            assert!(
+                serde_json::from_str::<QueryTextLimit>(text).is_err(),
+                "{text}"
+            );
+        }
+        assert!(QueryTextLimit::new(1_000_000_001).is_err());
     }
     #[test]
     fn syntax_rejection_precedes_query_registration() {

@@ -17,15 +17,27 @@
 
 //! Query-application SQL admission that is independent of a product route.
 
-use super::{
-    SqlBatchCursor, parse_optional_single_statement, query_service_parse_error,
-    strip_leading_line_comments,
-};
 use crate::engine_error::EngineError;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_parser::ast::{self, Statement as ParsedStatement};
 use novarocks_types::EngineErrorCode;
 use novarocks_workload_control::WorkClass;
+
+/// Connection management has no authority in a statement-scoped client session.
+/// Refuse its admitted syntax before creating any statement work or effects.
+pub fn admit_statement_session(statement: &ParsedStatement) -> Result<(), QueryServiceError> {
+    if matches!(
+        statement,
+        ParsedStatement::Session(ast::SessionStatement::Kill(_))
+            | ParsedStatement::ShowProcessList(_)
+    ) {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::Unsupported,
+            "connection management SQL is unavailable for statement-scoped client sessions",
+        ));
+    }
+    Ok(())
+}
 
 /// Reject uncaptured semantic settings before any definition side effects.
 /// Metadata-only statements remain available; refresh/repartition replays the
@@ -143,69 +155,6 @@ pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
     }
 }
 
-/// Returns all executable SQL fragments from one COM_QUERY request. Empty
-/// fragments and comments have no effect. Callers must gate use of more than
-/// one fragment on the protocol capability negotiated for that connection.
-pub fn negotiated_query_statements(sql: &str) -> Result<Vec<&str>, QueryServiceError> {
-    let mut cursor = SqlBatchCursor::new(sql);
-    let mut statements = Vec::new();
-    while let Some(fragment) = cursor.next_fragment()? {
-        let trimmed = strip_leading_line_comments(fragment.trim());
-        if trimmed.is_empty() {
-            continue;
-        }
-        let is_statement = admin_raise_engine_error(trimmed)?.is_some()
-            || parse_optional_single_statement(trimmed)
-                .map_err(|error| query_service_parse_error(error, trimmed))?
-                .is_some();
-        if !is_statement {
-            continue;
-        }
-        statements.push(fragment);
-    }
-    Ok(statements)
-}
-
-/// Reserved control connections use the same session authentication and KILL
-/// authorization as ordinary connections, but cannot admit ordinary SQL work.
-/// Validate the entire bounded batch before executing any fragment.
-pub fn admit_control_connection_batch(sql: &str) -> Result<(), QueryServiceError> {
-    if sql.len() > 16 * 1024 {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Unsupported,
-            "control SQL exceeds its diagnostic input bound",
-        ));
-    }
-    let mut cursor = SqlBatchCursor::new(sql);
-    while let Some(fragment) = cursor.next_fragment()? {
-        let statement = parse_optional_single_statement(fragment)
-            .map_err(|error| query_service_parse_error(error, fragment))?;
-        if !matches!(
-            statement,
-            None | Some(ParsedStatement::Session(ast::SessionStatement::Kill(_)))
-        ) {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Unsupported,
-                "control connection only accepts KILL",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Return the single executable SQL statement admitted without negotiated
-/// multi-statement support. Empty fragments and comments have no effect.
-pub fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
-    let mut statements = negotiated_query_statements(sql)?;
-    if statements.len() > 1 {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Unsupported,
-            "multiple SQL statements require negotiated MySQL multi-statement support",
-        ));
-    }
-    Ok(statements.pop())
-}
-
 /// Parse the test-only SQL hook that forces a stable engine error.
 pub fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, QueryServiceError> {
     let parts = sql.split_whitespace().collect::<Vec<_>>();
@@ -291,29 +240,21 @@ mod tests {
     use crate::sql::parse_single_statement;
 
     #[test]
-    fn reserved_control_batch_refuses_ordinary_sql_before_any_fragment_executes() {
+    fn statement_sessions_refuse_connection_management_but_preserve_ordinary_sql() {
         for sql in [
+            "KILL 7",
             "KILL QUERY 7",
             "KILL CONNECTION 7",
-            "/* control */ KILL QUERY 7; KILL QUERY 8",
-            "-- nothing\n",
-        ] {
-            admit_control_connection_batch(sql).unwrap();
-        }
-        for sql in [
-            "SELECT 1",
-            "SELECT @@max_allowed_packet",
-            "select @@max_allowed_packet",
-            "SET @v=1",
-            "USE db",
+            "SHOW PROCESSLIST",
             "SHOW FULL PROCESSLIST",
-            "KILL QUERY 7; SELECT 1",
-            "KILL QUERY 7; SET @v=1",
         ] {
-            assert!(admit_control_connection_batch(sql).is_err(), "{sql}");
+            let statement = parse_single_statement(sql).unwrap();
+            let error = admit_statement_session(&statement).unwrap_err();
+            assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported, "{sql}");
         }
-        assert!(admit_control_connection_batch(&" ".repeat(16 * 1024 + 1)).is_err());
-        assert!(admit_control_connection_batch(&" ".repeat(16 * 1024)).is_ok());
+        for sql in ["SELECT 1", "USE db", "SET @v = 1", "SHOW BACKENDS"] {
+            admit_statement_session(&parse_single_statement(sql).unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -364,34 +305,6 @@ mod tests {
             let statement = parse_single_statement(sql).unwrap();
             assert!(admit_persisted_definition_semantics(sql, &statement, &legacy).is_ok());
         }
-    }
-
-    #[test]
-    fn unnegotiated_admission_ignores_empty_fragments_and_returns_one_statement() {
-        assert_eq!(
-            unnegotiated_query_statement("; /* leading comment */; SELECT ';'; -- done\n")
-                .expect("admit"),
-            Some(" SELECT ';'")
-        );
-        assert_eq!(
-            unnegotiated_query_statement("; -- comment only\n; /* still empty */").expect("admit"),
-            None
-        );
-    }
-
-    #[test]
-    fn unnegotiated_admission_rejects_multiple_executable_statements() {
-        let error = unnegotiated_query_statement("SET query_timeout = 1; SELECT 1")
-            .expect_err("must reject multiple statements");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
-    }
-
-    #[test]
-    fn negotiated_admission_retains_each_executable_fragment_in_order() {
-        assert_eq!(
-            negotiated_query_statements("; SET query_timeout = 1; /* separator */ SELECT 1;"),
-            Ok(vec![" SET query_timeout = 1", " /* separator */ SELECT 1"])
-        );
     }
 
     #[test]

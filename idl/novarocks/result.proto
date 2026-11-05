@@ -55,23 +55,19 @@ enum OpaqueKind {
   PERCENTILE = 4;
 }
 enum RenderPresentation {
+  reserved 1 to 8;
+  reserved "SCALAR_TEXT", "TIMESTAMP_UTC_MICROS", "JSON_TEXT",
+      "VARIANT_SERIALIZED_BYTES", "VARIANT_JSON", "OPAQUE_NULL",
+      "MYSQL_CONTAINER", "TIMESTAMP_CONTAINER_TEXT";
   RENDER_PRESENTATION_UNSPECIFIED = 0;
-  SCALAR_TEXT = 1;
-  TIMESTAMP_UTC_MICROS = 2;
-  JSON_TEXT = 3;
-  VARIANT_SERIALIZED_BYTES = 4;
-  VARIANT_JSON = 5;
-  OPAQUE_NULL = 6;
-  MYSQL_CONTAINER = 7;
-  TIMESTAMP_CONTAINER_TEXT = 8;
   TRINO_VALUE = 9;
 }
 message RenderField {
+  reserved 4;
+  reserved "variant_json_timezone_offset_seconds";
   bool nullable = 1;
   NativeRenderType native_type = 2;
   RenderPresentation presentation = 3;
-  // Required only for VARIANT_JSON. Absent is not an implicit UTC offset.
-  optional sint32 variant_json_timezone_offset_seconds = 4;
 }
 message NamedRenderField {
   string name = 1;
@@ -94,7 +90,6 @@ message RenderColumn {
   string name = 3;
   uint32 field_node_id = 4; // One-based index into the schema node table.
 }
-message MysqlTextFamily {}
 message TrinoJsonFamily {
   bool parametric_datetime = 1;
   bool variant = 2;
@@ -103,10 +98,11 @@ message TrinoJsonFamily {
 // A tree encoded as a flat table: protobuf depth is independent of semantic
 // nesting. Every node is referenced exactly once; sharing/cycles are refused.
 message ClientRenderSchema {
+  reserved 3;
+  reserved "mysql_text";
   repeated RenderColumn columns = 1;
   repeated RenderField field_nodes = 2;
   oneof family {
-    MysqlTextFamily mysql_text = 3;
     TrinoJsonFamily trino_json = 4;
   }
 }
@@ -124,7 +120,7 @@ message RootOutputKind {
     bool count_only = 3;
   }
 }
-// ScalarValueV1 owns this semantic schema, independent of MySQL presentation.
+// ScalarValueV1 owns its semantic schema independently of client presentation.
 // Type nodes form one tree; cycles, sharing and unreachable nodes are refused.
 enum ScalarTypeKind {
   SCALAR_TYPE_KIND_UNSPECIFIED = 0;

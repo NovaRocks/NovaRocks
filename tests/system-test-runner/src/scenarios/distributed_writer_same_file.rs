@@ -61,13 +61,15 @@ pub(super) fn observation_specs(cluster_size: usize) -> impl Iterator<Item = Sta
     })
 }
 
-fn files(control: &mut mysql::Conn, table: &str) -> Result<Vec<FileFact>> {
-    control
-        .query(format!(
-            "SELECT content,file_path,file_format,record_count FROM {table}$files \
+fn files(control: &mut SqlSession, table: &str) -> Result<Vec<FileFact>> {
+    writer_live_files(
+        &control
+            .execute(format!(
+                "SELECT content,file_path,file_format,record_count FROM {table}$files \
              ORDER BY content,file_path"
-        ))
-        .context("read current live data/delete entries from original Iceberg metadata")
+            ))
+            .context("read current live data/delete entries from original Iceberg metadata")?,
+    )
 }
 
 fn assert_live_dv(observed: &[FileFact], old_file: &str, deleted_rows: i64) -> Result<()> {
@@ -89,7 +91,7 @@ fn assert_live_dv(observed: &[FileFact], old_file: &str, deleted_rows: i64) -> R
 }
 
 fn assert_remaining(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     table: &str,
     intervals: &[std::ops::RangeInclusive<i64>],
     subject: &str,
@@ -100,9 +102,9 @@ fn assert_remaining(
         .map(|id| (id, id))
         .collect::<Vec<_>>();
     assert_rows(control, table, &expected, subject)?;
-    let aggregate: Option<(i64, i64, i64, i64)> = control.query_first(format!(
+    let aggregate = writer_boundary_summary(&control.execute(format!(
         "SELECT count(*),min(id),max(id),sum(v) FROM {table}"
-    ))?;
+    ))?)?;
     let expected_summary: (i64, i64, i64, i64) = (
         expected.len() as i64,
         expected
@@ -116,7 +118,7 @@ fn assert_remaining(
         expected.iter().map(|(_, v)| *v).sum(),
     );
     anyhow::ensure!(
-        aggregate == Some(expected_summary),
+        aggregate == expected_summary,
         "{subject}: boundary aggregate {aggregate:?}, expected {expected_summary:?}"
     );
     Ok(())
@@ -124,7 +126,7 @@ fn assert_remaining(
 
 pub(super) fn run(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     dop: i32,
@@ -134,21 +136,25 @@ pub(super) fn run(
     context.action(format!(
         "retain one old data file across large DELETE and DV merge with requested DOP {dop}"
     ));
-    control.query_drop(format!(
+    control.execute(format!(
         "CREATE TABLE {table} (id BIGINT,v BIGINT) TBLPROPERTIES \
          (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"merge-on-read\")"
     ))?;
     // Only seeding is singleton. The original ORDER BY shape also gathers
     // the generated input, and the following observations verify the outcome.
-    control.query_drop("SET pipeline_dop=1")?;
-    control.query_drop(format!(
+    control.execute("SET pipeline_dop=1")?;
+    let seed_result = control.execute(format!(
         "INSERT INTO {table} SELECT generate_series,generate_series \
          FROM TABLE(generate_series(1,{SEED_ROWS})) ORDER BY generate_series"
     ))?;
-    assert_affected(control, SEED_ROWS as u64, "seed the one original old file")?;
-    let row_files: Vec<(String, i64)> = control.query(format!(
+    assert_affected(
+        &seed_result,
+        SEED_ROWS as u64,
+        "seed the one original old file",
+    )?;
+    let row_files: Vec<(String, i64)> = writer_file_row_counts(&control.execute(format!(
         "SELECT _file,count(*) FROM {table} GROUP BY _file ORDER BY _file"
-    ))?;
+    ))?)?;
     anyhow::ensure!(
         row_files.len() == 1 && row_files[0].1 == SEED_ROWS,
         "same-file fixture did not produce exactly one {SEED_ROWS}-row file: {row_files:?}"
@@ -159,7 +165,7 @@ pub(super) fn run(
         "row-level source file differs from original live metadata: {before:?}"
     );
     let old_file = row_files[0].0.as_str();
-    control.query_drop(format!("SET pipeline_dop={dop}"))?;
+    control.execute(format!("SET pipeline_dop={dop}"))?;
 
     let before_writers = all_write_counters(context)?;
     super::dop_observation::mutate_observed(

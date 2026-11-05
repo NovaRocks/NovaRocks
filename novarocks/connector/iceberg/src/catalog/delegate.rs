@@ -86,38 +86,18 @@ impl CatalogDelegate {
         &self,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_namespaces_inner(
-            bound,
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            None,
-        )
-        .await
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(super) async fn list_namespaces_observed(
-        &self,
-        bound: ConnectorListingBound,
-        invocation: &super::hms_listing_observer::Invocation,
-    ) -> Result<Vec<String>, ConnectorError> {
-        self.list_namespaces_inner(bound, Some(invocation)).await
+        self.list_namespaces_inner(bound).await
     }
 
     async fn list_namespaces_inner(
         &self,
         bound: ConnectorListingBound,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
-            &super::hms_listing_observer::Invocation,
-        >,
     ) -> Result<Vec<String>, ConnectorError> {
         let mut collector = ConnectorListingCollector::new(bound)?;
         let namespaces = {
             let sdk = self.client.list_namespaces(None);
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
-            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
-            let result = sdk.await;
-            result
+
+            sdk.await
         }
         .map_err(|error| map_read_error(&error))?;
         for name in namespaces
@@ -150,43 +130,20 @@ impl CatalogDelegate {
         namespace: &CatalogNamespaceName,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.list_tables_inner(
-            namespace,
-            bound,
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            None,
-        )
-        .await
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(super) async fn list_tables_observed(
-        &self,
-        namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
-        invocation: &super::hms_listing_observer::Invocation,
-    ) -> Result<Vec<String>, ConnectorError> {
-        self.list_tables_inner(namespace, bound, Some(invocation))
-            .await
+        self.list_tables_inner(namespace, bound).await
     }
 
     async fn list_tables_inner(
         &self,
         namespace: &CatalogNamespaceName,
         bound: ConnectorListingBound,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
-            &super::hms_listing_observer::Invocation,
-        >,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = namespace_ident(namespace)?;
         let mut collector = ConnectorListingCollector::new(bound)?;
         let tables = {
             let sdk = self.client.list_tables(&ident);
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
-            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
-            let result = sdk.await;
-            result
+
+            sdk.await
         }
         .map_err(|error| map_read_error(&error))?;
         for table in tables {

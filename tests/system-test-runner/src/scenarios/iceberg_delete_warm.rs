@@ -22,11 +22,10 @@ use super::connector::{await_resource_convergence, require_three_backends, resou
 use super::iceberg_delete_applicability::{
     CATALOG, create_catalog_sql_from_parts, credential_overlay_with_cache, table_name,
 };
-use super::provider_mysql_actors::run_checks;
-use crate::actors::mysql as mysql_actor;
+use super::provider_mysql_actors::{ActorStatements, ProviderCheck, run_checks};
+use crate::actors::sql::{SqlSession, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::CrossProcessChildEnvironment;
 use novarocks_cluster_harness::fixture_run::{RunBudget, RunStorageScope};
 use serde::Deserialize;
@@ -260,17 +259,18 @@ impl Scenario for IcebergDeleteWarmConcurrent {
             .as_ref()
             .context("warm delete fixture was not prepared")?;
         let baseline = resource_baseline(context)?;
-        let mut control = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect warm delete fixture")?,
-        )?;
-        control.query_drop("SET enable_scan_datacache = true")?;
-        control.query_drop(create_catalog_sql_from_parts(
-            &fixture.rest_uri,
-            &fixture.warehouse,
-            &fixture.s3_endpoint,
-        ))?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        control
+            .execute("SET enable_scan_datacache = true")
+            .map(|_| ())?;
+        control
+            .execute(create_catalog_sql_from_parts(
+                &fixture.rest_uri,
+                &fixture.warehouse,
+                &fixture.s3_endpoint,
+            ))
+            .map(|_| ())?;
         let mut observations = Vec::new();
         for case in &fixture.cases {
             let table = table_name(&case.table)?;
@@ -305,10 +305,12 @@ impl Scenario for IcebergDeleteWarmConcurrent {
             &namespace,
             &storage_projection,
         )?;
-        control.query_drop(format!("CREATE DATABASE {CATALOG}.{namespace}"))?;
+        control
+            .execute(format!("CREATE DATABASE {CATALOG}.{namespace}"))
+            .map(|_| ())?;
         let mut location_verified = false;
         let private_operation = (|| -> Result<()> {
-            control.query_drop(format!("CREATE TABLE {table} (id INT, p INT, value STRING) TBLPROPERTIES ('format-version'='3', 'write.row-lineage'='true')"))?;
+            control.execute(format!("CREATE TABLE {table} (id INT, p INT, value STRING) TBLPROPERTIES ('format-version'='3', 'write.row-lineage'='true')")).map(|_| ())?;
             verify_scratch_table(
                 &fixture.rest_uri,
                 &namespace,
@@ -317,10 +319,14 @@ impl Scenario for IcebergDeleteWarmConcurrent {
                 budget,
             )?;
             location_verified = true;
-            control.query_drop(format!(
-                "INSERT INTO {table} VALUES (1,1,'one'),(2,1,'two'),(3,1,'three')"
-            ))?;
-            control.query_drop(format!("ALTER TABLE {table} CREATE TAG before_delete"))?;
+            control
+                .execute(format!(
+                    "INSERT INTO {table} VALUES (1,1,'one'),(2,1,'two'),(3,1,'three')"
+                ))
+                .map(|_| ())?;
+            control
+                .execute(format!("ALTER TABLE {table} CREATE TAG before_delete"))
+                .map(|_| ())?;
             let old = format!("SELECT id,p,value FROM {table} FOR VERSION AS OF 'before_delete'");
             let latest = format!("SELECT id,p,value FROM {table}");
             let seed: RowBag = [(1, "one"), (2, "two"), (3, "three")]
@@ -333,7 +339,9 @@ impl Scenario for IcebergDeleteWarmConcurrent {
                 .collect();
             verify_row_bag(&mut control, &old, &seed)?;
             verify_row_bag(&mut control, &latest, &seed)?;
-            control.query_drop(format!("DELETE FROM {table} WHERE id = 2"))?;
+            control
+                .execute(format!("DELETE FROM {table} WHERE id = 2"))
+                .map(|_| ())?;
             concurrent_row_bags(
                 context,
                 vec![
@@ -532,8 +540,45 @@ fn cleanup_scratch_run(budget: &RunBudget, machine: &MachineBinding, root: &Path
     outcome.release_diagnostics()?;
     Ok(())
 }
-fn verify_row_bag(connection: &mut mysql::Conn, sql: &str, expected: &RowBag) -> Result<()> {
-    let mut actual: RowBag = connection.query(sql)?;
+fn verify_row_bag(connection: &mut SqlSession, sql: &str, expected: &RowBag) -> Result<()> {
+    verify_row_bag_result(connection.execute(sql)?, expected)
+}
+fn verify_row_bag_result(result: StatementResult, expected: &RowBag) -> Result<()> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 3,
+        "expected row-bag result set: {result:?}"
+    );
+    ensure!(
+        result.columns[..2].iter().all(|column| matches!(
+            column.type_signature.raw_type.as_str(),
+            "tinyint" | "smallint" | "integer" | "bigint"
+        ) && column.type_signature.arguments.is_empty())
+            && result.columns[2].type_signature.raw_type == "varchar",
+        "row-bag declared types differ: {result:?}"
+    );
+    let mut actual: RowBag = result
+        .rows
+        .iter()
+        .map(|row| {
+            let integer = |value: &TrinoValue| match value {
+                TrinoValue::Null => Ok(None),
+                TrinoValue::Integer(value) => Ok(Some(*value)),
+                other => anyhow::bail!("expected nullable row-bag integer, got {other:?}"),
+            };
+            match row.as_slice() {
+                [id, partition, value] => Ok((
+                    integer(id)?,
+                    integer(partition)?,
+                    match value {
+                        TrinoValue::Null => None,
+                        TrinoValue::Text(value) => Some(value.clone()),
+                        other => anyhow::bail!("expected nullable row-bag text, got {other:?}"),
+                    },
+                )),
+                other => anyhow::bail!("expected exactly three row-bag cells, got {other:?}"),
+            }
+        })
+        .collect::<Result<_>>()?;
     let mut expected = expected.clone();
     actual.sort();
     expected.sort();
@@ -551,10 +596,12 @@ fn concurrent_row_bags(
     let checks = queries
         .into_iter()
         .map(|(sql, expected)| {
-            Box::new(move |connection: &mut mysql::Conn| -> Result<()> {
-                connection.query_drop("SET enable_scan_datacache = true")?;
-                verify_row_bag(connection, &sql, &expected)
-            }) as Box<dyn FnOnce(&mut mysql::Conn) -> Result<()> + Send>
+            Box::new(
+                move |connection: &mut SqlSession, statements: &ActorStatements| -> Result<()> {
+                    statements.run(connection, "SET enable_scan_datacache = true")??;
+                    verify_row_bag_result(statements.run(connection, &sql)??, &expected)
+                },
+            ) as ProviderCheck
         })
         .collect();
     run_checks(context, label, checks)

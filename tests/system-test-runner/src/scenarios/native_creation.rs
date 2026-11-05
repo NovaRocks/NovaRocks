@@ -28,20 +28,23 @@
 //! markers it prints; the frontend half through the task-creation gauges it
 //! exports, which fall only when a payload's last holder drops it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
-use novarocks_cluster_harness::TestClusterOwner;
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_native_trust::NativeEndpointConnector;
 use novarocks_proto_models::{common, novarocks as proto};
+use novarocks_test_trino_client::{
+    CancelHandle, PendingStatement, StatementFailure, StatementResult, TrinoError, TrinoValue,
+};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
-use crate::actors::mysql as mysql_actor;
-use crate::actors::mysql_stream::MysqlStream;
+use crate::actors::sql::SqlSession;
+use crate::actors::trino_protocol::{HeldHttpResponse, TrinoClient as RawTrinoClient};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 
 use super::native_compatibility::{
@@ -51,9 +54,8 @@ use super::native_compatibility::{
 };
 use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use super::query_lifecycle::{
-    NID2_FENCE_QUERY, arm_on_every_backend, assert_two_sleep_rows, await_backend_exit,
-    await_fresh_task_create, await_resource_convergence, await_token_scoped_marker,
-    resource_snapshot,
+    NID2_FENCE_QUERY, await_backend_exit, await_fresh_task_create, await_resource_convergence,
+    await_token_scoped_marker, resource_snapshot,
 };
 
 #[path = "raw_creation_controls.rs"]
@@ -906,13 +908,19 @@ pub(super) fn compiled_fragment(
             // This fixture authors one actual non-null I64 root occurrence.
             // LocalCompiler binds its slot from the original native layout.
             let schema = ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: true,
+                    },
+                ),
                 vec![RenderColumn {
                     source_ordinal: 0,
                     source_slot: None,
                     name: "v".into(),
                     field: RenderField {
-                        presentation: RenderPresentation::ScalarText,
+                        presentation: RenderPresentation::TrinoValue,
                         nullable: false,
                         native_type: NativeRenderType::SignedInteger(64),
                     },
@@ -1347,35 +1355,50 @@ impl Scenario for CreationPayloadLifetime {
         context.action(format!("idle frontend creation gauges: {idle:?}"));
 
         // Exact acknowledgements release the payload mid-statement.
-        let pending = PendingRead::start(context, self.intent.take(0)?)?;
-        let mut peak_payloads = 0;
-        loop {
-            let now = FrontendCreationGauges::scrape(context)?;
-            peak_payloads = peak_payloads.max(now.create_payloads_retained);
-            if now.creates_frozen > idle.creates_frozen
-                && now.create_payloads_retained == idle.create_payloads_retained
-                && now.static_fragments_retained > idle.static_fragments_retained
-            {
-                ensure!(
-                    pending.still_running(),
-                    "the statement ended before its create payloads were observed released"
-                );
-                context.action(format!(
+        let mut pending = PendingRead::start(context, self.intent.take(0)?)?;
+        let observation = pending.observation.clone();
+        let phase = (|| -> Result<()> {
+            let mut peak_payloads = 0;
+            loop {
+                let now = FrontendCreationGauges::scrape(context)?;
+                peak_payloads = peak_payloads.max(now.create_payloads_retained);
+                if now.creates_frozen > idle.creates_frozen
+                    && now.create_payloads_retained == idle.create_payloads_retained
+                    && now.static_fragments_retained > idle.static_fragments_retained
+                {
+                    ensure!(
+                        pending.still_running(),
+                        "the statement ended before its create payloads were observed released"
+                    );
+                    context.action(format!(
                     "while the statement still ran, every answered create released its payload \
                      (peak {peak_payloads} retained) and its static plans stayed retained ({} alive)",
                     now.static_fragments_retained
                 ));
-                break;
+                    break;
+                }
+                ensure!(
+                    pending.still_running(),
+                    "the statement ended before its create payloads were observed released: {now:?}"
+                );
+                let remaining =
+                    context.remaining("observe answered creates releasing their payloads")?;
+                thread::sleep(remaining.min(POLL_INTERVAL));
             }
-            ensure!(
-                pending.still_running(),
-                "the statement ended before its create payloads were observed released: {now:?}"
-            );
-            let remaining =
-                context.remaining("observe answered creates releasing their payloads")?;
-            thread::sleep(remaining.min(POLL_INTERVAL));
-        }
-        let rows = pending.finish(context)?;
+            Ok(())
+        })();
+        let cancellation = if phase.is_err() {
+            pending.cancel_active()
+        } else {
+            Ok(())
+        };
+        let response = pending.finish(context);
+        let deadline = context.deadline();
+        let drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, deadline);
+        let cleanup = creation_merge(phase, creation_merge(cancellation, drain));
+        let rows = creation_response(response, cleanup)??;
         ensure!(
             rows.len() == 2,
             "the delayed read returned {rows:?} instead of two rows"
@@ -1395,8 +1418,7 @@ impl Scenario for CreationPayloadLifetime {
             .handle()
             .clear_query_lifecycle_faults()
             .context("clear create-task-ack-drop tokens");
-        result?;
-        cleared?;
+        creation_merge(result, cleared)?;
         let dropped_on = await_token_scoped_marker(context, CREATE_ACK_DROPPED, &tokens)?;
         let after = FrontendCreationGauges::scrape(context)?;
         let applied = backend_marker_total(context, CREATE_APPLIED)? - applied_before;
@@ -1424,16 +1446,37 @@ impl Scenario for CreationPayloadLifetime {
             .map(|index| context.handle().be_log_count(index, CREATE_APPLIED))
             .collect::<Result<Vec<_>>>()?;
         let pending = PendingRead::start(context, self.intent.take(2)?)?;
-        await_fresh_task_create(context, &created_before)?;
+        let observation = pending.observation.clone();
+        let phase = (|| -> Result<()> {
+            await_fresh_task_create(context, &created_before)?;
+            pending.cancel().context("cancel the delayed read")
+        })();
+        let cancellation = if phase.is_err() {
+            pending.cancel_active()
+        } else {
+            Ok(())
+        };
+        let response = pending.finish(context);
         let deadline = context.deadline();
-        context
+        let drain = context
             .handle()
-            .kill_query_until(pending.connection_id, deadline)
-            .context("cancel the delayed read")?;
-        match pending.finish(context) {
+            .drain_query_lifecycle_statement_binding(&observation, deadline);
+        let response = creation_response(
+            response,
+            creation_merge(phase, creation_merge(cancellation, drain)),
+        )?;
+        match response {
             Ok(rows) => bail!("a cancelled statement returned {rows:?}"),
             Err(error) => {
-                context.action(format!("the cancelled statement failed as asked: {error}"))
+                if !matches!(creation_sql_error(&error), Some(wire)
+                    if wire.error_code == 3
+                        && wire.error_name == "USER_CANCELED"
+                        && wire.error_type == "USER_ERROR")
+                {
+                    return Err(error
+                        .context("cancelled delayed read did not return original USER_CANCELED"));
+                }
+                context.action(format!("the cancelled statement failed as asked: {error}"));
             }
         }
         await_idle_gauges(context, &idle, "a cancelled statement")?;
@@ -1525,103 +1568,331 @@ fn backend_marker_total(context: &mut ScenarioContext, marker: &str) -> Result<u
 }
 
 fn run_baseline_query(context: &mut ScenarioContext, selected: &SelectedStatement) -> Result<()> {
-    let mut connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    let observation = arm_on_every_backend(
-        context,
-        selected,
-        "create-task-ack-drop",
-        connection.connection_id(),
-        BASELINE_QUERY,
-    )?;
-    let rows: Vec<i64> = connection
-        .query(BASELINE_QUERY)
-        .context("run the baseline read")?;
+    let mut session = creation_session(context)?;
     ensure!(
-        rows == vec![1, 2],
-        "the baseline read returned {rows:?} instead of [1, 2]"
+        selected.sql == BASELINE_QUERY,
+        "baseline SQL differs from its original finite input"
     );
-    connection.finish()?;
+    ensure!(
+        selected.faults.len() == REQUIRED_BACKENDS
+            && (0..REQUIRED_BACKENDS)
+                .all(|index| selected.faults.contains(&(index, "create-task-ack-drop"))),
+        "all-backend arming differs from the exact finite fault set"
+    );
+    let (pending, observation) = creation_arm(context, &session, selected)?;
     let deadline = context.deadline();
-    context
+    let phase = (|| -> Result<()> {
+        let rows = creation_run_pending(&mut session, pending, deadline)
+            .and_then(creation_baseline_rows)
+            .context("run the baseline read")?;
+        ensure!(
+            rows == vec![1, 2],
+            "the baseline read returned {rows:?} instead of [1, 2]"
+        );
+        context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+        Ok(())
+    })();
+    let drain = context
         .handle()
-        .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
-    context
-        .handle()
-        .drain_query_lifecycle_statement_observation(&observation)?;
-    Ok(())
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    creation_merge(phase, drain)
 }
 
-/// One statement running on its own connection, cancellable by id.
-struct PendingRead {
-    observation: novarocks_cluster_harness::QueryLifecycleStatementObservation,
-    thread: Option<thread::JoinHandle<Result<()>>>,
-    connection_id: u32,
-    done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
+fn creation_session(context: &ScenarioContext) -> Result<SqlSession> {
+    Ok(SqlSession::new(
+        context.sql_user(),
+        context.trino_port(),
+        context.deadline(),
+    )?)
 }
-
-impl Drop for PendingRead {
-    fn drop(&mut self) {
-        if let Some(actor) = self.thread.take() {
-            match actor.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    eprintln!("Original delayed read actor cleanup failed: {error:#}")
-                }
-                Err(_) => eprintln!("Original delayed read actor panicked during join"),
-            }
+fn creation_merge<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(CreationCleanupFailure { primary, cleanup }.into()),
+    }
+}
+#[derive(Debug)]
+struct CreationCleanupFailure {
+    primary: anyhow::Error,
+    cleanup: anyhow::Error,
+}
+impl std::fmt::Display for CreationCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}; original creation cleanup also failed: {:#}",
+            self.primary, self.cleanup
+        )
+    }
+}
+impl std::error::Error for CreationCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+fn creation_sql_error(error: &anyhow::Error) -> Option<&TrinoError> {
+    error
+        .chain()
+        .find_map(|source| match source.downcast_ref::<StatementFailure>() {
+            Some(StatementFailure::Trino(wire)) => Some(wire),
+            _ => None,
+        })
+}
+fn creation_arm(
+    context: &mut ScenarioContext,
+    session: &SqlSession,
+    selected: &SelectedStatement,
+) -> Result<(PendingStatement, QueryLifecycleStatementObservation)> {
+    let pending = session.submit(&selected.sql)?;
+    let cancel = pending.cancel_handle();
+    match selected.arm_client_query(context, &pending.query_id, &selected.sql) {
+        Ok(observation) => Ok((pending, observation)),
+        Err(primary) => {
+            let cancelled = cancel.delete(selected.deadline).map_err(Into::into);
+            let ended = context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original creation fault bindings after arm refusal");
+            creation_merge(Err(primary), creation_merge(cancelled, ended))
         }
     }
 }
+fn creation_run_pending(
+    session: &mut SqlSession,
+    pending: PendingStatement,
+    deadline: Instant,
+) -> Result<StatementResult> {
+    let cancel = pending.cancel_handle();
+    let response = session.run_pending(pending);
+    let cleanup = if matches!(&response, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+    {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    creation_merge(response.map_err(anyhow::Error::from), cleanup)
+}
+fn creation_column(result: &StatementResult, expected: &str) -> Result<()> {
+    ensure!(
+        result.is_result_set()
+            && result.columns.len() == 1
+            && result.columns[0].type_signature.raw_type == expected
+            && result.columns[0].type_signature.arguments.is_empty(),
+        "creation read expected one declared {expected} result column: {:?}",
+        result.columns
+    );
+    Ok(())
+}
+fn creation_baseline_rows(result: StatementResult) -> Result<Vec<i64>> {
+    creation_column(&result, "bigint")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(value)] => Ok(*value),
+            _ => bail!("creation baseline requires one non-null BIGINT: {row:?}"),
+        })
+        .collect()
+}
+fn creation_sleep_rows(result: StatementResult) -> Result<Vec<bool>> {
+    creation_column(&result, "boolean")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Boolean(value)] => Ok(*value),
+            _ => bail!("creation SLEEP requires one non-null BOOLEAN: {row:?}"),
+        })
+        .collect()
+}
+fn creation_response<T>(response: Result<Result<T>>, cleanup: Result<()>) -> Result<Result<T>> {
+    match cleanup {
+        Ok(()) => response,
+        Err(cleanup) => match response {
+            Ok(Err(primary)) | Err(primary) => {
+                Err(CreationCleanupFailure { primary, cleanup }.into())
+            }
+            Ok(Ok(_)) => Err(cleanup),
+        },
+    }
+}
+fn creation_publish(
+    sender: &mpsc::SyncSender<Result<Vec<bool>>>,
+    response: Result<Vec<bool>>,
+) -> Result<()> {
+    match sender.send(response) {
+        Ok(()) => Ok(()),
+        Err(mpsc::SendError(Err(actual))) => {
+            Err(actual.context("original delayed read result owner closed"))
+        }
+        Err(mpsc::SendError(Ok(_))) => {
+            bail!("original delayed read result owner closed before delivery")
+        }
+    }
+}
+struct CreationActorPanic(std::sync::Mutex<Box<dyn std::any::Any + Send>>);
+impl std::fmt::Debug for CreationActorPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CreationActorPanic(original payload retained)")
+    }
+}
+impl std::fmt::Display for CreationActorPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.0;
+        f.write_str("original delayed read actor panicked; payload retained")
+    }
+}
+impl std::error::Error for CreationActorPanic {}
 
+/// One actual POST/GET reader, with its exact cancellation capability and D.
+struct PendingRead {
+    observation: QueryLifecycleStatementObservation,
+    thread: Option<thread::JoinHandle<Result<()>>>,
+    cancel: CancelHandle,
+    deadline: Instant,
+    nonterminal: Arc<AtomicBool>,
+    done: mpsc::Receiver<Result<Vec<bool>>>,
+    observed: Option<Result<Vec<bool>>>,
+}
 impl PendingRead {
     fn start(context: &mut ScenarioContext, selected: SelectedStatement) -> Result<Self> {
+        let mut session = creation_session(context)?;
+        let (pending, observation) = creation_arm(context, &session, &selected)?;
+        let cancel = pending.cancel_handle();
+        let deadline = context.deadline();
         let (done_tx, done) = mpsc::sync_channel(1);
-        let connection = mysql_actor::connect_for_cancellation_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
-        let connection_id = connection.connection_id();
-        let observation = selected.arm(context, connection_id, &selected.sql)?;
-        let sql = selected.sql;
+        let nonterminal = Arc::new(AtomicBool::new(true));
+        let worker_nonterminal = nonterminal.clone();
         let thread = thread::Builder::new()
-            .name("native-creation-read".to_owned())
+            .name("native-creation-read".into())
             .spawn(move || -> Result<()> {
-                connection.run(|connection| {
-                    let outcome = connection.query(sql);
-                    done_tx
-                        .send(outcome)
-                        .context("publish the delayed read result")
-                })
-            })
-            .context("start the delayed read")?;
-        Ok(Self {
-            observation,
-            thread: Some(thread),
-            connection_id,
-            done,
-        })
+                let response = session.run_pending(pending);
+                worker_nonterminal.store(
+                    matches!(&response, Err(error) if !matches!(error, StatementFailure::Trino(_))),
+                    Ordering::Release,
+                );
+                creation_publish(
+                    &done_tx,
+                    response
+                        .map_err(anyhow::Error::from)
+                        .and_then(creation_sleep_rows),
+                )
+            });
+        match thread {
+            Ok(thread) => Ok(Self {
+                observation,
+                thread: Some(thread),
+                cancel,
+                deadline,
+                nonterminal,
+                done,
+                observed: None,
+            }),
+            Err(primary) => {
+                let cancelled = cancel.delete(deadline).map_err(Into::into);
+                let drained = context
+                    .handle()
+                    .drain_query_lifecycle_statement_binding(&observation, deadline);
+                creation_merge(Err(primary.into()), creation_merge(cancelled, drained))
+            }
+        }
     }
-
-    fn still_running(&self) -> bool {
-        matches!(self.done.try_recv(), Err(mpsc::TryRecvError::Empty))
+    fn still_running(&mut self) -> bool {
+        if self.observed.is_some() {
+            return false;
+        }
+        match self.done.try_recv() {
+            Ok(response) => {
+                self.observed = Some(response);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        }
     }
-
-    fn finish(mut self, context: &mut ScenarioContext) -> Result<Vec<i64>> {
-        let outcome = self
-            .done
-            .recv_timeout(context.remaining("await the delayed read")?)
-            .context("the delayed read did not finish")?;
-        self.thread
+    fn cancel(&self) -> Result<()> {
+        Ok(self.cancel.delete(self.deadline)?)
+    }
+    fn cancel_active(&self) -> Result<()> {
+        if self.nonterminal.load(Ordering::Acquire)
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            self.cancel()?;
+        }
+        Ok(())
+    }
+    fn join_original(&mut self) -> Result<()> {
+        let joined = self
+            .thread
             .take()
-            .expect("original delayed read actor")
+            .context("original delayed read actor already joined")?
             .join()
-            .map_err(|_| anyhow::anyhow!("the delayed read thread panicked"))??;
-        outcome.context("the delayed read failed")
+            .map_err(|payload| {
+                anyhow::Error::new(CreationActorPanic(std::sync::Mutex::new(payload)))
+            })
+            .and_then(|result| result);
+        let cancelled = if self.nonterminal.load(Ordering::Acquire) {
+            self.cancel()
+        } else {
+            Ok(())
+        };
+        creation_merge(joined, cancelled)
+    }
+    /// The outer result is actual reader/cancel settlement. Only its inner
+    /// result can be used as the expected SQL outcome.
+    fn finish(mut self, context: &mut ScenarioContext) -> Result<Result<Vec<bool>>> {
+        let response = match self.observed.take() {
+            Some(response) => Ok(response),
+            None => context
+                .remaining("await the delayed read")
+                .and_then(|remaining| {
+                    self.done
+                        .recv_timeout(remaining)
+                        .context("the delayed read did not finish")
+                }),
+        };
+        let cancellation = if response.is_err() {
+            self.cancel_active()
+        } else {
+            Ok(())
+        };
+        let joined = self.join_original();
+        let late = if response.is_err() {
+            match self.done.try_recv() {
+                Ok(Err(actual)) => {
+                    Err(actual.context("original delayed SQL failed after receiver wait"))
+                }
+                _ => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+        creation_response(
+            response,
+            creation_merge(joined, creation_merge(cancellation, late)),
+        )
+    }
+}
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let cancelled = self.cancel_active();
+            let joined = self.join_original();
+            let pending = self
+                .observed
+                .take()
+                .or_else(|| self.done.try_recv().ok())
+                .map_or(Ok(()), |outcome| outcome.map(|_| ()));
+            if let Err(error) = creation_merge(joined, creation_merge(cancelled, pending)) {
+                eprintln!("Original delayed read actor cleanup failed: {error:#}");
+            }
+        }
     }
 }
 
@@ -1683,15 +1954,19 @@ impl Scenario for FixedPlanRecovery {
         // The reference: how many static plans one clean run freezes.
         let pending = PendingRead::start(context, self.intent.take(0)?)?;
         let clean_observation = pending.observation.clone();
-        let rows = pending.finish(context)?;
-        ensure!(rows.len() == 2, "the clean read returned {rows:?}");
+        let phase = (|| {
+            let rows = pending.finish(context)??;
+            ensure!(rows.len() == 2, "the clean read returned {rows:?}");
+            let deadline = context.deadline();
+            context
+                .handle()
+                .await_query_lifecycle_statement_observation(&clean_observation, true, deadline)
+        })();
         let deadline = context.deadline();
-        let clean_terminal = context
+        let drain = context
             .handle()
-            .await_query_lifecycle_statement_observation(&clean_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&clean_observation)?;
+            .drain_query_lifecycle_statement_binding(&clean_observation, deadline);
+        let clean_terminal = creation_merge(phase, drain)?;
         ensure!(
             clean_terminal.attempt_id == 1,
             "the clean read unexpectedly ran attempt {}",
@@ -1714,35 +1989,112 @@ impl Scenario for FixedPlanRecovery {
         let created_before = (0..context.handle().be_count())
             .map(|index| context.handle().be_log_count(index, CREATE_APPLIED))
             .collect::<Result<Vec<_>>>()?;
-        let mut stream = MysqlStream::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("open the recovered read")?,
-        )?;
-        let recovery_observation =
-            self.intent
-                .take(1)?
-                .arm(context, stream.connection_id()?, NID2_FENCE_QUERY)?;
-        stream.send_query(NID2_FENCE_QUERY)?;
-        let target = await_fresh_task_create(context, &created_before)?;
-        context
-            .handle()
-            .kill_be(target)
-            .with_context(|| format!("kill admitted BE[{target}]"))?;
-        await_backend_exit(context, target)?;
-        assert_two_sleep_rows(&mut stream)?;
+        let selected = self.intent.take(1)?;
+        let mut session = creation_session(context)?;
+        let (pending, recovery_observation) = creation_arm(context, &session, &selected)?;
+        let cancel = pending.cancel_handle();
         let deadline = context.deadline();
-        let terminal = context
+        let mut pending = Some(pending);
+        let mut held: Option<HeldHttpResponse> = None;
+        let phase = (|| {
+            let uri = pending
+                .as_ref()
+                .context("recovery Pending missing")?
+                .initial_next_uri
+                .as_deref()
+                .context("recovery POST has no actual continuation")?;
+            let raw = RawTrinoClient::new(
+                context.trino_port(),
+                context.sql_user(),
+                deadline,
+                &context
+                    .scenario_root()
+                    .join("native-creation-unread-recovery"),
+            )?;
+            held = Some(raw.open_get(uri)?);
+            let original = held.as_mut().context("original first GET body missing")?;
+            ensure!(
+                original.status() == 200,
+                "recovery first GET returned HTTP {}",
+                original.status()
+            );
+            let unread = original.observe_held()?;
+            ensure!(
+                !unread.first_byte_observed
+                    && !unread.eof_observed
+                    && unread.read_bytes == 0
+                    && unread.read_calls == 0,
+                "recovery read consumed original body before backend fault: {unread:?}"
+            );
+            let target = await_fresh_task_create(context, &created_before)?;
+            context
+                .handle()
+                .kill_be(target)
+                .with_context(|| format!("kill admitted BE[{target}]"))?;
+            await_backend_exit(context, target)?;
+            let unread = held
+                .as_mut()
+                .context("original body owner missing after backend exit")?
+                .observe_held()?;
+            ensure!(
+                !unread.first_byte_observed
+                    && !unread.eof_observed
+                    && unread.read_bytes == 0
+                    && unread.read_calls == 0,
+                "recovery read became visible before actual backend exit: {unread:?}"
+            );
+            let joined = held
+                .take()
+                .context("original body owner already settled")?
+                .interrupt();
+            joined.require_clean()?;
+            ensure!(
+                joined.observation.read_bytes == 0 && !joined.observation.first_byte_observed,
+                "original recovery response was drained before actual Drop/Join: {joined:?}"
+            );
+            // Read the same token's replay only after the original unread body
+            // actually drops/joins. The shared client owns all continuation/data decoding.
+            let rows = creation_run_pending(
+                &mut session,
+                pending
+                    .take()
+                    .context("recovery Pending already consumed")?,
+                deadline,
+            )
+            .and_then(creation_sleep_rows)?;
+            ensure!(
+                rows == [true, true],
+                "recovered read expected two original SLEEP true values: {rows:?}"
+            );
+            let terminal = context
+                .handle()
+                .await_query_lifecycle_statement_observation(
+                    &recovery_observation,
+                    true,
+                    deadline,
+                )?;
+            ensure!(
+                terminal.attempt_id == 2,
+                "the read must complete on replacement attempt 2, got attempt {}",
+                terminal.attempt_id
+            );
+            Ok(target)
+        })();
+        let original_body = held
+            .take()
+            .map_or(Ok(()), |body| body.interrupt().require_clean());
+        let cancellation = if pending.is_some() {
+            cancel.delete(deadline).map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let drain = context
             .handle()
-            .await_query_lifecycle_statement_observation(&recovery_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&recovery_observation)?;
-        ensure!(
-            terminal.attempt_id == 2,
-            "the read must complete on replacement attempt 2, got attempt {}",
-            terminal.attempt_id
-        );
+            .drain_query_lifecycle_statement_binding(&recovery_observation, deadline);
+        let target = creation_merge(
+            phase,
+            creation_merge(original_body, creation_merge(cancellation, drain)),
+        )?;
         let recovered = FrontendCreationGauges::scrape(context)?;
         let recovered_static =
             recovered.static_fragments_frozen - frozen_before.static_fragments_frozen;
@@ -2669,5 +3021,23 @@ mod finite_sql_authorization_tests {
                 )))
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod trino_reader_settlement_tests {
+    use super::*;
+    #[test]
+    fn cleanup_failure_is_not_an_expected_sql_cancellation() {
+        let wire: TrinoError = serde_json::from_value(serde_json::json!({
+            "message":"original cancellation", "errorCode":3,
+            "errorName":"USER_CANCELED", "errorType":"USER_ERROR"
+        }))
+        .unwrap();
+        let response: Result<Result<Vec<bool>>> = Ok(Err(StatementFailure::Trino(wire).into()));
+        let outer = creation_response(response, Err(anyhow::anyhow!("actual reader Join failed")));
+        let failure = outer.unwrap_err();
+        assert_eq!(creation_sql_error(&failure).unwrap().error_code, 3);
+        assert!(format!("{failure:#}").contains("actual reader Join failed"));
     }
 }

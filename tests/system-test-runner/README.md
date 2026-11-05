@@ -119,34 +119,33 @@ remove the generated runtime directory.
 
 两个按需期限场景为 `result-delivery/producer-wait-query-deadline-separation`
 与 `result-delivery/original-query-deadline-cancels-producer-wait`。分别用正常
-MySQL session 的 `query_timeout=120` 和 `2` 执行 `SLEEP(35)`，验证独立预期
-Boolean true / 原 ERR 1317，再在同一 socket 执行 `SELECT 1`。每例独占
+Trino 语句会话的 `query_timeout=120` 和 `2` 执行 `SLEEP(35)`，验证独立预期
+Boolean true / `131075 / EXCEEDED_TIME_LIMIT / INSUFFICIENT_RESOURCES`，再由同一客户端
+执行独立 `SELECT 1`。每例独占
 native 1FE+3BE，使用 `--launch-profile performance --timeout-secs 300` 和独立
 artifact root；不构建数据 fixture，不参与默认基线。公开 root census、BE
-query owner 计数与双零 FE/BE barrier 分别证明实际排空；ERR、客户端关闭和
+query owner 计数与双零 FE/BE barrier 分别证明实际排空；typed 错误、客户端关闭和
 进程 shutdown 保留为不同事实。35 秒是旧期限错误的复现输入，不是性能门。
 
 `result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
-1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
-17825860 字节大行跨 MySQL U24 packet（17 个合法 1 MiB 字符串字段）。输入在
-`docs/testing/mem-1-m07/inputs/result-delivery-wire-boundary-v4.json` 冻结，客户端
-明确声明 frozen profile 的 64 MiB logical packet allowance，独立
-Python literal oracle 生成期待摘要。原始 actor 以 64 KiB scratch 流式校验
-packet sequence、列数、行数、length-encoded 字段及数据摘要，不积累整行。
+1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-native-segment` 验证一个
+含三个 1 MiB 字符串字段的合法 Trino 行跨 Native 段。独立 SQL、精确列声明、行数、
+固定宽度整数与长度前缀字符串的值摘要在 `result_delivery_trino_rows.rs` 声明；逐页检查
+原查询 ID、续页、值及摘要，计数命令不能冒充结果集。旧 U24 packet 输入保留为历史材料。
 每项还要求真实 BE Task 创建，并保留前后两次连续零值的 FE window/governance
-和 BE reservation/ingress 快照。这里只证明 wire 正确性与公开资源收敛；closing
-满池、精确 alias 退出、全部 W=2 容量矩阵和 transport 测量仍是独立验收。
+和 BE reservation/ingress 快照。这里只证明结果正确性与公开资源收敛；精确 alias 退出、
+全部 W=2 容量矩阵和 transport 测量仍是独立验收。
 
-`result-delivery/producer-exit-participation-retention` 在严格校验 metadata 后暂停
-客户端读行。客户端在 connect 前申请 4 KiB receive buffer，并记录 OS 实际值；
-不修改 server profile。一个合法 1 MiB 字符串形成 S+8 Native 行字节，要求
+`result-delivery/producer-exit-participation-retention` 在真实 Trino 查询下按独立 Installed
+身份持有原 Native 根响应。一个合法 1 MiB 字符串形成 S+8 Native 行字节，要求
 连续两次观测同一个仍由 context 持有的 root：两个 Data position、End 已发布、
-producer guard 已退出且 task 已为退休记录、最终 End 尚未 ACK。恢复后核对
-独立冻结 schema/packet/行字节摘要并等待公开 owner 收敛。输入为
-`inputs/root-context-retention-freeze-v1.json`。新增 BE ownership 指标只在
+producer guard 已退出且 task 已为退休记录、最终 End 尚未 ACK。准确释放后核对
+原 Trino 列声明、独立字符串长度/内容与 Native ACK，并等待原 actor/proxy 实际 Join
+及公开 owner 收敛。输入由 `result_delivery_inputs.rs` 声明。BE ownership 指标只在
 1024 个 context/root 扫描位置内作非阻塞 census；锁忙或覆盖不完整时明确
 不可用并省略 ownership family。它不包含移出 context 的固定 backing 或其它
-Arc 尾部，归零不证明 allocator dealloc，也不代替 ACK-only/ClosingRow 满池门。
+Arc 尾部，归零不证明 allocator dealloc。原 Worker encoded response 的持有与释放
+由显式 `result-delivery/held-response-late-ack` 单独保护，proxy 副本不替代该原件。
 
 `tools/ci/local-full-ci.sh` runs this registry as its own stable stage,
 between the server binary smoke and the SQL suites. The stage discovers
@@ -252,7 +251,7 @@ pass and transport supervisor composition tests, not by these scenarios.
 
 | 性质 | 原生selector | 输入/实际退出 |
 |---|---|---|
-| 慢读与完全不读客户端 | `result-delivery/slow-client-progress`、`result-delivery/unread-client-progress` | 正常MySQL、冻结行/字节预期，进展/取消与owner收敛分开 |
+| 慢读与完全不读客户端 | `result-delivery/slow-client-progress`、`result-delivery/unread-client-progress` | 真实 Trino body 慢读/不读与暂停 GET 分开，独立行/字节预期，进展/取消与 owner 收敛分开 |
 | 独立并发结果 | `result-delivery/concurrent-results-drain` | 有限actors，失败取消其他live peers、实际join，保留primary及cleanup错误 |
 | range/短查询 | `uea4/iceberg-range-functional`、`connector/iceberg-short-range-concurrent` | 多文件A4及独立4096行单文件manifest；准确行序/算术、LIMIT后退出、并发结果 |
 | 同provider排队进展 | `catalog/provider-read-queued-progress` | held真实Parquet读、同provider waiting，释放后两个查询正确并退出 |
@@ -264,7 +263,7 @@ range/planning输入准备与校验见保留的 [range fixture](../benchmarks/ue
 
 结果owner相关writer/buffer/ACK/取消/helper改动必跑对应场景；range/delete/planning/DOP由Connector/scan领域按provider/cache/range/admission/fixture改动必跑。高成本显式组每周由维护者手工相关领域轮次，记录缺输入与raw FAIL，不扩默认registry选择。周期调度与共享存储尚未交付；G7a/G7b已取消，不作为未来服务承诺。FE statement observation/auth保留，运行级计时collector退出；实际能力/profile见每次产物自报，未运行范围不能据接口存在宣称通过。
 
-常规 Rust 使用唯一 workspace/tests/bins/dev 主图和 nextest 逐测试进程；不再维护 normal/control 七包串行分图。实际开发 cfg 决定能力是否编入，准确有限授权继续逐角色生效。HMS/MySQL 专用 feature/fixture 仍显式选择，默认主图结果不代替其完整矩阵。维护命令及独立 doctest 见 [测试治理](../../docs/guides/development/test-governance.md#原生-rust-执行进程回收与原始结果)。
+常规 Rust 使用唯一 workspace/tests/bins/dev 主图和 nextest 逐测试进程；不再维护 normal/control 七包串行分图。实际开发 cfg 决定能力是否编入，准确有限授权继续逐角色生效。旧 MySQL exact/closing 与 HMS binding 专属 feature 已退出；保留保护的默认或 explicit 选择以原生声明为准，`held-response-late-ack` 等具名专项显式选择。依赖 HMS fixture 的功能测试只维护在 `iceberg-hms` suite，除非明确要求，否则不运行；外部 MySQL StateStore provider gate 与 fixture 保留。默认主图结果不代替专用输入的完整矩阵。维护命令及独立 doctest 见 [测试治理](../../docs/guides/development/test-governance.md#原生-rust-执行进程回收与原始结果)。
 
 MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。
 

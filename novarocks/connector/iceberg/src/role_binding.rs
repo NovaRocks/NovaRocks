@@ -56,8 +56,7 @@ use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
 #[derive(Clone)]
 pub struct IcebergControlRoleBindingFactory {
     resources: IcebergMetadataResources,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    hms_listing_slot: Option<crate::hms_listing_probe::HmsListingObservationSlot>,
+
     blocking_materialization_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -68,20 +67,11 @@ impl IcebergControlRoleBindingFactory {
     ) -> Self {
         Self {
             resources,
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_listing_slot: None,
+
             blocking_materialization_permits: Arc::new(tokio::sync::Semaphore::new(
                 max_blocking_materializations.get(),
             )),
         }
-    }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn with_hms_listing_observation_slot(
-        mut self,
-        slot: crate::hms_listing_probe::HmsListingObservationSlot,
-    ) -> Self {
-        self.hms_listing_slot = Some(slot);
-        self
     }
 }
 
@@ -139,12 +129,7 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
             .with_activity(activity.clone());
         let coordination = Arc::clone(&self.coordination);
         let identity = self.identity.clone();
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let probe = self
-            .factory
-            .hms_listing_slot
-            .as_ref()
-            .and_then(|slot| slot.active_probe());
+
         let permits = Arc::clone(&self.factory.blocking_materialization_permits);
         Box::pin(async move {
             let waiting = activity
@@ -177,14 +162,7 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
                 // The activity guard drops last, after the job's permit.
                 let _worker = worker;
                 let _permit = permit;
-                materialize_control_blocking(
-                    resources,
-                    coordination,
-                    properties,
-                    worker_context,
-                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                    probe,
-                )
+                materialize_control_blocking(resources, coordination, properties, worker_context)
             })
             .await
             .map_err(|error| {
@@ -205,9 +183,6 @@ fn materialize_control_blocking(
     coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
     properties: NormalizedCatalogProperties,
     context: MaterializationContext,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")] probe: Option<
-        Arc<crate::hms_listing_probe::HmsListingProbe>,
-    >,
 ) -> Result<ConnectorControlRoleBinding, ConnectorMaterializationError> {
     context.check_active()?;
     let catalog_properties = properties.as_catalog_properties().clone();
@@ -267,8 +242,7 @@ fn materialize_control_blocking(
     let control = control
         .with_catalog_properties(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    let observed_catalog = Arc::clone(runtime.novarocks_catalog());
+
     let document_storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
         control.descriptor().clone(),
         control.incarnation(),
@@ -339,26 +313,7 @@ fn materialize_control_blocking(
     let binding =
         ConnectorControlRoleBinding::try_new(properties, Arc::new(control), Some(read), write)
             .map_err(ConnectorMaterializationError::from)?;
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    if let Some(probe) = probe {
-        probe
-            .capture(
-                binding
-                    .control()
-                    .catalog_handle()
-                    .map_err(ConnectorMaterializationError::from)?,
-                binding.control().incarnation(),
-                observed_catalog.implementation_name(),
-                &observed_catalog.listing_admission(),
-            )
-            .map_err(|message| {
-                ConnectorMaterializationError::new(
-                    ConnectorMaterializationErrorClass::Internal,
-                    ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
-                    message,
-                )
-            })?;
-    }
+
     Ok(binding)
 }
 

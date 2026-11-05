@@ -23,7 +23,7 @@ NovaRocks is a Rust-native analytical query engine. Its production runtime is
 the native NovaRocks FE/BE role model; one binary starts a `fe`, `be`, or
 `all-in-one` role through the `standalone` command.
 
-- `fe` owns the MySQL SQL entrypoint, planning, and distributed coordination.
+- `fe` owns the Trino HTTP SQL entrypoint, planning, and distributed coordination.
 - `be` owns local fragment execution and the native gRPC boundary.
 - `all-in-one` is a test and local-development convenience. It keeps the FE/BE
   application boundary rather than adding a direct-call shortcut.
@@ -59,7 +59,7 @@ Implemented or actively exercised areas include:
 - Standalone SQL stack:
   - StarRocks-oriented SQL parsing and analysis
   - SQL planner/codegen into NovaRocks execution plans
-  - MySQL-compatible standalone server
+  - Trino HTTP statement entrypoint
   - SQL test runner integration
 - Catalog and connector work:
   - Iceberg catalogs: memory, Hadoop/filesystem, and REST
@@ -88,8 +88,8 @@ described in the [application domains guide](docs/guides/architecture/applicatio
 ### Native FE/BE Roles
 
 ```text
-SQL client / mysql CLI
-  `- MySQL-compatible protocol
+SQL client / Trino CLI
+  `- Trino HTTP protocol
        v
   NovaRocks role=fe
        v
@@ -142,7 +142,7 @@ Build artifacts:
 
 Deployable role configuration is explicit. Use the two templates as a pair:
 
-- `novarocks-fe.toml.example`: FE MySQL, coordinator-report gRPC, management
+- `novarocks-fe.toml.example`: FE Trino HTTP, coordinator-report gRPC, management
   HTTP, an explicit catalog source, and optional local Accelerator carrier.
 - `novarocks-catalogs.toml.example`: the immutable, explicit empty catalog
   snapshot paired with the static-file FE template.
@@ -176,7 +176,9 @@ role = "fe"
 mode = "dynamic-state-store"
 
 [standalone_server]
-mysql_port = 9030
+trino_port = 8080
+trino_client_timeout_ms = 300000
+trino_query_max_length = 1000000
 user = "root"
 
 [connector.object_store]
@@ -222,7 +224,7 @@ MAC. Omitting `[native_trust.transport]` deliberately selects authenticated
 plaintext h2c for a trusted network. Select `automatic` or `pem` to add the
 fixed TLS 1.3/h2 layer; JWT authentication remains mandatory in either TLS
 mode. See the [Native trust deployment guide](docs/guides/deployment/native-trust.md)
-for exact TLS configuration, rotation, and threat boundaries. MySQL and
+for exact TLS configuration, rotation, and threat boundaries. Trino client HTTP and
 management HTTP are outside this NWT-3 configuration surface.
 
 ## Run
@@ -252,13 +254,17 @@ cargo run -p novarocks-server -- standalone --role be --config ./novarocks-be.to
 cargo run -p novarocks-server -- standalone --role fe --config ./novarocks-fe.toml
 ```
 
-Connect with a MySQL client:
+Connect with the Trino CLI:
 
 ```bash
-mysql -h 127.0.0.1 -P 9030 -uroot
+trino --server http://127.0.0.1:8080 --user root
 ```
 
-The standalone server supports session context such as `USE <db>`,
+The HTTP listener binds to `127.0.0.1`; its configured port is reported as
+`NOVAROCKS_READY role=fe trino_port=<actual-port> pid=<pid>`.
+`trino_query_max_length` counts UTF-16 code units, defaults to 1,000,000,
+and accepts `0..=1000000000`. Retired MySQL listener configuration is rejected.
+The SQL dialect is unchanged. The server supports session context such as `USE <db>`,
 `SET catalog = <catalog>`, `SET query_timeout = N`, and
 `SET group_concat_max_len = N`.
 

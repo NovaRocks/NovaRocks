@@ -211,8 +211,17 @@ pub struct StatementResult {
     pub query_id: String,
     pub pages: usize,
     pub update_type: Option<String>,
+    pub update_count: Option<u64>,
 }
 impl StatementResult {
+    /// JDBC completion classification follows updateType, including commands
+    /// with the static rows bigint column. Column names never classify results.
+    pub fn is_completion(&self) -> bool {
+        self.update_type.is_some()
+    }
+    pub fn is_result_set(&self) -> bool {
+        !self.is_completion() && self.has_columns()
+    }
     pub fn has_columns(&self) -> bool {
         !self.columns.is_empty()
     }

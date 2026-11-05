@@ -1148,6 +1148,276 @@ fn invalid_match(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
 
+/// This observer is only a recipe constructor. Online IPC methods are explicit
+/// refusals because COW retains its independent bounded record grammar.
+struct CowRecipeObserver<'a> {
+    collector: &'a BoundedRowMutationMatchCollector,
+    author: Option<&'a ConnectorPayloadRetentionGuard>,
+    requested: usize,
+    receipts: Vec<ConnectorPayloadRetentionGuard>,
+    receipt_backing: Option<ConnectorPayloadRetentionGuard>,
+}
+impl novarocks_arrow_batch_codec::UnitObserver for CowRecipeObserver<'_> {
+    type Error = ConnectorError;
+    fn project_carrier(
+        &mut self,
+        _: usize,
+        _: &ArrayRef,
+        _: &arrow::datatypes::DataType,
+    ) -> Result<ArrayRef, Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot project an online carrier",
+        ))
+    }
+    fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
+        // The existing bounded CPU operation and collector control own this
+        // finite synchronous initialization; it grants no retained bytes.
+        self.checkpoint()
+    }
+    fn checkpoint(&mut self) -> Result<(), Self::Error> {
+        self.collector.check_control()
+    }
+    fn before_allocation(&mut self, layout: std::alloc::Layout) -> Result<(), Self::Error> {
+        self.checkpoint()?;
+        self.requested = self
+            .requested
+            .checked_add(layout.size())
+            .ok_or_else(cast_footprint::exhausted)?;
+        if self.requested as u128 > self.collector.max_bytes() as u128 {
+            return Err(cast_footprint::exhausted());
+        }
+        if layout.size() == 0 {
+            return Ok(());
+        }
+        if let Some(author) = self.author {
+            if self.receipts.len() == self.receipts.capacity() {
+                let next = self
+                    .receipts
+                    .capacity()
+                    .max(1)
+                    .checked_mul(2)
+                    .ok_or_else(cast_footprint::exhausted)?;
+                let backing = std::alloc::Layout::array::<ConnectorPayloadRetentionGuard>(next)
+                    .map_err(|_| cast_footprint::exhausted())?;
+                self.requested = self
+                    .requested
+                    .checked_add(backing.size())
+                    .ok_or_else(cast_footprint::exhausted)?;
+                if self.requested as u128 > self.collector.max_bytes() as u128 {
+                    return Err(cast_footprint::exhausted());
+                }
+                let next_receipt = author.reserve_owned_bytes(backing.size())?;
+                // The previous receipt stays live until actual reallocation
+                // has returned and released the old descriptor backing.
+                self.receipts
+                    .try_reserve_exact(next - self.receipts.len())
+                    .map_err(|_| cast_footprint::exhausted())?;
+                self.receipt_backing = Some(next_receipt);
+            }
+            self.receipts
+                .push(author.reserve_owned_bytes(layout.size())?);
+        } else {
+            #[cfg(not(test))]
+            return Err(invalid_match(
+                "COW recipe requires its original Root byte author",
+            ));
+        }
+        Ok(())
+    }
+    fn before_recipe(
+        &mut self,
+        fields: &[novarocks_arrow_batch_codec::RecipeField<'_>],
+    ) -> Result<(), Self::Error> {
+        self.checkpoint()?;
+        for _ in fields {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+    fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot verify an online IPC message",
+        ))
+    }
+    fn copy_body(&mut self, _: &[u8]) -> Result<arrow::buffer::Buffer, Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+    fn before_arrow_decode(
+        &mut self,
+        _: &arrow::datatypes::Schema,
+        _: arrow::ipc::RecordBatch<'_>,
+        _: &arrow::buffer::Buffer,
+        _: &std::collections::HashMap<i64, ArrayRef>,
+        _: novarocks_arrow_batch_codec::DecodeKind,
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+    fn before_unit_recipe(
+        &mut self,
+        _: &novarocks_arrow_batch_codec::BatchRecipe,
+        _: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot select an online representation",
+        ))
+    }
+    fn before_encode_batch(
+        &mut self,
+        _: &novarocks_arrow_batch_codec::BatchRecipe,
+        _: &RecordBatch,
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot encode an online IPC message",
+        ))
+    }
+    fn before_decode_message(
+        &mut self,
+        _: &arrow::datatypes::Schema,
+        _: arrow::ipc::RecordBatch<'_>,
+        _: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+}
+fn cow_recipe_failure(
+    error: novarocks_arrow_batch_codec::CodecError<ConnectorError>,
+) -> ConnectorError {
+    use novarocks_arrow_batch_codec::CodecError;
+    match error {
+        CodecError::Observer(error) => error,
+        CodecError::Metadata(source) => ConnectorError::from_domain(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_native_adapter::root_cow_selection_codec::CowRecipeConstructionFailure(
+                source,
+            ),
+        ),
+        CodecError::ValueType(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Layout(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, error)
+        }
+        CodecError::Carrier(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Construction(novarocks_type_contract::ControlResourceError::Control(error)) => {
+            ConnectorError::compile_interruption(error)
+        }
+        CodecError::Construction(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Allocation(error) => ConnectorError::from_domain(
+            ConnectorErrorKind::ResourceExhausted,
+            novarocks_functions::allocation_failure::AllocationRefusal::new(
+                "construct COW root recipe",
+                error,
+            ),
+        ),
+        CodecError::Arrow(source) => ConnectorError::from_domain(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_functions::array_projection::ArrayProjectionFailure::Arrow {
+                operation:
+                    novarocks_functions::array_projection::ArrayProjectionOperation::RebuildArray,
+                source,
+            },
+        ),
+        CodecError::Invalid(detail) => {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail)
+        }
+    }
+}
+
+impl RelayedCowSelectionCollector {
+    fn install_recipe(
+        &mut self,
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> Result<(), ConnectorError> {
+        use novarocks_arrow_batch_codec::{
+            BatchRecipe, RecipeField, RepresentationPolicy, UnitObserver,
+        };
+        use novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecipe;
+        let mut observer = CowRecipeObserver {
+            collector: &self.collector,
+            author: self.retention.as_ref(),
+            requested: 0,
+            receipts: Vec::new(),
+            receipt_backing: None,
+        };
+        observer.before_allocation(
+            std::alloc::Layout::array::<std::sync::Arc<arrow::datatypes::Field>>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let mut fields = Vec::with_capacity(output.len());
+        observer.before_allocation(
+            std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let mut declarations = Vec::with_capacity(output.len());
+        for field in output {
+            observer.checkpoint()?;
+            observer.before_allocation(
+                novarocks_type_contract::owned_resources::layout::arc_layout(
+                    std::alloc::Layout::new::<arrow::datatypes::Field>(),
+                )
+                .map_err(|_| cast_footprint::exhausted())?,
+            )?;
+            // Empty root names allocate nothing and are canonicalized to ordinal
+            // by BatchRecipe. Nested identities/NULL and logical types stay exact.
+            fields.push(Arc::new(arrow::datatypes::Field::new(
+                "",
+                field.data_type().clone(),
+                field.nullable(),
+            )));
+            declarations.push(field.value_type().clone());
+        }
+        observer.before_allocation(
+            std::alloc::Layout::array::<RecipeField<'_>>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let views = fields
+            .iter()
+            .zip(&declarations)
+            .map(|(field, value_type)| RecipeField {
+                field,
+                value_type,
+                representation: RepresentationPolicy::Exact,
+                nullability: novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+            })
+            .collect::<Vec<_>>();
+        let batch = BatchRecipe::try_new(&views, &mut observer).map_err(cow_recipe_failure)?;
+        drop(views);
+        drop(fields);
+        let recipe = CowSelectionRecipe::try_new(batch, declarations).map_err(cow_codec_error)?;
+        observer.before_allocation(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<CowSelectionRecipe>(),
+            )
+            .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        observer.before_allocation(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<(
+                    Vec<ConnectorPayloadRetentionGuard>,
+                    Option<ConnectorPayloadRetentionGuard>,
+                )>(),
+            )
+            .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let recipe = recipe.with_metadata_retention(ConnectorPayloadRetentionGuard::new((
+            observer.receipts,
+            observer.receipt_backing,
+        )));
+        self.decoder = Some(CowSelectionStreamDecoder::new(Arc::new(recipe)));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2572,7 +2842,7 @@ mod tests {
             // author before metadata-only projection by relayed_stream.
             let after = deep_array(case);
             let base = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
-            let columns = vec![
+            let columns = [
                 Arc::clone(base.column(0)),
                 Arc::clone(base.column(1)),
                 after,
@@ -2663,14 +2933,14 @@ mod tests {
         // Test-only pause in the real decoder's allocation callback. This
         // delegates every byte request to the SAME original Root author; the
         // gate grants no bytes, replaces no worker, and runs no codec itself.
+        type AllocationGateSignal = (
+            tokio::sync::oneshot::Sender<String>,
+            Option<mpsc::Receiver<()>>,
+        );
+
         struct BodyAllocationGate {
             original: ConnectorPayloadRetentionGuard,
-            first: Mutex<
-                Option<(
-                    tokio::sync::oneshot::Sender<String>,
-                    Option<mpsc::Receiver<()>>,
-                )>,
-            >,
+            first: Mutex<Option<AllocationGateSignal>>,
         }
         impl ConnectorPayloadByteBudget for BodyAllocationGate {
             fn reserve_bytes(
@@ -2986,275 +3256,5 @@ mod tests {
                 .await
                 .unwrap();
         }
-    }
-}
-
-/// This observer is only a recipe constructor. Online IPC methods are explicit
-/// refusals because COW retains its independent bounded record grammar.
-struct CowRecipeObserver<'a> {
-    collector: &'a BoundedRowMutationMatchCollector,
-    author: Option<&'a ConnectorPayloadRetentionGuard>,
-    requested: usize,
-    receipts: Vec<ConnectorPayloadRetentionGuard>,
-    receipt_backing: Option<ConnectorPayloadRetentionGuard>,
-}
-impl novarocks_arrow_batch_codec::UnitObserver for CowRecipeObserver<'_> {
-    type Error = ConnectorError;
-    fn project_carrier(
-        &mut self,
-        _: usize,
-        _: &ArrayRef,
-        _: &arrow::datatypes::DataType,
-    ) -> Result<ArrayRef, Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot project an online carrier",
-        ))
-    }
-    fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
-        // The existing bounded CPU operation and collector control own this
-        // finite synchronous initialization; it grants no retained bytes.
-        self.checkpoint()
-    }
-    fn checkpoint(&mut self) -> Result<(), Self::Error> {
-        self.collector.check_control()
-    }
-    fn before_allocation(&mut self, layout: std::alloc::Layout) -> Result<(), Self::Error> {
-        self.checkpoint()?;
-        self.requested = self
-            .requested
-            .checked_add(layout.size())
-            .ok_or_else(cast_footprint::exhausted)?;
-        if self.requested as u128 > self.collector.max_bytes() as u128 {
-            return Err(cast_footprint::exhausted());
-        }
-        if layout.size() == 0 {
-            return Ok(());
-        }
-        if let Some(author) = self.author {
-            if self.receipts.len() == self.receipts.capacity() {
-                let next = self
-                    .receipts
-                    .capacity()
-                    .max(1)
-                    .checked_mul(2)
-                    .ok_or_else(cast_footprint::exhausted)?;
-                let backing = std::alloc::Layout::array::<ConnectorPayloadRetentionGuard>(next)
-                    .map_err(|_| cast_footprint::exhausted())?;
-                self.requested = self
-                    .requested
-                    .checked_add(backing.size())
-                    .ok_or_else(cast_footprint::exhausted)?;
-                if self.requested as u128 > self.collector.max_bytes() as u128 {
-                    return Err(cast_footprint::exhausted());
-                }
-                let next_receipt = author.reserve_owned_bytes(backing.size())?;
-                // The previous receipt stays live until actual reallocation
-                // has returned and released the old descriptor backing.
-                self.receipts
-                    .try_reserve_exact(next - self.receipts.len())
-                    .map_err(|_| cast_footprint::exhausted())?;
-                self.receipt_backing = Some(next_receipt);
-            }
-            self.receipts
-                .push(author.reserve_owned_bytes(layout.size())?);
-        } else {
-            #[cfg(not(test))]
-            return Err(invalid_match(
-                "COW recipe requires its original Root byte author",
-            ));
-        }
-        Ok(())
-    }
-    fn before_recipe(
-        &mut self,
-        fields: &[novarocks_arrow_batch_codec::RecipeField<'_>],
-    ) -> Result<(), Self::Error> {
-        self.checkpoint()?;
-        for _ in fields {
-            self.checkpoint()?;
-        }
-        Ok(())
-    }
-    fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot verify an online IPC message",
-        ))
-    }
-    fn copy_body(&mut self, _: &[u8]) -> Result<arrow::buffer::Buffer, Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot decode an online IPC message",
-        ))
-    }
-    fn before_arrow_decode(
-        &mut self,
-        _: &arrow::datatypes::Schema,
-        _: arrow::ipc::RecordBatch<'_>,
-        _: &arrow::buffer::Buffer,
-        _: &std::collections::HashMap<i64, ArrayRef>,
-        _: novarocks_arrow_batch_codec::DecodeKind,
-    ) -> Result<(), Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot decode an online IPC message",
-        ))
-    }
-    fn before_unit_recipe(
-        &mut self,
-        _: &novarocks_arrow_batch_codec::BatchRecipe,
-        _: &[u8],
-    ) -> Result<(), Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot select an online representation",
-        ))
-    }
-    fn before_encode_batch(
-        &mut self,
-        _: &novarocks_arrow_batch_codec::BatchRecipe,
-        _: &RecordBatch,
-    ) -> Result<(), Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot encode an online IPC message",
-        ))
-    }
-    fn before_decode_message(
-        &mut self,
-        _: &arrow::datatypes::Schema,
-        _: arrow::ipc::RecordBatch<'_>,
-        _: &[u8],
-    ) -> Result<(), Self::Error> {
-        Err(invalid_match(
-            "COW recipe constructor cannot decode an online IPC message",
-        ))
-    }
-}
-fn cow_recipe_failure(
-    error: novarocks_arrow_batch_codec::CodecError<ConnectorError>,
-) -> ConnectorError {
-    use novarocks_arrow_batch_codec::CodecError;
-    match error {
-        CodecError::Observer(error) => error,
-        CodecError::Metadata(source) => ConnectorError::from_domain(
-            ConnectorErrorKind::InvalidRequest,
-            novarocks_native_adapter::root_cow_selection_codec::CowRecipeConstructionFailure(
-                source,
-            ),
-        ),
-        CodecError::ValueType(error) => {
-            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
-        }
-        CodecError::Layout(error) => {
-            ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, error)
-        }
-        CodecError::Carrier(error) => {
-            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
-        }
-        CodecError::Construction(novarocks_type_contract::ControlResourceError::Control(error)) => {
-            ConnectorError::compile_interruption(error)
-        }
-        CodecError::Construction(error) => {
-            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
-        }
-        CodecError::Allocation(error) => ConnectorError::from_domain(
-            ConnectorErrorKind::ResourceExhausted,
-            novarocks_functions::allocation_failure::AllocationRefusal::new(
-                "construct COW root recipe",
-                error,
-            ),
-        ),
-        CodecError::Arrow(source) => ConnectorError::from_domain(
-            ConnectorErrorKind::InvalidRequest,
-            novarocks_functions::array_projection::ArrayProjectionFailure::Arrow {
-                operation:
-                    novarocks_functions::array_projection::ArrayProjectionOperation::RebuildArray,
-                source,
-            },
-        ),
-        CodecError::Invalid(detail) => {
-            ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail)
-        }
-    }
-}
-
-impl RelayedCowSelectionCollector {
-    fn install_recipe(
-        &mut self,
-        output: &[novarocks_query_application::api::ResultField],
-    ) -> Result<(), ConnectorError> {
-        use novarocks_arrow_batch_codec::{
-            BatchRecipe, RecipeField, RepresentationPolicy, UnitObserver,
-        };
-        use novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecipe;
-        let mut observer = CowRecipeObserver {
-            collector: &self.collector,
-            author: self.retention.as_ref(),
-            requested: 0,
-            receipts: Vec::new(),
-            receipt_backing: None,
-        };
-        observer.before_allocation(
-            std::alloc::Layout::array::<std::sync::Arc<arrow::datatypes::Field>>(output.len())
-                .map_err(|_| cast_footprint::exhausted())?,
-        )?;
-        let mut fields = Vec::with_capacity(output.len());
-        observer.before_allocation(
-            std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(output.len())
-                .map_err(|_| cast_footprint::exhausted())?,
-        )?;
-        let mut declarations = Vec::with_capacity(output.len());
-        for field in output {
-            observer.checkpoint()?;
-            observer.before_allocation(
-                novarocks_type_contract::owned_resources::layout::arc_layout(
-                    std::alloc::Layout::new::<arrow::datatypes::Field>(),
-                )
-                .map_err(|_| cast_footprint::exhausted())?,
-            )?;
-            // Empty root names allocate nothing and are canonicalized to ordinal
-            // by BatchRecipe. Nested identities/NULL and logical types stay exact.
-            fields.push(Arc::new(arrow::datatypes::Field::new(
-                "",
-                field.data_type().clone(),
-                field.nullable(),
-            )));
-            declarations.push(field.value_type().clone());
-        }
-        observer.before_allocation(
-            std::alloc::Layout::array::<RecipeField<'_>>(output.len())
-                .map_err(|_| cast_footprint::exhausted())?,
-        )?;
-        let views = fields
-            .iter()
-            .zip(&declarations)
-            .map(|(field, value_type)| RecipeField {
-                field,
-                value_type,
-                representation: RepresentationPolicy::Exact,
-                nullability: novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
-            })
-            .collect::<Vec<_>>();
-        let batch = BatchRecipe::try_new(&views, &mut observer).map_err(cow_recipe_failure)?;
-        drop(views);
-        drop(fields);
-        let recipe = CowSelectionRecipe::try_new(batch, declarations).map_err(cow_codec_error)?;
-        observer.before_allocation(
-            novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<CowSelectionRecipe>(),
-            )
-            .map_err(|_| cast_footprint::exhausted())?,
-        )?;
-        observer.before_allocation(
-            novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<(
-                    Vec<ConnectorPayloadRetentionGuard>,
-                    Option<ConnectorPayloadRetentionGuard>,
-                )>(),
-            )
-            .map_err(|_| cast_footprint::exhausted())?,
-        )?;
-        let recipe = recipe.with_metadata_retention(ConnectorPayloadRetentionGuard::new((
-            observer.receipts,
-            observer.receipt_backing,
-        )));
-        self.decoder = Some(CowSelectionStreamDecoder::new(Arc::new(recipe)));
-        Ok(())
     }
 }

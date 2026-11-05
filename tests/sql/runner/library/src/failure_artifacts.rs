@@ -320,6 +320,10 @@ impl FailureArtifactRecorder {
                 "suite": suite, "case": case_id, "query": query,
                 "header": &execution.header, "rows": &execution.rows,
                 "complete":complete,"result_statements":&execution.result_statements,
+                // Preserve only identities already carried by client results.
+                // These neither identify Native Tasks nor infer a failed request.
+                "client_result_query_ids": execution.typed_results.iter()
+                    .map(|result| result.query_id.as_str()).collect::<Vec<_>>(),
             }))?,
         )?;
         pending.write_file("actual.txt", &execution.text_output)?;
@@ -1283,6 +1287,7 @@ mod tests {
                 query_id: "diagnostic-query".into(),
                 pages: 1,
                 update_type: None,
+                update_count: None,
             }],
             header: vec!["Name".into(), "Definition".into(), "Manageability".into()],
             rows: vec![vec!["a_mv".into(), definition.clone(), "MANAGEABLE".into()]],
@@ -1311,6 +1316,11 @@ mod tests {
         );
         let actual: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path.join("actual.json")).unwrap()).unwrap();
+        assert_eq!(
+            actual["client_result_query_ids"],
+            serde_json::json!(["diagnostic-query"])
+        );
+        assert_eq!(actual["query"], 3);
         assert_eq!(actual["header"][2], "Manageability");
         assert_eq!(actual["rows"][0][1], definition);
         assert_eq!(actual["rows"][0][2], "MANAGEABLE");
@@ -1431,6 +1441,7 @@ mod tests {
         );
         let retained: serde_json::Value =
             serde_json::from_slice(&fs::read(path.join("actual.json")).unwrap()).unwrap();
+        assert_eq!(retained["client_result_query_ids"], serde_json::json!([]));
         assert_eq!(retained["rows"][0][0], "42");
         assert_eq!(
             fs::read_to_string(path.join("actual.txt")).unwrap(),

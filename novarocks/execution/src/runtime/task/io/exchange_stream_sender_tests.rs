@@ -37,9 +37,16 @@ impl Call {
         drop(self.activity);
     }
 }
+struct ControlCall {
+    entries: Vec<ExchangeDemandEntry>,
+    activity: ExchangeCallActivity,
+    done: ExchangeDemandCallback,
+}
 #[derive(Default)]
 struct Scripted {
     grant: AtomicBool,
+    hold_controls: AtomicBool,
+    control_calls: Mutex<VecDeque<ControlCall>>,
     calls: Mutex<VecDeque<Call>>,
     demands: Mutex<Vec<ExchangeDemandEntry>>,
     watches: Mutex<HashMap<ExchangeStreamIdentity, ExchangeGrantWake>>,
@@ -124,9 +131,18 @@ impl ExchangeFrameTransmitter for Scripted {
         _destination: RuntimeEndpoint,
         entries: Vec<ExchangeDemandEntry>,
         _stop: CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: ExchangeDemandCallback,
     ) {
         self.demands.lock().unwrap().extend(entries.iter().copied());
+        if self.hold_controls.load(Ordering::Acquire) {
+            self.control_calls.lock().unwrap().push_back(ControlCall {
+                entries,
+                activity,
+                done,
+            });
+            return;
+        }
         if entries
             .iter()
             .all(|entry| entry.operation == ExchangeDemandOperation::StopSender)
@@ -809,6 +825,77 @@ fn authoritative_route_retirement_ends_stop_retries_without_forging_confirmation
 }
 
 #[test]
+fn exact_lifecycle_retirement_reply_ends_stop_debt_but_keeps_actual_data_activity() {
+    let transport = Scripted::granting();
+    let budget = scheduler(16);
+    let sender = sender(
+        transport.clone(),
+        budget.clone(),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    publish(&sender, b"one", false);
+    let call = transport.take();
+    transport
+        .stop_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown("paused route".into()));
+    sender.stop();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::Pending
+    );
+    transport
+        .stop_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::RouteRetired(
+            sender.config.stream,
+        ));
+    transport.retry();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::RouteRetired
+    );
+    assert_eq!(sender.snapshot().active_calls, 1);
+    assert_eq!(budget.snapshot().bytes, 3);
+    drop(call);
+    assert_eq!(sender.snapshot().active_calls, 0);
+    assert_eq!(budget.snapshot().bytes, 0);
+    assert!(transport.retries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn foreign_lifecycle_retirement_reply_is_refused_for_the_original_stream() {
+    let transport = Scripted::granting();
+    let sender = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    publish(&sender, b"one", false);
+    transport.take().complete(0, 1);
+    transport
+        .stop_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::RouteRetired(stream_in_query(
+            2, 1,
+        )));
+    sender.stop();
+    assert!(matches!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::Refused(_)
+    ));
+    assert!(matches!(
+        sender.snapshot().status,
+        ExchangeStreamSenderStatus::Failed(_)
+    ));
+}
+
+#[test]
 fn exact_consumed_proof_covers_its_end_even_with_an_older_custody_snapshot() {
     let transport = Scripted::granting();
     let sender = sender(
@@ -1475,4 +1562,57 @@ fn unknown_demand_contact_requires_stop_even_after_all_local_activity_is_idle() 
     );
     assert!(transport.retries.lock().unwrap().is_empty());
     assert_eq!(transport.queued(), 0);
+}
+
+#[test]
+fn control_callback_and_route_retirement_preserve_the_actual_request_captures() {
+    let transport = Scripted::granting();
+    transport.hold_controls.store(true, Ordering::Release);
+    let scheduler = scheduler(16);
+    let sender = sender(
+        transport.clone(),
+        scheduler.clone(),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    publish(&sender, b"one", false);
+    let demand = transport.control_calls.lock().unwrap().pop_front().unwrap();
+    assert!(matches!(
+        demand.entries[0].operation,
+        ExchangeDemandOperation::Register(_)
+    ));
+    assert_eq!(sender.snapshot().active_control_calls, 1);
+    assert_eq!(sender.snapshot().active_calls, 0);
+    (demand.done)(ExchangeDemandCallOutcome::Unknown(
+        "original demand reply lost".into(),
+    ));
+    assert!(!sender.try_diagnostic_snapshot().unwrap().demand_active);
+    assert_eq!(sender.snapshot().active_control_calls, 1);
+    sender.stop();
+    let stop = transport.control_calls.lock().unwrap().pop_front().unwrap();
+    assert_eq!(
+        stop.entries[0].operation,
+        ExchangeDemandOperation::StopSender
+    );
+    (stop.done)(ExchangeDemandCallOutcome::Unknown(
+        "original stop reply lost".into(),
+    ));
+    assert!(!sender.try_diagnostic_snapshot().unwrap().stop_active);
+    assert_eq!(sender.snapshot().active_control_calls, 2);
+    sender.retire_after_route_retirement();
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::RouteRetired
+    );
+    assert_eq!(sender.snapshot().active_control_calls, 2);
+    assert_eq!(scheduler.snapshot().calls, 0);
+    assert_eq!(scheduler.snapshot().bytes, 0);
+    drop(demand.activity);
+    assert_eq!(sender.snapshot().active_control_calls, 1);
+    drop(stop.activity);
+    assert_eq!(sender.snapshot().active_control_calls, 0);
+    assert_eq!(
+        sender.snapshot().stop_obligation,
+        ExchangeSenderStopState::RouteRetired
+    );
 }

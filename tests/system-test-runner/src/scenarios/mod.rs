@@ -6,10 +6,6 @@ mod catalog_state;
 mod connector;
 mod declarations;
 mod distributed_writer;
-#[cfg(unix)]
-pub(crate) mod exact_mysql_native_driver;
-#[cfg(unix)]
-pub(crate) mod exact_mysql_native_oracle;
 mod exchange_flow;
 mod exchange_normal_close;
 mod execution_failure;
@@ -18,9 +14,6 @@ mod execution_failure_prepared;
 mod execution_failure_representation;
 mod execution_failure_streaming;
 mod frontend_lifecycle;
-#[cfg(unix)]
-pub(crate) mod hms_bulk_readonly_native;
-pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
 mod iceberg_delete_warm;
@@ -49,15 +42,24 @@ mod provider_mysql_actors;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
+mod query_tool;
 mod result_delivery;
 mod result_delivery_closing;
 mod result_delivery_concurrency;
 mod result_delivery_deadline;
+#[cfg(unix)]
+mod result_delivery_held_late_ack;
+mod result_delivery_inputs;
 mod result_delivery_progress;
 mod result_delivery_root_protocol;
 mod result_delivery_root_reply;
 mod result_delivery_support;
+mod result_delivery_trino_protocol;
+mod result_delivery_trino_retention;
+mod result_delivery_trino_rows;
 mod runtime_filter;
+mod sql_client;
+mod sql_client_ctas;
 mod state_family;
 mod table_maintenance;
 mod task_evidence;
@@ -85,6 +87,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(result_delivery_deadline::scenarios());
     scenarios.extend(result_delivery::scenarios());
     scenarios.extend(result_delivery_root_reply::scenarios());
+    #[cfg(unix)]
+    scenarios.extend(result_delivery_held_late_ack::scenarios());
     scenarios.extend(result_delivery_closing::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
@@ -125,6 +129,9 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(table_maintenance::scenarios());
     scenarios.extend(trino_interop::scenarios());
     scenarios.extend(trino_protocol::scenarios());
+    scenarios.push(Box::new(sql_client::SharedSqlClient::default()));
+    scenarios.push(Box::new(sql_client_ctas::SharedCtasCount::default()));
+    scenarios.push(Box::new(query_tool::QueryTool));
     scenarios
 }
 

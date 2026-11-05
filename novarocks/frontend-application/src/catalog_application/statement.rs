@@ -26,7 +26,9 @@ use std::sync::Arc;
 use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
 use bytes::Bytes;
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+use novarocks_query_application::{
+    api::CommandError, protocol_delivery::QuerySessionOutput as StatementResult,
+};
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
@@ -113,7 +115,7 @@ pub(crate) fn execute_create_table_statement(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     match stmt.kind {
         CatalogCreateTableKind::Iceberg {
             columns,
@@ -141,7 +143,7 @@ pub(crate) fn execute_create_table_statement(
                     return Err(format!(
                         "BITMAP/HLL columns cannot be used as distribution key (column `{}` has type {:?})",
                         column.name, column.data_type
-                    ));
+                    ).into());
                 }
             }
             let target = crate::catalog_application::resolver::resolve_table_target(
@@ -152,7 +154,7 @@ pub(crate) fn execute_create_table_statement(
             )?;
             let instance_id = mutation_instance_id(&target.catalog)?;
             let _ = bucket_count;
-            crate::connector::mutation::execute_catalog_mutation(
+            crate::connector::mutation::execute_catalog_mutation_for_command(
                 context.connector_control(),
                 &instance_id,
                 ConnectorCatalogMutationOperation::CreateTable {

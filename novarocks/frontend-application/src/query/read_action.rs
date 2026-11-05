@@ -74,7 +74,7 @@ pub(super) async fn prepare_read(
         let topology =
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
-        let presentation = *input.state.presentation();
+        let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
@@ -826,6 +826,15 @@ impl FrontendQuerySession {
         statement: GovernedQueryStatementOwner,
         purpose: FrontendQueryPurpose,
     ) -> Result<StatementResult, QueryServiceError> {
+        let family = match state.presentation().copied() {
+            Some(family) => family,
+            None => {
+                return Ok(self.governed_typed_error(
+                    internal_error("Read client result requires an explicit presentation"),
+                    statement,
+                ));
+            }
+        };
         let window = statement
             .result_window_alias()
             .ok_or_else(|| internal_error("Read has no original result window"))?;
@@ -866,8 +875,12 @@ impl FrontendQuerySession {
         let io = ReadMetadataIoSource::new(statement.scope().clone(), local.clone());
         // This same host-local preparation remains a Source through encoding.
         // Exact selected Provider/service facts are added before their effects.
-        io.configure_read_source(&local)
-            .map_err(|error| internal_error(error.to_string()))?;
+        io.configure_read_source(&local).map_err(|error| {
+            QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            )
+            .reconcile_local_stop_observation(&cancellation)
+        })?;
         let stage = StatementStageAdmission::new(statement.scope().clone(), 0);
         let stage = if window.class() == novarocks_workload_control::ResultWindowClass::Client {
             stage
@@ -884,7 +897,6 @@ impl FrontendQuerySession {
             .statement_observation
             .as_ref()
             .and_then(|o| o.bound_statement(statement.token()));
-        let family = *state.presentation();
         let input = ReadPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -1086,6 +1098,55 @@ mod tests {
         drop((request, source));
         finish(control, root, driver);
     }
+    #[test]
+    fn read_source_configuration_retains_cancellation_before_and_after_install() {
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_workload_control::CancellationReason;
+
+        for installed in [false, true] {
+            let (control, driver, _) = fixture();
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = root.owner.scope();
+            let cancellation =
+                QueryCancellationView::governed(scope.cancellation().unwrap(), Some(5_000));
+            let profile = local_preparation_profile().unwrap();
+            let source = ReadMetadataIoSource::new(scope, profile.clone());
+            if installed {
+                source.configure_read_source(&profile).unwrap();
+            }
+            root.owner.cancel(CancellationReason::DeadlineExceeded);
+            let error = source.configure_read_source(&profile).unwrap_err();
+            assert_eq!(
+                error.failure_fact().evidence(),
+                FailureEvidence::StopObservation
+            );
+            assert!(
+                std::iter::successors(Some(&error as &dyn std::error::Error), |error| error
+                    .source())
+                .any(|error| matches!(
+                    error.downcast_ref::<WorkError>(),
+                    Some(WorkError::Cancelled(CancellationReason::DeadlineExceeded))
+                ))
+            );
+            let service = QueryServiceError::from_failure_cause(SharedFailureCause::new(error))
+                .reconcile_local_stop_observation(&cancellation);
+            assert_eq!(
+                service.execution_failure(),
+                Some(
+                    &novarocks_query_application::session_outcome::cancellation_failure_input(
+                        cancellation.reason().unwrap(),
+                    )
+                ),
+            );
+            assert!(service.failure_cause().is_some());
+            drop((service, source, cancellation));
+            finish(control, root, driver);
+        }
+    }
+
     #[test]
     fn cancelled_read_bootstrap_withdraws_original_without_manufacturing_health() {
         let (control, driver, _) = fixture();

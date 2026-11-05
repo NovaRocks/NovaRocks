@@ -16,19 +16,19 @@
 // under the License.
 use super::*;
 use arrow::datatypes::{Field, Schema};
-use novarocks_result_contract::RenderColumn;
+use novarocks_result_contract::{RenderColumn, RenderPresentation as P};
 fn make(value: String, with_float: bool) -> ArrowClientRowEncoder {
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![value.as_str()]))];
     let mut fields = vec![RenderField {
         native_type: N::String,
-        presentation: P::ScalarText,
+        presentation: P::TrinoValue,
         nullable: false,
     }];
     if with_float {
         arrays.push(Arc::new(Float64Array::from(vec![1.25])));
         fields.push(RenderField {
             native_type: N::Float64,
-            presentation: P::ScalarText,
+            presentation: P::TrinoValue,
             nullable: false,
         });
     }
@@ -55,7 +55,7 @@ fn make(value: String, with_float: bool) -> ArrowClientRowEncoder {
     ArrowClientRowEncoder::try_new(
         Arc::new(
             ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default()),
                 cols,
                 batch.num_columns(),
             )
@@ -67,7 +67,7 @@ fn make(value: String, with_float: bool) -> ArrowClientRowEncoder {
 }
 #[test]
 fn exact_threshold_path_and_float_once() {
-    for (n, large) in [(65532, false), (65533, false), (65534, true)] {
+    for (n, large) in [(65531, false), (65532, false), (65533, true)] {
         let mut e = make("x".repeat(n), false);
         let mut out = [0; 65536];
         let mut counted = false;
@@ -99,7 +99,7 @@ fn u32_prefix_not_published_on_exhausted_cell_budget() {
     }
     e.reset_row(Phase::Emit);
     e.row_length = 65538;
-    e.lengths[0] = 65534;
+    e.lengths[0] = 65537;
     let mut budget = Budget::new();
     budget.cells = V::CELLS_PER_TURN;
     assert!(!e.start_cell(&mut budget).unwrap());
@@ -107,7 +107,7 @@ fn u32_prefix_not_published_on_exhausted_cell_budget() {
     assert!(!e.cell_started);
     let t = e.step(&mut out[..5]).unwrap();
     assert_eq!(t.emitted_bytes, 5);
-    assert_eq!(out[4], 0xfc);
+    assert_eq!(out[4], b'[');
 }
 
 #[test]
@@ -141,14 +141,14 @@ fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
     )
     .unwrap();
     let schema = ClientRenderSchema::try_new(
-        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default()),
         vec![RenderColumn {
             source_ordinal: 0,
             source_slot: None,
             name: name.into(),
             field: RenderField {
                 native_type,
-                presentation: P::ScalarText,
+                presentation: P::TrinoValue,
                 nullable: false,
             },
         }],
@@ -169,15 +169,6 @@ fn single_cell_body(array: ArrayRef, native_type: N, name: &str) -> Vec<u8> {
 }
 
 #[test]
-fn date32_zero_sentinel_uses_mysql_zero_date_in_the_production_encoder() {
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-    let sentinel = chrono::NaiveDate::from_ymd_opt(-1, 11, 30).unwrap();
-    let days = sentinel.signed_duration_since(epoch).num_days() as i32;
-    let body = single_cell_body(Arc::new(Date32Array::from(vec![days])), N::Date, "d");
-    assert_eq!(body, b"\x0b\0\0\0\x0a0000-00-00");
-}
-
-#[test]
 fn plain_binary_names_do_not_infer_opaque_domains() {
     for name in ["hll", "bitmap", "object", "percentile"] {
         let body = single_cell_body(
@@ -185,9 +176,8 @@ fn plain_binary_names_do_not_infer_opaque_domains() {
             N::Binary,
             name,
         );
-        let mut expected = 15u32.to_le_bytes().to_vec();
-        expected.push(14);
-        expected.extend_from_slice(b"external state");
+        let mut expected = 24u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(br#"["ZXh0ZXJuYWwgc3RhdGU="]"#);
         assert_eq!(body, expected);
     }
 }
@@ -248,14 +238,14 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
         novarocks_result_contract::RootProfileId::V1,
         FrozenRootOutput::ClientRows(
             ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default()),
                 vec![RenderColumn {
                     source_ordinal: 0,
                     source_slot: Some(7),
                     name: "published_name".into(),
                     field: RenderField {
                         native_type: N::Json,
-                        presentation: P::JsonText,
+                        presentation: P::TrinoValue,
                         nullable: false,
                     },
                 }],
@@ -293,7 +283,7 @@ fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schem
             break;
         }
     }
-    assert_eq!(emitted, [3, 0, 0, 0, 2, b'{', b'}']);
+    assert_eq!(emitted, b"\x06\0\0\0[\"{}\"]");
     assert_eq!(released.load(Ordering::SeqCst), 0);
     drop(encoder);
     assert_eq!(released.load(Ordering::SeqCst), 1);

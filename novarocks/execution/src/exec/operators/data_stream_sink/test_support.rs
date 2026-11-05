@@ -276,6 +276,7 @@ impl ExchangeFrameTransmitter for UnitTransport {
         _destination: RuntimeEndpoint,
         entries: Vec<ExchangeDemandEntry>,
         _stop: CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: ExchangeDemandCallback,
     ) {
         let facts = {
@@ -299,6 +300,7 @@ impl ExchangeFrameTransmitter for UnitTransport {
                 .collect()
         };
         done(ExchangeDemandCallOutcome::Observed(facts));
+        drop(activity);
     }
     fn watch_unit_facts(
         &self,
@@ -351,10 +353,11 @@ impl ExchangeFrameTransmitter for BlockingEosTransmitter {
         destination: RuntimeEndpoint,
         entries: Vec<ExchangeDemandEntry>,
         stop: CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: ExchangeDemandCallback,
     ) {
         self.transport
-            .register_unit_demands(destination, entries, stop, done);
+            .register_unit_demands(destination, entries, stop, activity, done);
     }
     fn watch_unit_facts(
         &self,

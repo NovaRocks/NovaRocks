@@ -16,6 +16,7 @@
 // under the License.
 
 // Pure predicates and typed submitted-request checks, not Native acceptance.
+use super::super::result_delivery_inputs::RetentionShape;
 use super::*;
 use sha2::{Digest, Sha256};
 #[test]
@@ -177,24 +178,13 @@ fn actual_request_encodes_full_identity_nonzero_wait_and_proven_ack_only_frontie
     }
 }
 #[test]
-fn row_and_data1_oracles_are_independent_literals_and_original_bounds_remain_fixed() {
-    let mut row = Sha256::new();
-    row.update([0xfd, 0, 0, 0x10]);
-    let scratch = [b'x'; 4096];
-    for _ in 0..256 {
-        row.update(scratch);
-    }
-    row.update((S + 4).to_le_bytes());
-    assert_eq!(format!("{:x}", row.finalize()), ROW_SHA);
-    let mut data = Sha256::new();
-    data.update([4, 0, 0x10, 0, 0xfd, 0, 0, 0x10]);
-    for _ in 0..255 {
-        data.update(scratch);
-    }
-    data.update(&scratch[..4088]);
+fn independent_trino_data1_literal_and_original_clocks_remain_fixed() {
+    let [first, tail] = RetentionShape::Normal.independent_segments().unwrap();
+    assert_eq!(first.len(), S as usize);
+    assert_eq!(tail, [b'x', b'x', b'x', b'x', b'x', b'x', b'"', b']']);
     assert_eq!(
-        format!("{:x}", data.finalize()),
-        "e1778a1a63f0deff423d34c267bbc2be60c018adde82cf23dfcc9926582d0b42"
+        format!("{:x}", Sha256::digest(first)),
+        "708e2b855b167d324638a01359fd1be6106151a152ce41ad56dcb15811e93b0c"
     );
     assert_eq!(
         (WHOLE.as_millis(), PROTOCOL.as_millis(), SAMPLES),
@@ -202,29 +192,36 @@ fn row_and_data1_oracles_are_independent_literals_and_original_bounds_remain_fix
     );
 }
 #[test]
-fn original_1317_is_structural_and_unknown_io_or_zero_rows_never_health_pass() {
-    let mut result = OwnedTextResultObservation {
-        observation: TextResultObservation::default(),
-        actual_failure: Some(anyhow::anyhow!("actual IO")),
-        server_result_error_code: None,
+fn cancellation_requires_the_actual_typed_trino_error() {
+    let error = |code, name, kind| {
+        serde_json::from_str::<TrinoError>(&json!({"message":"actual test error","errorCode":code,"errorName":name,"errorType":kind}).to_string()).unwrap()
     };
-    result.observation.columns = 1;
-    result.observation.rows = 1;
-    result.observation.packets = 5;
-    result
-        .observation
-        .schema
-        .push(crate::actors::mysql_stream::TextColumnObservation {
-            name: "payload".into(),
-            mysql_type: 253,
-        });
-    result.observation.row_payload_bytes = S + 4;
-    result.observation.row_sha256 = ROW_SHA.into();
-    result.observation.error = Some("finite class".into());
-    assert!(validate_mysql(&result, false).is_err());
-    result.server_result_error_code = Some(1317);
-    assert!(validate_mysql(&result, false).is_ok());
-    result.observation.rows = 0;
-    assert!(validate_mysql(&result, false).is_err());
-    assert!(validate_mysql(&result, true).is_err());
+    validate_public_terminal(&error(3, "USER_CANCELED", "USER_ERROR")).unwrap();
+    for (code, name, kind) in [
+        (0, "GENERIC_USER_ERROR", "USER_ERROR"),
+        (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
+        (3, "USER_CANCELED", "INTERNAL_ERROR"),
+    ] {
+        assert!(validate_public_terminal(&error(code, name, kind)).is_err());
+    }
+}
+
+#[test]
+fn failure_evidence_reads_owned_context_without_invoking_an_unknown_error_formatter() {
+    #[derive(Debug)]
+    struct NeverFormat;
+    impl std::fmt::Display for NeverFormat {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("raw source Display must not be invoked");
+        }
+    }
+    impl std::error::Error for NeverFormat {}
+    let original = anyhow::Error::new(NeverFormat);
+    assert_eq!(error_fact(&original)["class"], "OtherActualSourceRetained");
+    let missing = None::<()>
+        .context("required original observer field missing")
+        .unwrap_err();
+    let fact = error_fact(&missing);
+    assert_eq!(fact["class"], "StaticContext");
+    assert_eq!(fact["context"], "required original observer field missing");
 }

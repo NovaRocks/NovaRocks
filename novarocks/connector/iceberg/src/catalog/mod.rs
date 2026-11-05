@@ -63,8 +63,7 @@ pub(crate) mod error;
 pub(crate) mod factory;
 pub(crate) mod hadoop;
 pub(crate) mod hive;
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-pub(crate) mod hms_listing_observer;
+
 pub(crate) mod listing_admission;
 pub(crate) mod metadata_read;
 #[cfg(test)]
@@ -777,7 +776,3 @@ pub(super) fn views_unsupported(operation: &str) -> ConnectorError {
 }
 
 pub(crate) mod transaction;
-
-#[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-#[path = "../hms_listing_probe_tests.rs"]
-mod hms_listing_probe_tests;

@@ -20,7 +20,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::cancellation::QueryCancellationReason;
-use crate::client_connection::ClientConnectionToken;
 use crate::protocol_delivery::QuerySessionOutput;
 use crate::session_control::ClientQueryId;
 use crate::session_effects::SessionEffects;
@@ -92,28 +91,82 @@ impl QuerySessionStatement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuerySessionOpenRequest {
-    connection: ClientConnectionToken,
-    principal: Arc<str>,
+/// Static output admitted by the parser owner. CALL remains unresolved until
+/// its application route selects the actual row or command carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatementOutputShape {
+    ResultSet,
+    Empty,
+    Rows,
+    UndeterminedCall,
 }
-
-impl QuerySessionOpenRequest {
-    pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
-        Self {
-            connection,
-            principal: principal.into(),
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatementAdmission {
+    pub kind: StatementKind,
+    pub shape: StatementOutputShape,
+}
+// Design: ADR-0213 (docs/adr/ADR-0213-sole-trino-entry-and-application-owned-completion.md)
+impl StatementAdmission {
+    pub fn from_statement(statement: &novarocks_parser::ast::Statement) -> Self {
+        use novarocks_parser::ast::{DmlStatement, Statement};
+        let kind = StatementKind::from_statement(statement);
+        let shape = if matches!(
+            statement,
+            Statement::Dml(DmlStatement::CreateTableAsSelect(_))
+        ) || matches!(
+            kind,
+            StatementKind::Insert
+                | StatementKind::Delete
+                | StatementKind::Update
+                | StatementKind::Merge
+                | StatementKind::RefreshMaterializedView
+                | StatementKind::Analyze
+        ) {
+            StatementOutputShape::Rows
+        } else if kind.is_row_kind()
+            || matches!(
+                statement,
+                Statement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(alter))
+                    if matches!(&alter.action, novarocks_parser::ast::IcebergTableAction::AddFiles(_))
+            )
+        {
+            // ADD FILES already returns the original domain status result set.
+            // It is not a counted command and must not discard those rows.
+            StatementOutputShape::ResultSet
+        } else if kind == StatementKind::Call {
+            StatementOutputShape::UndeterminedCall
+        } else {
+            StatementOutputShape::Empty
+        };
+        Self { kind, shape }
     }
-
-    pub const fn connection_id(&self) -> u32 {
-        self.connection.connection_id()
+}
+/// One original statement retains its immutable admission fact. Observation
+/// grants neither execution nor access to the statement owner.
+#[derive(Clone)]
+pub struct StatementAdmissionPublisher(tokio::sync::watch::Sender<Option<StatementAdmission>>);
+impl Default for StatementAdmissionPublisher {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(None).0)
     }
-    pub const fn connection_token(&self) -> ClientConnectionToken {
-        self.connection
+}
+impl StatementAdmissionPublisher {
+    pub fn publish(&self, admission: StatementAdmission) {
+        self.0.send_if_modified(|slot| {
+            if let Some(original) = slot {
+                assert_eq!(*original, admission, "one original statement admission");
+                false
+            } else {
+                *slot = Some(admission);
+                true
+            }
+        });
     }
-    pub fn principal(&self) -> &str {
-        &self.principal
+    pub fn current(&self) -> Option<StatementAdmission> {
+        *self.0.borrow()
+    }
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<StatementAdmission>> {
+        self.0.subscribe()
     }
 }
 
@@ -122,6 +175,7 @@ pub struct StatementSessionRequest {
     client_query_id: ClientQueryId,
     principal: Arc<str>,
     session: SessionValue,
+    admission: StatementAdmissionPublisher,
 }
 impl StatementSessionRequest {
     pub fn new(
@@ -133,7 +187,11 @@ impl StatementSessionRequest {
             client_query_id,
             principal: principal.into(),
             session,
+            admission: StatementAdmissionPublisher::default(),
         }
+    }
+    pub fn admission(&self) -> StatementAdmissionPublisher {
+        self.admission.clone()
     }
     pub fn into_parts(self) -> (ClientQueryId, Arc<str>, SessionValue) {
         (self.client_query_id, self.principal, self.session)
@@ -143,31 +201,12 @@ impl StatementSessionRequest {
 /// Application-owned client session consumed by a protocol adapter.
 #[async_trait]
 pub trait QuerySession: Send + Sync + 'static {
-    /// Observe the original lease only for its exact connection incarnation.
-    #[cfg(novarocks_dev_controls)]
-    fn connection_session(
-        &self,
-        connection: ClientConnectionToken,
-    ) -> Option<crate::session_control::SessionToken>;
-
-    /// Handles a COM_INIT_DB request. Like COM_QUERY, the result retains its
-    /// governed statement owner until the protocol adapter has written the
-    /// terminal packet.
-    async fn init_database(&self, schema: &str)
-    -> Result<QuerySessionStatement, QueryServiceError>;
-
-    /// Executes one protocol-framed SQL fragment. Query Application validates
-    /// it as exactly one statement; protocol adapters use this for negotiated
-    /// multi-statement requests so statement ordering remains application
-    /// owned.
+    /// Execute the one statement admitted with this original client session.
+    /// Query Application owns framing, admission and the terminal lifecycle.
     async fn execute_statement(
         &self,
         sql: &str,
     ) -> Result<QuerySessionStatement, QueryServiceError>;
-
-    /// Executes an unnegotiated COM_QUERY request. Implementations must reject
-    /// more than one executable SQL statement.
-    async fn execute_batch(&self, sql: &str) -> Result<QuerySessionStatement, QueryServiceError>;
 
     fn cancel_current(&self, reason: QueryCancellationReason);
 
@@ -179,11 +218,6 @@ pub trait QuerySessionFactory: Send + Sync + 'static {
         &self,
         request: StatementSessionRequest,
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError>;
-
-    fn open_session(
-        &self,
-        request: QuerySessionOpenRequest,
-    ) -> Result<Arc<dyn QuerySession>, QueryServiceError>;
 
     fn cancel_all(&self, reason: QueryCancellationReason);
 }
@@ -203,18 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn admission_request_retains_exact_connection_identity_and_principal() {
-        let request = QuerySessionOpenRequest::new(
-            ClientConnectionToken::new(42, 7).expect("connection token"),
-            "alice",
-        );
-
-        assert_eq!(request.connection_id(), 42);
-        assert_eq!(request.connection_token().generation(), 7);
-        assert_eq!(request.principal(), "alice");
-    }
-
-    #[test]
     fn statement_carries_terminal_until_the_adapter_consumes_it() {
         let completed = Arc::new(AtomicBool::new(false));
         let statement = QuerySessionStatement::new(
@@ -228,5 +250,61 @@ mod tests {
         assert!(!completed.load(Ordering::Acquire));
         terminal.complete();
         assert!(completed.load(Ordering::Acquire));
+    }
+    #[test]
+    fn admitted_shape_distinguishes_ctas_and_preserves_call_uncertainty() {
+        fn admission(sql: &str) -> StatementAdmission {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            assert_eq!(statements.len(), 1);
+            StatementAdmission::from_statement(&statements[0])
+        }
+        let create = admission("CREATE TABLE t (v BIGINT)");
+        let ctas = admission("CREATE TABLE IF NOT EXISTS t AS SELECT 1");
+        assert_eq!(create.kind, ctas.kind);
+        assert_eq!(create.shape, StatementOutputShape::Empty);
+        assert_eq!(ctas.shape, StatementOutputShape::Rows);
+        for sql in [
+            "INSERT INTO t SELECT 1",
+            "INSERT OVERWRITE t SELECT 1",
+            "DELETE FROM t",
+            "UPDATE t SET v = 1",
+            "MERGE INTO t USING src s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "ANALYZE TABLE t",
+            "REFRESH MATERIALIZED VIEW mv",
+        ] {
+            assert_eq!(admission(sql).shape, StatementOutputShape::Rows, "{sql}");
+        }
+        assert_eq!(admission("SELECT 1").shape, StatementOutputShape::ResultSet);
+        let add_files = admission("ALTER TABLE t ADD FILES FROM 's3://bucket/input'");
+        assert_eq!(add_files.kind, StatementKind::AddFiles);
+        assert_eq!(add_files.shape, StatementOutputShape::ResultSet);
+        assert!(
+            !add_files.kind.is_row_kind(),
+            "business classification is unchanged"
+        );
+        for sql in [
+            "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (2)",
+            "TRUNCATE TABLE t",
+        ] {
+            assert_eq!(admission(sql).shape, StatementOutputShape::Empty, "{sql}");
+        }
+        assert_eq!(
+            admission("CALL system.expire_snapshots('t')").shape,
+            StatementOutputShape::UndeterminedCall
+        );
+    }
+    #[tokio::test]
+    async fn original_admission_observation_precedes_statement_completion() {
+        let publisher = StatementAdmissionPublisher::default();
+        let mut observer = publisher.subscribe();
+        let fact = StatementAdmission {
+            kind: StatementKind::Analyze,
+            shape: StatementOutputShape::Rows,
+        };
+        publisher.publish(fact);
+        observer.changed().await.unwrap();
+        assert_eq!(*observer.borrow_and_update(), Some(fact));
+        publisher.publish(fact);
+        assert!(!observer.has_changed().unwrap());
     }
 }

@@ -29,11 +29,6 @@ pub(crate) struct BoundedMessage {
     pub(crate) truncated: bool,
 }
 
-/// Return a UTF-8 prefix without first cloning or serializing the full input.
-pub(crate) fn bound_message(message: &str) -> BoundedMessage {
-    bound_display(message)
-}
-
 /// Sources with structured public Display output stream into this same bound.
 /// The formatter stops on the first character that cannot fit, so a large
 /// Session error does not need a temporary unbounded formatted String.
@@ -100,7 +95,7 @@ mod tests {
             .chain(['中', '😀', '\u{2028}', '\u{2029}'])
         {
             let input = character.to_string().repeat(MAX_MESSAGE_JSON_BYTES);
-            let bounded = bound_message(&input);
+            let bounded = bound_display(&input);
             let encoded = serde_json::to_string(&bounded.message).unwrap();
             assert_eq!(bounded.json_bytes, encoded.len(), "{character:?}");
             assert!(encoded.len() <= MAX_MESSAGE_JSON_BYTES);
@@ -117,19 +112,19 @@ mod tests {
     #[test]
     fn exact_limit_includes_quotes_and_stops_at_a_complete_character() {
         let input = "x".repeat(MAX_MESSAGE_JSON_BYTES - 2);
-        let exact = bound_message(&input);
+        let exact = bound_display(&input);
         assert!(!exact.truncated);
         assert_eq!(exact.json_bytes, MAX_MESSAGE_JSON_BYTES);
         assert_eq!(exact.message, input);
         let input = format!("{}中", "x".repeat(MAX_MESSAGE_JSON_BYTES - 3));
-        let bounded = bound_message(&input);
+        let bounded = bound_display(&input);
         assert!(bounded.truncated);
         assert_eq!(bounded.message, "x".repeat(MAX_MESSAGE_JSON_BYTES - 3));
         assert_eq!(
             serde_json::to_string(&bounded.message).unwrap().len(),
             MAX_MESSAGE_JSON_BYTES - 1
         );
-        let empty = bound_message("");
+        let empty = bound_display("");
         assert_eq!(empty.json_bytes, 2);
         assert!(!empty.truncated);
     }

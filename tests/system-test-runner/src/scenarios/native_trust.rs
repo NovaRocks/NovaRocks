@@ -22,7 +22,7 @@
 //! listener-wide admission layer before routing, while public SQL proves the
 //! normal FE-to-BE production path continues through the same 1FE+3BE launch.
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::native_sql_controls::SqlIntentOwner;
 use crate::scenarios::task_evidence;
@@ -33,7 +33,6 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
 use http::{Request, header};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
 use novarocks_cluster_harness::vended_rest_catalog::{
     VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
@@ -161,11 +160,8 @@ impl Scenario for NativeTrustPositive {
             "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
         );
 
-        let mut connection = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
+        let mut connection =
+            sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         let mut snapshots = Vec::new();
         let mut participating = BTreeSet::new();
         for index in 0..3 {
@@ -213,7 +209,6 @@ impl Scenario for NativeTrustPositive {
             self.fixture.mode()
             , snapshots.len()
         ));
-        connection.finish()?;
         Ok(())
     }
 }
@@ -541,14 +536,11 @@ token = "${{ENV:{environment_name}}}"
         assert_credential_domain_task_ingress(context, self.fixture.mode())?;
 
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
-        let mut connection = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
+        let mut connection =
+            sql::SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         const CATALOG: &str = "vended_parity";
         connection
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create real REST-vended catalog for Native transport parity")?;
@@ -606,7 +598,6 @@ token = "${{ENV:{environment_name}}}"
             self.table_loads()? > 0,
             "vended transport parity did not observe a REST table response carrying a lease"
         );
-        connection.finish()?;
         Ok(())
     }
 

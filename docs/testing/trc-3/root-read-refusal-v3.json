@@ -1,0 +1,77 @@
+{
+  "schema_version": 3,
+  "topology": "1FE+3BE",
+  "scope": "Same seven original authenticated Native Root request/refusal cases and exact originating fact. Follow-up uses the unchanged SUM(generate_series) SQL through Trino and an independent declared BIGINT total=5050 oracle; historical MySQL row-wire SHA is retired.",
+  "path": "/novarocks.NovaRocksGrpc/FetchRootResult",
+  "cases": [
+    {
+      "name": "valid-v1-foreign-process",
+      "profile_id": 1,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 0,
+      "response_contract": "typed-identity-refusal"
+    },
+    {
+      "name": "absent-profile",
+      "profile_id": 0,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    },
+    {
+      "name": "unsupported-v2-profile",
+      "profile_id": 2,
+      "kind": "client_rows_true",
+      "wanted_sequence": 1,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    },
+    {
+      "name": "absent-kind",
+      "profile_id": 1,
+      "kind": "absent",
+      "wanted_sequence": 1,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    },
+    {
+      "name": "false-client-rows-kind",
+      "profile_id": 1,
+      "kind": "client_rows_false",
+      "wanted_sequence": 1,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    },
+    {
+      "name": "unknown-internal-domain",
+      "profile_id": 1,
+      "kind": "unknown_domain_999",
+      "wanted_sequence": 1,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    },
+    {
+      "name": "zero-wanted-sequence",
+      "profile_id": 1,
+      "kind": "client_rows_true",
+      "wanted_sequence": 0,
+      "grpc_status": 3,
+      "response_contract": "malformed-no-body"
+    }
+  ],
+  "health": {
+    "sql": "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)",
+    "expected_value": 5050
+  },
+  "identity_refusal": {
+    "class": "Data",
+    "domain": 10,
+    "reason": 43,
+    "evidence": "Originating",
+    "safe_detail": "root read was refused by its owning channel",
+    "ack_receipt": false,
+    "resource_facts": false
+  }
+}

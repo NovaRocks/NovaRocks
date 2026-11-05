@@ -531,10 +531,11 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         destination: RuntimeEndpoint,
         entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
-            .register_unit_demands(destination, entries, stop, done)
+            .register_unit_demands(destination, entries, stop, activity, done)
     }
     fn watch_unit_facts(
         &self,
@@ -704,9 +705,9 @@ fn assert_gather_stream_positionally(programs: Programs, local_nullable: [bool; 
     let local_layout = programs.consumer.graph().nodes()[source.index()].output_layout();
     assert_eq!(local_layout.slots(), &[SlotId::new(0), SlotId::new(1)]);
     assert_eq!(input.wire_layout.slots(), &[SlotId::new(0), SlotId::new(1)]);
-    for ordinal in 0..2 {
+    for (ordinal, nullable) in local_nullable.into_iter().enumerate() {
         let required = FunctionValueType::new(DataType::Int64, false);
-        let local = FunctionValueType::new(DataType::Int64, local_nullable[ordinal]);
+        let local = FunctionValueType::new(DataType::Int64, nullable);
         for (layout, expected) in [(&input.wire_layout, &required), (local_layout, &local)] {
             assert!(
                 layout
@@ -799,12 +800,12 @@ fn assert_gather_stream_positionally(programs: Programs, local_nullable: [bool; 
         assert_eq!(schema.slots().len(), 2);
         assert_eq!(schema.slots()[0].slot_id(), SlotId::new(0));
         assert_eq!(schema.slots()[1].slot_id(), SlotId::new(1));
-        for ordinal in 0..2 {
+        for (ordinal, nullable) in local_nullable.into_iter().enumerate() {
             assert_eq!(schema.slots()[ordinal].data_type(), &DataType::Int64);
-            assert_eq!(schema.slots()[ordinal].nullable(), local_nullable[ordinal]);
+            assert_eq!(schema.slots()[ordinal].nullable(), nullable);
             assert_eq!(
                 chunk.record_batch().schema().field(ordinal).is_nullable(),
-                local_nullable[ordinal]
+                nullable
             );
             assert_eq!(chunk.columns()[ordinal].null_count(), 0);
         }

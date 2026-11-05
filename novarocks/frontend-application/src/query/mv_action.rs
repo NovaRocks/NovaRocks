@@ -351,7 +351,19 @@ impl MvCommandOriginal {
         Some(
             result
                 .clone()
-                .map(|()| StatementActionValue::Ok(novarocks_query_application::session_control::StatementCommandCompletion::new(0)))
+                .map(|()| {
+                    use novarocks_query_application::session_control::StatementCommandCompletion;
+                    let completion = if matches!(
+                        &self.input.request,
+                        MvCommandRequest::Refresh { .. }
+                            | MvCommandRequest::ScheduledRefresh { .. }
+                    ) {
+                        StatementCommandCompletion::no_count()
+                    } else {
+                        StatementCommandCompletion::empty()
+                    };
+                    StatementActionValue::Ok(completion)
+                })
                 .map_err(|failure| match self.observed_effect() {
                     Some(disposition) => failure
                         .service
@@ -762,11 +774,5 @@ fn fold_effect(
     a: Option<StatementExternalEffectDisposition>,
     b: Option<StatementExternalEffectDisposition>,
 ) -> Option<StatementExternalEffectDisposition> {
-    use StatementExternalEffectDisposition::*;
-    match (a, b) {
-        (Some(KnownCommitted), _) | (_, Some(KnownCommitted)) => Some(KnownCommitted),
-        (Some(CommitUnknown), _) | (_, Some(CommitUnknown)) => Some(CommitUnknown),
-        (Some(KnownUncommitted), _) | (_, Some(KnownUncommitted)) => Some(KnownUncommitted),
-        _ => None,
-    }
+    StatementExternalEffectDisposition::combine(a, b)
 }

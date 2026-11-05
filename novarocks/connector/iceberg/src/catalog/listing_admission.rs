@@ -19,8 +19,6 @@
 
 use std::future::Future;
 use std::sync::Arc;
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-use std::sync::Mutex;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
@@ -32,8 +30,6 @@ pub(crate) const LISTING_CONCURRENCY: usize = 8;
 #[derive(Debug)]
 pub(crate) struct ListingAdmission {
     positions: Arc<Semaphore>,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    observer: Mutex<Option<HmsObservation>>,
 }
 
 /// Observation of a result already published by the original closed source.
@@ -46,147 +42,11 @@ impl Default for ListingAdmission {
     fn default() -> Self {
         Self {
             positions: Arc::new(Semaphore::new(LISTING_CONCURRENCY)),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Mutex::new(None),
         }
     }
-}
-
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-#[derive(Debug)]
-struct HmsObservation {
-    observer: Arc<super::hms_listing_observer::Observer>,
-    cancellation: Option<novarocks_failpoint::scope::ControlCancellation>,
 }
 
 impl ListingAdmission {
-    #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-    fn observed_test_fixture() -> Self {
-        Self {
-            positions: Arc::new(Semaphore::new(LISTING_CONCURRENCY)),
-            observer: Mutex::new(Some(HmsObservation {
-                observer: Default::default(),
-                cancellation: None,
-            })),
-        }
-    }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) fn install_hms_observation(
-        &self,
-        cancellation: novarocks_failpoint::scope::ControlCancellation,
-    ) -> Result<(), &'static str> {
-        if !cancellation.is_active() {
-            return Err("HMS observation session is closed");
-        }
-        let mut state = self
-            .observer
-            .lock()
-            .map_err(|_| "HMS observer lock failed")?;
-        if state.is_some() {
-            return Err("HMS observer is already installed");
-        }
-        *state = Some(HmsObservation {
-            observer: Default::default(),
-            cancellation: Some(cancellation),
-        });
-        Ok(())
-    }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) fn close_hms_observation(&self) {
-        if let Ok(mut state) = self.observer.lock() {
-            *state = None;
-        }
-    }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(super) fn active_observer(&self) -> Option<Arc<super::hms_listing_observer::Observer>> {
-        let mut state = self.observer.lock().ok()?;
-        if state
-            .as_ref()?
-            .cancellation
-            .as_ref()
-            .is_some_and(|scope| !scope.is_active())
-        {
-            *state = None;
-            return None;
-        }
-        Some(Arc::clone(&state.as_ref()?.observer))
-    }
-    #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-    fn hms_observation_active(&self) -> bool {
-        self.active_observer().is_some()
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) fn hms_snapshot(
-        &self,
-    ) -> Result<super::hms_listing_observer::Snapshot, &'static str> {
-        let mut snapshot = self
-            .active_observer()
-            .ok_or("HMS observation is not active")?
-            .snapshot()?;
-        snapshot.available_positions_sample = Some(self.positions.available_permits());
-        Ok(snapshot)
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(crate) fn reset_hms_observation_idle(
-        &self,
-        domain: uuid::Uuid,
-        phase: u64,
-        sequence: u64,
-    ) -> Result<u64, &'static str> {
-        self.active_observer()
-            .ok_or("HMS observation is not active")?
-            .reset_idle(domain, phase, sequence)
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(super) async fn run_hms<T, F: Future<Output = Result<T, ConnectorError>>>(
-        &self,
-        context: &ConnectorRequestContext,
-        observer: Arc<super::hms_listing_observer::Observer>,
-        operation: super::hms_listing_observer::HmsListingOperation,
-        target_sha256: Option<[u8; 32]>,
-        make_call: impl FnOnce(super::hms_listing_observer::Invocation) -> F,
-    ) -> Result<T, ConnectorError> {
-        use super::hms_listing_observer::{ExitSelection, PermitOwner, WrapperExit};
-        let invocation = observer.begin(operation, target_sha256, context.deadline());
-        // PermitOwner is declared before both wrapper witness and the future.
-        // Cancelling/dropping this outer future cannot return the permit first.
-        let mut owner = PermitOwner {
-            invocation: invocation.clone(),
-            permit: None,
-        };
-        let _wrapper_exit = WrapperExit(invocation.clone());
-        let call = make_call(invocation.clone());
-        tokio::pin!(call);
-        if let Err(error) = context.check_active() {
-            invocation.select(ExitSelection::InitialCheck, context);
-            return Err(error);
-        }
-        let deadline = tokio::time::Instant::from_std(context.deadline());
-        let permit = tokio::select! {
-            biased;
-            _ = context.stop().stopped() => { invocation.select(ExitSelection::StopWaiting, context); return Err(cancelled()); },
-            _ = tokio::time::sleep_until(deadline) => { invocation.select(ExitSelection::DeadlineWaiting, context); return Err(expired()); },
-            permit = self.positions.clone().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => { invocation.select(ExitSelection::AdmissionClosed, context);
-                    return Err(ConnectorError::new(ConnectorErrorKind::Internal, "catalog listing admission was closed")); }
-            },
-        };
-        owner.acquired(permit);
-        tokio::select! {
-            biased;
-            _ = context.stop().stopped() => { invocation.select(ExitSelection::StopAdmitted, context); Err(cancelled()) },
-            _ = tokio::time::sleep_until(deadline) => { invocation.select(ExitSelection::DeadlineAdmitted, context); Err(expired()) },
-            result = &mut call => {
-                invocation.select(if result.is_ok() { ExitSelection::ReadyOk } else { ExitSelection::ReadyErr }, context);
-                result
-            },
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn available_positions(&self) -> usize {
         self.positions.available_permits()
@@ -303,11 +163,288 @@ fn expired() -> ConnectorError {
 mod tests {
     use super::*;
     use novarocks_spi::connector::ConnectorStopOwner;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::pin::Pin;
+    use std::sync::Mutex as TestMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
     fn context(stop: &ConnectorStopOwner, deadline: Instant) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(deadline, stop.view(), 1024, 4096).unwrap()
+    }
+
+    #[derive(Default)]
+    struct SdkProbe {
+        started: AtomicUsize,
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        dropped: AtomicUsize,
+        positions_at_drop: TestMutex<Vec<usize>>,
+    }
+
+    struct SdkLifetime {
+        positions: Arc<Semaphore>,
+        probe: Arc<SdkProbe>,
+    }
+
+    impl SdkLifetime {
+        fn new(positions: Arc<Semaphore>, probe: Arc<SdkProbe>) -> Self {
+            assert!(positions.available_permits() < LISTING_CONCURRENCY);
+            let live = probe.live.fetch_add(1, Ordering::SeqCst) + 1;
+            probe.started.fetch_add(1, Ordering::SeqCst);
+            probe.peak.fetch_max(live, Ordering::SeqCst);
+            assert!(live <= LISTING_CONCURRENCY);
+            Self { positions, probe }
+        }
+    }
+
+    impl Drop for SdkLifetime {
+        fn drop(&mut self) {
+            let available = self.positions.available_permits();
+            assert!(
+                available < LISTING_CONCURRENCY,
+                "the actual SDK object must exit before its position returns"
+            );
+            self.probe.positions_at_drop.lock().unwrap().push(available);
+            assert!(self.probe.live.fetch_sub(1, Ordering::SeqCst) > 0);
+            self.probe.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    enum SdkCompletion {
+        Pending,
+        Ready(Option<ConnectorError>),
+        Release(tokio::sync::oneshot::Receiver<()>),
+        Panic(Arc<u8>),
+    }
+
+    struct SdkCall {
+        positions: Arc<Semaphore>,
+        probe: Arc<SdkProbe>,
+        lifetime: Option<SdkLifetime>,
+        completion: SdkCompletion,
+    }
+
+    impl Future for SdkCall {
+        type Output = Result<(), ConnectorError>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            // The delegate constructs its SDK object when the admitted body
+            // first runs. A waiting outer future is not a live SDK object.
+            // Retain that object even after Ready until this future's Drop.
+            if this.lifetime.is_none() {
+                this.lifetime = Some(SdkLifetime::new(
+                    Arc::clone(&this.positions),
+                    Arc::clone(&this.probe),
+                ));
+            }
+            match &mut this.completion {
+                SdkCompletion::Pending => Poll::Pending,
+                SdkCompletion::Ready(error) => Poll::Ready(error.take().map_or(Ok(()), Err)),
+                SdkCompletion::Release(released) => Pin::new(released).poll(cx).map(|result| {
+                    result.expect("the original SDK release sender remains owned");
+                    Ok(())
+                }),
+                SdkCompletion::Panic(payload) => std::panic::panic_any(Arc::clone(payload)),
+            }
+        }
+    }
+
+    fn sdk_call(
+        gate: &ListingAdmission,
+        probe: &Arc<SdkProbe>,
+        completion: SdkCompletion,
+    ) -> SdkCall {
+        SdkCall {
+            positions: Arc::clone(&gate.positions),
+            probe: Arc::clone(probe),
+            lifetime: None,
+            completion,
+        }
+    }
+
+    fn assert_idle(gate: &ListingAdmission, probe: &SdkProbe, expected_calls: usize) {
+        assert_eq!(gate.positions.available_permits(), LISTING_CONCURRENCY);
+        assert_eq!(probe.started.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(probe.live.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.dropped.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(
+            probe.positions_at_drop.lock().unwrap().len(),
+            expected_calls
+        );
+    }
+
+    #[tokio::test]
+    async fn eight_started_sdk_calls_keep_the_ninth_waiting_then_reuse_the_same_gate() {
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let probe = Arc::new(SdkProbe::default());
+        let mut releases = Vec::new();
+        let mut calls = Vec::new();
+        for _ in 0..=LISTING_CONCURRENCY {
+            let (release, released) = tokio::sync::oneshot::channel();
+            releases.push(Some(release));
+            calls.push(Box::pin(gate.run(
+                &ctx,
+                sdk_call(&gate, &probe, SdkCompletion::Release(released)),
+            )));
+        }
+        for call in &mut calls {
+            assert!(futures::poll!(call.as_mut()).is_pending());
+        }
+        assert_eq!(gate.positions.available_permits(), 0);
+        assert_eq!(probe.started.load(Ordering::SeqCst), 8);
+        assert_eq!(probe.live.load(Ordering::SeqCst), 8);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 8);
+
+        releases[0].take().unwrap().send(()).unwrap();
+        calls.remove(0).await.unwrap();
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [0]);
+        assert_eq!(probe.live.load(Ordering::SeqCst), 7);
+        assert!(futures::poll!(calls.last_mut().unwrap().as_mut()).is_pending());
+        assert_eq!(probe.started.load(Ordering::SeqCst), 9);
+        assert_eq!(probe.live.load(Ordering::SeqCst), 8);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 8);
+
+        for release in releases.iter_mut().skip(1) {
+            release.take().unwrap().send(()).unwrap();
+        }
+        for call in calls {
+            call.await.unwrap();
+        }
+        assert_idle(&gate, &probe, 9);
+        gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Ready(None)))
+            .await
+            .unwrap();
+        assert_idle(&gate, &probe, 10);
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn ready_sdk_results_drop_before_position_return_and_preserve_the_original_error() {
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let probe = Arc::new(SdkProbe::default());
+        gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Ready(None)))
+            .await
+            .unwrap();
+        let original = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "the original catalog listing refusal",
+        );
+        let error = gate
+            .run(
+                &ctx,
+                sdk_call(&gate, &probe, SdkCompletion::Ready(Some(original.clone()))),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), original.kind());
+        assert_eq!(error.message(), original.message());
+        assert_idle(&gate, &probe, 2);
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7, 7]);
+    }
+
+    #[tokio::test]
+    async fn default_deadline_drops_the_polled_sdk_before_its_position_returns() {
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_millis(100));
+        let probe = Arc::new(SdkProbe::default());
+        let mut call = Box::pin(gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Pending)));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        assert_eq!(probe.live.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.positions.available_permits(), 7);
+        assert_eq!(
+            call.await.unwrap_err().kind(),
+            ConnectorErrorKind::DeadlineExceeded
+        );
+        assert_idle(&gate, &probe, 1);
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);
+    }
+
+    #[tokio::test]
+    async fn default_stop_drops_the_polled_sdk_before_its_position_returns() {
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let probe = Arc::new(SdkProbe::default());
+        let mut call = Box::pin(gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Pending)));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        stop.request_stop();
+        assert_eq!(
+            call.await.unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_idle(&gate, &probe, 1);
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);
+    }
+
+    #[tokio::test]
+    async fn sdk_poll_panic_keeps_the_original_payload_and_returns_its_position_after_drop() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let probe = Arc::new(SdkProbe::default());
+        let payload = Arc::new(17_u8);
+        let panic = AssertUnwindSafe(gate.run(
+            &ctx,
+            sdk_call(&gate, &probe, SdkCompletion::Panic(Arc::clone(&payload))),
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_err();
+        assert!(Arc::ptr_eq(&payload, &panic.downcast::<Arc<u8>>().unwrap()));
+        assert_idle(&gate, &probe, 1);
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);
+        gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Ready(None)))
+            .await
+            .unwrap();
+        assert_idle(&gate, &probe, 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_outer_call_drops_the_actual_sdk_before_returning_its_position() {
+        let gate = ListingAdmission::default();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
+        let probe = Arc::new(SdkProbe::default());
+        let mut call = Box::pin(gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Pending)));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        assert_eq!(probe.live.load(Ordering::SeqCst), 1);
+        drop(call);
+        assert_idle(&gate, &probe, 1);
+        assert_eq!(*probe.positions_at_drop.lock().unwrap(), [7]);
+    }
+
+    #[tokio::test]
+    async fn waiting_stop_wins_an_elapsed_deadline_without_polling_an_sdk_call() {
+        let gate = ListingAdmission::default();
+        let occupied = gate
+            .positions
+            .clone()
+            .acquire_many_owned(LISTING_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let stop = ConnectorStopOwner::new();
+        let ctx = context(&stop, Instant::now() + Duration::from_millis(100));
+        let probe = Arc::new(SdkProbe::default());
+        let mut call = Box::pin(gate.run(&ctx, sdk_call(&gate, &probe, SdkCompletion::Pending)));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        tokio::time::sleep_until(ctx.deadline().into()).await;
+        stop.request_stop();
+        assert_eq!(
+            call.await.unwrap_err().kind(),
+            ConnectorErrorKind::Cancelled
+        );
+        drop(occupied);
+        assert_idle(&gate, &probe, 0);
     }
 
     struct PendingCall {
@@ -338,11 +475,6 @@ mod tests {
     async fn source_stop_retains_position_until_the_issued_call_actually_exits() {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Mutex::new(Some(HmsObservation {
-                observer: Default::default(),
-                cancellation: None,
-            })),
         };
         let stop = ConnectorStopOwner::new();
         let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
@@ -385,11 +517,6 @@ mod tests {
     async fn deadline_drops_sdk_before_returning_its_position() {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Mutex::new(Some(HmsObservation {
-                observer: Default::default(),
-                cancellation: None,
-            })),
         };
         let stop = ConnectorStopOwner::new();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -413,11 +540,6 @@ mod tests {
     async fn stop_drops_sdk_before_returning_its_position() {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Mutex::new(Some(HmsObservation {
-                observer: Default::default(),
-                cancellation: None,
-            })),
         };
         let stop = ConnectorStopOwner::new();
         let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
@@ -472,10 +594,6 @@ mod tests {
         assert_eq!(gate.positions.available_permits(), LISTING_CONCURRENCY);
     }
 }
-
-#[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-#[path = "hms_listing_observer_tests.rs"]
-mod hms_observation_tests;
 
 #[cfg(test)]
 mod original_outcome_tests {

@@ -21,37 +21,26 @@ use novarocks_result_contract::ClientPresentationFamily;
 
 pub struct ArrowTrinoJsonEncoder(ArrowClientRowEncoder);
 impl ArrowTrinoJsonEncoder {
+    pub const fn scratch_capacity_bound_bytes() -> usize {
+        super::scratch_capacity_bound_bytes() - size_of::<ArrowClientRowEncoder>()
+            + size_of::<Self>()
+    }
     pub fn try_new(
         schema: Arc<ClientRenderSchema>,
         batch: RecordBatch,
     ) -> Result<Self, RenderError> {
-        if !matches!(schema.family(), ClientPresentationFamily::TrinoJson(_)) {
-            return Err(error(E::UnsupportedPresentation));
-        }
         ArrowClientRowEncoder::try_new(schema, batch).map(Self)
     }
     pub fn try_new_root(
         contract: Arc<RootOutputContract>,
         batch: RecordBatch,
     ) -> Result<Self, RenderError> {
-        let FrozenRootOutput::ClientRows(schema) = contract.output() else {
-            return Err(error(E::SchemaMismatch));
-        };
-        if !matches!(schema.family(), ClientPresentationFamily::TrinoJson(_)) {
-            return Err(error(E::UnsupportedPresentation));
-        }
         ArrowClientRowEncoder::try_new_root(contract, batch).map(Self)
     }
     pub fn try_new_typed_root(
         input: ValidatedClientInput,
         batch: RecordBatch,
     ) -> Result<Self, RenderError> {
-        let FrozenRootOutput::ClientRows(schema) = input.contract().output() else {
-            return Err(error(E::SchemaMismatch));
-        };
-        if !matches!(schema.family(), ClientPresentationFamily::TrinoJson(_)) {
-            return Err(error(E::UnsupportedPresentation));
-        }
         ArrowClientRowEncoder::try_new_typed_root(input, batch).map(Self)
     }
 }
@@ -63,7 +52,7 @@ impl BoundedClientRowEncoder for ArrowTrinoJsonEncoder {
         self.0.cancel();
     }
     fn scratch_capacity_bytes(&self) -> usize {
-        self.0.scratch_capacity_bytes()
+        self.0.scratch_capacity_bytes() - size_of::<ArrowClientRowEncoder>() + size_of::<Self>()
     }
 }
 
@@ -109,11 +98,9 @@ impl CellCursor {
         budget: &mut Budget,
     ) -> Result<(), RenderError> {
         // Fixed descriptor work uses the same reserved operation quantum as
-        // the MySQL cursor; variable source bytes are scanned by Stream.
+        // the shared cursor; variable source bytes are scanned by Stream.
         budget.scan(32);
-        let ClientPresentationFamily::TrinoJson(facts) = *schema.family() else {
-            return Err(invalid());
-        };
+        let ClientPresentationFamily::TrinoJson(facts) = *schema.family();
         let field = path.field(schema)?;
         let (array, row) = resolve_dictionary(array, row)?;
         if row >= array.len() {
@@ -166,7 +153,6 @@ impl CellCursor {
                     row,
                     path,
                     next: 0,
-                    phase: 0,
                 })?;
                 self.literal(b"[")?;
             }
@@ -191,7 +177,7 @@ impl CellCursor {
             }
             N::Variant if key => {
                 let source = Source::array(array, row);
-                let data = source.data(schema)?;
+                let data = source.data()?;
                 let view = VariantView::parse(data)?;
                 let head = data[view.metadata_end];
                 let basic = match head & 3 {
@@ -236,7 +222,7 @@ impl CellCursor {
             }
             N::Variant if !key => {
                 let source = Source::array(array, row);
-                let data = source.data(schema)?;
+                let data = source.data()?;
                 let view = VariantView::parse(data)?;
                 if facts.variant_binary {
                     self.literal(b"\"}")?;
@@ -260,7 +246,6 @@ impl CellCursor {
                         view,
                         range: view.metadata_end..data.len(),
                         depth: path.depth as usize,
-                        offset: 0,
                     }))?;
                     self.push(EncodeStep::Metadata {
                         source,
@@ -338,11 +323,7 @@ pub(super) fn scalar(
             )?);
         }
         N::Date => {
-            return quoted(date_atom(
-                down::<Date32Array>(array)?.value(row),
-                true,
-                false,
-            )?);
+            return quoted(date_atom(down::<Date32Array>(array)?.value(row))?);
         }
         N::Time { unit } | N::Timestamp { unit, .. } => {
             return quoted(temporal(
@@ -352,7 +333,7 @@ pub(super) fn scalar(
                 parametric || key,
             )?);
         }
-        N::SignedInteger(_) => scalar_atom(array, row, field, true)?,
+        N::SignedInteger(_) => scalar_atom(array, row, field)?,
         _ => return Err(error(E::UnsupportedPresentation)),
     };
     if key {
@@ -368,6 +349,8 @@ pub(super) fn scalar(
 }
 
 pub(super) fn float32(n: f32, budget: &mut Budget) -> Result<Atom, RenderError> {
+    #[cfg(test)]
+    FLOAT_FORMATS.with(|count| count.set(count.get() + 1));
     if !n.is_finite() {
         return Ok(Atom::literal(if n.is_nan() {
             b"\"NaN\""
@@ -393,6 +376,8 @@ pub(super) fn float32(n: f32, budget: &mut Budget) -> Result<Atom, RenderError> 
     java_float(decimal, scientific)
 }
 pub(super) fn float64(n: f64, budget: &mut Budget) -> Result<Atom, RenderError> {
+    #[cfg(test)]
+    FLOAT_FORMATS.with(|count| count.set(count.get() + 1));
     if !n.is_finite() {
         return Ok(Atom::literal(if n.is_nan() {
             b"\"NaN\""
@@ -594,7 +579,7 @@ pub(super) fn temporal(
     };
     let mut out = atom!(
         "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year_atom(local.year(), true)?,
+        year_atom(local.year())?,
         local.month(),
         local.day(),
         local.hour(),

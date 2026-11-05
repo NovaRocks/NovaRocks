@@ -30,7 +30,9 @@ prometheus.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+novarocks-failure-contract.workspace = true
 novarocks-parser.workspace = true
+novarocks-spi.workspace = true
 novarocks-sql.workspace = true
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "io-util"] }
 

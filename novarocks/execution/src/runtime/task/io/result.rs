@@ -184,9 +184,7 @@ pub trait TaskResultSession: Send + Sync + 'static {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultPresentation {
-    MysqlText,
-    HttpJson,
-    Statistic,
+    ArrowIpc,
 }
 
 #[derive(Clone, Debug)]

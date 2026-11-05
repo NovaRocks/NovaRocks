@@ -11,9 +11,10 @@ use super::mv_uea7::{
     ManagedMvRestFixture, assert_rows, execute, require_three_backends,
     select_catalog_and_namespace,
 };
+use super::mv_uea7::{mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup};
+use crate::actors::sql::{self, SqlSession, StatementFailure};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
@@ -195,7 +196,7 @@ impl Scenario for Documents {
             Kind::Consistent => self.run_consistent(context, &mut conn, catalog, &rest)?,
             Kind::Keyed => run_keyed(context, &mut conn, &rest)?,
         }
-        conn.finish()?;
+        drop(conn);
         Ok(())
     }
     fn teardown(&self) -> Result<()> {
@@ -227,12 +228,9 @@ pub(super) fn load_metadata(
         .context("REST load lacks metadata")?
         .clone())
 }
-fn connect(context: &mut ScenarioContext) -> Result<crate::actors::mysql::DeadlineConnection> {
-    crate::actors::mysql::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )
+fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }
 fn client(context: &ScenarioContext) -> Result<Client> {
     Ok(Client::builder()
@@ -328,11 +326,7 @@ fn save_graph(context: &ScenarioContext, label: &str, metadata: &Value) -> Resul
     )?;
     Ok(graph)
 }
-fn create_mv(
-    context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
-    name: &str,
-) -> Result<()> {
+fn create_mv(context: &mut ScenarioContext, conn: &mut SqlSession, name: &str) -> Result<()> {
     execute(
         context,
         conn,
@@ -342,11 +336,7 @@ fn create_mv(
         ),
     )
 }
-fn refresh(
-    context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
-    name: &str,
-) -> Result<()> {
+fn refresh(context: &mut ScenarioContext, conn: &mut SqlSession, name: &str) -> Result<()> {
     execute(
         context,
         conn,
@@ -356,7 +346,7 @@ fn refresh(
 }
 fn repartition(
     context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
+    conn: &mut SqlSession,
     name: &str,
     buckets: u32,
 ) -> Result<()> {
@@ -374,7 +364,7 @@ fn expiry_sql(catalog: &str, table: &str, token: &str, keep: usize) -> String {
 }
 fn expire(
     context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
+    conn: &mut SqlSession,
     catalog: &str,
     table: &str,
     token: &str,
@@ -697,8 +687,10 @@ fn simulate_old_layout(
 }
 
 struct HeldExpiry {
-    actor: Option<JoinHandle<std::result::Result<(), String>>>,
+    actor: Option<JoinHandle<std::result::Result<(), StatementFailure>>>,
     trigger: PathBuf,
+    cancel: novarocks_test_trino_client::CancelHandle,
+    deadline: Instant,
 }
 impl HeldExpiry {
     fn start(
@@ -711,23 +703,42 @@ impl HeldExpiry {
         fs::create_dir_all(&dir)?;
         let trigger = dir.join("mv-document-expiry-planned.trigger");
         fs::write(&trigger, format!("token={token}\n"))?;
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
         let deadline = context.deadline();
         let sql = expiry_sql(catalog, table, token, 1);
-        let actor = thread::spawn(move || {
-            crate::actors::mysql::connect_until(&user, port, deadline)
-                .and_then(|conn| {
-                    conn.run(|c| {
-                        c.query_drop(sql)?;
-                        Ok(())
-                    })
-                })
-                .map_err(|e| format!("{e:#}"))
-        });
+        let prepared = (|| -> Result<_> {
+            let conn = connect(context)?;
+            let pending = conn.submit(&sql)?;
+            Ok((conn, pending))
+        })();
+        let (mut conn, pending) = match prepared {
+            Ok(original) => original,
+            Err(primary) => {
+                return control_plan::with_cleanup(
+                    Err(primary),
+                    fs::remove_file(&trigger).map_err(Into::into),
+                );
+            }
+        };
+        let cancel = pending.cancel_handle();
+        let actor = thread::Builder::new()
+            .name("mv-document-expiry-sql".into())
+            .spawn(move || conn.run_pending(pending).map(|_| ()));
+        let actor = match actor {
+            Ok(actor) => actor,
+            Err(primary) => {
+                let removed = fs::remove_file(&trigger).map_err(anyhow::Error::from);
+                let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
+                return control_plan::with_cleanup(
+                    Err(primary.into()),
+                    control_plan::with_cleanup(removed, cancelled),
+                );
+            }
+        };
         let mut held = Self {
             actor: Some(actor),
             trigger,
+            cancel,
+            deadline,
         };
         let marker = format!(
             "{} token={token}",
@@ -738,49 +749,126 @@ impl HeldExpiry {
                 break;
             }
             if held.actor.as_ref().is_some_and(|a| a.is_finished()) {
-                let result = held.release()?;
-                bail!("expiry failed before its planning barrier: {result:?}");
+                match held.release()? {
+                    Ok(()) => bail!("expiry succeeded before its planning barrier"),
+                    Err(primary) => {
+                        return Err(anyhow::Error::new(primary)
+                            .context("expiry failed before its planning barrier"));
+                    }
+                }
             }
             context.remaining("wait for expiry planning barrier")?;
             thread::sleep(Duration::from_millis(20));
         }
         Ok(held)
     }
-    fn release(&mut self) -> Result<std::result::Result<(), String>> {
-        if self.trigger.exists() {
-            fs::remove_file(&self.trigger)?;
-        }
+    fn release(&mut self) -> Result<std::result::Result<(), StatementFailure>> {
+        let removed = if self.trigger.exists() {
+            fs::remove_file(&self.trigger).map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
         let actor = self.actor.take().context("expiry actor already joined")?;
-        actor
+        // A failed release must still cancel before joining the same actor.
+        let before_join = if removed.is_err() {
+            self.cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
+        let joined = actor
             .join()
-            .map_err(|_| anyhow::anyhow!("expiry SQL actor panicked"))
+            .map_err(|_| anyhow::anyhow!("expiry SQL actor panicked"));
+        let after_join =
+            if removed.is_ok() && joined.as_ref().map_or(true, mv_response_needs_cancel) {
+                self.cancel
+                    .delete(self.deadline)
+                    .map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+        let cleanup = control_plan::with_cleanup(
+            removed,
+            control_plan::with_cleanup(before_join, after_join),
+        );
+        match joined {
+            Ok(response) => mv_response_with_cleanup(response, cleanup),
+            Err(primary) => match cleanup {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(primary.context(format!("expiry SQL cleanup: {cleanup:#}"))),
+            },
+        }
     }
 }
 impl Drop for HeldExpiry {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.trigger);
+        let removed = if self.trigger.exists() {
+            fs::remove_file(&self.trigger).map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
         if let Some(actor) = self.actor.take() {
-            let _ = actor.join();
+            let cancel_before_join = !actor.is_finished();
+            let before_join = if cancel_before_join {
+                self.cancel
+                    .delete(self.deadline)
+                    .map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+            let joined = actor
+                .join()
+                .map_err(|_| anyhow::anyhow!("expiry SQL actor panicked"));
+            let after_join =
+                if !cancel_before_join && joined.as_ref().map_or(true, mv_response_needs_cancel) {
+                    self.cancel
+                        .delete(self.deadline)
+                        .map_err(anyhow::Error::from)
+                } else {
+                    Ok(())
+                };
+            let cleanup = control_plan::with_cleanup(
+                removed,
+                control_plan::with_cleanup(before_join, after_join),
+            );
+            let result = match joined {
+                Ok(response) => mv_response_with_cleanup(response, cleanup)
+                    .and_then(|response| response.map_err(anyhow::Error::from)),
+                Err(primary) => match cleanup {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => {
+                        Err(primary.context(format!("expiry SQL cleanup: {cleanup:#}")))
+                    }
+                },
+            };
+            if let Err(error) = result {
+                eprintln!("Original expiry SQL actor cleanup failed: {error:#}");
+            }
+        } else if let Err(error) = removed {
+            eprintln!("Original expiry trigger cleanup failed: {error:#}");
         }
     }
 }
 
-fn require_uncommitted(result: std::result::Result<(), String>, label: &str) -> Result<()> {
+fn require_uncommitted(
+    result: std::result::Result<(), StatementFailure>,
+    label: &str,
+) -> Result<()> {
     let error = result
         .err()
         .with_context(|| format!("expiry accepted {label}"))?;
+    let public_error = mv_public_error(&error)?;
     ensure!(
-        error.contains("MV document expiry did not commit"),
+        public_error
+            .message
+            .contains("MV document expiry did not commit"),
         "expiry failed before a definite rejected commit for {label}: {error}"
     );
     Ok(())
 }
 
-fn run_keyed(
-    context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
-    rest: &str,
-) -> Result<()> {
+fn run_keyed(context: &mut ScenarioContext, conn: &mut SqlSession, rest: &str) -> Result<()> {
     create_mv(context, conn, "keyed")?;
     refresh(context, conn, "keyed")?;
     repartition(context, conn, "keyed", 2)?;
@@ -840,7 +928,7 @@ fn run_keyed(
 
 fn run_expiry(
     context: &mut ScenarioContext,
-    conn: &mut crate::actors::mysql::DeadlineConnection,
+    conn: &mut SqlSession,
     catalog: &str,
     rest: &str,
     workspace: &Path,
@@ -1124,9 +1212,9 @@ fn run_expiry(
         ],
         "rollback-after-reintroduction",
     )?;
-    held.release()?.map_err(|e| {
-        anyhow::anyhow!("D15 expiry unexpectedly rejected restored observed main: {e}")
-    })?;
+    held.release()?
+        .map_err(anyhow::Error::from)
+        .context("D15 expiry unexpectedly rejected restored observed main")?;
     let e_after = load_metadata(context, rest, NS, "e")?;
     let e_graph = save_graph(context, "rollback-history-diagnostic", &e_after)?;
     ensure!(
@@ -1275,7 +1363,7 @@ impl Documents {
     fn run_consistent(
         &self,
         context: &mut ScenarioContext,
-        conn: &mut crate::actors::mysql::DeadlineConnection,
+        conn: &mut SqlSession,
         catalog: &str,
         rest: &str,
     ) -> Result<()> {
@@ -1365,10 +1453,17 @@ impl Documents {
             let prior_diagnostics = fs::read_to_string(&diagnostic_path).with_context(|| {
                 format!("read original FE warning log {}", diagnostic_path.display())
             })?;
-            let error = conn
-                .query_drop(format!("REFRESH MATERIALIZED VIEW {case} WITH SYNC MODE"))
-                .expect_err("corrupt current documents must refuse refresh")
-                .to_string();
+            let failure = conn
+                .execute(format!("REFRESH MATERIALIZED VIEW {case} WITH SYNC MODE"))
+                .expect_err("corrupt current documents must refuse refresh");
+            let public = mv_public_error(&failure)?;
+            ensure!(
+                public.error_code == 0
+                    && public.error_name == "GENERIC_USER_ERROR"
+                    && public.error_type == "USER_ERROR",
+                "document corruption changed its original Data failure: {public:?}"
+            );
+            let error = &public.message;
             context.action(format!("corruption {case} rejected: {error}"));
             ensure!(
                 error.contains("[query.execution.invalid_data]")
@@ -1470,7 +1565,14 @@ impl Documents {
             graph.snapshots.len() == 300,
             "300 ordinary refreshes did not produce 300 publication snapshots"
         );
-        let count: Option<u64> = conn.query_first("SELECT COUNT(*) FROM stable")?;
+        let counted = conn.execute("SELECT COUNT(*) FROM stable")?;
+        ensure!(
+            counted.columns.len() == 1
+                && counted.columns[0].type_signature.raw_type == "bigint"
+                && counted.columns[0].type_signature.arguments.is_empty(),
+            "document COUNT lost its declared bigint"
+        );
+        let count = Some(u64::try_from(sql::single_integer(&counted)?)?);
         ensure!(
             count == Some(302),
             "300-refresh output lost source rows: {count:?}"

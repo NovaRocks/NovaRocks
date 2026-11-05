@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! P09 real FE semantic refusal after a bounded authenticated native reply fault.
-//! Requires the separately reviewed actor v2 and runner launch opt-in integration.
+//! Native FE semantic refusal after one bounded authenticated Root reply fault.
+//! Public Trino errors and rows are observed independently of the Native actor.
 
 use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use super::result_delivery::root_census;
 use super::result_delivery_root_protocol::parse_created_task_candidates;
 use super::result_delivery_support::await_idle;
-use crate::actors::mysql_stream::{
-    AsyncMysqlStream, BoundedNegativeTextObservation, TextColumnObservation, TextResultObservation,
-};
+use crate::actors::sql::{SqlSession, StatementResult, TrinoValue, single_integer};
+use crate::actors::trino_protocol::TrinoClient;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::native_root_reply_fault::{
@@ -37,6 +36,7 @@ use novarocks_execution_contract::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
 use novarocks_task_codec::budget::TransportBudget;
 use novarocks_task_codec::identity::decode_task_identity;
+use novarocks_test_trino_client::{Column, TrinoError, TypeArgument};
 use novarocks_types::{BackendProcessId, FrontendProcessId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -44,6 +44,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CAPTURE: Duration = Duration::from_secs(5);
@@ -76,17 +77,15 @@ impl Case {
     }
     fn freeze(self) -> &'static str {
         match self {
-            Self::Profile => include_str!(
-                "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-profile-freeze-v1.json"
-            ),
-            Self::Kind => include_str!(
-                "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-kind-freeze-v1.json"
-            ),
-            Self::Prefix => include_str!(
-                "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-prefix-only-freeze-v1.json"
-            ),
+            Self::Profile => {
+                include_str!("../../../../docs/testing/trc-3/root-reply-profile-v2.json")
+            }
+            Self::Kind => include_str!("../../../../docs/testing/trc-3/root-reply-kind-v2.json"),
+            Self::Prefix => {
+                include_str!("../../../../docs/testing/trc-3/root-reply-prefix-only-v2.json")
+            }
             Self::PrefixSuffix => include_str!(
-                "../../../../docs/testing/mem-1-m07/inputs/native-root-reply-valid-row-prefix-suffix-freeze-v1.json"
+                "../../../../docs/testing/trc-3/root-reply-valid-row-prefix-suffix-v2.json"
             ),
         }
     }
@@ -99,7 +98,7 @@ struct NativeRootReplyRefusal {
 #[serde(deny_unknown_fields)]
 struct Freeze {
     schema_version: u32,
-    status: String,
+    contract: String,
     scenario: String,
     topology: String,
     sql: String,
@@ -108,18 +107,20 @@ struct Freeze {
     capture_millis: u64,
     maximum_target_attempts: u64,
     forward_millis: u64,
-    mysql_packet_cap: usize,
-    mysql_error_code: u16,
-    mysql_sqlstate: String,
-    metadata_oracle: String,
-    root_meta_proof: String,
+    expected_native_body_bytes: usize,
     expected_native_body_sha256: String,
+    expected_value_length: usize,
+    trino_error_code: i64,
+    trino_error_name: String,
+    trino_error_type: String,
+    trino_message: String,
+    health_sql: String,
+    health_type: String,
+    health_value: i64,
     #[serde(default)]
     expected_mutated_body_bytes: Option<usize>,
     #[serde(default)]
     expected_mutated_body_sha256: Option<String>,
-    expected_row_sha256: String,
-    health_row_sha256: String,
 }
 pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
     [Case::Profile, Case::Kind, Case::Prefix, Case::PrefixSuffix]
@@ -134,83 +135,170 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
 }
 #[derive(serde::Serialize)]
 struct NegativeClientAttempt {
-    connection_stage: &'static str,
-    connection_wire: &'static str,
-    connection_failure: Value,
-    mysql: Option<BoundedNegativeTextObservation>,
+    pages: u64,
+    rows: u64,
+    columns: Option<Vec<Column>>,
+    terminal_error: TrinoError,
 }
-async fn negative_client(
-    user: String,
-    port: u16,
-    ready: tokio::sync::oneshot::Sender<()>,
-    connected: tokio::sync::oneshot::Sender<u32>,
-    submit: tokio::sync::oneshot::Receiver<()>,
-    deadline: Instant,
-) -> NegativeClientAttempt {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        let cause = anyhow::anyhow!("absolute client deadline elapsed before connect attempt");
-        return NegativeClientAttempt {
-            connection_stage: "absolute-deadline-before-connect",
-            connection_wire: "not-attempted",
-            connection_failure: failure_summary("mysql-connect-deadline", Some(&cause)),
-            mysql: None,
-        };
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NegativePage {
+    id: String,
+    columns: Option<Vec<Column>>,
+    data: Option<Vec<Value>>,
+    error: Option<TrinoError>,
+    next_uri: Option<String>,
+    update_type: Option<String>,
+    update_count: Option<u64>,
+    stats: NegativeStats,
+}
+#[derive(Deserialize)]
+struct NegativeStats {
+    state: String,
+}
+fn check_negative_page(page: &NegativePage, query_id: &str) -> Result<()> {
+    ensure!(
+        page.id == query_id && page.update_type.is_none() && page.update_count.is_none(),
+        "native refusal lost its original query or became a command completion"
+    );
+    ensure!(
+        page.data.as_ref().is_none_or(Vec::is_empty),
+        "native malformed response published a client row before refusal"
+    );
+    if let Some(columns) = &page.columns {
+        check_payload_columns(columns)?;
     }
-    let connect = tokio::time::timeout_at(
-        tokio::time::Instant::from_std(deadline),
-        AsyncMysqlStream::connect(&user, port, remaining),
-    )
-    .await;
-    match connect {
-        Ok(Ok(mut stream)) => {
-            // Keep the actual connection idle until the original statement
-            // owner has bound this exact SQL and connection before submission.
-            let admission = async {
-                connected.send(stream.connection_id()?).map_err(|_| {
-                    anyhow::anyhow!("root reply connection owner closed before binding")
-                })?;
-                tokio::time::timeout_at(deadline.into(), submit)
-                    .await
-                    .context("root reply original submission deadline")?
-                    .context("root reply original submission owner closed")?;
-                Ok::<(), anyhow::Error>(())
+    if page.error.is_some() {
+        ensure!(
+            page.next_uri.is_none() && page.stats.state == "FAILED",
+            "native refusal is not the actual terminal failed Trino page"
+        );
+    } else {
+        ensure!(
+            page.next_uri.is_some(),
+            "native fault unexpectedly completed successfully"
+        );
+    }
+    Ok(())
+}
+fn negative_client(
+    actor: TrinoClient,
+    query_id: String,
+    first_uri: String,
+    live: Arc<Mutex<Option<String>>>,
+) -> Result<NegativeClientAttempt> {
+    let mut uri = first_uri;
+    let mut pages = 0u64;
+    let mut columns = None;
+    loop {
+        let raw = actor.get(&uri)?;
+        ensure!(
+            raw.status == 200,
+            "native refusal returned HTTP {} instead of a typed SQL error",
+            raw.status
+        );
+        let page: NegativePage = serde_json::from_slice(&raw.body)?;
+        // The raw actor retains every original body and repeated header. Only
+        // one complete page is decoded here; no full-result accumulator.
+        *live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original query URI owner poisoned"))? =
+            page.next_uri.clone();
+        check_negative_page(&page, &query_id)?;
+        pages = pages
+            .checked_add(1)
+            .context("original Trino page count overflow")?;
+        if let Some(actual) = page.columns {
+            if let Some(previous) = &columns {
+                ensure!(
+                    previous == &actual,
+                    "native refusal metadata changed between pages"
+                );
             }
-            .await;
-            if let Err(cause) = admission {
-                return NegativeClientAttempt {
-                    connection_stage: "authenticated-before-submission",
-                    connection_wire: "handshake-bytes-unobserved",
-                    connection_failure: failure_summary("mysql-statement-binding", Some(&cause)),
-                    mysql: None,
-                };
-            }
-            NegativeClientAttempt {
-                connection_stage: "authenticated",
-                connection_wire: "handshake-bytes-unobserved",
-                connection_failure: Value::Null,
-                mysql: Some(
-                    stream
-                        .observe_bounded_contract_error(SQL, ready, deadline)
-                        .await,
-                ),
-            }
+            columns = Some(actual);
         }
-        Ok(Err(error)) => NegativeClientAttempt {
-            connection_stage: "failed-before-observer",
-            connection_wire: "unknown-partial-handshake",
-            connection_failure: failure_summary("mysql-connect", Some(&error)),
-            mysql: None,
-        },
-        Err(error) => {
-            let cause = anyhow::Error::new(error);
-            NegativeClientAttempt {
-                connection_stage: "absolute-deadline-before-observer",
-                connection_wire: "unknown-partial-handshake",
-                connection_failure: failure_summary("mysql-connect-deadline", Some(&cause)),
-                mysql: None,
-            }
+        if let Some(error) = page.error {
+            return Ok(NegativeClientAttempt {
+                pages,
+                rows: 0,
+                columns,
+                terminal_error: error,
+            });
         }
+        uri = page
+            .next_uri
+            .context("nonterminal original query has no continuation")?;
+        *live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original query URI owner poisoned"))? = Some(uri.clone());
+    }
+}
+fn check_payload_columns(columns: &[Column]) -> Result<()> {
+    ensure!(
+        columns.len() == 1
+            && columns[0].name == "payload"
+            && columns[0].type_name == "varchar"
+            && columns[0].type_signature.raw_type == "varchar"
+            && columns[0].type_signature.arguments == [TypeArgument::Long(2_147_483_647)],
+        "native query lost its independent VARCHAR payload declaration"
+    );
+    Ok(())
+}
+fn check_trino(observed: &NegativeClientAttempt, freeze: &Freeze) -> Result<()> {
+    let error = &observed.terminal_error;
+    ensure!(
+        observed.pages > 0
+            && observed.rows == 0
+            && error.error_code == freeze.trino_error_code
+            && error.error_name == freeze.trino_error_name
+            && error.error_type == freeze.trino_error_type
+            && error.message == freeze.trino_message,
+        "real FE did not report the exact typed semantic refusal with zero published rows"
+    );
+    if let Some(columns) = &observed.columns {
+        check_payload_columns(columns)?;
+    }
+    Ok(())
+}
+fn join_client(
+    job: std::thread::JoinHandle<Result<NegativeClientAttempt>>,
+) -> Result<NegativeClientAttempt> {
+    job.join()
+        .map_err(|payload| anyhow::Error::new(OriginalClientPanic(Mutex::new(payload))))?
+}
+#[derive(Debug)]
+struct OriginalClientPanic(Mutex<Box<dyn std::any::Any + Send>>);
+impl std::fmt::Display for OriginalClientPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _original = &self.0;
+        f.write_str("original Trino refusal reader panicked; original payload retained")
+    }
+}
+impl std::error::Error for OriginalClientPanic {}
+fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(RootReplyCleanupFailure { primary, cleanup }.into()),
+    }
+}
+#[derive(Debug)]
+struct RootReplyCleanupFailure {
+    primary: anyhow::Error,
+    cleanup: anyhow::Error,
+}
+impl std::fmt::Display for RootReplyCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}; actual original Root reply cleanup failed: {:#}",
+            self.primary, self.cleanup
+        )
+    }
+}
+impl std::error::Error for RootReplyCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
     }
 }
 
@@ -252,7 +340,7 @@ impl Scenario for NativeRootReplyRefusal {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        Ok(Some(self.intent.freeze(
+        Ok(Some(self.intent.freeze_root_observation(
             vec![StatementSpec {
                 sql: SQL.into(),
                 faults: Vec::new(),
@@ -260,7 +348,6 @@ impl Scenario for NativeRootReplyRefusal {
                     .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(1)))
                     .collect(),
             }],
-            &[],
             cluster_size,
             binary,
             deadline,
@@ -289,8 +376,8 @@ impl Scenario for NativeRootReplyRefusal {
         );
         let freeze: Freeze = serde_json::from_str(self.case.freeze())?;
         ensure!(
-            freeze.schema_version == 1
-                && freeze.status == "draft-unexecuted"
+            freeze.schema_version == 2
+                && freeze.contract == "TRC-3 spec3 P4; approved plan4 P04"
                 && freeze.scenario == self.name()
                 && freeze.topology == "1FE+3BE"
                 && freeze.sql == SQL
@@ -298,128 +385,129 @@ impl Scenario for NativeRootReplyRefusal {
                 && freeze.capture_millis == 5000
                 && freeze.maximum_target_attempts == 32
                 && freeze.forward_millis == 20000
-                && freeze.mysql_packet_cap == 4096
-                && freeze.mysql_error_code == 1105
-                && freeze.mysql_sqlstate == "HY000"
-                && freeze.metadata_oracle
-                    == "complete-same-SQL-successful-native-baseline-plus-fixed-encoder-fields"
-                && freeze.root_meta_proof
-                    == "known-semantic-profile-purpose-schema-not-exact-protobuf-bytes",
-            "unsupported frozen negative contract"
+                && freeze.expected_native_body_bytes == 72
+                && freeze.expected_value_length == 64
+                && freeze.health_sql == HEALTH
+                && freeze.health_type == "bigint"
+                && freeze.health_value == 5050,
+            "unsupported independent Trino negative contract"
         );
         validate_suffix_freeze(&freeze, self.case)?;
-        // The baseline also opens BE Exchange subscriptions. Bind the original live
-        // roster before SQL so the existing actor owns their exact H2 cancellation.
-        for backend in 0..context.handle().be_count() {
+        for backend in 0..3 {
             context.handle().native_exchange_fault(backend)?;
         }
         let control = context.handle().native_root_reply_fault(0)?;
         let epoch = Instant::now();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
         let mut job = None;
         let mut observation = None;
-        let mut evidence = json!({"schema_version":1,"scenario":self.name(),"freeze":serde_json::from_str::<Value>(self.case.freeze())?});
-        let outcome = (|| -> Result<()> {
+        let mut cancel_actor = None::<TrinoClient>;
+        let live = Arc::new(Mutex::new(None::<String>));
+        let mut evidence = json!({"schema_version":2,"scenario":self.name(),"input":serde_json::from_str::<Value>(self.case.freeze())?,
+            "scope":"same Native semantic refusal and independent logical Trino metadata/values; MySQL packet ordering and historical wire hashes retired"});
+        let primary = (|| -> Result<()> {
             check_effective(context, &mut evidence)?;
             context.recheck_live_process_launch_identities()?;
             await_idle(context, "root-reply", "before-baseline", epoch)?;
             zero_roots(context, "before-baseline", &mut evidence)?;
-            let baseline = positive_query(context, &runtime, SQL)?;
+            let baseline = positive_query(context, SQL)?;
+            check_payload_columns(&baseline.columns)?;
             ensure!(
-                baseline.error.is_none()
-                    && baseline.rows == 1
-                    && baseline.row_payload_bytes == 65
-                    && baseline.packets == 5
-                    && baseline.columns == 1
-                    && baseline.schema
-                        == [TextColumnObservation {
-                            name: "payload".to_owned(),
-                            mysql_type: 253
-                        }]
-                    && baseline.row_sha256 == freeze.expected_row_sha256,
-                "same-SQL native metadata baseline differs from frozen scalar row"
+                baseline.is_result_set()
+                    && baseline.rows == [vec![TrinoValue::Text("x".repeat(64))]],
+                "same-SQL native baseline differs from independent logical scalar input"
             );
-            let metadata_hash = baseline.metadata_sha256.clone();
-            evidence["metadata_baseline"] = serde_json::to_value(baseline)?;
+            let [TrinoValue::Text(value)] = baseline.rows[0].as_slice() else {
+                anyhow::bail!("baseline has no actual String value");
+            };
+            evidence["metadata_baseline"] = json!({"columns":baseline.columns,"rows":baseline.rows.len(),"actual_value":value,"pages":baseline.pages});
             await_idle(context, "root-reply", "before-capture", epoch)?;
             zero_roots(context, "before-capture", &mut evidence)?;
             let before = logs(context)?;
             let processes = (0..3)
-                .map(|i| context.handle().backend_process_id(i))
+                .map(|index| context.handle().backend_process_id(index))
                 .collect::<Result<Vec<_>>>()?;
-            let user = context.mysql_user().to_owned();
-            let port = context.mysql_port();
-            let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
-            let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
-            let (submit_tx, submit_rx) = tokio::sync::oneshot::channel();
-            let selected = self.intent.take(0)?;
             ensure!(
-                context.remaining("absolute capture and client join")? >= CLIENT,
-                "insufficient remaining scenario budget for bounded query join"
+                context.remaining("absolute capture and original Trino join")? >= CLIENT,
+                "insufficient original budget for bounded query join"
             );
-            let client_started = Instant::now();
-            let client_deadline = client_started + CLIENT;
-            let deadline = client_started + CAPTURE;
+            let started = Instant::now();
+            let query_deadline = started + CLIENT;
+            let deadline = started + CAPTURE;
+            let frontend = context
+                .handle()
+                .original_root_observation_frontend_identity(query_deadline)?;
+            let actor = TrinoClient::new(
+                context.trino_port(),
+                context.sql_user(),
+                query_deadline,
+                &context.scenario_root().join("root-reply-trino-http"),
+            )?
+            .with_session(&[("x-trino-time-zone", "Asia/Shanghai")]);
+            cancel_actor = Some(actor.clone());
+            let pending = actor.submit(SQL)?;
+            ensure!(
+                pending.status == 200,
+                "original Trino POST did not return a pending query"
+            );
+            let pending_page: NegativePage = serde_json::from_slice(&pending.body)?;
+            check_negative_page(&pending_page, &pending_page.id)?;
+            ensure!(
+                pending_page.error.is_none() && pending_page.stats.state == "QUEUED",
+                "Native statement executed before its exact Trino arm"
+            );
+            let query_id = pending_page.id;
+            let uri = pending_page
+                .next_uri
+                .context("original pending query has no continuation")?;
+            *live
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original query URI owner poisoned"))? =
+                Some(uri.clone());
+            observation = Some(
+                self.intent
+                    .take(0)?
+                    .arm_client_query(context, &query_id, SQL)?,
+            );
             control.begin_capture(deadline)?;
-            job = Some(runtime.spawn(negative_client(
-                user,
-                port,
-                ready_tx,
-                connected_tx,
-                submit_rx,
-                client_deadline,
-            )));
-            let connection_id = runtime.block_on(async {
-                tokio::time::timeout_at(deadline.into(), connected_rx)
-                    .await
-                    .context("root reply idle connection deadline")?
-                    .context("root reply client closed before publishing its actual connection")
-            })?;
-            observation = Some(selected.arm(context, connection_id, SQL)?);
-            submit_tx.send(()).map_err(|_| {
-                anyhow::anyhow!("root reply client closed before its bound SQL submission")
-            })?;
+            let original_live = live.clone();
+            let original_query_id = query_id.clone();
+            job = Some(
+                std::thread::Builder::new()
+                    .name("native-refusal-trino".into())
+                    .spawn(move || negative_client(actor, original_query_id, uri, original_live))?,
+            );
+            let installed = context
+                .handle()
+                .await_statement_root_installed(observation.as_ref().unwrap(), deadline)?;
             let mut snapshots = Vec::with_capacity(51);
-            let mut metadata_ready = false;
             loop {
                 ensure!(
                     Instant::now() < deadline && snapshots.len() < 51,
-                    "exact root proof exceeded original capture clock"
+                    "exact Native refusal proof exceeded original capture clock"
                 );
                 ensure!(
                     !job.as_ref()
-                        .context("missing negative client")?
+                        .context("missing original Trino reader")?
                         .is_finished(),
-                    "negative client exited before exact arm"
+                    "original Trino reader exited before exact Native mutation arm"
                 );
-                if !metadata_ready {
-                    match ready_rx.try_recv() {
-                        Ok(()) => metadata_ready = true,
-                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-                        Err(_) => anyhow::bail!("negative metadata observer closed before arm"),
-                    }
-                }
                 let roots = census(context, deadline)?;
                 snapshots.push(json!({"epoch_micros":epoch.elapsed().as_micros(),"roots":roots}));
                 evidence["capture_samples"] = json!(snapshots);
                 if roots.iter().all(Option::is_some) {
-                    let occupied: Vec<_> = roots
+                    let occupied = roots
                         .iter()
                         .enumerate()
-                        .filter_map(|(i, r)| {
-                            (r.as_ref().expect("checked availability")["channels"] != 0)
-                                .then_some(i)
+                        .filter_map(|(index, root)| {
+                            (root.as_ref().unwrap()["channels"] != 0).then_some(index)
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
                     ensure!(
                         occupied.len() <= 1,
-                        "multiple fresh root owners cannot establish exact target"
+                        "multiple fresh roots cannot establish exact fault target"
                     );
-                    if let [be] = occupied.as_slice() {
-                        let root = roots[*be].as_ref().expect("available root");
+                    if let [backend] = occupied.as_slice() {
+                        let root = roots[*backend].as_ref().unwrap();
                         if root["channels"] == 1
                             && root["terminal_task_records"] == 1
                             && root["producers_running"] == 0
@@ -429,19 +517,23 @@ impl Scenario for NativeRootReplyRefusal {
                             && root["sealed"] == 0
                             && root["data_positions"] == 1
                             && root["segments"] == 1
-                            && root["payload_bytes"] == 69
-                            && roots.iter().enumerate().all(|(i, r)| {
-                                i == *be || r.as_ref().expect("available").values().all(|n| *n == 0)
+                            && root["payload_bytes"] == 72
+                            && roots.iter().enumerate().all(|(index, root)| {
+                                index == *backend
+                                    || root.as_ref().unwrap().values().all(|value| *value == 0)
                             })
-                            && metadata_ready
                         {
                             let after = logs(context)?;
-                            let (task, frontend) =
-                                independent_target(&before, &after, *be, &processes)?;
+                            let (task, observed_frontend) =
+                                independent_target(&before, &after, *backend, &processes)?;
+                            ensure!(
+                                task == installed.root && observed_frontend == frontend,
+                                "original FE Installed identity differs from independent Task/backend/frontend facts"
+                            );
                             context.recheck_live_process_launch_identities()?;
                             if let Some(candidate) = control.candidate() {
                                 ensure!(
-                                    candidate.backend_index == *be
+                                    candidate.backend_index == *backend
                                         && candidate.caller == frontend
                                         && candidate.read.root_task() == task
                                         && candidate.read.profile().get() == 1
@@ -449,14 +541,19 @@ impl Scenario for NativeRootReplyRefusal {
                                             == novarocks_result_contract::RootOutputKind::ClientRows
                                         && candidate.read.consumed() == 0
                                         && candidate.read.wanted().map(|n| n.get()) == Some(1),
-                                    "candidate differs from independently unique native task/frontend/root"
+                                    "candidate differs from original Installed Task/frontend/root"
                                 );
-                                evidence["exact_target"] = json!({"backend_index":be,"backend_process":processes[*be].to_string(),
-                                    "task":task.to_string(),"frontend_process":frontend.to_string(),
-                                    "independent_markers":appended_markers(&before,&after)?,
-                                    "root_meta_known_facts":{"profile":1,"kind":"ClientRows","schema":[{"name":"payload","mysql_type":253}]},
-                                    "metadata_sha256":metadata_hash,"candidate_request_sha256":candidate.request_sha256});
-                                control.arm_exact(task, frontend, *be, self.case.mutation())?;
+                                evidence["exact_target"] = json!({"backend_index":backend,"backend_process":processes[*backend].to_string(),
+                                    "task":task.to_string(),"frontend_process":frontend.to_string(),"client_query_id":query_id,
+                                    "installed_status_version":installed.status_version.get(),"independent_markers":appended_markers(&before,&after)?,
+                                    "known_root_profile":1,"known_root_kind":"ClientRows","independent_value_length":64,
+                                    "candidate_request_sha256":candidate.request_sha256});
+                                control.arm_exact(
+                                    task,
+                                    frontend,
+                                    *backend,
+                                    self.case.mutation(),
+                                )?;
                                 break;
                             }
                         }
@@ -467,88 +564,83 @@ impl Scenario for NativeRootReplyRefusal {
                         .min(deadline.saturating_duration_since(Instant::now())),
                 );
             }
-            let observed = runtime
-                .block_on(job.take().context("negative client missing at join")?)
-                .context("negative client task failed while joining")?;
-            evidence["negative_client"] = serde_json::to_value(&observed)?;
-            let mysql = observed.mysql.as_ref().context(
-                "connection failed before MySQL observer; partial connection wire unknown",
+            let observed = join_client(
+                job.take()
+                    .context("original Trino reader missing at join")?,
             )?;
-            check_mysql(mysql, &freeze, &metadata_hash, self.case)?;
+            evidence["negative_client"] = serde_json::to_value(&observed)?;
+            check_trino(&observed, &freeze)?;
             check_fault(&control.observation(), &freeze, self.case)?;
             evidence["fault_complete"] = serde_json::to_value(control.observation())?;
             control.disarm();
             await_idle(context, "root-reply", "after-refusal", epoch)?;
             zero_roots(context, "after-refusal", &mut evidence)?;
-            let health = positive_query(context, &runtime, HEALTH)?;
+            let health = positive_query(context, HEALTH)?;
             ensure!(
-                health.error.is_none()
-                    && health.rows == 1
-                    && health.row_payload_bytes == 5
-                    && health.packets == 5
-                    && health.row_sha256 == freeze.health_row_sha256
-                    && health.schema
-                        == [TextColumnObservation {
-                            name: "total".to_owned(),
-                            mysql_type: 8
-                        }],
-                "normal native query failed after fault phase closed"
+                health.is_result_set()
+                    && health.columns.len() == 1
+                    && health.columns[0].name == "total"
+                    && health.columns[0].type_name == "bigint"
+                    && health.columns[0].type_signature.raw_type == "bigint"
+                    && health.columns[0].type_signature.arguments.is_empty()
+                    && health.rows == [vec![TrinoValue::Integer(5050)]],
+                "ordinary Native Trino query failed after exact fault closed"
             );
-            evidence["healthy_mysql"] = serde_json::to_value(health)?;
+            evidence["healthy_trino"] = json!({"columns":health.columns,"rows":health.rows.len(),"actual_total":single_integer(&health)?,"pages":health.pages});
             await_idle(context, "root-reply", "after-health", epoch)?;
             zero_roots(context, "after-health", &mut evidence)?;
             check_fault(&control.observation(), &freeze, self.case)?;
             context.recheck_live_process_launch_identities()?;
             Ok(())
         })();
-        // Failure paths release the held slot and actually join the client;
-        // dropping a runtime or issuing KILL QUERY is not a successful refusal.
+        // A failed capture must still cancel this exact public query, release
+        // the original proxy slot and join its original HTTP reader.
         control.disarm();
-        let cleanup_join = if let Some(job) = job.take() {
-            match runtime.block_on(job) {
-                Ok(observed) => {
-                    evidence["cleanup_negative_client"] = serde_json::to_value(&observed)?;
-                    if observed.mysql.is_some() {
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "connection failed before negative observer; actual cause retained in client evidence"
-                        ))
-                    }
-                }
-                Err(error) => {
-                    Err(anyhow::Error::new(error).context("negative client cleanup join failed"))
+        let cancelled = (|| -> Result<()> {
+            if primary.is_err() {
+                let uri = live
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("original query URI owner poisoned"))?
+                    .clone();
+                if let Some(uri) = uri {
+                    let actor = cancel_actor
+                        .as_ref()
+                        .context("live original query has no cancel actor")?;
+                    let response = actor.delete(&uri)?;
+                    ensure!(
+                        matches!(response.status, 200 | 204),
+                        "same-query Trino cleanup DELETE failed"
+                    );
                 }
             }
-        } else {
             Ok(())
-        };
-        let cleanup_owners = if outcome.is_err() {
+        })();
+        let cleanup_join = job
+            .take()
+            .map_or(Ok(()), |job| join_client(job).map(|_| ()));
+        let cleanup_owners = if primary.is_err() {
             await_idle(context, "root-reply", "failure-cleanup", epoch)
                 .and_then(|_| zero_roots(context, "failure-cleanup", &mut evidence))
         } else {
             Ok(())
         };
-        let cleanup_observation = if let Some(observation) = observation.as_ref() {
+        let cleanup_observation = observation.as_ref().map_or(Ok(()), |observation| {
             let deadline = context.deadline();
             context
                 .handle()
                 .drain_query_lifecycle_statement_binding(observation, deadline)
-        } else {
-            Ok(())
-        };
-        evidence["failure_summaries"] = json!({
-            "primary": failure_summary("scene-contract", outcome.as_ref().err()),
-            "client_join": failure_summary("client-join", cleanup_join.as_ref().err()),
-            "owner_cleanup": failure_summary("owner-cleanup", cleanup_owners.as_ref().err()),
-            "statement_observation": failure_summary("statement-observation", cleanup_observation.as_ref().err()),
         });
+        evidence["failure_summaries"] = json!({"primary":failure_summary("scene-contract",primary.as_ref().err()),
+            "cancel":failure_summary("same-query-cancel",cancelled.as_ref().err()),
+            "client_join":failure_summary("client-join",cleanup_join.as_ref().err()),
+            "owner_cleanup":failure_summary("owner-cleanup",cleanup_owners.as_ref().err()),
+            "statement_observation":failure_summary("statement-observation",cleanup_observation.as_ref().err())});
         evidence["actor_before_shutdown"] = serde_json::to_value(control.observation())?;
-        if outcome.is_err()
+        if primary.is_err()
+            || cancelled.is_err()
             || cleanup_join.is_err()
             || cleanup_owners.is_err()
             || cleanup_observation.is_err()
-            || !control.observation().failures.is_empty()
         {
             context.retain_artifacts();
         }
@@ -556,68 +648,99 @@ impl Scenario for NativeRootReplyRefusal {
         let post = control.observation();
         let joined = check_shutdown(&post);
         evidence["actor_after_shutdown"] = serde_json::to_value(post)?;
-        evidence["outcome"] = json!({"contract_and_recovery_ok":outcome.is_ok(),"client_join_ok":cleanup_join.is_ok(),
+        evidence["outcome"] = json!({"contract_and_recovery_ok":primary.is_ok(),"client_join_ok":cleanup_join.is_ok(),
             "cluster_shutdown_ok":shutdown.is_ok(),"actor_join_ok":joined.is_ok(),"failure_owner_cleanup_ok":cleanup_owners.is_ok(),
-            "statement_observation_cleanup_ok":cleanup_observation.is_ok()});
-        std::fs::write(
+            "statement_observation_cleanup_ok":cleanup_observation.is_ok(),"same_query_cancel_ok":cancelled.is_ok()});
+        let recorded = std::fs::write(
             context
                 .scenario_root()
                 .join("native-root-reply-observations.json"),
             serde_json::to_vec_pretty(&evidence)?,
-        )?;
-        outcome?;
-        cleanup_owners?;
-        cleanup_join?;
-        cleanup_observation?;
-        shutdown?;
-        joined?;
-        context.action("verified one exact native RootReply semantic refusal, no target ACK, owner convergence and normal native recovery");
+        )
+        .map_err(anyhow::Error::from);
+        let result = with_cleanup(
+            with_cleanup(
+                with_cleanup(
+                    with_cleanup(
+                        with_cleanup(with_cleanup(primary, cancelled), cleanup_join),
+                        cleanup_owners,
+                    ),
+                    cleanup_observation,
+                ),
+                shutdown,
+            ),
+            joined,
+        );
+        with_cleanup(result, recorded)?;
+        context.action("verified exact Native RootReply semantic refusal, zero public rows/target ACK, real reader/actor Join and Native Trino recovery");
         Ok(())
     }
 }
 
-// Only the new closed fixture carries a mutation-body oracle; older inputs stay exact.
+// Independent ASCII JSON input, not a production renderer or candidate output.
+fn payload_literal() -> Vec<u8> {
+    let mut body = vec![68, 0, 0, 0, b'[', b'"'];
+    body.extend_from_slice(&[b'x'; 64]);
+    body.extend_from_slice(b"\"]");
+    body
+}
 fn validate_suffix_freeze(freeze: &Freeze, case: Case) -> Result<()> {
+    let mut body = payload_literal();
+    ensure!(
+        body.len() == 72
+            && freeze.expected_native_body_bytes == 72
+            && format!("{:x}", Sha256::digest(&body)) == freeze.expected_native_body_sha256,
+        "independent Trino Native input does not match its literal"
+    );
+    let (code, name, kind, message) = match case {
+        Case::Profile | Case::Kind => (
+            65536,
+            "GENERIC_INTERNAL_ERROR",
+            "INTERNAL_ERROR",
+            "[query.execution.invariant] root response violates its contract",
+        ),
+        Case::Prefix | Case::PrefixSuffix => (
+            0,
+            "GENERIC_USER_ERROR",
+            "USER_ERROR",
+            "[query.execution.invalid_data] client-row prefix has no payload in the same body",
+        ),
+    };
+    ensure!(
+        freeze.trino_error_code == code
+            && freeze.trino_error_name == name
+            && freeze.trino_error_type == kind
+            && freeze.trino_message == message,
+        "independent Trino semantic error contract changed"
+    );
     if matches!(case, Case::PrefixSuffix) {
+        body.extend_from_slice(&[1, 0, 0, 0]);
         ensure!(
-            freeze.expected_mutated_body_bytes == Some(73)
+            freeze.expected_mutated_body_bytes == Some(76)
                 && freeze.expected_mutated_body_sha256.as_deref()
-                    == Some("112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7")
+                    == Some(format!("{:x}", Sha256::digest(&body)).as_str())
                 && freeze.contract_reason
                     == "[query.execution.invalid_data] client-row prefix has no payload in the same body",
-            "unsupported frozen valid-row prefix-only suffix"
+            "unsupported valid-row prefix-only suffix input"
         );
     } else {
         ensure!(
             freeze.expected_mutated_body_bytes.is_none()
                 && freeze.expected_mutated_body_sha256.is_none(),
-            "existing refusal fixture cannot acquire a suffix-body oracle"
+            "refusal fixture unexpectedly acquired a suffix input"
         );
     }
     Ok(())
 }
-
-fn positive_query(
-    context: &mut ScenarioContext,
-    runtime: &tokio::runtime::Runtime,
-    sql: &str,
-) -> Result<TextResultObservation> {
+fn positive_query(context: &mut ScenarioContext, sql: &str) -> Result<StatementResult> {
     let before = (0..3)
-        .map(|i| context.handle().backend_task_execution_tasks_created(i))
+        .map(|index| context.handle().backend_task_execution_tasks_created(index))
         .collect::<Result<Vec<_>>>()?;
-    let timeout = context.remaining("normal native query")?.min(CLIENT);
-    let observed = runtime.block_on(async {
-        tokio::time::timeout(timeout, async {
-            let mut stream =
-                AsyncMysqlStream::connect(context.mysql_user(), context.mysql_port(), timeout)
-                    .await?;
-            Ok::<_, anyhow::Error>(stream.observe_text_query(sql, Duration::ZERO).await)
-        })
-        .await
-        .context("absolute positive client phase deadline exceeded")?
-    })?;
+    let deadline = context.deadline().min(Instant::now() + CLIENT);
+    let observed =
+        SqlSession::new(context.sql_user(), context.trino_port(), deadline)?.execute(sql)?;
     let after = (0..3)
-        .map(|i| context.handle().backend_task_execution_tasks_created(i))
+        .map(|index| context.handle().backend_task_execution_tasks_created(index))
         .collect::<Result<Vec<_>>>()?;
     ensure!(
         before
@@ -625,44 +748,9 @@ fn positive_query(
             .zip(&after)
             .all(|(a, b)| a.is_finite() && b.is_finite() && *a >= 0.0 && b >= a)
             && before.iter().zip(&after).any(|(a, b)| b > a),
-        "normal query never created a native task"
+        "ordinary Trino query never created a Native Task"
     );
     Ok(observed)
-}
-
-fn check_mysql(
-    observed: &BoundedNegativeTextObservation,
-    freeze: &Freeze,
-    metadata: &str,
-    case: Case,
-) -> Result<()> {
-    let err = observed
-        .terminal
-        .as_ref()
-        .context("no complete protocol-41 contract ERR")?;
-    ensure!(
-        observed.text.error.is_none()
-            && observed.completed_metadata
-            && observed.metadata_payload_hex.len() == 3
-            && observed.text.columns == 1
-            && observed.text.packets == 4
-            && observed.text.rows == 0
-            && observed.text.row_payload_bytes == 0
-            && observed.text.first_row_micros.is_none()
-            && observed.text.first_payload_chunk_micros.is_none()
-            && observed.text.metadata_sha256 == metadata
-            && err.sequence == 4
-            && err.code == freeze.mysql_error_code
-            && err.sqlstate == freeze.mysql_sqlstate
-            && match case {
-                Case::Profile | Case::Kind =>
-                    err.message == "[query.execution.invariant] root response violates its contract",
-                Case::Prefix | Case::PrefixSuffix => err.message == freeze.contract_reason,
-            }
-            && err.payload_hex.starts_with("ff5104234859303030"),
-        "real FE did not report the exact semantic contract refusal with complete metadata and zero rows"
-    );
-    Ok(())
 }
 fn check_fault(obs: &RootReplyFaultObservation, freeze: &Freeze, case: Case) -> Result<()> {
     ensure!(
@@ -690,7 +778,7 @@ fn check_fault(obs: &RootReplyFaultObservation, freeze: &Freeze, case: Case) -> 
             && old["kind"] == "ClientRows"
             && old["sequence"] == 1
             && old["accepted_consumed"] == 0
-            && old["body_bytes"] == 69
+            && old["body_bytes"] == 72
             && old["body_sha256"] == freeze.expected_native_body_sha256
             && new["mutation"] == format!("{:?}", case.mutation())
             && new["task"] == old["task"]
@@ -738,7 +826,7 @@ fn check_fault(obs: &RootReplyFaultObservation, freeze: &Freeze, case: Case) -> 
                     && new["output_kind"]
                         .as_str()
                         .is_some_and(|s| s.contains("ClientRows(true)"))
-                    && new["body_bytes"] == 73
+                    && new["body_bytes"] == 76
                     && new["body_sha256"].as_str()
                         == freeze.expected_mutated_body_sha256.as_deref(),
                 "valid-row prefix-only suffix mutation differs"
@@ -1313,81 +1401,73 @@ mod root_reply_predicate_tests {
         assert!(independent_target(&before, &after, 1, &processes[..2]).is_err());
     }
 
-    use crate::actors::mysql_stream::root_reply_test_peer::{Mode, script};
-
-    #[tokio::test]
-    async fn scripted_sequence_interrupted_eof_and_ok_never_satisfy_real_contract_err_oracle() {
-        let freeze: Freeze = serde_json::from_str(Case::Profile.freeze()).expect("freeze");
-        for mode in [Mode::WrongSequence, Mode::Interrupted, Mode::Eof, Mode::Ok] {
-            let result = script(mode, Duration::ZERO)
-                .await
-                .expect("joined scripted peer");
-            assert!(
-                check_mysql(
-                    &result.observed,
-                    &freeze,
-                    &result.metadata_sha256,
-                    Case::Profile
-                )
-                .is_err(),
-                "accepted {mode:?}"
-            );
-            assert!(
-                result.observed.completed_metadata,
-                "failure must occur after complete valid metadata"
-            );
-            if matches!(mode, Mode::Interrupted) {
-                assert_eq!(
-                    result.observed.text.error, None,
-                    "1317 is a full structurally valid ERR, not a parser failure"
-                );
-                assert_eq!(
-                    result
-                        .observed
-                        .terminal
-                        .as_ref()
-                        .expect("complete ERR")
-                        .code,
-                    1317
-                );
+    #[test]
+    fn raw_trino_refusal_rejects_success_cancel_transport_shape_and_partial_rows() {
+        let freeze: Freeze = serde_json::from_str(Case::Profile.freeze()).unwrap();
+        let original = json!({"id":"original-query","stats":{"state":"FAILED"},
+            "error":{"message":freeze.trino_message,"errorCode":65536,"errorName":"GENERIC_INTERNAL_ERROR","errorType":"INTERNAL_ERROR"}});
+        let page: NegativePage = serde_json::from_value(original.clone()).unwrap();
+        check_negative_page(&page, "original-query").unwrap();
+        check_trino(
+            &NegativeClientAttempt {
+                pages: 1,
+                rows: 0,
+                columns: None,
+                terminal_error: page.error.unwrap(),
+            },
+            &freeze,
+        )
+        .unwrap();
+        for change in [
+            "query",
+            "row",
+            "completion",
+            "nonterminal",
+            "success",
+            "cancel",
+        ] {
+            let mut value = original.clone();
+            match change {
+                "query" => value["id"] = json!("foreign-query"),
+                "row" => value["data"] = json!([["already-published"]]),
+                "completion" => value["updateType"] = json!("SELECT"),
+                "nonterminal" => value["nextUri"] = json!("http://127.0.0.1:1/unexpected"),
+                "success" => {
+                    value.as_object_mut().unwrap().remove("error");
+                    value["stats"]["state"] = json!("FINISHED");
+                }
+                "cancel" => {
+                    value["error"]["errorCode"] = json!(3);
+                    value["error"]["errorName"] = json!("USER_CANCELED");
+                }
+                _ => unreachable!(),
             }
-            if matches!(mode, Mode::WrongSequence) {
+            let page: NegativePage = serde_json::from_value(value).unwrap();
+            if change == "cancel" {
                 assert!(
-                    result
-                        .observed
-                        .text
-                        .error
-                        .as_deref()
-                        .is_some_and(|e| e.contains("sequence mismatch"))
+                    check_trino(
+                        &NegativeClientAttempt {
+                            pages: 1,
+                            rows: 0,
+                            columns: None,
+                            terminal_error: page.error.unwrap()
+                        },
+                        &freeze
+                    )
+                    .is_err()
                 );
-                let consumed = result.metadata_wire_bytes + 4;
-                assert_eq!(result.observed.text.wire_bytes as usize, consumed);
-                assert_eq!(
-                    result.observed.text.wire_prefix_sha256,
-                    format!("{:x}", Sha256::digest(&result.response_wire[..consumed]))
+            } else {
+                assert!(
+                    check_negative_page(&page, "original-query").is_err(),
+                    "accepted {change}"
                 );
             }
         }
-        // Positive control: the same parser/predicate must accept a complete
-        // 1105/HY000 contract ERR, so the negative checks are not vacuous.
-        let valid = script(Mode::Valid, Duration::ZERO)
-            .await
-            .expect("joined positive control");
-        check_mysql(
-            &valid.observed,
-            &freeze,
-            &valid.metadata_sha256,
-            Case::Profile,
-        )
-        .expect("valid contract ERR oracle");
-        assert!(valid.observed.pending_packet.is_none());
-        assert_eq!(
-            valid.observed.text.wire_bytes as usize,
-            valid.response_wire.len()
-        );
-        assert_eq!(
-            valid.observed.text.wire_prefix_sha256,
-            format!("{:x}", Sha256::digest(&valid.response_wire))
+        assert!(
+            serde_json::from_str::<NegativePage>(
+                r#"{"id":"original-query","stats":{"state":"FAILED"},"error":{"message":"cut"}"#
+            )
+            .is_err()
         );
     }
 
@@ -1395,7 +1475,7 @@ mod root_reply_predicate_tests {
     // not assert that a real FE consumed native bytes or establish identity.
     fn data_fixture(end: Value, freeze: &Freeze) -> RootReplyFaultObservation {
         let original = json!({"task":"test-only-task","profile":1,"kind":"ClientRows","sequence":1,
-            "accepted_consumed":0,"body_bytes":69,"body_sha256":freeze.expected_native_body_sha256,"end_after_data":end});
+            "accepted_consumed":0,"body_bytes":72,"body_sha256":freeze.expected_native_body_sha256,"end_after_data":end});
         let mutated = json!({"task":"test-only-task","profile":2,"output_kind":"Some(ClientRows(true))","sequence":1,
             "accepted_consumed":0,"mutation":"ProfileTwo","body_sha256":freeze.expected_native_body_sha256,
             "end_after_data":original["end_after_data"]});
@@ -1408,7 +1488,7 @@ mod root_reply_predicate_tests {
             stream_positions: 0,
             target_slots: 0,
             owned_buffer_bytes: 0,
-            peak_owned_buffer_bytes: 69,
+            peak_owned_buffer_bytes: 72,
             claimed: 1,
             emitted_messages: 1,
             frozen_root_task: Some("test-only-task".to_owned()),
@@ -1443,14 +1523,14 @@ mod root_reply_predicate_tests {
             target_attempt_requests: vec![],
             original: Some(original),
             mutated: Some(mutated),
+            original_hold: None,
         }
     }
     #[test]
     fn frozen_suffix_literal_and_optional_end_are_exact() {
         let freeze: Freeze = serde_json::from_str(Case::PrefixSuffix.freeze()).expect("freeze");
         validate_suffix_freeze(&freeze, Case::PrefixSuffix).unwrap();
-        let mut literal = vec![65, 0, 0, 0, 64];
-        literal.extend_from_slice(&[b'x'; 64]);
+        let mut literal = payload_literal();
         assert_eq!(
             format!("{:x}", Sha256::digest(&literal)),
             freeze.expected_native_body_sha256
@@ -1468,7 +1548,7 @@ mod root_reply_predicate_tests {
             mutated["mutation"] = json!("ValidRowPrefixOnlySuffix");
             mutated["profile"] = json!(1);
             mutated["output_kind"] = json!("ClientRows(true)");
-            mutated["body_bytes"] = json!(73);
+            mutated["body_bytes"] = json!(76);
             mutated["body_sha256"] = json!(digest);
             check_fault(&observed, &freeze, Case::PrefixSuffix).unwrap();
             observed.mutated.as_mut().unwrap()["body_sha256"] =

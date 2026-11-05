@@ -1987,7 +1987,7 @@ mod owner_tests {
                 &writer,
                 ResultWriteSpec::new(
                     id,
-                    crate::runtime::task::io::ResultPresentation::MysqlText,
+                    crate::runtime::task::io::ResultPresentation::ArrowIpc,
                     None,
                     false,
                 ),

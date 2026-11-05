@@ -4434,9 +4434,15 @@ fn conclude_for_work_cancellation(
         && state.conclusion() == Some(conclusion)
         && let Some(runtime) = runtime
     {
-        let (kind, message) = match reason {
-            CancellationReason::DeadlineExceeded
-            | CancellationReason::FrontendDrainDeadlineExceeded => (
+        runtime.accepted_error = Some(match reason {
+            CancellationReason::FrontendDrainDeadlineExceeded => {
+                QueryExecutionError::from_execution(
+                    crate::session_outcome::governed_cancellation_failure_input(
+                        CancellationReason::FrontendDrainDeadlineExceeded,
+                    ),
+                )
+            }
+            CancellationReason::DeadlineExceeded => logical_owner_failure(
                 crate::execution_error::QueryFailureReason::DeadlineExceeded,
                 "logical execution deadline expired before success EOF",
             ),
@@ -4446,12 +4452,11 @@ fn conclude_for_work_cancellation(
             | CancellationReason::ClientCancelRequested
             | CancellationReason::ClientDisconnected
             | CancellationReason::ServerShutdown
-            | CancellationReason::OwnerDropped => (
+            | CancellationReason::OwnerDropped => logical_owner_failure(
                 crate::execution_error::QueryFailureReason::Cancelled,
                 "logical execution was cancelled before success EOF",
             ),
-        };
-        runtime.accepted_error = Some(logical_owner_failure(kind, message));
+        });
     }
 }
 
@@ -9046,56 +9051,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inherited_deadline_is_preserved_on_the_result_stream() {
-        let runtime = Handle::current();
-        let first = execution(8801);
-        let (parent, work_owner, stage) = test_governed_child_work(None);
-        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
-            first,
-            NonZeroUsize::new(4).unwrap(),
-            Vec::new(),
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroU32::new(2).unwrap(),
-            Arc::new(DelayedQualificationPort::default()),
-            work_owner,
-            stage,
-            Duration::from_secs(30),
-        )
-        .unwrap()
-        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
-        .with_result_row_carrier(result_carrier());
-        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+    async fn inherited_deadline_and_frontend_drain_keep_their_original_reason_on_the_result_stream()
+    {
+        for (id, reason, expected) in [
+            (
+                8801,
+                CancellationReason::DeadlineExceeded,
+                "logical execution deadline expired before success EOF",
+            ),
+            (
+                8802,
+                CancellationReason::FrontendDrainDeadlineExceeded,
+                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded",
+            ),
+        ] {
+            let runtime = Handle::current();
+            let first = execution(id);
+            let (parent, work_owner, stage) = test_governed_child_work(None);
+            let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+                first,
+                NonZeroUsize::new(4).unwrap(),
+                Vec::new(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroU32::new(2).unwrap(),
+                Arc::new(DelayedQualificationPort::default()),
+                work_owner,
+                stage,
+                Duration::from_secs(30),
+            )
             .unwrap()
-            .into_parts();
-        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
-            panic!("result execution must expose its row stream");
-        };
-        stream.begin_schema().unwrap().complete();
-        let actor = owner.actor().clone();
-        let running = actor.activate(initial.ready()).await.unwrap();
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap())
+            .with_result_row_carrier(result_carrier());
+            let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+                .unwrap()
+                .into_parts();
+            let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+                panic!("result execution must expose its row stream");
+            };
+            stream.begin_schema().unwrap().complete();
+            let actor = owner.actor().clone();
+            let running = actor.activate(initial.ready()).await.unwrap();
 
-        parent.cancel(CancellationReason::DeadlineExceeded);
-        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
-        let error = match stream.next().await {
-            Err(error) => error,
-            Ok(_) => panic!("deadline must terminate the result stream"),
-        };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
-        assert_eq!(
-            error.message(),
-            "logical execution deadline expired before success EOF"
-        );
+            parent.cancel(reason);
+            wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+            let error = match stream.next().await {
+                Err(error) => error,
+                Ok(_) => panic!("deadline must terminate the result stream"),
+            };
+            let kind = error.kind();
+            let message = error.message().to_owned();
+            let input = error.execution_failure().cloned();
 
-        drop(running);
-        drop(stream);
-        drop(actor);
-        owner
-            .into_residual_stand_down_supervisor()
-            .join()
-            .await
-            .unwrap();
-        parent.complete();
+            drop(running);
+            drop(stream);
+            drop(actor);
+            owner
+                .into_residual_stand_down_supervisor()
+                .join()
+                .await
+                .unwrap();
+            parent.complete();
+            eprintln!(
+                "original logical cancellation actor, result stream and residual supervisor actually exited before reason assertion"
+            );
+            assert_eq!(kind, QueryExecutionErrorKind::DeadlineExceeded);
+            let input = input.expect("the original logical owner supplies its exact control fact");
+            assert_eq!(
+                input.site(),
+                crate::execution_error::ExecutionFailureSite::Coordinator
+            );
+            assert_eq!(message, expected);
+        }
     }
 
     #[tokio::test]

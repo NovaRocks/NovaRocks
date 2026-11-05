@@ -53,8 +53,8 @@ fn read(wanted: Option<u64>, consumed: u64) -> RootResultRead {
 }
 fn data1() -> RootResultReply {
     let mut bytes = vec![b'x'; S];
-    // Literal native row prefix + MySQL string prefix from the immutable input.
-    bytes[..8].copy_from_slice(&[4, 0, 16, 0, 253, 0, 0, 16]);
+    // Literal Native LE-u32 length plus the JSON string row opening.
+    bytes[..6].copy_from_slice(&[4, 0, 16, 0, b'[', b'"']);
     RootResultReply {
         root_task: root(),
         profile: RootProfileId::V1,

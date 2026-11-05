@@ -49,7 +49,7 @@ deployment_owner = "fe-a"
 base readiness 失败，应从 state/metrics 另行观测。
 
 蓝绿切换顺序是：先等待 green `/readyz`，在 LB/Gateway external deactivate blue，再向 blue FE
-发送 `SIGTERM`。旧 FE 的长期 MySQL session 不能在 drain 后提交新 statement；已准入 attempt 继续到
+发送 `SIGTERM`。旧 FE 的 Trino 入口在 drain 后拒绝新 statement；已准入 attempt 继续到
 内部 deadline。不要依赖 LB 摘流本身实现这个线性化边界。
 
 Kubernetes 示例：

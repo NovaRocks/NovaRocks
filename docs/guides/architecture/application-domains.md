@@ -68,12 +68,12 @@ runtime wrapper 分开，仍共用同业务闸门和调度状态，不弱化 Unk
 | Execution Contract | `novarocks-execution-contract` | 不可变 identity、descriptor、operation、receipt 与纯验证 | registry、重试循环、资源 owner、transport 或执行 kernel |
 | Coordination Contract | `novarocks-coordination-contract` | FE owner 之间实际共用的身份、时间、消息与中立事实 | Tokio、运行资源、领域载荷、任意 callback 或恢复算法 |
 | Query Application | `novarocks-query-application` | request-local 观察/准备，各分布式意图的逻辑执行、attempt 恢复、可见性与计算就绪 | 产品业务结果、publication/GC 策略、角色实现、wire codec 或 Server 配置 |
-| Frontend Application | `novarocks-frontend-application` | FE 装配、prepare 前语句监督、Native attempt 驱动、领域就绪证明与 SQL/MySQL 结果接线 | BE Task registry、第二套逻辑执行 policy 或第二份 Provider 提交真相 |
+| Frontend Application | `novarocks-frontend-application` | FE 装配、prepare 前语句监督、Native attempt 驱动、领域就绪证明与 SQL/Trino 结果接线 | BE Task registry、第二套逻辑执行 policy 或第二份 Provider 提交真相 |
 | Worker | `novarocks-worker` | BE 本地 Task/Participation 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
 | Workload Control | `novarocks-workload-control` | 进程内 scope、责任/完整依赖事实及原结果预算授权 | MV/Statistics/Maintenance 的业务锁、外部提交或 durable truth |
 | Catalog Application | `novarocks-catalog-application` | 长期 Catalog generation 与退休 | 查询局部 compiler 映射或 Connector execution instance |
 | 产品应用 | MV、Statistics、Maintenance application crates | 业务状态、外部效果、发布与业务恢复决定 | Query Application 的通用协调 policy |
-| Native/MySQL adapter | `novarocks-native-adapter`、`novarocks-mysql-adapter` | wire/协议 decode、encode、连接与 transport 事实 | 领域业务 policy 或全局 service locator |
+| Native/Trino adapter | `novarocks-native-adapter`、`novarocks-trino-adapter` | wire/协议 decode、encode、连接与 transport 事实 | 领域业务 policy 或全局 service locator |
 | Server | `novarocks-server` | 配置验证、唯一 owner 构造、窄 handle 注入与逆序 shutdown | SQL/Task wire 的业务解释或查询执行 policy |
 
 依赖方向向政策内侧：产品与角色 adapter 依赖通用应用契约，Server 依赖并组合它们；
@@ -167,7 +167,7 @@ producer Future 正常退出；失败、取消或 attempt 替换不能伪造成�
 
 外层语句/job 同时保存业务是否完成、实际 publication 的累计效果、剩余必要/维护义务和本地
 响应交付事实。seal/NoOp 不产生虚构提交；最后一步未提交不能覆盖前一步已提交或 Unknown。
-成功路径和错误路径都把这些事实传到 MySQL；业务完成后晚到取消不得改成普通中断。
+成功路径和错误路径都把这些事实传到 Trino；业务完成后晚到取消不得改成普通中断。
 响应失败不撤销业务成功，本地发送成功也不证明客户端应用已收到。已发终局不可改写。
 
 派发授权、取消 veto 与 Provider 可能派发前沿各有证据。未派发是 KnownUncommitted；

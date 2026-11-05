@@ -24,11 +24,7 @@ use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
-#[cfg(feature = "mem-1-m07-closing-pressure")]
-mod closing_pressure_fixture;
-#[cfg(feature = "mem-1-m07-exact-mysql-write")]
-mod exact_mysql_write_fixture;
-#[cfg(feature = "mem-1-m07-root-observation")]
+#[cfg(novarocks_dev_controls)]
 mod root_observation_identity;
 
 use crate::capabilities as core_capabilities;
@@ -36,17 +32,12 @@ use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
 use novarocks_mv_application::service::MvKeyedProductService;
-use novarocks_mysql_adapter::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
-use novarocks_query_application::client_connection::{
-    ClientConnectionControlPort, ClientConnectionTerminationReason,
-};
 use novarocks_query_application::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_state_store_runtime::{StateStoreHostInput, StateStoreProviderRegistry};
-use novarocks_types::naming::DEFAULT_DATABASE;
 
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
@@ -117,17 +108,6 @@ pub struct FrontendApplicationOpenConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-#[path = "server/hms_admission_observation.rs"]
-pub(crate) mod hms_admission_observation;
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-pub use hms_admission_observation::HmsListingObservationSetup;
-
-/// Feature-only observer supplied by Server; it owns no provider capability.
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-pub type HmsListingObservationHandler =
-    Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, &'static str> + Send + Sync>;
-
 /// Inputs for the Frontend-owned management listener.
 #[derive(Clone)]
 pub struct FrontendManagementConfig {
@@ -140,15 +120,13 @@ pub struct FrontendManagementConfig {
     /// This process's allocator and physical memory readings for `/metrics`;
     /// `None` exports no process memory series.
     pub process_memory: Option<crate::metrics::FrontendProcessMemoryObservation>,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub hms_listing_observation: Option<HmsListingObservationSetup>,
 }
 
-/// Inputs for serving one ready Frontend application through native and MySQL
-/// listeners. The Server role owns their process supervision.
+/// Inputs for serving one ready Frontend through Native and Trino listeners.
+/// The Server role owns process supervision.
 #[derive(Clone)]
 pub struct FrontendServingConfig {
-    /// Executable-frozen version projected to the MySQL greeting.
+    /// Executable-frozen version exposed by the Trino information endpoint.
     pub server_version: String,
     pub report_bind_host: String,
     pub report_grpc_port: u16,
@@ -156,7 +134,6 @@ pub struct FrontendServingConfig {
     pub frontend_drain_timeout: Duration,
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
-    pub mysql_listener: ResolvedMysqlListenerSettings,
     pub trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
@@ -381,12 +358,6 @@ async fn build_frontend_role_products(
                 if let Some(observer) = observer.upgrade() {
                     observer.on_client_statement_session_registered(query, session);
                 }
-            }))
-            .map_err(FrontendApplicationError::server)?;
-        let session_control = query_application_control.clone();
-        owner
-            .install_session_resolver(Arc::new(move |connection_id| {
-                session_control.current_session_for_test_controls(connection_id)
             }))
             .map_err(FrontendApplicationError::server)?;
     }
@@ -677,7 +648,6 @@ fn build_frontend_query_session_factory_from_role_products(
     host: &FrontendApplicationHost,
     products: &FrontendRoleProducts,
     system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
-    client_connection_control: Arc<dyn ClientConnectionControlPort>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service = Arc::clone(&products.catalog_service);
     let unified_statistics = Arc::clone(&products.unified_statistics);
@@ -821,7 +791,6 @@ fn build_frontend_query_session_factory_from_role_products(
         mv_command_consumer,
         mv_command_executor,
         products.query_control.clone(),
-        client_connection_control,
         Arc::clone(&products.logical_execution_launcher),
         host.workload_root_admission(),
         role,
@@ -862,17 +831,12 @@ async fn build_frontend_query_session_factory(
     system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    client_connection_control: Arc<dyn ClientConnectionControlPort>,
 ) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
     let products =
         build_frontend_role_products(host, exchange_port, mv_storage_observation).await?;
     products.start_background_workers()?;
-    let session_factory = build_frontend_query_session_factory_from_role_products(
-        host,
-        &products,
-        system_catalog,
-        client_connection_control,
-    )?;
+    let session_factory =
+        build_frontend_query_session_factory_from_role_products(host, &products, system_catalog)?;
     Ok((session_factory, products))
 }
 
@@ -967,8 +931,6 @@ pub struct FrontendManagementServer {
     island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
     convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
     metrics_http_server: crate::metrics::MetricsHttpServer,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    hms_admission_observation: Option<Arc<hms_admission_observation::HmsAdmissionObservation>>,
 }
 
 pub fn start_frontend_management_server(
@@ -990,11 +952,7 @@ pub fn start_frontend_management_server(
     let management_convergence_reader: Arc<
         dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    let hms_admission_observation = host
-        .test_session
-        .as_ref()
-        .and_then(|session| session.hms_admission_owner.clone());
+
     #[cfg(novarocks_dev_controls)]
     let statement_observation = host
         .test_session
@@ -1013,10 +971,6 @@ pub fn start_frontend_management_server(
         Some(host.catalog_activity_observer()),
         #[cfg(novarocks_dev_controls)]
         statement_observation,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        hms_admission_observation
-            .as_ref()
-            .map(|owner| owner.handler()),
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {
@@ -1025,8 +979,6 @@ pub fn start_frontend_management_server(
         island_reader,
         convergence_reader,
         metrics_http_server,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        hms_admission_observation,
     })
 }
 
@@ -1034,12 +986,7 @@ impl FrontendManagementServer {
     pub fn install(&self, host: &FrontendApplicationHost) -> Result<(), FrontendApplicationError> {
         // The original role runner calls this after opening its original Host
         // and before creating role products/admission observers/SQL readiness.
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        if let Some(owner) = self.hms_admission_observation.as_ref() {
-            owner
-                .require_installed(&host.catalog_runtime_projection())
-                .map_err(FrontendApplicationError::server)?;
-        }
+
         self.serving_reader
             .install(host.serving_snapshot_reader())
             .map_err(|error| {
@@ -1063,19 +1010,6 @@ impl FrontendManagementServer {
             })
     }
 
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    fn require_hms_admission_projection(
-        &self,
-        host: &FrontendApplicationHost,
-    ) -> Result<(), FrontendApplicationError> {
-        if let Some(owner) = self.hms_admission_observation.as_ref() {
-            owner
-                .require_installed(&host.catalog_runtime_projection())
-                .map_err(FrontendApplicationError::server)?;
-        }
-        Ok(())
-    }
-
     pub fn poll_failure(&mut self) -> Result<Option<String>, FrontendApplicationError> {
         self.metrics_http_server
             .poll_failure()
@@ -1097,8 +1031,6 @@ pub async fn serve_ready_frontend_session_factory<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    management_server.require_hms_admission_projection(host)?;
     let mut report_server = host.start_report_server_from_host(
         &config.report_bind_host,
         config.report_grpc_port,
@@ -1111,9 +1043,6 @@ where
         Arc::new(
             novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
         );
-    let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
-    let client_connection_control: Arc<dyn ClientConnectionControlPort> =
-        client_connections.clone();
     let mut products =
         match build_frontend_role_products(host, exchange_port, mv_storage_observation).await {
             Ok(products) => products,
@@ -1142,7 +1071,6 @@ where
         host,
         &products,
         system_catalog,
-        client_connection_control,
     ) {
         Ok(factory) => factory,
         Err(error) => {
@@ -1161,19 +1089,13 @@ where
         }
     };
     let server_result = run_client_listeners_with_supervision(
-        #[cfg(any(
-            feature = "mem-1-m07-exact-mysql-write",
-            feature = "mem-1-m07-root-observation",
-            feature = "mem-1-m07-closing-pressure"
-        ))]
+        #[cfg(novarocks_dev_controls)]
         Arc::clone(&config.native_trust),
         ClientListenerInputs {
-            mysql_listener: config.mysql_listener,
             trino_listener: config.trino_listener,
             server_version: config.server_version,
             session_factory,
             query_control: products.query_control.clone(),
-            client_connections,
         },
         shutdown,
         &mut report_server,
@@ -1183,7 +1105,7 @@ where
         config.frontend_cleanup_timeout,
     )
     .await;
-    crate::application::trace_shutdown_stage("mysql_serving_returned");
+    crate::application::trace_shutdown_stage("client_serving_returned");
     let product_shutdown = shutdown_frontend_role_products_to_convergence(
         &mut products,
         config.frontend_cleanup_timeout,
@@ -1201,21 +1123,14 @@ where
 }
 
 struct ClientListenerInputs {
-    mysql_listener: ResolvedMysqlListenerSettings,
     trino_listener: novarocks_trino_adapter::TrinoListenerSettings,
     server_version: String,
     session_factory: Arc<dyn QuerySessionFactory>,
     query_control: novarocks_query_application::session_control::QueryControlService,
-    client_connections: Arc<MysqlClientConnectionRegistry>,
 }
 
 async fn run_client_listeners_with_supervision<F>(
-    #[cfg(any(
-        feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation",
-        feature = "mem-1-m07-closing-pressure"
-    ))]
-    native_trust: Arc<NativeTrust>,
+    #[cfg(novarocks_dev_controls)] native_trust: Arc<NativeTrust>,
     listeners: ClientListenerInputs,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportListener,
@@ -1228,197 +1143,86 @@ where
     F: Future<Output = ()> + Send,
 {
     let ClientListenerInputs {
-        mysql_listener,
         trino_listener,
         server_version,
         session_factory,
         query_control,
-        client_connections,
     } = listeners;
     let mut trino_server = novarocks_trino_adapter::TrinoListener::bind(
         &trino_listener,
-        server_version.clone(),
+        server_version,
         host.serving_lifecycle().admission(),
         Arc::clone(&session_factory),
         query_control,
     )
     .await
     .map_err(FrontendApplicationError::server)?;
-    let trino_port = trino_server.bound_addr().port();
     let result = async {
-    management_server.metrics_registry.install_trino(&trino_server.observation())
-        .map_err(FrontendApplicationError::server)?;
-    #[cfg(feature = "mem-1-m07-root-observation")]
-    let _root_observation_claim = root_observation_identity::emit(
-        &native_trust,
-        host.test_session.as_ref().map_or_else(Vec::new, |session| {
-            session
-                .scope()
-                .grants_for(root_observation_identity::DOMAIN)
-        }),
-    )?;
-    #[cfg(any(
-        feature = "mem-1-m07-closing-pressure",
-        feature = "mem-1-m07-exact-mysql-write"
-    ))]
-    let authorization = host
-        .test_session
-        .as_ref()
-        .map(|session| session.take_mysql_fixture())
-        .transpose()
-        .map_err(FrontendApplicationError::server)?
-        .flatten();
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    let authorization = match authorization {
-        Some(authorization) if authorization.is_closing_pressure() => {
-            let fixture = closing_pressure_fixture::bind_authorized(
-                &native_trust,
-                authorization,
-                host.workload_observation(),
-            )?;
-            return closing_pressure_fixture::serve(
-                fixture,
-                mysql_listener,
-                server_version,
-                session_factory,
-                client_connections,
-                shutdown,
-                report_server,
-                management_server,
-                host,
-                drain_timeout,
-                cleanup_timeout,
-            &mut trino_server,
-            )
-            .await;
-
-        }
-        other => other,
-    };
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    if let Some(authorization) = authorization {
-        let fixture = exact_mysql_write_fixture::bind_authorized(&native_trust, authorization)?;
-        return exact_mysql_write_fixture::serve(
-            fixture,
-            mysql_listener,
-            server_version,
-            session_factory,
-            client_connections,
-            shutdown,
-            report_server,
-            management_server,
-            host,
-            drain_timeout,
-            cleanup_timeout,
-            &mut trino_server,
-        )
-        .await;
-
-    }
-    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
-    let (finalize_tx, finalize_rx) = tokio::sync::watch::channel(false);
-    let wait_for_signal = |mut receiver: tokio::sync::watch::Receiver<bool>| async move {
-        while !*receiver.borrow() {
-            if receiver.changed().await.is_err() {
-                break;
-            }
-        }
-    };
-    let ready_user = mysql_listener.user().to_string();
-    let mysql_server =
-        novarocks_mysql_adapter::serve_query_application_mysql_until_drain_then_shutdown(
-            mysql_listener,
-            server_version,
-            Arc::clone(&session_factory),
-            Arc::clone(&client_connections),
-            wait_for_signal(drain_rx),
-            wait_for_signal(finalize_rx),
-            cleanup_timeout,
-            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user, trino_port),
-        );
-    tokio::pin!(mysql_server);
-
-    tokio::select! {
-        result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
-        _ = shutdown => {
-            crate::application::trace_shutdown_stage("shutdown_signal_observed");
-            host.begin_serving_drain(drain_timeout);
-            crate::application::trace_shutdown_stage("mysql_drain_started");
-            trino_server.begin_drain();
-            let _ = drain_tx.send(true);
-            let graceful = tokio::time::timeout(
-                drain_timeout,
-                host.workload_observation().wait_until_no_root_responsibilities(),
-            )
-            .await;
-            crate::application::trace_shutdown_stage("mysql_root_grace_returned");
-            if graceful.is_err() {
-                crate::application::trace_shutdown_stage("mysql_root_cleanup_started");
-                host.cancel_governed_work_at_drain_deadline();
-                // Keep the admitted protocol tasks alive long enough to
-                // observe the first-wins deadline cancellation and return
-                // its typed error. Final connection termination remains the
-                // fallback when a cancelled attempt does not converge inside
-                // the configured bounded cleanup window.
-                let _ = tokio::time::timeout(
-                    cleanup_timeout,
+        management_server.metrics_registry.install_trino(&trino_server.observation())
+            .map_err(FrontendApplicationError::server)?;
+        #[cfg(novarocks_dev_controls)]
+        let _root_observation_claim = root_observation_identity::emit(
+            &native_trust,
+            host.test_session.as_ref().map_or_else(Vec::new, |session| {
+                session.scope().grants_for(root_observation_identity::DOMAIN)
+            }),
+        )?;
+        emit_frontend_trino_ready(trino_server.bound_addr(), &trino_listener.user);
+        tokio::select! {
+            _ = shutdown => {
+                crate::application::trace_shutdown_stage("shutdown_signal_observed");
+                host.begin_serving_drain(drain_timeout);
+                trino_server.begin_drain();
+                crate::application::trace_shutdown_stage("client_drain_started");
+                let graceful = tokio::time::timeout(
+                    drain_timeout,
                     host.workload_observation().wait_until_no_root_responsibilities(),
-                )
-                .await;
-                crate::application::trace_shutdown_stage("mysql_root_cleanup_returned");
+                ).await;
+                crate::application::trace_shutdown_stage("client_root_grace_returned");
+                if graceful.is_err() {
+                    host.cancel_governed_work_at_drain_deadline();
+                    crate::application::trace_shutdown_stage("client_root_cleanup_started");
+                    let _ = tokio::time::timeout(
+                        cleanup_timeout,
+                        host.workload_observation().wait_until_no_root_responsibilities(),
+                    ).await;
+                    crate::application::trace_shutdown_stage("client_root_cleanup_returned");
+                }
+                session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
+                host.serving_lifecycle().mark_stopping();
+                Ok(())
             }
-            session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
-            client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            host.serving_lifecycle().mark_stopping();
-            let _ = finalize_tx.send(true);
-            crate::application::trace_shutdown_stage("mysql_listener_join_started");
-            let result = mysql_server.await.map_err(FrontendApplicationError::server);
-            crate::application::trace_shutdown_stage("mysql_listener_join_returned");
-            result
-        }
-        error = wait_for_frontend_listener_failure(report_server, management_server, &mut trino_server, host) => {
-            host.begin_serving_drain(drain_timeout);
-            trino_server.begin_drain();
-            let _ = drain_tx.send(true);
-            host.cancel_governed_work_at_drain_deadline();
-            session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
-            client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            host.serving_lifecycle().mark_stopping();
-            let _ = finalize_tx.send(true);
-            let mysql_result = mysql_server.await.map_err(FrontendApplicationError::server);
-            match mysql_result {
-                Ok(()) => Err(FrontendApplicationError::server(error)),
-                Err(mysql_error) => Err(FrontendApplicationError::server(error)
-                    .with_cleanup_context(format!("shutdown MySQL listener after Frontend listener failure: {mysql_error}"))),
+            error = wait_for_frontend_listener_failure(report_server, management_server, &mut trino_server, host) => {
+                host.begin_serving_drain(drain_timeout);
+                trino_server.begin_drain();
+                host.cancel_governed_work_at_drain_deadline();
+                session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
+                host.serving_lifecycle().mark_stopping();
+                Err(FrontendApplicationError::server(error))
             }
         }
-    }
     }.await;
     trino_server.finalize();
-    combine_server_and_shutdown(
-        result,
-        trino_server
-            .wait_stopped()
-            .await
-            .map_err(FrontendApplicationError::server),
-    )
+    crate::application::trace_shutdown_stage("client_listener_join_started");
+    let stopped = trino_server
+        .wait_stopped()
+        .await
+        .map_err(FrontendApplicationError::server);
+    crate::application::trace_shutdown_stage("client_listener_join_returned");
+    combine_server_and_shutdown(result, stopped)
 }
 
-fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str, trino_port: u16) {
+// Design: ADR-0213 (docs/adr/ADR-0213-sole-trino-entry-and-application-owned-completion.md)
+fn emit_frontend_trino_ready(bind_addr: std::net::SocketAddr, user: &str) {
     info!(
-        "standalone mysql server listening on {} (user={}, db={})",
-        bind_addr, user, DEFAULT_DATABASE
+        "standalone Trino server listening on {} (user={})",
+        bind_addr, user
     );
-    // Emit a parser-friendly readiness marker on stdout. Orchestration
-    // scripts must wait for this exact line before connecting; probing the
-    // mysql port alone cannot distinguish a freshly-bound server from a
-    // pre-existing process that already owned the port.
     println!(
-        "{} mysql_port={} pid={} trino_port={}",
+        "{} role=fe trino_port={} pid={}",
         novarocks_failpoint::observation_marker::READY,
         bind_addr.port(),
         std::process::id(),
-        trino_port
     );
 }
 
@@ -1544,17 +1348,9 @@ fn combine_server_and_shutdown(
         (Err(server_error), Ok(())) => Err(server_error),
         (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
         (Err(server_error), Err(shutdown_error)) => {
-            #[cfg(any(
-                feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation",
-                feature = "mem-1-m07-closing-pressure"
-            ))]
+            #[cfg(novarocks_dev_controls)]
             return Err(server_error.with_role_cleanup(shutdown_error));
-            #[cfg(not(any(
-                feature = "mem-1-m07-exact-mysql-write",
-                feature = "mem-1-m07-root-observation",
-                feature = "mem-1-m07-closing-pressure"
-            )))]
+            #[cfg(not(novarocks_dev_controls))]
             Err(server_error.with_cleanup_context(shutdown_error))
         }
     }
@@ -1642,7 +1438,6 @@ mod tests {
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
-    use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
     use novarocks_workload_control::{WorkClass, WorkRequest};
@@ -1664,11 +1459,30 @@ mod tests {
         topology::ClusterBackendOpenConfig,
     };
     use novarocks_catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
-    use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
     use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-    use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};
+    use novarocks_query_application::session::{QuerySessionStatement, StatementSessionRequest};
     use novarocks_query_application::session_error::QueryServiceErrorKind;
+
+    fn test_statement_request(
+        control: &novarocks_query_application::session_control::QueryControlService,
+        principal: &str,
+    ) -> StatementSessionRequest {
+        StatementSessionRequest::new(
+            control.mint_client_query_id(),
+            principal,
+            novarocks_query_application::session_value::SessionValue::try_new(
+                None,
+                None,
+                Vec::new(),
+                None,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts::default(),
+                ),
+            )
+            .unwrap(),
+        )
+    }
 
     fn settle_governed_completion(statement: QuerySessionStatement) {
         let (result, terminal) = statement.into_parts();
@@ -1680,7 +1494,7 @@ mod tests {
             panic!("successful statement must retain its owner through terminal OK");
         };
         let (completion, mut protocol) = result.into_parts();
-        assert_eq!(completion.affected_rows(), 0);
+        assert_eq!(completion.count(), None);
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
         terminal.complete();
@@ -1874,13 +1688,12 @@ mod tests {
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
-            Arc::new(MysqlClientConnectionRegistry::new()),
         )
         .await
         .expect("build ready frontend session factory");
         let session = session_factory
-            .open_session(QuerySessionOpenRequest::new(
-                ClientConnectionToken::new(1, 1).expect("valid connection token"),
+            .open_statement_session(test_statement_request(
+                &products.query_control,
                 "cp2-cutover",
             ))
             .expect("open frontend query session");
@@ -1888,7 +1701,7 @@ mod tests {
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
         let result = session
-            .execute_batch(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
+            .execute_statement(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         settle_governed_completion(result);
@@ -1903,14 +1716,30 @@ mod tests {
             products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Ready(_)
         ));
+        session.close();
+        drop(session);
+        let session = session_factory
+            .open_statement_session(test_statement_request(
+                &products.query_control,
+                "cp2-cutover",
+            ))
+            .expect("open fresh statement session");
         let result = session
-            .execute_batch("SET CATALOG warehouse")
+            .execute_statement("SET CATALOG warehouse")
             .await
             .expect("the committed attachment is admitted by this frontend session");
         settle_governed_completion(result);
 
+        session.close();
+        drop(session);
+        let session = session_factory
+            .open_statement_session(test_statement_request(
+                &products.query_control,
+                "cp2-cutover",
+            ))
+            .expect("open fresh statement session");
         let result = session
-            .execute_batch("DROP CATALOG warehouse")
+            .execute_statement("DROP CATALOG warehouse")
             .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
         settle_governed_completion(result);
@@ -1926,8 +1755,16 @@ mod tests {
             products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Absent
         ));
+        session.close();
+        drop(session);
+        let session = session_factory
+            .open_statement_session(test_statement_request(
+                &products.query_control,
+                "cp2-cutover",
+            ))
+            .expect("open fresh statement session");
         let result = session
-            .execute_batch("SET CATALOG warehouse")
+            .execute_statement("SET CATALOG warehouse")
             .await
             .expect("admission error is retained until the protocol terminal error");
         let (result, terminal) = result.into_parts();
@@ -2033,18 +1870,17 @@ mod tests {
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
-            Arc::new(MysqlClientConnectionRegistry::new()),
         )
         .await
         .expect("build ready frontend session factory");
         let session = session_factory
-            .open_session(QuerySessionOpenRequest::new(
-                ClientConnectionToken::new(2, 1).expect("valid connection token"),
+            .open_statement_session(test_statement_request(
+                &products.query_control,
                 "statistics-binding",
             ))
             .expect("open frontend query session");
         let result = session
-            .execute_batch("SHOW ANALYZE JOBS")
+            .execute_statement("SHOW ANALYZE JOBS")
             .await
             .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
         settle_governed_query(result);
@@ -2090,7 +1926,6 @@ mod tests {
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
-            Arc::new(MysqlClientConnectionRegistry::new()),
         )
         .await
         .expect("build ready frontend session factory");
@@ -2450,42 +2285,27 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         fn complete_empty_provider_execution_config() -> Result<FrontendExecutionConfig> {
-            // Same frozen ingress author used by the actual session/control
-            // service; no test-owned listener quota or session registry.
-            let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
-                .map_err(anyhow::Error::msg)?;
-            let ingress = crate::native_workload::FrontendStatementIngress {
-                ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
-                    .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
-                control_connections: NonZeroUsize::new(mysql.control_positions)
-                    .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
-                ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
-                    .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
-                control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
-                    .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
-            };
             FrontendExecutionConfig::new_for_test(
                 NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 builtin_function_catalog(),
                 crate::application::test_constant_policy(),
             )
-            .try_with_empty_provider_read_profile_for_test(ingress)
+            .try_with_empty_provider_read_profile_for_test()
             .map_err(anyhow::Error::new)
         }
 
         fn arm_real_entry(
             owner: &crate::preparation_diagnostics::StatementObservationOwner,
             token: &str,
-            connection_id: u32,
+            query: &novarocks_query_application::session_control::ClientQueryId,
             sql: &str,
         ) -> Result<()> {
             owner
                 .arm(
                     crate::preparation_diagnostics::StatementObservationArmRequest {
                         run_token: token.to_owned(),
-                        connection_id: Some(connection_id),
-                        client_query_id: None,
+                        client_query_id: Some(query.to_string()),
                         sql_sha256: hex::encode(Sha256::digest(sql.as_bytes())),
                     },
                 )
@@ -2493,18 +2313,30 @@ mod tests {
         }
 
         async fn actual_entry_error(
+            control: &novarocks_query_application::session_control::QueryControlService,
             session: &dyn QuerySession,
             sql: &str,
         ) -> Result<QueryServiceError> {
-            match session.execute_batch(sql).await {
+            match session.execute_statement(sql).await {
                 Err(error) => Ok(error),
                 Ok(statement) => {
                     let (output, terminal) = statement.into_parts();
                     match output {
                         StatementResult::GovernedError(result) => {
                             let (error, mut protocol) = result.into_parts();
+                            let token = protocol.statement_token();
                             let finish = protocol.fail();
                             terminal.complete();
+                            let token = token.ok_or_else(|| {
+                                anyhow!("governed error lost its original statement token")
+                            })?;
+                            let inactive = control.cancel_session_statement(
+                                token.session(),
+                                novarocks_query_application::cancellation::QueryCancellationReason::ClientCancelRequested,
+                            );
+                            ensure!(matches!(inactive,
+                                novarocks_query_application::session_control::QueryCancelOutcome::NoActiveStatement),
+                                "original protocol terminal retained an active statement: {inactive:?}");
                             if matches!(finish, GovernedStatementFinishOutcome::Stale) {
                                 return Err(anyhow::Error::new(error).context(
                                     "real error protocol failed to finish its statement",
@@ -2524,33 +2356,28 @@ mod tests {
             }
         }
 
-        async fn configure_real_entry(session: &dyn QuerySession) -> Result<()> {
-            let statement = session.execute_batch("SET query_timeout = 1").await?;
-            let (output, terminal) = statement.into_parts();
-            let StatementResult::GovernedCompletion(result) = output else {
-                drop(output);
-                terminal.complete();
-                return Err(anyhow!(
-                    "query timeout SET did not return its governed completion"
-                ));
-            };
-            let (completion, mut protocol) = result.into_parts();
-            ensure!(completion.affected_rows() == 0, "SET has no affected rows");
-            let seal = protocol.seal_success_visibility();
-            let finish = protocol.complete();
-            terminal.complete();
-            ensure!(matches!(seal,
-                novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Sealed),
-                "query timeout SET visibility did not seal: {seal:?}");
-            ensure!(
-                matches!(finish, GovernedStatementFinishOutcome::Completed),
-                "query timeout SET did not actually finish: {finish:?}"
-            );
-            Ok(())
+        fn real_entry_request(
+            query: novarocks_query_application::session_control::ClientQueryId,
+            principal: &str,
+        ) -> StatementSessionRequest {
+            StatementSessionRequest::new(
+                query,
+                principal,
+                novarocks_query_application::session_value::SessionValue::try_new(
+                    None,
+                    None,
+                    vec![("query_timeout".into(), "1".into())],
+                    None,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts::default(),
+                    ),
+                )
+                .unwrap(),
+            )
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn real_unbound_arm_cannot_move_to_replacement_connection() -> Result<()> {
+        async fn real_unbound_arm_cannot_move_to_replacement_query() -> Result<()> {
             run_unbound_entry_case(false).await
         }
 
@@ -2631,8 +2458,7 @@ mod tests {
                 ),
                 0,
                 Arc::new(UnavailableMvStorageObservationPort),
-                Arc::new(MysqlClientConnectionRegistry::new()),
-            )
+                )
             .await;
             let (session_factory, mut products) = match built {
                 Ok(products) => products,
@@ -2646,67 +2472,113 @@ mod tests {
             };
             let mut sessions = Vec::<Arc<dyn QuerySession>>::new();
             let primary: Result<()> = async {
-                ensure!(host.backend_topology_port().snapshot()?.targets().is_empty(),
-                    "the preallocation check must use the actual empty topology");
-                let controls = host.test_session.as_ref().ok_or_else(|| anyhow!("missing actual role session"))?;
-                let owner = controls.statement.as_ref().ok_or_else(|| anyhow!("missing actual observation owner"))?;
+                ensure!(
+                    host.backend_topology_port()
+                        .snapshot()?
+                        .targets()
+                        .is_empty(),
+                    "the preallocation check must use the actual empty topology"
+                );
+                let controls = host
+                    .test_session
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing actual role session"))?;
+                let owner = controls
+                    .statement
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing actual observation owner"))?;
                 let scope = controls.scope().clone();
-                let original = session_factory.open_session(QuerySessionOpenRequest::new(
-                    ClientConnectionToken::new(41, 1).unwrap(), "unbound-original"))?;
-                sessions.push(original.clone());
-                configure_real_entry(original.as_ref()).await?;
+                let original_query = products.query_control.mint_client_query_id();
                 let selected_sql = if rearm { "SELECT" } else { "SELECT 1" };
-                arm_real_entry(owner, "first-entry", 41, selected_sql)?;
-                ensure!(owner.peek("first-entry").map_err(anyhow::Error::msg)?.work_id.is_none(),
-                    "the selected arm must still be unbound before its first matching statement");
-                let replacement = if rearm {
-                    // Parser failure occurs before QueryControl allocates any
-                    // statement for this selected request. Keep the exact same
-                    // live client while testing a forbidden SQL retarget.
-                    let parse = actual_entry_error(original.as_ref(), selected_sql).await?;
+                arm_real_entry(owner, "first-entry", &original_query, selected_sql)?;
+                let original = session_factory.open_statement_session(real_entry_request(
+                    original_query,
+                    "unbound-original",
+                ))?;
+                sessions.push(original.clone());
+                ensure!(
+                    owner
+                        .peek("first-entry")
+                        .map_err(anyhow::Error::msg)?
+                        .work_id
+                        .is_none(),
+                    "the selected arm must still be unbound before its first matching statement"
+                );
+                if rearm {
+                    let parse = actual_entry_error(
+                        &products.query_control,
+                        original.as_ref(),
+                        selected_sql,
+                    )
+                    .await?;
                     ensure!(parse.kind() == QueryServiceErrorKind::Parse, "{parse}");
-                    ensure!(owner.peek("first-entry").map_err(anyhow::Error::msg)?.work_id.is_none(),
-                        "the parser failure unexpectedly allocated a statement");
-                    original.clone()
-                } else {
-                    original.close();
-                    let replacement = session_factory.open_session(QuerySessionOpenRequest::new(
-                        ClientConnectionToken::new(41, 2).unwrap(), "unbound-replacement"))?;
-                    sessions.push(replacement.clone());
-                    configure_real_entry(replacement.as_ref()).await?;
-                    replacement
-                };
-                let rearmed = if rearm {
+                    ensure!(
+                        owner
+                            .peek("first-entry")
+                            .map_err(anyhow::Error::msg)?
+                            .work_id
+                            .is_none(),
+                        "the parser failure unexpectedly allocated a statement"
+                    );
                     owner.drain("first-entry").map_err(anyhow::Error::msg)?;
-                    Some(arm_real_entry(owner, "first-entry", 41, "SELECT 1"))
-                } else {
-                    None
-                };
-
-                // Poll the actual entry to its returned error before checking the
-                // nomination predicate. No direct bind or invented execution is
-                // used, and failure assertions cannot abandon a query future.
-                let error = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                }
+                original.close();
+                let replacement_query = products.query_control.mint_client_query_id();
+                if rearm {
+                    arm_real_entry(owner, "first-entry", &replacement_query, "SELECT 1")?;
+                }
+                let replacement = session_factory.open_statement_session(real_entry_request(
+                    replacement_query,
+                    "unbound-replacement",
+                ))?;
+                sessions.push(replacement.clone());
+                // Registration freezes the selected input. A rejected observation
+                // remains a journal error and cannot refuse the product session.
+                let error =
+                    actual_entry_error(&products.query_control, replacement.as_ref(), "SELECT 1")
+                        .await?;
                 ensure!(error.kind() == QueryServiceErrorKind::Timeout, "{error}");
-                ensure!(products.query_control.list_processes().iter().all(|process| process.statement.is_none()),
-                    "the returned query error retained an active statement");
-                if let Some(rearmed) = rearmed {
-                    ensure!(rearmed.is_err(),
-                        "the same predeclared Native permission retargeted SQL through drain/rearm after parser failure");
+                if rearm {
+                    let refusal = owner
+                        .peek("first-entry")
+                        .err()
+                        .ok_or_else(|| anyhow!("replacement input must be refused"))?;
+                    ensure!(
+                        refusal.contains("Native original statement input replacement refused"),
+                        "unexpected finite input refusal: {refusal}"
+                    );
                 } else {
                     let old = owner.peek("first-entry").map_err(anyhow::Error::msg)?;
-                    ensure!(old.work_id.is_none(),
-                        "the original unbound arm moved to the replacement client: work_id={:?}", old.work_id);
-                    ensure!(old.execution_id.is_none() && old.logical_execution_id.is_none()
-                        && old.attempt_id.is_none() && old.snapshot.is_none(),
-                        "an abandoned arm acquired replacement execution evidence");
+                    ensure!(
+                        old.work_id.is_none(),
+                        "the original unbound arm moved to a replacement query: work_id={:?}",
+                        old.work_id
+                    );
+                    ensure!(
+                        old.execution_id.is_none()
+                            && old.logical_execution_id.is_none()
+                            && old.attempt_id.is_none()
+                            && old.snapshot.is_none(),
+                        "an abandoned arm acquired replacement execution evidence"
+                    );
                 }
-                ensure!(scope.observations().iter().all(|event| event.domain != "native"),
-                    "replacement observation caused a Native authority claim/hit");
-                ensure!(!directory.path().join("unpublished-be.receipt.json").exists(),
-                    "the entry test fabricated a backend receipt");
+                ensure!(
+                    scope
+                        .observations()
+                        .iter()
+                        .all(|event| event.domain != "native"),
+                    "replacement observation caused a Native authority claim/hit"
+                );
+                ensure!(
+                    !directory
+                        .path()
+                        .join("unpublished-be.receipt.json")
+                        .exists(),
+                    "the entry test fabricated a backend receipt"
+                );
                 Ok(())
-            }.await;
+            }
+            .await;
             for session in &sessions {
                 session.close();
             }
@@ -2740,23 +2612,31 @@ mod tests {
             }
         }
 
-        fn actual_statement_identity(work_id: Option<&str>) -> Result<(u32, u64, u64)> {
+        fn actual_statement_identity(
+            work_id: Option<&str>,
+        ) -> Result<(
+            novarocks_query_application::session_control::ClientQueryId,
+            u64,
+            u64,
+        )> {
             let fields = work_id
                 .ok_or_else(|| anyhow!("real statement entry did not bind"))?
                 .split(':')
                 .collect::<Vec<_>>();
             ensure!(
-                fields.len() == 4 && fields[0] == "statement",
+                fields.len() == 4 && fields[0] == "client-query",
                 "invalid statement work identity"
             );
-            let connection = fields[1].parse()?;
+            let query =
+                novarocks_query_application::session_control::ClientQueryId::parse(fields[1])
+                    .map_err(anyhow::Error::msg)?;
             let epoch = fields[2].parse()?;
             let generation = fields[3].parse()?;
             ensure!(
                 epoch > 0 && generation > 0,
                 "statement identity must be owner allocated"
             );
-            Ok((connection, epoch, generation))
+            Ok((query, epoch, generation))
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2833,8 +2713,7 @@ mod tests {
                 ),
                 0,
                 Arc::new(UnavailableMvStorageObservationPort),
-                Arc::new(MysqlClientConnectionRegistry::new()),
-            )
+                )
             .await;
             let (session_factory, mut products) = match built {
                 Ok(products) => products,
@@ -2864,23 +2743,21 @@ mod tests {
                     .as_ref()
                     .ok_or_else(|| anyhow!("missing actual observation owner"))?;
                 let scope = controls.scope().clone();
-                let original = session_factory.open_session(QuerySessionOpenRequest::new(
-                    ClientConnectionToken::new(41, 1).unwrap(),
+                let original_query = products.query_control.mint_client_query_id();
+                arm_real_entry(owner, "first-entry", &original_query, "SELECT 1")?;
+                let original = session_factory.open_statement_session(real_entry_request(
+                    original_query,
                     "complement-original",
                 ))?;
                 sessions.push(original.clone());
-                let unrelated = session_factory.open_session(QuerySessionOpenRequest::new(
-                    ClientConnectionToken::new(42, 1).unwrap(),
+                let unrelated = session_factory.open_statement_session(real_entry_request(
+                    products.query_control.mint_client_query_id(),
                     "complement-unrelated",
                 ))?;
                 sessions.push(unrelated.clone());
-                configure_real_entry(original.as_ref()).await?;
-                configure_real_entry(unrelated.as_ref()).await?;
-                arm_real_entry(owner, "first-entry", 41, "SELECT 1")?;
-
-                // Neither an unrelated client nor another SQL on the selected client
-                // can acquire the unbound first permission. Await both real entries.
-                let foreign = actual_entry_error(unrelated.as_ref(), "SELECT 1").await?;
+                let foreign =
+                    actual_entry_error(&products.query_control, unrelated.as_ref(), "SELECT 1")
+                        .await?;
                 ensure!(
                     foreign.kind() == QueryServiceErrorKind::Timeout,
                     "{foreign}"
@@ -2891,14 +2768,16 @@ mod tests {
                         .map_err(anyhow::Error::msg)?
                         .work_id
                         .is_none(),
-                    "unrelated connection stole the finite nomination"
+                    "unrelated query stole the finite nomination"
                 );
-                let different_sql = actual_entry_error(original.as_ref(), "SELECT 2").await?;
+                let different_sql =
+                    actual_entry_error(&products.query_control, original.as_ref(), "SELECT 2")
+                        .await?;
                 ensure!(
                     different_sql.kind() == QueryServiceErrorKind::Timeout,
                     "{different_sql}"
                 );
-                let unbound = owner.peek("first-entry").map_err(anyhow::Error::msg)?;
+                let unbound = owner.drain("first-entry").map_err(anyhow::Error::msg)?;
                 ensure!(
                     unbound.work_id.is_none()
                         && unbound.execution_id.is_none()
@@ -2907,137 +2786,95 @@ mod tests {
                         && unbound.snapshot.is_none(),
                     "an unmatched statement acquired selected evidence"
                 );
-                let drained = owner.drain("first-entry").map_err(anyhow::Error::msg)?;
-                ensure!(
-                    drained.work_id.is_none(),
-                    "the first arm unexpectedly bound before drain"
-                );
                 original.close();
-                let replacement = session_factory.open_session(QuerySessionOpenRequest::new(
-                    ClientConnectionToken::new(41, 2).unwrap(),
+                let replacement_query = products.query_control.mint_client_query_id();
+                arm_real_entry(owner, "first-entry", &replacement_query, "SELECT 1")?;
+                let replacement = session_factory.open_statement_session(real_entry_request(
+                    replacement_query,
                     "complement-replacement",
                 ))?;
                 sessions.push(replacement.clone());
-                configure_real_entry(replacement.as_ref()).await?;
-                let old_rearm = arm_real_entry(owner, "first-entry", 41, "SELECT 1");
-                // Even a faulty rearm must not abandon its actual query future.
-                let replacement_error = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                let error =
+                    actual_entry_error(&products.query_control, replacement.as_ref(), "SELECT 1")
+                        .await?;
+                ensure!(error.kind() == QueryServiceErrorKind::Timeout, "{error}");
+                let refusal = owner
+                    .peek("first-entry")
+                    .err()
+                    .ok_or_else(|| anyhow!("original input is immutable"))?;
                 ensure!(
-                    replacement_error.kind() == QueryServiceErrorKind::Timeout,
-                    "{replacement_error}"
-                );
-                let refusal = old_rearm.err().ok_or_else(|| {
-                    anyhow!(
-                        "unbound original permission followed the replacement client through drain/rearm"
-                    )
-                })?;
-                ensure!(
-                    refusal
-                        .to_string()
-                        .contains("Native original statement input replacement refused"),
+                    refusal.contains("Native original statement input replacement refused"),
                     "unexpected unbound input refusal: {refusal}"
                 );
                 ensure!(
-                    owner.peek("first-entry").is_err(),
-                    "failed finite input rearm retained a replacement journal"
+                    owner.drain("first-entry").is_err(),
+                    "drain lost the retained binding error"
                 );
 
-                // The separately declared permission remains usable after that refusal.
-                arm_real_entry(owner, "independent-entry", 41, "SELECT 1")?;
-                let first = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                // A separately declared permission still binds a fresh real statement.
+                let independent_query = products.query_control.mint_client_query_id();
+                arm_real_entry(owner, "independent-entry", &independent_query, "SELECT 1")?;
+                let independent = session_factory.open_statement_session(real_entry_request(
+                    independent_query.clone(),
+                    "complement-independent",
+                ))?;
+                sessions.push(independent.clone());
+                let first =
+                    actual_entry_error(&products.query_control, independent.as_ref(), "SELECT 1")
+                        .await?;
                 ensure!(first.kind() == QueryServiceErrorKind::Timeout, "{first}");
                 let bound = owner
                     .peek("independent-entry")
                     .map_err(anyhow::Error::msg)?;
                 let first_id = actual_statement_identity(bound.work_id.as_deref())?;
                 ensure!(
-                    first_id.0 == 41,
-                    "nomination differs from the actual replacement connection"
+                    first_id.0 == independent_query,
+                    "nomination differs from the actual client query"
                 );
                 ensure!(
                     bound.execution_id.is_none()
                         && bound.logical_execution_id.is_none()
                         && bound.attempt_id.is_none()
                         && bound.snapshot.is_none(),
-                    "preallocation failure invented an execution or completion"
+                    "preallocation failure invented execution or completion"
                 );
-
-                // With its journal retained, a later real generation cannot move the
-                // existing binding. Drain may retire only that observer journal.
-                let later = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
-                ensure!(later.kind() == QueryServiceErrorKind::Timeout, "{later}");
+                let later = session_factory.open_statement_session(real_entry_request(
+                    products.query_control.mint_client_query_id(),
+                    "complement-later",
+                ))?;
+                sessions.push(later.clone());
+                let error =
+                    actual_entry_error(&products.query_control, later.as_ref(), "SELECT 1").await?;
+                ensure!(error.kind() == QueryServiceErrorKind::Timeout, "{error}");
                 ensure!(
                     owner
                         .peek("independent-entry")
                         .map_err(anyhow::Error::msg)?
                         .work_id
                         == bound.work_id,
-                    "a bound journal rolled forward to a later generation"
+                    "a bound journal rolled forward to another client query"
                 );
                 owner
                     .drain("independent-entry")
                     .map_err(anyhow::Error::msg)?;
-                arm_real_entry(owner, "independent-entry", 41, "SELECT 1")?;
-                let next = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
-                ensure!(
-                    next.kind() == QueryServiceErrorKind::Internal
-                        && next
-                            .message()
-                            .contains("Native first statement nomination replacement refused"),
-                    "drain/rearm rolled an existing permission into the next generation: {next}"
-                );
-                let next_bound = owner
-                    .peek("independent-entry")
-                    .map_err(anyhow::Error::msg)?;
-                let next_id = actual_statement_identity(next_bound.work_id.as_deref())?;
-                ensure!(
-                    next_id.0 == first_id.0 && next_id.1 == first_id.1 && next_id.2 > first_id.2,
-                    "real QueryControl did not advance the same client generation"
-                );
-                ensure!(
-                    next_bound.execution_id.is_none()
-                        && next_bound.logical_execution_id.is_none()
-                        && next_bound.attempt_id.is_none()
-                        && next_bound.snapshot.is_none(),
-                    "refused generation acquired execution evidence"
-                );
-                owner
-                    .drain("independent-entry")
-                    .map_err(anyhow::Error::msg)?;
-                replacement.close();
-
-                let successor = session_factory.open_session(QuerySessionOpenRequest::new(
-                    ClientConnectionToken::new(41, 3).unwrap(),
+                let successor_query = products.query_control.mint_client_query_id();
+                arm_real_entry(owner, "independent-entry", &successor_query, "SELECT 1")?;
+                let successor = session_factory.open_statement_session(real_entry_request(
+                    successor_query,
                     "complement-successor",
                 ))?;
                 sessions.push(successor.clone());
-                configure_real_entry(successor.as_ref()).await?;
-                let bound_rearm = arm_real_entry(owner, "independent-entry", 41, "SELECT 1");
-                let successor_error = actual_entry_error(successor.as_ref(), "SELECT 1").await?;
-                ensure!(
-                    successor_error.kind() == QueryServiceErrorKind::Timeout,
-                    "{successor_error}"
-                );
-                let refusal = bound_rearm
+                let error =
+                    actual_entry_error(&products.query_control, successor.as_ref(), "SELECT 1")
+                        .await?;
+                ensure!(error.kind() == QueryServiceErrorKind::Timeout, "{error}");
+                let refusal = owner
+                    .peek("independent-entry")
                     .err()
-                    .ok_or_else(|| anyhow!("bound original permission followed a replacement client"))?;
+                    .ok_or_else(|| anyhow!("bound input cannot be replaced"))?;
                 ensure!(
-                    refusal
-                        .to_string()
-                        .contains("Native original statement input replacement refused"),
+                    refusal.contains("Native original statement input replacement refused"),
                     "unexpected bound input refusal: {refusal}"
-                );
-                ensure!(
-                    owner.peek("independent-entry").is_err(),
-                    "failed bound-input rearm retained a replacement journal"
-                );
-                ensure!(
-                    products
-                        .query_control
-                        .list_processes()
-                        .iter()
-                        .all(|process| process.statement.is_none()),
-                    "returned real queries retained an active statement"
                 );
                 ensure!(
                     scope

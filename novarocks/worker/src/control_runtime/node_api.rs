@@ -91,16 +91,35 @@ impl crate::WorkerAdmissionEpochAuthority for WorkerTaskControl {
         self.node.admission_epoch_capability()
     }
 }
+enum WorkerRefusalCustody {
+    Opaque(ManuallyDrop<NodeHostRefusal>),
+    /// The existing paid Root cleanup owns the rich original and ingress.
+    /// This original negative diagnostic carries no source or capacity.
+    Neutral(super::node::NeutralNodeRequestRefusal),
+}
+
 /// An unaccepted handoff can still own original opaque sources or a partial
 /// admission. It must move to its real recovery/disposal owner; ordinary Drop
 /// cannot erase those originals or run their foreign destruction here.
+/// A closed pre-admission input already accepted by the original Root's
+/// physical cleanup owner retains only its same negative diagnostic here.
 #[must_use = "Retain the refused original custody until its actual supervised disposition"]
 pub struct WorkerRequestRefusal {
-    original: ManuallyDrop<NodeHostRefusal>,
+    original: WorkerRefusalCustody,
 }
 impl WorkerRequestRefusal {
     pub fn stage(&self) -> &'static str {
-        self.original.operation
+        match &self.original {
+            WorkerRefusalCustody::Opaque(original) => original.operation,
+            WorkerRefusalCustody::Neutral(original) => original.stage(),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn into_original_for_test(self) -> NodeHostRefusal {
+        match self.original {
+            WorkerRefusalCustody::Opaque(original) => ManuallyDrop::into_inner(original),
+            WorkerRefusalCustody::Neutral(original) => original.into_original_for_test(),
+        }
     }
 }
 impl fmt::Debug for WorkerRequestRefusal {
@@ -134,7 +153,7 @@ impl std::error::Error for WorkerRequestError {}
 impl From<NodeHostRefusal> for WorkerRequestError {
     fn from(original: NodeHostRefusal) -> Self {
         Self::HandoffRefused(WorkerRequestRefusal {
-            original: ManuallyDrop::new(original),
+            original: WorkerRefusalCustody::Opaque(ManuallyDrop::new(original)),
         })
     }
 }
@@ -143,6 +162,11 @@ impl From<super::node::NodeRequestRefusal> for WorkerRequestError {
         match original {
             super::node::NodeRequestRefusal::OwnerFailed => Self::OwnerFailed,
             super::node::NodeRequestRefusal::Invariant(original) => original.into(),
+            super::node::NodeRequestRefusal::Neutral(original) => {
+                Self::HandoffRefused(WorkerRequestRefusal {
+                    original: WorkerRefusalCustody::Neutral(original),
+                })
+            }
         }
     }
 }
@@ -202,7 +226,7 @@ impl WorkerParticipationDelivery {
     }
 }
 
-#[must_use = "Hold the original Task-causal R through its actual response lifetime"]
+#[must_use = "Hold the original paid R through its actual response lifetime"]
 pub struct WorkerTaskDelivery {
     original: RequestDelivery<
         WorkerParticipationReplyBody,
@@ -215,6 +239,10 @@ impl WorkerTaskDelivery {
     }
     pub fn body(&self) -> &WorkerParticipationReplyBody {
         self.original.body()
+    }
+    #[cfg(test)]
+    pub(crate) fn request_deadline_for_test(&self) -> WorkerMonotonicInstant {
+        self.original.request().deadline
     }
 }
 /// An admitted cancellation retains its exact original R delivery. A lookup

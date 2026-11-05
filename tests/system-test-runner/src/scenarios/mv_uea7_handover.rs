@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::mv_uea7::{mv_properties, mv_public_error};
+use crate::actors::sql::TrinoValue;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::mv_uea7::{
     ManagedMvRestFixture, assert_rows, connect, execute, property, require_property,
     require_status_phase, require_three_backends, select_catalog_and_namespace, status,
 };
 use anyhow::{Context, Result, bail};
-use mysql::Row;
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use std::path::Path;
 use std::sync::Mutex;
@@ -140,12 +140,14 @@ impl Scenario for MvOwnerHandover {
             bail!("the fixture's taking deployment matches its current owner");
         }
         let challenge = property(&before, "Challenge")?;
-        let handover: Vec<(String, Option<String>)> = conn
-            .query(format!(
-                "CALL novarocks_mv_set_owner('{CATALOG}', 'ns', 'orders_mv', \
+        let handover: Vec<(String, Option<String>)> = mv_properties(
+            &conn
+                .execute(format!(
+                    "CALL novarocks_mv_set_owner('{CATALOG}', 'ns', 'orders_mv', \
                  '{challenge}', '{TAKING_DEPLOYMENT}')"
-            ))
-            .context("hand over the exact MV through public management SQL")?;
+                ))
+                .context("hand over the exact MV through public management SQL")?,
+        )?;
         require_property(&handover, "Result", "HANDED_OVER")?;
         require_property(&handover, "NewOwner", TAKING_DEPLOYMENT)?;
         require_property(&handover, "PreviousOwner", original_owner)?;
@@ -168,14 +170,37 @@ impl Scenario for MvOwnerHandover {
         )?;
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;
         context.action("verify the handed-over MV is listed as read-only");
-        let listed: Vec<Row> = conn
-            .query("SHOW MATERIALIZED VIEWS FROM ns")
+        let listed = conn
+            .execute("SHOW MATERIALIZED VIEWS FROM ns")
             .context("list handed-over MV after old deployment restart")?;
-        let manageability = listed
-            .iter()
-            .find(|row| row.get::<String, _>("Name").as_deref() == Some("orders_mv"))
-            .and_then(|row| row.get::<String, _>("Manageability"))
-            .context("handed-over MV is missing from SHOW MATERIALIZED VIEWS")?;
+        let named = |name: &str| -> Result<usize> {
+            let columns = listed
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name == name)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                listed.is_result_set() && columns.len() == 1,
+                "SHOW MATERIALIZED VIEWS omitted or duplicated {name}"
+            );
+            anyhow::ensure!(
+                listed.columns[columns[0]].type_signature.raw_type == "varchar",
+                "SHOW {name} is not declared text"
+            );
+            Ok(columns[0])
+        };
+        let name = named("Name")?;
+        let manageability_column = named("Manageability")?;
+        let target = listed.rows.iter().filter(|row| matches!(row.get(name), Some(TrinoValue::Text(value)) if value == "orders_mv")).collect::<Vec<_>>();
+        anyhow::ensure!(
+            target.len() == 1,
+            "handed-over MV is missing or duplicated in SHOW MATERIALIZED VIEWS"
+        );
+        let Some(TrinoValue::Text(manageability)) = target[0].get(manageability_column) else {
+            bail!("handed-over MV omitted its text Manageability")
+        };
         if !manageability.starts_with("READ_ONLY:") {
             bail!(
                 "handed-over MV was listed as {manageability:?}, expected READ_ONLY; {}",
@@ -184,9 +209,9 @@ impl Scenario for MvOwnerHandover {
         }
         context.action("verify the old deployment cannot publish after handover");
         let error = conn
-            .query_drop("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE")
+            .execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE")
             .expect_err("old deployment must not manage a handed-over MV");
-        let message = error.to_string();
+        let message = mv_public_error(&error)?.message.clone();
         if !message.contains("another deployment")
             && !message.contains("not owned by this process")
             && !message.contains("fresh Current observation")

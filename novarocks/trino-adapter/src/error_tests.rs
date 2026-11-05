@@ -37,10 +37,12 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("PERMISSION_DENIED", 4, "USER_ERROR"),
     ("NOT_FOUND", 5, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
+    ("ALREADY_EXISTS", 12, "USER_ERROR"),
     ("NOT_SUPPORTED", 13, "USER_ERROR"),
     ("INVALID_SESSION_PROPERTY", 14, "USER_ERROR"),
     ("INVALID_WINDOW_FRAME", 15, "USER_ERROR"),
     ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
+    ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
@@ -73,6 +75,22 @@ fn assert_wire(error: &TrinoQueryError, name: &str) {
         (error.error_name, error.error_code, error.error_type),
         (name, *number, *kind)
     );
+}
+
+#[test]
+fn query_text_too_large_has_the_frozen_trino_483_identity_without_text_classification() {
+    let error = query_error(TrinoErrorSource::QueryTextTooLarge {
+        message: "opaque admission fact",
+    });
+    assert_wire(&error, "QUERY_TEXT_TOO_LARGE");
+    let wire = serde_json::to_value(&error).unwrap();
+    assert_eq!(wire["errorCode"], 35);
+    assert_eq!(wire["errorName"], "QUERY_TEXT_TOO_LARGE");
+    assert_eq!(wire["errorType"], "USER_ERROR");
+    assert_eq!(wire["message"], "opaque admission fact");
+    assert!(error.error_location.is_none());
+    assert!(error.sql_state.is_none());
+    assert!(error.failure_info.is_none());
 }
 
 fn expected_descriptor_name(code: &str) -> &'static str {
@@ -360,6 +378,74 @@ fn dependency_refinements_do_not_change_foreign_classes() {
             }),
             expected,
         );
+    }
+}
+
+#[test]
+fn already_exists_requires_the_original_connector_data_fact() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    for (class, producer, reason, message, expected) in [
+        (
+            FailureClass::Data,
+            domain::CONNECTOR,
+            6002,
+            "opaque",
+            "ALREADY_EXISTS",
+        ),
+        (
+            FailureClass::Data,
+            domain::QUERY,
+            6002,
+            "AlreadyExists",
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Data,
+            domain::CONNECTOR,
+            6000,
+            "AlreadyExists",
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Dependency,
+            domain::CONNECTOR,
+            6002,
+            "AlreadyExists",
+            "REMOTE_TASK_ERROR",
+        ),
+        (
+            FailureClass::Unexpected,
+            domain::CONNECTOR,
+            6002,
+            "AlreadyExists",
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(
+                class,
+                FailureReason::new(producer, NonZeroU16::new(reason).unwrap()),
+            ),
+            SafeDetail::truncating(message),
+            ExecutionFailureSite::Coordinator,
+        );
+        let execution = QueryExecutionError::from_execution(input.clone());
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &execution,
+            sql: "CREATE TABLE t(k INT)",
+        });
+        assert_wire(&wire, expected);
+        let service = QueryServiceError::from_execution_failure(input.clone());
+        assert_eq!(
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "CREATE TABLE t(k INT)"
+            }),
+            wire
+        );
+        assert_eq!(service.execution_failure(), Some(&input));
     }
 }
 
@@ -720,4 +806,44 @@ fn execution_control_heavy_safe_detail_stays_complete_when_it_fits_wire_bound() 
         serde_json::to_string(&projected.message).unwrap().len()
             <= crate::diagnostics::MAX_MESSAGE_JSON_BYTES
     );
+}
+
+#[test]
+fn originating_connector_mutation_cause_reaches_the_service_mapping_with_its_effect() {
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
+    use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+    for (kind, message, expected) in [
+        (
+            ConnectorMutationFailureKind::AlreadyExists,
+            "opaque provider detail",
+            "ALREADY_EXISTS",
+        ),
+        (
+            ConnectorMutationFailureKind::Internal,
+            "AlreadyExists: misleading detail",
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let original = ConnectorMutationFailure::new(kind, message);
+        let original_fact = original.failure_fact();
+        let cause = SharedFailureCause::new(original);
+        let service = QueryServiceError::from_failure_cause(cause.clone())
+            .attach_external_effect_disposition(
+                StatementExternalEffectDisposition::KnownUncommitted,
+            );
+        let mapped = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql: "CREATE TABLE t(k BIGINT)",
+        });
+        assert_wire(&mapped, expected);
+        assert_eq!(service.execution_failure().unwrap().fact(), original_fact);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
+        assert!(mapped.message.contains(message));
+        assert!(!mapped.message.contains("do_not_retry=true"));
+    }
 }

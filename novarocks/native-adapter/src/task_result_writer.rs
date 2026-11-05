@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use novarocks_execution::runtime::exchange;
 use novarocks_execution::runtime::observable::Observable;
+#[cfg(test)]
+use novarocks_execution::runtime::task::io::ResultPresentation;
 use novarocks_execution::runtime::task::io::{
-    ResultAbort, ResultPresentation, ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure,
-    ResultWriteSpec, TaskIoError, TaskIoErrorKind, TaskIoOperation, TaskResultSession,
-    TaskResultWriter,
+    ResultAbort, ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure, ResultWriteSpec,
+    TaskIoError, TaskIoErrorKind, TaskIoOperation, TaskResultSession, TaskResultWriter,
 };
 use novarocks_worker::result_buffer::{
     ResultBufferKey, ResultBufferWriteObligation, ResultPublication, ResultRetainedBudget,
@@ -39,13 +40,6 @@ struct NativeTaskResultWriter {
 
 impl TaskResultWriter for NativeTaskResultWriter {
     fn open(&self, spec: ResultWriteSpec) -> Result<Arc<dyn TaskResultSession>, TaskIoError> {
-        if spec.presentation() == ResultPresentation::Statistic {
-            return Err(TaskIoError::new(
-                TaskIoOperation::ResultOpen,
-                TaskIoErrorKind::RemoteRejected,
-                "native backend does not support STATISTIC result presentation",
-            ));
-        }
         if !spec.is_typed() {
             return Err(TaskIoError::new(
                 TaskIoOperation::ResultOpen,
@@ -75,7 +69,6 @@ impl TaskResultWriter for NativeTaskResultWriter {
             )
         })?;
         Ok(Arc::new(NativeTaskResultSession {
-            spec,
             handle,
             root_retained_byte_cap: self.root_retained_byte_cap,
         }))
@@ -83,7 +76,6 @@ impl TaskResultWriter for NativeTaskResultWriter {
 }
 
 struct NativeTaskResultSession {
-    spec: ResultWriteSpec,
     handle: ResultBufferWriteObligation,
     root_retained_byte_cap: NonZeroUsize,
 }
@@ -95,13 +87,6 @@ impl TaskResultSession for NativeTaskResultSession {
     ) -> Result<usize, TaskIoError> {
         if input.rows() == 0 {
             return Ok(0);
-        }
-        if self.spec.presentation() != ResultPresentation::MysqlText {
-            return Err(TaskIoError::new(
-                TaskIoOperation::ResultWrite,
-                TaskIoErrorKind::InvalidResponse,
-                "typed result session only supports MYSQL text presentation",
-            ));
         }
         if input.retained_bytes() >= self.root_retained_byte_cap.get() {
             return Err(TaskIoError::new(
@@ -282,7 +267,7 @@ mod tests {
     fn native_result_writer_rejects_a_stream_without_task_identity() {
         let result = test_native_result_writer().open(ResultWriteSpec::new(
             novarocks_types::UniqueId::new(1, 2),
-            ResultPresentation::MysqlText,
+            ResultPresentation::ArrowIpc,
             None,
             true,
         ));
@@ -298,7 +283,7 @@ mod tests {
         let result = test_native_result_writer().open(
             ResultWriteSpec::new(
                 UniqueId::new(811, 1),
-                ResultPresentation::MysqlText,
+                ResultPresentation::ArrowIpc,
                 None,
                 false,
             )
@@ -331,7 +316,7 @@ mod tests {
             .open(
                 ResultWriteSpec::new(
                     UniqueId::new(812, 1),
-                    ResultPresentation::MysqlText,
+                    ResultPresentation::ArrowIpc,
                     None,
                     true,
                 )
@@ -489,7 +474,7 @@ mod tests {
                 .open(
                     ResultWriteSpec::new(
                         UniqueId::new(i64::from(seed), 1),
-                        ResultPresentation::MysqlText,
+                        ResultPresentation::ArrowIpc,
                         None,
                         true,
                     )

@@ -21,9 +21,6 @@
 //! on their implementations; role composition supplies the consumer ports.
 // Design: ADR-0144 (docs/adr/ADR-0144-application-domains-follow-stable-ownership-seams.md)
 
-#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(novarocks_dev_controls)))]
-compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
-
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
@@ -31,8 +28,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
         &[
             #[cfg(novarocks_dev_controls)]
             "test-controls",
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-            "mem-1-m07-exact-mysql-write",
         ],
     )
 }
@@ -56,8 +51,6 @@ pub mod engine_error;
 pub mod execution_error;
 
 /// Exact client-session identity and protocol-owned termination contracts.
-pub mod client_connection;
-
 mod client_query_id;
 /// Session registry and cancellation implementation owned by the query application.
 pub mod query_control;

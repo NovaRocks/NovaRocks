@@ -129,7 +129,7 @@ impl RootReplyFaultBounds {
     }
 
     pub(crate) fn semantics(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut semantics = serde_json::json!({
             "mode":"authenticated-plaintext-native-message-v2", "bounds":self,
             "exchange_methods":["DeliverExchangeUnit","RegisterExchangeDemand","SubscribeExchangeGrants"],
             "exchange_auth":"exact-live-backend-subject-and-process-original-signed-request",
@@ -159,7 +159,33 @@ impl RootReplyFaultBounds {
             "status_subscription_peer_cancel_policy":"authenticated-covered-request-response-capacity-none-actual-remote-cancel-only", "failure_digest_sha256_bytes":64,
             "overflow_policy":"fixed-first-cause-first-overflow-last-overflow-wholefailure",
             "accounting":"actor-owned-Vec-capacity-only-not-production-physical-envelope"
-        })
+        });
+        semantics
+            .as_object_mut()
+            .expect("root fault semantics is an object")
+            .extend([
+                (
+                    "original_hold".into(),
+                    "one-current-Data-RPC-with-original-connection-generation".into(),
+                ),
+                (
+                    "original_release".into(),
+                    "same-full-root-FE-BE-two-streams-request-hash-and-original-deadline".into(),
+                ),
+                (
+                    "original_cancel".into(),
+                    "actual-selected-inbound-RST-CANCEL-and-same-H2-reset-observation".into(),
+                ),
+                (
+                    "reset_timing".into(),
+                    "neutral-monotonic-observation-not-DELETE-causality".into(),
+                ),
+                (
+                    "cancelled_original_connection".into(),
+                    "explicit-same-original-query-phase-sole-RPC-typed-peer-exit-all-children-joined-zero-bytes-exact-release".into(),
+                ),
+            ]);
+        semantics
     }
 }
 
@@ -228,6 +254,7 @@ pub struct RootReplyFaultObservation {
     pub target_attempt_requests: Vec<serde_json::Value>,
     pub original: Option<serde_json::Value>,
     pub mutated: Option<serde_json::Value>,
+    pub original_hold: Option<RootReplyOriginalHold>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -260,8 +287,193 @@ impl FailureDigest {
         }
     }
 }
+#[derive(Clone, Copy, Debug)]
+enum RootReplyAction {
+    Mutate(RootReplyMutation),
+    HoldOriginal,
+}
+
+/// Exact current Data RPC, including the original connection generation.
+/// A candidate or a stream number alone never authorizes release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootReplyOriginalIdentity {
+    pub root: TaskIdentity,
+    pub caller: FrontendProcessId,
+    pub backend_index: usize,
+    pub connection_id: u64,
+    pub downstream_stream: u32,
+    pub upstream_stream: u32,
+    pub request_sha256: String,
+}
+impl Serialize for RootReplyOriginalIdentity {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serde_json::json!({
+            "task":self.root.to_string(), "frontend_process":self.caller.to_string(),
+            "backend_index":self.backend_index, "connection_id":self.connection_id,
+            "downstream_h2_stream":self.downstream_stream,
+            "upstream_h2_stream":self.upstream_stream, "request_sha256":self.request_sha256
+        })
+        .serialize(serializer)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum RootReplyOriginalDisposition {
+    Held,
+    ReleaseRequested,
+    ForwardedOriginal,
+    ExactDownstreamCancelled,
+    JoinedOriginalConnectionExit,
+}
+
+/// The sole watched stream's actual inbound RST_STREAM bytes, never a
+/// manufactured h2::Error or a GOAWAY reason. Time is observation, not cause.
+#[derive(Clone, Debug, Serialize)]
+pub struct RootReplyDownstreamReset {
+    pub stream: u32,
+    pub reason: u32,
+    pub frame: [u8; 13],
+    pub connection_frame_ordinal: u64,
+    #[serde(serialize_with = "serialize_monotonic_instant")]
+    pub observed_at: Instant,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RootReplyOriginalHold {
+    pub identity: RootReplyOriginalIdentity,
+    pub disposition: RootReplyOriginalDisposition,
+    #[serde(serialize_with = "serialize_monotonic_instant")]
+    pub held_at: Instant,
+    #[serde(serialize_with = "serialize_optional_monotonic_instant")]
+    pub release_requested_at: Option<Instant>,
+    #[serde(serialize_with = "serialize_optional_monotonic_instant")]
+    pub settled_at: Option<Instant>,
+    pub downstream_reset: Option<RootReplyDownstreamReset>,
+    // Preserve the actual downstream send error, if sending had begun. A raw
+    // reset observed before headers has no send error and must not invent one.
+    #[serde(serialize_with = "serialize_original_send_error")]
+    pub actual_send_error: Option<Arc<anyhow::Error>>,
+    #[serde(serialize_with = "serialize_original_reset_error")]
+    pub actual_reset_error: Option<Arc<h2::Error>>,
+    // The original accept owner observed a qualified peer close. Its held
+    // response may still own bytes; only connection_exit proves actual Join.
+    #[serde(serialize_with = "serialize_optional_monotonic_instant")]
+    pub parent_close_observed_at: Option<Instant>,
+    pub parent_close_facts: Option<RootReplyOriginalParentCloseFacts>,
+    pub connection_exit: Option<RootReplyOriginalConnectionExit>,
+    #[serde(serialize_with = "serialize_optional_monotonic_instant")]
+    pub expected_query_cancellation_at: Option<Instant>,
+}
+/// Original accept-owner inputs before cleanup. These observations grant no
+/// close exemption and retain no application payload or credential material.
+#[derive(Clone, Debug, Serialize)]
+pub struct RootReplyOriginalParentCloseFacts {
+    pub accepted_rpcs: u64,
+    pub application_children: usize,
+    pub original_hold_live: bool,
+    pub qualified_candidate: bool,
+    pub watched_reset_stream: Option<u32>,
+    pub watched_goaway: Option<([u8; 17], u64)>,
+    pub ingress_frames: String,
+}
+/// Neutral physical evidence from the original connection owner after every
+/// original child has been joined. It does not mean forwarding, a stream
+/// cancellation, or successful query completion.
+#[derive(Clone, Debug, Serialize)]
+pub struct RootReplyOriginalConnectionExit {
+    #[serde(serialize_with = "serialize_monotonic_instant")]
+    pub joined_at: Instant,
+    pub all_children_joined: bool,
+    pub cleanup_failed: bool,
+    pub remaining_connection_bytes: usize,
+    pub downstream_accept_failed: bool,
+    pub downstream_eof: bool,
+    pub owner_stop_observed: bool,
+    pub generation_change_observed: bool,
+    pub permitted_peer_exit: bool,
+    #[serde(serialize_with = "serialize_original_connection_error")]
+    pub actual_error: Option<Arc<anyhow::Error>>,
+}
+
+#[derive(Debug)]
+struct OriginalConnectionFailure(Arc<anyhow::Error>);
+impl std::fmt::Display for OriginalConnectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
+    }
+}
+impl std::error::Error for OriginalConnectionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+impl RootReplyOriginalHold {
+    pub fn require_forwarded_original(&self) -> Result<()> {
+        ensure!(
+            self.disposition == RootReplyOriginalDisposition::ForwardedOriginal
+                && self.downstream_reset.is_none(),
+            "held original response was not forwarded unchanged: {:?}",
+            self.disposition
+        );
+        Ok(())
+    }
+}
+fn serialize_monotonic_instant<S: serde::Serializer>(
+    value: &Instant,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("{value:?}"))
+}
+fn serialize_optional_monotonic_instant<S: serde::Serializer>(
+    value: &Option<Instant>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value
+        .map(|value| format!("{value:?}"))
+        .serialize(serializer)
+}
+
+// Observations retain the actual typed source in memory and serialize only its
+// bounded digest; they never format a request, grant or arbitrary body payload.
+fn serialize_original_send_error<S: serde::Serializer>(
+    value: &Option<Arc<anyhow::Error>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value
+        .as_ref()
+        .map(|error| digest_display("original-downstream-send", error.as_ref()))
+        .serialize(serializer)
+}
+fn serialize_original_connection_error<S: serde::Serializer>(
+    value: &Option<Arc<anyhow::Error>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value
+        .as_ref()
+        .map(|error| digest_display("original-downstream-connection", error.as_ref()))
+        .serialize(serializer)
+}
+fn serialize_original_reset_error<S: serde::Serializer>(
+    value: &Option<Arc<h2::Error>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value
+        .as_ref()
+        .map(|error| digest_display("original-downstream-reset", error.as_ref()))
+        .serialize(serializer)
+}
+
+#[derive(Clone)]
+struct RootReplyTransport {
+    connection_id: u64,
+    frames: Arc<Mutex<IngressFrames>>,
+}
 struct Slot {
     candidate: RootReplyCandidate,
+    connection_id: Option<u64>,
 }
 #[derive(Default)]
 struct State {
@@ -277,7 +489,9 @@ struct State {
     frozen_root: Option<(TaskIdentity, FrontendProcessId)>,
     frozen_request: Option<serde_json::Value>,
     frozen_backend_index: Option<usize>,
-    armed_mutation: Option<RootReplyMutation>,
+    armed_action: Option<RootReplyAction>,
+    original_hold: Option<RootReplyOriginalHold>,
+    expected_original_peer_exit: Option<RootReplyOriginalIdentity>,
     target_attempts: u64,
     non_target_peer_cancels: u64,
     status_subscription_peer_cancels: u64,
@@ -367,7 +581,8 @@ impl RootReplyFaultControl {
         );
         let mut state = self.core.state.lock().expect("root fault state lock");
         ensure!(
-            !state.used_capture
+            !state.lifecycle_closed
+                && !state.used_capture
                 && !state.exchange.occupied()
                 && state.failures.is_empty()
                 && !state.failure_overflow,
@@ -390,6 +605,114 @@ impl RootReplyFaultControl {
             .map(|slot| slot.candidate.clone())
     }
 
+    pub fn arm_exact_hold(
+        &self,
+        root: TaskIdentity,
+        caller: FrontendProcessId,
+        backend_index: usize,
+    ) -> Result<()> {
+        self.arm_action(root, caller, backend_index, RootReplyAction::HoldOriginal)
+    }
+
+    /// Declares the one exact held query's cancellation phase. The caller must
+    /// independently prove the public query's actual cancellation and order.
+    /// This grants no request, capacity, forwarding or stream-reset authority.
+    pub fn expect_exact_original_query_cancellation(
+        &self,
+        identity: &RootReplyOriginalIdentity,
+    ) -> Result<()> {
+        let mut state = self.core.state.lock().expect("root fault state lock");
+        let deadline = state.deadline.context("original capture has no deadline")?;
+        original_hold_live(&state, identity, deadline)?;
+        ensure!(
+            state.expected_original_peer_exit.is_none(),
+            "original query cancellation phase was already declared"
+        );
+        let held = state
+            .original_hold
+            .as_ref()
+            .context("no original response is held")?;
+        ensure!(
+            held.identity == *identity
+                && held.disposition == RootReplyOriginalDisposition::Held
+                && held.connection_exit.is_none()
+                && held.downstream_reset.is_none(),
+            "cancellation phase requires the same still-held original response"
+        );
+        state
+            .original_hold
+            .as_mut()
+            .unwrap()
+            .expected_query_cancellation_at = Some(Instant::now());
+        state.expected_original_peer_exit = Some(identity.clone());
+        drop(state);
+        self.core.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Releases only this original response under its existing clock. In the
+    /// explicitly declared cancellation phase its original connection may
+    /// already have joined; that remains distinct from forwarding or RST.
+    pub fn release_exact_original(&self, identity: &RootReplyOriginalIdentity) -> Result<()> {
+        let mut state = self.core.state.lock().expect("root fault state lock");
+        ensure!(
+            !state.lifecycle_closed
+                && state.claimed == 0
+                && state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() < deadline)
+                && state.first_failure.is_none()
+                && !state.failure_overflow,
+            "original response release is outside its live original capture"
+        );
+        ensure!(
+            matches!(state.armed_action, Some(RootReplyAction::HoldOriginal)),
+            "original release requires the closed HoldOriginal action"
+        );
+        let held = state
+            .original_hold
+            .as_ref()
+            .context("no actual Data response is held")?;
+        ensure!(
+            held.disposition == RootReplyOriginalDisposition::Held && &held.identity == identity,
+            "release identity is stale, different or already released"
+        );
+        let joined_peer_exit = held
+            .connection_exit
+            .as_ref()
+            .is_some_and(|exit| exit.permitted_peer_exit);
+        if joined_peer_exit {
+            let deadline = state.deadline.expect("validated capture deadline");
+            original_hold_capture_live(&state, identity, deadline)?;
+            ensure!(
+                state.expected_original_peer_exit.as_ref() == Some(identity),
+                "joined original response has no exact cancellation declaration"
+            );
+        } else {
+            let slot = state
+                .slot
+                .as_ref()
+                .context("original held RPC slot already exited")?;
+            ensure!(
+                original_identity(slot)? == *identity,
+                "release is not the current exact Data RPC"
+            );
+        }
+        // Every fallible precheck above precedes this single mutation.
+        let held = state
+            .original_hold
+            .as_mut()
+            .expect("validated original hold");
+        held.disposition = RootReplyOriginalDisposition::ReleaseRequested;
+        held.release_requested_at = Some(Instant::now());
+        if joined_peer_exit {
+            finish_original_peer_exit(&mut state);
+        }
+        drop(state);
+        self.core.changed.notify_waiters();
+        Ok(())
+    }
+
     pub fn arm_exact(
         &self,
         root: TaskIdentity,
@@ -397,20 +720,33 @@ impl RootReplyFaultControl {
         backend_index: usize,
         mutation: RootReplyMutation,
     ) -> Result<()> {
+        self.arm_action(
+            root,
+            caller,
+            backend_index,
+            RootReplyAction::Mutate(mutation),
+        )
+    }
+
+    fn arm_action(
+        &self,
+        root: TaskIdentity,
+        caller: FrontendProcessId,
+        backend_index: usize,
+        action: RootReplyAction,
+    ) -> Result<()> {
         let mut state = self.core.state.lock().expect("root fault state lock");
         ensure!(
-            state
-                .deadline
-                .is_some_and(|deadline| Instant::now() < deadline)
+            !state.lifecycle_closed
+                && state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() < deadline)
                 && state.claimed == 0
                 && state.failures.is_empty()
                 && !state.failure_overflow,
             "root fault cannot arm outside its original capture deadline"
         );
-        ensure!(
-            state.armed_mutation.is_none(),
-            "root mutation already armed"
-        );
+        ensure!(state.armed_action.is_none(), "root action already armed");
         let slot = state.slot.as_ref().context("no captured root candidate")?;
         ensure!(
             slot.candidate.read.root_task() == root
@@ -418,12 +754,15 @@ impl RootReplyFaultControl {
                 && slot.candidate.backend_index == backend_index,
             "independent root or frontend identity differs from candidate"
         );
+        if matches!(action, RootReplyAction::HoldOriginal) {
+            original_identity(slot)?;
+        }
         let frozen_request = serde_json::json!({"backend_index":slot.candidate.backend_index,
             "task":root.to_string(), "frontend_process":caller.to_string(),
             "downstream_h2_stream":slot.candidate.downstream_stream,
             "upstream_h2_stream":slot.candidate.upstream_stream,
             "request_sha256":slot.candidate.request_sha256});
-        state.armed_mutation = Some(mutation);
+        state.armed_action = Some(action);
         state.frozen_backend_index = Some(backend_index);
         state.frozen_request = Some(frozen_request);
         state.frozen_root = Some((root, caller));
@@ -435,11 +774,13 @@ impl RootReplyFaultControl {
     }
 
     pub fn disarm(&self) {
-        self.core
-            .state
-            .lock()
-            .expect("root fault state lock")
-            .deadline = None;
+        let mut state = self.core.state.lock().expect("root fault state lock");
+        let unconsumed_cancellation = state.expected_original_peer_exit.is_some();
+        state.deadline = None;
+        drop(state);
+        if unconsumed_cancellation {
+            self.core.failure("original query cancellation phase exited without exact response release and physical settlement");
+        }
         self.core.changed.notify_waiters();
     }
 
@@ -501,6 +842,7 @@ impl RootReplyFaultControl {
             target_attempt_requests: state.target_attempt_requests.clone(),
             original: state.original.clone(),
             mutated: state.mutated.clone(),
+            original_hold: state.original_hold.clone(),
         }
     }
 }
@@ -963,6 +1305,10 @@ struct IngressFrames {
     header_kind: u8,
     header_flags: u8,
     header_stream: u32,
+    raw_header: [u8; 9],
+    watched_reset_stream: Option<u32>,
+    watched_reset: Option<RootReplyDownstreamReset>,
+    watched_goaway: Option<([u8; 17], u64)>,
     payload_remaining: usize,
     payload_unit_target: usize,
     unit: [u8; 8],
@@ -1022,6 +1368,14 @@ impl IngressFrames {
             preface_valid: true,
             ..Self::default()
         }
+    }
+    fn watch_original_reset(&mut self, stream: u32) -> Result<()> {
+        ensure!(
+            self.watched_reset_stream.is_none() && self.watched_reset.is_none(),
+            "original downstream reset watch is already occupied"
+        );
+        self.watched_reset_stream = Some(stream);
+        Ok(())
     }
     fn count(counter: &mut u64) -> bool {
         if let Some(next) = counter.checked_add(1) {
@@ -1089,6 +1443,7 @@ impl IngressFrames {
             }
             let byte = bytes[0];
             bytes = &bytes[1..];
+            self.raw_header[self.header_bytes] = byte;
             match self.header_bytes {
                 0 => self.header_length = (byte as usize) << 16,
                 1 => self.header_length |= (byte as usize) << 8,
@@ -1149,6 +1504,31 @@ impl IngressFrames {
                 _ => 0,
             };
         }
+        // Unlike bootstrap-control validation above, this copies only the
+        // four public RST bytes for the one already selected stream, even on
+        // an application connection. No application/HPACK payload is retained.
+        if self.preface_valid
+            && self.header_kind == 3
+            && flags == 0
+            && length == 4
+            && stream != 0
+            && self.watched_reset_stream == Some(stream)
+            && self.watched_reset.is_none()
+        {
+            self.payload_unit_target = 4;
+        }
+        // After selecting the original stream, retain only a GOAWAY's fixed
+        // public control prefix. Application traffic remains ineligible for
+        // the separate preapplication-close classifier.
+        if self.preface_valid
+            && self.watched_reset_stream.is_some()
+            && self.header_kind == 7
+            && flags == 0
+            && stream == 0
+            && (8..=FRAME_BYTES).contains(&length)
+        {
+            self.payload_unit_target = 8;
+        }
         self.payload_remaining = length;
         if length == 0 {
             self.finish_frame();
@@ -1156,6 +1536,19 @@ impl IngressFrames {
     }
     fn validate_unit(&mut self) {
         match self.header_kind {
+            3 => {
+                let mut frame = [0; 13];
+                frame[..9].copy_from_slice(&self.raw_header);
+                frame[9..].copy_from_slice(&self.unit[..4]);
+                self.watched_reset = Some(RootReplyDownstreamReset {
+                    stream: self.header_stream & 0x7fff_ffff,
+                    reason: u32::from_be_bytes(self.unit[..4].try_into().expect("four-byte RST")),
+                    frame,
+                    connection_frame_ordinal: self.frames,
+                    observed_at: Instant::now(),
+                });
+                self.payload_unit_target = 0;
+            }
             4 => {
                 let id = u16::from_be_bytes([self.unit[0], self.unit[1]]);
                 let value =
@@ -1181,6 +1574,12 @@ impl IngressFrames {
                 self.payload_unit_target = 0;
             }
             7 => {
+                if self.watched_reset_stream.is_some() && self.watched_goaway.is_none() {
+                    let mut frame = [0; 17];
+                    frame[..9].copy_from_slice(&self.raw_header);
+                    frame[9..].copy_from_slice(&self.unit);
+                    self.watched_goaway = Some((frame, self.frames));
+                }
                 let last =
                     u32::from_be_bytes(self.unit[..4].try_into().expect("GOAWAY last stream"))
                         & 0x7fff_ffff;
@@ -1471,7 +1870,7 @@ fn preapplication_close_candidate(
         && !state.pending_capture
         && state.claimed == 0
         && state.frozen_root.is_none()
-        && state.armed_mutation.is_none()
+        && state.armed_action.is_none()
         && state.target_attempts == 0
         && state.failures.is_empty()
         && !state.failure_overflow
@@ -1610,6 +2009,35 @@ mod preapplication_close_candidate_tests {
         assert!(error.is_io());
         assert_eq!(error.get_io().map(std::io::Error::kind), Some(kind));
         anyhow::Error::new(error).context("actual downstream accept stage")
+    }
+    #[tokio::test]
+    async fn preapplication_classifier_retains_the_original_typed_source_across_shared_observation()
+    {
+        let actual = Arc::new(typed_accept_error(ErrorKind::ConnectionReset).await);
+        let returned = anyhow::Error::new(OriginalConnectionFailure(actual.clone()));
+        // The return wrapper preserves the actual Error::source chain, but
+        // Anyhow's direct downcast cannot cross another error's Arc owner.
+        assert!(returned.chain().any(|source| source.is::<h2::Error>()));
+        assert!(returned.downcast_ref::<h2::Error>().is_none());
+        let state = State::default();
+        let ledger = PreapplicationCloseLedger::new(&[0]).unwrap();
+        assert!(preapplication_close_candidate(
+            &state,
+            &ledger,
+            0,
+            exit(),
+            &controls(),
+            actual.as_ref()
+        ));
+        assert!(!preapplication_close_candidate(
+            &state,
+            &ledger,
+            0,
+            exit(),
+            &controls(),
+            &returned
+        ));
+        assert!(!original_peer_close_kind(true, false, Some(&returned)));
     }
     // This is a legal 79-byte control-only shape matching the observed frame
     // counts. Values are valid fixture settings, not recovered peer settings.
@@ -1963,6 +2391,7 @@ mod preapplication_close_candidate_tests {
 struct ObservedIngress {
     stream: tokio::net::TcpStream,
     frames: Arc<Mutex<IngressFrames>>,
+    original_hold: Option<(std::sync::Weak<Core>, u64)>,
 }
 impl tokio::io::AsyncRead for ObservedIngress {
     fn poll_read(
@@ -1978,6 +2407,19 @@ impl tokio::io::AsyncRead for ObservedIngress {
                 .lock()
                 .expect("root ingress facts lock")
                 .observe(&buf.filled()[before..]);
+            if let Some((core, connection_id)) = &this.original_hold {
+                let reset = this
+                    .frames
+                    .lock()
+                    .expect("root ingress facts lock")
+                    .watched_reset
+                    .clone();
+                if let Some(reset) = reset
+                    && let Some(core) = core.upgrade()
+                {
+                    publish_original_reset(&core, *connection_id, reset);
+                }
+            }
         }
         result
     }
@@ -2008,6 +2450,120 @@ enum ChildExit {
     Upstream,
     Stream,
 }
+
+fn original_peer_close_kind(
+    downstream_eof: bool,
+    downstream_accept_failed: bool,
+    error: Option<&anyhow::Error>,
+) -> bool {
+    match error {
+        None => downstream_eof && !downstream_accept_failed,
+        Some(error) if downstream_accept_failed && !downstream_eof => error
+            .chain()
+            .find_map(|source| source.downcast_ref::<h2::Error>())
+            .is_some_and(|error| {
+                error.is_io()
+                    && !error.is_reset()
+                    && error.reason().is_none()
+                    && error.get_io().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::UnexpectedEof
+                        )
+                    })
+            }),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OriginalPeerClose {
+    ConnectionOnly,
+    ExactRawCancel,
+}
+
+fn exact_cancel_peer_close_frames(frames: &IngressFrames) -> bool {
+    if frames.header_bytes != 0
+        || frames.payload_remaining != 0
+        || frames.frames != frames.completed_frames
+    {
+        return false;
+    }
+    let Some(reset) = frames.watched_reset.as_ref() else {
+        return false;
+    };
+    if reset.reason != u32::from(h2::Reason::CANCEL) {
+        return false;
+    }
+    if frames.goaways == 0 {
+        return true;
+    }
+    // The peer may retire its idle client connection after sending this exact
+    // stream's CANCEL. GOAWAY alone grants no cancellation proof. Only one
+    // complete NO_ERROR/last-stream-zero frame without debug bytes qualifies.
+    frames.goaways == 1
+        && frames
+            .watched_goaway
+            .as_ref()
+            .is_some_and(|(frame, ordinal)| {
+                *ordinal > reset.connection_frame_ordinal
+                    && *frame == [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn original_peer_exit_candidate(
+    state: &State,
+    frames: &IngressFrames,
+    connection_id: u64,
+    accepted_rpcs: u64,
+    application_children: usize,
+    downstream_eof: bool,
+    downstream_accept_failed: bool,
+    error: Option<&anyhow::Error>,
+) -> Option<(RootReplyOriginalIdentity, Instant, OriginalPeerClose)> {
+    let identity = state.expected_original_peer_exit.as_ref()?;
+    let deadline = state.deadline?;
+    let held = state.original_hold.as_ref()?;
+    let close = match frames.watched_reset.as_ref() {
+        None if held.downstream_reset.is_none() => OriginalPeerClose::ConnectionOnly,
+        Some(reset)
+            if reset.stream == identity.downstream_stream
+                && reset.reason == u32::from(h2::Reason::CANCEL)
+                && held
+                    .expected_query_cancellation_at
+                    .is_some_and(|at| at <= reset.observed_at)
+                && held.downstream_reset.as_ref().is_some_and(|observed| {
+                    observed.frame == reset.frame && observed.observed_at == reset.observed_at
+                }) =>
+        {
+            OriginalPeerClose::ExactRawCancel
+        }
+        _ => return None,
+    };
+    (identity.connection_id == connection_id
+        && held.identity == *identity
+        && accepted_rpcs == 1
+        && application_children == 1
+        && held.expected_query_cancellation_at.is_some()
+        && held.connection_exit.is_none()
+        && original_hold_live(state, identity, deadline).is_ok()
+        && frames.preface_valid
+        && frames.first_frame_non_ack_settings
+        && frames.header_bytes == 0
+        && frames.payload_remaining == 0
+        && frames.frames == frames.completed_frames
+        && match close {
+            OriginalPeerClose::ConnectionOnly => frames.goaways == 0,
+            OriginalPeerClose::ExactRawCancel => exact_cancel_peer_close_frames(frames),
+        }
+        && frames.watched_reset_stream == Some(identity.downstream_stream)
+        && original_peer_close_kind(downstream_eof, downstream_accept_failed, error))
+    .then(|| (identity.clone(), deadline, close))
+}
+
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     upstream: SocketAddr,
@@ -2026,6 +2582,7 @@ async fn serve_connection(
     let observed_stream = ObservedIngress {
         stream,
         frames: downstream_frames.clone(),
+        original_hold: Some((Arc::downgrade(&core), connection.id)),
     };
     let connect = async {
         let mut server_builder = server::Builder::new();
@@ -2085,6 +2642,7 @@ async fn serve_connection(
     let mut accepted_rpcs = 0u64;
     let mut application_children = 0usize;
     let mut normal_capacity_eof = false;
+    let mut downstream_eof = false;
     let mut failed_at_downstream_accept = false;
     let mut unresolved_rpcs_at_failure = 0;
     let outcome = async {
@@ -2119,7 +2677,7 @@ async fn serve_connection(
                                 error.is_reset(), error.is_remote(), error.reason());
                             anyhow::Error::new(error).context(context)
                         })?
-                        else {normal_capacity_eof=connection.is_draining();break Ok(())};
+                        else {downstream_eof=true;normal_capacity_eof=connection.is_draining();break Ok(())};
                     accepted_rpcs = accepted_rpcs.saturating_add(1);
                     let Ok(position) = core.stream_positions.clone().try_acquire_owned() else {
                         response.send_reset(h2::Reason::REFUSED_STREAM);
@@ -2129,11 +2687,14 @@ async fn serve_connection(
                     connection.accepted_during_grace();
                     let buffers=BufferContext::connection(core.clone(),connection.clone());
                     let child_sender = sender.clone();
+                    let transport = RootReplyTransport {
+                        connection_id: connection.id, frames: downstream_frames.clone(),
+                    };
                     application_children+=1;
                     children.spawn(async move {
                         let _position = position;
                         let _count = CountGuard::new(child_core.clone(), false);
-                        forward_stream_bound(request, response, child_sender, backend_index, buffers).await?;
+                        forward_stream_bound(request, response, child_sender, backend_index, buffers, Some(transport)).await?;
                         Ok(ChildExit::Stream)
                     });
                 }
@@ -2141,11 +2702,60 @@ async fn serve_connection(
         }
     }
     .await;
+    let peer_exit_candidate = {
+        let frames = downstream_frames.lock().expect("root ingress facts lock");
+        let mut state = core.state.lock().expect("root fault state lock");
+        let candidate = original_peer_exit_candidate(
+            &state,
+            &frames,
+            connection.id,
+            accepted_rpcs,
+            application_children,
+            downstream_eof,
+            failed_at_downstream_accept,
+            outcome.as_ref().err(),
+        );
+        let live = state.original_hold.as_ref().is_some_and(|held| {
+            state.deadline.is_some_and(|deadline| {
+                original_hold_live(&state, &held.identity, deadline).is_ok()
+            })
+        });
+        if let Some(held) = state.original_hold.as_mut()
+            && held.identity.connection_id == connection.id
+        {
+            held.parent_close_facts = Some(RootReplyOriginalParentCloseFacts {
+                accepted_rpcs,
+                application_children,
+                original_hold_live: live,
+                qualified_candidate: candidate.is_some(),
+                watched_reset_stream: frames.watched_reset_stream,
+                watched_goaway: frames.watched_goaway,
+                ingress_frames: format!("{frames:?}"),
+            });
+        }
+        candidate
+    };
+    if let Some((identity, _, _)) = peer_exit_candidate.as_ref() {
+        let mut state = core.state.lock().expect("root fault state lock");
+        if let Some(held) = state.original_hold.as_mut()
+            && held.identity == *identity
+        {
+            held.parent_close_observed_at = Some(Instant::now());
+        }
+        drop(state);
+        core.changed.notify_waiters();
+    }
+    // A declared exact raw CANCEL must keep the original response child alive
+    // until its caller releases it. The child still requires the same H2
+    // stream's actual reset; socket close alone cannot settle the response.
+    let retain_cancelled_child = peer_exit_candidate
+        .as_ref()
+        .is_some_and(|(_, _, close)| *close == OriginalPeerClose::ExactRawCancel);
     let cleanup_failed = capacity::finish_children(
         &mut children,
         application_children,
         sender,
-        normal_capacity_eof && outcome.is_ok(),
+        (normal_capacity_eof && outcome.is_ok()) || retain_cancelled_child,
         &mut stop,
         &mut generation,
         &core,
@@ -2153,7 +2763,77 @@ async fn serve_connection(
     .await;
     drop(downstream);
     connection.joined_children();
-    if failed_at_downstream_accept && let Err(error) = &outcome {
+    // Retain this original owner's result without converting an I/O close
+    // into an exact stream reset or losing the actual typed source.
+    let actual_error = outcome.err().map(Arc::new);
+    let outcome = actual_error.as_ref().map_or(Ok(()), |error| {
+        Err(anyhow::Error::new(OriginalConnectionFailure(error.clone())))
+    });
+    let (permitted_peer_exit, completed_exact_cancel) = {
+        let mut state = core.state.lock().expect("root fault state lock");
+        let permitted = peer_exit_candidate
+            .as_ref()
+            .is_some_and(|(identity, deadline, close)| {
+                *close == OriginalPeerClose::ConnectionOnly
+                    && children.is_empty()
+                    && !cleanup_failed
+                    && connection.bytes.load(Ordering::Acquire) == 0
+                    && !*stop.borrow()
+                    && !generation.has_changed().unwrap_or(true)
+                    && state.expected_original_peer_exit.as_ref() == Some(identity)
+                    && original_hold_capture_live(&state, identity, *deadline).is_ok()
+            });
+        let completed_exact_cancel =
+            peer_exit_candidate
+                .as_ref()
+                .is_some_and(|(identity, deadline, close)| {
+                    *close == OriginalPeerClose::ExactRawCancel
+                        && children.is_empty()
+                        && !cleanup_failed
+                        && connection.bytes.load(Ordering::Acquire) == 0
+                        && !*stop.borrow()
+                        && !generation.has_changed().unwrap_or(true)
+                        && Instant::now() < *deadline
+                        && state.expected_original_peer_exit.is_none()
+                        && state.original_hold.as_ref().is_some_and(|held| {
+                            held.identity == *identity
+                                && held.disposition
+                                    == RootReplyOriginalDisposition::ExactDownstreamCancelled
+                                && held.release_requested_at.is_some()
+                                && held.settled_at.is_some_and(|at| at < *deadline)
+                        })
+                });
+        if let Some(held) = state.original_hold.as_mut()
+            && held.identity.connection_id == connection.id
+            && held.connection_exit.is_none()
+        {
+            held.connection_exit = Some(RootReplyOriginalConnectionExit {
+                joined_at: Instant::now(),
+                all_children_joined: children.is_empty(),
+                cleanup_failed,
+                remaining_connection_bytes: connection.bytes.load(Ordering::Acquire),
+                downstream_accept_failed: failed_at_downstream_accept,
+                downstream_eof,
+                owner_stop_observed: *stop.borrow(),
+                generation_change_observed: generation.has_changed().unwrap_or(true),
+                permitted_peer_exit: permitted,
+                actual_error: actual_error.clone(),
+            });
+            if permitted && held.disposition == RootReplyOriginalDisposition::ReleaseRequested {
+                finish_original_peer_exit(&mut state);
+            }
+            drop(state);
+            core.changed.notify_waiters();
+        }
+        (permitted, completed_exact_cancel)
+    };
+    if permitted_peer_exit || completed_exact_cancel {
+        // Only the explicitly declared, sole original response qualifies.
+        // Its real error remains in connection_exit; this is not an RST or
+        // forwarding claim. An unconsumed declaration fails disarm/shutdown.
+        return Ok(());
+    }
+    if failed_at_downstream_accept && let Some(error) = actual_error.as_deref() {
         let frames = downstream_frames.lock().expect("root ingress facts lock");
         let mut state = core.state.lock().expect("root fault state lock");
         let facts = PreapplicationExitFacts {
@@ -2428,6 +3108,7 @@ async fn forward_stream(
         sender,
         backend_index,
         BufferContext::standalone(core),
+        None,
     )
     .await
 }
@@ -2438,6 +3119,7 @@ async fn forward_stream_bound(
     sender: client::SendRequest<Bytes>,
     backend_index: usize,
     buffers: BufferContext,
+    transport: Option<RootReplyTransport>,
 ) -> Result<()> {
     let core = buffers.core.clone();
     if exchange_fault::enabled_method(&core, &request) {
@@ -2616,6 +3298,7 @@ async fn forward_stream_bound(
                 state.target_attempt_requests.push(evidence);
                 state.pending_capture = false;
                 state.slot = Some(Slot {
+                    connection_id: transport.as_ref().map(|transport| transport.connection_id),
                     candidate: RootReplyCandidate {
                         read: read.clone(),
                         backend_index,
@@ -2630,7 +3313,15 @@ async fn forward_stream_bound(
             send_bytes(&mut upstream_send, body).await?;
             upstream_send.send_data(Bytes::new(), true)?;
             let upstream_response = upstream_response.await?;
-            inject_reply(upstream_response, response, read, deadline, buffers.clone()).await
+            inject_reply(
+                upstream_response,
+                response,
+                read,
+                deadline,
+                buffers.clone(),
+                transport,
+            )
+            .await
         } else if let Some(body) = saved_status.or_else(|| {
             if stream_class == StreamClass::NonTarget
                 && core
@@ -2770,13 +3461,46 @@ async fn read_bounded(
     Ok((buffer.into_bytes(), trailers))
 }
 
+#[derive(Debug)]
+struct ForwardingOutputFailure {
+    stage: &'static str,
+    reset: CapacityResetObservation,
+}
+impl std::fmt::Display for ForwardingOutputFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "forwarding output stage={} reset={:?}",
+            self.stage, self.reset
+        )
+    }
+}
+fn forwarding_output_failure(
+    stage: &'static str,
+    reset: std::task::Poll<std::result::Result<h2::Reason, h2::Error>>,
+    original: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    // One observation of the same failed output supplies diagnostics only.
+    // Pending and other Reasons remain errors; no cancellation is inferred.
+    let reset = match reset {
+        std::task::Poll::Pending => CapacityResetObservation::Pending,
+        std::task::Poll::Ready(Ok(reason)) => CapacityResetObservation::Reason(u32::from(reason)),
+        std::task::Poll::Ready(Err(error)) => {
+            CapacityResetObservation::Error(digest_display("forwarding-output-reset", &error))
+        }
+    };
+    original
+        .into()
+        .context(ForwardingOutputFailure { stage, reset })
+}
+
 async fn copy_body(
     mut input: RecvStream,
     mut output: SendStream<Bytes>,
     buffers: BufferContext,
 ) -> Result<()> {
     while let Some(bytes) = input.data().await {
-        let bytes = bytes?;
+        let bytes = bytes.context("forwarding response DATA read")?;
         ensure!(
             bytes.len() <= FRAME_BYTES,
             "root forwarding received oversized DATA frame"
@@ -2785,11 +3509,22 @@ async fn copy_body(
         copy.append(&bytes)?;
         input.flow_control().release_capacity(bytes.len())?;
         drop(bytes);
-        send_bytes(&mut output, copy.into_bytes()).await?;
+        if let Err(error) = send_bytes(&mut output, copy.into_bytes()).await {
+            let reset = poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await;
+            return Err(forwarding_output_failure("response-message", reset, error));
+        }
     }
-    match input.trailers().await? {
-        Some(trailers) => output.send_trailers(trailers)?,
-        None => output.send_data(Bytes::new(), true)?,
+    let (stage, result) = match input
+        .trailers()
+        .await
+        .context("forwarding response trailers read")?
+    {
+        Some(trailers) => ("response-trailers", output.send_trailers(trailers)),
+        None => ("response-eof", output.send_data(Bytes::new(), true)),
+    };
+    if let Err(error) = result {
+        let reset = poll_fn(|cx| std::task::Poll::Ready(output.poll_reset(cx))).await;
+        return Err(forwarding_output_failure(stage, reset, error));
     }
     Ok(())
 }
@@ -2916,8 +3651,8 @@ fn require_canonical_reply(
 // The new body backing is charged alongside the original until its last alias exits.
 fn append_prefix_only_suffix(buffers: BufferContext, original: &Bytes) -> Result<Bytes> {
     ensure!(
-        original.len() == 69,
-        "suffix fixture requires the real 69-byte scalar body"
+        original.len() == 72,
+        "suffix fixture requires the real 72-byte Trino scalar body"
     );
     let length = original
         .len()
@@ -2957,12 +3692,424 @@ fn reply_data_mut(
     Ok(data)
 }
 
+fn original_identity(slot: &Slot) -> Result<RootReplyOriginalIdentity> {
+    let candidate = &slot.candidate;
+    Ok(RootReplyOriginalIdentity {
+        root: candidate.read.root_task(),
+        caller: candidate.caller,
+        backend_index: candidate.backend_index,
+        connection_id: slot
+            .connection_id
+            .context("captured RPC has no original connection identity")?,
+        downstream_stream: candidate.downstream_stream,
+        upstream_stream: candidate.upstream_stream,
+        request_sha256: candidate.request_sha256.clone(),
+    })
+}
+
+fn original_hold_live(
+    state: &State,
+    identity: &RootReplyOriginalIdentity,
+    deadline: Instant,
+) -> Result<()> {
+    original_hold_capture_live(state, identity, deadline)?;
+    ensure!(
+        original_identity(state.slot.as_ref().context("original RPC slot exited")?)? == *identity,
+        "original hold is not the current exact RPC"
+    );
+    Ok(())
+}
+
+fn original_hold_capture_live(
+    state: &State,
+    identity: &RootReplyOriginalIdentity,
+    deadline: Instant,
+) -> Result<()> {
+    ensure!(
+        !state.lifecycle_closed
+            && state.claimed == 0
+            && state.deadline == Some(deadline)
+            && Instant::now() < deadline
+            && state.first_failure.is_none()
+            && !state.failure_overflow,
+        "original hold lost its original live absolute deadline"
+    );
+    ensure!(
+        matches!(state.armed_action, Some(RootReplyAction::HoldOriginal))
+            && state.frozen_root == Some((identity.root, identity.caller))
+            && state.frozen_backend_index == Some(identity.backend_index),
+        "original hold lost its exact armed identity"
+    );
+    Ok(())
+}
+
+fn finish_original_peer_exit(state: &mut State) {
+    let held = state
+        .original_hold
+        .as_mut()
+        .expect("validated original response");
+    let exit = held
+        .connection_exit
+        .as_ref()
+        .expect("validated original physical exit");
+    debug_assert!(
+        exit.permitted_peer_exit
+            && held.disposition == RootReplyOriginalDisposition::ReleaseRequested
+    );
+    held.disposition = RootReplyOriginalDisposition::JoinedOriginalConnectionExit;
+    held.settled_at = Some(exit.joined_at);
+    state.claimed = 1;
+    state.deadline = None;
+    state.expected_original_peer_exit = None;
+}
+
+// This records the time at which this original connection observed its selected
+// RST. It does not attribute an early/unexpected reset to a later DELETE.
+fn publish_original_reset(core: &Core, connection_id: u64, reset: RootReplyDownstreamReset) {
+    let mut state = core.state.lock().expect("root fault state lock");
+    if let Some(held) = state.original_hold.as_mut()
+        && held.identity.connection_id == connection_id
+        && held.identity.downstream_stream == reset.stream
+        && held.downstream_reset.is_none()
+    {
+        held.downstream_reset = Some(reset);
+        drop(state);
+        core.changed.notify_waiters();
+    }
+}
+
+fn original_cancel_reset(
+    transport: &RootReplyTransport,
+    identity: &RootReplyOriginalIdentity,
+) -> Option<RootReplyDownstreamReset> {
+    let reset = transport
+        .frames
+        .lock()
+        .expect("root ingress facts lock")
+        .watched_reset
+        .clone()?;
+    (transport.connection_id == identity.connection_id
+        && reset.stream == identity.downstream_stream
+        && reset.reason == u32::from(h2::Reason::CANCEL))
+    .then_some(reset)
+}
+
+fn settle_original_hold(
+    core: &Core,
+    identity: &RootReplyOriginalIdentity,
+    deadline: Instant,
+    disposition: RootReplyOriginalDisposition,
+    reset: Option<RootReplyDownstreamReset>,
+    actual_send_error: Option<anyhow::Error>,
+    actual_reset_error: Option<h2::Error>,
+) -> Result<()> {
+    let mut state = core.state.lock().expect("root fault state lock");
+    original_hold_live(&state, identity, deadline)?;
+    let held = state
+        .original_hold
+        .as_mut()
+        .context("actual original hold disappeared")?;
+    ensure!(
+        held.identity == *identity
+            && held.disposition == RootReplyOriginalDisposition::ReleaseRequested,
+        "original hold settlement is stale or duplicated"
+    );
+    ensure!(
+        matches!(
+            disposition,
+            RootReplyOriginalDisposition::ForwardedOriginal
+                | RootReplyOriginalDisposition::ExactDownstreamCancelled
+        ),
+        "invalid original hold settlement"
+    );
+    if disposition == RootReplyOriginalDisposition::ExactDownstreamCancelled {
+        ensure!(
+            reset
+                .as_ref()
+                .is_some_and(|reset| reset.stream == identity.downstream_stream
+                    && reset.reason == u32::from(h2::Reason::CANCEL)),
+            "original cancellation has no exact actual remote RST(CANCEL)"
+        );
+    }
+    held.disposition = disposition;
+    held.settled_at = Some(Instant::now());
+    if let Some(reset) = reset {
+        held.downstream_reset = Some(reset);
+    }
+    held.actual_send_error = actual_send_error.map(Arc::new);
+    held.actual_reset_error = actual_reset_error.map(Arc::new);
+    // A closed typed cancellation consumes the one capture, but is never an
+    // emitted original. The normal consumer must require ForwardedOriginal.
+    state.claimed = 1;
+    state.emitted += u64::from(disposition == RootReplyOriginalDisposition::ForwardedOriginal);
+    state.deadline = None;
+    state.expected_original_peer_exit = None;
+    drop(state);
+    core.changed.notify_waiters();
+    Ok(())
+}
+
+fn reset_is_actual_cancel(
+    reset: &std::task::Poll<std::result::Result<h2::Reason, h2::Error>>,
+) -> bool {
+    match reset {
+        std::task::Poll::Ready(Ok(reason)) => *reason == h2::Reason::CANCEL,
+        std::task::Poll::Ready(Err(error)) => {
+            error.is_reset() && error.is_remote() && error.reason() == Some(h2::Reason::CANCEL)
+        }
+        std::task::Poll::Pending => false,
+    }
+}
+
+fn original_hold_owner_closing(state: &State, deadline: Instant) -> Result<bool> {
+    if state.lifecycle_closed {
+        ensure!(
+            Instant::now() < deadline,
+            "capture absolute deadline expired before original actor close"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn hold_original_response(
+    parts: http::response::Parts,
+    _original_recv: RecvStream,
+    original: Bytes,
+    trailers: Option<HeaderMap>,
+    before: serde_json::Value,
+    mut downstream: server::SendResponse<Bytes>,
+    deadline: Instant,
+    buffers: BufferContext,
+    transport: RootReplyTransport,
+) -> Result<()> {
+    let core = buffers.core.clone();
+    let work = async {
+        let _original_recv = _original_recv;
+        let identity = {
+            let state = core.state.lock().expect("root fault state lock");
+            if original_hold_owner_closing(&state, deadline)? {
+                return Ok(());
+            }
+            original_identity(state.slot.as_ref().context("no exact original Data RPC")?)?
+        };
+        ensure!(
+            identity.connection_id == transport.connection_id
+                && identity.downstream_stream == downstream.stream_id().as_u32(),
+            "held Data transport differs from original current RPC"
+        );
+        {
+            let state = core.state.lock().expect("root fault state lock");
+            if original_hold_owner_closing(&state, deadline)? {
+                return Ok(());
+            }
+            original_hold_live(&state, &identity, deadline)?;
+            ensure!(
+                state.original_hold.is_none(),
+                "another original response is already held"
+            );
+        }
+        transport
+            .frames
+            .lock()
+            .expect("root ingress facts lock")
+            .watch_original_reset(identity.downstream_stream)?;
+        {
+            let mut state = core.state.lock().expect("root fault state lock");
+            if original_hold_owner_closing(&state, deadline)? {
+                return Ok(());
+            }
+            original_hold_live(&state, &identity, deadline)?;
+            ensure!(
+                state.original_hold.is_none(),
+                "original hold overlapped before publication"
+            );
+            state.original = Some(before);
+            state.original_hold = Some(RootReplyOriginalHold {
+                identity: identity.clone(),
+                disposition: RootReplyOriginalDisposition::Held,
+                held_at: Instant::now(),
+                release_requested_at: None,
+                settled_at: None,
+                downstream_reset: None,
+                actual_send_error: None,
+                actual_reset_error: None,
+                parent_close_observed_at: None,
+                parent_close_facts: None,
+                connection_exit: None,
+                expected_query_cancellation_at: None,
+            });
+        }
+        if let Some(reset) = transport
+            .frames
+            .lock()
+            .expect("root ingress facts lock")
+            .watched_reset
+            .clone()
+        {
+            publish_original_reset(&core, transport.connection_id, reset);
+        }
+        core.changed.notify_waiters();
+        loop {
+            let changed = core.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = core.state.lock().expect("root fault state lock");
+                if original_hold_owner_closing(&state, deadline)? {
+                    return Ok(());
+                }
+                original_hold_live(&state, &identity, deadline)?;
+                let held = state
+                    .original_hold
+                    .as_ref()
+                    .context("original hold disappeared")?;
+                ensure!(
+                    held.identity == identity,
+                    "held original RPC identity changed"
+                );
+                if held.disposition == RootReplyOriginalDisposition::ReleaseRequested {
+                    break;
+                }
+                ensure!(
+                    held.disposition == RootReplyOriginalDisposition::Held,
+                    "original hold settled before explicit release"
+                );
+            }
+            changed.await;
+        }
+        // A reset already present before headers cannot transition back to
+        // AwaitingHeaders. Require both actual raw RST bytes and the same H2
+        // stream's reset observation; GOAWAY(CANCEL) alone cannot qualify.
+        if let Some(reset) = original_cancel_reset(&transport, &identity) {
+            let actual_reset_error = match poll_fn(|cx| downstream.poll_reset(cx)).await {
+                Ok(reason) if reason == h2::Reason::CANCEL => None,
+                Err(error)
+                    if error.is_reset()
+                        && error.is_remote()
+                        && error.reason() == Some(h2::Reason::CANCEL) =>
+                {
+                    Some(error)
+                }
+                Err(error) => return Err(error).context("actual held downstream reset"),
+                Ok(_) => bail!("actual held downstream reset is not CANCEL"),
+            };
+            return settle_original_hold(
+                &core,
+                &identity,
+                deadline,
+                RootReplyOriginalDisposition::ExactDownstreamCancelled,
+                Some(reset),
+                None,
+                actual_reset_error,
+            );
+        }
+        let mut send = match downstream.send_response(Response::from_parts(parts, ()), false) {
+            Ok(send) => send,
+            Err(error) => {
+                let observed =
+                    poll_fn(|cx| std::task::Poll::Ready(downstream.poll_reset(cx))).await;
+                if let Some(reset) = original_cancel_reset(&transport, &identity)
+                    && reset_is_actual_cancel(&observed)
+                {
+                    return settle_original_hold(
+                        &core,
+                        &identity,
+                        deadline,
+                        RootReplyOriginalDisposition::ExactDownstreamCancelled,
+                        Some(reset),
+                        Some(anyhow::Error::new(error)),
+                        match observed {
+                            std::task::Poll::Ready(Err(error)) => Some(error),
+                            _ => None,
+                        },
+                    );
+                }
+                return Err(error).context("original downstream response headers");
+            }
+        };
+        let sent = async {
+            send_bytes(&mut send, original).await?;
+            match trailers {
+                Some(trailers) => send.send_trailers(trailers)?,
+                None => send.send_data(Bytes::new(), true)?,
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = sent {
+            let observed = poll_fn(|cx| std::task::Poll::Ready(send.poll_reset(cx))).await;
+            if let Some(reset) = original_cancel_reset(&transport, &identity)
+                && reset_is_actual_cancel(&observed)
+            {
+                return settle_original_hold(
+                    &core,
+                    &identity,
+                    deadline,
+                    RootReplyOriginalDisposition::ExactDownstreamCancelled,
+                    Some(reset),
+                    Some(error),
+                    match observed {
+                        std::task::Poll::Ready(Err(error)) => Some(error),
+                        _ => None,
+                    },
+                );
+            }
+            return Err(error).context("original downstream response send");
+        }
+        // Complete queueing only, never peer acceptance or physical exit.
+        settle_original_hold(
+            &core,
+            &identity,
+            deadline,
+            RootReplyOriginalDisposition::ForwardedOriginal,
+            None,
+            None,
+            None,
+        )
+    };
+    let closed = async {
+        loop {
+            let changed = core.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if core
+                .state
+                .lock()
+                .expect("root fault state lock")
+                .lifecycle_closed
+            {
+                break;
+            }
+            changed.await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = closed => {
+            // The same original actor's close drops this work and its bytes.
+            // It never authorizes release/forwarding or hides an expired clock.
+            ensure!(Instant::now() < deadline,
+                "capture absolute deadline expired before original actor close");
+            Ok(())
+        }
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work) => match result {
+            Ok(result) => result,
+            Err(_) => {
+                core.failure("capture absolute deadline expired while holding or sending original response");
+                bail!("capture absolute deadline expired while holding or sending original response")
+            }
+        },
+    }
+}
+
 async fn inject_reply(
     upstream: Response<RecvStream>,
     mut downstream: server::SendResponse<Bytes>,
     expected: RootResultRead,
     deadline: Instant,
     buffers: BufferContext,
+    transport: Option<RootReplyTransport>,
 ) -> Result<()> {
     let core = buffers.core.clone();
     let (mut parts, mut body) = upstream.into_parts();
@@ -3032,7 +4179,7 @@ async fn inject_reply(
             "wire_bytes":original.len(),"wire_sha256":hash(&original)});
         state.not_ready_replies.push(evidence);
     }
-    let mutation = loop {
+    let action = loop {
         let changed = core.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
@@ -3044,8 +4191,8 @@ async fn inject_reply(
                     && !state.failure_overflow,
                 "root fault target was disarmed or failed"
             );
-            if let Some(mutation) = state.armed_mutation {
-                break mutation;
+            if let Some(action) = state.armed_action {
+                break action;
             }
         }
         changed.await;
@@ -3087,6 +4234,26 @@ async fn inject_reply(
         "body_sha256":hash(&original_data.body),"wire_bytes":original.len(),"wire_sha256":hash(&original),
         "end_after_data":original_data.end_after_data.as_ref().map(|end|
             serde_json::json!({"sequence":end.sequence,"output_rows":end.output_rows}))});
+    if matches!(action, RootReplyAction::HoldOriginal) {
+        drop(wire);
+        drop(reply);
+        drop(original_data);
+        return hold_original_response(
+            parts,
+            body,
+            original,
+            trailers,
+            before,
+            downstream,
+            deadline,
+            buffers,
+            transport.context("hold requires the original transport identity")?,
+        )
+        .await;
+    }
+    let RootReplyAction::Mutate(mutation) = action else {
+        unreachable!("closed root action")
+    };
     match mutation {
         RootReplyMutation::ProfileTwo => wire.profile_id = 2,
         RootReplyMutation::ClientRowsFalse => {
@@ -3258,8 +4425,9 @@ mod tests {
     #[test]
     fn valid_real_row_plus_prefix_suffix_preserves_bytes_and_last_body_alias() {
         let core = core();
-        let mut original = vec![65, 0, 0, 0, 64];
+        let mut original = vec![68, 0, 0, 0, b'[', b'"'];
         original.extend_from_slice(&[b'x'; 64]);
+        original.extend_from_slice(b"\"]");
         let original = Bytes::from(original);
         let profile = ClientRowProfile::try_new(
             RootProfileV1::SEGMENT_BYTES,
@@ -3273,11 +4441,11 @@ mod tests {
         valid.after().validate_end().unwrap();
         let body =
             append_prefix_only_suffix(BufferContext::standalone(core.clone()), &original).unwrap();
-        assert_eq!(&body[..69], original.as_ref());
-        assert_eq!(&body[69..], &[1, 0, 0, 0]);
+        assert_eq!(&body[..72], original.as_ref());
+        assert_eq!(&body[72..], &[1, 0, 0, 0]);
         assert_eq!(
             hash(&body),
-            "112eb22b8f4cb517da83112c0bcc142bfbb7c37e4d09dfe5b2e0b1f0df53fbd7"
+            "2a9a4477feaf49dc279c7ede1803756305fc6eccf3c7c8f1624fb4e645cacebc"
         );
         assert!(
             ClientRowStreamCursor::new()
@@ -3286,7 +4454,7 @@ mod tests {
         );
         let alias = body.clone();
         let charged = core.bytes.load(Ordering::Acquire);
-        assert!(charged >= 73);
+        assert!(charged >= 76);
         drop(body);
         assert_eq!(core.bytes.load(Ordering::Acquire), charged);
         drop(alias);
@@ -3985,7 +5153,8 @@ mod tests {
             {
                 let mut state = core.state.lock().unwrap();
                 state.deadline = Some(deadline);
-                state.armed_mutation = is_not_ready.then_some(RootReplyMutation::ProfileTwo);
+                state.armed_action =
+                    is_not_ready.then_some(RootReplyAction::Mutate(RootReplyMutation::ProfileTwo));
                 state.target_attempts = 1;
             }
             let mut trailers = HeaderMap::new();
@@ -4052,6 +5221,7 @@ mod tests {
                 expected,
                 deadline,
                 BufferContext::standalone(core.clone()),
+                None,
             )
             .await?;
             let response = down_reply.await?;
@@ -4230,5 +5400,754 @@ mod tests {
         })
         .await
         .context("component actor join deadline")?
+    }
+    #[derive(Clone, Copy)]
+    enum OriginalHoldCase {
+        Forward,
+        Cancel,
+        DeclaredCancelThenConnectionClose,
+        DeclaredCancelThenGracefulConnectionClose,
+        OtherReset,
+        SendDeadline,
+        Expire,
+        Disarm,
+        Stop,
+        StopSending,
+        ConnectionClose,
+        ExpectedConnectionClose,
+        ExpectedConnectionCloseBeforeRelease,
+        UnconfirmedConnectionClose,
+    }
+
+    async fn await_actual_hold(
+        control: &RootReplyFaultControl,
+        deadline: Instant,
+    ) -> Result<RootReplyOriginalHold> {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            loop {
+                let changed = control.core.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if let Some(held) = control.observation().original_hold {
+                    return Ok(held);
+                }
+                changed.await;
+            }
+        })
+        .await
+        .context("actual original Data hold deadline")?
+    }
+
+    // Extends the existing actual H2 proxy/stop fixture and transparent-wire
+    // oracle. No simulated body owner, listener service or provider process.
+    async fn actual_original_hold_fixture(
+        case: OriginalHoldCase,
+        not_ready_first: bool,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let fixture_core = core();
+            let expected = expected();
+            let caller = FrontendProcessId::new_v7();
+            let data_body = if matches!(case, OriginalHoldCase::SendDeadline | OriginalHoldCase::StopSending | OriginalHoldCase::ConnectionClose
+                | OriginalHoldCase::ExpectedConnectionClose | OriginalHoldCase::ExpectedConnectionCloseBeforeRelease
+                | OriginalHoldCase::UnconfirmedConnectionClose | OriginalHoldCase::DeclaredCancelThenConnectionClose
+                | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) {
+                let mut bytes = vec![b'x'; RootProfileV1::SEGMENT_BYTES];
+                bytes[..4].copy_from_slice(&((RootProfileV1::SEGMENT_BYTES - 4) as u32).to_le_bytes());
+                Bytes::from(bytes)
+            } else { Bytes::from_static(&[1, 0, 0, 0, b'x']) };
+            let wire = encode_reply(&RootResultReply {
+                root_task: expected.root_task(), profile: expected.profile(), kind: expected.kind(),
+                accepted_consumed: 0,
+                outcome: RootReadOutcome::Data(
+                    novarocks_execution_contract::root_result::RootResultData::try_new(
+                        expected.kind(), NonZeroU64::new(1).unwrap(),
+                        data_body,
+                        Some(novarocks_execution_contract::root_result::RootResultEnd {
+                            sequence: NonZeroU64::new(2).unwrap(), output_rows: 1,
+                        }),
+                    )?,
+                ),
+            })?;
+            let original = frame(fixture_core.clone(), &wire)?;
+            let original_len = original.len();
+            let original_hash = hash(&original);
+            let original_bytes = original.to_vec();
+            let not_ready = frame(fixture_core.clone(), &encode_reply(&RootResultReply {
+                root_task: expected.root_task(), profile: expected.profile(), kind: expected.kind(),
+                accepted_consumed: 0, outcome: RootReadOutcome::NotReady,
+            })?)?;
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", http::HeaderValue::from_static("application/grpc"));
+            headers.append("x-component-header", http::HeaderValue::from_static("first"));
+            headers.append("x-component-header", http::HeaderValue::from_static("second"));
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+            trailers.append("x-component-trailer", http::HeaderValue::from_static("first"));
+            trailers.append("x-component-trailer", http::HeaderValue::from_static("second"));
+            let expected_headers = headers.clone();
+            let expected_trailers = trailers.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let mut tasks = JoinSet::new();
+            let mut upstream_owner = None;
+            let mut actor = None;
+            let mut control = None;
+            let mut held_downstream_body = None;
+            // All setup/verification errors pass through the original handle
+            // cleanup below. JoinSet completion is awaited, not just aborted.
+            let outcome = async {
+                let mut stop = fixture_core.stop.subscribe();
+                upstream_owner = Some(tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await?;
+                    let mut connection = server::handshake::<_>(socket).await?;
+                    let mut next_not_ready = not_ready_first;
+                    let mut children = JoinSet::new();
+                    let result = async {
+                        loop {
+                            tokio::select! {
+                                _ = stop.changed() => break Ok::<_, anyhow::Error>(()),
+                                joined = children.join_next(), if !children.is_empty() => {
+                                    match joined {
+                                        Some(Ok(result)) => result?,
+                                        Some(Err(error)) => return Err(error.into()),
+                                        None => {},
+                                    }
+                                }
+                                request = connection.accept() => {
+                                    let Some(request) = request else { break Ok(()); };
+                                    let (mut request, mut response) = match request {
+                                        Ok(request) => request,
+                                        Err(_) if *stop.borrow() => break Ok(()),
+                                        Err(error) => return Err(error.into()),
+                                    };
+                                    let body = if next_not_ready { next_not_ready = false; not_ready.clone() }
+                                        else { original.clone() };
+                                    let headers = headers.clone();
+                                    let trailers = trailers.clone();
+                                    children.spawn(async move {
+                                        while let Some(bytes) = request.body_mut().data().await {
+                                            let bytes = bytes?;
+                                            request.body_mut().flow_control().release_capacity(bytes.len())?;
+                                        }
+                                        let mut reply = Response::builder().status(200).body(())?;
+                                        *reply.headers_mut() = headers;
+                                        reply.headers_mut().insert("content-length",
+                                            http::HeaderValue::from_str(&body.len().to_string())?);
+                                        let mut send = response.send_response(reply, false)?;
+                                        send.send_data(body, false)?;
+                                        send.send_trailers(trailers)?;
+                                        Ok::<_, anyhow::Error>(())
+                                    });
+                                }
+                            }
+                        }
+                    }.await;
+                    drop(connection);
+                    children.abort_all();
+                    let mut cleanup = None;
+                    while let Some(joined) = children.join_next().await {
+                        match joined {
+                            Ok(Ok(())) => {},
+                            Err(error) if error.is_cancelled() => {},
+                            Err(error) => { cleanup.get_or_insert(error.into()); },
+                            Ok(Err(error)) => { cleanup.get_or_insert(error); },
+                        }
+                    }
+                    finish_fixture(result, cleanup)
+                }));
+                let original_actor = RootReplyFaultProxy::start(address, 0, None,
+                    RootReplyFaultBounds::default(), fixture_core.verifier.clone(),
+                    fixture_core.normal_subject.clone())?;
+                let c = original_actor.control();
+                control = Some(c.clone());
+                let proxy_address = original_actor.address();
+                actor = Some(original_actor);
+                let socket = tokio::net::TcpStream::connect(proxy_address).await?;
+                let (mut sender, driver) = client::handshake::<_>(socket).await?;
+                let downstream_driver = tasks.spawn(async move { driver.await?; Ok::<_, anyhow::Error>(()) });
+                let trust = NativeTrust::new(DeploymentId::parse("root-actor-component")?,
+                    ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))?,
+                    fixture_core.normal_subject.clone(), NativeTransportMode::Disabled);
+                trust.bind_process_identity(NativeProcessIdentity::Frontend(caller))?;
+                let mut metadata = Default::default(); trust.apply_client_authorization(&mut metadata)?;
+                let request_wire = novarocks_task_codec::root_result::encode_read(&expected);
+                let mut request_bytes = vec![0];
+                request_bytes.extend_from_slice(&(request_wire.encoded_len() as u32).to_be_bytes());
+                request_wire.encode(&mut request_bytes)?;
+                let make_request = || -> Result<Request<()>> {
+                    let mut request = Request::builder().method(http::Method::POST)
+                        .uri(format!("http://localhost{ROOT_PATH}"))
+                        .header("content-type", "application/grpc").body(())?;
+                    request.headers_mut().extend(metadata.clone().into_headers());
+                    Ok(request)
+                };
+                let deadline = Instant::now() + if matches!(case, OriginalHoldCase::Expire) {
+                    Duration::from_millis(150)
+                } else { Duration::from_secs(1) };
+                c.begin_capture(deadline)?;
+                let (mut reply, mut send) = sender.send_request(make_request()?, false)?;
+                send.send_data(Bytes::copy_from_slice(&request_bytes), true)?;
+                let candidate = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    loop {
+                        let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                        if let Some(candidate) = c.candidate() { return candidate; }
+                        changed.await;
+                    }
+                }).await.context("component original candidate deadline")?;
+                ensure!(candidate.read == expected && candidate.caller == caller,
+                    "actual authenticated candidate differs from fixture input");
+                let initial_identity = original_identity(c.core.state.lock().unwrap().slot.as_ref().unwrap())?;
+                ensure!(c.release_exact_original(&initial_identity).is_err(), "early release was accepted");
+                c.arm_exact_hold(expected.root_task(), caller, 0)?;
+                if not_ready_first {
+                    let response = reply.await?;
+                    let mut body = response.into_body();
+                    let (bytes, _) = read_bounded(&mut body, RESPONSE_BYTES,
+                        BufferContext::standalone(fixture_core.clone())).await?;
+                    let decoded = wire::FetchRootResultResponse::decode(single_message(&bytes)?)?;
+                    ensure!(matches!(decode_response(decoded, &expected, 0,
+                        FieldPath::root("component_not_ready"))?, RootReadResponse::Reply(
+                            novarocks_execution_contract::root_result::RootResultReply {
+                                outcome: RootReadOutcome::NotReady, .. })), "NotReady was changed");
+                    drop(bytes); drop(body); drop(send);
+                    ensure!(c.observation().original_hold.is_none() && c.observation().claimed == 0
+                        && c.observation().not_ready_forwarded == 1
+                        && c.core.state.lock().unwrap().deadline == Some(deadline),
+                        "NotReady consumed the hold or renewed the clock");
+                    ensure!(c.release_exact_original(&initial_identity).is_err(), "NotReady authorized release");
+                    (reply, send) = sender.send_request(make_request()?, false)?;
+                    send.send_data(Bytes::copy_from_slice(&request_bytes), true)?;
+                }
+                let held = await_actual_hold(&c, deadline).await?;
+                let observed = c.observation();
+                ensure!(held.disposition == RootReplyOriginalDisposition::Held
+                    && observed.claimed == 0 && observed.emitted_messages == 0
+                    && observed.target_slots == 1 && observed.owned_buffer_bytes > 0
+                    && observed.mutated.is_none()
+                    && c.core.state.lock().unwrap().deadline == Some(deadline),
+                    "held original lost its exact slot, bytes or original clock");
+                ensure!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(std::pin::Pin::new(&mut reply), cx))).await.is_pending(),
+                    "held downstream headers were emitted before release");
+                if not_ready_first {
+                    ensure!(held.identity.downstream_stream != initial_identity.downstream_stream
+                        && held.identity.upstream_stream != initial_identity.upstream_stream,
+                        "Data hold reused the earlier NotReady RPC identity");
+                    ensure!(c.release_exact_original(&initial_identity).is_err(), "old NotReady RPC released Data");
+                }
+                let mut wrong = Vec::new();
+                let mut key = held.identity.clone(); key.root = self::expected().root_task(); wrong.push(key);
+                let mut key = held.identity.clone(); key.caller = FrontendProcessId::new_v7(); wrong.push(key);
+                let mut key = held.identity.clone(); key.backend_index += 1; wrong.push(key);
+                let mut key = held.identity.clone(); key.connection_id += 1; wrong.push(key);
+                let mut key = held.identity.clone(); key.downstream_stream += 2; wrong.push(key);
+                let mut key = held.identity.clone(); key.upstream_stream += 2; wrong.push(key);
+                let mut key = held.identity.clone(); key.request_sha256 = "0".repeat(64); wrong.push(key);
+                let before = serde_json::to_value(&held)?;
+                for key in wrong {
+                    ensure!(c.release_exact_original(&key).is_err(), "different full RPC was released");
+                    ensure!(c.expect_exact_original_query_cancellation(&key).is_err(),
+                        "different full RPC acquired a cancellation declaration");
+                }
+                ensure!(c.arm_exact_hold(expected.root_task(), caller, 0).is_err()
+                    && c.arm_exact(expected.root_task(), caller, 0, RootReplyMutation::ProfileTwo).is_err()
+                    && c.begin_capture(deadline).is_err(), "overlapping capture/action was accepted");
+                ensure!(serde_json::to_value(c.observation().original_hold)? == before,
+                    "a rejected control call changed the original hold");
+                match case {
+                    OriginalHoldCase::Stop => { /* Cleanup consumes the actual actor thread below. */ }
+                    OriginalHoldCase::StopSending => {
+                        c.release_exact_original(&held.identity)?;
+                        held_downstream_body = Some(reply.await?.into_body());
+                        ensure!(c.observation().claimed == 0 && c.observation().emitted_messages == 0
+                            && c.observation().owned_buffer_bytes > 0
+                            && c.core.state.lock().unwrap().deadline == Some(deadline),
+                            "original send was not retained at its real H2 capacity wait");
+                    }
+                    OriginalHoldCase::ConnectionClose | OriginalHoldCase::ExpectedConnectionClose
+                    | OriginalHoldCase::ExpectedConnectionCloseBeforeRelease | OriginalHoldCase::UnconfirmedConnectionClose => {
+                        let expected_exit = !matches!(case, OriginalHoldCase::ConnectionClose);
+                        let release_before_exit = matches!(case, OriginalHoldCase::ConnectionClose | OriginalHoldCase::ExpectedConnectionClose);
+                        if expected_exit {
+                            c.expect_exact_original_query_cancellation(&held.identity)?;
+                            ensure!(c.expect_exact_original_query_cancellation(&held.identity).is_err(),
+                                "duplicate cancellation declaration was accepted");
+                        }
+                        if release_before_exit {
+                            c.release_exact_original(&held.identity)?;
+                            held_downstream_body = Some(reply.await?.into_body());
+                        }
+                        ensure!(c.observation().claimed == 0
+                            && c.observation().owned_buffer_bytes > 0,
+                            "original response did not reach its real capacity wait");
+                        // Retire the actual connection driver while retaining
+                        // the unread response. No RST_STREAM is synthesized.
+                        downstream_driver.abort();
+                        match tasks.join_next().await {
+                            Some(Err(error)) if error.is_cancelled() => {},
+                            other => anyhow::bail!("original retired driver did not actually join: {other:?}"),
+                        }
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                            loop {
+                                let changed = c.core.changed.notified();
+                                tokio::pin!(changed); changed.as_mut().enable();
+                                let actual = c.observation();
+                                if actual.joined_connections == 1 {
+                                    ensure!(actual.active_connections == 0
+                                        && actual.active_streams == 0
+                                        && actual.target_slots == 0
+                                        && actual.owned_buffer_bytes == 0,
+                                        "original connection descendants/bytes survived actual join: {actual:?}");
+                                    let response = actual.original_hold.as_ref().context("joined original hold disappeared")?;
+                                    let exit = response.connection_exit.as_ref()
+                                        .context("actual joined connection lost its original response exit")?;
+                                    ensure!(exit.all_children_joined && !exit.cleanup_failed
+                                        && exit.remaining_connection_bytes == 0
+                                        && !exit.owner_stop_observed && !exit.generation_change_observed
+                                        && exit.joined_at >= response.expected_query_cancellation_at.unwrap_or(response.held_at)
+                                        && exit.permitted_peer_exit == expected_exit,
+                                        "physical exit was not the original peer close/Join: {exit:?}");
+                                    if let Some(error) = exit.actual_error.as_ref() {
+                                        let h2 = error.chain().find_map(|source| source.downcast_ref::<h2::Error>())
+                                            .context("actual closed connection error lost its H2 source")?;
+                                        ensure!(exit.downstream_accept_failed && !exit.downstream_eof
+                                            && h2.is_io() && !h2.is_reset() && h2.reason().is_none()
+                                            && h2.get_io().is_some_and(|error| matches!(error.kind(),
+                                                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                                                    | std::io::ErrorKind::UnexpectedEof)),
+                                            "retired real driver produced another failure: {error:#}");
+                                    } else {
+                                        ensure!(exit.downstream_eof && !exit.downstream_accept_failed,
+                                            "original parent has neither actual EOF nor a typed close error");
+                                    }
+                                    ensure!(response.identity == held.identity && response.downstream_reset.is_none()
+                                        && actual.emitted_messages == 0 && response.require_forwarded_original().is_err(),
+                                        "physical connection exit became forwarding or an invented stream cancellation");
+                                    if expected_exit {
+                                        if !release_before_exit {
+                                            ensure!(actual.claimed == 0 && response.settled_at.is_none()
+                                                && response.disposition == RootReplyOriginalDisposition::Held,
+                                                "physical exit consumed a capture before exact release");
+                                        }
+                                        if matches!(case, OriginalHoldCase::UnconfirmedConnectionClose) {
+                                            c.disarm();
+                                            ensure!(c.release_exact_original(&held.identity).is_err()
+                                                && c.observation().claimed == 0
+                                                && c.observation().failures.iter().any(|failure| failure.contains("without exact response release")),
+                                                "unconsumed cancellation declaration silently passed disarm");
+                                        } else {
+                                            if !release_before_exit { c.release_exact_original(&held.identity)?; }
+                                            let actual = c.observation();
+                                            let response = actual.original_hold.as_ref().unwrap();
+                                            ensure!(actual.claimed == 1 && actual.emitted_messages == 0
+                                                && response.disposition == RootReplyOriginalDisposition::JoinedOriginalConnectionExit
+                                                && response.settled_at == Some(exit.joined_at)
+                                                && c.release_exact_original(&held.identity).is_err(),
+                                                "exact original physical exit did not settle once after release");
+                                        }
+                                    } else {
+                                        ensure!(actual.claimed == 0 && response.settled_at.is_none()
+                                            && response.disposition == RootReplyOriginalDisposition::ReleaseRequested,
+                                            "undeclared physical close acquired a cancellation qualification");
+                                    }
+                                    break Ok::<_, anyhow::Error>(());
+                                }
+                                // Connection Join counters are neutral atomics;
+                                // their update does not promise this Notify.
+                                tokio::select! {
+                                    _ = changed => {},
+                                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                                }
+                            }
+                        }).await.context("actual original connection response exit deadline")??;
+                    }
+                    OriginalHoldCase::Expire => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                        let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                        if c.observation().first_failure.is_none() { changed.await; }
+                        ensure!(c.release_exact_original(&held.identity).is_err()
+                            && c.observation().claimed == 0 && c.observation().emitted_messages == 0,
+                            "expired hold minted an original release");
+                    }
+                    OriginalHoldCase::SendDeadline => {
+                        c.release_exact_original(&held.identity)?;
+                        let response = reply.await?;
+                        let _unread_original_body = response.into_body();
+                        ensure!(c.observation().claimed == 0 && c.observation().emitted_messages == 0
+                            && c.observation().owned_buffer_bytes > 0
+                            && c.core.state.lock().unwrap().deadline == Some(deadline),
+                            "sending claimed before the original H2 capacity wait completed");
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                        let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                        if c.observation().first_failure.is_none() { changed.await; }
+                        let hold = c.observation().original_hold.context("held send disappeared")?;
+                        ensure!(hold.require_forwarded_original().is_err()
+                            && c.observation().claimed == 0 && c.observation().emitted_messages == 0
+                            && c.release_exact_original(&held.identity).is_err(),
+                            "send wait renewed the deadline or minted forwarding success");
+                    }
+                    OriginalHoldCase::Disarm => {
+                        c.disarm();
+                        ensure!(c.release_exact_original(&held.identity).is_err()
+                            && c.observation().claimed == 0, "disarm became original release");
+                    }
+                    OriginalHoldCase::Cancel | OriginalHoldCase::OtherReset | OriginalHoldCase::DeclaredCancelThenConnectionClose
+                    | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose => {
+                        let graceful_close = matches!(case, OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose);
+                        let close_before_release = matches!(case, OriginalHoldCase::DeclaredCancelThenConnectionClose
+                            | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose);
+                        if close_before_release { c.expect_exact_original_query_cancellation(&held.identity)?; }
+                        let reason = if matches!(case, OriginalHoldCase::Cancel | OriginalHoldCase::DeclaredCancelThenConnectionClose
+                            | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) { h2::Reason::CANCEL }
+                            else { h2::Reason::INTERNAL_ERROR };
+                        send.send_reset(reason);
+                        let reset = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                            loop {
+                                let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                                if let Some(reset) = c.observation().original_hold.and_then(|held| held.downstream_reset) {
+                                    break reset;
+                                }
+                                changed.await;
+                            }
+                        }).await.context("actual original RST observation deadline")?;
+                        let later_independent_phase = Instant::now();
+                        ensure!(reset.observed_at <= later_independent_phase && reset.reason == u32::from(reason)
+                            && reset.stream == held.identity.downstream_stream,
+                            "raw reset lost its stream/reason/original observation time");
+                        // An early observed reset cannot be attributed to this
+                        // later phase. Scene code can reject the exact order.
+                        ensure!(reset.observed_at <= later_independent_phase,
+                            "fixture did not retain the early reset observation");
+                        let mut reply = Some(reply);
+                        if close_before_release {
+                            if graceful_close {
+                                // Let the original h2 client retire itself and
+                                // emit its real GOAWAY after the exact reset.
+                                drop(reply.take()); drop(send); drop(sender);
+                            } else {
+                                downstream_driver.abort();
+                            }
+                            match (graceful_close, tasks.join_next().await) {
+                                (true, Some(Ok(Ok(())))) => {},
+                                (false, Some(Err(error))) if error.is_cancelled() => {},
+                                (_, other) => anyhow::bail!("cancelled original client driver did not actually join: {other:?}"),
+                            }
+                            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                                loop {
+                                    let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                                    let actual = c.observation();
+                                    let response = actual.original_hold.as_ref().context("held response disappeared at peer close")?;
+                                    if response.parent_close_observed_at.is_some() {
+                                        if graceful_close {
+                                            ensure!(response.parent_close_facts.as_ref().is_some_and(|facts|
+                                                facts.watched_goaway.is_some_and(|(frame, ordinal)|
+                                                    frame == [0,0,8,7,0,0,0,0,0,0,0,0,0,0,0,0,0]
+                                                        && ordinal > reset.connection_frame_ordinal)),
+                                                "original graceful client did not emit the actual normal GOAWAY after CANCEL");
+                                        }
+                                        ensure!(response.disposition == RootReplyOriginalDisposition::Held
+                                            && response.settled_at.is_none() && response.connection_exit.is_none()
+                                            && actual.claimed == 0 && actual.emitted_messages == 0
+                                            && actual.owned_buffer_bytes > 0 && actual.active_streams == 1,
+                                            "declared peer close discarded or settled the original held child");
+                                        break Ok::<_, anyhow::Error>(());
+                                    }
+                                    changed.await;
+                                }
+                            }).await.context("declared exact CANCEL original parent close observation deadline")??;
+                        }
+                        c.release_exact_original(&held.identity)?;
+                        ensure!(c.release_exact_original(&held.identity).is_err(), "duplicate release accepted");
+                        if matches!(case, OriginalHoldCase::Cancel | OriginalHoldCase::DeclaredCancelThenConnectionClose
+                            | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose) {
+                            let outcome = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                                loop {
+                                    let changed = c.core.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                                    let hold = c.observation().original_hold.context("hold disappeared")?;
+                                    if hold.disposition == RootReplyOriginalDisposition::ExactDownstreamCancelled { break Ok::<_, anyhow::Error>(hold); }
+                                    changed.await;
+                                }
+                            }).await.context("exact downstream cancellation deadline")??;
+                            ensure!(outcome.require_forwarded_original().is_err()
+                                && outcome.downstream_reset.as_ref().is_some_and(|r| r.frame[3] == 3
+                                    && r.observed_at == reset.observed_at)
+                                && outcome.actual_send_error.is_none()
+                                && c.observation().emitted_messages == 0,
+                                "exact cancellation was silently treated as forwarding or fabricated an error");
+                            if close_before_release {
+                                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                                    loop {
+                                        let actual = c.observation();
+                                        if actual.joined_connections == 1 {
+                                            let response = actual.original_hold.as_ref().unwrap();
+                                            let exit = response.connection_exit.as_ref().context("cancelled parent lost its actual Join")?;
+                                            ensure!(exit.all_children_joined && !exit.cleanup_failed
+                                                && exit.remaining_connection_bytes == 0 && !exit.permitted_peer_exit
+                                                && !exit.owner_stop_observed && !exit.generation_change_observed
+                                                && actual.owned_buffer_bytes == 0 && actual.active_streams == 0
+                                                && response.expected_query_cancellation_at.unwrap() <= reset.observed_at
+                                                && reset.observed_at <= response.parent_close_observed_at.unwrap()
+                                                && response.parent_close_observed_at.unwrap() <= response.release_requested_at.unwrap()
+                                                && response.release_requested_at.unwrap() <= response.settled_at.unwrap()
+                                                && response.settled_at.unwrap() <= exit.joined_at,
+                                                "exact stream cancellation did not preserve original close/release/Join order");
+                                            break Ok::<_, anyhow::Error>(());
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                }).await.context("declared cancelled original parent actual Join deadline")??;
+                            }
+                        } else {
+                            let _ = reply.take().context("non-CANCEL original reply disappeared")?.await;
+                            ensure!(c.observation().original_hold.unwrap().disposition
+                                != RootReplyOriginalDisposition::ExactDownstreamCancelled,
+                                "non-CANCEL reset was exempted");
+                        }
+                    }
+                    OriginalHoldCase::Forward => {
+                        c.release_exact_original(&held.identity)?;
+                        ensure!(c.release_exact_original(&held.identity).is_err(), "duplicate release accepted");
+                        let response = reply.await?;
+                        ensure!(response.status() == http::StatusCode::OK, "status changed");
+                        let mut headers = expected_headers.clone();
+                        headers.insert("content-length", http::HeaderValue::from_str(&original_len.to_string())?);
+                        ensure!(response.headers() == &headers, "original duplicate headers changed");
+                        let mut body = response.into_body();
+                        let (actual, trailers) = read_bounded(&mut body, RESPONSE_BYTES,
+                            BufferContext::standalone(fixture_core.clone())).await?;
+                        ensure!(actual.as_ref() == original_bytes.as_slice() && actual.len() == original_len
+                            && hash(&actual) == original_hash && trailers.as_ref() == Some(&expected_trailers),
+                            "held body bytes or duplicate trailers were changed");
+                        let outcome = c.observation().original_hold.context("hold disappeared")?;
+                        outcome.require_forwarded_original()?;
+                        ensure!(c.observation().claimed == 1 && c.observation().emitted_messages == 1
+                            && outcome.downstream_reset.is_none(), "original forwarding was not settled once");
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            let mut cleanup = None;
+            if let Some(mut actor) = actor
+                && let Err(error) = tokio::task::spawn_blocking(move || actor.stop()).await
+            {
+                cleanup = Some(error.into());
+            }
+            drop(held_downstream_body.take());
+            fixture_core.stop.send_replace(true);
+            if let Some(upstream) = upstream_owner {
+                match upstream.await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => { cleanup.get_or_insert(error); },
+                    Err(error) => { cleanup.get_or_insert(error.into()); },
+                }
+            }
+            tasks.abort_all();
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {},
+                    Err(error) if error.is_cancelled() => {},
+                    Err(error) => { cleanup.get_or_insert(error.into()); },
+                    Ok(Err(error)) => { cleanup.get_or_insert(error); },
+                }
+            }
+            if let Some(control) = control {
+                let observation = control.observation();
+                if !(observation.shutdown_joined && observation.active_listeners == 0
+                    && observation.active_connections == 0 && observation.active_streams == 0
+                    && observation.connection_positions == 0 && observation.stream_positions == 0
+                    && observation.owned_buffer_bytes == 0) {
+                    cleanup.get_or_insert(anyhow::anyhow!("original held proxy/children/bytes did not exit"));
+                }
+                if matches!(case, OriginalHoldCase::StopSending)
+                    && (observation.claimed != 0 || observation.emitted_messages != 0
+                        || observation.original_hold.as_ref().is_none_or(|held|
+                            held.disposition != RootReplyOriginalDisposition::ReleaseRequested)) {
+                    cleanup.get_or_insert(anyhow::anyhow!("actor close minted an original forwarding/cancellation claim"));
+                }
+                if matches!(case, OriginalHoldCase::ConnectionClose)
+                    && observation.original_hold.as_ref().and_then(|held| held.connection_exit.as_ref())
+                        .is_some_and(|exit| exit.actual_error.is_some())
+                    && observation.failures.is_empty() {
+                    cleanup.get_or_insert(anyhow::anyhow!("undeclared actual connection error was silently qualified"));
+                }
+                if matches!(case, OriginalHoldCase::Forward | OriginalHoldCase::Cancel | OriginalHoldCase::Stop | OriginalHoldCase::StopSending
+                    | OriginalHoldCase::ExpectedConnectionClose | OriginalHoldCase::ExpectedConnectionCloseBeforeRelease
+                    | OriginalHoldCase::DeclaredCancelThenConnectionClose | OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose)
+                    && (!observation.failures.is_empty() || observation.failure_overflow) {
+                    cleanup.get_or_insert(anyhow::anyhow!("unexpected original hold actor failure: {:?}", observation.failures));
+                }
+            }
+            if fixture_core.bytes.load(Ordering::Acquire) != 0 {
+                cleanup.get_or_insert(anyhow::anyhow!(
+                    "fixture's original H2 frame aliases outlived actual driver joins"));
+            }
+            finish_fixture(outcome, cleanup)?;
+            Ok::<_, anyhow::Error>(())
+        }).await.context("component original held H2 owner deadline")?
+    }
+
+    #[tokio::test]
+    async fn actual_hold_releases_identical_wire_and_rejects_full_identity_mismatch() -> Result<()>
+    {
+        actual_original_hold_fixture(OriginalHoldCase::Forward, false).await
+    }
+    #[tokio::test]
+    async fn declared_exact_cancel_then_peer_close_retains_original_child_until_release_and_join()
+    -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::DeclaredCancelThenConnectionClose, false)
+            .await
+    }
+    #[tokio::test]
+    async fn declared_exact_cancel_then_actual_normal_goaway_keeps_original_child_until_release()
+    -> Result<()> {
+        actual_original_hold_fixture(
+            OriginalHoldCase::DeclaredCancelThenGracefulConnectionClose,
+            false,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn actual_not_ready_then_data_hold_uses_current_rpc_and_same_absolute_deadline()
+    -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::Forward, true).await
+    }
+    #[tokio::test]
+    async fn actual_held_remote_cancel_retains_raw_reset_order_and_is_not_forwarded() -> Result<()>
+    {
+        actual_original_hold_fixture(OriginalHoldCase::Cancel, false).await
+    }
+    #[tokio::test]
+    async fn actual_held_non_cancel_reset_is_not_an_exact_cancellation() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::OtherReset, false).await
+    }
+    #[tokio::test]
+    async fn actual_hold_expiry_and_disarm_never_claim_and_join_original_owners() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::Expire, false).await?;
+        actual_original_hold_fixture(OriginalHoldCase::Disarm, false).await
+    }
+    #[tokio::test]
+    async fn actor_stop_joins_exact_held_response_and_returns_original_credit() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::Stop, false).await
+    }
+    #[tokio::test]
+    async fn actor_stop_during_original_send_joins_without_a_forwarded_claim() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::StopSending, false).await
+    }
+    #[tokio::test]
+    async fn actual_connection_exit_joins_original_response_without_fabricating_a_stream_reset()
+    -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::ConnectionClose, false).await
+    }
+    #[tokio::test]
+    async fn declared_original_connection_exit_requires_both_actual_join_and_exact_release()
+    -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::ExpectedConnectionClose, false).await?;
+        actual_original_hold_fixture(
+            OriginalHoldCase::ExpectedConnectionCloseBeforeRelease,
+            false,
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn declared_original_connection_exit_cannot_pass_unconsumed_disarm() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::UnconfirmedConnectionClose, false).await
+    }
+    #[test]
+    fn declared_original_peer_exit_never_accepts_strings_protocol_or_stream_reset_as_io() {
+        assert!(original_peer_close_kind(true, false, None));
+        assert!(!original_peer_close_kind(false, false, None));
+        for error in [
+            anyhow::anyhow!("connection reset"),
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            anyhow::Error::new(h2::Error::from(h2::Reason::CANCEL)),
+            anyhow::Error::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)),
+            anyhow::Error::new(h2::Error::from(h2::Reason::INTERNAL_ERROR)),
+        ] {
+            assert!(!original_peer_close_kind(false, true, Some(&error)));
+            assert!(!original_peer_close_kind(true, false, Some(&error)));
+        }
+    }
+    #[test]
+    fn exact_hold_reset_observation_excludes_goaway_and_other_streams() {
+        let cancel = [0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8];
+        let other = [0, 0, 4, 3, 0, 0, 0, 0, 5, 0, 0, 0, 8];
+        let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 8];
+        for cut in 0..=cancel.len() {
+            let mut frames = IngressFrames::new();
+            frames.observe(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            frames.observe(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+            frames.watch_original_reset(3).unwrap();
+            frames.observe(&other);
+            frames.observe(&goaway);
+            assert!(frames.watched_reset.is_none());
+            frames.observe(&cancel[..cut]);
+            if cut != cancel.len() {
+                assert!(frames.watched_reset.is_none());
+            }
+            frames.observe(&cancel[cut..]);
+            let original = frames.watched_reset.as_ref().unwrap();
+            assert_eq!(original.frame, cancel);
+            assert_eq!((original.stream, original.reason), (3, 8));
+            assert!(frames.watch_original_reset(5).is_err());
+            assert_eq!(frames.watched_reset.as_ref().unwrap().frame, cancel);
+        }
+    }
+    #[test]
+    fn selected_stream_goaway_prefix_requires_exact_cancel_and_one_complete_normal_close() {
+        let prefix = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
+        let application = [0, 0, 0, 1, 4, 0, 0, 0, 1];
+        let reset = [0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8];
+        let normal = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let observe = |tail: &[u8]| {
+            let mut frames = IngressFrames::new();
+            frames.observe(prefix);
+            frames.observe(&application);
+            frames.watch_original_reset(1).unwrap();
+            for byte in tail {
+                frames.observe(std::slice::from_ref(byte));
+            }
+            assert!(
+                !frames.complete_control_sequence(),
+                "application connection became preapplication-close eligible"
+            );
+            frames
+        };
+        let tail = [reset.as_slice(), normal.as_slice()].concat();
+        for end in reset.len() + 1..tail.len() {
+            assert!(!exact_cancel_peer_close_frames(&observe(&tail[..end])));
+        }
+        let actual = observe(&tail);
+        assert!(exact_cancel_peer_close_frames(&actual));
+        assert_eq!(actual.watched_goaway.unwrap().0, normal);
+        assert!(!exact_cancel_peer_close_frames(&observe(&normal)));
+        assert!(!exact_cancel_peer_close_frames(&observe(
+            &[normal.as_slice(), reset.as_slice()].concat()
+        )));
+        assert!(!exact_cancel_peer_close_frames(&observe(
+            &[tail.as_slice(), normal.as_slice()].concat()
+        )));
+        for position in [8, 12, 16] {
+            let mut wrong = normal;
+            wrong[position] = 1;
+            assert!(!exact_cancel_peer_close_frames(&observe(
+                &[reset.as_slice(), wrong.as_slice()].concat()
+            )));
+        }
+        let mut debug = normal.to_vec();
+        debug[2] = 9;
+        debug.push(0);
+        assert!(!exact_cancel_peer_close_frames(&observe(
+            &[reset.as_slice(), debug.as_slice()].concat()
+        )));
+        let mut wrong_reset = reset;
+        wrong_reset[12] = 2;
+        assert!(!exact_cancel_peer_close_frames(&observe(
+            &[wrong_reset.as_slice(), normal.as_slice()].concat()
+        )));
+    }
+    #[tokio::test]
+    async fn actual_released_send_capacity_wait_keeps_original_absolute_deadline() -> Result<()> {
+        actual_original_hold_fixture(OriginalHoldCase::SendDeadline, false).await
     }
 }

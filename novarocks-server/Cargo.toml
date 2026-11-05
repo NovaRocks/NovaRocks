@@ -16,10 +16,6 @@ novarocks-server-application.workspace = true
 
 [features]
 default = ["jemalloc"]
-mem-1-m07-hms-listing-observe = ["novarocks-server-application/mem-1-m07-hms-listing-observe"]
-mem-1-m07-closing-pressure = ["novarocks-server-application/mem-1-m07-closing-pressure"]
-mem-1-m07-root-observation = ["novarocks-server-application/mem-1-m07-root-observation"]
-mem-1-m07-exact-mysql-write = ["novarocks-server-application/mem-1-m07-exact-mysql-write"]
 jemalloc = ["novarocks-server-application/jemalloc"]
 native-compatibility-test-fixture = ["novarocks-server-application/native-compatibility-test-fixture"]
 

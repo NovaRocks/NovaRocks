@@ -19,16 +19,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
-#[cfg(test)]
-use crate::client_connection::ClientConnectionToken;
 use crate::session_control::{
-    ClientQueryId, ClientSessionKey, ConnectionKillAuthorization, GovernedStatementCancellation,
-    GovernedStatementFinishOutcome, GovernedStatementRegistration,
-    GovernedStatementVisibilitySealOutcome, QueryCancelOutcome, QueryControlError,
-    QueryControlPort, QueryControlService, SessionIdentity, SessionOrigin, SessionProcess,
+    ClientQueryId, ClientSessionKey, GovernedStatementCancellation, GovernedStatementFinishOutcome,
+    GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
+    QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionOrigin,
     SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
 };
 use novarocks_workload_control::{
@@ -55,34 +51,23 @@ struct QueryControlState {
     statement_progress_installed: bool,
     statement_sources: Box<[Option<Arc<crate::session_control::StatementActionSource>>]>,
     sessions: BTreeMap<ClientSessionKey, SessionEntry>,
-    by_connection: BTreeMap<u32, ClientSessionKey>,
     by_client_query: BTreeMap<ClientQueryId, ClientSessionKey>,
 }
 
 impl QueryControlState {
     fn remove_session(&mut self, key: ClientSessionKey) {
         if let Some(entry) = self.sessions.remove(&key) {
-            match entry.origin {
-                SessionOrigin::Connection(connection) => {
-                    self.by_connection.remove(&connection.connection_id());
-                }
-                SessionOrigin::ClientStatement(query) => {
-                    self.by_client_query.remove(&query);
-                }
-            }
+            let SessionOrigin::ClientStatement(query) = entry.origin;
+            self.by_client_query.remove(&query);
         }
     }
 }
 
 struct SessionEntry {
     origin: SessionOrigin,
-    principal: Arc<str>,
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
     unregister_pending: bool,
-    /// When this session registered, which is what an idle session's reported
-    /// time is measured from.
-    registered_at: Instant,
 }
 
 struct ActiveStatement {
@@ -90,10 +75,6 @@ struct ActiveStatement {
     action: Option<Arc<crate::session_control::StatementActionSource>>,
     cancellation: ActiveStatementCancellation,
     success_visibility_sealed: bool,
-    /// When this statement began, and the text it began with. Both exist only
-    /// to be reported; nothing in admission or cancellation reads them.
-    began_at: Instant,
-    text: Option<Arc<str>>,
 }
 
 enum ActiveStatementCancellation {
@@ -301,33 +282,6 @@ impl QueryApplicationControl {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-#[cfg(novarocks_dev_controls)]
-impl QueryApplicationControl {
-    /// Reads this owner's current session; it neither registers nor keeps it alive.
-    pub fn current_session_for_test_controls(
-        &self,
-        connection_id: u32,
-    ) -> Result<SessionToken, String> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "statement input query-control lock poisoned".to_owned())?;
-        let key = state
-            .by_connection
-            .get(&connection_id)
-            .filter(|key| {
-                state
-                    .sessions
-                    .get(key)
-                    .is_some_and(|entry| !entry.unregister_pending)
-            })
-            .ok_or_else(|| {
-                "statement input requires an active registered client session".to_owned()
-            })?;
-        Ok(SessionToken::new(*key))
     }
 }
 
@@ -547,26 +501,11 @@ impl QueryControlPort for QueryApplicationControl {
         identity: SessionIdentity,
     ) -> Result<SessionToken, QueryControlError> {
         let mut state = self.lock();
-        let connection = match identity.origin() {
-            SessionOrigin::Connection(connection) => Some(*connection),
-            SessionOrigin::ClientStatement(_) => None,
-        };
-        if connection.is_some_and(|connection| {
-            state
-                .by_connection
-                .contains_key(&connection.connection_id())
-        }) {
-            return Err(QueryControlError::ConnectionIdInUse);
+        let SessionOrigin::ClientStatement(query) = identity.origin();
+        if state.by_client_query.contains_key(query) {
+            return Err(QueryControlError::ClientQueryIdInUse);
         }
-        let client_query = match identity.origin() {
-            SessionOrigin::ClientStatement(query) => {
-                if state.by_client_query.contains_key(query) {
-                    return Err(QueryControlError::ClientQueryIdInUse);
-                }
-                Some(query.clone())
-            }
-            SessionOrigin::Connection(_) => None,
-        };
+        let client_query = query.clone();
         state.next_session_key = state
             .next_session_key
             .checked_add(1)
@@ -574,31 +513,22 @@ impl QueryControlPort for QueryApplicationControl {
         let key =
             ClientSessionKey::new(state.next_session_key).expect("incremented nonzero session key");
         let token = SessionToken::new(key);
-        if let Some(connection) = connection {
-            state.by_connection.insert(connection.connection_id(), key);
-        }
-        if let Some(query) = &client_query {
-            state.by_client_query.insert(query.clone(), key);
-        }
+        state.by_client_query.insert(client_query.clone(), key);
         state.sessions.insert(
             key,
             SessionEntry {
                 origin: identity.origin().clone(),
-                principal: Arc::from(identity.principal()),
                 next_statement_generation: 0,
                 active: None,
                 unregister_pending: false,
-                registered_at: Instant::now(),
             },
         );
         // Never call the consumer while holding the registry lock: the observer
-        // has its own journal and connection arming reads this same registry.
+        // has its own journal and input freezing must precede statement admission.
         drop(state);
         #[cfg(novarocks_dev_controls)]
-        if let Some(query) = &client_query
-            && let Some(observer) = self.client_statement_observer.get()
-        {
-            observer(query, token);
+        if let Some(observer) = self.client_statement_observer.get() {
+            observer(&client_query, token);
         }
         Ok(token)
     }
@@ -660,8 +590,6 @@ impl QueryControlPort for QueryApplicationControl {
         entry.active = Some(ActiveStatement {
             action: None,
             generation: entry.next_statement_generation,
-            began_at: Instant::now(),
-            text: None,
             cancellation: ActiveStatementCancellation::Legacy(cancellation),
             success_visibility_sealed: false,
         });
@@ -672,7 +600,7 @@ impl QueryControlPort for QueryApplicationControl {
         &self,
         session: SessionToken,
         cancellation: GovernedStatementCancellation,
-        statement_text: Option<Arc<str>>,
+        _statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError> {
         let mut state = self.lock();
         let entry = state
@@ -696,36 +624,10 @@ impl QueryControlPort for QueryApplicationControl {
         entry.active = Some(ActiveStatement {
             action: None,
             generation: entry.next_statement_generation,
-            began_at: Instant::now(),
-            text: statement_text,
             cancellation: ActiveStatementCancellation::Governed(cancellation),
             success_visibility_sealed: false,
         });
         Ok(registration)
-    }
-
-    fn list_processes(&self) -> Vec<SessionProcess> {
-        let now = Instant::now();
-        let state = self.lock();
-        state
-            .by_connection
-            .iter()
-            .map(|(connection_id, key)| {
-                let entry = &state.sessions[key];
-                let (since, statement) = entry
-                    .active
-                    .as_ref()
-                    .map_or((entry.registered_at, None), |active| {
-                        (active.began_at, active.text.clone())
-                    });
-                SessionProcess {
-                    connection_id: *connection_id,
-                    principal: Arc::clone(&entry.principal),
-                    elapsed: now.saturating_duration_since(since),
-                    statement,
-                }
-            })
-            .collect()
     }
 
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome {
@@ -882,64 +784,6 @@ impl QueryControlPort for QueryApplicationControl {
         active.cancellation.request(reason)
     }
 
-    fn kill_query(&self, requester: SessionToken, target_connection_id: u32) -> QueryCancelOutcome {
-        let state = self.lock();
-        let Some(requester_entry) = state.sessions.get(&requester.key()) else {
-            return QueryCancelOutcome::UnknownSession;
-        };
-        let requester_principal = Arc::clone(&requester_entry.principal);
-        let Some(target_entry) = state
-            .by_connection
-            .get(&target_connection_id)
-            .and_then(|key| state.sessions.get(key))
-        else {
-            return QueryCancelOutcome::UnknownSession;
-        };
-        if target_entry.principal != requester_principal {
-            return QueryCancelOutcome::PermissionDenied;
-        }
-        let Some(active) = target_entry.active.as_ref() else {
-            return QueryCancelOutcome::NoActiveStatement;
-        };
-        if active.success_visibility_sealed {
-            return QueryCancelOutcome::NoActiveStatement;
-        }
-        active
-            .cancellation
-            .request(QueryCancellationReason::ExplicitKill {
-                requester_session: requester.key(),
-            })
-    }
-
-    fn authorize_connection_kill(
-        &self,
-        requester: SessionToken,
-        target_connection_id: u32,
-    ) -> ConnectionKillAuthorization {
-        let state = self.lock();
-        let Some(requester_entry) = state.sessions.get(&requester.key()) else {
-            return ConnectionKillAuthorization::UnknownSession;
-        };
-        let Some(target_entry) = state
-            .by_connection
-            .get(&target_connection_id)
-            .and_then(|key| state.sessions.get(key))
-        else {
-            return ConnectionKillAuthorization::UnknownSession;
-        };
-        if target_entry.principal != requester_entry.principal {
-            return ConnectionKillAuthorization::PermissionDenied;
-        }
-        match target_entry.origin {
-            SessionOrigin::Connection(connection) => {
-                ConnectionKillAuthorization::Authorized(connection)
-            }
-            SessionOrigin::ClientStatement(_) => {
-                unreachable!("connection index only contains connections")
-            }
-        }
-    }
-
     fn cancel_all(&self, reason: QueryCancellationReason) {
         let state = self.lock();
         for entry in state.sessions.values() {
@@ -970,40 +814,26 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    fn register(
-        control: &QueryApplicationControl,
-        id: u32,
-        generation: u64,
-        principal: &str,
-    ) -> SessionToken {
+    fn register(control: &QueryApplicationControl, principal: &str) -> SessionToken {
         control
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(id, generation).expect("valid connection token"),
+            .register_session(SessionIdentity::client_statement(
+                control.mint_client_query_id(),
                 principal,
             ))
-            .expect("register session")
+            .expect("register original statement session")
     }
 
     #[test]
     fn statement_sessions_have_independent_nonreused_keys_and_no_connection_position() {
         let control = QueryApplicationControl::default();
-        let requester = register(&control, 1, 1, "root");
+        let peer = register(&control, "root");
         let query_id = control.mint_client_query_id();
         let client = control
             .register_session(SessionIdentity::client_statement(query_id, "root"))
             .unwrap();
         let statement = control.begin_statement(client).unwrap();
-        assert_ne!(client.key(), requester.key());
-        assert_eq!(control.list_processes().len(), 1);
-        // A numerical coincidence with a session key never makes it a connection.
-        assert_eq!(
-            control.kill_query(requester, client.key().get() as u32),
-            QueryCancelOutcome::UnknownSession
-        );
-        assert_eq!(
-            control.authorize_connection_kill(requester, client.key().get() as u32),
-            ConnectionKillAuthorization::UnknownSession
-        );
+        assert_ne!(client.key(), peer.key());
+        assert_eq!(control.lock().by_client_query.len(), 2);
         control.unregister_session(client);
         assert_eq!(
             control.finish_statement(statement.token()),
@@ -1018,9 +848,8 @@ mod tests {
         assert!(successor.key() > client.key());
         control.cancel_all(QueryCancellationReason::ServerShutdown);
         control.unregister_session(successor);
-        control.unregister_session(requester);
+        control.unregister_session(peer);
         assert!(control.lock().sessions.is_empty());
-        assert!(control.lock().by_connection.is_empty());
     }
 
     #[test]
@@ -1095,58 +924,24 @@ mod tests {
         assert!(control.lock().sessions.is_empty());
     }
 
-    #[cfg(novarocks_dev_controls)]
-    #[test]
-    fn session_observation_tracks_the_service_owner_without_retaining_sessions() {
-        let control = Arc::new(QueryApplicationControl::default());
-        let service = QueryControlService::new(control.clone());
-        assert!(control.current_session_for_test_controls(7).is_err());
-
-        let first = service
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(7, 1).expect("valid connection token"),
-                "root",
-            ))
-            .expect("register first session");
-        let first_token = first.token();
-        assert_eq!(
-            control.current_session_for_test_controls(7).unwrap(),
-            first_token
-        );
-        drop(first);
-        assert!(control.current_session_for_test_controls(7).is_err());
-
-        let second = service
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(7, 2).expect("valid connection token"),
-                "root",
-            ))
-            .expect("register replacement session");
-        assert_ne!(second.token(), first_token);
-        assert_eq!(
-            control.current_session_for_test_controls(7).unwrap(),
-            second.token()
-        );
-    }
-
     #[test]
     fn stale_session_and_statement_cannot_remove_successor() {
         let control = QueryApplicationControl::default();
-        let first = register(&control, 7, 1, "root");
+        let query = control.mint_client_query_id();
+        let first = control
+            .register_session(SessionIdentity::client_statement(query.clone(), "root"))
+            .unwrap();
         let old = control.begin_statement(first).expect("begin old");
         control.unregister_session(first);
-        assert!(matches!(
-            control.register_session(SessionIdentity::new(
-                ClientConnectionToken::new(7, 2).expect("valid connection token"),
-                "root",
-            )),
-            Err(QueryControlError::ConnectionIdInUse)
-        ));
+        assert_eq!(
+            control.register_session(SessionIdentity::client_statement(query, "root")),
+            Err(QueryControlError::ClientQueryIdInUse)
+        );
         assert_eq!(
             control.finish_statement(old.token()),
             StatementFinishOutcome::Cancelled(QueryCancellationReason::ClientDisconnected)
         );
-        let second = register(&control, 7, 2, "root");
+        let second = register(&control, "root");
         let current = control.begin_statement(second).expect("begin current");
         assert_eq!(
             control.finish_statement(old.token()),
@@ -1160,56 +955,30 @@ mod tests {
     }
 
     #[test]
-    fn repeated_kill_preserves_first_reason() {
+    fn repeated_client_cancel_preserves_first_reason() {
         let control = QueryApplicationControl::default();
-        let target = register(&control, 7, 1, "root");
-        let requester = register(&control, 8, 1, "root");
+        let target = register(&control, "root");
         let active = control.begin_statement(target).expect("begin target");
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::Requested
         );
         assert_eq!(
-            control.kill_query(requester, 7),
-            QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ExplicitKill {
-                requester_session: requester.key(),
-            })
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
+            QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ClientCancelRequested)
         );
         assert_eq!(
             control.finish_statement(active.token()),
-            StatementFinishOutcome::Cancelled(QueryCancellationReason::ExplicitKill {
-                requester_session: requester.key(),
-            })
+            StatementFinishOutcome::Cancelled(QueryCancellationReason::ClientCancelRequested)
         );
-    }
-
-    #[test]
-    fn permission_and_idle_do_not_change_target() {
-        let control = QueryApplicationControl::default();
-        let target = register(&control, 7, 1, "root");
-        let foreign = register(&control, 8, 1, "other");
-        let own = register(&control, 9, 1, "root");
-        assert_eq!(
-            control.kill_query(own, 99),
-            QueryCancelOutcome::UnknownSession
-        );
-        assert_eq!(
-            control.kill_query(own, 7),
-            QueryCancelOutcome::NoActiveStatement
-        );
-        let active = control.begin_statement(target).expect("begin target");
-        assert_eq!(
-            control.kill_query(foreign, 7),
-            QueryCancelOutcome::PermissionDenied
-        );
-        assert!(!active.cancellation().is_cancelled());
     }
 
     #[test]
     fn finish_and_cancel_are_linearized_and_busy_session_rejects_successor() {
         let control = QueryApplicationControl::default();
-        let target = register(&control, 7, 1, "root");
-        let requester = register(&control, 8, 1, "root");
+        let target = register(&control, "root");
         let active = control.begin_statement(target).expect("begin target");
 
         assert!(matches!(
@@ -1217,17 +986,17 @@ mod tests {
             Err(QueryControlError::StatementBusy)
         ));
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::Requested
         );
         assert_eq!(
             control.finish_statement(active.token()),
-            StatementFinishOutcome::Cancelled(QueryCancellationReason::ExplicitKill {
-                requester_session: requester.key(),
-            })
+            StatementFinishOutcome::Cancelled(QueryCancellationReason::ClientCancelRequested)
         );
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::NoActiveStatement
         );
         assert!(
@@ -1239,7 +1008,7 @@ mod tests {
     #[test]
     fn caller_owned_cancellation_source_controls_the_registered_statement() {
         let control = QueryApplicationControl::default();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let source = QueryCancellationSource::new();
         let active = control
             .begin_statement_with_cancellation(session, source.clone())
@@ -1260,39 +1029,6 @@ mod tests {
                 }
             )
         );
-    }
-
-    #[test]
-    fn connection_kill_authorization_returns_only_the_exact_target_token() {
-        let control = QueryApplicationControl::default();
-        let target = register(&control, 7, 3, "root");
-        let requester = register(&control, 8, 4, "root");
-        let foreign = register(&control, 9, 5, "other");
-
-        assert_eq!(
-            control.authorize_connection_kill(requester, 7),
-            ConnectionKillAuthorization::Authorized(
-                ClientConnectionToken::new(7, 3).expect("valid token")
-            )
-        );
-        assert_eq!(
-            control.authorize_connection_kill(requester, 99),
-            ConnectionKillAuthorization::UnknownSession
-        );
-        assert_eq!(
-            control.authorize_connection_kill(foreign, 7),
-            ConnectionKillAuthorization::PermissionDenied
-        );
-
-        control.unregister_session(target);
-        let successor = register(&control, 7, 6, "root");
-        assert_eq!(
-            control.authorize_connection_kill(requester, 7),
-            ConnectionKillAuthorization::Authorized(
-                ClientConnectionToken::new(7, 6).expect("valid token")
-            )
-        );
-        control.unregister_session(successor);
     }
 
     fn governed_control() -> (
@@ -1343,8 +1079,8 @@ mod tests {
             })
             .unwrap();
         workload.mark_ready().unwrap();
-        let session = register(&control, 7, 1, "root");
-        let other = register(&control, 8, 2, "root");
+        let session = register(&control, "root");
+        let other = register(&control, "root");
         let begin = |session| {
             service.begin_governed_statement_with_result(
                 session,
@@ -1365,7 +1101,7 @@ mod tests {
         assert_eq!(workload.snapshot().businesses, 1);
         assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
         let second = begin(other).unwrap();
-        let third = register(&control, 9, 3, "root");
+        let third = register(&control, "root");
         assert!(matches!(
             begin(third),
             Err(GovernedQueryStatementBeginError::Admission(_))
@@ -1424,7 +1160,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
-        let session = register(&control, 71, 1, "root");
+        let session = register(&control, "root");
         let queued = service
             .begin_queued_governed_query_statement_with_result(
                 session,
@@ -1438,7 +1174,7 @@ mod tests {
             .expect("Root retention must not wait for a compute position")
             .unwrap();
         assert_eq!(workload.snapshot().admitted_queries, 1);
-        let other = register(&control, 72, 2, "root");
+        let other = register(&control, "root");
         let nonqueued = service
             .begin_governed_statement_with_result(
                 other,
@@ -1501,7 +1237,7 @@ mod tests {
             })
             .unwrap();
         workload.mark_ready().unwrap();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_queued_governed_query_statement_with_result(
                 session,
@@ -1521,7 +1257,8 @@ mod tests {
         assert_eq!(alias.class(), ResultWindowClass::Client);
         // An accepted cancel cut returns only the computation permit.
         assert_eq!(
-            control.kill_query(session, 7),
+            control
+                .cancel_session_statement(session, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::Requested
         );
         assert!(statement.accept_cancel_delivery_cut().unwrap());
@@ -1546,233 +1283,12 @@ mod tests {
         assert!(plain.result_window_alias().is_none());
     }
 
-    #[tokio::test]
-    async fn streaming_closing_transfer_releases_ordinary_window_after_last_alias_exit() {
-        use crate::api::{
-            ExecutionOutput, ExecutionOutputObligation, QueryResultStream, ResultField,
-            ResultRowCarrier, ResultSchema,
-        };
-        use crate::protocol_delivery::StreamingStatementResult;
-        use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
-        let control = Arc::new(QueryApplicationControl::default());
-        let service = QueryControlService::new(control.clone());
-        let workload = WorkloadControl::try_new(
-            WorkloadConfig {
-                query_concurrency_limit: 1,
-                ..WorkloadConfig::default()
-            },
-            ResourceConfig {
-                total_bytes: 1024,
-                control_bytes: 128,
-                per_scope_bytes: 896,
-            },
-        )
-        .unwrap();
-        let capacity = workload
-            .configure_result_capacity(ResultCapacityConfig {
-                positions: [1; 4],
-                client_compute_positions: 1,
-                client_short_tail_positions: 0,
-                supported_cancel_burst: 0,
-                sustained_cancels_per_second: 0,
-                ..ResultCapacityConfig::V1
-            })
-            .unwrap();
-        workload.mark_ready().unwrap();
-        let session = register(&control, 7, 1, "root");
-        let mut statement = service
-            .begin_queued_governed_query_statement_with_result(
-                session,
-                &workload.root_admission(),
-                None,
-                None,
-                None,
-                ResultWindowClass::Client,
-            )
-            .await
-            .unwrap();
-        let token = statement.token();
-        let native_alias = statement.result_window_alias().unwrap();
-        let owner = statement.take_execution_owner().unwrap();
-        let (_transport, _receipt, _failure, stream) = QueryResultStream::try_channel(
-            novarocks_types::identity::QueryId::new(71, 1),
-            ResultSchema::new(vec![ResultField::new(
-                "value",
-                novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int32,
-                    false,
-                ),
-            )]),
-            ResultRowCarrier::relayed(
-                novarocks_result_contract::RootOutputKind::ClientRows,
-                Some(
-                    novarocks_result_contract::ClientRowProfile::try_new(
-                        novarocks_result_contract::RootProfileV1::SEGMENT_BYTES,
-                        novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES,
-                    )
-                    .unwrap(),
-                ),
-            )
-            .unwrap(),
-            1,
-        )
-        .unwrap();
-        let execution = ExecutionOutputObligation::new(
-            owner.cancellation_requester(),
-            ExecutionOutput::Rows(stream),
-        );
-        let mut result =
-            StreamingStatementResult::try_from_execution(execution, statement).unwrap();
-        assert_eq!(result.statement_token(), Some(token));
-        assert!(matches!(
-            service.begin_statement(session),
-            Err(QueryControlError::StatementBusy)
-        ));
-        control.kill_query(session, 7);
-        let grant = result.try_closing_capacity(true).unwrap();
-        assert_eq!(result.statement_token(), Some(token));
-        assert_eq!(workload.snapshot().admitted_queries, 0);
-        let closing = result
-            .into_closing_delivery((), grant, 1024)
-            .unwrap_or_else(|_| panic!("valid transfer"));
-        assert_eq!(
-            capacity.snapshot().held_positions[0],
-            1,
-            "Native short tail retains the original window"
-        );
-        drop(native_alias);
-        assert_eq!(
-            capacity.snapshot().held_positions[0],
-            0,
-            "closing owns no ordinary window after actual alias exit"
-        );
-        assert_eq!(capacity.snapshot().held_positions[3], 1);
-        assert!(matches!(
-            service.begin_statement(session),
-            Err(QueryControlError::StatementBusy)
-        ));
-        owner.complete();
-        assert!(matches!(
-            closing.settle_after_writer_exit().await,
-            GovernedStatementFinishOutcome::Cancelled(_)
-        ));
-        assert_eq!(capacity.snapshot().held_positions[3], 0);
-        assert!(service.begin_statement(session).is_ok());
-    }
-
-    #[tokio::test]
-    async fn delivery_cut_returns_compute_only_and_closing_retains_generation_and_aliases() {
-        use crate::protocol_delivery::{ClosingDelivery, GovernedProtocolOwner};
-        use novarocks_workload_control::{ResultCapacityConfig, ResultClosingCut};
-        for abandon_wait in [false, true] {
-            let control = Arc::new(QueryApplicationControl::default());
-            let service = QueryControlService::new(control.clone());
-            let workload = WorkloadControl::try_new(
-                WorkloadConfig {
-                    query_concurrency_limit: 1,
-                    ..WorkloadConfig::default()
-                },
-                ResourceConfig {
-                    total_bytes: 1024,
-                    control_bytes: 128,
-                    per_scope_bytes: 896,
-                },
-            )
-            .unwrap();
-            let capacity = workload
-                .configure_result_capacity(ResultCapacityConfig {
-                    positions: [1; 4],
-                    client_compute_positions: 1,
-                    client_short_tail_positions: 0,
-                    supported_cancel_burst: 0,
-                    sustained_cancels_per_second: 0,
-                    ..ResultCapacityConfig::V1
-                })
-                .unwrap();
-            workload.mark_ready().unwrap();
-            let session = register(&control, 7, 1, "root");
-            let mut statement = service
-                .begin_queued_governed_query_statement(
-                    session,
-                    &workload.root_admission(),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            let token = statement.token();
-            let scope = statement.scope().clone();
-            assert_eq!(workload.snapshot().admitted_queries, 1);
-            assert!(statement.accept_cancel_delivery_cut().is_err());
-            assert_eq!(
-                control.kill_query(session, 7),
-                QueryCancelOutcome::Requested
-            );
-            assert!(statement.accept_cancel_delivery_cut().unwrap());
-            assert!(!statement.accept_cancel_delivery_cut().unwrap());
-            assert!(!statement.accept_failed_delivery_cut().unwrap());
-            assert_eq!(workload.snapshot().admitted_queries, 0);
-            assert_eq!(statement.token(), token);
-            assert!(matches!(
-                service.begin_statement(session),
-                Err(QueryControlError::StatementBusy)
-            ));
-            let grant = capacity
-                .try_acquire_closing(&scope, ResultClosingCut::AcceptedCancellation)
-                .unwrap();
-            let protocol = GovernedProtocolOwner::new(statement);
-            let closing = ClosingDelivery::try_new((), protocol, grant, 1024)
-                .unwrap_or_else(|_| panic!("accepted closing cut"));
-            let alias = closing.retained_guard();
-            let mut settlement = Box::pin(closing.settle_after_writer_exit());
-            assert!(
-                std::future::poll_fn(|cx| std::task::Poll::Ready(
-                    std::future::Future::poll(settlement.as_mut(), cx).is_pending()
-                ))
-                .await
-            );
-            assert!(
-                matches!(
-                    service.begin_statement(session),
-                    Err(QueryControlError::StatementBusy)
-                ),
-                "a still-live writer alias must retain the original statement generation"
-            );
-            assert_eq!(capacity.snapshot().held_positions[3], 1);
-            if abandon_wait {
-                drop(settlement);
-                assert!(
-                    matches!(
-                        service.begin_statement(session),
-                        Err(QueryControlError::StatementBusy)
-                    ),
-                    "dropping the closing waiter cannot settle a still-live writer alias"
-                );
-                drop(alias);
-            } else {
-                drop(alias);
-                assert!(matches!(
-                    settlement.await,
-                    GovernedStatementFinishOutcome::Cancelled(_)
-                ));
-            }
-            assert_eq!(
-                capacity.snapshot().held_positions[3],
-                0,
-                "settlement follows the last physical alias exit"
-            );
-            let successor = service.begin_statement(session).unwrap();
-            assert_ne!(successor.token(), token);
-        }
-    }
-
     #[test]
     fn failed_delivery_cut_retains_business_and_does_not_fabricate_cancel() {
         for previously_sealed in [false, true] {
             for finish_path in 0..3 {
                 let (control, service, workload) = governed_control();
-                let session = register(&control, 7, 1, "root");
+                let session = register(&control, "root");
                 let mut statement = service
                     .begin_governed_query_statement(
                         session,
@@ -1814,7 +1330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_governed_query_registers_kill_before_its_concurrency_grant() {
+    async fn queued_governed_query_registers_cancellation_before_its_concurrency_grant() {
         let control = Arc::new(QueryApplicationControl::default());
         let service = QueryControlService::new(control.clone());
         let config = WorkloadConfig {
@@ -1831,8 +1347,8 @@ mod tests {
         )
         .expect("workload authority");
         workload.mark_ready().expect("workload authority ready");
-        let first_session = register(&control, 7, 1, "root");
-        let second_session = register(&control, 8, 1, "root");
+        let first_session = register(&control, "root");
+        let second_session = register(&control, "root");
 
         let mut first = service
             .begin_queued_governed_query_statement(
@@ -1864,17 +1380,14 @@ mod tests {
         assert_eq!(
             control.cancel_session_statement(
                 second_session,
-                QueryCancellationReason::ExplicitKill {
-                    requester_session: crate::session_control::ClientSessionKey::new(7)
-                        .expect("nonzero fixture requester"),
-                },
+                QueryCancellationReason::ClientCancelRequested,
             ),
             QueryCancelOutcome::Requested
         );
         assert!(matches!(
             second.await,
             Err(GovernedQueryStatementBeginError::Admission(
-                WorkError::Cancelled(CancellationReason::ExplicitKill { .. })
+                WorkError::Cancelled(CancellationReason::ClientCancelRequested)
             ))
         ));
         assert_eq!(workload.snapshot().admitted_queries, 1);
@@ -1890,10 +1403,9 @@ mod tests {
     }
 
     #[test]
-    fn governed_kill_requests_the_registered_work_scope() {
+    fn governed_client_cancel_requests_the_registered_work_scope() {
         let (control, service, workload) = governed_control();
-        let target = register(&control, 7, 1, "root");
-        let requester = register(&control, 8, 1, "root");
+        let target = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -1902,30 +1414,26 @@ mod tests {
             .expect("root owner transfers once");
 
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::Requested
         );
         assert_eq!(
             statement.cancellation().reason(),
-            Some(CancellationReason::ExplicitKill {
-                requester_session: requester.key().get(),
-            })
+            Some(CancellationReason::ClientCancelRequested)
         );
         owner.complete();
         assert_eq!(
             statement.finish(),
-            GovernedStatementFinishOutcome::Cancelled(CancellationReason::ExplicitKill {
-                requester_session: requester.key().get(),
-            })
+            GovernedStatementFinishOutcome::Cancelled(CancellationReason::ClientCancelRequested)
         );
         assert_eq!(workload.snapshot().businesses, 0);
     }
 
     #[test]
-    fn governed_late_kill_reports_the_existing_owner_drop_reason() {
+    fn governed_late_client_cancel_reports_the_existing_owner_drop_reason() {
         let (control, service, workload) = governed_control();
-        let target = register(&control, 7, 1, "root");
-        let requester = register(&control, 8, 1, "root");
+        let target = register(&control, "root");
         let statement = service
             .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -1936,7 +1444,8 @@ mod tests {
             QueryCancelOutcome::Requested
         );
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ExecutionOwnerDropped,)
         );
         assert_eq!(
@@ -1948,7 +1457,7 @@ mod tests {
     #[test]
     fn governed_disconnect_and_timeout_use_the_same_workload_authority() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -1980,8 +1489,8 @@ mod tests {
         );
 
         let session_lease = service
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(9, 1).expect("valid connection token"),
+            .register_session(SessionIdentity::client_statement(
+                service.mint_client_query_id(),
                 "root",
             ))
             .expect("register second session");
@@ -1999,7 +1508,7 @@ mod tests {
     #[test]
     fn cancelled_unstarted_read_settles_its_known_control() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2026,7 +1535,7 @@ mod tests {
     fn cancelled_local_query_terminals_do_not_leave_ready_control() {
         for terminal in 0..3 {
             let (control, service, workload) = governed_control();
-            let session = register(&control, 7, 1, "root");
+            let session = register(&control, "root");
             let statement = service
                 .begin_governed_query_statement(
                     session,
@@ -2069,7 +1578,7 @@ mod tests {
     #[test]
     fn cancelled_synchronous_execution_settles_control_before_protocol_finish() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2094,7 +1603,7 @@ mod tests {
     #[test]
     fn governed_generation_and_business_permit_span_execution_start_to_protocol_finish() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut first = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("first governed query statement");
@@ -2132,10 +1641,9 @@ mod tests {
     }
 
     #[test]
-    fn governed_success_seal_wins_against_late_kill_until_protocol_finish() {
+    fn governed_success_seal_wins_against_late_client_cancel_until_protocol_finish() {
         let (control, service, workload) = governed_control();
-        let target = register(&control, 7, 1, "root");
-        let requester = register(&control, 8, 1, "root");
+        let target = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2150,7 +1658,8 @@ mod tests {
         );
         assert_eq!(workload.snapshot().businesses, 1);
         assert_eq!(
-            control.kill_query(requester, 7),
+            control
+                .cancel_session_statement(target, QueryCancellationReason::ClientCancelRequested),
             QueryCancelOutcome::NoActiveStatement
         );
         assert_eq!(statement.cancellation().reason(), None);
@@ -2162,61 +1671,9 @@ mod tests {
     }
 
     #[test]
-    fn process_list_separates_an_idle_session_from_a_running_statement() {
-        let (control, service, workload) = governed_control();
-        let idle = register(&control, 7, 1, "root");
-        let busy = register(&control, 9, 1, "reader");
-        let _ = idle;
-        let mut statement = service
-            .begin_governed_query_statement(
-                busy,
-                &workload.root_admission(),
-                None,
-                None,
-                Some(Arc::from("SELECT 1")),
-            )
-            .expect("governed query statement");
-
-        let processes = control.list_processes();
-        assert_eq!(
-            processes
-                .iter()
-                .map(|process| process.connection_id)
-                .collect::<Vec<_>>(),
-            vec![7, 9],
-            "sessions are reported in connection-id order"
-        );
-        assert_eq!(processes[0].command(), "Sleep");
-        assert_eq!(processes[0].statement, None);
-        assert_eq!(processes[0].principal.as_ref(), "root");
-        assert_eq!(processes[1].command(), "Query");
-        assert_eq!(
-            processes[1].statement.as_deref(),
-            Some("SELECT 1"),
-            "a running statement reports the text it began with"
-        );
-
-        statement
-            .take_execution_owner()
-            .expect("execution owner")
-            .complete();
-        assert_eq!(
-            statement.finish(),
-            GovernedStatementFinishOutcome::Completed
-        );
-
-        let processes = control.list_processes();
-        assert_eq!(processes[1].command(), "Sleep");
-        assert_eq!(
-            processes[1].statement, None,
-            "a finished statement stops being reported as running"
-        );
-    }
-
-    #[test]
     fn governed_eof_failure_after_success_seal_is_protocol_failed() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2239,7 +1696,7 @@ mod tests {
     #[test]
     fn governed_internal_protocol_failure_does_not_fabricate_cancellation() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2260,9 +1717,9 @@ mod tests {
     #[test]
     fn unregister_is_deferred_until_the_active_generation_settles() {
         let (control, service, workload) = governed_control();
-        let connection = ClientConnectionToken::new(17, 1).expect("connection token");
+        let query = control.mint_client_query_id();
         let session = service
-            .register_session(SessionIdentity::new(connection, "root"))
+            .register_session(SessionIdentity::client_statement(query.clone(), "root"))
             .expect("register session");
         let token = session.token();
         let statement = service
@@ -2272,8 +1729,8 @@ mod tests {
         drop(session);
         assert!(
             matches!(
-                service.register_session(SessionIdentity::new(connection, "root")),
-                Err(QueryControlError::ConnectionIdInUse)
+                service.register_session(SessionIdentity::client_statement(query.clone(), "root")),
+                Err(QueryControlError::ClientQueryIdInUse)
             ),
             "the registry retains the deferred unregister owner"
         );
@@ -2282,7 +1739,10 @@ mod tests {
             GovernedStatementFinishOutcome::ProtocolFailed
         );
         let successor = service
-            .register_session(SessionIdentity::new(connection, "root"))
+            .register_session(SessionIdentity::client_statement(
+                control.mint_client_query_id(),
+                "root",
+            ))
             .expect("settlement completes deferred unregister");
         assert_ne!(successor.token().key(), token.key());
         drop(successor);
@@ -2292,7 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn governed_root_deadline_is_observed_without_a_legacy_cancellation_source() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
         let statement = service
             .begin_governed_query_statement(
@@ -2318,7 +1778,7 @@ mod tests {
     #[test]
     fn dropping_protocol_owner_after_execution_handoff_cancels_the_same_root() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
@@ -2355,7 +1815,7 @@ mod tests {
             std::pin::Pin::new(&mut self.gate).poll(cx).map(|ready| {
                 ready.expect("original release sender");
                 Ok(crate::session_control::StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 ))
             })
         }
@@ -2390,7 +1850,7 @@ mod tests {
     fn ordinary_action_views_cannot_seal_statement_visibility() {
         use crate::session_control::GovernedActionContext;
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let mut statement = service
             .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .unwrap();
@@ -2450,7 +1910,7 @@ mod tests {
                 self.outcomes.lock().unwrap().push(outcome.clone());
                 Poll::Ready(match outcome {
                     GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok(
-                        crate::session_control::StatementCommandCompletion::new(0),
+                        crate::session_control::StatementCommandCompletion::empty(),
                     )),
                     GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
                         Err(QueryServiceError::new(
@@ -2464,8 +1924,8 @@ mod tests {
         }
         for cancel_first in [false, true] {
             let (control, service, workload) = governed_control();
-            let session = register(&control, 7, 1, "root");
-            let foreign_session = register(&control, 9, 1, "root");
+            let session = register(&control, "root");
+            let foreign_session = register(&control, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
             slot.install(
                 service.clone(),
@@ -2494,7 +1954,21 @@ mod tests {
             }));
             let mut receiver = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut receiver,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -2545,6 +2019,16 @@ mod tests {
                 .publish_statement_action_in(
                     &mut foreign_owner,
                     &mut foreign_action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
                     &mut foreign_receiver,
                 )
                 .unwrap()
@@ -2604,7 +2088,10 @@ mod tests {
             assert_eq!(*outcomes.lock().unwrap(), vec![expected.clone()]);
             if !cancel_first {
                 assert_eq!(
-                    control.kill_query(session, 7),
+                    control.cancel_session_statement(
+                        session,
+                        QueryCancellationReason::ClientCancelRequested
+                    ),
                     QueryCancelOutcome::NoActiveStatement
                 );
                 assert!(cancellation.reason().is_none());
@@ -2657,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn original_statement_source_keeps_owner_until_actual_action_drop_and_protocol_take() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -2685,7 +2172,21 @@ mod tests {
             }));
         let mut receiver = None;
         let publication = service
-            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut receiver,
+            )
             .unwrap();
         assert!(owner.is_none() && action.is_none());
         publication.finish().unwrap();
@@ -2724,7 +2225,7 @@ mod tests {
     #[test]
     fn abandoning_the_waiter_never_drops_the_original_inflight_statement() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -2751,7 +2252,21 @@ mod tests {
             }));
         let mut receiver = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut receiver,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -2821,7 +2336,7 @@ mod tests {
             }
         }
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -2850,7 +2365,21 @@ mod tests {
             }));
         let mut receiver = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut receiver,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -2930,7 +2459,7 @@ mod tests {
                 self.polls.fetch_add(1, Ordering::SeqCst);
                 if self.ready {
                     std::task::Poll::Ready(Ok(StatementActionValue::Ok(
-                        crate::session_control::StatementCommandCompletion::new(0),
+                        crate::session_control::StatementCommandCompletion::empty(),
                     )))
                 } else {
                     std::task::Poll::Pending
@@ -2944,7 +2473,7 @@ mod tests {
         }
         for ready in [false, true] {
             let (control, service, workload) = governed_control();
-            let session = register(&control, 7, 1, "root");
+            let session = register(&control, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
             slot.install(
                 service.clone(),
@@ -2977,7 +2506,21 @@ mod tests {
                 }));
             let mut observer = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut observer,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -3040,7 +2583,7 @@ mod tests {
             }
         }
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -3062,7 +2605,21 @@ mod tests {
             Some(Box::new(DomainError));
         let mut observer = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut observer,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -3122,7 +2679,7 @@ mod tests {
             > {
                 self.polls.fetch_add(1, Ordering::SeqCst);
                 std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
         }
@@ -3139,7 +2696,7 @@ mod tests {
             StatementExternalEffectDisposition::KnownUncommitted,
         ] {
             let (control, service, workload) = governed_control();
-            let session = register(&control, 7, 1, "root");
+            let session = register(&control, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
             slot.install(
                 service.clone(),
@@ -3167,7 +2724,21 @@ mod tests {
                 }));
             let mut observer = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut observer,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -3209,7 +2780,7 @@ mod tests {
                 >,
             > {
                 std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
         }
@@ -3219,7 +2790,7 @@ mod tests {
             StatementExternalEffectDisposition::KnownUncommitted,
         ] {
             let (control, service, workload) = governed_control();
-            let session = register(&control, 7, 1, "root");
+            let session = register(&control, "root");
             let slot = crate::session_control::StatementProgressSlot::empty();
             slot.install(
                 service.clone(),
@@ -3241,7 +2812,21 @@ mod tests {
                 Some(Box::new(PublishedAction(disposition)));
             let mut observer = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut observer)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut observer,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -3263,7 +2848,7 @@ mod tests {
     #[test]
     fn stopped_statement_publication_returns_the_same_two_original_sources() {
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -3292,7 +2877,21 @@ mod tests {
         let mut receiver = None;
         slot.close();
         let refusal = service
-            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut receiver,
+            )
             .unwrap();
         assert_eq!(refusal.result(), &Err(QueryControlError::StatementBusy));
         assert_eq!(owner.as_ref().unwrap().token(), token);
@@ -3345,7 +2944,7 @@ mod tests {
                 >,
             > {
                 std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
         }
@@ -3370,7 +2969,7 @@ mod tests {
         }
         let (control, service, workload) = governed_control();
         let workload = Arc::new(workload);
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -3402,7 +3001,21 @@ mod tests {
             }));
         let mut receiver = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut receiver)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut receiver,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -3472,7 +3085,13 @@ mod tests {
             let value = crate::api::LocalResultProducer::try_new(
                 owner.scope(),
                 window,
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: false,
+                        variant_binary: false,
+                    },
+                ),
             )
             .and_then(|producer| {
                 producer.produce(|| {
@@ -3499,9 +3118,9 @@ mod tests {
         control: &Arc<QueryApplicationControl>,
         service: &QueryControlService,
         workload: &WorkloadControl,
-        id: u32,
+        _id: u32,
     ) -> crate::session_control::GovernedQueryStatementOwner {
-        let session = register(control, id, 1, "root");
+        let session = register(control, "root");
         service
             .begin_queued_governed_query_statement_with_result(
                 session,
@@ -3554,7 +3173,21 @@ mod tests {
             }));
         let mut wait = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut wait)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::ResultSet,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut wait,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -3589,7 +3222,21 @@ mod tests {
             Some(Box::new(OriginalLocalExplainGate { gate, dropped }));
         let mut wait = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut wait)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::ResultSet,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut wait,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -3661,16 +3308,22 @@ mod tests {
         let local = crate::api::LocalResultProducer::try_new(
             foreign.scope(),
             foreign.result_window_alias().unwrap(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: false,
+                    variant_binary: false,
+                },
+            ),
         )
         .unwrap()
         .produce(|| crate::api::build_string_query_result("Explain String", vec!["foreign".into()]))
         .unwrap();
         let token = owner.token();
-        let mut source = Some(StatementActionReady {
-            result: Ok(StatementActionValue::Local(local)),
+        let mut source = Some(StatementActionReady::new(
+            Ok(StatementActionValue::Local(local)),
             owner,
-        });
+        ));
         let mut target = None;
         assert!(StatementActionReady::transfer_protocol_in(&mut source, &mut target).is_err());
         assert!(target.is_none());
@@ -3746,7 +3399,7 @@ mod tests {
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
                 std::task::Poll::Ready(Ok(StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
             fn handoff_residual_in(
@@ -3796,7 +3449,7 @@ mod tests {
         workload.mark_ready().unwrap();
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(service.clone(), source_slots).unwrap();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let action_drops = Arc::new(AtomicUsize::new(0));
         let tail_drops = Arc::new(AtomicUsize::new(0));
         let mut releases = Vec::new();
@@ -3827,7 +3480,21 @@ mod tests {
             }));
             let mut waiter = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut waiter,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -3943,7 +3610,7 @@ mod tests {
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
                 std::task::Poll::Ready(Ok(StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
             fn handoff_residual_in(
@@ -3956,7 +3623,7 @@ mod tests {
             }
         }
         let (control, service, workload) = governed_control();
-        let session = register(&control, 7, 1, "root");
+        let session = register(&control, "root");
         let slot = crate::session_control::StatementProgressSlot::empty();
         slot.install(
             service.clone(),
@@ -3985,7 +3652,21 @@ mod tests {
             })))));
         let mut waiter = None;
         service
-            .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Empty,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut waiter,
+            )
             .unwrap()
             .finish()
             .unwrap();
@@ -4066,7 +3747,7 @@ mod tests {
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
                 std::task::Poll::Ready(Ok(StatementActionValue::Ok(
-                    crate::session_control::StatementCommandCompletion::new(0),
+                    crate::session_control::StatementCommandCompletion::empty(),
                 )))
             }
             fn handoff_residual_in(
@@ -4106,7 +3787,21 @@ mod tests {
                 })))));
             let mut waiter = None;
             service
-                .publish_statement_action_in(&mut owner, &mut action, &mut waiter)
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Empty,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut waiter,
+                )
                 .unwrap()
                 .finish()
                 .unwrap();
@@ -4143,7 +3838,7 @@ mod tests {
                     .unwrap();
                 let ready = ready.take().unwrap();
                 assert!(
-                    matches!(ready.result, Ok(StatementActionValue::Ok(completion)) if completion.affected_rows() == 0)
+                    matches!(ready.result, Ok(StatementActionValue::Ok(completion)) if completion == crate::session_control::StatementCommandCompletion::empty())
                 );
                 ready.owner.finish();
             } else {
@@ -4184,6 +3879,470 @@ mod tests {
             assert!(
                 workload.shutdown().is_ok(),
                 "explicit same-owner disposition drains WC"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn completion_projection_failure_keeps_original_commit_fact_and_owner() {
+        use crate::api::StatementExternalEffectDisposition;
+        use crate::session_control::{
+            GovernedStatementAction, StatementActionReady, StatementActionValue,
+            StatementCommandCompletion,
+        };
+        struct CommittedCount;
+        impl GovernedStatementAction for CommittedCount {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+                Some(StatementExternalEffectDisposition::KnownCommitted)
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    StatementCommandCompletion::new(u64::MAX),
+                )))
+            }
+        }
+        let control = Arc::new(QueryApplicationControl::default());
+        let service = QueryControlService::new(control.clone());
+        let (workload, capacity) = local_workload();
+        let slot = crate::session_control::StatementProgressSlot::empty();
+        slot.install(
+            service.clone(),
+            std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+        )
+        .unwrap();
+        let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+        let original_token = owner.as_ref().unwrap().token();
+        let mut action: Option<Box<dyn GovernedStatementAction>> = Some(Box::new(CommittedCount));
+        let mut wait = None;
+        service
+            .publish_statement_action_in(
+                &mut owner,
+                &mut action,
+                crate::session_control::StatementCompletionProjection::new(
+                    crate::session::StatementOutputShape::Rows,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: false,
+                            variant_binary: false,
+                        },
+                    ),
+                ),
+                &mut wait,
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+        drive_original_statement_actions(&slot);
+        let receipt = wait.take().unwrap().await.unwrap();
+        let mut ready = None;
+        receipt
+            .take_ready_in(&mut ready)
+            .unwrap_or_else(|_| panic!("original ready transfer"))
+            .finish()
+            .unwrap();
+        ready.as_mut().unwrap().prepare_completion(
+            crate::session::StatementOutputShape::Rows,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: false,
+                    variant_binary: false,
+                },
+            ),
+        );
+        assert_eq!(ready.as_ref().unwrap().owner.token(), original_token);
+        let error = ready
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .err()
+            .expect("bigint overflow refused");
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        let mut output = None;
+        StatementActionReady::transfer_protocol_in(&mut ready, &mut output).unwrap();
+        let crate::protocol_delivery::QuerySessionOutput::GovernedError(error) = output.unwrap()
+        else {
+            panic!("original governed error")
+        };
+        let (error, mut protocol) = error.into_parts();
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        protocol.fail();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+    #[tokio::test]
+    async fn post_transfer_failures_retain_original_effect_cause_and_last_window_alias() {
+        use crate::api::StatementExternalEffectDisposition;
+        use crate::session_control::{
+            GovernedStatementAction, StatementActionReady, StatementActionValue,
+            StatementCommandCompletion,
+        };
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        struct OriginalCompletion(
+            StatementCommandCompletion,
+            StatementExternalEffectDisposition,
+        );
+        impl GovernedStatementAction for OriginalCompletion {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+                Some(self.1)
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(self.0)))
+            }
+        }
+        for (completion, effect, cancel) in [
+            (
+                StatementCommandCompletion::new(0),
+                StatementExternalEffectDisposition::KnownCommitted,
+                false,
+            ),
+            (
+                StatementCommandCompletion::no_count(),
+                StatementExternalEffectDisposition::CommitUnknown,
+                true,
+            ),
+        ] {
+            let control = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(control.clone());
+            let (workload, capacity) = local_workload();
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
+            let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+            let token = owner.as_ref().unwrap().token();
+            let mut action: Option<Box<dyn GovernedStatementAction>> =
+                Some(Box::new(OriginalCompletion(completion, effect)));
+            let mut wait = None;
+            service
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Rows,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut wait,
+                )
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            let receipt = wait.take().unwrap().await.unwrap();
+            let mut ready = None;
+            receipt
+                .take_ready_in(&mut ready)
+                .unwrap_or_else(|_| panic!("same original source"))
+                .finish()
+                .unwrap();
+            ready.as_mut().unwrap().prepare_completion(
+                crate::session::StatementOutputShape::Rows,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: false,
+                        variant_binary: false,
+                    },
+                ),
+            );
+            assert!(ready.as_ref().unwrap().result.is_ok());
+            let mut output = None;
+            StatementActionReady::transfer_protocol_in(&mut ready, &mut output).unwrap();
+            let output = output.unwrap();
+            assert_eq!(output.external_effect_disposition(), Some(effect));
+            let crate::protocol_delivery::QuerySessionOutput::GovernedCompletion(result) = output
+            else {
+                panic!("original completion carrier")
+            };
+            let (actual, local, mut protocol) = result.into_parts_with_rows();
+            assert_eq!(actual, completion);
+            assert_eq!(protocol.statement_token(), Some(token));
+            assert_eq!(protocol.external_effect_disposition(), Some(effect));
+            let window = protocol.result_window_alias().unwrap();
+            let mut cursor = local.unwrap().into_cursor();
+            let physical = cursor.retain_physical_guard();
+            let source = if cancel {
+                let cancellation = protocol.cancellation();
+                let _ = protocol.client_cancel_requested();
+                assert!(matches!(
+                    cancellation.reason(),
+                    Some(crate::cancellation::QueryCancellationReason::ClientCancelRequested)
+                ));
+                cursor.cancel();
+                let failure = cursor
+                    .step(&mut [0; 64])
+                    .expect_err("actual canceled local cursor");
+                assert_eq!(
+                    failure.kind,
+                    novarocks_result_render::RenderErrorKind::Cancelled
+                );
+                SharedFailureCause::new(failure)
+            } else {
+                let failure = window
+                    .check_backing_total(u64::MAX)
+                    .expect_err("actual original backing envelope refuses overflow");
+                assert_eq!(
+                    failure,
+                    novarocks_workload_control::WorkError::Capacity("result backing envelope")
+                );
+                let _ = protocol.fail();
+                SharedFailureCause::new(failure)
+            };
+            let error = crate::session_error::QueryServiceError::from_failure_cause(source.clone())
+                .attach_external_effect_disposition(
+                    protocol.external_effect_disposition().unwrap(),
+                );
+            assert_eq!(error.failure_cause(), Some(&source));
+            assert_eq!(
+                error.execution_failure().unwrap().fact(),
+                source.failure_fact()
+            );
+            assert_eq!(error.external_effect_disposition(), Some(effect));
+            assert_eq!(protocol.external_effect_disposition(), Some(effect));
+            assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+            drop(window);
+            drop(cursor);
+            drop(protocol);
+            assert_eq!(
+                capacity.snapshot().held_positions,
+                [0, 1, 0, 0],
+                "last real physical alias still owns the original window"
+            );
+            drop(physical);
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_count_completion_keeps_original_root_until_projection_after_residual_exit() {
+        use crate::api::StatementExternalEffectDisposition;
+        use crate::session_control::{
+            GovernedStatementAction, GovernedStatementResidual, StatementActionReady,
+            StatementActionValue, StatementCommandCompletion,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct OriginalTail {
+            gate: futures::channel::oneshot::Receiver<()>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl GovernedStatementResidual for OriginalTail {
+            fn poll_retirement(
+                &mut self,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), crate::api::StatementNativeHealthFailure>> {
+                use std::future::Future;
+                std::pin::Pin::new(&mut self.gate).poll(cx).map(|result| {
+                    result.expect("same original residual exit sender");
+                    Ok(())
+                })
+            }
+        }
+        impl Drop for OriginalTail {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct OriginalNoCount(Option<Box<dyn GovernedStatementResidual>>);
+        impl GovernedStatementAction for OriginalNoCount {
+            fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
+                Some(StatementExternalEffectDisposition::KnownCommitted)
+            }
+            fn poll_action(
+                &mut self,
+                _: &mut crate::session_control::GovernedActionContext<'_>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<
+                Result<StatementActionValue, crate::session_error::QueryServiceError>,
+            > {
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    StatementCommandCompletion::no_count(),
+                )))
+            }
+            fn handoff_residual_in(
+                &mut self,
+                target: &mut Option<Box<dyn GovernedStatementResidual>>,
+            ) -> Result<(), crate::api::StatementNativeHealthFailure> {
+                assert!(target.is_none());
+                *target = self.0.take();
+                Ok(())
+            }
+        }
+
+        for abandon_before_take in [false, true] {
+            let control = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(control.clone());
+            let (workload, capacity) = local_workload();
+            let slot = crate::session_control::StatementProgressSlot::empty();
+            slot.install(
+                service.clone(),
+                std::num::NonZeroUsize::new(WorkloadConfig::default().scope_records_limit).unwrap(),
+            )
+            .unwrap();
+            let mut owner = Some(original_local_statement(&control, &service, &workload, 7).await);
+            let root = owner.as_ref().unwrap().scope().clone();
+            let last_alias = owner.as_ref().unwrap().result_window_alias().unwrap();
+            let (exit, gate) = futures::channel::oneshot::channel();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut action: Option<Box<dyn GovernedStatementAction>> =
+                Some(Box::new(OriginalNoCount(Some(Box::new(OriginalTail {
+                    gate,
+                    drops: drops.clone(),
+                })))));
+            let mut waiter = None;
+            service
+                .publish_statement_action_in(
+                    &mut owner,
+                    &mut action,
+                    crate::session_control::StatementCompletionProjection::new(
+                        crate::session::StatementOutputShape::Rows,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: false,
+                                variant_binary: false,
+                            },
+                        ),
+                    ),
+                    &mut waiter,
+                )
+                .unwrap()
+                .finish()
+                .unwrap();
+            drive_original_statement_actions(&slot);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert!(root.check().is_ok());
+            assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+
+            // Close the actual original residual, then drive its real retirement
+            // before the client takes Ready or constructs its Trino no-count graph.
+            exit.send(()).unwrap();
+            drive_original_statement_actions(&slot);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+            let before_projection = root.check();
+            if abandon_before_take {
+                // The closed graph remains in the same Source when the client
+                // never takes Ready. Actual abandon disposes it before settlement.
+                drop(waiter.take());
+                drive_original_statement_actions(&slot);
+                assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+                drop(last_alias);
+                drive_original_statement_actions(&slot);
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+                assert_eq!(workload.snapshot().root_responsibilities, 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                continue;
+            }
+            let receipt = waiter.take().unwrap().await.unwrap();
+            let mut ready = None;
+            receipt
+                .take_ready_in(&mut ready)
+                .unwrap_or_else(|_| panic!("same original business result and owner"))
+                .finish()
+                .unwrap();
+            assert_eq!(ready.as_ref().unwrap().owner.scope().id(), root.id());
+            assert!(matches!(
+                ready.as_ref().unwrap().result,
+                Ok(StatementActionValue::Ok(StatementCommandCompletion::Rows(
+                    crate::session_control::StatementCommandRowCount::NoCount
+                )))
+            ));
+            ready.as_mut().unwrap().prepare_completion(
+                crate::session::StatementOutputShape::Rows,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: false,
+                        variant_binary: false,
+                    },
+                ),
+            );
+            let projection_error = ready.as_ref().unwrap().result.as_ref().err().cloned();
+            let mut output = None;
+            StatementActionReady::transfer_protocol_in(&mut ready, &mut output).unwrap();
+            match output.take().unwrap() {
+                crate::protocol_delivery::QuerySessionOutput::GovernedCompletion(result) => {
+                    let (completion, local, mut protocol) = result.into_parts_with_rows();
+                    assert_eq!(completion, StatementCommandCompletion::no_count());
+                    assert_eq!(
+                        protocol.external_effect_disposition(),
+                        Some(StatementExternalEffectDisposition::KnownCommitted)
+                    );
+                    let mut cursor = local
+                        .expect("Trino no-count owns its original NULL row")
+                        .into_cursor();
+                    let physical = cursor.retain_physical_guard();
+                    let mut rendered = Vec::new();
+                    let mut rows = 0;
+                    loop {
+                        let mut bytes = [0; 64];
+                        let turn = cursor.step(&mut bytes).unwrap();
+                        rendered.extend_from_slice(&bytes[..turn.emitted_bytes]);
+                        rows += turn.completed_rows;
+                        if turn.status == novarocks_result_render::RenderTurnStatus::InputComplete {
+                            break;
+                        }
+                    }
+                    assert_eq!(rows, 1);
+                    let payload = b"[null]";
+                    let mut expected = (payload.len() as u32).to_le_bytes().to_vec();
+                    expected.extend_from_slice(payload);
+                    assert_eq!(rendered, expected);
+                    drop(cursor);
+                    protocol.complete();
+                    drop(protocol);
+                    assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+                    drop(physical);
+                }
+                crate::protocol_delivery::QuerySessionOutput::GovernedError(result) => {
+                    // Dispose the real failed protocol before the final regression
+                    // assertion, so the RED run leaves no original responsibility.
+                    let (error, mut protocol) = result.into_parts();
+                    assert_eq!(
+                        error.external_effect_disposition(),
+                        Some(StatementExternalEffectDisposition::KnownCommitted)
+                    );
+                    protocol.fail();
+                }
+                _ => panic!("same original command completion carrier"),
+            }
+            drop(last_alias);
+            drive_original_statement_actions(&slot);
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(
+                projection_error.is_none(),
+                "original Root state before projection: {before_projection:?}; completion: {projection_error:?}"
             );
         }
     }

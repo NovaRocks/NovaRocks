@@ -207,12 +207,7 @@ impl OwnedLocalResult {
                     source_slot: None,
                     name: field.name().to_owned(),
                     field: RenderField {
-                        presentation: match family {
-                            ClientPresentationFamily::MysqlText => RenderPresentation::ScalarText,
-                            ClientPresentationFamily::TrinoJson(_) => {
-                                RenderPresentation::TrinoValue
-                            }
-                        },
+                        presentation: RenderPresentation::TrinoValue,
                         nullable: field.nullable(),
                         native_type: native(kind(field.data_type(), false)?),
                     },
@@ -394,7 +389,15 @@ mod tests {
         (host, capacity)
     }
     fn produce_text(host: &WorkloadControl, text: &str) -> OwnedLocalResult {
-        produce_text_for_family(host, text, ClientPresentationFamily::MysqlText)
+        produce_text_for_family(
+            host,
+            text,
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
+        )
     }
     fn produce_text_for_family(
         host: &WorkloadControl,
@@ -433,10 +436,7 @@ mod tests {
         let mut bytes = [0; 256];
         let turn = cursor.step(&mut bytes).unwrap();
         assert_eq!(turn.status, RenderTurnStatus::InputComplete);
-        assert_eq!(
-            &bytes[..turn.emitted_bytes],
-            &[6, 0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o']
-        );
+        assert_eq!(&bytes[..turn.emitted_bytes], b"\x09\0\0\0[\"hello\"]");
         drop(cursor);
         assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
         drop(physical);
@@ -445,18 +445,8 @@ mod tests {
     }
     #[test]
     fn cancellation_latches_before_first_encoder_and_after_a_counting_turn() {
-        for (family, after_count) in [
-            (ClientPresentationFamily::MysqlText, false),
-            (ClientPresentationFamily::MysqlText, true),
-            (
-                ClientPresentationFamily::TrinoJson(Default::default()),
-                false,
-            ),
-            (
-                ClientPresentationFamily::TrinoJson(Default::default()),
-                true,
-            ),
-        ] {
+        for after_count in [false, true] {
+            let family = ClientPresentationFamily::TrinoJson(Default::default());
             let (host, capacity) = fixture();
             let result = produce_text_for_family(&host, &"x".repeat(128 * 1024), family);
             let mut cursor = result.into_cursor();
@@ -495,10 +485,8 @@ mod tests {
         use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 
         for class in [ResultWindowClass::Local, ResultWindowClass::Internal] {
-            for family in [
-                ClientPresentationFamily::MysqlText,
-                ClientPresentationFamily::TrinoJson(Default::default()),
-            ] {
+            {
+                let family = ClientPresentationFamily::TrinoJson(Default::default());
                 let (host, capacity) = fixture();
                 let (root, window) = host
                     .root_admission()
@@ -549,12 +537,7 @@ mod tests {
                 let mut output = [0; 256];
                 let turn = cursor.step(&mut output).unwrap();
                 assert_eq!(turn.status, RenderTurnStatus::InputComplete);
-                let expected_bytes: &[u8] = match family {
-                    ClientPresentationFamily::MysqlText => &[2, 0, 0, 0, 1, b'v'],
-                    ClientPresentationFamily::TrinoJson(_) => {
-                        &[5, 0, 0, 0, b'[', b'"', b'v', b'"', b']']
-                    }
-                };
+                let expected_bytes: &[u8] = b"\x05\0\0\0[\"v\"]";
                 assert_eq!(&output[..turn.emitted_bytes], expected_bytes);
                 assert_eq!(cursor.retained_backing_bytes(), expected as u64);
                 cursor.cancel();
@@ -636,7 +619,11 @@ mod tests {
             LocalResultProducer::try_new(
                 &other.owner.scope(),
                 window.retain_alias(),
-                ClientPresentationFamily::MysqlText
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true
+                })
             )
             .is_err()
         );
@@ -651,7 +638,11 @@ mod tests {
             LocalResultProducer::try_new(
                 &client_root.owner.scope(),
                 client_window.retain_alias(),
-                ClientPresentationFamily::MysqlText
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true
+                })
             )
             .is_err()
         );
@@ -679,7 +670,11 @@ mod tests {
         let result = LocalResultProducer::try_new(
             &root.owner.scope(),
             window.retain_alias(),
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
         )
         .unwrap()
         .produce(|| {
@@ -732,7 +727,7 @@ mod tests {
         assert_eq!(turn.completed_rows, 1);
         assert_eq!(
             &bytes[..turn.emitted_bytes],
-            &[8, 0, 0, 0, 1, b'1', 2, b'-', b'2', 1, b'7', 0xfb]
+            &[&[16, 0, 0, 0][..], b"[true,-2,7,null]"].concat()
         );
         drop(cursor);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
@@ -866,7 +861,11 @@ mod tests {
         let result = LocalResultProducer::try_new(
             &root.owner.scope(),
             window.retain_alias(),
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
         )
         .unwrap()
         .produce(|| {
@@ -898,7 +897,7 @@ mod tests {
         assert_eq!(cursor.retained_backing_bytes(), expected as u64);
         let turn = cursor.step(&mut bytes).unwrap();
         assert_eq!(turn.status, RenderTurnStatus::InputComplete);
-        assert_eq!(&bytes[..turn.emitted_bytes], &[2, 0, 0, 0, 1, b'a']);
+        assert_eq!(&bytes[..turn.emitted_bytes], b"\x05\0\0\0[\"a\"]");
         assert_eq!(cursor.retained_backing_bytes(), expected as u64);
         cursor.cancel();
         assert_eq!(cursor.retained_backing_bytes(), expected as u64);
@@ -920,7 +919,11 @@ mod tests {
             let source = LocalResultProducer::try_new(
                 &root.owner.scope(),
                 window.retain_alias(),
-                ClientPresentationFamily::MysqlText,
+                ClientPresentationFamily::TrinoJson(novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                }),
             )
             .unwrap();
             let result = source.produce(|| {

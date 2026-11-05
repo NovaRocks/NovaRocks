@@ -296,12 +296,6 @@ fn normalize_role_config(
             );
             replace_exact_integer(
                 root,
-                &["standalone_server", "mysql_port"],
-                input.runtime.fe_mysql_port,
-                "$FE_MYSQL",
-            )?;
-            replace_exact_integer(
-                root,
                 &["standalone_server", "trino_port"],
                 input.runtime.fe_trino_port,
                 "$FE_TRINO",
@@ -328,10 +322,6 @@ fn normalize_role_config(
                 input.runtime.be[index].control_grpc,
                 "$ROLE_CONTROL_GRPC",
             )?;
-            ensure!(
-                get_path(root, &["standalone_server", "mysql_port"]).is_none(),
-                "effective BE config must not contain standalone_server.mysql_port"
-            );
             ensure!(
                 get_path(root, &["standalone_server", "trino_port"]).is_none(),
                 "effective BE config must not contain standalone_server.trino_port"
@@ -615,7 +605,7 @@ mod tests {
         http: u16,
         grpc: u16,
         control_grpc: Option<u16>,
-        mysql: Option<u16>,
+
         trino: Option<u16>,
         frontend_grpc: u16,
         runtime_dir: &'a Path,
@@ -631,7 +621,6 @@ mod tests {
             http,
             grpc,
             control_grpc,
-            mysql,
             trino,
             frontend_grpc,
             runtime_dir,
@@ -642,9 +631,6 @@ mod tests {
         } = input;
         let control = control_grpc
             .map(|port| format!("control_grpc_port = {port}\n"))
-            .unwrap_or_default();
-        let mysql = mysql
-            .map(|port| format!("mysql_port = {port}"))
             .unwrap_or_default();
         let trino = trino
             .map(|port| format!("trino_port = {port}"))
@@ -667,7 +653,7 @@ mod tests {
         };
         format!(
             "[server]\nhost = \"127.0.0.1\"\nhttp_port = {http}\ngrpc_port = {grpc}\n{control}\
-             [standalone_server]\n{mysql}\n{trino}\n\
+             [standalone_server]\n{trino}\n\
              [cluster]\nrole = \"{role}\"\n{role_fields}\
              [runtime]\noperator_buffer_chunks = 1000\n{extra}\n\
              [native_trust]\ndeployment_id = \"novarocks-system-tests\"\nshared_secret = \"${{ENV:NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET}}\"\n\
@@ -703,7 +689,7 @@ mod tests {
             }],
             fe_http_port: ports.0,
             fe_grpc_port: ports.1,
-            fe_mysql_port: ports.2,
+
             fe_trino_port: ports.6,
         };
         let advertised_port = proxy_limit.map(|_| ports.4 + 1);
@@ -713,7 +699,7 @@ mod tests {
             http: ports.0,
             grpc: ports.1,
             control_grpc: None,
-            mysql: Some(ports.2),
+
             trino: Some(ports.6),
             frontend_grpc: ports.1,
             runtime_dir: root,
@@ -727,7 +713,7 @@ mod tests {
             http: ports.3,
             grpc: ports.4,
             control_grpc: Some(ports.5),
-            mysql: None,
+
             trino: None,
             frontend_grpc: ports.1,
             runtime_dir: root,
@@ -978,7 +964,7 @@ mod tests {
             }],
             fe_http_port: 1101,
             fe_grpc_port: 1102,
-            fe_mysql_port: 1103,
+
             fe_trino_port: 1106,
         };
         let frontend = config(TestRoleConfig {
@@ -986,7 +972,7 @@ mod tests {
             http: 1101,
             grpc: 1102,
             control_grpc: None,
-            mysql: Some(1103),
+
             trino: Some(1106),
             frontend_grpc: 1102,
             runtime_dir: root,
@@ -1000,7 +986,7 @@ mod tests {
             http: 1104,
             grpc: 1105,
             control_grpc: Some(1205),
-            mysql: None,
+
             trino: None,
             frontend_grpc: 1102,
             runtime_dir: root,
@@ -1098,7 +1084,7 @@ mod tests {
             }],
             fe_http_port: 1101,
             fe_grpc_port: 1102,
-            fe_mysql_port: 1103,
+
             fe_trino_port: 1106,
         };
         let frontend = format!(
@@ -1108,7 +1094,7 @@ mod tests {
                 http: 1101,
                 grpc: 1102,
                 control_grpc: None,
-                mysql: Some(1103),
+
                 trino: Some(1106),
                 frontend_grpc: 1102,
                 runtime_dir: &runtime_dir,
@@ -1127,7 +1113,7 @@ mod tests {
             http: 1104,
             grpc: 1105,
             control_grpc: Some(1205),
-            mysql: None,
+
             trino: None,
             frontend_grpc: 1102,
             runtime_dir: &runtime_dir,

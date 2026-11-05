@@ -42,7 +42,7 @@ import oss_ops
 
 HERE = Path(__file__).resolve().parent
 FILES = runtime.ENTRY_FILES
-LOCAL_RANGES = {"trino": 8640, "mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
+LOCAL_RANGES = {"trino": 8640, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
 MANAGED = """NOVA_ENV_CONFIG_FILE NOVA_ENV_ID NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT
 NOVA_ENV_RUNTIME_DIR NOVA_ENV_CURRENT_DIR NOVA_ENV_REST_ENV_FILE NOVA_ENV_MANIFEST NOVA_ENV_README
 NOVA_ENV_COMPOSE_FILE NOVA_ENV_COMPOSE_ENV NOVA_ENV_MINIO_PORT NOVA_ENV_MINIO_CONSOLE_PORT
@@ -387,7 +387,6 @@ path = {json_string(stable / "frontend-state.sqlite")}
 cluster_id = {json_string(env_id)}
 
 [standalone_server]
-mysql_port = {ports["mysql"]}
 trino_port = {ports["trino"]}
 user = "root"
 mv_refresh_scheduler_enabled = true
@@ -596,7 +595,7 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     offset = int(hashlib.sha1(str(workspace).encode()).hexdigest()[:8], 16)
     starts = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_START', base)) for name, base in LOCAL_RANGES.items()}
     ranges = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_RANGE', '199')) for name in LOCAL_RANGES}
-    ports = dict(old_config.get('local_ports') or {})
+    ports = {name: value for name, value in (old_config.get('local_ports') or {}).items() if name in LOCAL_RANGES}
     missing = {name: base for name, base in starts.items() if name not in ports}
     if missing:
         ports.update(choose_ports(missing, offset, ranges, reserved=set(ports.values())))

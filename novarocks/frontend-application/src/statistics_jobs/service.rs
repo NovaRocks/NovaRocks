@@ -836,9 +836,7 @@ impl novarocks_query_application::session_control::GovernedStatementAction
         {
             application::StatisticsApplicationResult::JobSubmitted(_) => {
                 Poll::Ready(Ok(StatementActionValue::Ok(
-                    novarocks_query_application::session_control::StatementCommandCompletion::new(
-                        0,
-                    ),
+                    novarocks_query_application::session_control::StatementCommandCompletion::no_count(),
                 )))
             }
             _ => Poll::Ready(Err(error(
@@ -1273,15 +1271,14 @@ mod admission_and_conclusion_tests {
 
     async fn assert_one_permit_submission(detached: bool, reject_install: bool) {
         use novarocks_query_application::{
-            client_connection::ClientConnectionToken,
             query_control::QueryApplicationControl,
             session_control::{QueryControlService, SessionIdentity},
         };
         let (control, mut driver, m) = handoff_control();
         let query = QueryControlService::new(Arc::new(QueryApplicationControl::default()));
         let session = query
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(73, 1).unwrap(),
+            .register_session(SessionIdentity::client_statement(
+                query.mint_client_query_id(),
                 "root",
             ))
             .unwrap();

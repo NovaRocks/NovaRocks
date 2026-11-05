@@ -822,6 +822,28 @@ mod boundary_tests {
         );
     }
     #[test]
+    fn representation_fact_preserves_nonretryable_execution_identity() {
+        // This typed-input test covers application policy; the real List
+        // guard condition is tested by Functions without a cross-package API.
+        let fact = FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(320).unwrap()),
+        );
+        let input = ExecutionFailureInput::new(
+            fact,
+            SafeDetail::truncating("List output exceeds its format extent"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact(), fact);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            input.descriptor().descriptor.code.as_str(),
+            "query.execution.representation"
+        );
+        assert_eq!(input.user_error().retry(), RetryClass::Never);
+    }
+
+    #[test]
     fn numeric_sql_code_uses_the_kernel_owned_reason_and_class() {
         let reason = novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE;
         let numeric = ExecutionFailureInput::new(

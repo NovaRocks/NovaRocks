@@ -23,7 +23,7 @@ use crate::{
 };
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
-use novarocks_query_application::{session_effects::SessionEffects, statement_kind::StatementKind};
+use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_workload_control::ResultWindowAlias;
 use std::{
     sync::{Arc, Mutex},
@@ -43,13 +43,16 @@ pub(crate) struct Production {
     pub(crate) columns: Option<Bytes>,
     pub(crate) outcome: Option<Outcome>,
     pub(crate) retained: bool,
+    pub(crate) admission: Option<novarocks_query_application::session::StatementAdmission>,
+    // Selected domain fact becomes visible only on its original data page.
+    pub(crate) selected_count: Option<u64>,
+    pub(crate) update_count: Option<u64>,
 }
 pub(crate) struct Outcome {
     pub(crate) settlement: Option<Settlement>,
     pub(crate) error: Option<TrinoQueryError>,
     pub(crate) disposition: Disposition,
     pub(crate) effects: SessionEffects,
-    pub(crate) kind: StatementKind,
 }
 pub(crate) enum Phase {
     Registered,
@@ -72,6 +75,13 @@ pub(crate) struct QueryEntry {
     pub(crate) request: Mutex<Option<ParsedStatementRequest>>,
     pub(crate) state: tokio::sync::Mutex<EntryState>,
     pub(crate) production: Mutex<Production>,
+    // Bounded diagnostic knowledge from this original output; not an owner,
+    // publication proof, result capacity, or second lifecycle authority.
+    pub(crate) external_effect:
+        Mutex<Option<novarocks_query_application::api::StatementExternalEffectDisposition>>,
+    #[cfg(test)]
+    pub(crate) delivery_panic:
+        Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
     pub(crate) progress: Arc<Notify>,
     pub(crate) touched: Mutex<Instant>,
     pub(crate) created: Instant,
@@ -83,6 +93,27 @@ pub(crate) struct QueryEntry {
     pub(crate) timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl QueryEntry {
+    pub(crate) fn retain_external_effect(
+        &self,
+        effect: Option<novarocks_query_application::api::StatementExternalEffectDisposition>,
+    ) {
+        let mut retained = self
+            .external_effect
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *retained = novarocks_query_application::api::StatementExternalEffectDisposition::combine(
+            *retained, effect,
+        );
+    }
+    pub(crate) fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        *self
+            .external_effect
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     pub(crate) fn touch(&self) {
         *self.touched.lock().expect("query request clock") = Instant::now();
         self.requests.notify_one();

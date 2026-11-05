@@ -29,7 +29,6 @@ doctest = false
 
 [features]
 # Test fixture observation only; excluded from ordinary/release acceptance.
-mem-1-m07-hms-listing-observe = []
 
 [dependencies]
 novarocks-failpoint = { workspace = true, features = ["typed"] }

@@ -2003,7 +2003,9 @@ mod map_utf8_offset_properties {
 #[cfg(test)]
 mod wide_list_output_properties {
     use super::*;
-    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    use novarocks_failure_contract::{
+        FailureClass, FailureEvidence, FailureProjection, RepresentationBoundary, domain,
+    };
     #[test]
     fn actual_wide_spans_refuse_without_narrowing_or_fabricated_prefix() {
         assert_eq!(checked_list_output_offset_u128(2, 3).unwrap(), 5);
@@ -2028,8 +2030,15 @@ mod wide_list_output_properties {
             ),
         ] {
             let failure = checked_list_output_offset_u128(current, additional).unwrap_err();
-            assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
-            let facts = failure.failure_fact().representation().unwrap();
+            let fact = failure.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Representation);
+            assert_eq!(fact.evidence(), FailureEvidence::Originating);
+            assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+            assert_eq!(fact.reason().code(), 320);
+            assert_eq!(fact.resource(), None);
+            assert_eq!(fact.row_position(), None);
+            let facts = fact.representation().unwrap();
+            assert_eq!(facts.layout.domain, domain::KERNEL);
             assert_eq!(facts.layout.code.get(), 63);
             assert_eq!(facts.required, required);
             assert_eq!(facts.boundary, boundary);

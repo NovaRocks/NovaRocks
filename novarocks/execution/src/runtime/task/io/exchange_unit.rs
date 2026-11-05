@@ -81,6 +81,9 @@ pub enum ExchangeCallOutcome {
 
 #[derive(Clone, Debug)]
 pub enum ExchangeDemandCallOutcome {
+    /// The destination lifecycle owner fenced this exact route. This is not
+    /// SenderStopped, Consumed or proof that local request captures exited.
+    RouteRetired(ExchangeStreamIdentity),
     Observed(
         Vec<(
             ExchangeStreamIdentity,

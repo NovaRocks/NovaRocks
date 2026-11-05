@@ -135,7 +135,6 @@ impl ExchangeSenderGroup {
 
     /// Observation only. Busy is unavailable; never wait for a sender or
     /// clone a sender/claim/payload merely to produce a diagnostic marker.
-    #[cfg(novarocks_dev_controls)]
     pub(crate) fn try_diagnostic_state(&self) -> Option<String> {
         let state = self.state.try_lock().ok()?;
         let Some(binding) = &state.binding else {
@@ -150,6 +149,7 @@ impl ExchangeSenderGroup {
                 entry.sender.try_diagnostic_snapshot()?,
             ));
         }
+        drop(state);
         Some(format!("{samples:?}"))
     }
 
@@ -389,6 +389,7 @@ impl ExchangeSenderGroup {
         self.entries().iter().all(|entry| {
             let snapshot = entry.sender.snapshot();
             snapshot.active_calls == 0
+                && snapshot.active_control_calls == 0
                 && snapshot.stop_obligation != ExchangeSenderStopState::Pending
                 && (!matches!(snapshot.status, ExchangeStreamSenderStatus::Failed(_))
                     || (entry.failure.get().is_some() && self.first_failure.get().is_some()))
@@ -575,10 +576,11 @@ impl ExchangeFrameTransmitter for MeasuredTransmitter {
         destination: crate::runtime::endpoint::RuntimeEndpoint,
         entries: Vec<super::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: super::exchange_unit::ExchangeDemandCallback,
     ) {
         self.inner
-            .register_unit_demands(destination, entries, stop, done);
+            .register_unit_demands(destination, entries, stop, activity, done);
     }
     fn watch_unit_facts(
         &self,
@@ -602,7 +604,6 @@ impl ExchangeFrameTransmitter for MeasuredTransmitter {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(novarocks_dev_controls)]
     #[test]
     fn busy_diagnostic_sampling_does_not_wait_or_report_an_empty_group() {
         let group = super::ExchangeSenderGroup::new();

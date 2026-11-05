@@ -153,33 +153,12 @@ pub enum FrontendApplicationErrorKind {
     Shutdown,
 }
 
-#[cfg(feature = "mem-1-m07-root-observation")]
+#[cfg(novarocks_dev_controls)]
 struct RootObservationIoSource(std::io::Error);
-#[cfg(feature = "mem-1-m07-root-observation")]
+#[cfg(novarocks_dev_controls)]
 impl fmt::Debug for RootObservationIoSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OriginalRootObservationIo { source_retained: true }")
-    }
-}
-
-#[cfg(feature = "mem-1-m07-closing-pressure")]
-enum ClosingPressureRoleSource {
-    Fixture(novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError),
-    OriginalIo(std::io::Error),
-}
-#[cfg(feature = "mem-1-m07-closing-pressure")]
-impl fmt::Debug for ClosingPressureRoleSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("OriginalClosingPressureSource { source_retained: true }")
-    }
-}
-#[cfg(feature = "mem-1-m07-closing-pressure")]
-impl ClosingPressureRoleSource {
-    fn original(&self) -> &(dyn std::error::Error + 'static) {
-        match self {
-            Self::Fixture(source) => source,
-            Self::OriginalIo(source) => source,
-        }
     }
 }
 
@@ -189,14 +168,9 @@ pub struct FrontendApplicationError {
     message: String,
     original: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
     original_cleanup: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    pressure_failures: [Option<Box<ClosingPressureRoleSource>>; 4],
-    #[cfg(feature = "mem-1-m07-root-observation")]
+
+    #[cfg(novarocks_dev_controls)]
     root_observation_io: Option<Box<RootObservationIoSource>>,
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    fixture_failures: [Option<
-        Box<novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError>,
-    >; 4],
 }
 
 impl FrontendApplicationError {
@@ -206,12 +180,9 @@ impl FrontendApplicationError {
             message: error.to_string(),
             original: None,
             original_cleanup: None,
-            #[cfg(feature = "mem-1-m07-closing-pressure")]
-            pressure_failures: std::array::from_fn(|_| None),
-            #[cfg(feature = "mem-1-m07-root-observation")]
+
+            #[cfg(novarocks_dev_controls)]
             root_observation_io: None,
-            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-            fixture_failures: std::array::from_fn(|_| None),
         }
     }
 
@@ -253,77 +224,25 @@ impl FrontendApplicationError {
     pub fn server(error: impl fmt::Display) -> Self {
         Self::new(FrontendApplicationErrorKind::Server, error)
     }
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    pub(crate) fn server_fixture(
-        error: novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixtureError,
-    ) -> Self {
-        let mut result = Self::server(&error);
-        result.fixture_failures[0] = Some(Box::new(error));
-        result
-    }
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    pub(crate) fn server_pressure(
-        error: novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError,
-    ) -> Self {
-        let mut result = Self::server("original Closing pressure fixture failed");
-        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::Fixture(error)));
-        result
-    }
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    pub(crate) fn server_pressure_registry(error: std::io::Error) -> Self {
-        let mut result = Self::server("original Closing pressure connection drain failed");
-        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
-        result
-    }
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    pub(crate) fn server_pressure_binding(error: std::io::Error) -> Self {
-        let mut result = Self::server("original Closing pressure listener binding failed");
-        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
-        result
-    }
-    #[cfg(feature = "mem-1-m07-root-observation")]
+
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn server_root_observation(error: std::io::Error) -> Self {
         let mut result = Self::server("root observation stdout IO failed");
         result.root_observation_io = Some(Box::new(RootObservationIoSource(error)));
         result
     }
-    #[cfg(any(
-        feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation",
-        feature = "mem-1-m07-closing-pressure"
-    ))]
+    #[cfg(novarocks_dev_controls)]
     pub fn with_role_cleanup(mut self, cleanup: Self) -> Self {
         self.preserve_original_cleanup(&cleanup);
         self.message
             .push_str(&format!("; cleanup failed: {cleanup}"));
-        #[cfg(feature = "mem-1-m07-root-observation")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(source) = cleanup.root_observation_io {
             // Only the one startup emission can supply this original IO source.
             assert!(self.root_observation_io.is_none());
             self.root_observation_io = Some(source);
         }
-        #[cfg(feature = "mem-1-m07-closing-pressure")]
-        for source in cleanup.pressure_failures.into_iter().flatten() {
-            // Startup is mutually exclusive with the four serving verdict stages:
-            // control, socket close, registry verification and original-owner finish.
-            let slot = self
-                .pressure_failures
-                .iter_mut()
-                .find(|slot| slot.is_none())
-                .expect("fixed Closing pressure verdict stages");
-            *slot = Some(source);
-        }
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        for source in cleanup.fixture_failures.into_iter().flatten() {
-            // The fixture has exactly four possible verdict stages: control,
-            // socket cleanup, registry verification and original-owner finish.
-            let slot = self
-                .fixture_failures
-                .iter_mut()
-                .find(|slot| slot.is_none())
-                .expect("fixed MySQL fixture verdict stages");
-            *slot = Some(source);
-        }
+
         self
     }
 
@@ -350,18 +269,11 @@ impl std::error::Error for FrontendApplicationError {
         if let Some(cause) = self.original.as_ref().or(self.original_cleanup.as_ref()) {
             return Some(cause);
         }
-        #[cfg(feature = "mem-1-m07-root-observation")]
+        #[cfg(novarocks_dev_controls)]
         if let Some(error) = &self.root_observation_io {
             return Some(&error.0);
         }
-        #[cfg(feature = "mem-1-m07-closing-pressure")]
-        if let Some(error) = self.pressure_failures.iter().flatten().next() {
-            return Some(error.original());
-        }
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        if let Some(error) = self.fixture_failures.iter().flatten().next() {
-            return Some(error.as_ref());
-        }
+
         None
     }
 }
@@ -1218,7 +1130,6 @@ impl FrontendExecutionConfig {
     #[cfg(test)]
     pub(crate) fn try_with_empty_provider_read_profile_for_test(
         mut self,
-        ingress: crate::native_workload::FrontendStatementIngress,
     ) -> Result<Self, novarocks_workload_control::WorkError> {
         use crate::native_workload::{
             FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig,
@@ -1236,7 +1147,6 @@ impl FrontendExecutionConfig {
             &self.workload,
             self.result_profile,
             self.transport_budget,
-            ingress,
         )?;
         Ok(self)
     }
@@ -1377,15 +1287,6 @@ impl FrontendExecutionConfig {
 }
 
 impl FrontendApplicationHost {
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn hms_listing_test_observation(
-        &self,
-    ) -> Option<crate::server::HmsListingObservationSetup> {
-        self.test_session
-            .as_ref()
-            .and_then(|session| session.hms_listing_observation())
-    }
-
     /// Installs the original aggregate in the caller before any asynchronous
     /// bootstrap. Failure leaves that same aggregate in receiving for teardown.
     pub async fn open(
@@ -1677,21 +1578,6 @@ impl FrontendApplicationHost {
             }
         }
 
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        if let Some(owner) = host
-            .test_session
-            .as_ref()
-            .and_then(|session| session.hms_admission_owner.as_ref())
-        {
-            if let Err(error) = owner.install(&host.catalog_runtime_projection) {
-                return Err(host
-                    .cleanup_open_error(FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::CoordinatorOpen,
-                        error,
-                    ))
-                    .await);
-            }
-        }
         #[cfg(novarocks_dev_controls)]
         if let Some(session) = &mut host.test_session
             && let Err(error) = session.start_cleanup(
@@ -3307,44 +3193,5 @@ mod tests {
             novarocks_catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
-    }
-}
-
-#[cfg(all(test, feature = "mem-1-m07-closing-pressure"))]
-mod closing_pressure_role_error_tests {
-    use super::*;
-
-    #[test]
-    fn four_original_verdict_boxes_preserve_primary_and_each_cleanup_source() {
-        let sources: [std::sync::Arc<()>; 4] = std::array::from_fn(|_| std::sync::Arc::new(()));
-        #[derive(Debug)]
-        struct Actual(std::sync::Arc<()>);
-        impl fmt::Display for Actual {
-            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
-                panic!("unknown original source cannot be formatted");
-            }
-        }
-        impl std::error::Error for Actual {}
-        let mut primary = FrontendApplicationError::server("original primary");
-        for source in &sources {
-            primary =
-                primary.with_role_cleanup(FrontendApplicationError::server_pressure_registry(
-                    std::io::Error::other(Actual(source.clone())),
-                ));
-        }
-        assert!(primary.message.starts_with("original primary"));
-        assert_eq!(primary.pressure_failures.iter().flatten().count(), 4);
-        for (slot, expected) in primary.pressure_failures.iter().flatten().zip(&sources) {
-            let actual = slot
-                .original()
-                .downcast_ref::<std::io::Error>()
-                .unwrap()
-                .get_ref()
-                .unwrap()
-                .downcast_ref::<Actual>()
-                .unwrap();
-            assert!(std::sync::Arc::ptr_eq(&actual.0, expected));
-        }
-        let _finite = format!("{primary:?} {primary}");
     }
 }

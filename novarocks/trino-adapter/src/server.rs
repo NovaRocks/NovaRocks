@@ -76,7 +76,10 @@ impl TrinoListener {
         let router = Router::new()
             .route("/v1/info", get(info))
             .with_state(state)
-            .merge(crate::routes::routes(Arc::clone(&registry)))
+            .merge(crate::routes::routes(
+                Arc::clone(&registry),
+                settings.query_max_length,
+            ))
             .layer(middleware::from_fn(require_local_host));
         let (shutdown, mut receiver) = watch::channel(false);
         let task_registry = Arc::clone(&registry);
@@ -161,15 +164,6 @@ mod tests {
         ) -> Result<
             Arc<dyn novarocks_query_application::session::QuerySession>,
             novarocks_query_application::session_value::StatementSessionError,
-        > {
-            unreachable!("info-only test")
-        }
-        fn open_session(
-            &self,
-            _: novarocks_query_application::session::QuerySessionOpenRequest,
-        ) -> Result<
-            Arc<dyn novarocks_query_application::session::QuerySession>,
-            novarocks_query_application::session_error::QueryServiceError,
         > {
             unreachable!("info-only test")
         }

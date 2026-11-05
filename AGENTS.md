@@ -38,7 +38,7 @@ analytical query engine.
 Its production runtime is the native NovaRocks FE/BE role model:
 
 - **Native FE/BE roles**
-  - `role=fe` owns the MySQL SQL entrypoint, statement admission, planning, and
+  - `role=fe` owns the Trino HTTP SQL entrypoint, statement admission, planning, and
     distributed coordination.
   - `role=be` owns local fragment execution and the native gRPC boundary.
   - `all-in-one` is a server-owned local supervisor that reads one normal FE
@@ -64,7 +64,7 @@ Columnar processing is centered on Arrow `RecordBatch` / `Chunk`.
 
 ```text
 SQL client
-  `- MySQL protocol -----------> NovaRocks role=fe
+  `- Trino HTTP protocol ------> NovaRocks role=fe
                                       |
                                       v
                             Frontend SQL / logical execution
@@ -215,9 +215,10 @@ SQL client
   共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
   成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
   命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
-  保留原业务选定的 affected rows，再由 MySQL `terminal.rs` 标准编码。普通/MOR 取同 Session
-  完整冻结的 Root 计数，COW 取原 selection，CTAS 等最终 CREATE；控制与签名 NoOp 显式为零。
-  缺计数或失败不能转成 OK(0)，完成数据不替代原 visibility、取消、真实 flush 与退出。
+  保留原领域的 Counted/NoCount；Query Application 从原 AST 冻结静态完成形状，Trino 只投影
+  `columns`、`data`、`updateType` 与 `updateCount`。普通/MOR 取同 Session 完整冻结的 Root
+  计数，COW 取原 selection，CTAS 等最终 CREATE；无真实计数时为 NULL，不能填零。
+  计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0213。
 
 - `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
   Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
@@ -254,11 +255,11 @@ SQL client
 - `novarocks/frontend-application/src/catalog_application/statement.rs`
   Catalog, database and table DDL against the projected catalog.
 
-- `novarocks/mysql-adapter/src/**`
-  MySQL protocol: `listener.rs` (connection serving and drain),
-  `result_encoding.rs` (metadata projection), `relay_result_writer.rs` and
-  `local_result_writer.rs` (governed bounded result delivery),
-  `error_mapping/**`.
+- `novarocks/trino-adapter/src/**`
+  Trino HTTP：`server.rs` 组合监听与 drain，`driver.rs` 投影原语句结果，
+  `registry.rs` 保管不可变页、重放与结算，`body.rs` 保管实际响应写出，
+  `error_mapping.rs` 编码 typed 错误。根结果只使用显式 TrinoJson 呈现事实；Internal
+  Scalar/CountOnly/Arrow IPC 保留原领域。见 ADR-0203、ADR-0213。
 
 ### 4.3 Native Compiled Package and BE Preparation
 
@@ -499,8 +500,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.1 Native SQL and Connector Path
 
-1. A MySQL client connects to a `role=fe` process through the native SQL
-   entrypoint.
+1. A Trino client submits SQL to the `role=fe` HTTP statement entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
    supervised statement orchestration and common logical execution assembly.
 3. 持久表属于外部 Provider。Iceberg 拥有 catalog 与 mutation 真相；Paimon 保留注册
@@ -599,12 +599,10 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    local task is a terminal record, and the Frontend Application drives it for every
    intent. The task protocol mints no participant proof or attestation -- a
    task's terminal *is* its own status.
-6. Client cancellation is `KILL QUERY` through the Query Application query-control
-   owner, delivered as `AbortParticipation`. The Frontend Application withholds the
-   interrupt until this statement's local supervised orchestration exits, so the
-   next statement cannot race its generation. This does not require remote
-   Unknown publication or residual cleanup to disappear; its stable owner retains
-   the actual responsibility and capacity. See ADR-0198.
+6. 客户端沿准确 continuation URI 的 DELETE 请求取消，由 Query Application 原语句 owner
+   续接 Native `AbortParticipation`。HTTP 连接不是查询身份；旧连接寻址的 KILL / SHOW
+   PROCESSLIST 在准入时 typed 拒绝。取消不代替原本地编排、远端 Unknown publication
+   或 residual 的实际退出；稳定 owner 继续保管原责任与容量。见 ADR-0198、ADR-0213。
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -621,7 +619,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Exchange routing key (`task_key_hi` + `task_key_lo` + `node_id`).
 
 - `QueryResult`: `novarocks/query-application/src/api/result.rs`
-  Query-application result type consumed by the MySQL adapter's result encoding.
+  Query-application result type consumed by the Trino adapter's result projection.
 
 - `QueryExecutionId`: `novarocks/types/src/identity.rs`
   Immutable native query-attempt identity, shared across the process boundary.
@@ -661,7 +659,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Server-resolved `shared_secret`. Every Native RPC requires its deployment
   JWT. An absent `[native_trust.transport]` deliberately means authenticated
   plaintext h2c; `automatic` and `pem` add optional TLS 1.3/h2 without
-  removing JWT. This does not protect MySQL or management HTTP. Read
+  removing JWT. This does not protect Trino client HTTP or management HTTP. Read
   `docs/guides/deployment/native-trust.md` and ADR-0110 before changing this
   boundary; NWT-4 protocol slimming remains separate follow-up work.
 
@@ -675,9 +673,11 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.
 
 - `[standalone_server]`
-  `mysql_port`、`trino_port`（默认 `8080`）、`trino_client_timeout_ms`（默认 `300000`）、
-  `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，与 MySQL
-  复用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
+  `trino_port`（默认 `8080`，`0` 由 OS 分配）、`trino_client_timeout_ms`（默认 `300000`）、
+  `trino_query_max_length`（默认 `1000000`，范围 `0..=1000000000` UTF-16 code units）、
+  `user`、MV scheduler 与 Iceberg maintenance 设置。Trino 固定监听 `127.0.0.1`，
+  使用配置用户；Host 仅接受 `localhost`、`127.0.0.1`、`[::1]`（可带数字端口）。
+  `mysql_port` 与旧 MySQL 载体配置明确拒绝，不转换为 Trino 配置。
   Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
@@ -779,7 +779,7 @@ SRV_PID=$!
 # Wait up to 60 s for the server to bind. If bind fails the line never
 # appears, the process exits with code 1, and `wait` surfaces the failure.
 for i in $(seq 1 60); do
-  if grep -q '^NOVAROCKS_READY ' "$LOG"; then break; fi
+  if rg -q '^NOVAROCKS_READY role=fe trino_port=' "$LOG"; then break; fi
   if ! kill -0 "$SRV_PID" 2>/dev/null; then
     echo "standalone died during startup; tail of $LOG:" >&2
     tail -20 "$LOG" >&2
@@ -787,12 +787,11 @@ for i in $(seq 1 60); do
   fi
   sleep 1
 done
-grep -q '^NOVAROCKS_READY ' "$LOG" || { echo "timed out waiting for NOVAROCKS_READY" >&2; kill -9 "$SRV_PID"; exit 1; }
+rg -q '^NOVAROCKS_READY role=fe trino_port=' "$LOG" || { echo "timed out waiting for FE readiness" >&2; kill -9 "$SRV_PID"; exit 1; }
 ```
 
-FE 绑定 Trino 与 MySQL 客户端监听后，在 stdout 输出：
-`NOVAROCKS_READY mysql_port=23223 pid=<pid> trino_port=<actual-port>`。
-字段 `trino_port` 追加在末尾，原 `NOVAROCKS_READY mysql_port=` 前缀保留。
+FE 绑定 Trino 客户端监听后，在 stdout 输出：
+`NOVAROCKS_READY role=fe trino_port=<actual-port> pid=<pid>`。
 后台启动的编排必须等到这一行再连接，端口取本次实际 marker；不能只探测一个可能已被其他进程占用的端口。
 `NOVA_ENV_TRINO_PORT` 是本地 fixture 导出的 Trino 端口。
 
@@ -1087,8 +1086,8 @@ suspected case against a clean server before attributing it to the change.
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、
   `compiled_writer_binding.rs`、`compiled_runtime_filter.rs`，pipeline 见 Execution
   `exec/pipeline/builder/compiled.rs`。先读 ADR-0185，禁止恢复 v1 decoder/构造桥。
-- **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
-  `result_encoding.rs`, `relay_result_writer.rs` and `local_result_writer.rs`.
+- **Trino protocol behavior**: inspect `novarocks/trino-adapter/src/{server,driver,registry,body,error_mapping}.rs`;
+  read ADR-0203 and ADR-0213 before changing page acknowledgement or completion projection.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
   admission and routing, then the specific flow under
   `novarocks/frontend-application/src/query_execution/dml/**` (`insert.rs`,
@@ -1102,7 +1101,7 @@ suspected case against a clean server before attributing it to the change.
   chain is retired.
   Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
-  and MySQL success/error projection; consult ADR-0198 before changing these boundaries.
+  and Trino success/error projection; consult ADR-0198 and ADR-0213 before changing these boundaries.
   资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
   局部组件通过不证明原生调用面或最终全工作区验证完成。
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、

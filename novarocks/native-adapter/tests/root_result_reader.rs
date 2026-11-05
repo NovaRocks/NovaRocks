@@ -150,7 +150,11 @@ impl ParticipationHostInstance for FixtureParticipationHost {
     fn participation(&self) -> ParticipationRef {
         self.0
     }
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        _control: &dyn novarocks_worker::ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
         assert_eq!(request.participation(), self.0);
         Ok(())
     }
@@ -600,13 +604,19 @@ impl Fixture {
         } else {
             FrozenRootOutput::ClientRows(
                 ClientRenderSchema::try_new(
-                    novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: true,
+                            variant_binary: true,
+                        },
+                    ),
                     vec![RenderColumn {
                         source_ordinal: 0,
                         source_slot: Some(1),
                         name: "v".into(),
                         field: RenderField {
-                            presentation: RenderPresentation::ScalarText,
+                            presentation: RenderPresentation::TrinoValue,
                             nullable: false,
                             native_type: NativeRenderType::SignedInteger(64),
                         },
@@ -781,8 +791,8 @@ impl Fixture {
             self.root.publish_end().unwrap();
         } else {
             let mut builder = self.root.try_segment().unwrap().unwrap();
-            builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
-            self.root.publish_segment(builder, 6, true).unwrap();
+            builder.output()[..7].copy_from_slice(b"\x03\0\0\0[1]");
+            self.root.publish_segment(builder, 7, true).unwrap();
         }
         assert!(producer.finish_encoder().is_none());
         self.host
@@ -1255,7 +1265,7 @@ mod root_observation_tests {
         let RootReadOutcome::Data(data) = &reply.reply().outcome else {
             panic!("expected original Data")
         };
-        assert_eq!(data.body().as_ref(), b"\x02\0\0\0\x011");
+        assert_eq!(data.body().as_ref(), b"\x03\0\0\0[1]");
         assert_eq!(data.end_after_data().unwrap().output_rows, 1);
         session.assert_observed_once();
         drop(reply);
@@ -1432,7 +1442,7 @@ async fn participation_read_survives_task_retirement_and_horizon() {
         let RootReadOutcome::Data(data) = &reply.reply().outcome else {
             panic!("expected Data")
         };
-        assert_eq!(data.body().as_ref(), b"\x02\0\0\0\x011");
+        assert_eq!(data.body().as_ref(), b"\x03\0\0\0[1]");
         assert_eq!(data.end_after_data().unwrap().output_rows, 1);
         assert_eq!(reply.reply().accepted_consumed, 0);
     }
@@ -2227,7 +2237,7 @@ async fn unary_last_data_slice_outlives_body_and_participation_seal() {
     let RootReadOutcome::Data(payload) = decoded.outcome else {
         panic!("Data")
     };
-    assert_eq!(payload.body().as_ref(), b"\x02\0\0\0\x011");
+    assert_eq!(payload.body().as_ref(), b"\x03\0\0\0[1]");
     assert_eq!(payload.end_after_data().unwrap().output_rows, 1);
     drop(payload);
     let tail = data.slice(5..);
@@ -2558,7 +2568,7 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     let RootReadOutcome::Data(payload) = decoded.outcome else {
         panic!("Data")
     };
-    assert_eq!(payload.body().as_ref(), b"\x02\0\0\0\x011");
+    assert_eq!(payload.body().as_ref(), b"\x03\0\0\0[1]");
     drop(payload);
     let clone = data.clone();
     let short = data.slice(5..6);
@@ -2907,7 +2917,7 @@ mod end_observation {
         fixture.finish();
         let data = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
         assert!(
-            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 1 && data.body().len() == 6 && data.end_after_data().is_some_and(|end| end.sequence.get() == 2 && end.output_rows == 1))
+            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 1 && data.body().len() == 7 && data.end_after_data().is_some_and(|end| end.sequence.get() == 2 && end.output_rows == 1))
         );
         drop(data);
         assert_eq!(session.hits(), 1);
@@ -2976,8 +2986,8 @@ mod end_observation {
             wait_until(|| fixture.control.metrics_snapshot().requests == 0);
             fixture.root.note_rows(1).unwrap();
             let mut builder = fixture.root.try_segment().unwrap().unwrap();
-            builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
-            fixture.root.publish_segment(builder, 6, false).unwrap();
+            builder.output()[..7].copy_from_slice(b"\x03\0\0\0[1]");
+            fixture.root.publish_segment(builder, 7, false).unwrap();
             let reply = owned(
                 fixture
                     .reader
@@ -2985,7 +2995,7 @@ mod end_observation {
                     .await,
             );
             assert!(
-                matches!(&reply.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == sequence && data.body().len() == 6 && data.end_after_data().is_none())
+                matches!(&reply.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == sequence && data.body().len() == 7 && data.end_after_data().is_none())
             );
             drop(reply);
             assert_eq!(session.hits(), 1);
@@ -3006,12 +3016,12 @@ mod end_observation {
         fixture.root.note_rows(1).unwrap();
         fixture.root.request_finish().unwrap();
         let mut builder = fixture.root.try_segment().unwrap().unwrap();
-        builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
-        fixture.root.publish_segment(builder, 6, true).unwrap();
+        builder.output()[..7].copy_from_slice(b"\x03\0\0\0[1]");
+        fixture.root.publish_segment(builder, 7, true).unwrap();
         assert!(producer.finish_encoder().is_none());
         let data = owned(fixture.reader.read(&fixture.request(Some(3), 2, 1)).await);
         assert!(
-            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 3 && data.body().len() == 6 && data.end_after_data().is_some_and(|end| end.sequence.get() == 4 && end.output_rows == 3))
+            matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 3 && data.body().len() == 7 && data.end_after_data().is_some_and(|end| end.sequence.get() == 4 && end.output_rows == 3))
         );
         // A non-first Data with an actual fused End consumes the second event.
         // No standalone End read is performed before the original ACK.

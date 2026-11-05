@@ -903,7 +903,7 @@ mod selection_migration_tests {
                 else {
                     panic!("publication success must preserve command metadata")
                 };
-                assert_eq!(rows.affected_rows(), expected_rows);
+                assert_eq!(rows.count(), Some(expected_rows));
             }
             _ => assert!(
                 completion.is_err(),

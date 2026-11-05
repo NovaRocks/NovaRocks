@@ -411,7 +411,15 @@ mod tests {
             cancellation.view(),
             Default::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            Some(
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: true,
+                    },
+                ),
+            ),
         ))
     }
 

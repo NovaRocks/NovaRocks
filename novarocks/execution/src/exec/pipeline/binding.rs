@@ -41,7 +41,7 @@ impl std::fmt::Debug for ExchangeBinding {
 }
 
 /// Per-node exchange bindings keyed by plan node_id. Exec-level; built in
-/// `runtime::fragment` from the validated `FragmentInstanceSpec`.
+/// `runtime::task` from the validated `TaskInstanceSpec`.
 #[derive(Clone, Debug, Default)]
 pub struct ExchangeBindings(BTreeMap<i32, ExchangeBinding>);
 

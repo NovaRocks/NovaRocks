@@ -62,6 +62,8 @@ pub struct WorkerNodeTaskIngress {
     static_package_admission: Arc<StaticPackageAdmission>,
     #[cfg(novarocks_dev_controls)]
     test_controls: std::sync::OnceLock<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(novarocks_dev_controls)]
+    test_update_host: std::sync::OnceLock<Arc<dyn novarocks_worker::TaskExecutionHost>>,
 }
 impl WorkerNodeTaskIngress {
     pub fn new(
@@ -75,13 +77,19 @@ impl WorkerNodeTaskIngress {
             static_package_admission,
             #[cfg(novarocks_dev_controls)]
             test_controls: std::sync::OnceLock::new(),
+            #[cfg(novarocks_dev_controls)]
+            test_update_host: std::sync::OnceLock::new(),
         })
     }
     #[cfg(novarocks_dev_controls)]
     pub fn install_test_controls(
         &self,
         controls: Arc<crate::test_controls::NativeTestControls>,
+        execution: Arc<dyn novarocks_worker::TaskExecutionHost>,
     ) -> Result<(), String> {
+        self.test_update_host
+            .set(execution)
+            .map_err(|_| "Native Node ingress test update host was already installed")?;
         self.test_controls
             .set(controls)
             .map_err(|_| "Native Node ingress test controls were already installed".into())
@@ -140,6 +148,8 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
             return Ok(receipt);
         }
         let identity = operation.envelope().operation_id();
+        #[cfg(novarocks_dev_controls)]
+        let original_deadline = deadline;
         let deadline = self.deadline(deadline);
         match operation {
             DecodedOperation::AcquireParticipationAdmissionTicket(request) => {
@@ -157,16 +167,22 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
             }
             DecodedOperation::CreateTask(decoded) => {
                 #[cfg(novarocks_dev_controls)]
-                if let Some(controls) = self.test_controls.get()
-                    && crate::task_protocol_fault::restart_after_establish_participation_holds_task_creation(
-                        controls, decoded.request().participation(),
+                if let Some(controls) = self.test_controls.get() {
+                    // This same RPC retains its admitted ingress and decoded
+                    // input until the exact creation hold actually releases.
+                    crate::task_protocol_fault::wait_for_restart_after_establish_participation_async(
+                        controls,
+                        decoded.request().participation(),
+                        original_deadline,
                     )
-                {
-                    // The old hook blocks on runner-owned file/UDS waits.
-                    // Reject the unported async rendezvous before Task R
-                    // admission; never block the Native executor or pretend
-                    // the selected process-loss boundary was exercised.
-                    return Err(Status::unimplemented("the asynchronous restart-after-establish creation hold is not connected"));
+                    .await?;
+                    crate::task_protocol_fault::create_task_before_worker_hold_async(
+                        controls,
+                        decoded.request().identity(),
+                        decoded.descriptor().topology().outbound().len(),
+                        original_deadline,
+                    )
+                    .await?;
                 }
                 let (request, input, retained) = decoded.into_parts_with_retained_bytes();
                 #[cfg(novarocks_dev_controls)]
@@ -248,18 +264,51 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                 let result = match request {
                     UpdateParticipation::Establish(request) => {
                         #[cfg(novarocks_dev_controls)]
+                        let participation = request.participation();
+                        #[cfg(novarocks_dev_controls)]
                         if let Some(controls) = self.test_controls.get() {
                             crate::task_protocol_fault::arm_restart_after_establish_participation(
                                 controls,
                                 request.participation(),
                             )?;
-                            if crate::task_protocol_fault::restart_after_establish_participation_holds_task_creation(controls, request.participation()) {
-                                return Err(Status::unimplemented("the asynchronous restart-after-establish rendezvous is not connected"));
-                            }
                         }
                         return match self.control.establish(request, deadline).await {
-                            Ok(original) => encode_control(identity, original),
-                            Err(error) => request_error(identity, error),
+                            Ok(original) => {
+                                #[cfg(novarocks_dev_controls)]
+                                if let Some(controls) = self.test_controls.get() {
+                                    check_operation(identity, original.operation())?;
+                                    if let WorkerControlReplyBody::Participation(ack) =
+                                        original.body()
+                                    {
+                                        if ack.receipt.participation() != participation {
+                                            controls.disarm_restart(participation);
+                                            return Err(Status::internal(
+                                                "original Establish receipt has a foreign Participation",
+                                            ));
+                                        }
+                                        crate::task_protocol_fault::establish_participation_ack_dropped(
+                                            controls,
+                                            participation,
+                                            ack.outcome,
+                                        )?;
+                                        // Keep this exact Worker's delivery through
+                                        // the asynchronous runner rendezvous.
+                                        crate::task_protocol_fault::restart_after_establish_participation_async(
+                                            controls, participation, ack.outcome, original_deadline,
+                                        ).await?;
+                                    } else {
+                                        controls.disarm_restart(participation);
+                                    }
+                                }
+                                encode_control(identity, original)
+                            }
+                            Err(error) => {
+                                #[cfg(novarocks_dev_controls)]
+                                if let Some(controls) = self.test_controls.get() {
+                                    controls.disarm_restart(participation);
+                                }
+                                request_error(identity, error)
+                            }
                         };
                     }
                     UpdateParticipation::RenewLease(request) => {
@@ -347,6 +396,37 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                 let participation = self.control.participation_for_task(task).ok_or_else(|| {
                     Status::failed_precondition("the Node does not hold this Task's Participation")
                 })?;
+                #[cfg(novarocks_dev_controls)]
+                let terminal_nonempty = request.domains().iter().any(|domain| {
+                    matches!(domain,
+                        novarocks_execution_contract::TaskDomainUpdate::SplitAssignment(intent)
+                            if intent.no_more_splits() && intent.offer().range().is_some())
+                });
+                // Only an explicitly refined grant may pause actual input, and
+                // it must reserve that input before the original Worker apply.
+                #[cfg(novarocks_dev_controls)]
+                let replay_target = self
+                    .test_controls
+                    .get()
+                    .map(|controls| controls.reserve_task_update_replay_target(&request))
+                    .transpose()
+                    .map_err(Status::failed_precondition)?
+                    .flatten();
+                #[cfg(novarocks_dev_controls)]
+                let mut replay_reservation = match &replay_target {
+                    Some(target) => Some(
+                        self.test_update_host
+                            .get()
+                            .ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "Native Node ingress has no original test update host",
+                                )
+                            })?
+                            .reserve_test_update_consumption(&request, target.cancellation())
+                            .map_err(host_rejection_status)?,
+                    ),
+                    None => None,
+                };
                 match self
                     .control
                     .update_task(
@@ -357,7 +437,22 @@ impl TaskOperationBatchApplier for WorkerNodeTaskIngress {
                     )
                     .await
                 {
-                    Ok(original) => encode_task_domain(identity, task, original),
+                    Ok(original) => {
+                        #[cfg(novarocks_dev_controls)]
+                        if let Some(controls) = self.test_controls.get() {
+                            // Retain the actual paid R while deciding whether
+                            // this exact committed Worker answer is lost.
+                            check_operation(identity, original.operation())?;
+                            drop_task_update_ack(
+                                controls,
+                                task,
+                                terminal_nonempty,
+                                original.body(),
+                                &mut replay_reservation,
+                            )?;
+                        }
+                        encode_task_domain(identity, task, original)
+                    }
                     Err(error) => request_error(identity, error),
                 }
             }
@@ -964,5 +1059,135 @@ fn encode_task_domain(
         _ => Err(Status::internal(
             "the original Task domain reply has an unexpected body",
         )),
+    }
+}
+
+/// Fault selection follows the original Worker reply, never a reconstructed
+/// status snapshot. A plain ACK loss grants no input-consumption authority.
+#[cfg(novarocks_dev_controls)]
+fn drop_task_update_ack(
+    controls: &crate::test_controls::NativeTestControls,
+    task: novarocks_execution_contract::TaskIdentity,
+    terminal_nonempty: bool,
+    original: &WorkerParticipationReplyBody,
+    reservation: &mut Option<Box<dyn novarocks_worker::TestTaskUpdateConsumptionReservation>>,
+) -> Result<(), Status> {
+    let WorkerParticipationReplyBody::TaskDomain { outcome, .. } = original else {
+        return Ok(());
+    };
+    let result = crate::task_protocol_fault::task_update_terminal_ack_dropped(
+        controls,
+        task,
+        *outcome,
+        terminal_nonempty,
+        || {
+            // The emitter has just claimed the exact accepted fault. Check its
+            // real refinement instead of treating activation as unconditional.
+            let claim = controls.claimed_task_update_replay(task)?;
+            match (claim.requires_replay_barrier(), reservation.as_mut()) {
+                (false, None) => Ok(()),
+                (true, Some(reservation)) => reservation.activate(),
+                _ => Err("TaskUpdate ACK-drop claim does not match its input reservation".into()),
+            }
+        },
+    );
+    // Only this emitter's actual post-hit ACK loss transfers the pause to the
+    // original Task. All other exits keep RAII rollback, including hit failure.
+    if result
+        .as_ref()
+        .is_err_and(|status| status.code() == tonic::Code::DeadlineExceeded)
+        && let Some(reservation) = reservation.as_mut()
+    {
+        reservation.acknowledgement_dropped();
+    }
+    result
+}
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod task_update_ack_tests {
+    use super::*;
+    use crate::test_controls::tests::{bind_fixture, controlled, controlled_replay, task};
+    use novarocks_failpoint::QueryLifecycleFaultKind;
+
+    fn domain(outcome: OperationOutcome) -> WorkerParticipationReplyBody {
+        WorkerParticipationReplyBody::TaskDomain {
+            outcome,
+            receipts: Arc::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn only_the_original_accepted_terminal_domain_reply_consumes_the_fault() {
+        let fixture = controlled("task-update-terminal-ack-drop");
+        bind_fixture(&fixture, QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop);
+        let identity = task(&fixture, 1);
+        let mut reservation = None;
+        for (terminal_nonempty, reply) in [
+            (false, domain(OperationOutcome::Accepted)),
+            (true, domain(OperationOutcome::Idempotent)),
+            (true, domain(OperationOutcome::InvalidStateOrRequest)),
+            (
+                true,
+                WorkerParticipationReplyBody::Verdict(WorkerRequestResult::Outcome(
+                    OperationOutcome::Accepted,
+                )),
+            ),
+        ] {
+            drop_task_update_ack(
+                &fixture.controls,
+                identity,
+                terminal_nonempty,
+                &reply,
+                &mut reservation,
+            )
+            .unwrap();
+            assert!(
+                fixture
+                    .controls
+                    .claimed_task_update_replay(identity)
+                    .is_err()
+            );
+        }
+        let accepted = domain(OperationOutcome::Accepted);
+        let error = drop_task_update_ack(
+            &fixture.controls,
+            identity,
+            true,
+            &accepted,
+            &mut reservation,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(
+            !fixture
+                .controls
+                .claimed_task_update_replay(identity)
+                .unwrap()
+                .requires_replay_barrier()
+        );
+        drop_task_update_ack(
+            &fixture.controls,
+            identity,
+            true,
+            &accepted,
+            &mut reservation,
+        )
+        .unwrap();
+        assert!(reservation.is_none());
+    }
+
+    #[test]
+    fn a_refined_claim_cannot_succeed_without_its_original_input_reservation() {
+        let fixture = controlled_replay(10_000);
+        bind_fixture(&fixture, QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop);
+        let error = drop_task_update_ack(
+            &fixture.controls,
+            task(&fixture, 1),
+            true,
+            &domain(OperationOutcome::Accepted),
+            &mut None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 }

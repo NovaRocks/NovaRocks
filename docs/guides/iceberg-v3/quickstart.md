@@ -26,28 +26,32 @@ under the License.
 ## 前置
 
 - Rust toolchain（参考 `CLAUDE.md` 的"Build Mode"段）
-- 一个 MySQL CLI（用于连接 standalone）
+- Trino CLI（用于连接 FE 的 HTTP statement 入口）
 
-> 当前版本仅推荐 **Hadoop catalog**（写本地 / HDFS / S3 / OSS）。REST catalog 客户端基础已经就位但 engine 流程未切换，端到端 fixture 待补，详见 [Catalog 接入](catalog.md)。
+Catalog 的当前能力与 fixture 准备方式见 [Catalog 接入](catalog.md)；Hadoop catalog 仅用于单写者测试，生产写入使用 REST catalog。
 
 ---
 
 ## 1. 启动 standalone
 
+先按 [本地部署](../deployment/standalone.md) 准备普通 FE/BE 配置，并将两份配置路径分别导出为 `NOVAROCKS_FE_CONFIG` 和 `NOVAROCKS_BE_CONFIG`。
+
 ```bash
 # Debug build（编译快，查询慢，适合学习与功能验证）
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 
 # Release build（编译慢，查询快，适合性能测试）
-NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
-服务监听 `127.0.0.1:9030`（MySQL wire 协议）。
+FE 监听 `127.0.0.1` 的 Trino HTTP 端口（`trino_port` 默认 `8080`）。等待 `NOVAROCKS_READY role=fe trino_port=<actual-port> pid=<pid>`，连接本次实际端口。
 
 ## 2. 连接
 
 ```bash
-mysql -h 127.0.0.1 -P 9030 -u root
+trino --server http://127.0.0.1:8080 --user root
 ```
 
 ## 3. 创建一个 Iceberg v3 表

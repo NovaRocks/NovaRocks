@@ -17,15 +17,17 @@
 //! Explicit publication properties exercised through native SQL and a real Java catalog.
 //! The fixture observes exact service phases; the scenario owns every actor to actual exit.
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::publication::PublicationFixture;
 use novarocks_cluster_harness::publication_service::{CommitOutcome, Hold, HoldStage};
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, TestClusterOwner,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, QueryLifecycleStatementObservation,
+    StatementObservationOnly, TestClusterOwner,
+    test_sessions::{ClusterTestSessionPlan, RoleSlot},
 };
+use novarocks_test_trino_client::{CancelHandle, PendingStatement, TrinoError};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -57,6 +59,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(PublicationScenario {
             property,
             fixture: Mutex::new(None),
+            statement_observer: Mutex::new(None),
         }) as Box<dyn Scenario>
     })
     .collect()
@@ -64,6 +67,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct PublicationScenario {
     property: Property,
     fixture: Mutex<Option<PublicationFixture>>,
+    statement_observer: Mutex<Option<StatementObservationOnly>>,
 }
 impl Scenario for PublicationScenario {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -153,6 +157,45 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
             ..Default::default()
         })
     }
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        if !matches!(self.property, Property::ExpiryConcurrency) {
+            return Ok(None);
+        }
+        ensure!(size == 3, "publication observation requires native 1FE+3BE");
+        let mut observer = self
+            .statement_observer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("publication statement observer poisoned"))?;
+        ensure!(observer.is_none(), "publication observer already reserved");
+        let mut plan = ClusterTestSessionPlan::new(deadline)?;
+        let (owner, grant) = StatementObservationOnly::reserve(&plan)?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_launch(
+            &frontend,
+            vec![grant],
+            vec![
+                ("novarocks-server".into(), "test-controls".into()),
+                (
+                    "novarocks-frontend-application".into(),
+                    "test-controls".into(),
+                ),
+            ],
+        )?;
+        plan.set_launch_binary(&frontend, binary.to_path_buf())?;
+        for index in 0..size {
+            let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
+            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
+        }
+        *observer = Some(owner);
+        Ok(Some(plan))
+    }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         ensure!(
             context.handle().be_count() == 3,
@@ -173,32 +216,47 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
         } else {
             30_000
         };
-        let connection = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
+        let deadline = context.deadline();
+        let mut conn = new_session(context)?;
+        // Fixture preparation has a separate generous budget. Only the
+        // selected publication consumes the deliberately short policy.
+        execute_sql(
+            &mut conn,
+            catalog_sql(fixture, "publication_setup", 30_000),
+            deadline,
         )?;
-        connection.run(|conn| {
-            // Fixture preparation has a separate generous budget. Only the
-            // selected publication consumes the deliberately short policy.
-            conn.query_drop(catalog_sql(fixture, "publication_setup", 30_000))?;
-            conn.query_drop("CREATE DATABASE publication_setup.ns")?;
-            conn.query_drop("CREATE TABLE publication_setup.ns.orders (k INT) TBLPROPERTIES (\"format-version\"=\"2\", \"history.expire.min-snapshots-to-keep\"=\"1\")")?;
-            conn.query_drop(catalog_sql(fixture, CATALOG, budget))?;
-            match self.property {
-                Property::LateCommit => late_commit(context, fixture),
-                Property::StreamDeadline => stream_deadline(context, fixture),
-                Property::ExpiryConcurrency | Property::ManifestReprepare => {
-                    for value in 1..=4 { conn.query_drop(format!("INSERT INTO {TABLE} VALUES ({value})"))?; }
-                    maintenance_race(context, fixture, self.property)?;
-                    if matches!(self.property, Property::ExpiryConcurrency) {
-                        expiry_properties(context, fixture)?;
-                    }
-                    Ok(())
+        execute_sql(&mut conn, "CREATE DATABASE publication_setup.ns", deadline)?;
+        execute_sql(
+            &mut conn,
+            "CREATE TABLE publication_setup.ns.orders (k INT) TBLPROPERTIES (\"format-version\"=\"2\", \"history.expire.min-snapshots-to-keep\"=\"1\")",
+            deadline,
+        )?;
+        execute_sql(&mut conn, catalog_sql(fixture, CATALOG, budget), deadline)?;
+        match self.property {
+            Property::LateCommit => late_commit(context, fixture),
+            Property::StreamDeadline => stream_deadline(context, fixture),
+            Property::ExpiryConcurrency | Property::ManifestReprepare => {
+                for value in 1..=4 {
+                    execute_sql(
+                        &mut conn,
+                        format!("INSERT INTO {TABLE} VALUES ({value})"),
+                        deadline,
+                    )?;
                 }
-            }?;
-            require_catalog_activity(context)
-        })
+                maintenance_race(context, fixture, self.property)?;
+                if matches!(self.property, Property::ExpiryConcurrency) {
+                    let observer = self
+                        .statement_observer
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("publication statement observer poisoned"))?
+                        .take()
+                        .context("publication statement observer not reserved")?;
+                    expiry_properties(context, fixture, observer)?;
+                }
+                Ok(())
+            }
+        }?;
+        require_catalog_activity(context)
     }
     fn teardown(&self) -> Result<()> {
         if let Some(mut fixture) = self
@@ -261,13 +319,31 @@ fn catalog_sql(fixture: &PublicationFixture, catalog: &str, budget: u64) -> Stri
         endpoints.minio_endpoint
     )
 }
-fn sql(context: &ScenarioContext, statement: &str) -> Result<()> {
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+fn new_session(context: &ScenarioContext) -> Result<SqlSession> {
+    Ok(SqlSession::new(
+        context.sql_user(),
+        context.trino_port(),
         context.deadline(),
-    )?
-    .run(|conn| conn.query_drop(statement).map_err(Into::into))
+    )?)
+}
+fn execute_sql(
+    session: &mut SqlSession,
+    statement: impl AsRef<str>,
+    deadline: Instant,
+) -> Result<StatementResult> {
+    let pending = session.submit(statement)?;
+    let cancel = pending.cancel_handle();
+    let outcome = session.run_pending(pending);
+    let cleanup = if matches!(&outcome, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+    {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    both(outcome.map_err(anyhow::Error::from), cleanup).map(|(result, ())| result)
+}
+fn sql(context: &ScenarioContext, statement: &str) -> Result<()> {
+    execute_sql(&mut new_session(context)?, statement, context.deadline()).map(|_| ())
 }
 fn metadata(fixture: &PublicationFixture) -> Result<Value> {
     table_metadata(fixture, "orders")
@@ -293,40 +369,275 @@ fn save(context: &ScenarioContext, name: &str, value: &Value) -> Result<()> {
     )?;
     Ok(())
 }
+fn public_sql_error(error: &anyhow::Error) -> Result<&TrinoError> {
+    match error
+        .chain()
+        .find_map(|source| source.downcast_ref::<StatementFailure>())
+    {
+        Some(StatementFailure::Trino(error)) => Ok(error),
+        Some(failure) => {
+            Err(anyhow::Error::new(failure.clone()).context("expected original Trino SQL failure"))
+        }
+        None => anyhow::bail!("publication failure has no original Trino SQL source: {error:#}"),
+    }
+}
 fn require_unknown(outcome: &Result<()>) -> Result<()> {
     let error = outcome
         .as_ref()
         .err()
         .context("publication unexpectedly returned success")?;
+    let wire = public_sql_error(error)?;
+    if !wire.message.to_ascii_lowercase().contains("unknown") {
+        return Err(anyhow::Error::new(StatementFailure::Trino(wire.clone()))
+            .context("SQL did not return Unknown"));
+    }
+    Ok(())
+}
+
+/// Owns the one actual POST, its same cancellation capability and real reader.
+struct PublicationSqlActor {
+    cancel: CancelHandle,
+    deadline: Instant,
+    join: Option<JoinHandle<std::result::Result<StatementResult, StatementFailure>>>,
+    join_succeeded: Option<bool>,
+    settled: Option<Result<Result<()>>>,
+}
+impl PublicationSqlActor {
+    fn start(
+        mut session: SqlSession,
+        pending: PendingStatement,
+        deadline: Instant,
+    ) -> Result<Self> {
+        let cancel = pending.cancel_handle();
+        match std::thread::Builder::new()
+            .name("publication-sql".into())
+            .spawn(move || session.run_pending(pending))
+        {
+            Ok(join) => Ok(Self {
+                cancel,
+                deadline,
+                join: Some(join),
+                join_succeeded: None,
+                settled: None,
+            }),
+            Err(error) => both(
+                Err(anyhow::Error::from(error)),
+                cancel.delete(deadline).map_err(Into::into),
+            )
+            .map(|(actor, ())| actor),
+        }
+    }
+    fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+    fn cancel_active(&self) -> Result<()> {
+        if self.join.as_ref().is_some_and(|join| !join.is_finished()) {
+            self.cancel.delete(self.deadline)?;
+        }
+        Ok(())
+    }
+    fn prejoin_finished(&mut self) {
+        if self.settled.is_none() && self.join.as_ref().is_some_and(JoinHandle::is_finished) {
+            // This consumes the actual reader once, including same-query DELETE
+            // on non-Trino refusal. Keep its original outcome for the owner.
+            self.settled = Some(self.join());
+        }
+    }
+    fn join(&mut self) -> Result<Result<()>> {
+        if let Some(settled) = self.settled.take() {
+            return settled;
+        }
+        let joined = self
+            .join
+            .take()
+            .context("publication SQL actor already joined")?
+            .join();
+        self.join_succeeded = Some(joined.is_ok());
+        let terminal = matches!(&joined, Ok(Ok(_)) | Ok(Err(StatementFailure::Trino(_))));
+        // A local/HTTP/transport failure or panic is not server terminal,
+        // including after this original reader has actually returned.
+        let cleanup = if terminal {
+            Ok(())
+        } else {
+            self.cancel.delete(self.deadline).map_err(Into::into)
+        };
+        let response = joined
+            .map_err(|payload| {
+                anyhow::Error::new(PublicationSqlPanic {
+                    _original_payload: Mutex::new(payload),
+                })
+            })
+            .map(|response| response.map(|_| ()).map_err(anyhow::Error::from));
+        match cleanup {
+            Ok(()) => response,
+            Err(cleanup) => match response {
+                Ok(Err(primary)) | Err(primary) => Err(PublicationFailures {
+                    primary,
+                    secondary: cleanup,
+                }
+                .into()),
+                Ok(Ok(())) => Err(cleanup),
+            },
+        }
+    }
+}
+impl Drop for PublicationSqlActor {
+    fn drop(&mut self) {
+        if self.join.is_some() || self.settled.is_some() {
+            let cancelled = self.cancel_active();
+            let joined = self.join().and_then(|outcome| outcome);
+            if let Err(error) = both(joined, cancelled) {
+                eprintln!("publication SQL actor cleanup failed: {error:#}");
+            }
+        }
+    }
+}
+struct PublicationSqlPanic {
+    _original_payload: Mutex<Box<dyn std::any::Any + Send + 'static>>,
+}
+impl std::fmt::Debug for PublicationSqlPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublicationSqlPanic(original payload retained)")
+    }
+}
+impl std::fmt::Display for PublicationSqlPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("publication SQL actor panicked (original payload retained)")
+    }
+}
+impl std::error::Error for PublicationSqlPanic {}
+#[derive(Debug)]
+struct PublicationFailures {
+    primary: anyhow::Error,
+    secondary: anyhow::Error,
+}
+impl std::fmt::Display for PublicationFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}; additional publication failure: {:#}",
+            self.primary, self.secondary
+        )
+    }
+}
+impl std::error::Error for PublicationFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+fn both<T, U>(primary: Result<T>, secondary: Result<U>) -> Result<(T, U)> {
+    match (primary, secondary) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => Err(PublicationFailures { primary, secondary }.into()),
+    }
+}
+fn spawn_sql(context: &ScenarioContext, statement: String) -> Result<PublicationSqlActor> {
+    let session = new_session(context)?;
+    let pending = session.submit(statement)?;
+    PublicationSqlActor::start(session, pending, context.deadline())
+}
+fn spawn_observed_sql(
+    context: &mut ScenarioContext,
+    statement: String,
+    observer: StatementObservationOnly,
+    observation_slot: &mut Option<QueryLifecycleStatementObservation>,
+) -> Result<PublicationSqlActor> {
     ensure!(
-        format!("{error:#}")
-            .to_ascii_lowercase()
-            .contains("unknown"),
-        "SQL did not return Unknown: {error:#}"
+        observation_slot.is_none(),
+        "publication local reference was already nominated"
     );
-    Ok(())
-}
-fn spawn_sql(context: &ScenarioContext, statement: String) -> JoinHandle<Result<()>> {
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
     let deadline = context.deadline();
-    std::thread::spawn(move || {
-        mysql_actor::connect_until(&user, port, deadline)?
-            .run(|conn| conn.query_drop(statement).map_err(Into::into))
-    })
+    let session = new_session(context)?;
+    let pending = session.submit(&statement)?;
+    let cancel = pending.cancel_handle();
+    let observation = match observer.arm(context.handle(), &pending.query_id, &statement, deadline)
+    {
+        Ok(observation) => observation,
+        Err(primary) => {
+            return both(
+                Err::<(), _>(primary),
+                cancel.delete(deadline).map_err(Into::into),
+            )
+            .map(|_| unreachable!());
+        }
+    };
+    // The successful nomination remains owned even if its original reader
+    // cannot start. Cleanup must drain only this actual arm, after settlement.
+    *observation_slot = Some(observation);
+    PublicationSqlActor::start(session, pending, deadline)
 }
-fn joined(query: JoinHandle<Result<()>>) -> Result<Result<()>> {
-    query
-        .join()
-        .map_err(|_| anyhow::anyhow!("publication SQL actor panicked"))
+fn service_sql(
+    context: &ScenarioContext,
+    name: &str,
+    hold: &mut Hold,
+    statement: String,
+) -> Result<PublicationSqlActor> {
+    match spawn_sql(context, statement) {
+        Ok(actor) => Ok(actor),
+        Err(primary) => {
+            let release = hold.release();
+            let trace = hold.trace().and_then(|trace| {
+                fs::write(
+                    context.scenario_root().join(format!("{name}-trace.ndjson")),
+                    trace,
+                )?;
+                Ok(())
+            });
+            let receipt = save(
+                context,
+                &format!("{name}-actors.json"),
+                &json!({
+                    "actor_start_error":format!("{primary:#}"), "release_error":failure(&release),
+                    "trace_error":failure(&trace), "sql_actor_started":false,
+                    "sql_actor_actual_exit":null, "original_exit":null
+                }),
+            );
+            both(Err::<(), _>(primary), both(release, both(trace, receipt))).map(|_| unreachable!())
+        }
+    }
 }
-fn aggregate(failures: &[(&str, Option<String>)]) -> Result<()> {
-    let failures = failures
-        .iter()
-        .filter_map(|(stage, error)| error.as_ref().map(|error| format!("{stage}: {error}")))
-        .collect::<Vec<_>>();
-    ensure!(failures.is_empty(), "{}", failures.join("; "));
-    Ok(())
+fn proxy_sql(
+    context: &ScenarioContext,
+    name: &str,
+    mut guard: novarocks_cluster_harness::publication_catalog::FixtureFaultGuard,
+    statement: String,
+) -> Result<(
+    PublicationSqlActor,
+    novarocks_cluster_harness::publication_catalog::FixtureFaultGuard,
+)> {
+    match spawn_sql(context, statement) {
+        Ok(actor) => Ok((actor, guard)),
+        Err(primary) => {
+            let release = guard.release();
+            let trace = save(context, &format!("{name}-trace.json"), &guard.trace());
+            let exit = guard.finish();
+            let receipt = save(
+                context,
+                &format!("{name}-actors.json"),
+                &json!({
+                    "actor_start_error":format!("{primary:#}"), "release_error":failure(&release),
+                    "trace_error":failure(&trace), "proxy_actual_exit_error":failure(&exit),
+                    "sql_actor_started":false, "sql_actor_actual_exit":null
+                }),
+            );
+            both(
+                Err::<(), _>(primary),
+                both(release, both(trace, both(exit, receipt))),
+            )
+            .map(|_| unreachable!())
+        }
+    }
+}
+/// Preserve actual SQL as the primary source whenever another owned phase fails.
+fn finish_query<T>(phase: Result<T>, outcome: Result<Result<()>>) -> Result<(T, Result<()>)> {
+    match (phase, outcome) {
+        (Ok(phase), Ok(outcome)) => Ok((phase, outcome)),
+        (Err(error), Ok(Ok(()))) | (Ok(_), Err(error)) => Err(error),
+        (Err(secondary), Ok(Err(primary)) | Err(primary)) => {
+            Err(PublicationFailures { primary, secondary }.into())
+        }
+    }
 }
 fn failure<T>(result: &Result<T>) -> Option<String> {
     result.as_ref().err().map(|error| format!("{error:#}"))
@@ -338,14 +649,14 @@ fn finish_service<T>(
     name: &str,
     hold: &mut Hold,
     phase: Result<T>,
-    query: JoinHandle<Result<()>>,
+    mut query: PublicationSqlActor,
     join_while_held: bool,
+    peer: Option<&mut PublicationSqlActor>,
     inspect_while_held: impl FnOnce(&Result<()>) -> Result<()>,
 ) -> Result<(T, Result<()>, CommitOutcome)> {
-    let mut actor = Some(query);
     let mut outcome = None;
     if join_while_held && phase.is_ok() {
-        outcome = Some(joined(actor.take().unwrap()));
+        outcome = Some(query.join());
     }
     let inspection = if let Some(Ok(result)) = &outcome {
         inspect_while_held(result)
@@ -353,7 +664,38 @@ fn finish_service<T>(
         Ok(())
     };
     let release = hold.release();
-    let outcome = outcome.unwrap_or_else(|| joined(actor.take().unwrap()));
+    let failed_before_join = phase.is_err() || inspection.is_err() || release.is_err();
+    let cancellation = if failed_before_join {
+        query.cancel_active()
+    } else {
+        Ok(())
+    };
+    // The local reference is a separately owned live peer. Release the exact
+    // Java hold first, then cancel it immediately on phase/cleanup failure.
+    let peer_cancellation = if failed_before_join {
+        peer.as_deref()
+            .map_or(Ok(()), PublicationSqlActor::cancel_active)
+    } else {
+        Ok(())
+    };
+    let outcome = outcome.unwrap_or_else(|| query.join());
+    let unresolved_reader = match &outcome {
+        Err(_) => true,
+        Ok(Err(error)) => public_sql_error(error).is_err(),
+        Ok(Ok(())) => false,
+    };
+    let peer_cancellation_after_join = if !failed_before_join && unresolved_reader {
+        peer.as_deref()
+            .map_or(Ok(()), PublicationSqlActor::cancel_active)
+    } else {
+        Ok(())
+    };
+    let peer_cancellation = both(peer_cancellation, peer_cancellation_after_join).map(|_| ());
+    if let Some(peer) = peer {
+        // A finished non-Trino peer still owns its exact pending capability.
+        // Settle it before waiting for the independent original Java exit.
+        peer.prejoin_finished();
+    }
     let exited = hold.wait_for_original_exit(context.deadline());
     let trace = hold.trace().and_then(|trace| {
         fs::write(
@@ -367,44 +709,37 @@ fn finish_service<T>(
         &format!("{name}-actors.json"),
         &json!({
             "phase_error":failure(&phase),"held_inspection_error":failure(&inspection),"release_error":failure(&release),
-            "join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":outcome.is_ok(),
+            "cancel_error":failure(&cancellation),"peer_cancel_error":failure(&peer_cancellation),"join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":query.join_succeeded,
+            "sql_actor_settlement_succeeded":outcome.is_ok(),
             "sql_result":outcome.as_ref().ok().map(|result| format!("{result:?}")),
             "original_exit":format!("{exited:?}"),"trace_error":failure(&trace)
         }),
     );
-    let sql_failure =
-        if phase.is_err() || inspection.is_err() || release.is_err() || exited.is_err() {
-            outcome.as_ref().ok().and_then(failure)
-        } else {
-            None
-        };
-    aggregate(&[
-        ("phase", failure(&phase)),
-        ("SQL outcome during failed cleanup", sql_failure),
-        ("held inspection", failure(&inspection)),
-        ("release", failure(&release)),
-        ("join", failure(&outcome)),
-        ("original actual exit", failure(&exited)),
-        ("trace", failure(&trace)),
-        ("actor receipt", failure(&receipt)),
-    ])?;
-    Ok((phase?, outcome?, exited?))
+    let cleanup = both(
+        inspection,
+        both(
+            release,
+            both(cancellation, both(peer_cancellation, both(trace, receipt))),
+        ),
+    )
+    .map(|_| ());
+    let phase = both(both(phase, exited), cleanup).map(|(value, ())| value);
+    let ((phase, exited), outcome) = finish_query(phase, outcome)?;
+    Ok((phase, outcome, exited))
 }
+
 fn late_commit(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
     let before = metadata(fixture)?;
     let control = fixture.proxy()?;
     let counts = control.mutation_counts("ns", "orders");
     let mut hold = fixture.service().arm("ns.orders")?;
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let deadline = context.deadline();
     let started = Instant::now();
-    let query = std::thread::spawn(move || {
-        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
-            conn.query_drop(format!("ALTER TABLE {TABLE} ADD COLUMN late_value BIGINT"))
-                .map_err(Into::into)
-        })
-    });
+    let query = service_sql(
+        context,
+        "service",
+        &mut hold,
+        format!("ALTER TABLE {TABLE} ADD COLUMN late_value BIGINT"),
+    )?;
     let phase = (|| -> Result<()> {
         hold.wait_until_held(context.deadline())?;
         // The server has checked requirements but has not committed. The real
@@ -422,6 +757,7 @@ fn late_commit(context: &mut ScenarioContext, fixture: &PublicationFixture) -> R
         phase,
         query,
         true,
+        None,
         |query_result| {
             require_unknown(query_result)?;
             ensure!(
@@ -482,17 +818,12 @@ fn post_commit_reload(context: &mut ScenarioContext, fixture: &PublicationFixtur
     let mut hold = fixture
         .service()
         .arm_at("ns.orders", HoldStage::AfterPersistentCommit)?;
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let deadline = context.deadline();
-    let query = std::thread::spawn(move || {
-        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
-            conn.query_drop(
-                "ALTER TABLE publication_response.ns.orders ADD COLUMN post_commit BIGINT",
-            )
-            .map_err(Into::into)
-        })
-    });
+    let query = service_sql(
+        context,
+        "post-commit",
+        &mut hold,
+        "ALTER TABLE publication_response.ns.orders ADD COLUMN post_commit BIGINT".into(),
+    )?;
     let phase = (|| -> Result<Value> {
         hold.wait_until_held(context.deadline())?;
         let applied = metadata(fixture)?;
@@ -509,6 +840,7 @@ fn post_commit_reload(context: &mut ScenarioContext, fixture: &PublicationFixtur
         phase,
         query,
         false,
+        None,
         |_| Ok(()),
     )?;
     outcome.context("post-commit response should preserve Applied evidence")?;
@@ -606,12 +938,11 @@ fn stream_deadline(context: &mut ScenarioContext, fixture: &PublicationFixture) 
                 "body_owner_error":failure(&evidence),"sql_actor_actual_exit":true
             }),
         );
-        aggregate(&[
-            ("body actual exit", failure(&evidence)),
-            ("trace", failure(&trace_saved)),
-            ("receipt", failure(&receipt)),
-        ])?;
-        let evidence = evidence?;
+        let cleanup = both(evidence, both(trace_saved, receipt));
+        let evidence = match cleanup {
+            Ok((evidence, _)) => evidence,
+            Err(cleanup) => return both(outcome, Err::<(), _>(cleanup)).map(|_| ()),
+        };
         let mutations =
             |counters: &novarocks_cluster_harness::publication_catalog::TrafficCounters| {
                 counters
@@ -702,9 +1033,6 @@ fn maintenance_race(
         .table_commit_forwarded;
     let traffic_before = control.traffic_snapshot();
     let mut hold = fixture.service().arm("ns.orders")?;
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let deadline = context.deadline();
     let statement = if matches!(property, Property::ExpiryConcurrency) {
         format!(
             "ALTER TABLE {TABLE} EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00' RETAIN LAST 1"
@@ -712,10 +1040,7 @@ fn maintenance_race(
     } else {
         format!("ALTER TABLE {TABLE} REWRITE MANIFESTS")
     };
-    let query = std::thread::spawn(move || {
-        mysql_actor::connect_until(&user, port, deadline)?
-            .run(|conn| conn.query_drop(statement).map_err(Into::into))
-    });
+    let query = service_sql(context, "maintenance", &mut hold, statement)?;
     let mut competitor_snapshot = Value::Null;
     let mut competitor_list = String::new();
     let phase = (|| -> Result<()> {
@@ -772,6 +1097,7 @@ fn maintenance_race(
         phase,
         query,
         false,
+        None,
         |_| Ok(()),
     )?;
     let traffic_after = control.traffic_snapshot();
@@ -845,12 +1171,11 @@ fn maintenance_race(
     } else {
         vec![1, 2, 3, 4, 99]
     };
-    let actual: Vec<i32> = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+    let actual = integer_rows(execute_sql(
+        &mut new_session(context)?,
+        format!("SELECT k FROM {TABLE} ORDER BY k"),
         context.deadline(),
-    )?
-    .run(|conn| Ok(conn.query(format!("SELECT k FROM {TABLE} ORDER BY k"))?))?;
+    )?)?;
     ensure!(
         actual == expected,
         "maintenance race lost source rows: {actual:?}"
@@ -964,20 +1289,34 @@ fn register_source(fixture: &PublicationFixture, table: &str) -> Result<String> 
         .error_for_status()?;
     Ok(name)
 }
+fn integer_rows(result: StatementResult) -> Result<Vec<i32>> {
+    ensure!(
+        result.is_result_set()
+            && result.columns.len() == 1
+            && result.columns[0].type_signature.raw_type == "integer"
+            && result.columns[0].type_signature.arguments.is_empty(),
+        "publication source rows lost their declared INT column"
+    );
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(value)] => {
+                i32::try_from(*value).context("publication INT row overflow")
+            }
+            actual => anyhow::bail!("publication source row requires one non-null INT: {actual:?}"),
+        })
+        .collect()
+}
 fn rows(context: &ScenarioContext, table: &str, version: Option<&str>) -> Result<Vec<i32>> {
     let version = version
         .map(|version| format!(" FOR VERSION AS OF {version}"))
         .unwrap_or_default();
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+    integer_rows(execute_sql(
+        &mut new_session(context)?,
+        format!("SELECT k FROM {CATALOG}.ns.{table}{version} ORDER BY k"),
         context.deadline(),
-    )?
-    .run(|conn| {
-        Ok(conn.query(format!(
-            "SELECT k FROM {CATALOG}.ns.{table}{version} ORDER BY k"
-        ))?)
-    })
+    )?)
 }
 fn expire(catalog: &str, table: &str) -> String {
     format!(
@@ -989,10 +1328,15 @@ fn finish_proxy<T>(
     name: &str,
     mut guard: novarocks_cluster_harness::publication_catalog::FixtureFaultGuard,
     phase: Result<T>,
-    query: JoinHandle<Result<()>>,
+    mut query: PublicationSqlActor,
 ) -> Result<(T, Result<()>)> {
     let release = guard.release();
-    let outcome = joined(query);
+    let cancellation = if phase.is_err() || release.is_err() {
+        query.cancel_active()
+    } else {
+        Ok(())
+    };
+    let outcome = query.join();
     let early_trace = save(context, &format!("{name}-trace.json"), &guard.trace());
     let exit = guard.finish();
     let trace = match &exit {
@@ -1004,28 +1348,25 @@ fn finish_proxy<T>(
         &format!("{name}-actors.json"),
         &json!({
             "phase_error":failure(&phase),"release_error":failure(&release),
-            "join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":outcome.is_ok(),
+            "cancel_error":failure(&cancellation),"join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":query.join_succeeded,
+            "sql_actor_settlement_succeeded":outcome.is_ok(),
             "sql_result":outcome.as_ref().ok().map(|result| format!("{result:?}")),
             "proxy_actual_exit_error":failure(&exit),"trace_error":failure(&trace)
         }),
     );
-    let sql_failure = if phase.is_err() || release.is_err() || exit.is_err() {
-        outcome.as_ref().ok().and_then(failure)
-    } else {
-        None
-    };
-    aggregate(&[
-        ("phase", failure(&phase)),
-        ("SQL outcome during failed cleanup", sql_failure),
-        ("release", failure(&release)),
-        ("join", failure(&outcome)),
-        ("proxy actual exit", failure(&exit)),
-        ("trace", failure(&trace)),
-        ("actor receipt", failure(&receipt)),
-    ])?;
-    Ok((phase?, outcome?))
+    let cleanup = both(
+        release,
+        both(cancellation, both(exit, both(trace, receipt))),
+    )
+    .map(|_| ());
+    finish_query(both(phase, cleanup).map(|(value, ())| value), outcome)
 }
-fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
+
+fn expiry_properties(
+    context: &mut ScenarioContext,
+    fixture: &PublicationFixture,
+    observer: StatementObservationOnly,
+) -> Result<()> {
     for case in ["ref_move", "new_branch", "lost_tag"] {
         let table = format!("expiry_{case}");
         // Branch writes are admitted only for format v3; the other races
@@ -1061,7 +1402,7 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
             "table-commit",
             "before-requirement-check-hold-for-concurrent-shell",
         )?;
-        let query = spawn_sql(context, expire(CATALOG, &table));
+        let (query, guard) = proxy_sql(context, case, guard, expire(CATALOG, &table))?;
         let mut branch_append_forwarded = None;
         let phase = (|| -> Result<(Value, Option<i64>)> {
             guard.wait_until_entered(context.deadline())?;
@@ -1262,34 +1603,12 @@ fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture
         );
         context.action(format!("expiry {case}: exact snapshot/ref IDs, reachable manifest list and independent source read verified"));
     }
-    local_expiry_serialization(context, fixture)
-}
-fn wait_for_statement(context: &ScenarioContext, statement: &str) -> Result<()> {
-    loop {
-        let present = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?
-        .run(|conn| {
-            let rows: Vec<mysql::Row> = conn.query("SHOW FULL PROCESSLIST")?;
-            Ok(rows.iter().any(|row| {
-                row.get::<Option<String>, _>("Info").flatten().as_deref() == Some(statement)
-            }))
-        })?;
-        if present {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < context.deadline(),
-            "local ref never reached FE statement ownership"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    local_expiry_serialization(context, fixture, observer)
 }
 fn local_expiry_serialization(
     context: &mut ScenarioContext,
     fixture: &PublicationFixture,
+    observer: StatementObservationOnly,
 ) -> Result<()> {
     let table = "expiry_local_serial";
     let before = seed(context, fixture, table, 2)?;
@@ -1297,16 +1616,33 @@ fn local_expiry_serialization(
     let control = fixture.proxy()?;
     let initial_count = control.mutation_counts("ns", table).table_commit_forwarded;
     let mut hold = fixture.service().arm(&format!("ns.{table}"))?;
-    let query = spawn_sql(context, expire(CATALOG, table));
+    let query = service_sql(
+        context,
+        "local-serialization",
+        &mut hold,
+        expire(CATALOG, table),
+    )?;
     let mut reference = None;
+    let mut reference_observation = None;
     let phase = (|| -> Result<()> {
         hold.wait_until_held(context.deadline())?;
         let count = control.mutation_counts("ns", table).table_commit_forwarded;
         let statement = format!(
             "ALTER TABLE {CATALOG}.ns.{table} CREATE TAG local_waiter AS OF VERSION {candidate}"
         );
-        reference = Some(spawn_sql(context, statement.clone()));
-        wait_for_statement(context, &statement)?;
+        reference = Some(spawn_observed_sql(
+            context,
+            statement,
+            observer,
+            &mut reference_observation,
+        )?);
+        let observation = reference_observation
+            .as_ref()
+            .context("local reference nomination missing")?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .await_query_lifecycle_statement_owned(observation, deadline)?;
         std::thread::sleep(Duration::from_millis(250));
         ensure!(
             !reference.as_ref().unwrap().is_finished(),
@@ -1331,39 +1667,71 @@ fn local_expiry_serialization(
         phase,
         query,
         false,
+        reference.as_mut(),
         |_| Ok(()),
     );
     // Join the waiting ref even if release, the expiry actor or wrapper failed.
-    let reference = reference.map(joined).transpose();
+    let mut reference_join_succeeded = None;
+    let reference = reference
+        .map(|mut actor| {
+            let cancellation = if expired.is_err() {
+                actor.cancel_active()
+            } else {
+                Ok(())
+            };
+            let outcome = actor.join();
+            reference_join_succeeded = actor.join_succeeded;
+            finish_query(cancellation, outcome).map(|((), outcome)| outcome)
+        })
+        .transpose();
+    // Both actual SQL actors have settled (or no ref reader started). Drain
+    // only a successful original nomination, with the same absolute deadline.
+    let binding_drain = match reference_observation.as_ref() {
+        Some(observation) => {
+            let deadline = context.deadline();
+            context
+                .handle()
+                .drain_query_lifecycle_statement_binding(observation, deadline)
+        }
+        None => Ok(()),
+    };
     let receipt = save(
         context,
         "local-serialization-ref.json",
         &json!({
             "expiry":format!("{expired:?}"),"ref_actor":format!("{reference:?}"),
-            "ref_actor_actual_exit":!matches!(&reference,Ok(None))
+            "ref_actor_actual_exit":reference_join_succeeded.is_some(),
+            "ref_actor_join_succeeded":reference_join_succeeded,
+            "observer_nominated":reference_observation.is_some(),
+            "binding_drain_error":failure(&binding_drain)
         }),
     );
-    aggregate(&[
-        ("expiry", failure(&expired)),
-        ("ref join", failure(&reference)),
-        ("receipt", failure(&receipt)),
-    ])?;
-    let (_, expired, original) = expired?;
+    let expired = both(expired, both(binding_drain, receipt)).map(|(expired, _)| expired);
+    let reference = match expired {
+        Ok(expired) => (expired, reference?),
+        Err(primary) => {
+            let peer = reference.and_then(|peer| peer.unwrap_or(Ok(())));
+            return both(Err::<(), _>(primary), peer).map(|_| ());
+        }
+    };
+    let ((_, expired, original), reference) = reference;
     expired.context("local serialized expiry did not apply")?;
     ensure!(
         original == CommitOutcome::Succeeded,
         "local expiry did not actually commit"
     );
-    let rejected = reference?
+    let rejected = reference
         .context("ref actor not started")?
         .err()
         .context("ref planned against an already expired snapshot after lock release")?;
-    let diagnostic = format!("{rejected:#}");
-    ensure!(
-        diagnostic.to_ascii_lowercase().contains("snapshot")
-            && diagnostic.contains(&candidate.to_string()),
-        "local ref failed for a reason other than the removed snapshot: {diagnostic}"
-    );
+    let diagnostic = &public_sql_error(&rejected)?.message;
+    if !(diagnostic.to_ascii_lowercase().contains("snapshot")
+        && diagnostic.contains(&candidate.to_string()))
+    {
+        return Err(
+            rejected.context("local ref failed for a reason other than the removed snapshot")
+        );
+    }
     ensure!(
         control.mutation_counts("ns", table).table_commit_forwarded == initial_count + 1,
         "local ref dispatched against the removed snapshot"
@@ -1393,7 +1761,12 @@ fn local_expiry_serialization(
     let unknown_count = control.mutation_counts("ns", table).table_commit_forwarded;
     let service_table = format!("ns.{table}");
     let mut hold = fixture.service().arm(&service_table)?;
-    let query = spawn_sql(context, expire("publication_unknown", table));
+    let query = service_sql(
+        context,
+        "unknown-window-service",
+        &mut hold,
+        expire("publication_unknown", table),
+    )?;
     let phase = (|| -> Result<Value> {
         hold.wait_until_held(context.deadline())?;
         let events = hold
@@ -1419,10 +1792,13 @@ fn local_expiry_serialization(
         phase,
         query,
         true,
+        None,
         |outcome| {
             require_unknown(outcome)?;
             ensure!(
-                format!("{:#}", outcome.as_ref().unwrap_err()).contains("[CommitUnknown]"),
+                public_sql_error(outcome.as_ref().unwrap_err())?
+                    .message
+                    .contains("[CommitUnknown]"),
                 "Unknown window SQL lost the canonical CommitUnknown code"
             );
             sql(
@@ -1600,14 +1976,8 @@ fn local_expiry_serialization(
             "guarantee":"local serialization ends at Unknown; late application remains possible"
         }),
     );
-    aggregate(&[
-        ("service release/join/original exit", failure(&finished)),
-        ("retry actual exit", failure(&retry)),
-        ("trace", failure(&trace)),
-        ("metadata", failure(&after)),
-        ("receipt", failure(&receipt)),
-    ])?;
-    let after = after?;
+    let (_, (_, (_, (after, ())))) =
+        both(finished, both(retry, both(trace, both(after, receipt))))?;
     ensure!(
         forwarded == 2,
         "Unknown expiry or the following local tag was replayed"
@@ -1630,4 +2000,44 @@ fn local_expiry_serialization(
     );
     context.action("Unknown unlocked the same catalog; local tag applied before original late expiry removed it, while physical files remained readable");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit_unknown() -> StatementFailure {
+        StatementFailure::Trino(serde_json::from_value(json!({
+            "message":"[CommitUnknown] original publication remains Unknown",
+            "errorCode":65536, "errorName":"GENERIC_INTERNAL_ERROR", "errorType":"INTERNAL_ERROR"
+        })).unwrap())
+    }
+
+    #[test]
+    fn publication_unknown_requires_original_trino_source() {
+        assert!(require_unknown(&Err(commit_unknown().into())).is_ok());
+        for error in [
+            StatementFailure::Http {
+                status: 503,
+                body: "[CommitUnknown] Unknown".into(),
+            },
+            StatementFailure::Transport("Unknown publication transport".into()),
+            StatementFailure::Deadline,
+        ] {
+            assert!(require_unknown(&Err(error.into())).is_err());
+        }
+    }
+
+    #[test]
+    fn publication_cleanup_preserves_original_sql_source() {
+        let outcome = finish_query::<()>(
+            Err(anyhow::anyhow!("original hold release failed")),
+            Ok(Err(commit_unknown().into())),
+        )
+        .unwrap_err();
+        let wire = public_sql_error(&outcome).unwrap();
+        assert_eq!(wire.error_code, 65536);
+        assert!(wire.message.starts_with("[CommitUnknown]"));
+        assert!(format!("{outcome:#}").contains("original hold release failed"));
+    }
 }

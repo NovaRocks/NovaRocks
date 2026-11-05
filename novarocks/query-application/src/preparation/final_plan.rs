@@ -1078,9 +1078,13 @@ mod tests {
                 FrozenRootOutput::ClientRows(
                     novarocks_sql::compiler::client_render_schema(
                         completed.candidate().plan(),
-                        novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-                            timezone_offset_seconds: 0,
-                        },
+                        novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+                            &novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: true,
+                                variant_binary: true,
+                            },
+                        ),
                     )
                     .unwrap(),
                 )

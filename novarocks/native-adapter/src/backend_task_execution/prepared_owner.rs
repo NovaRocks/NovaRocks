@@ -169,6 +169,7 @@ pub(crate) struct NativePreparationChild {
     state: Arc<Mutex<State>>,
     self_weak: std::sync::Weak<Self>,
     task_stopped: std::sync::atomic::AtomicBool,
+    readiness_waker: std::task::Waker,
     #[cfg(novarocks_dev_controls)]
     prepared_exit_gate: Mutex<Option<super::prepared_exit_control::PreparedExitGate>>,
 }
@@ -177,9 +178,25 @@ impl NativePreparationChild {
         scope: &TaskPreparationContext<'_>,
         health: Arc<ExecutionHealth>,
     ) -> ExecutionResult<Arc<Self>> {
-        let child = Arc::new_cyclic(|weak| Self {
-            identity: scope.runtime_control().identity(),
+        let child = Self::new(
+            scope.runtime_control().identity(),
             health,
+            scope.readiness_waker(),
+        );
+        scope
+            .register_child(child.clone())
+            .map_err(ExecutionFailure::from_domain)?;
+        Ok(child)
+    }
+    fn new(
+        identity: TaskIdentity,
+        health: Arc<ExecutionHealth>,
+        readiness_waker: std::task::Waker,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            identity,
+            health,
+            readiness_waker,
             state: Arc::new(Mutex::new(State {
                 retained: None,
                 rollback: false,
@@ -201,11 +218,7 @@ impl NativePreparationChild {
             task_stopped: std::sync::atomic::AtomicBool::new(false),
             #[cfg(novarocks_dev_controls)]
             prepared_exit_gate: Mutex::new(None),
-        });
-        scope
-            .register_child(child.clone())
-            .map_err(ExecutionFailure::from_domain)?;
-        Ok(child)
+        })
     }
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn inject_prepared_exit_failure(
@@ -679,6 +692,30 @@ impl NativePreparationChild {
             }
         }
     }
+    fn terminal_publisher(
+        &self,
+        completion: Option<novarocks_worker::TaskCompletionSignal>,
+    ) -> LocalTaskTerminalPublisher {
+        let rollback = completion.is_none();
+        let weak = self.self_weak.clone();
+        Box::new(move |fact| {
+            if let Some(owner) = weak.upgrade() {
+                owner
+                    .task_stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if rollback {
+                    owner.finish_registration();
+                    // Kernel exit can follow the original owner's Pending
+                    // observation. Wake it after registration cleanup so that
+                    // the same Task can finish its retained rollback.
+                    owner.readiness_waker.wake_by_ref();
+                }
+            }
+            if let Some(completion) = &completion {
+                completion.publish(fact.clone());
+            }
+        })
+    }
     fn bind_publisher(
         &self,
         completion: Option<novarocks_worker::TaskCompletionSignal>,
@@ -686,21 +723,7 @@ impl NativePreparationChild {
         if !self.claim(Phase::LocalTaskObserve) {
             return Err(NativePreparedOwnerFailure::StartWithoutAdoption.into());
         }
-        let rollback = completion.is_none();
-        let weak = self.self_weak.clone();
-        let publisher: LocalTaskTerminalPublisher = Box::new(move |fact| {
-            if let Some(owner) = weak.upgrade() {
-                owner
-                    .task_stopped
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if rollback {
-                    owner.finish_registration();
-                }
-            }
-            if let Some(completion) = &completion {
-                completion.publish(fact.clone());
-            }
-        });
+        let publisher = self.terminal_publisher(completion);
         self.state.lock().unwrap().publisher = Some(ManuallyDrop::new(publisher));
         let mut publisher = self
             .state
@@ -1038,5 +1061,74 @@ impl PreparedLocalTaskOffer {
         completion: novarocks_worker::TaskCompletionSignal,
     ) -> ExecutionResult<()> {
         self.owner.finish_handoff(completion)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_execution::runtime::task::{LocalTaskOutcome, LocalTaskTerminalFact};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    #[derive(Default)]
+    struct OriginalReadiness {
+        owner: Mutex<std::sync::Weak<NativePreparationChild>>,
+        notifications: AtomicUsize,
+    }
+    impl Wake for OriginalReadiness {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let owner = self.owner.lock().unwrap().upgrade().unwrap();
+            // Reentry also verifies that notification runs outside the finite
+            // owner's state lock, after its independent registration cleanup.
+            let state = owner.state.lock().unwrap();
+            assert!(owner.task_stopped.load(Ordering::Acquire));
+            assert_eq!(state.phases[Phase::Registration as usize], Action::Exited);
+            assert_eq!(state.phases[Phase::Control as usize], Action::Exited);
+            drop(state);
+            self.notifications.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn rollback_terminal_publisher_notifies_original_preparation_readiness() {
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(91_216, 1), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(2).unwrap(),
+            TaskId::new(4).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let original = Arc::new(OriginalReadiness::default());
+        let health = Arc::new(ExecutionHealth::new());
+        let owner =
+            NativePreparationChild::new(identity, health.clone(), Waker::from(original.clone()));
+        *original.owner.lock().unwrap() = Arc::downgrade(&owner);
+        let mut publisher = owner.terminal_publisher(None);
+        assert_eq!(original.notifications.load(Ordering::Acquire), 0);
+        // This is solely the existing publisher's notification boundary. The
+        // input is metadata: no Task publication, Work, kernel, registration,
+        // or physical-exit proof is created by this fixture.
+        let notification = LocalTaskTerminalFact::new(
+            identity.query_execution_id().query_id(),
+            novarocks_types::UniqueId::new(91_216, 4),
+            LocalTaskOutcome::Succeeded,
+            None,
+        );
+        publisher(&notification);
+        let notifications = original.notifications.load(Ordering::Acquire);
+        // Dispose the callback and metadata before the oracle, including on RED.
+        drop(publisher);
+        drop(owner);
+        assert!(health.is_healthy());
+        assert_eq!(
+            notifications, 1,
+            "rollback terminal must wake its original preparation"
+        );
     }
 }

@@ -24,6 +24,7 @@ from pathlib import Path
 import sys
 
 REQUIRED = ("novarocks", "novarocks-sql-test", "novarocks-system-tests", "novarocks-error-manifest")
+OPTIONAL = ("novarocks-trino-query",)
 
 def digest(path):
     with open(path, "rb") as stream:
@@ -104,7 +105,7 @@ try:
             if v.get("reason") != "compiler-artifact" or not v.get("executable"):
                 continue
             target = v["target"]
-            if "bin" in target["kind"] and not v["profile"]["test"] and target["name"] in REQUIRED:
+            if "bin" in target["kind"] and not v["profile"]["test"] and target["name"] in REQUIRED + OPTIONAL:
                 found[target["name"]] = record(v["executable"])
         missing = set(REQUIRED) - found.keys()
         if missing:

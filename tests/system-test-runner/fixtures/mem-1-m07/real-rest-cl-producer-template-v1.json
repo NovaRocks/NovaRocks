@@ -40,7 +40,7 @@
     "iceberg_tag": "apache-iceberg-1.10.1",
     "iceberg_build_version": "1.11.0-SNAPSHOT"
   },
-  "producer_sha256": "38fef638c5d199793aa92bc8a3c4b4b920cc5cdb635ba692558b1acfeea98059",
+  "producer_sha256": "20b4b327e93defe832d170863c3480f9a9c4e6d343d13678a61ecb38ad0cf41c",
   "binding": {
     "compose_project": null,
     "fixture_id": null,

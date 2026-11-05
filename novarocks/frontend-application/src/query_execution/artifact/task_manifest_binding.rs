@@ -2066,9 +2066,13 @@ mod tests {
         // alias. Public rendering owns the column name seen by the client.
         let render = novarocks_sql::compiler::client_render_schema_from_port(
             Some(result),
-            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-                timezone_offset_seconds: 0,
-            },
+            novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+                &novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .expect("render schema from the original SQL public result declaration");
         assert_eq!(render.columns().len(), 1);

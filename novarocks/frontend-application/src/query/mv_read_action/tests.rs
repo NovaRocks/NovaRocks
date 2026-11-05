@@ -206,7 +206,13 @@ impl Fixture {
         let producer = LocalResultProducer::try_new(
             &scope,
             origin.clone(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .unwrap();
         let io = MetadataIoAdmission::for_original_source(
@@ -275,7 +281,13 @@ impl Fixture {
                 }
             };
         let mut state = State {
-            family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             readiness,
             entrance,
             binding,

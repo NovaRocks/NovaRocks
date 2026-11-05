@@ -250,11 +250,7 @@ mod tests {
     }
     fn field(native_type: N, nullable: bool) -> RenderField {
         RenderField {
-            presentation: match native_type {
-                N::Json => RenderPresentation::JsonText,
-                N::Struct(_) => RenderPresentation::MysqlContainer,
-                _ => RenderPresentation::ScalarText,
-            },
+            presentation: RenderPresentation::TrinoValue,
             nullable,
             native_type,
         }
@@ -264,7 +260,13 @@ mod tests {
             RootProfileId::V1,
             FrozenRootOutput::ClientRows(
                 ClientRenderSchema::try_new(
-                    novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts {
+                            parametric_datetime: true,
+                            variant: true,
+                            variant_binary: true,
+                        },
+                    ),
                     vec![RenderColumn {
                         source_ordinal: 0,
                         source_slot: Some(17),
@@ -302,24 +304,55 @@ mod tests {
             ValidatedClientInputTypes::try_new(json, input(ValueKind::String, D::Utf8, true))
                 .is_err()
         );
-        let integer = contract(field(N::LargeInt, false));
+        let binary = contract(field(N::Binary, false));
         assert!(
             ValidatedClientInputTypes::try_new(
-                integer.clone(),
-                input(
-                    ValueKind::Nominal(V::LargeInt),
-                    D::FixedSizeBinary(16),
-                    false
-                )
+                binary.clone(),
+                input(ValueKind::Binary, D::LargeBinary, false)
             )
             .is_ok()
         );
         assert!(
             ValidatedClientInputTypes::try_new(
-                integer,
-                input(ValueKind::Nominal(V::Uuid), D::FixedSizeBinary(16), false)
+                binary,
+                input(ValueKind::Nominal(V::Variant), D::LargeBinary, false)
             )
             .is_err()
+        );
+        let variant = contract(field(N::Variant, false));
+        assert!(
+            ValidatedClientInputTypes::try_new(
+                variant.clone(),
+                input(ValueKind::Nominal(V::Variant), D::LargeBinary, false)
+            )
+            .is_ok()
+        );
+        assert!(
+            ValidatedClientInputTypes::try_new(
+                variant,
+                input(ValueKind::Binary, D::LargeBinary, false)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: true
+                    }
+                ),
+                vec![RenderColumn {
+                    source_ordinal: 0,
+                    source_slot: Some(17),
+                    name: "wide".into(),
+                    field: field(N::LargeInt, false)
+                }],
+                1,
+            )
+            .unwrap_err(),
+            novarocks_result_contract::RootContractError::UnsupportedRenderType
         );
     }
 

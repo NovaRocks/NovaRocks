@@ -162,9 +162,9 @@ pub use drain::WorkerDrainState;
 pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
     FrozenCodecContent, HostRejection, ParticipationHost, ParticipationHostFactory,
-    ParticipationHostInstance, PreparationControlLoan, PreparedTaskInstallation,
-    ReleasedParticipationEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-    TaskIngressRetirement,
+    ParticipationHostInstance, ParticipationMaterializationControl, PreparationControlLoan,
+    PreparedTaskInstallation, ReleasedParticipationEvidence, RunnableTask, SharedFactsRequest,
+    TaskExecutionHost, TaskIngressRetirement,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, InboundRetentionSnapshot,

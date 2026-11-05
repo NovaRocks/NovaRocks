@@ -407,7 +407,7 @@ impl State {
         })?;
         if !self.spark_call {
             return Poll::Ready(Ok(StatementActionValue::Ok(
-                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+                novarocks_query_application::session_control::StatementCommandCompletion::empty(),
             )));
         }
         let producer = self
@@ -1183,7 +1183,13 @@ mod tests {
         let producer = LocalResultProducer::try_new(
             &root.owner.scope(),
             local.retain_alias(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .unwrap();
         let result = produce_local(

@@ -1583,6 +1583,15 @@ async fn apply_operations(
         {
             Ok(response) => response,
             Err(result) => {
+                for item in send.receipts.pending.iter().take(batch.items) {
+                    tracing::warn!(
+                        operation = ?item.operation_id,
+                        kind = item.kind.as_str(),
+                        address = ?item.address,
+                        dispatch_result = ?result,
+                        "task operation method run failed before receipt settlement"
+                    );
+                }
                 send.receipts.publish_prefix_uniform(batch.items, result);
                 continue;
             }

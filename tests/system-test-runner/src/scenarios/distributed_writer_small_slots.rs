@@ -153,16 +153,42 @@ fn end_scopes(
 /// reentry, including when this coordinator failed to observe or end a scope.
 pub(super) fn query_drop(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     selected: &SelectedStatement,
-    sql: &str,
+    pending: PendingStatement,
     dop: i32,
-) -> (Option<mysql::Result<()>>, Result<()>) {
+) -> (
+    Option<std::result::Result<StatementResult, StatementFailure>>,
+    Result<()>,
+) {
     if selected.faults.is_empty() {
-        return (Some(control.query_drop(sql)), Ok(()));
+        let cancel = pending.cancel_handle();
+        let outcome = control.run_pending(pending);
+        let cleanup = if matches!(&outcome, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+        {
+            let cancelled = cancel
+                .delete(selected.deadline)
+                .map_err(anyhow::Error::from);
+            let shutdown = if cancelled.is_err() {
+                context.shutdown()
+            } else {
+                Ok(())
+            };
+            writer_statement_actor::combine(cancelled, shutdown)
+        } else {
+            Ok(())
+        };
+        return (Some(outcome), cleanup);
     }
     if selected.faults.iter().any(|(_, kind)| *kind != APPEND_HOLD) {
         let (_, ended) = end_scopes(context, selected);
+        let ended = writer_statement_actor::combine(
+            ended,
+            pending
+                .cancel_handle()
+                .delete(selected.deadline)
+                .map_err(Into::into),
+        );
         return (
             None,
             writer_statement_actor::combine(
@@ -173,21 +199,28 @@ pub(super) fn query_drop(
             ),
         );
     }
-    let connection_id = control.connection_id();
+    let client_query_id = pending.query_id.clone();
+    let cancel = pending.cancel_handle();
     let deadline = selected.deadline;
     let (outcome, coordination, hits, ended, killed, joined) = thread::scope(|scope| {
-        // Borrow the original connection: its SET pipeline_dop and the DML OK
-        // packet stay with the existing row-level contract, not a new session.
+        // Borrow the original session: its SET pipeline_dop effects and this
+        // exact armed statement remain with the existing row-level contract.
         let query = thread::Builder::new()
             .name("small-slots-original-row-level-sql".into())
-            .spawn_scoped(scope, move || control.query_drop(sql));
+            .spawn_scoped(scope, move || control.run_pending(pending));
         let query = match query {
             Ok(query) => query,
             Err(error) => {
                 let (ended, cleanup) = end_scopes(context, selected);
                 return (
                     None,
-                    writer_statement_actor::combine(Err(error.into()), cleanup),
+                    writer_statement_actor::combine(
+                        Err(error.into()),
+                        writer_statement_actor::combine(
+                            cleanup,
+                            cancel.delete(deadline).map_err(Into::into),
+                        ),
+                    ),
                     Vec::new(),
                     ended,
                     false,
@@ -228,7 +261,7 @@ pub(super) fn query_drop(
         let mut killed = false;
         if coordination.is_err() && !query.is_finished() {
             killed = true;
-            let cancelled = context.handle().kill_query_until(connection_id, deadline);
+            let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
             let shutdown = if cancelled.is_err() {
                 context.shutdown()
             } else {
@@ -249,6 +282,23 @@ pub(super) fn query_drop(
                 None
             }
         };
+        // A finished reader with a local/HTTP failure did not report the
+        // server terminal. Cancel the same query once even after actual join.
+        if !killed
+            && matches!(&outcome, Some(Err(error)) if !matches!(error, StatementFailure::Trino(_)))
+        {
+            killed = true;
+            let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
+            let shutdown = if cancelled.is_err() {
+                context.shutdown()
+            } else {
+                Ok(())
+            };
+            coordination = writer_statement_actor::combine(
+                coordination,
+                writer_statement_actor::combine(cancelled, shutdown),
+            );
+        }
         (outcome, coordination, hits, ended, killed, true)
     });
     let retained = (|| -> Result<()> {
@@ -259,13 +309,13 @@ pub(super) fn query_drop(
             serde_json::to_vec_pretty(&serde_json::json!({
                 "requested_dop": dop,
                 "selected_statement_token": selected.token,
-                "connection_id": connection_id,
+                "client_query_id": client_query_id,
                 "actual_append_hold_hit_backends": hits,
                 "scope_end_successful_backends": ended,
                 "original_sql_thread_joined": joined,
                 "original_sql_outcome_available": outcome.is_some(),
-                "original_sql_succeeded": matches!(&outcome, Some(Ok(()))),
-                "scenario_requested_kill": killed,
+                "original_sql_succeeded": matches!(&outcome, Some(Ok(_))),
+                "scenario_requested_cancel": killed,
                 "coordination_succeeded": coordination.is_ok(),
             }))?,
         )?;

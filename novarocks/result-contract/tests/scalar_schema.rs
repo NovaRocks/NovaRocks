@@ -430,8 +430,9 @@ fn struct_field_count_is_bounded_without_silently_deduplicating_names() {
 
 #[test]
 fn scalar_ceiling_constants_match_the_frozen_p00_profile() {
-    // Read only the frozen scalar/session object. No JSON dependency or runtime
-    // funding authority is added to this dependency-free contract crate.
+    // The historical mysql_input object also freezes the still-owned Internal
+    // Scalar/session limits. Retain those exact facts without reviving a client
+    // input owner, changing the historical profile, or granting capacity.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/testing/mem-1-m07/profile-v1.json");
     let json = std::fs::read_to_string(path).unwrap();

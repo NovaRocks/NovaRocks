@@ -11,10 +11,6 @@ workspace = true
 doctest = false
 
 [features]
-mem-1-m07-hms-listing-observe = []
-mem-1-m07-closing-pressure = ["novarocks-mysql-adapter/mem-1-m07-closing-pressure"]
-mem-1-m07-root-observation = []
-mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
 
 [dependencies]
 novarocks-arrow-batch-codec.workspace = true
@@ -56,7 +52,6 @@ novarocks-spi.workspace = true
 novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-mv-application.workspace = true
-novarocks-mysql-adapter.workspace = true
 novarocks-trino-adapter.workspace = true
 novarocks-native-adapter.workspace = true
 novarocks-statistics-application.workspace = true

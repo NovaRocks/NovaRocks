@@ -1410,7 +1410,7 @@ mod affected_count_tests {
         else {
             panic!("COW success must preserve selected logical count")
         };
-        assert_eq!(completion.affected_rows(), 3);
+        assert_eq!(completion.count(), Some(3));
         assert_eq!(fixture.session.accumulated_row_count().unwrap(), 29);
         assert_eq!(fixture.session.finish_invocations(), 0);
     }

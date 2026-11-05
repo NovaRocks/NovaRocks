@@ -118,12 +118,12 @@ enum BackendReportedState {
 }
 
 message NativeResultSupportGeometry {
+  reserved 4, 5, 6, 71;
+  reserved "frontend_closing_positions", "frontend_ordinary_connections",
+      "frontend_control_connections", "frontend_closing_all_objects_bytes";
   uint64 frontend_client_compute_positions = 1;
   uint64 frontend_short_tail_positions = 2;
   uint64 frontend_client_window_positions = 3;
-  uint64 frontend_closing_positions = 4;
-  uint64 frontend_ordinary_connections = 5;
-  uint64 frontend_control_connections = 6;
   uint64 frontend_local_positions = 7;
   uint64 frontend_internal_positions = 8;
   uint64 frontend_supported_cancel_burst = 9;
@@ -188,7 +188,6 @@ message NativeResultSupportGeometry {
   uint64 root_actual_exit_deadline_ms = 68;
   uint64 root_retired_segment_tail_positions = 69;
   uint64 frontend_window_all_objects_bytes = 70;
-  uint64 frontend_closing_all_objects_bytes = 71;
   uint64 frontend_minimum_open_file_limit = 72;
   uint64 backend_minimum_open_file_limit = 73;
   uint64 transport_connecting_positions_per_lane = 74;

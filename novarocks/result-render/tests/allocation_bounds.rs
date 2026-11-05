@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     ClientRenderSchema, NativeRenderType as N, RenderColumn, RenderField, RenderPresentation as P,
     RenderTimeUnit as U, RootProfileV1 as V,
 };
-use novarocks_result_render::{ArrowMysqlTextEncoder, BoundedClientRowEncoder, RenderTurnStatus};
+use novarocks_result_render::{ArrowTrinoJsonEncoder, BoundedClientRowEncoder, RenderTurnStatus};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -98,7 +98,13 @@ fn prepare(array: ArrayRef, render: RenderField) -> (Arc<ClientRenderSchema>, Re
     .unwrap();
     let schema = Arc::new(
         ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: false,
+                },
+            ),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -124,7 +130,7 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
     let text = "x".repeat(128 * 1024);
     let (schema, batch) = prepare(
         Arc::new(StringArray::from(vec![text])),
-        f(N::String, P::ScalarText),
+        f(N::String, P::TrinoValue),
     );
     let schema = Arc::try_unwrap(schema).unwrap();
     let contract = Arc::new(RootOutputContract::new(
@@ -134,7 +140,7 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
     let weak = Arc::downgrade(&contract);
     let mut output = [0u8; V::EMIT_BYTES_PER_TURN];
     start();
-    let encoded = ArrowMysqlTextEncoder::try_new_root(Arc::clone(&contract), batch);
+    let encoded = ArrowTrinoJsonEncoder::try_new_root(Arc::clone(&contract), batch);
     let (allocated, calls, _) = stop();
     let mut encoder = encoded.unwrap();
     assert_eq!(
@@ -163,7 +169,7 @@ fn root_contract_schema_is_borrowed_through_actual_encoder_exit() {
 fn probe(schema: Arc<ClientRenderSchema>, batch: RecordBatch) {
     let mut out = vec![0; V::SEGMENT_BYTES];
     start();
-    let result = ArrowMysqlTextEncoder::try_new(schema, batch);
+    let result = ArrowTrinoJsonEncoder::try_new(schema, batch);
     let (allocated, calls, maximum) = stop();
     let mut e = result.unwrap();
     let cap = e.scratch_capacity_bytes();
@@ -196,13 +202,13 @@ fn fixed_actual_capacity_and_zero_turn_allocations() {
     let value = "x".repeat(4 * 1024 * 1024);
     let (schema, batch) = prepare(
         Arc::new(StringArray::from(vec![value.as_str()])),
-        f(N::String, P::ScalarText),
+        f(N::String, P::TrinoValue),
     );
     probe(schema, batch);
     let text = format!("{{\"k\":\"{}\"}}", "a\\\"".repeat(30000));
     let (schema, batch) = prepare(
         Arc::new(StringArray::from(vec![text.as_str()])),
-        f(N::Json, P::JsonText),
+        f(N::Json, P::TrinoValue),
     );
     probe(schema, batch);
     let array = Arc::new(BinaryArray::from(vec![vec![0xff; 200000].as_slice()])) as ArrayRef;
@@ -216,14 +222,14 @@ fn fixed_actual_capacity_and_zero_turn_allocations() {
     let (schema, batch) = prepare(
         Arc::new(array),
         f(
-            N::List(Box::new(f(N::Binary, P::ScalarText))),
-            P::MysqlContainer,
+            N::List(Box::new(f(N::Binary, P::TrinoValue))),
+            P::TrinoValue,
         ),
     );
     probe(schema, batch);
 }
 #[test]
-fn temporal_and_variant_frozen_offset_do_not_allocate() {
+fn temporal_and_variant_trino_values_do_not_allocate() {
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(Date32Array::from(vec![-719561])),
         Arc::new(TimestampNanosecondArray::from(vec![-1]).with_timezone("UTC")),
@@ -238,7 +244,7 @@ fn temporal_and_variant_frozen_offset_do_not_allocate() {
         N::Struct(vec![
             novarocks_result_contract::NamedRenderField {
                 name: "0".into(),
-                field: f(N::Date, P::ScalarText),
+                field: f(N::Date, P::TrinoValue),
             },
             novarocks_result_contract::NamedRenderField {
                 name: "1".into(),
@@ -247,15 +253,15 @@ fn temporal_and_variant_frozen_offset_do_not_allocate() {
                         unit: U::Nanosecond,
                         timezone: Some("UTC".into()),
                     },
-                    P::TimestampContainerText,
+                    P::TrinoValue,
                 ),
             },
         ]),
-        P::MysqlContainer,
+        P::TrinoValue,
     );
     let (schema, batch) = prepare(Arc::new(array), render);
     probe(schema, batch);
-    for offset in [-86399, -59, -30, 30, 59, 86399] {
+    {
         let mut value = vec![12 << 2];
         value.extend_from_slice(&1i64.to_le_bytes());
         let mut data = ((3 + value.len()) as u32).to_le_bytes().to_vec();
@@ -263,12 +269,7 @@ fn temporal_and_variant_frozen_offset_do_not_allocate() {
         data.extend(value);
         let (schema, batch) = prepare(
             Arc::new(LargeBinaryArray::from(vec![data.as_slice()])),
-            f(
-                N::Variant,
-                P::VariantJson {
-                    timezone_offset_seconds: offset,
-                },
-            ),
+            f(N::Variant, P::TrinoValue),
         );
         probe(schema, batch);
     }
@@ -277,8 +278,8 @@ fn temporal_and_variant_frozen_offset_do_not_allocate() {
 fn input_backing_remains_until_actual_encoder_exit() {
     let array = Arc::new(StringArray::from(vec!["x".repeat(200000)])) as ArrayRef;
     let weak = Arc::downgrade(&array);
-    let (schema, batch) = prepare(array, f(N::String, P::ScalarText));
-    let mut e = ArrowMysqlTextEncoder::try_new(schema, batch).unwrap();
+    let (schema, batch) = prepare(array, f(N::String, P::TrinoValue));
+    let mut e = ArrowTrinoJsonEncoder::try_new(schema, batch).unwrap();
     e.step(&mut [0; 100]).unwrap();
     e.cancel();
     assert!(weak.upgrade().is_some(), "cancel is not physical release");
@@ -289,7 +290,7 @@ fn input_backing_remains_until_actual_encoder_exit() {
 #[test]
 fn maximum_native_depth_keeps_fixed_capacity() {
     let mut array = Arc::new(Int8Array::from(vec![0])) as ArrayRef;
-    let mut render = f(N::SignedInteger(8), P::ScalarText);
+    let mut render = f(N::SignedInteger(8), P::TrinoValue);
     for _ in 0..63 {
         let child = Arc::new(Field::new("item", array.data_type().clone(), true));
         array = Arc::new(ListArray::new(
@@ -298,7 +299,7 @@ fn maximum_native_depth_keeps_fixed_capacity() {
             array,
             None,
         ));
-        render = f(N::List(Box::new(render)), P::MysqlContainer);
+        render = f(N::List(Box::new(render)), P::TrinoValue);
     }
     let (schema, batch) = prepare(array, render);
     probe(schema, batch);

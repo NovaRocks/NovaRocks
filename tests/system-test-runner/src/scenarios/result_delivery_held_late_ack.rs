@@ -15,31 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original S+8 query, one held replay and two sealed ACK-only reads.
-//! This is a child of exact_mysql_native_driver only to reuse its bounded observations.
-//! It neither creates nor weakens an exact MySQL gate/control owner.
-use super::{
-    AdmittedExactNativeRun, Census, HEALTH_ROW_SHA, HEALTH_SQL, OriginalPreparedConfig,
-    RECEIPT_BYTES, S, await_idle, census, check, retain_secondary, sleep_until_sample,
-};
-use crate::actors::mysql_stream::{
-    AsyncMysqlStream, OwnedTextResultObservation, TextResultObservation,
-};
-use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::independent_root_target::{
+//! One original S+8 Trino query, a real held Native replay and two sealed ACKs.
+//! Ordinary explicit registry entry; the original Native driver owns its actual
+//! response/credit and Join. The FE proxy copy is not that encoded response.
+use super::independent_root_target::{
     FrontendIdentitySource, IndependentRootObserver, IndependentRootTarget,
 };
-use crate::scenarios::result_delivery_root_protocol::{
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::result_delivery_root_protocol::{
     held_response::{HeldObservation, HeldRootResponse, JoinedOriginalConnection, ProvenReplayOne},
     probe_owned,
 };
+use super::result_delivery_support::{
+    OriginalRootCensus as Census, await_original_root_idle as await_idle,
+    check_original_root_deadline as check, original_root_census as census,
+    sleep_original_root_sample as sleep_until_sample,
+};
+use crate::actors::sql::{SqlSession, TrinoValue, single_integer};
+use crate::actors::trino_protocol::TrinoClient;
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
+use novarocks_cluster_harness::native_root_reply_fault::{
+    RootReplyFaultBounds, RootReplyFaultObservation, RootReplyOriginalDisposition,
+    RootReplyOriginalIdentity,
+};
 use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
-use novarocks_cluster_harness::{LaunchProfile, TestClusterOwner};
+use novarocks_cluster_harness::{
+    CrossProcessRootReplyFaultConfig, LaunchProfile, TestClusterOwner,
+};
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultRead};
 use novarocks_proto_codec::FieldPath;
 use novarocks_result_contract::{RootOutputKind, RootProfileId};
 use novarocks_task_codec::root_result::{decode_read, encode_read};
+use novarocks_test_trino_client::{Column, TrinoError, TypeArgument};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -49,16 +57,16 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{runtime::Runtime, sync::oneshot, task::JoinHandle};
+use tokio::runtime::Runtime;
 
 const NAME: &str = "result-delivery/held-response-late-ack";
 const SQL: &str = "SELECT REPEAT('x', 1048576) AS payload FROM generate_series(1, 1)";
-const ROW_SHA: &str = "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c52fd50b8";
+const HEALTH_SQL: &str = "SELECT SUM(generate_series) AS total FROM generate_series(1, 100)";
+const S: u64 = 1_048_576;
 const SAMPLES: usize = 51;
+const RECEIPT_BYTES: usize = 131_072;
 const WHOLE: Duration = Duration::from_secs(20);
 const PROTOCOL: Duration = Duration::from_secs(5);
-const TARGET_RUN_TOKEN: &str = "m07-held-late-ack-target";
-const HEALTH_RUN_TOKEN: &str = "m07-held-late-ack-health";
 const ROOT_FIELDS: [&str; 14] = [
     "channels",
     "terminal_task_records",
@@ -76,39 +84,26 @@ const ROOT_FIELDS: [&str; 14] = [
     "metadata_bytes",
 ];
 
-/// Called after prelaunch admission verifies the immutable input, actual
-/// neutral-marker feature and original build pins. Shape checking below is local.
-pub(super) fn from_admitted(
-    run: AdmittedExactNativeRun,
-    live_fences: bool,
-) -> Result<Box<dyn Scenario>> {
-    run.validate_shape()?;
-    Ok(Box::new(HeldLateAck {
-        run: Arc::new(run),
-        clock: Mutex::new(None),
-        prepared: Mutex::new(None),
-        source_fences: Mutex::new(if live_fences {
-            Some(crate::held_live_source_fence::SourceFenceOwner::from_original_stdin()?)
-        } else {
-            None
-        }),
-    }))
+pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
+    vec![Box::new(HeldLateAck::default())]
 }
+#[derive(Default)]
 struct HeldLateAck {
-    run: Arc<AdmittedExactNativeRun>,
     clock: Mutex<Option<Instant>>,
-    prepared: Mutex<Option<OriginalPreparedConfig>>,
-    source_fences: Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
+    intent: SqlIntentOwner,
 }
 impl HeldLateAck {
     fn clock(&self) -> Result<Instant> {
         self.clock
             .lock()
-            .map_err(|_| anyhow::anyhow!("original root clock poisoned"))?
-            .context("original root clock was not captured before role launch")
+            .map_err(|_| anyhow::anyhow!("original Root clock poisoned"))?
+            .context("original Root clock was not captured before role launch")
     }
 }
 impl Scenario for HeldLateAck {
+    fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+        super::declarations::for_module("result_delivery_held_late_ack", self.name(), true, false)
+    }
     fn name(&self) -> &'static str {
         NAME
     }
@@ -118,155 +113,105 @@ impl Scenario for HeldLateAck {
     fn validate_runner_inputs(&self, profile: LaunchProfile) -> Result<()> {
         ensure!(
             profile == LaunchProfile::FaultScenario,
-            "held response requires the fault-scenario launch profile"
+            "held response requires fault-scenario profile"
         );
-        self.run.validate_shape()
+        Ok(())
     }
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
         let mut clock = self
             .clock
             .lock()
-            .map_err(|_| anyhow::anyhow!("original clock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("original Root clock poisoned"))?;
         ensure!(clock.is_none(), "original prelaunch clock already captured");
         *clock = Some(Instant::now() + WHOLE);
-        // Neutral source feature is build-admitted, not enabled by an environment knob.
-        // No exact Hub, socket, nonce or controller is created for this unarmed scene.
-        Ok(ScenarioLaunchConfig::default())
+        Ok(ScenarioLaunchConfig {
+            native_root_reply_fault: Some(CrossProcessRootReplyFaultConfig {
+                backend_indices: (0..3).collect(),
+                bounds: RootReplyFaultBounds::default(),
+            }),
+            native_fault_proxies: novarocks_cluster_harness::CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: (0..3).map(|index| (index, 1_048_576)).collect(),
+            },
+            ..ScenarioLaunchConfig::default()
+        })
     }
     fn test_session_plan(
         &self,
-        launch: &ScenarioLaunchConfig,
-        _scenario_root: &Path,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
         cluster_size: usize,
         binary: &Path,
-        original_deadline: Instant,
+        deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        self.run.validate_shape()?;
         ensure!(
-            original_deadline <= self.clock()?,
-            "held declaration renewed original clock"
+            deadline == self.clock()?,
+            "held declaration changed its original prelaunch clock"
         );
-        ensure!(
-            launch.child_environment == Default::default(),
-            "held root observation cannot adopt exact fixture or ambient control inputs"
-        );
-        Ok(Some(super::variant_sessions::fixture_plan(
-            binary,
+        Ok(Some(self.intent.freeze_root_observation(
+            vec![StatementSpec {
+                    sql: SQL.into(),
+                    faults: vec![],
+                    observations: (0..cluster_size)
+                        .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(1)))
+                        .collect(),
+                }],
             cluster_size,
-            original_deadline,
-            vec![super::variant_sessions::grant(
-                "root-observation",
-                "original-neutral-root",
-                json!({"action":"observe"}),
-            )],
-            "mem-1-m07-root-observation",
-            &["novarocks-server", "novarocks-frontend-application"],
-            &[TARGET_RUN_TOKEN, HEALTH_RUN_TOKEN],
+            binary,
+            deadline,
         )?))
     }
     fn root_observation_deadline(&self) -> Result<Option<Instant>> {
         Ok(Some(self.clock()?))
     }
-    fn freeze_prepared_exact_config(
-        &self,
-        artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
-        root: &Path,
-        deadline: Instant,
-    ) -> Result<()> {
-        ensure!(
-            deadline == self.clock()?,
-            "prepared config renewed original clock"
-        );
-        let mut prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("prepared owner poisoned"))?;
-        ensure!(prepared.is_none(), "prepared config already frozen");
-        *prepared = Some(OriginalPreparedConfig::freeze(artifact, root, deadline)?);
-        let mut fences = self
-            .source_fences
-            .lock()
-            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
-        if let Some(fences) = fences.as_mut() {
-            fences.prepared(deadline)?;
-        }
-        Ok(())
-    }
-    fn observe_original_durable_log_owner(
-        &self,
-        role: &str,
-        device: u64,
-        inode: u64,
-    ) -> Result<()> {
-        let mut fences = self
-            .source_fences
-            .lock()
-            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
-        fences
-            .as_mut()
-            .context("original source fence owner is not enabled")?
-            .log_owner(role, device, inode, self.clock()?)
-    }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let deadline = self.clock()?;
         check(deadline)?;
-        let prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("prepared owner poisoned"))?;
-        prepared
-            .as_ref()
-            .context("prepared callback did not run before FE spawn")?
-            .verify(context.effective_launch_config_evidence())?;
-        // A running worker drives the original MySQL job while synchronous strict
-        // probe uses its existing private runtime; no nested Runtime::block_on.
+        ensure!(
+            context.deadline() == deadline && context.handle().be_count() == 3,
+            "held scene lost its original 1FE+3BE clock"
+        );
+        for index in 0..3 {
+            context.handle().native_exchange_fault(index)?;
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()?;
         context.retain_artifacts();
-        run_owned(context, &runtime, deadline, &self.run, &self.source_fences)
+        run_owned(context, &runtime, deadline, &self.intent)
     }
     fn teardown(&self) -> Result<()> {
-        let prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| anyhow::anyhow!("prepared owner poisoned"))?;
-        if let Some(prepared) = &*prepared {
-            prepared.verify_original_file()?;
-        }
-        // This occurs after original runner cleanup; a late exit cannot become PASS.
         check(self.clock()?)
     }
 }
 
 #[derive(Default)]
 struct Facts {
-    samples: Vec<Value>, // admission on every push: at most the original 51 positions
+    samples: Vec<Value>,
     actor: Option<HeldObservation>,
     root: Option<Value>,
     target_source: Option<Value>,
-    closed_acks: Vec<Value>, // checked before each push: at most two
+    closed_acks: Vec<Value>,
     original_prelaunch: Option<Instant>,
-    mysql_terminal_code: Option<u16>,
     health_before_tasks_created: Option<[u64; 3]>,
     health_after_tasks_created: Option<[u64; 3]>,
     protocol_complete: bool,
     actor_actual_join: bool,
-    mysql_actual_join: bool,
-    kill_attempted: bool,
-    kill_returned: bool,
+    query_actual_join: bool,
+    delete_attempted: bool,
+    delete_returned: bool,
     protocol_started_from_original_prelaunch_us: Option<u128>,
-    kill_started_from_original_prelaunch_us: Option<u128>,
-    kill_returned_from_original_prelaunch_us: Option<u128>,
+    delete_started_from_original_prelaunch_us: Option<u128>,
+    delete_returned_from_original_prelaunch_us: Option<u128>,
     settled_from_original_prelaunch_us: Option<u128>,
-    mysql: Option<TextResultObservation>,
-    health: Option<TextResultObservation>,
+    trino_terminal: Option<TrinoError>,
+    trino_pages: u64,
+    health: Option<Value>,
     expected_server_err_retained: bool,
     expected_connection_cancel_retained: bool,
 }
 struct OwnedFailure {
-    errors: [Option<anyhow::Error>; 8],
+    errors: [Option<anyhow::Error>; 12],
 }
 impl std::fmt::Debug for OwnedFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -289,7 +234,109 @@ impl std::error::Error for OwnedFailure {
             .map(|error| error.as_ref())
     }
 }
-type MysqlJob = JoinHandle<(AsyncMysqlStream, OwnedTextResultObservation)>;
+#[derive(Debug)]
+struct SecondaryFailure {
+    primary: anyhow::Error,
+    secondary: anyhow::Error,
+}
+impl std::fmt::Display for SecondaryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _retained = &self.secondary;
+        f.write_str("original held primary and cleanup errors retained")
+    }
+}
+impl std::error::Error for SecondaryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+fn retain_secondary(slot: &mut Option<anyhow::Error>, secondary: anyhow::Error) {
+    *slot = Some(match slot.take() {
+        Some(primary) => SecondaryFailure { primary, secondary }.into(),
+        None => secondary,
+    });
+}
+struct PublicTerminal {
+    error: TrinoError,
+    pages: u64,
+}
+type PublicJob = std::thread::JoinHandle<Result<PublicTerminal>>;
+fn public_query(
+    actor: TrinoClient,
+    query: String,
+    first: String,
+    live: Arc<Mutex<Option<String>>>,
+) -> Result<PublicTerminal> {
+    let mut uri = first;
+    let mut pages = 0u64;
+    loop {
+        let raw = actor.get(&uri)?;
+        ensure!(
+            raw.status == 200,
+            "original public query returned HTTP failure instead of Trino terminal error"
+        );
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Page {
+            id: String,
+            next_uri: Option<String>,
+            error: Option<TrinoError>,
+            data: Option<Vec<Value>>,
+            columns: Option<Vec<Column>>,
+            stats: Value,
+            update_type: Option<String>,
+            update_count: Option<u64>,
+        }
+        let page: Page = serde_json::from_slice(&raw.body)?;
+        *live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original continuation owner poisoned"))? =
+            page.next_uri.clone();
+        ensure!(
+            page.id == query
+                && page.update_type.is_none()
+                && page.update_count.is_none()
+                && page.data.as_ref().is_none_or(Vec::is_empty),
+            "held original query changed identity or published data before its held first Root response"
+        );
+        if let Some(columns) = page.columns {
+            ensure!(
+                columns.len() == 1
+                    && columns[0].name == "payload"
+                    && columns[0].type_name == "varchar"
+                    && columns[0].type_signature.raw_type == "varchar"
+                    && columns[0].type_signature.arguments == [TypeArgument::Long(2_147_483_647)],
+                "held original Trino declaration differs"
+            );
+        }
+        pages = pages
+            .checked_add(1)
+            .context("original public page count overflow")?;
+        if let Some(error) = page.error {
+            ensure!(
+                page.next_uri.is_none() && page.stats["state"] == "FAILED",
+                "original query error was not terminal"
+            );
+            return Ok(PublicTerminal { error, pages });
+        }
+        uri = page
+            .next_uri
+            .context("held query unexpectedly succeeded before exact cancellation")?;
+    }
+}
+#[derive(Debug)]
+struct OriginalPublicPanic(Mutex<Box<dyn std::any::Any + Send>>);
+impl std::fmt::Display for OriginalPublicPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _original = &self.0;
+        f.write_str("original public held-query thread panicked; actual payload retained")
+    }
+}
+impl std::error::Error for OriginalPublicPanic {}
+fn join_public(job: PublicJob) -> Result<PublicTerminal> {
+    job.join()
+        .map_err(|payload| anyhow::Error::new(OriginalPublicPanic(Mutex::new(payload))))?
+}
 
 fn request(root: TaskIdentity, ack: bool) -> Result<RootResultRead> {
     let read = RootResultRead::try_new(
@@ -436,38 +483,6 @@ fn qualify(
         runtime.block_on(sleep_until_sample(deadline))?; // original fixed 100 ms
     }
 }
-fn validate_mysql(value: &OwnedTextResultObservation, health: bool) -> Result<()> {
-    let row = &value.observation;
-    ensure!(
-        row.columns == 1 && row.schema.len() == 1 && row.rows == 1 && row.packets == 5,
-        "original MySQL row/metadata/packet count differs"
-    );
-    if health {
-        ensure!(
-            value.actual_failure.is_none()
-                && value.server_result_error_code.is_none()
-                && row.error.is_none()
-                && row.schema[0].name == "total"
-                && row.schema[0].mysql_type == 8
-                && row.row_payload_bytes == 5
-                && row.row_sha256 == HEALTH_ROW_SHA,
-            "same original socket health oracle differs"
-        );
-    } else {
-        ensure!(
-            value.server_result_error_code == Some(1317)
-                && value.actual_failure.is_some()
-                && row.error.is_some()
-                && row.schema[0].name == "payload"
-                && row.schema[0].mysql_type == 253
-                && row.row_payload_bytes == S + 4
-                && row.row_sha256 == ROW_SHA,
-            "original complete row plus interrupted terminal differs"
-        );
-    }
-    Ok(())
-}
-
 fn original_role_inventory(
     (frontend, backends): (&ProcessLaunchIdentity, &[ProcessLaunchIdentity]),
 ) -> Result<Value> {
@@ -478,7 +493,7 @@ fn original_role_inventory(
                 .iter()
                 .zip(["be-0", "be-1", "be-2"])
                 .all(|(role, name)| role.role == name),
-        "original held role inventory differs from the admitted topology"
+        "original held role inventory differs from the declared topology"
     );
     // The harness API returns (FE, BE slice). Serialize the same four original
     // launch identities in order, not that tuple's nested JSON representation.
@@ -494,27 +509,29 @@ fn run_owned(
     context: &mut ScenarioContext,
     runtime: &Runtime,
     deadline: Instant,
-    admitted: &AdmittedExactNativeRun,
-    source_fences: &Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
+    intent: &SqlIntentOwner,
 ) -> Result<()> {
     let original_roles = original_role_inventory(context.process_launch_identities())?;
-    // Every original handle stays outside the primary operation and all fallible writes.
+    let control = context.handle().native_root_reply_fault(0)?;
     let mut actor: Option<HeldRootResponse> = None;
-    let mut job: Option<MysqlJob> = None;
-    let mut resume: Option<oneshot::Sender<()>> = None;
-    let mut stream: Option<AsyncMysqlStream> = None;
-    let mut cid: Option<u32> = None;
+    let mut job: Option<PublicJob> = None;
+    let mut http = None::<TrinoClient>;
+    let live = Arc::new(Mutex::new(None::<String>));
+    let mut statement = None;
+    let mut original = None::<RootReplyOriginalIdentity>;
     let mut protocol_deadline = None;
+    let mut delete_started = None;
+    let mut replay_joined = None;
     let mut facts = Facts {
         original_prelaunch: Some(deadline - WHOLE),
         ..Facts::default()
     };
-    let mut errors: [Option<anyhow::Error>; 8] = std::array::from_fn(|_| None);
-    let mut expected_server_error: Option<anyhow::Error> = None;
-    let mut expected_connection_exit: Option<tokio::task::JoinError> = None;
+    let mut errors: [Option<anyhow::Error>; 12] = std::array::from_fn(|_| None);
+    let mut expected_connection_exit = None;
+    let mut expected_server_error = None;
+    let origin = deadline - WHOLE;
     let primary = (|| -> Result<()> {
-        runtime.block_on(await_idle(context, deadline))?;
-        // Only this selected neutral source supplies expected FE; no RPC/CID/PID fallback.
+        runtime.block_on(await_idle(context, deadline, "held-before"))?;
         let frontend = context
             .handle()
             .original_root_observation_frontend_identity(deadline)?;
@@ -524,88 +541,95 @@ fn run_owned(
             deadline,
             FrontendIdentitySource::RootObservation,
         )?;
-        {
-            let mut fences = source_fences
-                .lock()
-                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
-            if let Some(fences) = fences.as_mut() {
-                fences.baseline(observer.original_baseline_log_bytes(), deadline)?;
-            }
-        }
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        check(deadline)?;
-        let client = runtime.block_on(async {
-            tokio::time::timeout_at(deadline.into(), async {
-                AsyncMysqlStream::connect_with_receive_buffer(
-                    &user,
-                    port,
-                    deadline.saturating_duration_since(Instant::now()),
-                    67_108_864,
-                    4096,
-                )
-                .await
-            })
-            .await
-        })??;
-        check(deadline)?;
-        ensure!(
-            client
-                .receive_buffer_bytes()
-                .is_some_and(|bytes| bytes > 0 && bytes <= 65536),
-            "actual original socket receive bound unavailable"
-        );
-        cid = Some(client.connection_id()?);
-        super::variant_sessions::arm_statement_until(
-            context,
-            TARGET_RUN_TOKEN,
-            cid.unwrap(),
-            SQL,
-            deadline,
-        )?;
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (resume_tx, resume_rx) = oneshot::channel();
-        resume = Some(resume_tx);
-        let mut client = client;
-        job = Some(runtime.spawn(async move {
-            let result = client
-                .observe_text_query_owned_until(
-                    SQL,
-                    Duration::ZERO,
-                    Some((ready_tx, resume_rx)),
-                    deadline,
-                )
-                .await;
-            (client, result)
-        }));
-        runtime.block_on(async {
-            tokio::time::timeout_at(deadline.min(Instant::now() + PROTOCOL).into(), ready_rx)
-                .await??;
-            Ok::<(), anyhow::Error>(())
-        })?;
-        ensure!(
-            !job.as_ref().unwrap().is_finished(),
-            "original MySQL job left metadata pause"
-        );
+        // Captured once before submission/discovery; neither another HTTP page
+        // nor the independent Native actor renews this original five seconds.
         let phase = deadline.min(Instant::now() + PROTOCOL);
-        protocol_deadline = Some(phase); // exactly once, before discovery or any Root request
-        facts.protocol_started_from_original_prelaunch_us = Some(
-            Instant::now()
-                .saturating_duration_since(deadline - WHOLE)
-                .as_micros(),
+        protocol_deadline = Some(phase);
+        facts.protocol_started_from_original_prelaunch_us = Some(origin.elapsed().as_micros());
+        let client = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            deadline,
+            &context.scenario_root().join("held-original-trino-http"),
+        )?
+        .with_session(&[("x-trino-time-zone", "Asia/Shanghai")]);
+        http = Some(client.clone());
+        let pending = client.submit(SQL)?;
+        let page = pending.assert_success()?;
+        ensure!(
+            page["stats"]["state"] == "QUEUED" && page.get("data").is_none(),
+            "held POST executed before exact original arm"
         );
+        let query = page["id"]
+            .as_str()
+            .context("held POST omitted original query id")?
+            .to_owned();
+        let uri = pending
+            .next_uri()?
+            .context("held POST has no original continuation")?;
+        *live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original continuation owner poisoned"))? =
+            Some(uri.clone());
+        statement = Some(intent.take(0)?.arm_client_query(context, &query, SQL)?);
+        control.begin_capture(phase)?;
+        let original_live = live.clone();
+        job = Some(
+            std::thread::Builder::new()
+                .name("held-original-trino".into())
+                .spawn(move || public_query(client, query, uri, original_live))?,
+        );
+        let installed = context
+            .handle()
+            .await_statement_root_installed(statement.as_ref().unwrap(), phase)?;
         let target = observer.observe_ready_until(context, phase)?;
-        {
-            let mut fences = source_fences
-                .lock()
-                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
-            if let Some(fences) = fences.as_mut() {
-                fences.target(target.after_log_bytes, phase)?;
-            }
-        }
+        ensure!(
+            target.root == installed.root && target.frontend == frontend,
+            "held target differs from original FE Installed and independent role facts"
+        );
         facts.root = Some(identity(target.root));
         facts.target_source = Some(observer.source_evidence(&target)?);
-        // Same closed whole-cluster inventory and two genuine retained Data positions.
+        loop {
+            check(phase)?;
+            ensure!(
+                !job.as_ref().unwrap().is_finished(),
+                "held original query exited before exact Data capture"
+            );
+            if let Some(candidate) = control.candidate() {
+                ensure!(
+                    candidate.read.root_task() == target.root
+                        && candidate.caller == frontend
+                        && candidate.backend_index == target.root_backend_index
+                        && candidate.read.profile() == RootProfileId::V1
+                        && candidate.read.kind() == RootOutputKind::ClientRows
+                        && candidate.read.consumed() == 0
+                        && candidate.read.wanted().map(NonZeroU64::get) == Some(1),
+                    "held candidate differs from the exact installed original Root"
+                );
+                control.arm_exact_hold(target.root, frontend, target.root_backend_index)?;
+                break;
+            }
+            runtime.block_on(sleep_until_sample(phase))?;
+        }
+        loop {
+            check(phase)?;
+            ensure!(
+                !job.as_ref().unwrap().is_finished(),
+                "original query exited before its real response became held"
+            );
+            if let Some(held) = control.observation().original_hold {
+                ensure!(
+                    held.identity.root == target.root
+                        && held.identity.caller == frontend
+                        && held.identity.backend_index == target.root_backend_index
+                        && held.disposition == RootReplyOriginalDisposition::Held,
+                    "original response hold changed identity or settled early"
+                );
+                original = Some(held.identity);
+                break;
+            }
+            runtime.block_on(sleep_until_sample(phase))?;
+        }
         qualify(
             context, runtime, &mut facts, &observer, &target, phase, false, false, "W2",
         )?;
@@ -625,7 +649,7 @@ fn run_owned(
         let wire = encode_read(&read);
         let (reply, _) = probe_owned(context, target.root_backend_index, &wire, 0, phase)?;
         let proof = ProvenReplayOne::from_validated_data1(&read, &reply)?;
-        drop(reply); // no decoded body alias is retained by this scene
+        drop(reply); // no decoded data alias substitutes for the real held response
         qualify(
             context,
             runtime,
@@ -658,20 +682,25 @@ fn run_owned(
         )?;
         facts.actor = Some(runtime.block_on(actor.as_mut().unwrap().observe_held())?);
         check(phase)?;
-        facts.kill_attempted = true; // preserve unknown outcome; never retry this KILL
-        facts.kill_started_from_original_prelaunch_us = Some(
-            Instant::now()
-                .saturating_duration_since(deadline - WHOLE)
-                .as_micros(),
+        let uri = live
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original continuation owner poisoned"))?
+            .clone()
+            .context("original held query lost its active continuation before DELETE")?;
+        control.expect_exact_original_query_cancellation(original.as_ref().unwrap())?;
+        facts.delete_attempted = true; // retain unknown outcome; never retry this DELETE
+        let started = Instant::now();
+        delete_started = Some(started);
+        facts.delete_started_from_original_prelaunch_us =
+            Some(started.duration_since(origin).as_micros());
+        let response = http.as_ref().unwrap().delete(&uri)?;
+        ensure!(
+            matches!(response.status, 200 | 204),
+            "held same-query DELETE did not return success"
         );
-        context.handle().kill_query_until(cid.unwrap(), phase)?;
         check(phase)?;
-        facts.kill_returned = true;
-        facts.kill_returned_from_original_prelaunch_us = Some(
-            Instant::now()
-                .saturating_duration_since(deadline - WHOLE)
-                .as_micros(),
-        );
+        facts.delete_returned = true;
+        facts.delete_returned_from_original_prelaunch_us = Some(origin.elapsed().as_micros());
         qualify(
             context,
             runtime,
@@ -697,14 +726,10 @@ fn run_owned(
                 facts.closed_acks.len() < 2,
                 "closed ACK observation positions exhausted"
             );
-            facts
-                .closed_acks
-                .push(json!({"label":label,"root":identity(reply.root_task),
-                "profile":reply.profile.get(),"kind":"ClientRows", // actual typed proof checked above
-                "wanted":ack.wanted().map(|n| n.get()),"consumed":ack.consumed(),
+            facts.closed_acks.push(json!({"label":label,"root":identity(reply.root_task),"profile":reply.profile.get(),
+                "kind":"ClientRows","wanted":ack.wanted().map(NonZeroU64::get),"consumed":ack.consumed(),
                 "accepted_consumed":reply.accepted_consumed,"outcome":"AwaitTerminalControl",
-                "observed_from_original_prelaunch_us":Instant::now()
-                    .saturating_duration_since(deadline-WHOLE).as_micros()}));
+                "observed_from_original_prelaunch_us":origin.elapsed().as_micros()}));
             qualify(
                 context, runtime, &mut facts, &observer, &target, phase, true, true, label,
             )?;
@@ -715,26 +740,39 @@ fn run_owned(
         Ok(())
     })();
     errors[0] = primary.err();
-
-    // On failed discovery/probe, cancel the submitted original statement at most once.
-    if job.is_some() && !facts.kill_attempted {
-        facts.kill_attempted = true;
-        if let Some(cid) = cid {
-            let limit = protocol_deadline.unwrap_or(deadline); // existing whole clock, no renewed phase
-            match context.handle().kill_query_until(cid, limit) {
-                Ok(()) => facts.kill_returned = true,
-                Err(error) => retain_secondary(&mut errors[1], error),
+    // Failed capture/discovery still keeps and cancels the same submitted
+    // query at most once. A successful terminal page leaves no live URI.
+    if job.is_some() && !facts.delete_attempted {
+        let cancelled = (|| -> Result<()> {
+            let uri = live
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original continuation owner poisoned"))?
+                .clone();
+            if let Some(uri) = uri {
+                facts.delete_attempted = true;
+                let response = http
+                    .as_ref()
+                    .context("original query lost its HTTP owner")?
+                    .delete(&uri)?;
+                ensure!(
+                    matches!(response.status, 200 | 204),
+                    "original query cleanup DELETE failed"
+                );
+                facts.delete_returned = true;
             }
-        }
+            Ok(())
+        })();
+        errors[1] = cancelled.err();
     }
-    // Even an expired phase invokes actual settle on the retained same handle.
-    // Actual join may be late; the actor keeps Clock failure sticky. No timeout-drop.
+    // Settle the same real replay actor even after phase expiry. Its sticky
+    // clock and actual original driver Join never become a timeout/drop.
     if let Some(owner) = actor.as_mut() {
         match runtime.block_on(owner.settle()) {
             Ok(JoinedOriginalConnection {
                 observation,
                 actual_expected_cancellation,
             }) => {
+                replay_joined = Some(Instant::now());
                 facts.actor_actual_join = true;
                 facts.actor = Some(observation);
                 expected_connection_exit = actual_expected_cancellation;
@@ -745,110 +783,123 @@ fn run_owned(
             }
         }
     }
-    facts.settled_from_original_prelaunch_us = Some(
-        Instant::now()
-            .saturating_duration_since(deadline - WHOLE)
-            .as_micros(),
-    );
-    if let Some(resume) = resume.take() {
-        let _ = resume.send(());
-    }
-    // Borrow the original MySQL handle until it really returns. The observer owns
-    // its timeout and returns retained partial facts; no outer timeout drops it.
-    if let Some(handle) = job.as_mut() {
-        match runtime.block_on(handle) {
-            Ok((client, mut value)) => {
-                facts.mysql_actual_join = true;
-                facts.mysql_terminal_code = value.server_result_error_code;
-                if let Err(error) = validate_mysql(&value, false) {
-                    retain_secondary(&mut errors[3], error);
-                }
-                if value.server_result_error_code == Some(1317) {
-                    expected_server_error = value.actual_failure.take();
-                } else if let Some(error) = value.actual_failure.take() {
-                    retain_secondary(&mut errors[3], error);
-                }
-                facts.mysql = Some(value.observation);
-                stream = Some(client);
+    facts.settled_from_original_prelaunch_us = Some(origin.elapsed().as_micros());
+    // The FE response copy remains independent of the real replay actor. Only
+    // now release that original response, or retain the actual failed release.
+    let released = (|| -> Result<()> {
+        let original = original
+            .as_ref()
+            .context("original FE response never became held")?;
+        control.release_exact_original(original)?;
+        let phase = protocol_deadline.context("original protocol clock was never captured")?;
+        loop {
+            check(phase)?;
+            let observed = control.observation();
+            ensure!(
+                observed.failures.is_empty(),
+                "original FE response actor failed before settle"
+            );
+            let held = observed
+                .original_hold
+                .context("original FE hold disappeared")?;
+            ensure!(
+                &held.identity == original,
+                "original FE response changed during release"
+            );
+            if held.settled_at.is_some() {
+                ensure!(
+                    matches!(
+                        held.disposition,
+                        RootReplyOriginalDisposition::ForwardedOriginal
+                            | RootReplyOriginalDisposition::ExactDownstreamCancelled
+                            | RootReplyOriginalDisposition::JoinedOriginalConnectionExit
+                    ),
+                    "original FE response did not actually settle"
+                );
+                break;
             }
-            Err(error) => retain_secondary(&mut errors[3], error.into()),
+            runtime.block_on(sleep_until_sample(phase))?;
         }
-        job.take(); // original handle already actually joined, not discarded pending
+        Ok(())
+    })();
+    errors[8] = released.err();
+    if errors[0].is_some() || errors[8].is_some() {
+        control.disarm();
+    }
+    if let Some(job) = job.take() {
+        match join_public(job) {
+            Ok(value) => {
+                facts.query_actual_join = true;
+                facts.trino_pages = value.pages;
+                let validation = validate_public_terminal(&value.error);
+                facts.trino_terminal = Some(value.error.clone());
+                if let Err(error) = validation {
+                    retain_secondary(&mut errors[3], error);
+                } else {
+                    expected_server_error = Some(value.error);
+                }
+            }
+            Err(error) => retain_secondary(&mut errors[3], error),
+        }
     }
     facts.expected_server_err_retained = expected_server_error.is_some();
     facts.expected_connection_cancel_retained = expected_connection_exit.is_some();
     if errors.iter().all(Option::is_none) {
-        let recovery = (|| -> Result<()> {
-            let before = runtime.block_on(census(context, deadline))?.created;
-            facts.health_before_tasks_created = Some(before);
-            let client = stream
-                .as_mut()
-                .context("original client disappeared before health")?;
-            super::variant_sessions::arm_statement_until(
-                context,
-                HEALTH_RUN_TOKEN,
-                client.connection_id()?,
-                HEALTH_SQL,
-                deadline,
-            )?;
-            let mut value = runtime.block_on(client.observe_text_query_owned_until(
-                HEALTH_SQL,
-                Duration::ZERO,
-                None,
-                deadline,
-            ));
-            let validation = validate_mysql(&value, true);
-            facts.health = Some(value.observation);
-            if let Some(error) = value.actual_failure.take() {
-                return Err(error);
-            }
-            validation?;
-            let after = runtime.block_on(census(context, deadline))?.created;
-            facts.health_after_tasks_created = Some(after);
-            ensure!(
-                after
-                    .iter()
-                    .zip(before)
-                    .any(|(after, before)| *after > before)
-                    && after
-                        .iter()
-                        .zip(before)
-                        .all(|(after, before)| *after >= before),
-                "same socket health produced no real native tasks"
-            );
+        errors[4]=(||->Result<()> {
+            let before=runtime.block_on(census(context,deadline))?.created;
+            facts.health_before_tasks_created=Some(before);
+            let result=SqlSession::new(context.sql_user(),context.trino_port(),deadline)?.execute(HEALTH_SQL)?;
+            ensure!(result.is_result_set() && result.columns.len()==1 && result.columns[0].name=="total"
+                && result.columns[0].type_name=="bigint" && result.columns[0].type_signature.raw_type=="bigint"
+                && result.columns[0].type_signature.arguments.is_empty()
+                && result.rows==[vec![TrinoValue::Integer(5050)]],"ordinary Trino health oracle differs");
+            facts.health=Some(json!({"columns":result.columns,"rows":result.rows.len(),"actual_total":single_integer(&result)?}));
+            let after=runtime.block_on(census(context,deadline))?.created;
+            facts.health_after_tasks_created=Some(after);
+            ensure!(after.iter().zip(before).any(|(a,b)|*a>b) && after.iter().zip(before).all(|(a,b)|*a>=b),
+                "ordinary health query produced no real Native Tasks");
             check(deadline)
-        })();
-        errors[4] = recovery.err();
+        })().err();
     }
-    drop(stream.take()); // original MySQL job is already joined; close this original TCP owner
-    if let Err(error) = runtime.block_on(await_idle(context, deadline)) {
+    if let Err(error) = runtime.block_on(await_idle(context, deadline, "held-after")) {
         retain_secondary(&mut errors[5], error);
     }
-    // Save partial wire and actor facts after cleanup even when the primary failed.
-    // Saving invokes no arbitrary error formatter and cannot replace original sources.
-    let receipt = json!({"schema_version":1,"status":if errors.iter().all(Option::is_none) {"COMPONENT_AND_SCENE_ASSERTIONS_PASSED_PENDING_ROLE_EXIT"} else {"FAILED"},
-        "native_acceptance":false,"source_pins":{
-            "clean_revision":admitted.clean_revision,"source_tree_sha256":admitted.source_tree_sha256,
-            "server_binary_sha256":admitted.server_binary_sha256,"runner_binary_sha256":admitted.runner_binary_sha256,
-            "base_config_sha256":admitted.base_config_sha256,"execution_binding_sha256":admitted.frozen_execution_binding_sha256},
-        "original_roles":original_roles,"selected_root":facts.root,
+    if let Some(statement) = statement.as_ref()
+        && let Err(error) = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(statement, deadline)
+    {
+        retain_secondary(&mut errors[9], error);
+    }
+    let proxy_before = serde_json::to_value(control.observation());
+    if let Err(error) = context.shutdown() {
+        retain_secondary(&mut errors[10], error);
+    }
+    let proxy = control.observation();
+    if let Err(error) =
+        validate_proxy_join(&proxy, original.as_ref(), delete_started, replay_joined)
+    {
+        retain_secondary(&mut errors[11], error);
+    }
+    let receipt = json!({"schema_version":2,"status":if errors.iter().all(Option::is_none){"COMPONENT_AND_SCENE_ASSERTIONS_PASSED_PENDING_RUNNER_ROLE_EVIDENCE"}else{"FAILED"},
+        "native_acceptance":false,"original_roles":original_roles,"selected_root":facts.root,
         "independent_target_source":facts.target_source,"closed_acks":facts.closed_acks,
-        "mysql_terminal_code":facts.mysql_terminal_code,
-        "health_before_tasks_created":facts.health_before_tasks_created,
-        "health_after_tasks_created":facts.health_after_tasks_created,
-        "protocol_complete":facts.protocol_complete,"actor":facts.actor,
-        "actor_actual_join":facts.actor_actual_join,"mysql_actual_join":facts.mysql_actual_join,
-        "kill_attempted":facts.kill_attempted,"kill_returned":facts.kill_returned,
-        "timings_origin":"the original launch_config prelaunch instant, not scene entry",
-        "protocol_started_us":facts.protocol_started_from_original_prelaunch_us,
-        "kill_started_us":facts.kill_started_from_original_prelaunch_us,
-        "kill_returned_us":facts.kill_returned_from_original_prelaunch_us,
-        "settled_us":facts.settled_from_original_prelaunch_us,
-        "expected_server_error_actual_source_retained":facts.expected_server_err_retained,
-        "expected_connection_joinerror_retained":facts.expected_connection_cancel_retained,
-        "root_samples":facts.samples,"original_wire":facts.mysql,"same_socket_health":facts.health,
-        "failed_source_slots":errors.each_ref().map(Option::is_some),"raw_error_formatter_invoked":false,
-        "scope":"Context-owned unique root positive physical delivery/reservation holders only; excludes released roots, allocator dealloc, last Arc alias and full Closing pool"});
+        "effective_launch_config_sha256":context.effective_launch_config_evidence().artifact_sha256(),
+        "health_before_tasks_created":facts.health_before_tasks_created,"health_after_tasks_created":facts.health_after_tasks_created,
+        "protocol_complete":facts.protocol_complete,"actor":facts.actor,"actor_actual_join":facts.actor_actual_join,
+        "query_actual_join":facts.query_actual_join,"delete_attempted":facts.delete_attempted,"delete_returned":facts.delete_returned,
+        "timings_origin":"original launch_config prelaunch instant; never renewed at scene entry",
+        "protocol_started_us":facts.protocol_started_from_original_prelaunch_us,"delete_started_us":facts.delete_started_from_original_prelaunch_us,
+        "delete_returned_us":facts.delete_returned_from_original_prelaunch_us,"settled_us":facts.settled_from_original_prelaunch_us,
+        "expected_server_error_actual_source_retained":facts.expected_server_err_retained,"expected_connection_joinerror_retained":facts.expected_connection_cancel_retained,
+        "root_samples":facts.samples,"original_trino_terminal":facts.trino_terminal,"original_trino_pages":facts.trino_pages,
+        "ordinary_trino_health":facts.health,"proxy_before_shutdown":proxy_before.as_ref().ok(),"proxy_after_shutdown":proxy,
+        "failed_source_slots":errors.each_ref().map(Option::is_some),
+        "failure_facts":errors.each_ref().map(|error|error.as_ref().map(error_fact)),"raw_error_formatter_invoked":false,
+        "scope":"Context-owned unique Root real encoded replay delivery/reservation holders; proxy copy is separate; excludes allocator deallocation, final Arc alias and full Closing pool"});
+    if let Err(error) = proxy_before {
+        retain_secondary(&mut errors[11], error.into());
+    }
     match serde_json::to_vec_pretty(&receipt) {
         Ok(bytes) if bytes.len() <= RECEIPT_BYTES => {
             let write = (|| -> Result<()> {
@@ -869,16 +920,93 @@ fn run_owned(
     if let Err(error) = check(deadline) {
         errors[7] = Some(error);
     }
-    // Expected terminal sources remain alive through receipt settlement. They are
-    // separate from unknown failures; successful actual joins are already explicit.
     drop(expected_connection_exit);
     drop(expected_server_error);
     if errors.iter().any(Option::is_some) {
         return Err(OwnedFailure { errors }.into());
     }
     ensure!(
-        facts.protocol_complete && facts.actor_actual_join && facts.mysql_actual_join,
-        "original ownership/protocol phase did not complete"
+        facts.protocol_complete && facts.actor_actual_join && facts.query_actual_join,
+        "original protocol/ownership phase did not complete"
+    );
+    Ok(())
+}
+fn validate_public_terminal(error: &TrinoError) -> Result<()> {
+    ensure!(
+        error.error_code == 3
+            && error.error_name == "USER_CANCELED"
+            && error.error_type == "USER_ERROR",
+        "original held Trino query did not return its exact cancellation error"
+    );
+    Ok(())
+}
+fn validate_proxy_join(
+    proxy: &RootReplyFaultObservation,
+    identity: Option<&RootReplyOriginalIdentity>,
+    delete_started: Option<Instant>,
+    replay_joined: Option<Instant>,
+) -> Result<()> {
+    let held = proxy
+        .original_hold
+        .as_ref()
+        .context("original held response observation absent at Join")?;
+    let deleted = delete_started.context("original DELETE start was never observed")?;
+    let replay = replay_joined.context("real encoded replay driver was never actually joined")?;
+    ensure!(
+        held.held_at <= deleted
+            && held
+                .expected_query_cancellation_at
+                .is_some_and(|prepared| prepared <= deleted)
+            && held
+                .release_requested_at
+                .is_some_and(|released| released >= replay)
+            && held.settled_at.is_some_and(|settled| settled >= deleted),
+        "original response release/settle did not preserve DELETE and real replay Join order"
+    );
+    if held.disposition == RootReplyOriginalDisposition::JoinedOriginalConnectionExit {
+        let exit = held
+            .connection_exit
+            .as_ref()
+            .context("original connection exit absent")?;
+        ensure!(
+            exit.permitted_peer_exit
+                && exit.joined_at >= deleted
+                && exit.all_children_joined
+                && !exit.cleanup_failed
+                && exit.remaining_connection_bytes == 0
+                && !exit.owner_stop_observed
+                && !exit.generation_change_observed
+                && held.downstream_reset.is_none(),
+            "original connection exit is not the exact declared peer exit/Join"
+        );
+    }
+    if held.disposition == RootReplyOriginalDisposition::ExactDownstreamCancelled {
+        ensure!(
+            held.downstream_reset
+                .as_ref()
+                .is_some_and(|reset| reset.observed_at >= deleted),
+            "original exact stream cancellation preceded DELETE"
+        );
+    }
+    ensure!(
+        identity == Some(&held.identity)
+            && held.settled_at.is_some()
+            && proxy.shutdown_joined
+            && proxy.active_listeners == 0
+            && proxy.joined_listeners == 3
+            && proxy.active_connections == 0
+            && proxy.active_streams == 0
+            && proxy.connection_positions == 0
+            && proxy.stream_positions == 0
+            && proxy.target_slots == 0
+            && proxy.owned_buffer_bytes == 0
+            && proxy.claimed == 1
+            && proxy.emitted_messages
+                == u64::from(held.disposition == RootReplyOriginalDisposition::ForwardedOriginal)
+            && proxy.failures.is_empty()
+            && !proxy.failure_overflow
+            && proxy.first_failure.is_none(),
+        "original FE proxy/response/byte owners did not actually join"
     );
     Ok(())
 }
@@ -886,3 +1014,29 @@ fn run_owned(
 #[cfg(test)]
 #[path = "result_delivery_held_late_ack_tests.rs"]
 mod tests;
+
+// Read only known owned type/context fields. No arbitrary Error Display/Debug
+// is called while retaining evidence, including on a failing native run.
+fn error_fact(error: &anyhow::Error) -> Value {
+    if let Some(text) = error.downcast_ref::<String>() {
+        return json!({"class":"OwnedStringContext","context":text.chars().take(1024).collect::<String>(),"truncated":text.chars().count()>1024});
+    }
+    if let Some(text) = error.downcast_ref::<&'static str>() {
+        return json!({"class":"StaticContext","context":text});
+    }
+    if let Some(json) = error.downcast_ref::<serde_json::Error>() {
+        return json!({"class":"Json","category":format!("{:?}",json.classify()),"line":json.line(),"column":json.column()});
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        return json!({"class":"Io","kind":format!("{:?}",io.kind()),"raw_os_error":io.raw_os_error()});
+    }
+    if let Some(http) = error.downcast_ref::<reqwest::Error>() {
+        return json!({"class":"HttpTransport","status":http.status().map(|status|status.as_u16()),"timeout":http.is_timeout(),"connect":http.is_connect(),"body":http.is_body()});
+    }
+    if let Some(held) =
+        error.downcast_ref::<super::result_delivery_root_protocol::held_response::HeldFailure>()
+    {
+        return json!({"class":"OriginalHeldFailure","phase":held.class,"observation":held.observation});
+    }
+    json!({"class":"OtherActualSourceRetained","raw_formatter_invoked":false})
+}

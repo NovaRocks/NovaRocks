@@ -108,6 +108,7 @@ impl Fixture {
     fn new() -> Self {
         Self {
             core: ControlCore::new(
+                context(1, 1).backend_process_id(),
                 ControlConfig {
                     max_pending_requests: 2,
                     step_budget: ControlCore::MAX_STEP_WORK,

@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real stock REST metadata preparation is separate from FE allocator samples.
+//! Real stock REST functional metadata acceptance retains its private preparation owner.
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
-use super::listing::measure;
+use super::listing::{
+    join_listing_client, listing_count, listing_sql, listing_views, listing_with_cleanup,
+    record_listing_phase,
+};
 use super::mv_uea7::ManagedMvRestFixture;
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::SqlSession;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
+use novarocks_cluster_harness::fixture_run::RunBudget;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -32,7 +35,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn repo() -> Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,7 +65,14 @@ impl Drop for ChildOwner {
 
 /// A helper process has no service lifecycle authority. The existing private
 /// fixture remains the only owner of its Docker project and data locations.
-fn producer(root: &Path, freeze: &Path, phase: &str, previous: Option<&Path>) -> Result<()> {
+fn producer(
+    root: &Path,
+    freeze: &Path,
+    phase: &str,
+    previous: Option<&Path>,
+    budget: &RunBudget,
+) -> Result<()> {
+    budget.check_work()?;
     let repository = repo()?;
     let output = root.join(phase);
     let log = File::create(root.join(format!("producer-{phase}.log")))?;
@@ -74,6 +84,15 @@ fn producer(root: &Path, freeze: &Path, phase: &str, previous: Option<&Path>) ->
         .arg(freeze)
         .args(["--phase", phase, "--output"])
         .arg(&output)
+        .arg("--owner-work-deadline-unix-ms")
+        .arg(
+            SystemTime::now()
+                .checked_add(budget.work_remaining())
+                .context("original real REST owner deadline overflow")?
+                .duration_since(UNIX_EPOCH)?
+                .as_millis()
+                .to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -97,8 +116,10 @@ fn producer(root: &Path, freeze: &Path, phase: &str, previous: Option<&Path>) ->
         .context("metadata producer owner missing")?;
     // The helper enforces 300s/7200s absolute operation deadlines. This
     // independent exit watchdog permits only five seconds for process exit.
-    let deadline =
-        Instant::now() + Duration::from_secs(if phase == "preflight" { 305 } else { 7205 });
+    let deadline = (Instant::now()
+        + Duration::from_secs(if phase == "preflight" { 305 } else { 7205 }))
+    .min(budget.work_deadline() + Duration::from_secs(5))
+    .min(budget.deadline());
     loop {
         if let Some(status) = child.try_wait()? {
             ensure!(
@@ -330,11 +351,13 @@ struct PreparedListing {
     preparation_root: PathBuf,
     catalog_sql: String,
     native_deadline: Option<Instant>,
+    budget: RunBudget,
 }
 
 impl PreparedListing {
-    fn start(root: &Path) -> Result<(Self, ScenarioLaunchConfig)> {
-        let (mut fixture, launch) = ManagedMvRestFixture::start(root, "cl_normal")?;
+    fn start(root: &Path, budget: &RunBudget) -> Result<(Self, ScenarioLaunchConfig)> {
+        let (mut fixture, launch) =
+            ManagedMvRestFixture::start_private_with_budget(root, "cl_normal", budget)?;
         let prepared = (|| -> Result<_> {
             let preparation_root = root.join("real-rest-preparation");
             std::fs::create_dir(&preparation_root)?;
@@ -358,13 +381,20 @@ impl PreparedListing {
             });
             let producer_freeze = preparation_root.join("producer-freeze-bound.json");
             write_json(&producer_freeze, &freeze)?;
-            producer(&preparation_root, &producer_freeze, "preflight", None)?;
+            producer(
+                &preparation_root,
+                &producer_freeze,
+                "preflight",
+                None,
+                budget,
+            )?;
             let preflight = preparation_root.join("preflight/PREFLIGHT_PASS.json");
             producer(
                 &preparation_root,
                 &producer_freeze,
                 "bulk",
                 Some(&preflight),
+                budget,
             )?;
             ensure!(
                 preparation_root.join("bulk/READY.json").is_file(),
@@ -397,6 +427,7 @@ impl PreparedListing {
                     preparation_root,
                     catalog_sql,
                     native_deadline: None,
+                    budget: budget.clone(),
                 },
                 launch,
             )),
@@ -463,24 +494,23 @@ fn phase_work_matches(audit: &Value, expected_loads: Option<u64>) -> Result<bool
 fn finish_phase_result(
     outcome: Result<Value>,
     audit: Result<Value>,
-    mut failures: Vec<String>,
+    failures: Vec<String>,
 ) -> Result<Value> {
-    let sql = match outcome {
-        Ok(value) => Some(value),
-        Err(error) => {
-            failures.insert(0, format!("native SQL phase failed: {error:#}"));
-            None
-        }
+    let result = match (outcome, audit) {
+        (Ok(sql), Ok(provider)) => Ok(json!({"sql":sql,"provider":provider})),
+        (Err(primary), Ok(_)) => Err(primary.context("native SQL phase failed")),
+        (Ok(_), Err(observer)) => Err(observer.context("observer quiescence failed")),
+        (Err(primary), Err(observer)) => listing_with_cleanup(
+            Err(primary.context("native SQL phase failed")),
+            Err(observer.context("observer quiescence failed")),
+        ),
     };
-    let provider = match audit {
-        Ok(value) => Some(value),
-        Err(error) => {
-            failures.push(format!("observer quiescence failed: {error:#}"));
-            None
-        }
+    let receipts = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(failures.join("; ")))
     };
-    ensure!(failures.is_empty(), "{}", failures.join("; "));
-    Ok(json!({"sql":sql,"provider":provider}))
+    listing_with_cleanup(result, receipts)
 }
 
 impl PreparedListing {
@@ -651,8 +681,13 @@ impl Scenario for RealRestListing {
         true
     }
 
-    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (prepared, launch) = PreparedListing::start(root)?;
+    fn launch_config_with_fixture_run(
+        &self,
+        root: &Path,
+        budget: &RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        budget.check_work()?;
+        let (prepared, launch) = PreparedListing::start(root, budget)?;
         let mut owner = self
             .fixture
             .lock()
@@ -678,9 +713,8 @@ impl Scenario for RealRestListing {
         let timeout = context
             .remaining("real REST CL SQL")?
             .min(Duration::from_secs(120));
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        let mut control = mysql_actor::connect(&user, port, timeout)?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
         let mut owner = self
             .fixture
             .lock()
@@ -700,19 +734,28 @@ impl Scenario for RealRestListing {
                 .deadline()
                 .min(Instant::now() + Duration::from_secs(native_seconds)),
         );
+        // Reuse the already frozen native deadline, never a renewed SQL clock.
+        let deadline = fixture
+            .native_deadline
+            .context("native acceptance deadline missing")?;
+        let mut control = SqlSession::new_with_request_timeout_cap(&user, port, deadline, timeout)?;
         let mut phases = Vec::new();
         let admission = fixture.catalog_sql.clone();
-        phases.push(measure(context, "real-rest-catalog-admission", || {
-            let result = fixture.phase("catalog_admission", timeout, Some(16384), || {
-                control.query_drop(&admission)?;
-                Ok(json!({"catalog":"cl_normal"}))
-            })?;
-            ensure!(
-                actual_count(&result["provider"], "mutations")? == 0,
-                "catalog admission mutated provider state"
-            );
-            Ok(result)
-        })?);
+        phases.push(record_listing_phase(
+            context,
+            "real-rest-catalog-admission",
+            || {
+                let result = fixture.phase("catalog_admission", timeout, Some(16384), || {
+                    listing_sql(&mut control, &admission, deadline)?;
+                    Ok(json!({"catalog":"cl_normal"}))
+                })?;
+                ensure!(
+                    actual_count(&result["provider"], "mutations")? == 0,
+                    "catalog admission mutated provider state"
+                );
+                Ok(result)
+            },
+        )?);
         ensure!(
             admission
                 .matches("CREATE EXTERNAL CATALOG cl_normal ")
@@ -725,19 +768,23 @@ impl Scenario for RealRestListing {
             "CREATE EXTERNAL CATALOG cl_discovery ",
             1,
         );
-        phases.push(measure(context, "real-rest-lake-discovery", || {
-            let result = fixture.phase("lake_discovery", timeout, Some(16384), || {
-                control.query_drop(&discovery)?;
-                Ok(json!({"catalog":"cl_discovery"}))
-            })?;
-            ensure!(
-                actual_count(&result["provider"], "mutations")? == 0,
-                "lake discovery mutated provider state"
-            );
-            Ok(result)
-        })?);
+        phases.push(record_listing_phase(
+            context,
+            "real-rest-lake-discovery",
+            || {
+                let result = fixture.phase("lake_discovery", timeout, Some(16384), || {
+                    listing_sql(&mut control, &discovery, deadline)?;
+                    Ok(json!({"catalog":"cl_discovery"}))
+                })?;
+                ensure!(
+                    actual_count(&result["provider"], "mutations")? == 0,
+                    "lake discovery mutated provider state"
+                );
+                Ok(result)
+            },
+        )?);
         for clients in [1usize, 8, 16] {
-            phases.push(measure(context, "real-rest-information-schema", || {
+            phases.push(record_listing_phase(context, "real-rest-information-schema", || {
                 let result = fixture.phase(&format!("information_schema_{clients}"), timeout, Some(0), || {
                     let barrier = Arc::new(Barrier::new(clients));
                     thread::scope(|scope| -> Result<()> {
@@ -746,21 +793,18 @@ impl Scenario for RealRestListing {
                             let user = &user;
                             scope.spawn(move || -> Result<()> {
                                 barrier.wait();
-                                let mut connection = mysql_actor::connect(user, port, timeout)?;
-                                let count = connection.query_first::<u64, _>("SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%'")?;
+                                let mut connection = SqlSession::new_with_request_timeout_cap(user, port, deadline, timeout)?;
+                                let count = listing_sql(&mut connection, "SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%'", deadline).and_then(|result| listing_count(&result).map(Some))?;
                                 ensure!(count == Some(16384), "real REST information_schema omitted or duplicated tables");
                                 Ok(())
                             })
                         }).collect::<Vec<_>>();
-                        let mut first_error = None;
-                        // Always join every owner, including after an earlier
-                        // client refuses. No detached SQL work outlives a phase.
+                        let mut joined = Ok(());
+                        // Always join every original owner and retain every refusal.
                         for handle in handles {
-                            let result = handle.join().map_err(|_| anyhow::anyhow!("real REST client panicked")).and_then(|result| result);
-                            if first_error.is_none() { first_error = result.err(); }
+                            joined = listing_with_cleanup(joined, join_listing_client(handle.join()));
                         }
-                        if let Some(error) = first_error { return Err(error); }
-                        Ok(())
+                        joined
                     })?;
                     Ok(json!({"clients":clients,"rows_per_client":16384}))
                 })?;
@@ -771,48 +815,65 @@ impl Scenario for RealRestListing {
             })?);
         }
         for namespace in 0..32 {
-            phases.push(measure(context, "real-rest-show-views", || {
-                let result = fixture.phase(
-                    &format!("show_views_{namespace:04}"),
-                    timeout,
-                    Some(0),
-                    || {
-                        control.query_drop(format!("USE cl_normal.cl_ns_{namespace:04}"))?;
-                        let mut views = control.query::<String, _>("SHOW VIEWS")?;
-                        views.sort();
-                        let expected = (0..512)
-                            .map(|name| format!("cl_view_{name:06}"))
-                            .collect::<Vec<_>>();
-                        ensure!(
-                            views == expected,
-                            "real REST SHOW VIEWS omitted or duplicated names"
-                        );
-                        Ok(json!({"namespace":namespace,"rows":views.len()}))
-                    },
-                )?;
+            phases.push(record_listing_phase(
+                context,
+                "real-rest-show-views",
+                || {
+                    let result = fixture.phase(
+                        &format!("show_views_{namespace:04}"),
+                        timeout,
+                        Some(0),
+                        || {
+                            listing_sql(
+                                &mut control,
+                                format!("USE cl_normal.cl_ns_{namespace:04}"),
+                                deadline,
+                            )?;
+                            let mut views = listing_sql(&mut control, "SHOW VIEWS", deadline)
+                                .and_then(listing_views)?;
+                            views.sort();
+                            let expected = (0..512)
+                                .map(|name| format!("cl_view_{name:06}"))
+                                .collect::<Vec<_>>();
+                            ensure!(
+                                views == expected,
+                                "real REST SHOW VIEWS omitted or duplicated names"
+                            );
+                            Ok(json!({"namespace":namespace,"rows":views.len()}))
+                        },
+                    )?;
+                    ensure!(
+                        result["provider"]["routes"]["list_views"].as_u64() == Some(2),
+                        "SHOW VIEWS did not read both actual REST pages"
+                    );
+                    ensure!(
+                        actual_count(&result["provider"], "mutations")? == 0,
+                        "SHOW VIEWS mutated provider state"
+                    );
+                    Ok(result)
+                },
+            )?);
+        }
+        phases.push(record_listing_phase(
+            context,
+            "real-rest-drop-success",
+            || {
+                let result = fixture.phase("drop_success", timeout, None, || {
+                    listing_sql(
+                        &mut control,
+                        "DROP DATABASE cl_normal.cl_ns_0000 FORCE",
+                        deadline,
+                    )?;
+                    Ok(json!({"dropped_namespace":"cl_ns_0000"}))
+                })?;
                 ensure!(
-                    result["provider"]["routes"]["list_views"].as_u64() == Some(2),
-                    "SHOW VIEWS did not read both actual REST pages"
-                );
-                ensure!(
-                    actual_count(&result["provider"], "mutations")? == 0,
-                    "SHOW VIEWS mutated provider state"
+                    actual_count(&result["provider"], "mutations")? == 1025
+                        && actual_count(&result["provider"], "successful_mutations")? == 1025,
+                    "real REST DROP omitted an actual table, view or namespace mutation"
                 );
                 Ok(result)
-            })?);
-        }
-        phases.push(measure(context, "real-rest-drop-success", || {
-            let result = fixture.phase("drop_success", timeout, None, || {
-                control.query_drop("DROP DATABASE cl_normal.cl_ns_0000 FORCE")?;
-                Ok(json!({"dropped_namespace":"cl_ns_0000"}))
-            })?;
-            ensure!(
-                actual_count(&result["provider"], "mutations")? == 1025
-                    && actual_count(&result["provider"], "successful_mutations")? == 1025,
-                "real REST DROP omitted an actual table, view or namespace mutation"
-            );
-            Ok(result)
-        })?);
+            },
+        )?);
         await_resource_convergence(context, &baseline, "real REST CL")?;
         ensure!(
             Instant::now()
@@ -822,12 +883,13 @@ impl Scenario for RealRestListing {
             "actual REST native acceptance deadline expired after convergence"
         );
         // This independent provider oracle never uses the observer and runs
-        // after FE phase sampling stops. It performs no mutation or retry.
+        // after all native functional phases. It performs no mutation or retry.
         producer(
             &fixture.preparation_root,
             &fixture.producer_freeze,
             "verify-after-drop",
             Some(&fixture.preparation_root.join("bulk/READY.json")),
+            &fixture.budget,
         )?;
         ensure!(
             fixture
@@ -839,10 +901,10 @@ impl Scenario for RealRestListing {
         write_json(
             &context
                 .scenario_root()
-                .join("real-rest-listing-measurements.json"),
+                .join("real-rest-listing-functional-evidence.json"),
             &json!({
                 "native_freeze":freeze,"fixture":"stock private Iceberg REST; actual external metadata, no row data",
-                "scope":"sampled FE allocator high-water and actual REST calls; observer and producer allocations excluded; not a hard SDK byte bound or cross-provider CL completion",
+                "scope":"functional real REST pagination, complete mutation and independent survivor verification; no allocator measurement or capacity proof", "native_freeze_qualification":"historical workload/deadline declaration retained unchanged; no memory measurement is claimed",
                 "phases":phases,"verification":"real-rest-preparation/verify-after-drop/VERIFICATION_PASS.json"
             }),
         )?;

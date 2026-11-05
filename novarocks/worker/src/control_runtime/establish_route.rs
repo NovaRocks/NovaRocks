@@ -344,7 +344,7 @@ impl EstablishRouteCustody {
         }
         self.runtime.validate_registration(&self.registration)?;
         {
-            // Keep the existing ContextLeg -> RootLeg order whenever both
+            // Keep the existing ParticipationLeg -> RootLeg order whenever both
             // original legs are needed. Root initialization takes Root only.
             let root = self.root_leg.lock().expect("original Root route return");
             if root.retired

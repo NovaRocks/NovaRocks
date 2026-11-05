@@ -30,10 +30,9 @@ use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpe
 use super::task_evidence::assert_query_completed_across_boundary;
 #[path = "scan_statement_actor.rs"]
 pub(super) mod scan_statement_actor;
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use scan_statement_actor::ScanActor;
 use serde_json::Value;
@@ -166,10 +165,9 @@ impl Scenario for PaimonReadData {
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
         let selected = self.intent.take(0)?;
-        selected.arm(context, control.connection_id(), &selected.sql)?;
-        let codec_rows: Vec<(i64, String)> = control
-            .query(&selected.sql)
-            .context("read Paimon append tables across supported codecs")?;
+        let codec_rows: Vec<(i64, String)> =
+            selected_rows(context, &mut control, &selected, paimon_int_text)
+                .context("read Paimon append tables across supported codecs")?;
         ensure!(
             codec_rows
                 == [
@@ -184,10 +182,9 @@ impl Scenario for PaimonReadData {
         );
 
         let selected = self.intent.take(1)?;
-        selected.arm(context, control.connection_id(), &selected.sql)?;
-        let partitioned: Vec<(String, i64, String)> = control
-            .query(&selected.sql)
-            .context("read partitioned Paimon append table")?;
+        let partitioned: Vec<(String, i64, String)> =
+            selected_rows(context, &mut control, &selected, paimon_text_int_text)
+                .context("read partitioned Paimon append table")?;
         ensure!(
             partitioned
                 == [
@@ -200,20 +197,15 @@ impl Scenario for PaimonReadData {
             "partitioned Paimon rows differ from the external oracle: {partitioned:?}"
         );
 
-        type TypedPaimonRow = (i64, Option<String>, Option<String>, Option<String>);
-
         let selected = self.intent.take(2)?;
-        selected.arm(context, control.connection_id(), &selected.sql)?;
-        let empty: Vec<i64> = control
-            .query(&selected.sql)
+        let empty: Vec<i64> = selected_rows(context, &mut control, &selected, paimon_count)
             .context("read empty Paimon append table")?;
         ensure!(empty == [0], "empty Paimon table returned {empty:?}");
 
         let selected = self.intent.take(3)?;
-        selected.arm(context, control.connection_id(), &selected.sql)?;
-        let typed: Vec<TypedPaimonRow> = control
-            .query(&selected.sql)
-            .context("read Paimon scalar type matrix")?;
+        let typed: Vec<TypedPaimonRow> =
+            selected_rows(context, &mut control, &selected, paimon_typed)
+                .context("read Paimon scalar type matrix")?;
         ensure!(
             typed
                 == [
@@ -353,18 +345,20 @@ impl Scenario for PaimonSnapshotAndSchema {
             );
 
             let s2: Vec<i64> = control
-                .query(format!(
+                .execute(format!(
                     "SELECT id FROM {CATALOG}.fixture.append_none ORDER BY id"
                 ))
+                .and_then(paimon_integer_rows)
                 .context("read newly published Paimon S2")?;
             ensure!(s2 == [1, 2, 3], "fresh query did not observe S2: {s2:?}");
 
             advance_owned_fixture(&owned, "schema", context.deadline())?;
             context.remaining("read Paimon schema after external fixture advance")?;
             let evolved: Vec<(i64, String, Option<String>)> = control
-                .query(format!(
+                .execute(format!(
                     "SELECT id, name, added FROM {CATALOG}.fixture.schema_evolution ORDER BY id"
                 ))
+                .and_then(paimon_int_text_optional)
                 .context("read current Paimon schema over historical files")?;
             ensure!(
                 evolved
@@ -429,9 +423,10 @@ impl Scenario for PaimonMergeFilterCorrectness {
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
         let compacted: Vec<(i64, i64, String)> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT id, metric, note FROM {CATALOG}.fixture.pk_default ORDER BY id"
             ))
+            .and_then(paimon_int_int_text)
             .context("read compacted deduplicate Paimon table")?;
         ensure!(
             compacted
@@ -444,9 +439,10 @@ impl Scenario for PaimonMergeFilterCorrectness {
         );
 
         let uncompact: Vec<(i64, i64, String)> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT id, metric, note FROM {CATALOG}.fixture.pk_dynamic ORDER BY id"
             ))
+            .and_then(paimon_int_int_text)
             .context("read uncompact dynamic-bucket deduplicate Paimon table")?;
         ensure!(
             uncompact
@@ -461,9 +457,10 @@ impl Scenario for PaimonMergeFilterCorrectness {
         );
 
         let sequence: Vec<(i64, i64, String)> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT id, seq, value FROM {CATALOG}.fixture.pk_sequence ORDER BY id"
             ))
+            .and_then(paimon_int_int_text)
             .context("read sequence-field Paimon table")?;
         ensure!(
             sequence
@@ -476,19 +473,21 @@ impl Scenario for PaimonMergeFilterCorrectness {
         );
 
         let filtered: Vec<(i64, i64)> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT id, metric FROM {CATALOG}.fixture.pk_dynamic \
                  WHERE (id = 101 OR id = 105) AND metric >= 1050 ORDER BY id LIMIT 2"
             ))
+            .and_then(paimon_int_int)
             .context("apply engine predicate and limit after Paimon merge")?;
         ensure!(
             filtered == [(101, 1111), (105, 1050)],
             "filter/limit changed merged Paimon rows: {filtered:?}"
         );
         let deleted: Vec<i64> = control
-            .query(format!(
+            .execute(format!(
                 "SELECT count(*) FROM {CATALOG}.fixture.pk_all_deleted"
             ))
+            .and_then(paimon_integer_rows)
             .context("read all-deleted Paimon key group")?;
         ensure!(
             deleted == [0],
@@ -559,34 +558,38 @@ impl Scenario for PaimonCancelAndBudget {
 
         let target = start_query(context, self.intent.take(0)?)?;
         let operation = (|| -> Result<()> {
-            let connection_id = target.connection_id;
+            let client_query_id = &target.client_query_id;
+            context.action(format!("cancel exact Paimon query {client_query_id}"));
             wait_for_new_marker(context, &before, PAGE_SOURCE_OPEN, &target.done)?;
-            control
-                .query_drop(format!("KILL QUERY {connection_id}"))
-                .context("cancel active Paimon query through public MySQL")?;
+            target
+                .cancel()
+                .context("cancel active Paimon query through its original DELETE")?;
             let error = target
                 .done
                 .recv_timeout(context.remaining("await Paimon query cancellation")?)
                 .context("cancelled Paimon query did not terminate")?
                 .expect_err("cancelled Paimon query unexpectedly succeeded");
-            ensure!(
-                matches!(error, mysql::Error::MySqlError(ref error) if error.code == 1317),
-                "expected MySQL cancellation error 1317, received {error}"
-            );
+            if !matches!(&error, StatementFailure::Trino(error) if error.error_code == 3 && error.error_name == "USER_CANCELED" && error.error_type == "USER_ERROR")
+            {
+                return Err(anyhow::Error::new(error)
+                    .context("expected Trino cancellation 3 USER_CANCELED USER_ERROR"));
+            }
 
             let budget_error = control
-                .query::<mysql::Row, _>(format!(
+                .execute(format!(
                     "SELECT /*+ SET_VAR(query_mem_limit=1) */ * \
                  FROM {CATALOG}.fixture.type_matrix"
                 ))
                 .expect_err("one-byte query memory budget must reject the Paimon read");
-            ensure!(
-                budget_error
+            if !(matches!(&budget_error, StatementFailure::Trino(_))
+                && budget_error
                     .to_string()
                     .to_ascii_lowercase()
-                    .contains("memory"),
-                "low-budget Paimon read failed for another reason: {budget_error}"
-            );
+                    .contains("memory"))
+            {
+                return Err(anyhow::Error::new(budget_error)
+                    .context("low-budget Paimon read failed for another reason"));
+            }
 
             wait_for_balanced_page_sources(context, &before)?;
             await_resource_convergence(
@@ -634,9 +637,11 @@ impl Scenario for PaimonUnsupportedAndBinding {
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
         expect_error_any(
-            control.query_drop(format!(
-                "INSERT INTO {CATALOG}.fixture.pk_default VALUES (9, 9, 'forbidden')"
-            )),
+            control
+                .execute(format!(
+                    "INSERT INTO {CATALOG}.fixture.pk_default VALUES (9, 9, 'forbidden')"
+                ))
+                .map(|_| ()),
             &[
                 "no distributed write capability",
                 "no active mutation binding",
@@ -644,7 +649,9 @@ impl Scenario for PaimonUnsupportedAndBinding {
             "Paimon INSERT",
         )?;
         expect_error_any(
-            control.query_drop(format!("CREATE TABLE {CATALOG}.fixture.forbidden (id INT)")),
+            control
+                .execute(format!("CREATE TABLE {CATALOG}.fixture.forbidden (id INT)"))
+                .map(|_| ()),
             &[
                 "no catalog mutation capability",
                 "no active mutation binding",
@@ -653,7 +660,9 @@ impl Scenario for PaimonUnsupportedAndBinding {
             "Paimon CREATE TABLE",
         )?;
         expect_error_any(
-            control.query_drop(format!("ALTER TABLE {CATALOG}.fixture.pk_default OPTIMIZE")),
+            control
+                .execute(format!("ALTER TABLE {CATALOG}.fixture.pk_default OPTIMIZE"))
+                .map(|_| ()),
             &[
                 "no metadata maintenance capability",
                 "no active metadata maintenance binding",
@@ -661,7 +670,9 @@ impl Scenario for PaimonUnsupportedAndBinding {
             "Paimon OPTIMIZE",
         )?;
         expect_error_any(
-            control.query_drop(format!("ANALYZE TABLE {CATALOG}.fixture.pk_default")),
+            control
+                .execute(format!("ANALYZE TABLE {CATALOG}.fixture.pk_default"))
+                .map(|_| ()),
             &["no statistics capability", "no active statistics binding"],
             "Paimon ANALYZE",
         )?;
@@ -695,20 +706,22 @@ impl Scenario for PaimonUnsupportedAndBinding {
             ),
         ] {
             expect_error_any(
-                control.query::<mysql::Row, _>(format!("SELECT * FROM {CATALOG}.fixture.{table}")),
+                control.execute(format!("SELECT * FROM {CATALOG}.fixture.{table}")),
                 &[expected],
                 table,
             )?;
         }
 
         expect_error_any(
-            control.query_drop(format!(
-                "CREATE EXTERNAL CATALOG paimon_bad_binding PROPERTIES(\
+            control
+                .execute(format!(
+                    "CREATE EXTERNAL CATALOG paimon_bad_binding PROPERTIES(\
                  \"type\"=\"paimon\",\
                  \"paimon.catalog.type\"=\"rest\",\
                  \"warehouse\"=\"{}\")",
-                sql_string(&fixture.warehouse)
-            )),
+                    sql_string(&fixture.warehouse)
+                ))
+                .map(|_| ()),
             &["paimon.catalog.type must be filesystem"],
             "invalid Paimon catalog binding",
         )?;
@@ -784,23 +797,25 @@ impl Scenario for IcebergPaimonRead {
         let warehouse = create_warehouse(context, "iceberg-paimon-read")?;
         create_catalog(&mut control, ICEBERG, &warehouse)?;
         control
-            .query_drop(format!("CREATE DATABASE {ICEBERG}.fixture"))
+            .execute(format!("CREATE DATABASE {ICEBERG}.fixture"))
+            .map(|_| ())
             .context("create Iceberg cross-provider database")?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {ICEBERG}.fixture.dim (id BIGINT, label STRING)"
             ))
+            .map(|_| ())
             .context("create Iceberg cross-provider table")?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {ICEBERG}.fixture.dim VALUES (1, 'ice-a'), (4, 'ice-d'), (9, 'ice-x')"
             ))
+            .map(|_| ())
             .context("write Iceberg cross-provider rows")?;
 
         let selected = self.intent.take(0)?;
-        let observation = selected.arm(context, control.connection_id(), &selected.sql)?;
-        let joined: Vec<(i64, String, String)> = control
-            .query(&selected.sql)
+        let (joined_result, observation) = run_selected(context, &mut control, &selected)?;
+        let joined: Vec<(i64, String, String)> = paimon_int_text_text(joined_result)
             .context("join Paimon and Iceberg through one native query")?;
         ensure!(
             joined
@@ -818,7 +833,8 @@ impl Scenario for IcebergPaimonRead {
         assert_query_completed_across_boundary(context, &snapshot, "Iceberg/Paimon join")?;
         await_resource_convergence(context, &baseline, "Iceberg/Paimon join")?;
         control
-            .query_drop(format!("DROP TABLE {ICEBERG}.fixture.dim FORCE"))
+            .execute(format!("DROP TABLE {ICEBERG}.fixture.dim FORCE"))
+            .map(|_| ())
             .context("drop Iceberg cross-provider table")?;
         drop_catalog(&mut control, ICEBERG)?;
         drop_catalog(&mut control, PAIMON)?;
@@ -855,6 +871,271 @@ struct OwnedFixture {
     root: PathBuf,
     run_id: String,
     env_file: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum PaimonColumn {
+    Integer,
+    Text,
+}
+fn paimon_shape(
+    result: &StatementResult,
+    expected: &[PaimonColumn],
+) -> std::result::Result<(), StatementFailure> {
+    if !result.is_result_set()
+        || result.columns.len() != expected.len()
+        || result
+            .columns
+            .iter()
+            .zip(expected)
+            .any(|(column, expected)| match expected {
+                PaimonColumn::Integer => {
+                    !matches!(
+                        column.type_signature.raw_type.as_str(),
+                        "tinyint" | "smallint" | "integer" | "bigint"
+                    ) || !column.type_signature.arguments.is_empty()
+                }
+                PaimonColumn::Text => column.type_signature.raw_type != "varchar",
+            })
+    {
+        return Err(StatementFailure::Protocol(format!(
+            "Paimon result changed its declared tuple shape: {:?}",
+            result.columns
+        )));
+    }
+    Ok(())
+}
+fn paimon_integer_rows(result: StatementResult) -> std::result::Result<Vec<i64>, StatementFailure> {
+    sql::integer_column(&result)
+        .map_err(|error| StatementFailure::Protocol(format!("Paimon integer rows: {error:#}")))
+}
+fn paimon_count(result: StatementResult) -> std::result::Result<Vec<i64>, StatementFailure> {
+    if result.columns.len() != 1 || result.columns[0].type_signature.raw_type != "bigint" {
+        return Err(StatementFailure::Protocol(
+            "Paimon COUNT must be one declared BIGINT".into(),
+        ));
+    }
+    paimon_integer_rows(result)
+}
+fn paimon_optional_text(
+    value: &TrinoValue,
+) -> std::result::Result<Option<String>, StatementFailure> {
+    match value {
+        TrinoValue::Null => Ok(None),
+        TrinoValue::Text(value) => Ok(Some(value.clone())),
+        _ => Err(StatementFailure::Protocol(format!(
+            "Paimon expected nullable Text: {value:?}"
+        ))),
+    }
+}
+fn paimon_int_text(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, String)>, StatementFailure> {
+    paimon_shape(&result, &[PaimonColumn::Integer, PaimonColumn::Text])?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(a), TrinoValue::Text(b)] => Ok((*a, b.clone())),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn paimon_text_int_text(
+    result: StatementResult,
+) -> std::result::Result<Vec<(String, i64, String)>, StatementFailure> {
+    paimon_shape(
+        &result,
+        &[
+            PaimonColumn::Text,
+            PaimonColumn::Integer,
+            PaimonColumn::Text,
+        ],
+    )?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Text(a),
+                TrinoValue::Integer(b),
+                TrinoValue::Text(c),
+            ] => Ok((a.clone(), *b, c.clone())),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+type TypedPaimonRow = (i64, Option<String>, Option<String>, Option<String>);
+
+fn paimon_typed(
+    result: StatementResult,
+) -> std::result::Result<Vec<TypedPaimonRow>, StatementFailure> {
+    paimon_shape(
+        &result,
+        &[
+            PaimonColumn::Integer,
+            PaimonColumn::Text,
+            PaimonColumn::Text,
+            PaimonColumn::Text,
+        ],
+    )?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(a), b, c, d] => Ok((
+                *a,
+                paimon_optional_text(b)?,
+                paimon_optional_text(c)?,
+                paimon_optional_text(d)?,
+            )),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn paimon_int_text_optional(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, String, Option<String>)>, StatementFailure> {
+    paimon_shape(
+        &result,
+        &[
+            PaimonColumn::Integer,
+            PaimonColumn::Text,
+            PaimonColumn::Text,
+        ],
+    )?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(a), TrinoValue::Text(b), c] => {
+                Ok((*a, b.clone(), paimon_optional_text(c)?))
+            }
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn paimon_int_int_text(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, i64, String)>, StatementFailure> {
+    paimon_shape(
+        &result,
+        &[
+            PaimonColumn::Integer,
+            PaimonColumn::Integer,
+            PaimonColumn::Text,
+        ],
+    )?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(a),
+                TrinoValue::Integer(b),
+                TrinoValue::Text(c),
+            ] => Ok((*a, *b, c.clone())),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn paimon_int_int(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, i64)>, StatementFailure> {
+    paimon_shape(&result, &[PaimonColumn::Integer, PaimonColumn::Integer])?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(a), TrinoValue::Integer(b)] => Ok((*a, *b)),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn paimon_int_text_text(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, String, String)>, StatementFailure> {
+    paimon_shape(
+        &result,
+        &[
+            PaimonColumn::Integer,
+            PaimonColumn::Text,
+            PaimonColumn::Text,
+        ],
+    )?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(a),
+                TrinoValue::Text(b),
+                TrinoValue::Text(c),
+            ] => Ok((*a, b.clone(), c.clone())),
+            _ => Err(StatementFailure::Protocol(format!(
+                "Paimon tuple cell mismatch: {row:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn run_selected(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    selected: &SelectedStatement,
+) -> Result<(
+    StatementResult,
+    novarocks_cluster_harness::QueryLifecycleStatementObservation,
+)> {
+    let deadline = context.deadline();
+    let pending = session.submit(&selected.sql)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending(context, pending, &selected.sql)?;
+    let result = session.run_pending(pending);
+    let cancelled = if matches!(&result,Err(error)if !matches!(error,StatementFailure::Trino(_))) {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    let result = match result {
+        Ok(result) => scan_statement_actor::combine(Ok(result), cancelled),
+        Err(primary) => scan_statement_actor::combine(Err(anyhow::Error::new(primary)), cancelled),
+    };
+    match result {
+        Ok(result) => Ok((result, observation)),
+        Err(primary) => {
+            let drained = context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, deadline);
+            scan_statement_actor::combine(Err(primary), drained)
+        }
+    }
+}
+fn selected_rows<T>(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    selected: &SelectedStatement,
+    decode: impl FnOnce(StatementResult) -> std::result::Result<T, StatementFailure>,
+) -> Result<T> {
+    let (result, observation) = run_selected(context, session, selected)?;
+    let result = decode(result).map_err(anyhow::Error::from);
+    let deadline = context.deadline();
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    scan_statement_actor::combine(result, drained)
 }
 
 type QueryActor = ScanActor<Vec<i64>>;
@@ -913,13 +1194,10 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
     Ok(launch)
 }
 
-fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql_actor::DeadlineConnection> {
+fn connect(context: &ScenarioContext, operation: &str) -> Result<SqlSession> {
     context.remaining(operation)?;
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }
 
 pub(super) fn load_shared_fixture(expected_stage: &str) -> Result<Fixture> {
@@ -1026,15 +1304,16 @@ fn required_map_string(value: &serde_json::Map<String, Value>, key: &str) -> Res
 }
 
 pub(super) fn create_paimon_catalog(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     name: &str,
     fixture: &Fixture,
 ) -> Result<()> {
     control
-        .query_drop(format!("DROP CATALOG IF EXISTS {name}"))
+        .execute(format!("DROP CATALOG IF EXISTS {name}"))
+        .map(|_| ())
         .with_context(|| format!("remove stale Paimon catalog {name}"))?;
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE EXTERNAL CATALOG {name} PROPERTIES(\
              \"type\"=\"paimon\",\
              \"paimon.catalog.type\"=\"filesystem\",\
@@ -1058,12 +1337,14 @@ pub(super) fn create_paimon_catalog(
             sql_string(&fixture.credential_name),
             sql_string(&fixture.credential_generation),
         ))
+        .map(|_| ())
         .with_context(|| format!("create Filesystem Paimon catalog {name}"))
 }
 
-fn drop_catalog(control: &mut mysql::Conn, name: &str) -> Result<()> {
+fn drop_catalog(control: &mut SqlSession, name: &str) -> Result<()> {
     control
-        .query_drop(format!("DROP CATALOG IF EXISTS {name}"))
+        .execute(format!("DROP CATALOG IF EXISTS {name}"))
+        .map(|_| ())
         .with_context(|| format!("drop catalog {name}"))
 }
 
@@ -1301,11 +1582,15 @@ fn wait_for_new_marker(
     context: &mut ScenarioContext,
     before: &[String],
     marker: &str,
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
 ) -> Result<()> {
     loop {
         match done.try_recv() {
-            Ok(result) => bail!("Paimon query reached terminal before {marker}: {result:?}"),
+            Ok(Err(error)) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("Paimon query failed before {marker}")));
+            }
+            Ok(Ok(rows)) => bail!("Paimon query reached terminal before {marker}: {rows:?}"),
             Err(mpsc::TryRecvError::Disconnected) => {
                 bail!("Paimon query actor disconnected before {marker}")
             }
@@ -1373,12 +1658,12 @@ fn start_query(context: &mut ScenarioContext, selected: SelectedStatement) -> Re
         context,
         selected.sql.clone(),
         Some(selected),
-        |connection, sql| connection.query::<i64, _>(sql),
+        paimon_integer_rows,
     )
 }
 
 fn expect_error_any<T>(
-    result: std::result::Result<T, mysql::Error>,
+    result: std::result::Result<T, StatementFailure>,
     expected: &[&str],
     operation: &str,
 ) -> Result<()> {
@@ -1386,13 +1671,19 @@ fn expect_error_any<T>(
         Ok(_) => bail!("{operation} unexpectedly succeeded"),
         Err(error) => error,
     };
-    let message = error.to_string().to_ascii_lowercase();
-    ensure!(
-        expected
-            .iter()
-            .any(|needle| message.contains(&needle.to_ascii_lowercase())),
-        "{operation} failed with an unrelated error: {error}; expected one of {expected:?}"
-    );
+    let StatementFailure::Trino(server) = &error else {
+        return Err(anyhow::Error::new(error)
+            .context(format!("{operation} did not return its actual SQL refusal")));
+    };
+    let message = server.message.to_ascii_lowercase();
+    if !expected
+        .iter()
+        .any(|needle| message.contains(&needle.to_ascii_lowercase()))
+    {
+        return Err(anyhow::Error::new(error).context(format!(
+            "{operation} failed with an unrelated error; expected one of {expected:?}"
+        )));
+    }
     Ok(())
 }
 

@@ -73,7 +73,7 @@ use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::endpoint::{TaskDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::{RuntimeEndpoint, TaskDestination};
 use crate::runtime::exchange::online_unit;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::task::exchange::{
@@ -1005,10 +1005,11 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         destination: RuntimeEndpoint,
         entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
-            .register_unit_demands(destination, entries, stop, done)
+            .register_unit_demands(destination, entries, stop, activity, done)
     }
     fn watch_unit_facts(
         &self,

@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail};
-use mysql::Conn;
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, TestClusterOwner,
@@ -28,6 +26,27 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+/// A failed client reader is not a terminal server receipt. Retain the original
+/// typed SQL failure if cancellation or another physical cleanup also fails.
+pub(super) fn mv_response_needs_cancel<T>(
+    response: &std::result::Result<T, StatementFailure>,
+) -> bool {
+    matches!(response, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+}
+pub(super) fn mv_response_with_cleanup<T>(
+    response: std::result::Result<T, StatementFailure>,
+    cleanup: Result<()>,
+) -> Result<std::result::Result<T, StatementFailure>> {
+    match (response, cleanup) {
+        (response, Ok(())) => Ok(response),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => {
+            Err(anyhow::Error::new(primary)
+                .context(format!("original MV SQL cleanup: {cleanup:#}")))
+        }
+    }
+}
 
 const CREDENTIAL_NAME: &str = "uea7-mv-data";
 const CREDENTIAL_GENERATION: &str = "v1";
@@ -54,6 +73,23 @@ impl ManagedMvRestFixture {
     ) -> Result<(Self, ScenarioLaunchConfig)> {
         let rest = IsolatedIcebergRestFixture::start(scenario_root)
             .context("start private Iceberg REST and MinIO fixture for managed MV")?;
+        Self::from_private_rest(rest, catalog)
+    }
+
+    pub(super) fn start_private_with_budget(
+        scenario_root: &Path,
+        catalog: &str,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
+        let (rest, _control) =
+            IsolatedIcebergRestFixture::start_private_with_budget(scenario_root, budget, false)?;
+        Self::from_private_rest(rest, catalog)
+    }
+
+    fn from_private_rest(
+        rest: IsolatedIcebergRestFixture,
+        catalog: &str,
+    ) -> Result<(Self, ScenarioLaunchConfig)> {
         let endpoints = rest.endpoints().clone();
         let identity = rest.static_s3_identity();
         let create_catalog_sql = format!(
@@ -290,15 +326,16 @@ impl Scenario for MvManagementReadmission {
         )?;
         select_catalog_and_namespace(context, &mut conn, "uea7_mv_readmission")?;
         context.action("verify refresh is refused before readmission");
-        let error = match conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
             Err(error) => error,
-            Ok(()) => bail!(
+            Ok(_) => bail!(
                 "closed management accepted refresh before readmission; {}",
                 context.diagnostics()
             ),
         };
-        if !error
-            .to_string()
+        let public_error = mv_public_error(&error)?;
+        if !public_error
+            .message
             .contains("MV target requires a successful fresh Current observation")
         {
             bail!(
@@ -319,9 +356,11 @@ impl Scenario for MvManagementReadmission {
              'the system scenario replaced the declared frontend process before this statement')"
         );
         context.action("declare the previous FE incarnation isolated and readmit the MV");
-        let resumed: Vec<(String, Option<String>)> = conn
-            .query(resume_sql)
-            .context("resume closed MV through the public management procedure")?;
+        let resumed: Vec<(String, Option<String>)> = mv_properties(
+            &conn
+                .execute(resume_sql)
+                .context("resume closed MV through the public management procedure")?,
+        )?;
         let settled = property(&resumed, "SettledEffects")?
             .parse::<usize>()
             .context("parse settled effect count")?;
@@ -389,27 +428,29 @@ pub(super) fn require_three_backends(context: &mut ScenarioContext) -> Result<()
     Ok(())
 }
 
-pub(super) fn connect(context: &mut ScenarioContext) -> Result<Conn> {
-    let timeout = context.remaining("connect MySQL client")?;
-    context.action("connect through public MySQL protocol");
-    mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)
+pub(super) fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
+    context.remaining("connect MV SQL client")?;
+    context.action("connect through public Trino protocol");
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }
 
 pub(super) fn execute(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     action: &str,
     sql: &str,
 ) -> Result<()> {
     context.remaining(action)?;
     context.action(action);
-    conn.query_drop(sql)
+    conn.execute(sql)
         .with_context(|| format!("{action}: {sql}"))
+        .map(|_| ())
 }
 
 pub(super) fn select_catalog_and_namespace(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
 ) -> Result<()> {
     execute(
@@ -423,16 +464,18 @@ pub(super) fn select_catalog_and_namespace(
 
 pub(super) fn assert_rows(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     sql: &str,
     expected: &[(i32, i64)],
     action: &str,
 ) -> Result<()> {
     context.remaining(action)?;
     context.action(action);
-    let actual: Vec<(i32, i64)> = conn
-        .query(sql)
-        .with_context(|| format!("{action}: {sql}"))?;
+    let actual: Vec<(i32, i64)> = mv_rows(
+        &conn
+            .execute(sql)
+            .with_context(|| format!("{action}: {sql}"))?,
+    )?;
     if actual != expected {
         bail!(
             "{action} returned {actual:?}, expected {expected:?}; {}",
@@ -444,15 +487,88 @@ pub(super) fn assert_rows(
 
 pub(super) fn status(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<Vec<(String, Option<String>)>> {
     context.remaining("read managed MV status")?;
-    conn.query(format!(
-        "CALL novarocks_mv_management_status('{catalog}', 'ns', '{mv}')"
-    ))
-    .context("read managed MV status")
+    mv_properties(
+        &conn
+            .execute(format!(
+                "CALL novarocks_mv_management_status('{catalog}', 'ns', '{mv}')"
+            ))
+            .context("read managed MV status")?,
+    )
+}
+
+pub(super) fn mv_public_error(
+    failure: &StatementFailure,
+) -> Result<&novarocks_test_trino_client::TrinoError> {
+    let StatementFailure::Trino(error) = failure else {
+        bail!("expected the original MV SQL business refusal, got {failure}")
+    };
+    Ok(error)
+}
+pub(super) fn mv_properties(result: &StatementResult) -> Result<Vec<(String, Option<String>)>> {
+    anyhow::ensure!(
+        result.is_result_set()
+            && result.columns.len() == 2
+            && result
+                .columns
+                .iter()
+                .all(|column| column.type_signature.raw_type == "varchar"),
+        "MV procedure did not retain its two declared text columns: {result:?}"
+    );
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(key), TrinoValue::Text(value)] => {
+                Ok((key.clone(), Some(value.clone())))
+            }
+            [TrinoValue::Text(key), TrinoValue::Null] => Ok((key.clone(), None)),
+            row => bail!("MV property procedure changed its Text/nullable Text row: {row:?}"),
+        })
+        .collect()
+}
+pub(super) fn mv_rows(result: &StatementResult) -> Result<Vec<(i32, i64)>> {
+    anyhow::ensure!(
+        result.is_result_set() && result.columns.len() == 2,
+        "MV data query omitted its two columns: {result:?}"
+    );
+    for (column, expected) in result.columns.iter().zip(["integer", "bigint"]) {
+        anyhow::ensure!(
+            column.type_signature.raw_type == expected
+                && column.type_signature.arguments.is_empty(),
+            "MV data column changed its declared type {expected}: {column:?}"
+        );
+    }
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(key), TrinoValue::Integer(value)] => {
+                Ok((i32::try_from(*key)?, *value))
+            }
+            row => bail!("MV data query changed its non-null INT/BIGINT row: {row:?}"),
+        })
+        .collect()
+}
+pub(super) fn mv_text_lines(result: &StatementResult) -> Result<Vec<(String,)>> {
+    anyhow::ensure!(
+        result.is_result_set()
+            && result.columns.len() == 1
+            && result.columns[0].type_signature.raw_type == "varchar",
+        "MV EXPLAIN must retain its declared text column: {result:?}"
+    );
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(line)] => Ok((line.clone(),)),
+            row => bail!("MV EXPLAIN changed its text line: {row:?}"),
+        })
+        .collect()
 }
 
 pub(super) fn property<'a>(rows: &'a [(String, Option<String>)], name: &str) -> Result<&'a str> {
@@ -477,7 +593,7 @@ pub(super) fn require_property(
 
 pub(super) fn require_status_phase(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
     expected: &str,
@@ -491,7 +607,7 @@ pub(super) fn require_status_phase(
 
 pub(super) fn wait_for_status_phase(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
     expected: &str,

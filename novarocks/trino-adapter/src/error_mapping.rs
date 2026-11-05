@@ -17,9 +17,9 @@
 
 //! Typed projection of application failures into the Trino 483 client contract.
 use crate::diagnostics::{self, BoundedMessage};
-use novarocks_execution_contract::failure::FailureProjection;
+use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
-    api::{QueryExecutionError, QueryExecutionErrorKind},
+    api::{QueryExecutionError, QueryExecutionErrorKind, StatementExternalEffectDisposition},
     cancellation::QueryCancellationReason,
     execution_error::{ExecutionFailureInput, QueryFailureReason},
     session_error::{QueryServiceError, QueryServiceErrorKind},
@@ -48,6 +48,9 @@ pub(crate) enum TrinoErrorSource<'a> {
         message: &'a str,
     },
     Unsupported {
+        message: &'a str,
+    },
+    QueryTextTooLarge {
         message: &'a str,
     },
     RowTooLarge {
@@ -86,10 +89,12 @@ enum Code {
     PermissionDenied,
     NotFound,
     FunctionNotFound,
+    AlreadyExists,
     NotSupported,
     InvalidSessionProperty,
     InvalidWindowFrame,
     NumericOutOfRange,
+    QueryTextTooLarge,
     AdministrativelyKilled,
     SchemaNotFound,
     TableNotFound,
@@ -120,10 +125,12 @@ impl Code {
             PermissionDenied => (4, "PERMISSION_DENIED", "USER_ERROR"),
             NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
+            AlreadyExists => (12, "ALREADY_EXISTS", "USER_ERROR"),
             NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
             InvalidWindowFrame => (15, "INVALID_WINDOW_FRAME", "USER_ERROR"),
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
+            QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
             SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
@@ -153,14 +160,24 @@ impl Code {
 /// Pure projection used by mapping tests. Production callers retain their query ID.
 #[cfg(test)]
 pub(crate) fn query_error(source: TrinoErrorSource<'_>) -> TrinoQueryError {
-    project_source(None, source)
+    project_source(None, source, None)
 }
 
 pub(crate) fn query_error_for_query(
     query_id: &str,
     source: TrinoErrorSource<'_>,
 ) -> TrinoQueryError {
-    project_source(Some(query_id), source)
+    project_source(Some(query_id), source, None)
+}
+
+/// Preserve the originating typed source and the original owner's independent
+/// cumulative effect fact before applying the protocol's display bound.
+pub(crate) fn query_error_for_query_with_effect(
+    query_id: &str,
+    source: TrinoErrorSource<'_>,
+    effect: Option<StatementExternalEffectDisposition>,
+) -> TrinoQueryError {
+    project_source(Some(query_id), source, effect)
 }
 
 enum PublicMessage<'a> {
@@ -185,9 +202,15 @@ impl fmt::Display for PublicMessage<'_> {
         }
     }
 }
-fn project_source(query_id: Option<&str>, source: TrinoErrorSource<'_>) -> TrinoQueryError {
+fn project_source(
+    query_id: Option<&str>,
+    source: TrinoErrorSource<'_>,
+    effect: Option<StatementExternalEffectDisposition>,
+) -> TrinoQueryError {
     let (code, message, location) = match source {
-        TrinoErrorSource::Service { error, sql } => return service_error(query_id, error, sql),
+        TrinoErrorSource::Service { error, sql } => {
+            return service_error(query_id, error, sql, effect);
+        }
         TrinoErrorSource::Execution { error, sql: _sql } => {
             let (code, message) = match error.execution_failure() {
                 Some(input) => (execution_code(input), PublicMessage::Execution(input)),
@@ -207,7 +230,9 @@ fn project_source(query_id: Option<&str>, source: TrinoErrorSource<'_>) -> Trino
             (code, message, None)
         }
         TrinoErrorSource::Session { error, sql } => match error {
-            StatementSessionError::Service(error) => return service_error(query_id, error, sql),
+            StatementSessionError::Service(error) => {
+                return service_error(query_id, error, sql, effect);
+            }
             StatementSessionError::InvalidSessionProperty { .. } => (
                 Code::InvalidSessionProperty,
                 PublicMessage::Session(error),
@@ -225,6 +250,11 @@ fn project_source(query_id: Option<&str>, source: TrinoErrorSource<'_>) -> Trino
         TrinoErrorSource::Unsupported { message } => {
             (Code::NotSupported, PublicMessage::Borrowed(message), None)
         }
+        TrinoErrorSource::QueryTextTooLarge { message } => (
+            Code::QueryTextTooLarge,
+            PublicMessage::Borrowed(message),
+            None,
+        ),
         TrinoErrorSource::RowTooLarge { message } => (
             Code::InsufficientResources,
             PublicMessage::Borrowed(message),
@@ -236,22 +266,21 @@ fn project_source(query_id: Option<&str>, source: TrinoErrorSource<'_>) -> Trino
             None,
         ),
     };
-    project_message(query_id, code, message, location)
+    project_message(query_id, code, message, location, effect)
 }
 fn project_message(
     query_id: Option<&str>,
     code: Code,
     message: PublicMessage<'_>,
     location: Option<TrinoErrorLocation>,
+    effect: Option<StatementExternalEffectDisposition>,
 ) -> TrinoQueryError {
-    let bounded = match &message {
-        PublicMessage::Borrowed(message) => diagnostics::bound_message(message),
-        _ => diagnostics::bound_display(&message),
-    };
+    let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
+    let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
         && let Some(query_id) = query_id
     {
-        tracing::warn!(client_query_id = query_id, full_error = %message,
+        tracing::warn!(client_query_id = query_id, full_error = %public,
             client_message_json_bytes = bounded.json_bytes,
             max_message_json_bytes = diagnostics::MAX_MESSAGE_JSON_BYTES,
             "Trino client error message truncated; full public diagnostic retained here");
@@ -274,7 +303,12 @@ fn project(
         failure_info: None,
     }
 }
-fn service_error(query_id: Option<&str>, error: &QueryServiceError, sql: &str) -> TrinoQueryError {
+fn service_error(
+    query_id: Option<&str>,
+    error: &QueryServiceError,
+    sql: &str,
+    effect: Option<StatementExternalEffectDisposition>,
+) -> TrinoQueryError {
     let code = if let Some(input) = error.execution_failure() {
         execution_code(input)
     } else if let Some(user) = error.user_error() {
@@ -296,10 +330,19 @@ fn service_error(query_id: Option<&str>, error: &QueryServiceError, sql: &str) -
             QueryServiceErrorKind::Internal => Code::GenericInternal,
         }
     };
-    project_message(
-        query_id,
+    let public = error.diagnostic_with_external_effect(effect);
+    let bounded = diagnostics::bound_display(&public);
+    if bounded.truncated
+        && let Some(query_id) = query_id
+    {
+        tracing::warn!(client_query_id = query_id, full_error = %public,
+            client_message_json_bytes = bounded.json_bytes,
+            max_message_json_bytes = diagnostics::MAX_MESSAGE_JSON_BYTES,
+            "Trino client error message truncated; full public diagnostic retained here");
+    }
+    project(
         code,
-        PublicMessage::Borrowed(error.message()),
+        bounded,
         error.user_error().and_then(|user| user_location(user, sql)),
     )
 }
@@ -321,6 +364,17 @@ fn cancellation_code(reason: &QueryCancellationReason) -> Code {
 fn execution_code(input: &ExecutionFailureInput) -> Code {
     let descriptor = input.descriptor().descriptor;
     let code = user_code(descriptor.code.as_str()).unwrap_or(Code::GenericInternal);
+    // ConnectorMutationFailureKind::AlreadyExists owns the Data/CONNECTOR/6002
+    // fact (spi/connector/mutation.rs). Its entity is unspecified, so the wire
+    // uses Trino's general ALREADY_EXISTS rather than guessing a table kind.
+    let fact = input.fact();
+    if code == Code::GenericUser
+        && fact.class() == FailureClass::Data
+        && fact.reason().domain() == domain::CONNECTOR.get()
+        && fact.reason().code() == 6002
+    {
+        return Code::AlreadyExists;
+    }
     if code != Code::RemoteTaskError {
         return code;
     }
@@ -432,3 +486,100 @@ fn user_location(error: &UserError, sql: &str) -> Option<TrinoErrorLocation> {
 #[cfg(test)]
 #[path = "error_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod effect_projection_tests {
+    use super::*;
+    #[test]
+    fn original_cause_code_location_and_cumulative_effect_share_one_projection() {
+        use StatementExternalEffectDisposition::{
+            CommitUnknown as X, KnownCommitted as C, KnownUncommitted as U,
+        };
+        use novarocks_user_error::{RetryClass, UserErrorLocation};
+        let source = QueryServiceError::from_user_error(UserError::from_descriptor(
+            novarocks_parser::ERROR_CODE_DESCRIPTORS[4],
+            "unexpected token",
+            Some(UserErrorLocation::new(1, 8, None, None)),
+            RetryClass::Never,
+        ));
+        let sql = "SELECT ?";
+        let original = query_error_for_query(
+            "original-query",
+            TrinoErrorSource::Service {
+                error: &source,
+                sql,
+            },
+        );
+        assert!(original.error_location.is_some());
+        let attached = source.clone().attach_external_effect_disposition(U);
+        let error = query_error_for_query_with_effect(
+            "original-query",
+            TrinoErrorSource::Service {
+                error: &attached,
+                sql,
+            },
+            Some(C),
+        );
+        assert_eq!(
+            (
+                error.error_code,
+                error.error_name,
+                error.error_type,
+                error.error_location
+            ),
+            (
+                original.error_code,
+                original.error_name,
+                original.error_type,
+                original.error_location
+            )
+        );
+        assert_eq!(
+            error
+                .message
+                .matches(" (external effect disposition=")
+                .count(),
+            1
+        );
+        assert!(error.message.contains("KnownCommitted do_not_retry=true"));
+        assert_eq!(
+            attached.external_effect_disposition(),
+            Some(U),
+            "projection does not mutate its original source"
+        );
+        let canceled = query_error_for_query_with_effect(
+            "original-query",
+            TrinoErrorSource::Cancellation {
+                reason: &QueryCancellationReason::ClientCancelRequested,
+                message: "original accepted cancellation",
+            },
+            Some(X),
+        );
+        assert_eq!(
+            (canceled.error_code, canceled.error_name),
+            (3, "USER_CANCELED")
+        );
+        assert!(canceled.message.contains("CommitUnknown do_not_retry=true"));
+        let row = query_error_for_query_with_effect(
+            "original-query",
+            TrinoErrorSource::RowTooLarge {
+                message: "original row refusal",
+            },
+            Some(C),
+        );
+        assert_eq!(
+            (row.error_code, row.error_name),
+            (131072, "GENERIC_INSUFFICIENT_RESOURCES")
+        );
+        assert!(row.message.starts_with("original row refusal"));
+        let no_effect = query_error_for_query_with_effect(
+            "original-query",
+            TrinoErrorSource::Service {
+                error: &source,
+                sql,
+            },
+            None,
+        );
+        assert_eq!(no_effect, original);
+    }
+}

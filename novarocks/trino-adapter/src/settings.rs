@@ -22,6 +22,7 @@ pub struct TrinoListenerSettings {
     pub port: u16,
     pub user: String,
     pub client_timeout: Duration,
+    pub query_max_length: crate::QueryTextLimit,
 }
 impl Default for TrinoListenerSettings {
     fn default() -> Self {
@@ -29,6 +30,7 @@ impl Default for TrinoListenerSettings {
             port: 8080,
             user: "root".into(),
             client_timeout: Duration::from_millis(300_000),
+            query_max_length: crate::QueryTextLimit::default(),
         }
     }
 }
@@ -42,5 +44,6 @@ mod tests {
         assert_eq!(settings.port, 8080);
         assert_eq!(settings.user, "root");
         assert_eq!(settings.client_timeout, Duration::from_secs(300));
+        assert_eq!(settings.query_max_length.units(), 1_000_000);
     }
 }

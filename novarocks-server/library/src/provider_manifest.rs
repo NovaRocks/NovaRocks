@@ -399,8 +399,7 @@ fn build_iceberg_control_factory(
     #[cfg(novarocks_dev_controls)]
     let resources = resources.with_test_observation(input.test_slots.iceberg.clone());
     let factory = IcebergControlRoleBindingFactory::new(resources, max_inflight);
-    #[cfg(all(novarocks_dev_controls, feature = "mem-1-m07-hms-listing-observe"))]
-    let factory = factory.with_hms_listing_observation_slot(input.test_slots.hms.clone());
+
     Ok(Arc::new(factory))
 }
 

@@ -24,7 +24,7 @@ use super::{Block, parse_cell, parse_text, parse_type, render_cell};
 pub fn blocks_from_results(results: &[StatementResult]) -> Result<Vec<Block>> {
     results
         .iter()
-        .filter(|result| result.has_columns())
+        .filter(|result| result.is_result_set())
         .map(|result| {
             for column in &result.columns {
                 ensure!(
@@ -234,6 +234,7 @@ mod tests {
             query_id: "query".into(),
             pages: 1,
             update_type: None,
+            update_count: None,
         }
     }
 
@@ -347,5 +348,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(blocks_text(&blocks).unwrap(), "v\na\tb\n\nv\n\"x\"\nv\n2.0");
+    }
+    #[test]
+    fn command_count_rows_never_create_query_golden_blocks() {
+        let before = result("bigint", vec![vec![V::Integer(1)]]);
+        let after = result("bigint", vec![vec![V::Integer(2)]]);
+        let mut counted = result("bigint", vec![vec![V::Integer(0)]]);
+        counted.columns[0].name = "rows".into();
+        counted.update_type = Some("INSERT".into());
+        counted.update_count = Some(0);
+        let mut unknown = result("bigint", vec![vec![V::Null]]);
+        unknown.update_type = Some("ANALYZE".into());
+        let expected = blocks_from_results(&[before.clone(), after.clone()]).unwrap();
+        let actual = blocks_from_results(&[before, counted, unknown, after]).unwrap();
+        assert_eq!(actual, expected);
     }
 }

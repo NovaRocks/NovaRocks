@@ -490,7 +490,13 @@ mod tests {
         let producer = LocalResultProducer::try_new(
             &scope,
             local.retain_alias(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .unwrap();
         let result = produce_local(

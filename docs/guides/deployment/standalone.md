@@ -37,7 +37,7 @@ cargo build -p novarocks-server
 
 FE 配置必须包括：
 
-- FE 客户端端口 `[standalone_server].mysql_port` 与 `trino_port`；
+- FE 客户端端口 `[standalone_server].trino_port`；
 - FE Native gRPC 的 `[server].grpc_port`；
 - FE management HTTP 的 `[server].http_port`；
 - 一个显式 `[catalog_source]`：静态部署使用随配置挂载的 snapshot；只有需要 SQL
@@ -51,15 +51,15 @@ Trino 入口的 FE 配置如下，省略时分别使用 `8080` 与 `300000`：
 
 ```toml
 [standalone_server]
-mysql_port = 9030
 trino_port = 8080
 trino_client_timeout_ms = 300000
+trino_query_max_length = 1000000
 user = "root"
 ```
 
 `trino_client_timeout_ms` 是客户端两次查询请求之间的放弃期限，默认五分钟；针对该查询的 `HEAD` 也刷新期限。
 它不设置查询执行期限。每次 HTTP 响应另有固定 30 秒写出期限，写出失败或到期保留原页供重试；CLI 会处理分页与最后一页确认。
-Trino 与 MySQL 都固定绑定 `127.0.0.1`；`[server].host` 不扩展客户端入口的监听地址。
+Trino 固定绑定 `127.0.0.1`；`[server].host` 不扩展客户端入口的监听地址。
 
 BE 配置必须包括 Data 的 `[server].grpc_port`、显式非零 Control 的
 `[server].control_grpc_port` 与 `[server].http_port`，三个端口必须独立；Control 不从
@@ -106,17 +106,16 @@ NO_PROXY=127.0.0.1,localhost \
 NOVAROCKS_READY role=be grpc_port=9081 control_grpc_port=9082 advertise_host=127.0.0.1 pid=<pid>
 ```
 
-FE 在两个客户端监听绑定后另行打印就绪 marker；具体端口取自本次实际绑定：
+FE 在 Trino 客户端监听绑定后另行打印就绪 marker；具体端口取自本次实际绑定：
 
 ```text
-NOVAROCKS_READY mysql_port=9030 pid=<pid> trino_port=8080
+NOVAROCKS_READY role=fe trino_port=8080 pid=<pid>
 ```
 
 看到 marker 后再连接客户端。Trino CLI 使用当前 NovaRocks SQL 方言：
 
 ```bash
 trino --server http://127.0.0.1:8080 --user root --execute 'SELECT 1'
-mysql -h 127.0.0.1 -P 9030 -uroot
 ```
 
 Trino HTTP 只接受 Host 为 `localhost`、`127.0.0.1` 或 `[::1]` 的请求（可带数字端口），其他名称返回 403。
@@ -125,7 +124,9 @@ Native trust 只保护 FE/BE 的 Native 通道。`--catalog` 与 `--schema` 由 
 
 Trino 的 SQL 方言、时间语义、元数据查询、预编译语句和多语句事务没有因采用客户端协议而扩展。
 结果中的宽整数、无符号整数、opaque 与精度大于 38 的 decimal 在 Trino 呈现规划期返回不支持的具名错误。
-DDL 与会话语句返回 `updateType`；没有真实逻辑写计数时不返回 `updateCount`。
+完成结果从准入后各页保留 `updateType`。空命令的 `columns` 为 `[]`；计数类命令提供 `rows bigint` 列，真实计数同时出现在数据行与 `updateCount`，没有真实计数时行值为 NULL 且不返回 `updateCount`。计数数据页仍带 `nextUri`，请求终页后才结算。
+
+`trino_query_max_length` 默认 `1000000`，接受 `0..=1000000000` UTF-16 code units；BMP 字符占一单位，补充平面字符占两单位。超过限制返回 `QUERY_TEXT_TOO_LARGE`，不启动语句工作。`trino_port = 0` 由 OS 分配端口，以本次 ready marker 为准；旧 `mysql_port` 与 MySQL 载体配置在启动时明确拒绝。
 
 ## 五个 Native／management listener surface
 
@@ -176,7 +177,7 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 ```
 
 该 fixture 为当前工作区生成一对正常 FE/BE 配置，以及 FE Native/management、BE
-Data/Control/management 五个不冲突 listener port，并另外配置 MySQL 与 Trino 客户端端口。Trino 端口通过 `NOVA_ENV_TRINO_PORT` 导出；不要
+Data/Control/management 五个不冲突 listener port，并另外配置 Trino 客户端端口。Trino 端口通过 `NOVA_ENV_TRINO_PORT` 导出；不要
 猜测端口或重用旧的 standalone config 环境变量。
 
 当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon。Paimon catalog 配置与
@@ -194,7 +195,7 @@ paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 启动前报 endpoint overlap | 为 FE MySQL、FE Trino、FE Native、BE Data、BE Control 与两侧 management HTTP 分配不同端口；也检查 wildcard bind。 |
+| 启动前报 endpoint overlap | 为 FE Trino、FE Native、BE Data、BE Control 与两侧 management HTTP 分配不同端口；也检查 wildcard bind。 |
 | 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
 | FE 提示缺少 StaticFile snapshot | 复制 `novarocks-catalogs.toml.example` 到 FE config 同目录，并使 `[catalog_source].static_file_path` 指向它；文件缺失不会降级为空 snapshot。 |
 | FE 提示 DynamicStateStore 缺少 StateStore | 仅在 `[catalog_source].mode = "dynamic-state-store"` 时配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
@@ -203,6 +204,5 @@ paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138
 | 启动拒绝 Native descriptor baseline | 在进程启动环境使 soft FD limit 至少 2048；Server 不会自动修改限制。 |
 | Native RPC `Unauthenticated` 或 TLS handshake failure | 检查 secret/env、token clock 和双方 TLS profile；不要降级或删除 JWT 来绕过失败。 |
 | 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
-| 连接 MySQL 失败 | 等待 `NOVAROCKS_READY`，然后确认 FE 的 `[standalone_server].mysql_port`。 |
 | 连接 Trino 失败或返回 403/401 | 等待 marker 中的实际 `trino_port`；使用本机名称，核对 CLI 的 `--user` 与 `[standalone_server].user`。 |
 | Trino 查询返回 `ABANDONED_QUERY` | 客户端超过 `trino_client_timeout_ms` 没有请求该查询；检查分页消费或查询心跳，区别于原查询执行期限。 |

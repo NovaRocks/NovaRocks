@@ -1961,7 +1961,6 @@ mod tests {
             assert!(bounds.contains(&(192 + 3 * 192, ReaderArrayHeaderClass::Temporary)));
             // Pinned sparse helper initially collects floor(n/64) u64s, then pushes
             // one remainder. MutableBuffer can grow128->256; cumulative384 <=3*192.
-            assert!(128 + 256 <= 3 * 192);
         }
     }
 }

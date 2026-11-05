@@ -834,7 +834,15 @@ fn test_request_context_with_role(
             current_database.to_string(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            Some(
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: true,
+                    },
+                ),
+            ),
         ),
         QueryExecutionContext::new(
             role,

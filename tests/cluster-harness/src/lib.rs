@@ -19,11 +19,7 @@ mod effective_launch_config;
 pub mod test_sessions;
 use test_sessions::{ClusterTestSessionPlan, RoleSlot};
 #[cfg(unix)]
-mod exact_mysql_fixture_exit;
-#[cfg(unix)]
-mod exact_mysql_fixture_identity;
-#[cfg(unix)]
-mod exact_mysql_fixture_sources;
+mod original_role_sources;
 mod root_observation_identity;
 
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
@@ -43,8 +39,6 @@ pub mod resource_registration;
 pub mod vended_rest_catalog;
 
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
-use mysql::{Conn as MysqlConn, OptsBuilder};
 use native_fault_proxy::{NativeFaultProxy, NativeFaultProxyControl};
 use native_root_reply_fault::{RootReplyFaultBounds, RootReplyFaultControl, RootReplyFaultProxy};
 use novarocks_failpoint::{
@@ -113,6 +107,76 @@ struct StatementLifecycleObservationWire {
     query_local_sequence: Option<u64>,
     attempt_id: Option<u64>,
     snapshot: Option<LifecycleConvergenceWireSnapshot>,
+    root_status: Option<StatementRootStatusWire>,
+}
+
+#[derive(serde::Deserialize)]
+struct StatementRootStatusWire {
+    execution_id: String,
+    stage_id: u32,
+    task_id: u32,
+    backend_process_id: String,
+    installed: bool,
+    status_version: u64,
+}
+
+/// Observation copied from the FE's exact Task status author. This grants no
+/// Native access, cancellation, admission or result ownership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledStatementRoot {
+    pub root: novarocks_execution_contract::TaskIdentity,
+    pub status_version: novarocks_execution_contract::TaskStatusVersion,
+}
+
+fn decode_installed_statement_root(
+    token: &str,
+    target: &StatementObservationTarget,
+    wire: StatementLifecycleObservationWire,
+) -> Result<Option<InstalledStatementRoot>> {
+    if !statement_binding_is_owned(token, target, &wire)? {
+        return Ok(None);
+    }
+    let Some(root) = wire.root_status else {
+        return Ok(None);
+    };
+    ensure!(
+        wire.execution_id.as_deref() == Some(root.execution_id.as_str()),
+        "root status does not belong to the exact statement attempt"
+    );
+    let namespace = decode_query_process_namespace(
+        wire.query_process_namespace
+            .as_deref()
+            .context("root status omitted its query process namespace")?,
+    )?;
+    let sequence = wire
+        .query_local_sequence
+        .context("root status omitted its query sequence")?;
+    let query = novarocks_types::QueryId::new(
+        i64::from_ne_bytes(namespace.to_ne_bytes()),
+        i64::try_from(sequence)?,
+    );
+    let attempt = novarocks_types::AttemptId::new(
+        wire.attempt_id.context("root status omitted its attempt")?,
+    )?;
+    let execution = novarocks_types::QueryExecutionId::new(query, attempt)?;
+    let backend = root
+        .backend_process_id
+        .parse::<novarocks_types::BackendProcessId>()?;
+    ensure!(
+        backend.to_string() == root.backend_process_id,
+        "root status backend identity is not canonical"
+    );
+    let identity = novarocks_execution_contract::TaskIdentity::new(
+        execution,
+        novarocks_types::StageId::new(root.stage_id)?,
+        novarocks_types::TaskId::new(root.task_id)?,
+        backend,
+    );
+    let status_version = novarocks_execution_contract::TaskStatusVersion::new(root.status_version)?;
+    Ok(root.installed.then_some(InstalledStatementRoot {
+        root: identity,
+        status_version,
+    }))
 }
 
 /// Validate attribution only. A bound journal entry is not a completion receipt.
@@ -161,6 +225,34 @@ fn validate_statement_observation_binding(
         _ => bail!("statement observation returned incomplete execution attribution"),
     }
     Ok(())
+}
+
+/// Observe the original statement binding without consuming its journal or
+/// requiring the attempt's later convergence snapshot.
+fn statement_binding_is_owned(
+    token: &str,
+    target: &StatementObservationTarget,
+    wire: &StatementLifecycleObservationWire,
+) -> Result<bool> {
+    ensure!(
+        wire.schema_version == 1 && wire.run_token == token,
+        "statement observation returned a foreign token or schema"
+    );
+    if wire.work_id.is_none() {
+        ensure!(
+            wire.logical_execution_id.is_none()
+                && wire.execution_id.is_none()
+                && wire.query_process_namespace.is_none()
+                && wire.query_local_sequence.is_none()
+                && wire.attempt_id.is_none()
+                && wire.snapshot.is_none()
+                && wire.root_status.is_none(),
+            "unbound statement observation carried execution attribution"
+        );
+        return Ok(false);
+    }
+    validate_statement_observation_binding(token, target, wire)?;
+    Ok(true)
 }
 
 fn decode_statement_lifecycle_observation(
@@ -484,7 +576,6 @@ pub struct CrossProcessRuntime {
     pub be: Vec<BePorts>,
     pub fe_http_port: u16,
     pub fe_grpc_port: u16,
-    pub fe_mysql_port: u16,
     pub fe_trino_port: u16,
 }
 
@@ -1284,18 +1375,62 @@ pub struct QueryLifecycleStatementObservation {
     target: StatementObservationTarget,
 }
 
+/// One observer-only nomination, reserved before the original role launches.
+/// Runtime SQL binds its actual POST; this owner grants no Native fault action.
+#[must_use = "Consume the original finite observer for its one actual submission"]
+pub struct StatementObservationOnly {
+    run_token: String,
+    deadline: Instant,
+}
+impl StatementObservationOnly {
+    pub fn reserve(
+        plan: &ClusterTestSessionPlan,
+    ) -> Result<(Self, novarocks_failpoint::session::DomainGrant)> {
+        let owner = Self {
+            run_token: plan.fresh_domain_secret()?,
+            deadline: plan.deadline(),
+        };
+        let grant = novarocks_failpoint::session::DomainGrant {
+            domain: "statement-observation".into(),
+            grant_id: "finite-statement-observer".into(),
+            parameters: serde_json::json!({
+                "action":"observe", "bearer_secret":plan.fresh_domain_secret()?,
+            }),
+        };
+        Ok((owner, grant))
+    }
+
+    /// Consume even a refused nomination; the caller cancels the same pending
+    /// query on failure. This never starts its first GET or drains its journal.
+    pub fn arm(
+        self,
+        handle: &mut dyn TestClusterOwner,
+        client_query_id: &str,
+        sql: &str,
+        original_deadline: Instant,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        ensure!(
+            original_deadline == self.deadline && Instant::now() < self.deadline,
+            "observer-only original deadline changed or expired"
+        );
+        ensure!(!sql.trim().is_empty(), "observer-only submission is empty");
+        handle.arm_selected_statement_observation_for_client_query(
+            &self.run_token,
+            client_query_id,
+            sql,
+            self.deadline,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 enum StatementObservationTarget {
-    Connection(u32),
     ClientQuery(String),
 }
 
 impl StatementObservationTarget {
     fn matches_work_id(&self, parts: &[&str]) -> bool {
         match self {
-            Self::Connection(connection) => {
-                parts[0] == "statement" && parts[1].parse::<u32>().ok() == Some(*connection)
-            }
             Self::ClientQuery(query) => parts[0] == "client-query" && parts[1] == query,
         }
     }
@@ -2838,12 +2973,6 @@ pub trait TestClusterOwner: Send {
     ) -> Result<()> {
         bail!("an after-exit restart hook requires the original cross-process owner")
     }
-    fn kill_query(&mut self, connection_id: u32) -> Result<()> {
-        bail!("KILL QUERY is unsupported by this server mode (connection_id={connection_id})")
-    }
-    fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
-        self.kill_query(connection_id)
-    }
     fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         bail!("backend process identity is unsupported by this server mode (index={index})")
     }
@@ -2864,22 +2993,6 @@ pub trait TestClusterOwner: Send {
         &mut self,
     ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
         Ok(None)
-    }
-    fn arm_query_lifecycle_statement_observation(
-        &mut self,
-        _connection_id: u32,
-        _sql: &str,
-    ) -> Result<QueryLifecycleStatementObservation> {
-        bail!("exact statement lifecycle observation is unsupported by this server mode")
-    }
-    fn arm_selected_statement_observation(
-        &mut self,
-        _run_token: &str,
-        _connection_id: u32,
-        _sql: &str,
-        _deadline: Instant,
-    ) -> Result<QueryLifecycleStatementObservation> {
-        bail!("selected statement observation is unsupported by this server mode")
     }
     fn arm_selected_statement_observation_for_client_query(
         &mut self,
@@ -2946,6 +3059,33 @@ pub trait TestClusterOwner: Send {
         _deadline: Instant,
     ) -> Result<QueryLifecycleStructuredSnapshot> {
         bail!("exact statement lifecycle observation is unsupported by this server mode")
+    }
+    /// Read only the already bound statement key/generation from the original
+    /// observer. It grants no statement, fault or resource authority.
+    fn query_lifecycle_statement_token(
+        &mut self,
+        _observation: &QueryLifecycleStatementObservation,
+        _deadline: Instant,
+    ) -> Result<(u64, u64)> {
+        bail!("exact statement token observation is unsupported by this server mode")
+    }
+    /// Wait for FE ownership of this exact statement, leaving the observation
+    /// in place for the actor's later completion and explicit drain.
+    fn await_query_lifecycle_statement_owned(
+        &mut self,
+        _observation: &QueryLifecycleStatementObservation,
+        _deadline: Instant,
+    ) -> Result<()> {
+        bail!("exact statement ownership observation is unsupported by this server mode")
+    }
+    /// Wait for this exact FE attempt to observe its actual root Installed bit.
+    /// The existing finite observation remains available for explicit drain.
+    fn await_statement_root_installed(
+        &mut self,
+        _observation: &QueryLifecycleStatementObservation,
+        _deadline: Instant,
+    ) -> Result<InstalledStatementRoot> {
+        bail!("exact installed root observation is unsupported by this server mode")
     }
     /// Drain and validate the exact existing binding after the caller has settled
     /// its SQL actor. This does not prove FE worker or BE resource completion.
@@ -3147,6 +3287,13 @@ pub fn render_cross_process_config(
     let root = value
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("standalone config root must be a TOML table"))?;
+    ensure!(
+        !root
+            .get("standalone_server")
+            .and_then(Value::as_table)
+            .is_some_and(|server| server.contains_key("mysql_port")),
+        "standalone_server.mysql_port is retired; use standalone_server.trino_port"
+    );
 
     let server = table_mut(root, "server");
     server.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
@@ -3177,10 +3324,6 @@ pub fn render_cross_process_config(
         ClusterProcessRole::Fe => {
             let standalone_server = table_mut(root, "standalone_server");
             standalone_server.insert(
-                "mysql_port".to_string(),
-                Value::Integer(i64::from(runtime.fe_mysql_port)),
-            );
-            standalone_server.insert(
                 "trino_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_trino_port)),
             );
@@ -3199,7 +3342,6 @@ pub fn render_cross_process_config(
                 .get_mut("standalone_server")
                 .and_then(Value::as_table_mut)
             {
-                standalone_server.remove("mysql_port");
                 standalone_server.remove("trino_port");
             }
         }
@@ -3617,8 +3759,7 @@ impl Drop for CleanupFaultFiles {
 
 pub struct CrossProcessCluster {
     target_host: String,
-    target_port: u16,
-    mysql_user: String,
+    sql_user: String,
     // FE-visible endpoints; runtime.be retains the real process listen ports.
     be_grpc_ports: Vec<u16>,
     be_control_grpc_ports: Vec<u16>,
@@ -3862,44 +4003,6 @@ impl CrossProcessCluster {
         )
     }
 
-    /// Explicit fixture-only check after preparing exact configs, before any role spawn.
-    pub fn launch_with_exact_mysql_prelaunch_check(
-        options: CrossProcessClusterOptions,
-        check: &dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>,
-    ) -> Result<Self> {
-        Self::launch_with_native_fault_options(
-            options,
-            CrossProcessNativeFaultProxyConfig::default(),
-            None,
-            Some(check),
-            None,
-            None,
-            None,
-        )
-    }
-
-    /// Opt-in held-scene source observation; the normal launch path is unchanged.
-    /// Each log callback borrows the original writer's spawn-time identity source.
-    pub fn launch_with_held_live_source_checks(
-        options: CrossProcessClusterOptions,
-        prelaunch_check: &dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>,
-        log_owner_check: &dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>,
-    ) -> Result<Self> {
-        ensure!(
-            options.cluster_size == 3,
-            "held live sources require exactly three backends"
-        );
-        Self::launch_with_native_fault_options(
-            options,
-            CrossProcessNativeFaultProxyConfig::default(),
-            None,
-            Some(prelaunch_check),
-            Some(log_owner_check),
-            None,
-            None,
-        )
-    }
-
     /// Launch using finite consumer declarations. Scenario/profile names confer no authority.
     pub fn launch_with_test_sessions(
         options: CrossProcessClusterOptions,
@@ -4063,7 +4166,6 @@ impl CrossProcessCluster {
                 .collect(),
             fe_http_port: reserved.fe_http_port.port(),
             fe_grpc_port: reserved.fe_grpc_port.port(),
-            fe_mysql_port: reserved.fe_mysql_port.port(),
             fe_trino_port: reserved.fe_trino_port.port(),
         };
         let native_proxy_config = proxy_config.clone();
@@ -4084,7 +4186,7 @@ impl CrossProcessCluster {
                 base_config_path.display()
             )
         })?;
-        let mysql_user = base_config
+        let sql_user = base_config
             .parse::<Value>()
             .ok()
             .and_then(|value| {
@@ -4238,7 +4340,6 @@ impl CrossProcessCluster {
             // self-registration ingress from its first announce attempt.
             let _ = reserved.fe_http_port.release();
             let _ = reserved.fe_grpc_port.release();
-            let _ = reserved.fe_mysql_port.release();
             let _ = reserved.fe_trino_port.release();
             let (fe_process, fe_launch_identity) = spawn_novarocks_process(ProcessLaunch {
                 binary: &fe_binary,
@@ -4246,7 +4347,7 @@ impl CrossProcessCluster {
                 identity_role: "fe",
                 config_path: &fe_config_path,
                 marker: &format!(
-                    "{} mysql_port=",
+                    "{} role=fe trino_port=",
                     novarocks_failpoint::observation_marker::READY
                 ),
                 startup_timeout: capped_role_startup_timeout(
@@ -4271,9 +4372,9 @@ impl CrossProcessCluster {
                 check("fe", &fe_process.log_source())?;
             }
             println!(
-                "started cross-process FE pid={} mysql_port={} config={}",
+                "started cross-process FE pid={} trino_port={} config={}",
                 fe_process.pid(),
-                runtime.fe_mysql_port,
+                runtime.fe_trino_port,
                 fe_config_path.display()
             );
 
@@ -4390,8 +4491,7 @@ impl CrossProcessCluster {
 
         Ok(Self {
             target_host: "127.0.0.1".to_string(),
-            target_port: runtime.fe_mysql_port,
-            mysql_user,
+            sql_user,
             be_grpc_ports,
             be_control_grpc_ports,
             native_fault_proxies,
@@ -4809,7 +4909,7 @@ impl CrossProcessCluster {
     /// BE processes are deliberately left running, so a caller observes exactly
     /// one FE that lost every durable record while the lake and the live
     /// backends stayed where they were. Stop, start and readiness reuse the
-    /// same `ServerHandle::kill_fe` / `ServerHandle::restart_fe_until` paths an
+    /// same `TestClusterOwner::kill_fe` / `TestClusterOwner::restart_fe_until` paths an
     /// ordinary FE restart uses; only the store destruction is new.
     ///
     /// The reused restart path ends in the management backend topology barrier.
@@ -4833,9 +4933,9 @@ impl CrossProcessCluster {
             .context("restart cross-process FE against an empty durable state store")
     }
 
-    /// MySQL user parsed from the supplied base config.
-    pub fn mysql_user(&self) -> &str {
-        &self.mysql_user
+    /// SQL principal parsed from the supplied base config.
+    pub fn sql_user(&self) -> &str {
+        &self.sql_user
     }
 
     /// Begins the real FE SIGTERM drain without waiting for process exit, so a
@@ -4909,16 +5009,6 @@ impl CrossProcessCluster {
         self.query_execution_resource_diagnostics_impl()
     }
 
-    /// Independent bounded projection from the original FE child log, not Unix control.
-    #[cfg(unix)]
-    pub fn original_exact_mysql_frontend_identity(
-        &self,
-        original_deadline: Instant,
-    ) -> Result<novarocks_types::FrontendProcessId> {
-        self.with_original_frontend_log_snapshot(original_deadline, |reader, length| {
-            exact_mysql_fixture_identity::scan(reader, length, original_deadline)
-        })
-    }
     /// Neutral, selected stdout source; never falls back to an exact gate marker.
     #[cfg(unix)]
     pub fn original_root_observation_frontend_identity(
@@ -4928,76 +5018,6 @@ impl CrossProcessCluster {
         self.with_original_frontend_log_snapshot(deadline, |reader, length| {
             root_observation_identity::scan(reader, length, deadline)
         })
-    }
-    /// Explicit fixture-only success gate, using the original four role owners.
-    /// A failed FE success gate never skips cleanup or becomes successful generic stop.
-    #[cfg(unix)]
-    pub fn shutdown_exact_mysql_fixture(&mut self, original_deadline: Instant) -> Result<()> {
-        let mut failures: [Option<anyhow::Error>; 7] = std::array::from_fn(|_| None);
-        if let Err(error) = self.role_build_information.retain(&self.runtime_dir) {
-            self.retain_runtime_artifacts = true;
-            failures[6] = Some(error.context("retain actual role build information"));
-        }
-        if self.be_processes.len() != 3 {
-            failures[1] = Some(anyhow::anyhow!(
-                "exact MySQL role gate requires original 1FE+3BE"
-            ));
-            // Even an invalid topology must settle every original owner before
-            // the caller starts external-fixture teardown. It remains FAILED.
-            if let Err(error) = self.shutdown() {
-                failures[2] = Some(error);
-            }
-            return Err(ExactMysqlRoleShutdownError { failures }.into());
-        }
-        if let Err(error) = self.native_fault_proxies.stop_root_reply_actors() {
-            failures[0] = Some(error);
-        }
-        if let Err(error) = exact_mysql_fixture_exit::require_original_fe_success(
-            &mut self.fe_process,
-            original_deadline,
-        ) {
-            failures[1] = Some(error);
-        }
-        // Always settle this same FE, including failed/expired successful-exit wait.
-        self.role_sessions_joined = true;
-        if let Some(plan) = &mut self.test_sessions
-            && let Err(error) = plan.end_and_join()
-        {
-            self.role_sessions_joined = false;
-            let detail = format!("join exact fixture role sessions: {error:#}");
-            failures[0] = Some(match failures[0].take() {
-                Some(primary) => anyhow::anyhow!("{primary:#}; {detail}"),
-                None => anyhow::anyhow!(detail),
-            });
-        }
-        if let Err(error) = self.fe_process.stop() {
-            failures[2] = Some(error);
-        }
-        for (index, process) in self.be_processes.iter_mut().enumerate() {
-            if let Err(error) = process.stop() {
-                failures[3 + index] = Some(error);
-            }
-        }
-        self.native_fault_proxies.stop();
-        if failures.iter().all(Option::is_none)
-            && !self.retain_runtime_artifacts
-            && let Err(error) = fs::remove_dir_all(&self.runtime_dir)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            failures[6] = Some(error.into());
-        }
-        self.native_trust_fixture.cleanup_sensitive_material();
-        if failures.iter().any(Option::is_some) {
-            Err(ExactMysqlRoleShutdownError { failures }.into())
-        } else {
-            if !self.retain_runtime_artifacts {
-                self.fe_process.release_diagnostics()?;
-                for process in &self.be_processes {
-                    process.release_diagnostics()?;
-                }
-            }
-            Ok(())
-        }
     }
     pub fn build_information_evidence(&self) -> Result<serde_json::Value> {
         self.role_build_information.value(&self.runtime_dir)
@@ -5203,8 +5223,8 @@ impl CrossProcessCluster {
             after_exit()
                 .context("after the original frontend exit, before its successor launch")?;
         }
-        let marker = &*format!(
-            "{} mysql_port=",
+        let marker = &format!(
+            "{} role=fe trino_port=",
             novarocks_failpoint::observation_marker::READY
         );
         let binary = self.test_sessions.as_ref().map_or_else(
@@ -5389,70 +5409,6 @@ impl TestClusterOwner for CrossProcessCluster {
         )
     }
 
-    fn arm_query_lifecycle_statement_observation(
-        &mut self,
-        connection_id: u32,
-        sql: &str,
-    ) -> Result<QueryLifecycleStatementObservation> {
-        ensure!(
-            connection_id > 0 && !sql.is_empty(),
-            "invalid statement observation target"
-        );
-        let observation = QueryLifecycleStatementObservation {
-            token: next_fragment_failure_token(connection_id as usize),
-            target: StatementObservationTarget::Connection(connection_id),
-        };
-        self.statement_observation_control(
-            "arm",
-            &serde_json::json!({
-                "run_token": observation.token,
-                "connection_id": connection_id,
-                "sql_sha256": format!("{:x}", Sha256::digest(sql.as_bytes())),
-            }),
-            Instant::now() + TOPOLOGY_IO_TIMEOUT_CAP,
-        )?;
-        Ok(observation)
-    }
-
-    fn arm_selected_statement_observation(
-        &mut self,
-        run_token: &str,
-        connection_id: u32,
-        sql: &str,
-        deadline: Instant,
-    ) -> Result<QueryLifecycleStatementObservation> {
-        ensure!(
-            connection_id > 0
-                && !sql.is_empty()
-                && !run_token.is_empty()
-                && run_token.len() <= 128
-                && run_token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
-            "invalid frozen statement observation target"
-        );
-        let plan = self
-            .test_sessions
-            .as_ref()
-            .context("selected statement has no role session")?;
-        let deadline = deadline.min(plan.deadline());
-        ensure!(
-            deadline > Instant::now(),
-            "selected statement original deadline expired"
-        );
-        let observation = QueryLifecycleStatementObservation {
-            token: run_token.to_owned(),
-            target: StatementObservationTarget::Connection(connection_id),
-        };
-        self.statement_observation_control(
-            "arm",
-            &serde_json::json!({
-            "run_token":run_token,"connection_id":connection_id,
-            "sql_sha256":format!("{:x}",Sha256::digest(sql.as_bytes()))}),
-            deadline,
-        )?;
-        Ok(observation)
-    }
     fn arm_selected_statement_observation_for_client_query(
         &mut self,
         run_token: &str,
@@ -5639,6 +5595,98 @@ impl TestClusterOwner for CrossProcessCluster {
                 observation.token,
                 observation.target
             );
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(LIFECYCLE_CONVERGENCE_POLL_INTERVAL),
+            );
+        }
+    }
+
+    fn query_lifecycle_statement_token(
+        &mut self,
+        observation: &QueryLifecycleStatementObservation,
+        deadline: Instant,
+    ) -> Result<(u64, u64)> {
+        let value = self
+            .statement_observation_control(
+                "peek",
+                &serde_json::json!({"run_token":observation.token}),
+                deadline,
+            )?
+            .context("statement token peek returned no document")?;
+        let wire: StatementLifecycleObservationWire = serde_json::from_value(value)?;
+        validate_statement_observation_binding(&observation.token, &observation.target, &wire)?;
+        let work = wire
+            .work_id
+            .as_deref()
+            .context("original statement is not yet bound")?;
+        let parts = work.split(':').collect::<Vec<_>>();
+        ensure!(
+            parts.len() == 4,
+            "original statement token has invalid width"
+        );
+        Ok((parts[2].parse()?, parts[3].parse()?))
+    }
+
+    fn await_query_lifecycle_statement_owned(
+        &mut self,
+        observation: &QueryLifecycleStatementObservation,
+        deadline: Instant,
+    ) -> Result<()> {
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for exact FE statement ownership token={} target={:?}",
+                observation.token,
+                observation.target
+            );
+            let value = self
+                .statement_observation_control(
+                    "peek",
+                    &serde_json::json!({"run_token": observation.token}),
+                    deadline,
+                )?
+                .context("statement ownership peek returned no document")?;
+            let wire = serde_json::from_value(value)
+                .context("decode exact statement ownership observation")?;
+            if statement_binding_is_owned(&observation.token, &observation.target, &wire)? {
+                return Ok(());
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(LIFECYCLE_CONVERGENCE_POLL_INTERVAL),
+            );
+        }
+    }
+
+    fn await_statement_root_installed(
+        &mut self,
+        observation: &QueryLifecycleStatementObservation,
+        deadline: Instant,
+    ) -> Result<InstalledStatementRoot> {
+        loop {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for exact FE root installation token={} target={:?}",
+                observation.token,
+                observation.target
+            );
+            let value = self
+                .statement_observation_control(
+                    "peek",
+                    &serde_json::json!({"run_token": observation.token}),
+                    deadline,
+                )?
+                .context("root installation peek returned no document")?;
+            let wire =
+                serde_json::from_value(value).context("decode exact FE root installation")?;
+            if let Some(root) =
+                decode_installed_statement_root(&observation.token, &observation.target, wire)?
+            {
+                return Ok(root);
+            }
             thread::sleep(
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -6286,33 +6334,6 @@ impl TestClusterOwner for CrossProcessCluster {
         self.restart_frontend_until(Instant::now() + self.startup_timeout, Some(after_exit))
     }
 
-    fn kill_query(&mut self, connection_id: u32) -> Result<()> {
-        self.kill_query_until(connection_id, Instant::now() + self.startup_timeout)
-    }
-
-    fn kill_query_until(&mut self, connection_id: u32, deadline: Instant) -> Result<()> {
-        let io_timeout = topology_io_timeout(remaining_until(deadline, "KILL QUERY connect")?);
-        let builder = OptsBuilder::new()
-            .ip_or_hostname(Some(self.target_host.clone()))
-            .tcp_port(self.target_port)
-            .prefer_socket(false)
-            .user(Some(self.mysql_user.clone()))
-            .tcp_connect_timeout(Some(io_timeout))
-            .read_timeout(Some(io_timeout))
-            .write_timeout(Some(io_timeout));
-        let mut control = MysqlConn::new(builder).with_context(|| {
-            format!(
-                "connect KILL QUERY control session to {}:{}",
-                self.target_host, self.target_port
-            )
-        })?;
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .with_context(|| format!("execute KILL QUERY {connection_id}"))?;
-        println!("executed KILL QUERY {connection_id} through a separate control session");
-        Ok(())
-    }
-
     fn writer_exit_observed(&self) -> bool {
         !self.unconfirmed_role_launch
             && self.role_sessions_joined
@@ -6373,7 +6394,7 @@ fn process_runtime_diagnostics_with_drained_backends(
     let mut exited = false;
     match fe_process.runtime_diagnostic(
         "FE",
-        &format!("mysql://127.0.0.1:{}", runtime.fe_mysql_port),
+        &format!("http://127.0.0.1:{}/v1/statement", runtime.fe_trino_port),
         fe_config_path,
     ) {
         Ok(diagnostic) => diagnostics.push(diagnostic),
@@ -6888,7 +6909,6 @@ struct ReservedRuntimePorts {
     be_ports: Vec<ReservedBePorts>,
     fe_http_port: ReservedTcpPort,
     fe_grpc_port: ReservedTcpPort,
-    fe_mysql_port: ReservedTcpPort,
     fe_trino_port: ReservedTcpPort,
 }
 
@@ -6907,7 +6927,6 @@ impl ReservedRuntimePorts {
             be_ports,
             fe_http_port: ReservedTcpPort::new()?,
             fe_grpc_port: ReservedTcpPort::new()?,
-            fe_mysql_port: ReservedTcpPort::new()?,
             fe_trino_port: ReservedTcpPort::new()?,
         })
     }
@@ -7432,7 +7451,7 @@ mod tests {
         serde_json::json!({
             "schema_version": 1,
             "run_token": "query-on",
-            "work_id": "statement:7:1:5",
+            "work_id": "client-query:20261029_120000_00001_abcde:1:5",
             "logical_execution_id": "11:12",
             "execution_id": "11:12:13",
             "query_process_namespace": "0x000000000000000b",
@@ -7440,6 +7459,211 @@ mod tests {
             "attempt_id": 13,
             "snapshot": lifecycle_debug_json("11:12:13"),
         })
+    }
+
+    fn installed_root_json(installed: bool) -> serde_json::Value {
+        let mut value = statement_observation_json();
+        value["snapshot"] = serde_json::Value::Null;
+        value["root_status"] = serde_json::json!({
+            "execution_id":"11:12:13", "stage_id":2, "task_id":3,
+            "backend_process_id":novarocks_types::BackendProcessId::new_v7().to_string(),
+            "installed":installed, "status_version":7,
+        });
+        value
+    }
+
+    #[test]
+    fn root_installation_requires_the_actual_installed_bit_without_a_terminal_snapshot() {
+        let target = StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into());
+        let pending = installed_root_json(false);
+        assert!(
+            decode_installed_statement_root(
+                "query-on",
+                &target,
+                serde_json::from_value(pending).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let value = installed_root_json(true);
+        let root = decode_installed_statement_root(
+            "query-on",
+            &target,
+            serde_json::from_value(value.clone()).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(root.root.stage_id().get(), 2);
+        assert_eq!(root.root.task_id().get(), 3);
+        assert_eq!(
+            root.root.backend_process_id().to_string(),
+            value["root_status"]["backend_process_id"].as_str().unwrap()
+        );
+        assert_eq!(root.status_version.get(), 7);
+        assert_eq!(root.root.query_execution_id().attempt_id().get(), 13);
+        let mut absent = value;
+        absent["root_status"] = serde_json::Value::Null;
+        assert!(
+            decode_installed_statement_root(
+                "query-on",
+                &target,
+                serde_json::from_value(absent).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn root_installation_rejects_foreign_unbound_or_incomplete_facts() {
+        let target = StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into());
+        let original = installed_root_json(true);
+        assert!(
+            decode_installed_statement_root(
+                "foreign",
+                &target,
+                serde_json::from_value(original.clone()).unwrap()
+            )
+            .is_err()
+        );
+        for (field, changed) in [
+            ("execution_id", serde_json::json!("11:12:14")),
+            ("stage_id", serde_json::json!(0)),
+            ("task_id", serde_json::json!(0)),
+            ("status_version", serde_json::json!(0)),
+            (
+                "backend_process_id",
+                serde_json::json!("00000000-0000-0000-0000-000000000000"),
+            ),
+        ] {
+            let mut value = original.clone();
+            value["root_status"][field] = changed;
+            assert!(
+                decode_installed_statement_root(
+                    "query-on",
+                    &target,
+                    serde_json::from_value(value).unwrap()
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let mut unbound = original.clone();
+        for field in [
+            "work_id",
+            "logical_execution_id",
+            "execution_id",
+            "query_process_namespace",
+            "query_local_sequence",
+            "attempt_id",
+        ] {
+            unbound[field] = serde_json::Value::Null;
+        }
+        assert!(
+            decode_installed_statement_root(
+                "query-on",
+                &target,
+                serde_json::from_value(unbound).unwrap()
+            )
+            .is_err()
+        );
+        let mut incomplete = original;
+        incomplete["root_status"]
+            .as_object_mut()
+            .unwrap()
+            .remove("installed");
+        assert!(serde_json::from_value::<StatementLifecycleObservationWire>(incomplete).is_err());
+    }
+
+    #[test]
+    fn installed_root_keeps_the_exact_client_query_target_on_every_observation() {
+        let query = "20261029_120000_00001_abcde";
+        let target = StatementObservationTarget::ClientQuery(query.into());
+        let mut value = installed_root_json(true);
+        value["work_id"] = serde_json::json!(format!("client-query:{query}:1:5"));
+        for _ in 0..2 {
+            let observed = decode_installed_statement_root(
+                "query-on",
+                &target,
+                serde_json::from_value(value.clone()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(observed.root.query_execution_id().attempt_id().get(), 13);
+            assert_eq!(observed.status_version.get(), 7);
+        }
+        // A matching root does not confer attribution to another public query
+        // or to a legacy connection target with the same numeric suffix.
+        for foreign in [
+            "client-query:20261029_120000_00002_abcde:1:5",
+            "statement:7:1:5",
+        ] {
+            let mut changed = value.clone();
+            changed["work_id"] = serde_json::json!(foreign);
+            assert!(
+                decode_installed_statement_root(
+                    "query-on",
+                    &target,
+                    serde_json::from_value(changed).unwrap(),
+                )
+                .is_err()
+            );
+        }
+        value["attempt_id"] = serde_json::json!(14);
+        value["execution_id"] = serde_json::json!("11:12:14");
+        assert!(
+            decode_installed_statement_root(
+                "query-on",
+                &target,
+                serde_json::from_value(value).unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn statement_ownership_precedes_attempt_completion_and_does_not_drain() {
+        let query = "20261029_120000_00001_abcde";
+        let target = StatementObservationTarget::ClientQuery(query.into());
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "run_token": "query-on",
+            "work_id": null,
+            "logical_execution_id": null,
+            "execution_id": null,
+            "query_process_namespace": null,
+            "query_local_sequence": null,
+            "attempt_id": null,
+            "snapshot": null,
+        });
+        let pending = serde_json::from_value(value.clone()).unwrap();
+        assert!(!statement_binding_is_owned("query-on", &target, &pending).unwrap());
+        assert!(statement_binding_is_owned("foreign-token", &target, &pending).is_err());
+        value["work_id"] = serde_json::json!(format!("client-query:{query}:7:3"));
+        let owned = serde_json::from_value(value.clone()).unwrap();
+        assert!(statement_binding_is_owned("query-on", &target, &owned).unwrap());
+        // Repeated observations leave the original binding available. No
+        // logical query or terminal convergence snapshot exists at this point.
+        assert!(statement_binding_is_owned("query-on", &target, &owned).unwrap());
+        value["work_id"] = serde_json::json!("client-query:20261029_120000_00002_abcde:7:3");
+        assert!(
+            statement_binding_is_owned(
+                "query-on",
+                &target,
+                &serde_json::from_value(value.clone()).unwrap()
+            )
+            .is_err()
+        );
+        value["work_id"] = serde_json::Value::Null;
+        value["logical_execution_id"] = serde_json::json!("11:12");
+        assert!(
+            statement_binding_is_owned(
+                "query-on",
+                &target,
+                &serde_json::from_value(value).unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7487,7 +7711,7 @@ mod tests {
         let value = statement_observation_json();
         let snapshot = decode_statement_lifecycle_observation(
             "query-on",
-            &StatementObservationTarget::Connection(7),
+            &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
             serde_json::from_value(value.clone()).unwrap(),
         )
         .unwrap()
@@ -7498,7 +7722,7 @@ mod tests {
         previous["snapshot"]["query_local_sequence"] = serde_json::json!(11);
         let error = decode_statement_lifecycle_observation(
             "query-on",
-            &StatementObservationTarget::Connection(7),
+            &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
             serde_json::from_value(previous).unwrap(),
         )
         .expect_err("a delayed preceding query must never satisfy the observation");
@@ -7506,10 +7730,13 @@ mod tests {
     }
 
     #[test]
-    fn statement_observation_rejects_foreign_tokens_connections_and_logical_queries() {
+    fn statement_observation_rejects_foreign_tokens_client_queries_and_logical_queries() {
         for (field, replacement) in [
             ("run_token", serde_json::json!("other-query")),
-            ("work_id", serde_json::json!("statement:8:1:5")),
+            (
+                "work_id",
+                serde_json::json!("client-query:20261029_120000_00002_abcde:1:5"),
+            ),
             ("logical_execution_id", serde_json::json!("11:11")),
             ("attempt_id", serde_json::json!(12)),
         ] {
@@ -7518,7 +7745,7 @@ mod tests {
             assert!(
                 decode_statement_lifecycle_observation(
                     "query-on",
-                    &StatementObservationTarget::Connection(7),
+                    &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
                     serde_json::from_value(value).unwrap(),
                 )
                 .is_err(),
@@ -7534,21 +7761,24 @@ mod tests {
         let wire = serde_json::from_value(value.clone()).unwrap();
         validate_statement_observation_binding(
             "query-on",
-            &StatementObservationTarget::Connection(7),
+            &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
             &wire,
         )
         .unwrap();
         assert!(
             decode_statement_lifecycle_observation(
                 "query-on",
-                &StatementObservationTarget::Connection(7),
+                &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
                 wire
             )
             .unwrap()
             .is_none()
         );
         for (field, replacement) in [
-            ("work_id", serde_json::json!("statement:8:1:5")),
+            (
+                "work_id",
+                serde_json::json!("client-query:20261029_120000_00002_abcde:1:5"),
+            ),
             ("run_token", serde_json::json!("other-query")),
             ("execution_id", serde_json::json!("11:11:13")),
             ("attempt_id", serde_json::Value::Null),
@@ -7558,7 +7788,7 @@ mod tests {
             assert!(
                 validate_statement_observation_binding(
                     "query-on",
-                    &StatementObservationTarget::Connection(7),
+                    &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
                     &serde_json::from_value(foreign).unwrap()
                 )
                 .is_err()
@@ -7581,7 +7811,7 @@ mod tests {
         }
         validate_statement_observation_binding(
             "query-on",
-            &StatementObservationTarget::Connection(7),
+            &StatementObservationTarget::ClientQuery("20261029_120000_00001_abcde".into()),
             &serde_json::from_value(value).unwrap(),
         )
         .unwrap();
@@ -8350,7 +8580,6 @@ mod tests {
             }],
             fe_http_port: 28080,
             fe_grpc_port: 29070,
-            fe_mysql_port: 29030,
             fe_trino_port: 28081,
         }
     }
@@ -8371,7 +8600,6 @@ mod tests {
             ],
             fe_http_port: 28080,
             fe_grpc_port: 29070,
-            fe_mysql_port: 29030,
             fe_trino_port: 28081,
         }
     }
@@ -8610,7 +8838,7 @@ mod tests {
             novarocks_test_trino_client::ClientConfig {
                 host: "127.0.0.1".into(),
                 port: cluster.runtime().fe_trino_port,
-                user: cluster.mysql_user.clone(),
+                user: cluster.sql_user.clone(),
                 source: "cluster-harness-self-test".into(),
             },
         )?;
@@ -8687,7 +8915,7 @@ path = "tmp/novarocks-sql-test-state-store.sqlite"
 mode = "dynamic-state-store"
 
 [standalone_server]
-mysql_port = 9030
+trino_port = 8080
 user = "root"
 
 [[connector.credentials]]
@@ -8746,8 +8974,8 @@ access_key_secret = "admin123"
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
         assert_eq!(fe_value["server"]["grpc_port"].as_integer(), Some(29070));
         assert_eq!(
-            fe_value["standalone_server"]["mysql_port"].as_integer(),
-            Some(29030)
+            fe_value["standalone_server"]["trino_port"].as_integer(),
+            Some(i64::from(runtime.fe_trino_port))
         );
         assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
@@ -8795,7 +9023,7 @@ access_key_secret = "admin123"
         assert!(
             be_value
                 .get("standalone_server")
-                .and_then(|value| value.get("mysql_port"))
+                .and_then(|value| value.get("trino_port"))
                 .is_none()
         );
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
@@ -9682,41 +9910,3 @@ static_file_path = "catalogs.toml"
         assert!(expired.convergence_failure(&baseline).is_none());
     }
 }
-
-/// Owns the actual first and cleanup errors; Display never expands arbitrary source text.
-#[cfg(unix)]
-struct ExactMysqlRoleShutdownError {
-    failures: [Option<anyhow::Error>; 7],
-}
-#[cfg(unix)]
-impl std::fmt::Display for ExactMysqlRoleShutdownError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "exact MySQL role cleanup failed at stages:")?;
-        for (index, source) in self.failures.iter().enumerate() {
-            if source.is_some() {
-                write!(f, " {index}")?;
-            }
-        }
-        Ok(())
-    }
-}
-#[cfg(unix)]
-impl std::fmt::Debug for ExactMysqlRoleShutdownError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-#[cfg(unix)]
-impl std::error::Error for ExactMysqlRoleShutdownError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.failures
-            .iter()
-            .flatten()
-            .next()
-            .map(|error| error.as_ref())
-    }
-}
-
-#[cfg(all(test, unix))]
-#[path = "exact_mysql_prelaunch_check_tests.rs"]
-mod exact_mysql_prelaunch_check_tests;

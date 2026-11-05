@@ -836,3 +836,97 @@ impl Drop for ManagedProcess {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn new() -> Self {
+            static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "novarocks-managed-lifetime-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn role_lifetime_outlives_startup_and_observes_the_original_group() {
+        let directory = Directory::new();
+        // These caller-supplied lifetime clocks are inputs to this owner test.
+        // Actual run identity and budget inheritance are checked at the caller.
+        // Readiness does not replace either lifetime clock.
+        let admitted = Instant::now();
+        let original_work = admitted + Duration::from_secs(8);
+        let original_complete = admitted + Duration::from_secs(10);
+        let startup = Duration::from_secs(2);
+        let child_pid = directory.0.join("same-group-child.pid");
+        let mut request = ManagedCommand::new("/bin/sh");
+        request
+            .args([
+                "-c",
+                "trap 'exit 0' TERM; sleep 30 & printf '%s' $! > \"$CHILD_PID\"; printf 'READY\\n'; while :; do sleep 1; done",
+            ])
+            .env("CHILD_PID", &child_pid)
+            .terminate_at(original_work, original_complete);
+        let mut process = ManagedProcess::spawn(
+            "caller-bounded role".into(),
+            request,
+            ReadyMarker::StdoutContains("READY".into()),
+            startup,
+            directory.0.join("locator"),
+        )
+        .unwrap();
+        let root = process.diagnostic_root().to_owned();
+        let descendant: u32 = fs::read_to_string(child_pid).unwrap().parse().unwrap();
+        assert!(descendant > 0 && descendant != process.pid());
+        // The actual payload remains live beyond its startup observation.
+        // There is no new production work budget or refreshed cleanup clock.
+        thread::sleep(startup + Duration::from_millis(50));
+        assert!(Instant::now() < original_work);
+        assert!(process.owner.is_running_until(original_work).unwrap());
+        assert!(!process.cleanup_settled());
+        process.request_termination().unwrap();
+        // Consume the original private typed Final only after actual monitor
+        // wait; neither a marker nor a later PID probe authors group exit.
+        let final_fact = process.wait_until(original_complete).unwrap();
+        assert!(process.cleanup_settled());
+        assert!(final_fact.status.success());
+        assert!(final_fact.group_exit_observed);
+        assert!(final_fact.cleanup_complete);
+        assert!(!final_fact.owner_lost && !final_fact.lifetime_expired);
+        assert!(final_fact.errors.is_empty());
+        let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
+        let pending: serde_json::Value =
+            serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let final_record: serde_json::Value = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["event"] == "Final")
+            .unwrap();
+        assert!(pending["lifetime_ns"].is_array());
+        assert!(pending.get("group_exit_deadline_ns").is_none());
+        assert!(
+            final_record["group_exit_observed_ns"].as_u64().unwrap()
+                < pending["lifetime_ns"][1].as_u64().unwrap()
+        );
+        process.stop().unwrap();
+        process.release_diagnostics().unwrap();
+    }
+}

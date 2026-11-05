@@ -588,6 +588,7 @@ fn compose_backend_application_services(
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
             execution_runtime.exchange_flow_limits().transport_timeout(),
+            Arc::clone(&inbound_capabilities),
             #[cfg(novarocks_dev_controls)]
             test_session.and_then(|session| session.observation.clone()),
         ),
@@ -648,6 +649,10 @@ fn compose_backend_application_services(
             issuer, 1,
         )
         .expect("UUID variant makes issuer nonzero");
+    // A declared test refinement uses the same actual execution Host as the
+    // Worker Node. This port cannot submit or reconstruct an UpdateTask.
+    #[cfg(novarocks_dev_controls)]
+    let test_update_host: Arc<dyn novarocks_worker::TaskExecutionHost> = execution_host.clone();
     let worker_node = WorkerNodeRuntime::start(novarocks_worker::WorkerNodeConfig {
         observation: crate::worker_node_projection::observation_projection(),
         backend: backend_process_id,
@@ -679,7 +684,7 @@ fn compose_backend_application_services(
     #[cfg(novarocks_dev_controls)]
     if let Some(session) = test_session {
         task_execution_ingress
-            .install_test_controls(session.native.clone())
+            .install_test_controls(session.native.clone(), test_update_host)
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
             })?;

@@ -95,7 +95,12 @@ impl Scenario for RepresentationRecoveryPolicy {
         )?))
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_rejection_policy(context, &self.intent, 1105, assert_list_minimum_unit)
+        run_rejection_policy(
+            context,
+            &self.intent,
+            FailureClass::Representation,
+            assert_list_minimum_unit,
+        )
     }
 }
 

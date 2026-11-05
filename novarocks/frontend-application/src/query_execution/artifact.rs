@@ -1640,7 +1640,8 @@ mod tests {
     fn render_test_cells(
         result: &novarocks_query_application::api::QueryResult,
         domain: novarocks_physical_plan::ResultValueDomain,
-    ) -> Vec<Option<Vec<u8>>> {
+    ) -> Result<Vec<Option<Vec<u8>>>, novarocks_failure_contract::FailureFact> {
+        use novarocks_failure_contract::FailureProjection;
         use novarocks_physical_plan::ResultValueDomain as D;
         use novarocks_result_contract::{
             ClientRenderSchema, NativeRenderType as N, OpaqueRenderType as O, RenderColumn,
@@ -1653,21 +1654,27 @@ mod tests {
         assert_eq!(result.batches.len(), 1);
         let field = &result.columns[0];
         let (native_type, presentation) = match domain {
-            D::Hll => (N::Opaque(O::Hll), P::OpaqueNull),
-            D::Bitmap => (N::Opaque(O::Bitmap), P::OpaqueNull),
-            D::Object => (N::Opaque(O::Object), P::OpaqueNull),
-            D::Percentile => (N::Opaque(O::Percentile), P::OpaqueNull),
-            D::Variant => (N::Variant, P::VariantSerializedBytes),
-            D::Json => (N::Json, P::JsonText),
+            D::Hll => (N::Opaque(O::Hll), P::TrinoValue),
+            D::Bitmap => (N::Opaque(O::Bitmap), P::TrinoValue),
+            D::Object => (N::Opaque(O::Object), P::TrinoValue),
+            D::Percentile => (N::Opaque(O::Percentile), P::TrinoValue),
+            D::Variant => (N::Variant, P::TrinoValue),
+            D::Json => (N::Json, P::TrinoValue),
             D::Plain => match field.data_type() {
                 arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary => {
-                    (N::Binary, P::ScalarText)
+                    (N::Binary, P::TrinoValue)
                 }
-                _ => (N::String, P::ScalarText),
+                _ => (N::String, P::TrinoValue),
             },
         };
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -1680,13 +1687,15 @@ mod tests {
             }],
             1,
         )
-        .unwrap();
-        let mut encoder =
-            ClientRowEncoder::try_new(Arc::new(schema), result.batches[0].clone()).unwrap();
+        .map_err(|error| error.failure_fact())?;
+        let mut encoder = ClientRowEncoder::try_new(Arc::new(schema), result.batches[0].clone())
+            .map_err(|error| error.failure_fact())?;
         let mut body = Vec::new();
         for _ in 0..1024 {
             let mut segment = [0; 4096];
-            let turn = encoder.step(&mut segment).unwrap();
+            let turn = encoder
+                .step(&mut segment)
+                .map_err(|error| error.failure_fact())?;
             body.extend_from_slice(&segment[..turn.emitted_bytes]);
             if turn.status == RenderTurnStatus::InputComplete {
                 break;
@@ -1699,16 +1708,12 @@ mod tests {
             at += 4;
             let payload = &body[at..at + length];
             at += length;
-            cells.push(if payload == [0xfb] {
-                None
-            } else {
-                assert!(payload[0] < 0xfb, "fixture requires a short scalar cell");
-                assert_eq!(payload.len(), usize::from(payload[0]) + 1);
-                Some(payload[1..].to_vec())
-            });
+            let row: Vec<Option<String>> = serde_json::from_slice(payload).unwrap();
+            assert_eq!(row.len(), 1);
+            cells.push(row.into_iter().next().unwrap().map(String::into_bytes));
         }
         assert_eq!(cells.len(), result.row_count());
-        cells
+        Ok(cells)
     }
 
     // Finite source-fixture encoding only; all decoding and retained storage
@@ -2147,9 +2152,32 @@ mod tests {
             assert!(result.batches[0].schema().field(0).metadata().is_empty());
             let rows = render_test_cells(&result, domain);
             if matches!(domain, D::Hll | D::Bitmap | D::Object | D::Percentile) {
-                assert_eq!(rows[0], None);
+                use novarocks_failure_contract::FailureProjection;
+                assert_eq!(
+                    rows.unwrap_err(),
+                    novarocks_result_contract::RootContractError::UnsupportedRenderType
+                        .failure_fact()
+                );
+            } else if domain == D::Variant {
+                // IPC preserves the exact nominal bytes; arbitrary bytes do not
+                // become a valid Variant document when projected for a client.
+                let failure = rows.unwrap_err();
+                assert_eq!(
+                    failure.class(),
+                    novarocks_failure_contract::FailureClass::Data
+                );
+                assert_eq!(
+                    failure.reason().domain(),
+                    novarocks_failure_contract::domain::RESULT.get()
+                );
+                assert_eq!(failure.reason().code(), 111);
             } else {
-                assert_eq!(rows[0].as_deref(), Some(bytes));
+                let expected: &[u8] = if matches!(result.columns[0].data_type(), DataType::Binary) {
+                    b"bm9uZW1wdHk="
+                } else {
+                    bytes
+                };
+                assert_eq!(rows.unwrap()[0].as_deref(), Some(expected));
             }
         }
     }
@@ -2230,7 +2258,7 @@ mod tests {
                 assert_eq!(result.columns[0].value_type(), &ty);
                 assert_shared_payload(&original.to_data(), &result.batches[0].column(0).to_data());
                 assert_eq!(
-                    render_test_cells(&result, domain),
+                    render_test_cells(&result, domain).unwrap(),
                     vec![
                         Some(b.as_bytes().to_vec()),
                         None,

@@ -20,7 +20,7 @@
 use super::*;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{Field, Schema, i256};
-use novarocks_result_contract::{NamedRenderField, TrinoJsonFacts};
+use novarocks_result_contract::{NamedRenderField, RenderPresentation as P, TrinoJsonFacts};
 fn field(native_type: N, nullable: bool) -> RenderField {
     RenderField {
         native_type,
@@ -738,7 +738,7 @@ fn large_escaped_rows_keep_the_same_quantum_and_staging_bound() {
 }
 
 #[test]
-fn frozen_family_selects_wire_payload_without_presentation_fallback() {
+fn explicit_trino_facts_select_the_direct_wire_encoder() {
     use crate::ClientRowEncoder;
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -767,23 +767,8 @@ fn frozen_family_selects_wire_payload_without_presentation_fallback() {
         )
         .unwrap(),
     );
-    assert!(ArrowMysqlTextEncoder::try_new(trino.clone(), batch.clone()).is_err());
     let cursor = ClientRowEncoder::try_new(trino, batch.clone()).unwrap();
-    assert!(matches!(cursor, ClientRowEncoder::TrinoJson(_)));
     assert_eq!(payloads(cursor, 100), vec![r#"["v"]"#]);
-    let mysql = Arc::new(
-        ClientRenderSchema::try_new(
-            ClientPresentationFamily::MysqlText,
-            vec![column(P::ScalarText)],
-            1,
-        )
-        .unwrap(),
-    );
-    assert!(ArrowTrinoJsonEncoder::try_new(mysql.clone(), batch.clone()).is_err());
-    let mut cursor = ClientRowEncoder::try_new(mysql, batch).unwrap();
-    let mut output = [0; 100];
-    let turn = cursor.step(&mut output).unwrap();
-    assert_eq!(&output[..turn.emitted_bytes], &[2, 0, 0, 0, 1, b'v']);
 }
 
 #[test]

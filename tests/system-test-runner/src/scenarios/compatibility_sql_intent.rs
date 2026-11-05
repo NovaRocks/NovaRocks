@@ -17,9 +17,11 @@
 
 //! Exact compatibility-artifact role declarations for finite SQL observations.
 use super::super::native_sql_controls::SelectedStatement;
-use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
+use crate::{
+    actors::sql::{self, SqlSession, StatementFailure, StatementResult},
+    scenario::ScenarioContext,
+};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
@@ -27,6 +29,7 @@ use novarocks_cluster_harness::{
     CrossProcessCluster, QueryLifecycleStatementObservation, TestClusterOwner,
 };
 use novarocks_failpoint::session::DomainGrant;
+use novarocks_test_trino_client::CancelHandle;
 use serde_json::json;
 use std::{
     collections::BTreeSet,
@@ -243,52 +246,64 @@ pub(super) fn run_baselines(
     full_sql: &str,
     expected_backends: &[usize],
 ) -> Result<()> {
-    let connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    connection.run(|connection| {
-        for ordinal in 0..3 {
-            let selected = intent.take(ordinal)?;
-            let observation = selected.arm(context, connection.connection_id(), full_sql)?;
-            let outcome: mysql::Result<Vec<i64>> = connection.query(full_sql);
-            let sql_succeeded = outcome.is_ok();
-            let reentry = if matches!(&outcome, Err(mysql::Error::MySqlError(_))) {
-                require_public_error_reentry(connection)
-            } else {
+    let mut connection =
+        SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    for ordinal in 0..3 {
+        let selected = intent.take(ordinal)?;
+        let pending = connection.submit(full_sql)?;
+        let cancel = pending.cancel_handle();
+        let (pending, observation) = selected.arm_pending(context, pending, full_sql)?;
+        let outcome = connection.run_pending(pending);
+        let outcome_class = classify_sql_outcome(&outcome);
+        let sql_succeeded = outcome.is_ok();
+        let reentry = if matches!(&outcome, Err(StatementFailure::Trino(_))) {
+            require_public_error_reentry(&mut connection)
+        } else {
+            Ok(())
+        };
+        let result = outcome
+            .with_context(|| format!("run compatibility-island query {}", ordinal + 1))
+            .and_then(|result| {
+                let rows = sql::integer_column(&result)?;
+                ensure!(
+                    rows == vec![1, 2],
+                    "compatibility-island query {} returned {rows:?}",
+                    ordinal + 1
+                );
                 Ok(())
-            };
-            let result = outcome
-                .with_context(|| format!("run compatibility-island query {}", ordinal + 1))
-                .and_then(|rows| {
-                    ensure!(
-                        rows == vec![1, 2],
-                        "compatibility-island query {} returned {rows:?}",
-                        ordinal + 1
-                    );
-                    Ok(())
-                });
-            let deadline = context.deadline();
-            let observed =
-                settle_sql_observation(context.handle(), &observation, sql_succeeded, deadline);
-            combine(combine(result, reentry), observed)?;
-        }
-        for &backend in expected_backends {
-            context.handle().assert_be_log(
-                backend,
-                super::super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED,
-            )?;
-        }
-        Ok(())
-    })
+            });
+        let deadline = context.deadline();
+        let cancelled = if matches!(&outcome_class, SqlOutcomeClass::Unresolved) {
+            let cancelled = cancel.delete(deadline).map_err(Into::into);
+            if cancelled.is_err() {
+                combine(cancelled, context.shutdown())
+            } else {
+                cancelled
+            }
+        } else {
+            Ok(())
+        };
+        let observed =
+            settle_sql_observation(context.handle(), &observation, sql_succeeded, deadline);
+        combine(combine(combine(result, reentry), cancelled), observed)?;
+    }
+    for &backend in expected_backends {
+        context.handle().assert_be_log(
+            backend,
+            super::super::task_evidence::PARTICIPATION_ESTABLISH_APPLIED,
+        )?;
+    }
+    Ok(())
 }
 
-fn require_public_error_reentry(connection: &mut mysql::Conn) -> Result<()> {
-    let rows: Vec<i64> = connection
-        .query("SELECT 1")
-        .context("reenter the original compatibility connection after its public SQL error")?;
-    ensure!(rows == vec![1], "compatibility reentry returned {rows:?}");
+fn require_public_error_reentry(connection: &mut SqlSession) -> Result<()> {
+    let result = connection
+        .execute("SELECT 1")
+        .context("reenter the original compatibility session after its public SQL error")?;
+    ensure!(
+        sql::integer_column(&result)? == vec![1],
+        "compatibility reentry returned another row set"
+    );
     Ok(())
 }
 
@@ -302,7 +317,7 @@ fn settle_sql_observation(
         let terminal = handle
             .await_query_lifecycle_statement_observation(observation, true, deadline)
             .map(|_| ());
-        let drain = handle.drain_query_lifecycle_statement_observation(observation);
+        let drain = handle.drain_query_lifecycle_statement_binding(observation, deadline);
         combine(terminal, drain)
     } else {
         // This validates the original attribution, not worker completion.
@@ -340,74 +355,140 @@ impl std::error::Error for DualFailure {
     }
 }
 
-/// The source actor publishes its real idle connection before the parent
-/// nominates it and opens the submission gate. The original socket watchdog
-/// survives until Conn Drop.
-pub(super) struct SourceQuery(Option<std::thread::JoinHandle<Result<Vec<i64>>>>);
+/// The source actor owns its exact submitted query through real exit.
+/// Its original FE drain closes the source observation as before.
+pub(super) struct SourceQuery {
+    actor: Option<std::thread::JoinHandle<std::result::Result<StatementResult, StatementFailure>>>,
+    cancel: CancelHandle,
+    deadline: Instant,
+}
 impl SourceQuery {
     pub fn start(context: &mut ScenarioContext, selected: SelectedStatement) -> Result<Self> {
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
         let deadline = context.deadline();
-        let sql = selected.sql.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(1);
+        let mut connection = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        let pending = connection.submit(&selected.sql)?;
+        let (pending, observation) = selected.arm_pending(context, pending, &selected.sql)?;
+        let cancel = pending.cancel_handle();
         let actor = std::thread::Builder::new()
             .name("compatibility-source-cutover".into())
-            .spawn(move || -> Result<Vec<i64>> {
-                let connection = mysql_actor::connect_until(&user, port, deadline)?;
-                if let Err(primary) = ready_tx.send(connection.connection_id()) {
-                    return combine(Err(primary.into()), connection.finish());
-                }
-                if submit_rx.recv().is_err() {
-                    return connection.finish().map(|_| vec![]);
-                }
-                connection.run(|connection| {
-                    connection
-                        .query(sql)
-                        .context("run source pre-cutover query")
-                })
-            })?;
-        let armed = (|| -> Result<()> {
-            let cid = ready_rx
-                .recv_timeout(context.remaining("receive idle source cutover connection")?)
-                .context("source actor did not publish its actual idle connection")?;
-            selected.arm(context, cid, &selected.sql)?;
-            Ok(())
-        })();
-        if let Err(primary) = armed {
-            drop(submit_tx);
-            return combine(Err(primary), join_source(actor).map(|_| ()));
+            .spawn(move || connection.run_pending(pending));
+        let actor = match actor {
+            Ok(actor) => actor,
+            Err(primary) => {
+                let cancelled = cancel.delete(deadline).map_err(Into::into);
+                let drained = context
+                    .handle()
+                    .drain_query_lifecycle_statement_binding(&observation, deadline);
+                return combine(Err(primary.into()), combine(cancelled, drained));
+            }
+        };
+        let mut source = Self {
+            actor: Some(actor),
+            cancel,
+            deadline,
+        };
+        if let Err(primary) = context
+            .handle()
+            .await_query_lifecycle_statement_owned(&observation, deadline)
+        {
+            let exited = source.close();
+            let drained = context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, deadline);
+            return combine(Err(primary), combine(exited, drained));
         }
-        if let Err(primary) = submit_tx.send(()) {
-            return combine(Err(primary.into()), join_source(actor).map(|_| ()));
-        }
-        Ok(Self(Some(actor)))
+        Ok(source)
     }
     pub fn join(mut self) -> Result<()> {
-        let actor = self.0.take().expect("live source query actor");
-        let rows = join_source(actor)?;
-        ensure!(
-            rows.len() == 1,
-            "source pre-cutover query returned {rows:?}"
-        );
-        Ok(())
+        let joined = join_source(self.actor.take().expect("live source query actor"));
+        let unresolved = source_outcome_unresolved(&joined);
+        let cancelled = if unresolved {
+            self.cancel.delete(self.deadline).map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let result = joined
+            .and_then(|actual| actual.map_err(anyhow::Error::from))
+            .and_then(|result| {
+                ensure!(
+                    result.is_result_set()
+                        && result.columns.len() == 1
+                        && result.columns[0].type_name == "boolean"
+                        && result.columns[0].type_signature.raw_type == "boolean"
+                        && result.columns[0].type_signature.arguments.is_empty()
+                        && result.rows == vec![vec![novarocks_test_trino_client::TrinoValue::Boolean(true)]],
+                    "source pre-cutover SLEEP query did not return one completed BOOLEAN row: {result:?}"
+                );
+                Ok(())
+            });
+        combine(result, cancelled)
+    }
+    fn close(&mut self) -> Result<()> {
+        let Some(actor) = self.actor.take() else {
+            return Ok(());
+        };
+        let was_running = !actor.is_finished();
+        let mut cancelled = if was_running {
+            self.cancel.delete(self.deadline).map_err(Into::into)
+        } else {
+            Ok(())
+        };
+        let actual = join_source(actor);
+        // Actual local exit does not settle an HTTP/transport/panic outcome.
+        if !was_running && source_outcome_unresolved(&actual) {
+            cancelled = self.cancel.delete(self.deadline).map_err(Into::into);
+        }
+        let joined = actual.and_then(|result| match result {
+            Ok(_) => Ok(()),
+            Err(StatementFailure::Trino(error))
+                if error.error_code == 3
+                    && error.error_name == "USER_CANCELED"
+                    && error.error_type == "USER_ERROR" =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("original source SQL result during cleanup"))
+            }
+        });
+        combine(cancelled, joined)
     }
 }
+
+#[derive(Clone, Copy)]
+enum SqlOutcomeClass {
+    Terminal,
+    Unresolved,
+}
+fn classify_sql_outcome(
+    actual: &std::result::Result<StatementResult, StatementFailure>,
+) -> SqlOutcomeClass {
+    match actual {
+        Ok(_) | Err(StatementFailure::Trino(_)) => SqlOutcomeClass::Terminal,
+        Err(_) => SqlOutcomeClass::Unresolved,
+    }
+}
+fn source_outcome_unresolved(
+    actual: &Result<std::result::Result<StatementResult, StatementFailure>>,
+) -> bool {
+    !matches!(actual, Ok(Ok(_) | Err(StatementFailure::Trino(_))))
+}
+
 impl Drop for SourceQuery {
     fn drop(&mut self) {
-        // Known paths call join and retain its verdict. The original socket D
-        // also bounds this panic-unwind fallback, which never detaches work.
-        if let Some(actor) = self.0.take() {
-            let _ = actor.join();
+        if let Err(error) = self.close() {
+            eprintln!("Source compatibility actor cleanup failed: {error:#}");
         }
     }
 }
-fn join_source(actor: std::thread::JoinHandle<Result<Vec<i64>>>) -> Result<Vec<i64>> {
+fn join_source(
+    actor: std::thread::JoinHandle<std::result::Result<StatementResult, StatementFailure>>,
+) -> Result<std::result::Result<StatementResult, StatementFailure>> {
     actor
         .join()
-        .map_err(|payload| SourcePanic(std::sync::Mutex::new(payload)))?
+        .map_err(|payload| anyhow::Error::new(SourcePanic(std::sync::Mutex::new(payload))))
 }
+
 struct SourcePanic(std::sync::Mutex<Box<dyn std::any::Any + Send>>);
 impl std::fmt::Display for SourcePanic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -432,39 +513,63 @@ pub(super) fn run_peer_baseline(
         selected.sql == sql && selected.deadline == deadline && Instant::now() < deadline,
         "peer SQL differs from its original finite intent"
     );
-    let connection = mysql_actor::connect_until(
-        target.mysql_user(),
-        target.runtime().fe_mysql_port,
-        deadline,
-    )?;
-    connection.run(|connection| {
-        let observation = target.arm_selected_statement_observation(
-            &selected.token,
-            connection.connection_id(),
-            sql,
-            deadline,
-        )?;
-        let outcome: mysql::Result<Vec<i64>> = connection.query(sql);
-        let sql_succeeded = outcome.is_ok();
-        let reentry = if matches!(&outcome, Err(mysql::Error::MySqlError(_))) {
-            require_public_error_reentry(connection)
-        } else {
+    let mut connection =
+        SqlSession::new(target.sql_user(), target.runtime().fe_trino_port, deadline)?;
+    let pending = connection.submit(sql)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending_on(target, pending, sql, deadline)?;
+    let outcome = connection.run_pending(pending);
+    let outcome_class = classify_sql_outcome(&outcome);
+    let sql_succeeded = outcome.is_ok();
+    let reentry = if matches!(&outcome, Err(StatementFailure::Trino(_))) {
+        require_public_error_reentry(&mut connection)
+    } else {
+        Ok(())
+    };
+    let result = outcome
+        .context("run new query on target island")
+        .and_then(|result| {
+            let rows = sql::integer_column(&result)?;
+            ensure!(rows == vec![1, 2], "target island query returned {rows:?}");
             Ok(())
-        };
-        let result = outcome
-            .context("run new query on target island")
-            .and_then(|rows| {
-                ensure!(rows == vec![1, 2], "target island query returned {rows:?}");
-                Ok(())
-            });
-        let observed = settle_sql_observation(target, &observation, sql_succeeded, deadline);
-        combine(combine(result, reentry), observed)
-    })
+        });
+    let cancelled = if matches!(outcome_class, SqlOutcomeClass::Unresolved) {
+        let cancelled = cancel.delete(deadline).map_err(Into::into);
+        if cancelled.is_err() {
+            combine(cancelled, target.shutdown())
+        } else {
+            cancelled
+        }
+    } else {
+        Ok(())
+    };
+    let observed = settle_sql_observation(target, &observation, sql_succeeded, deadline);
+    combine(combine(combine(result, reentry), cancelled), observed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actual_finished_source_failure_remains_owned_and_unresolved() {
+        let actor = std::thread::spawn(|| {
+            Err(StatementFailure::Transport(
+                "original source failure".into(),
+            ))
+        });
+        let actual = join_source(actor).unwrap();
+        assert!(matches!(
+            classify_sql_outcome(&actual),
+            SqlOutcomeClass::Unresolved
+        ));
+        let actual = actual.unwrap_err();
+        assert!(
+            matches!(actual, StatementFailure::Transport(message) if message == "original source failure")
+        );
+        assert!(source_outcome_unresolved(&Err(anyhow::anyhow!(
+            "original panic owner"
+        ))));
+    }
     fn deadline() -> Instant {
         Instant::now() + std::time::Duration::from_secs(20)
     }

@@ -234,7 +234,6 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
         .unwrap();
     let blocking = ConnectorBlockingIoSupervisor::new(runtime.handle().clone());
     use novarocks_query_application::{
-        client_connection::ClientConnectionToken,
         coordination::{LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig},
         query_control::QueryApplicationControl,
         session_control::{QueryControlService, SessionIdentity},
@@ -242,8 +241,8 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     use std::num::{NonZeroU32, NonZeroUsize};
     let service = QueryControlService::new(Arc::new(QueryApplicationControl::default()));
     let session = service
-        .register_session(SessionIdentity::new(
-            ClientConnectionToken::new(7, 1).unwrap(),
+        .register_session(SessionIdentity::client_statement(
+            service.mint_client_query_id(),
             "root",
         ))
         .unwrap();
@@ -458,7 +457,23 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     > = Some(Box::new(ActualFactAction { original }));
     let mut receive = None;
     service
-        .publish_statement_action_in(&mut owner, &mut action, &mut receive)
+        .publish_statement_action_in(
+            &mut owner,
+            &mut action,
+            // Preserve this fixture's real counted command and explicitly
+            // declare its Trino presentation under the original admitted Root.
+            novarocks_query_application::session_control::StatementCompletionProjection::new(
+                novarocks_query_application::session::StatementOutputShape::Rows,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: false,
+                        variant_binary: false,
+                    },
+                ),
+            ),
+            &mut receive,
+        )
         .unwrap()
         .finish()
         .unwrap();

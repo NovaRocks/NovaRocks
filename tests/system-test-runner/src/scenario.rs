@@ -1,7 +1,4 @@
-#[path = "exact_mysql_fixture_clock.rs"]
-mod exact_mysql_fixture_clock;
 use anyhow::{Context, Result, bail};
-pub(crate) use exact_mysql_fixture_clock::ExactMysqlPrelaunchClock;
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessCluster, CrossProcessConfigOverlay,
     CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
@@ -100,29 +97,8 @@ pub trait Scenario: Send + Sync {
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
 
     /// Opt-in independent neutral source; caller captures once before all role launch.
-    /// This is not an exact MySQL Hub activation or a renewed scene-entry clock.
     fn root_observation_deadline(&self) -> Result<Option<Instant>> {
         Ok(None)
-    }
-
-    /// The explicit exact fixture freezes original prepared config facts before role launch.
-    fn freeze_prepared_exact_config(
-        &self,
-        _artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
-        _scenario_root: &Path,
-        _original_deadline: Instant,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Optional source-only event from the actual role log writer owner.
-    fn observe_original_durable_log_owner(
-        &self,
-        _role: &str,
-        _device: u64,
-        _inode: u64,
-    ) -> Result<()> {
-        anyhow::bail!("scenario has no explicit held live source owner")
     }
 
     /// Releases an external fixture created while preparing this scenario.
@@ -193,7 +169,7 @@ pub struct ScenarioContext {
     handle: CrossProcessCluster,
     scenario_root: PathBuf,
     deadline: Instant,
-    exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
+    fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget,
     actions: Vec<String>,
     phase_observations: Vec<ScenarioPhaseObservation>,
     binary: PathBuf,
@@ -280,6 +256,7 @@ pub(crate) struct ScenarioContextParams {
     pub scenario_root: PathBuf,
     pub timeout: Duration,
     pub original_deadline: Instant,
+    pub fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget,
     pub binary: PathBuf,
     pub compatible_binary: Option<PathBuf>,
     pub other_island_binary: Option<PathBuf>,
@@ -287,7 +264,6 @@ pub(crate) struct ScenarioContextParams {
     pub cluster_size: usize,
     pub launch_profile: LaunchProfile,
     pub build: crate::build_information::BuildInformation,
-    pub exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
 }
 
 impl ScenarioContext {
@@ -298,6 +274,7 @@ impl ScenarioContext {
             scenario_root,
             timeout,
             original_deadline,
+            fixture_budget,
             binary,
             compatible_binary,
             other_island_binary,
@@ -305,7 +282,6 @@ impl ScenarioContext {
             cluster_size,
             launch_profile,
             build,
-            exact_mysql_clock,
         } = params;
         Self {
             build,
@@ -313,7 +289,7 @@ impl ScenarioContext {
             handle,
             scenario_root,
             deadline: original_deadline,
-            exact_mysql_clock,
+            fixture_budget,
             actions: Vec::new(),
             phase_observations: Vec::new(),
             binary,
@@ -323,7 +299,7 @@ impl ScenarioContext {
             cluster_size,
             startup_timeout: timeout,
             launch_profile,
-            started_at: exact_mysql_clock.map_or_else(SystemTime::now, |clock| clock.started_at()),
+            started_at: SystemTime::now(),
         }
     }
 
@@ -370,38 +346,10 @@ impl ScenarioContext {
         self.handle.runtime().fe_trino_port
     }
 
-    pub fn mysql_port(&self) -> u16 {
-        self.handle.runtime().fe_mysql_port
+    pub fn sql_user(&self) -> &str {
+        self.handle.sql_user()
     }
 
-    pub fn mysql_user(&self) -> &str {
-        self.handle.mysql_user()
-    }
-
-    /// The launch-time exact fixture clock, never the generic run-entry deadline.
-    pub(crate) fn exact_mysql_deadline(&self) -> Result<Instant> {
-        let clock = self
-            .exact_mysql_clock
-            .context("exact MySQL scene has no prelaunch clock")?;
-        clock.remaining("exact scene operation")?;
-        Ok(clock.deadline())
-    }
-    /// Caller first saves scene wire/control evidence; cleanup must still run on expiry.
-    pub(crate) fn shutdown_exact_mysql_fixture(&mut self) -> Result<()> {
-        #[cfg(unix)]
-        {
-            let clock = self
-                .exact_mysql_clock
-                .context("exact MySQL scene has no prelaunch clock")?;
-            clock.settle_original_roles(|| {
-                self.handle.shutdown_exact_mysql_fixture(clock.deadline())
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            bail!("exact MySQL fixture requires Unix original role owners")
-        }
-    }
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -486,13 +434,7 @@ impl ScenarioContext {
     }
 
     pub fn diagnostics(&self) -> String {
-        if self.exact_mysql_clock.is_some() {
-            // Raw runtime diagnostics contain child tails outside the bounded
-            // failure-log redactor. Keep only a finite verdict in this artifact.
-            "exact MySQL fixture failed; original role cleanup remains required".to_string()
-        } else {
-            self.handle.diagnostics()
-        }
+        self.handle.diagnostics()
     }
 
     pub fn compatible_binary(&self) -> Result<PathBuf> {
@@ -643,10 +585,20 @@ impl ScenarioContext {
             config_overlay: launch_config.config_overlay,
             native_trust_fixture: launch_config.native_trust_fixture,
         };
-        let mut handle = match plan {
-            Some(plan) => CrossProcessCluster::launch_with_test_sessions(options, plan)?,
-            None => CrossProcessCluster::launch(options)?,
-        };
+        // Peer roles inherit the same admitted run, work clock and cleanup
+        // reserve. An ordinary role still receives no test-session authority.
+        // Preserve the peer's original direct transport and proxy selection.
+        let mut handle = CrossProcessCluster::launch_with_fixture_budget(
+            options,
+            plan,
+            CrossProcessNativeFaultProxyConfig::default(),
+            None,
+            None,
+            None,
+            self.fixture_budget
+                .clone()
+                .with_work_deadline_limit(self.deadline),
+        )?;
         let evidence = (|| -> Result<()> {
             fs::write(
                 self.scenario_root

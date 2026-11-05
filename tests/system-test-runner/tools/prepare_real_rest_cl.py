@@ -24,7 +24,7 @@ Bulk additionally requires --preflight-receipt PREFLIGHT_PASS.json.
 Read-only verify-after-drop requires --ready-receipt READY.json. It verifies
 namespace-list absence and independently reloads every surviving object; it does
 not infer an HTTP error type or establish that native SQL executed the DROP.
---self-test exercises local parsers only, without HTTP/provider acceptance.
+--self-test exercises local parsers and producer owners with fake HTTP only.
 
 Wire source: apache/iceberg ccb8bc435062171e64bc8b7e5f56e6aed9c5b934.
 RESTCatalogServlet returns 200 (including empty DELETE responses). The canonical
@@ -54,6 +54,41 @@ import uuid
 
 class Refusal(Exception):
     """Messages contain fixed reasons only, never remote bodies or credentials."""
+
+
+class PreparationStopped(Refusal):
+    """Queued work withdrew after an original sibling failure."""
+
+
+class PreparationFailures(Refusal):
+    def __init__(self, failures):
+        self.failures = tuple(failures)
+        # Preserve every original cause in memory. Persist safe typed details,
+        # never arbitrary exception text from bindings or remote bodies.
+        super().__init__("; ".join(
+            item["stage"] + ": " + item["reason"] for item in self.details()))
+
+    def details(self):
+        details = []
+        for stage, error in self.failures:
+            if isinstance(error, PreparationFailures):
+                for nested in error.details():
+                    details.append({**nested, "stage": stage + "/" + nested["stage"]})
+            else:
+                details.append({"stage": stage, "exception": type(error).__name__,
+                                "errno": getattr(error, "errno", None),
+                                "origin_exception": (type(error.__cause__).__name__
+                                                     if error.__cause__ is not None else None),
+                                "origin_errno": getattr(error.__cause__, "errno", None),
+                                "reason": str(error) if isinstance(error, Refusal)
+                                          else "local preparation owner failed"})
+        return details
+
+
+# Finite fixture work width, not a product quota: the exact stock image's
+# JdbcCatalog clients default is 2 (Iceberg ccb8bc435062, CatalogProperties).
+# The stock compose file does not override it. No throughput is promised.
+PROVISION_NAMESPACE_LANES = 2
 
 
 NORMAL = {
@@ -596,7 +631,7 @@ def load_ready(path, freeze, freeze_sha, check_deadline):
 
 
 class Producer:
-    def __init__(self, freeze, freeze_sha, phase, output):
+    def __init__(self, freeze, freeze_sha, phase, output, owner_work_deadline_unix_ms=None):
         self.freeze = freeze
         self.freeze_sha = freeze_sha
         self.phase = phase
@@ -608,6 +643,19 @@ class Producer:
         self.started = time.monotonic()
         budget_phase = "bulk" if phase == "verify-after-drop" else phase
         self.deadline = self.started + BOUNDS[budget_phase + "_deadline_seconds"]
+        if owner_work_deadline_unix_ms is not None:
+            need(type(owner_work_deadline_unix_ms) is int and owner_work_deadline_unix_ms > 0,
+                 "invalid original owner work deadline")
+            # The parent retains the original monotonic watchdog as well. This
+            # projection narrows work; it does not start a new owner clock.
+            self.deadline = min(self.deadline, self.started + max(
+                0, owner_work_deadline_unix_ms / 1000 - time.time()))
+        self.work_lock = threading.Lock()
+        self.journal_lock = threading.RLock()
+        self.stopped = threading.Event()
+        self.failures = []
+        self.audit_sequence = 0
+        self.startup_unknown = False
         self.count = 0
         self.bytes = 0
         self.page_count = 0
@@ -619,9 +667,103 @@ class Producer:
         need(time.monotonic() < self.deadline, "preparation absolute deadline expired")
 
     def record(self, handle, value):
-        handle.write(encoded(value) + b"\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+        with self.journal_lock:
+            handle.write(encoded(value) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def check_queued_work(self):
+        if self.stopped.is_set():
+            raise PreparationStopped("queued preparation stopped after original failure")
+        self.check_deadline()
+
+    def run_namespace_work(self, namespaces, operation):
+        """Own two finite workers and join every started owner before returning."""
+        pending = iter(enumerate(namespaces))
+        results = [None] * len(namespaces)
+        failures = []
+
+        def failed(stage, error):
+            with self.work_lock:
+                failures.append((stage, error))
+                self.stopped.set()
+
+        def worker():
+            while True:
+                with self.work_lock:
+                    if self.stopped.is_set():
+                        return
+                    try:
+                        self.check_deadline()
+                        index, namespace = next(pending)
+                    except StopIteration:
+                        return
+                    except BaseException as error:
+                        failures.append(("namespace-dispatch", error))
+                        self.stopped.set()
+                        return
+                try:
+                    results[index] = operation(namespace)
+                except PreparationStopped:
+                    return
+                except BaseException as error:
+                    failed(namespace, error)
+                    return
+
+        owners = []
+        try:
+            for index in range(PROVISION_NAMESPACE_LANES):
+                owner = threading.Thread(target=worker, name="rest-namespace-" + str(index))
+                owners.append(owner)
+                owner.start()
+        except BaseException as error:
+            failed("namespace-worker-start", error)
+        finally:
+            for owner in owners:
+                if owner.ident is None:
+                    # Public Thread APIs cannot distinguish failed launch from
+                    # an interrupted startup handshake. Retain failure rather
+                    # than claim this owner never started or gracefully exited.
+                    self.startup_unknown = True
+                    failed("namespace-worker-start-unknown", Refusal(
+                        "thread startup outcome unknown; original helper process must exit"))
+                    continue
+                while True:
+                    try:
+                        # Join even an already-exited worker: every started
+                        # original owner crosses the same actual-exit edge.
+                        owner.join()
+                        break
+                    except BaseException as error:
+                        # An interrupted waiter still owns the actual workers.
+                        failed("namespace-worker-join", error)
+        if failures:
+            self.failures.extend(failures)
+            raise PreparationFailures(failures)
+        need(all(result is not None for result in results), "namespace work did not complete")
+        return results
+
+    def create_namespace_objects(self, namespaces, tables, views):
+        facts = {}
+        uuids = set()
+
+        def mutate(namespace):
+            self.namespace(namespace)
+            for kind, names in (("tables", tables), ("views", views)):
+                for index, name in enumerate(names):
+                    self.check_queued_work()
+                    fact = self.create(namespace, kind, name, tables[index])
+                    with self.work_lock:
+                        need(fact["uuid"] not in uuids, "duplicate actual metadata UUID")
+                        uuids.add(fact["uuid"])
+                        facts[(namespace, kind, name)] = fact
+                    self.record(self.oracle, {"source": "actual-POST", **fact})
+            return namespace
+
+        # All mutation HTTP/Timer/worker owners have actually joined before
+        # independent GET verification can begin, including after failure.
+        self.run_namespace_work(namespaces, mutate)
+        return facts
 
     def request(self, method, path, identity, payload=None, query=None, empty=False):
         self.check_deadline()
@@ -633,21 +775,27 @@ class Producer:
         target = path + ("?" + urlencode(query) if query else "")
         need(len(target.encode()) + len(data) <= BOUNDS["max_request_bytes"],
              "request target and body exceed frozen cap")
-        self.count += 1
         mutation = method in ("POST", "DELETE")
-        self.mutations += int(mutation)
+        with self.work_lock:
+            self.check_queued_work()
+            self.count += 1
+            self.mutations += int(mutation)
         started = time.monotonic()
         deadline = min(self.deadline, started + BOUNDS["request_timeout_seconds"])
-        observation = {"sequence": self.count, "method": method, "identity": identity,
+        observation = {"sequence": None, "method": method, "identity": identity,
                        "request_body_bytes": len(data), "request_body_sha256": sha(data),
                        "mutation": mutation, "status": None, "response_bytes": 0,
                        "response_sha256": None, "outcome": "not-sent"}
-        connection = http.client.HTTPConnection(uri.hostname, uri.port, timeout=deadline - started)
+        connection = None
         timer = None
+        timer_started = False
         response = None
         expired = threading.Event()
         raw = b""
+        value = None
+        primary_error = None
         try:
+            connection = http.client.HTTPConnection(uri.hostname, uri.port, timeout=deadline - started)
             # http.client connects directly and never reads proxy/no_proxy variables.
             # Numeric loopback prevents DNS from escaping this absolute budget.
             connection.connect()
@@ -668,6 +816,7 @@ class Producer:
             timer = threading.Timer(max(0, deadline - time.monotonic()), expire)
             timer.daemon = True
             timer.start()
+            timer_started = True
             observation["outcome"] = "unknown-write" if mutation else "transport-failure"
             connection.request(method, target, body=data if payload is not None else None,
                                headers={"Accept": "application/json", "Content-Type": "application/json",
@@ -687,7 +836,8 @@ class Producer:
                  "request absolute deadline expired")
             observation["response_bytes"] = len(raw)
             observation["response_sha256"] = sha(raw)
-            self.bytes += len(raw)
+            with self.work_lock:
+                self.bytes += len(raw)
             need(len(raw) <= BOUNDS["max_response_bytes"], "response body exceeds frozen cap")
             if lengths:
                 need(len(raw) == int(lengths[0]), "truncated response body")
@@ -712,18 +862,58 @@ class Producer:
                 value = strict_json(raw)
             self.check_deadline()
             observation["outcome"] = "http-success"
-            return value
-        except (OSError, http.client.HTTPException, TimeoutError):
-            raise Refusal("unknown mutation outcome or read transport failure; no automatic retry") from None
+        except (OSError, http.client.HTTPException, TimeoutError) as error:
+            primary_error = Refusal("unknown mutation outcome or read transport failure; no automatic retry")
+            primary_error.__cause__ = error
+            self.stopped.set()
+        except BaseException as error:
+            primary_error = error
+            self.stopped.set()
         finally:
+            cleanup_errors = []
+
+            def settle(stage, action):
+                try:
+                    action()
+                except BaseException as error:
+                    cleanup_errors.append((stage, error))
+                    self.stopped.set()
+
             if timer is not None:
-                timer.cancel()
-                timer.join()
+                settle("request-timer-cancel", timer.cancel)
+                if not timer_started and timer.ident is None:
+                    self.startup_unknown = True
+                    cleanup_errors.append(("request-timer-start-unknown", Refusal(
+                        "timer startup outcome unknown; original helper process must exit")))
+                else:
+                    while True:
+                        try:
+                            timer.join()
+                            break
+                        except BaseException as error:
+                            cleanup_errors.append(("request-timer-join", error))
+                            self.stopped.set()
             if response is not None:
-                response.close()
-            connection.close()
+                settle("request-response-close", response.close)
+            if connection is not None:
+                settle("request-connection-close", connection.close)
             observation["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
-            self.record(self.audit, observation)
+
+            def record_request():
+                with self.journal_lock:
+                    # Sequence is durable completion order. The original audit
+                    # validator still requires every contiguous successful row.
+                    self.audit_sequence += 1
+                    observation["sequence"] = self.audit_sequence
+                    self.record(self.audit, observation)
+
+            settle("request-audit-record", record_request)
+            if cleanup_errors:
+                failures = ([('request', primary_error)] if primary_error is not None else [])
+                raise PreparationFailures(failures + cleanup_errors)
+        if primary_error is not None:
+            raise primary_error
+        return value
 
     def list_exact(self, expected, namespace=None, kind=None, page_size=256):
         collector = PageCollector(expected, page_size, namespace)
@@ -819,21 +1009,10 @@ class Producer:
             need(sha(bounded_file(preflight_parent / filename, 16777216)) == previous.get(key),
                  "preflight ledger digest mismatch")
         capabilities = self.initial(256)
-        facts = {}
-        uuids = set()
         namespaces = [NORMAL["namespace_pattern"] % i for i in range(32)]
         tables = [NORMAL["table_pattern"] % i for i in range(512)]
         views = [NORMAL["view_pattern"] % i for i in range(512)]
-        for namespace in namespaces:
-            self.namespace(namespace)
-            for kind, names in (("tables", tables), ("views", views)):
-                for index, name in enumerate(names):
-                    self.check_deadline()
-                    fact = self.create(namespace, kind, name, tables[index])
-                    need(fact["uuid"] not in uuids, "duplicate actual metadata UUID")
-                    uuids.add(fact["uuid"])
-                    facts[(namespace, kind, name)] = fact
-                    self.record(self.oracle, {"source": "actual-POST", **fact})
+        facts = self.create_namespace_objects(namespaces, tables, views)
         # The verification pass issues fresh GETs and consumes every returned token.
         # Producer counters alone never establish independent catalog completeness.
         self.list_exact(namespaces)
@@ -919,13 +1098,19 @@ class Producer:
         return receipt
 
     def fail(self, reason):
-        for handle in (self.audit, self.oracle):
-            if not handle.closed:
-                handle.close()
+        # An unknown startup may still own these captures. The original Rust
+        # Child owner retains the helper until actual process exit (kill/wait
+        # on its unchanged watchdog); do not close journals on its behalf.
+        if not self.startup_unknown:
+            for handle in (self.audit, self.oracle):
+                if not handle.closed:
+                    handle.close()
         atomic_json(self.output / "FAILED.json", {
             "schema_version": 1, "state": "FAILED", "phase": self.phase,
             "freeze_sha256": self.freeze_sha, "reason": reason,
             "http_requests": self.count, "mutations_attempted": self.mutations,
+            "thread_cleanup": "UNKNOWN_STARTUP" if self.startup_unknown else "joined",
+            "errors": PreparationFailures(self.failures).details() if self.failures else [],
             "recovery": "no automatic retry; inspect exact safe mutation audit and actual owner"})
 
 
@@ -1166,6 +1351,7 @@ class ParserTests(unittest.TestCase):
         producer.warehouse = "s3://b/private"
         with tempfile.TemporaryFile("w+b") as oracle:
             producer.oracle = oracle
+            producer.journal_lock = threading.RLock()
             producer.request = lambda *_args, **_kwargs: response
             producer.load(*identity, identity[2], fact)
             for changed in ({**response, "metadata-location": "s3://b/private/ns/t/metadata/00001.json"},
@@ -1186,6 +1372,275 @@ class ParserTests(unittest.TestCase):
         self.rejected(lambda: producer.request("GET", "/never-sent", {}, empty=True))
 
 
+
+class ProvisioningTests(unittest.TestCase):
+    def fixture(self, directory, deadline=None):
+        return Producer({"binding": {"server_default_warehouse": "s3://unit/private/",
+                                     "rest_uri": "http://127.0.0.1:1"}},
+                        "0" * 64, "bulk", Path(directory) / "bulk", deadline)
+
+    def exercise_two_lanes(self, fail):
+        # No HTTP server or socket is created. The production request owns real
+        # watchdog Timer threads and the producer owns real worker threads;
+        # controlled response headers hold their original request captures.
+        from email.message import Message
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.fixture(directory)
+            entered = {name: threading.Event() for name in ("a", "b", "c")}
+            release = {name: threading.Event() for name in entered}
+            closed = {name: threading.Event() for name in entered}
+            connections, timers, errors, phase = [], [], [], []
+            real_timer = threading.Timer
+            self_test = self
+
+            class Socket:
+                def shutdown(self, _how):
+                    pass
+
+                def close(self):
+                    pass
+
+            class Response:
+                status = 200
+                headers = Message()
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = "2"
+
+                def __init__(self):
+                    self.closed = False
+
+                def read(self, _maximum):
+                    return b"{}"
+
+                def close(self):
+                    self.closed = True
+
+            class Connection:
+                def __init__(self, _host, _port, timeout):
+                    self_test.assertGreater(timeout, 0)
+                    self.sock = Socket()
+                    self.name = None
+                    self.response = None
+                    connections.append(self)
+
+                def connect(self):
+                    pass
+
+                def request(self, method, path, **_kwargs):
+                    self_test.assertEqual(method, "POST")
+                    self.name = path.lstrip("/")
+
+                def getresponse(self):
+                    entered[self.name].set()
+                    self_test.assertTrue(release[self.name].wait(5), "original request not released")
+                    if fail:
+                        raise Refusal("controlled original " + self.name + " refusal")
+                    self.response = Response()
+                    return self.response
+
+                def close(self):
+                    closed[self.name].set()
+
+            def timer(interval, callback):
+                owner = real_timer(interval, callback)
+                timers.append(owner)
+                return owner
+
+            def operation(namespace):
+                value = producer.request("POST", "/" + namespace,
+                                         {"namespace": namespace, "operation": "create"}, {})
+                producer.record(producer.oracle, {"namespace": namespace, "value": value})
+                return namespace
+
+            done = threading.Event()
+
+            def supervise():
+                try:
+                    producer.run_namespace_work(["a", "b", "c"], operation)
+                    # This caller continuation cannot precede mutation owners'
+                    # actual exits; bulk's independent GET pass uses this edge.
+                    phase.append("independent-verification")
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    done.set()
+
+            with patch.object(http.client, "HTTPConnection", Connection), \
+                    patch.object(threading, "Timer", timer), \
+                    patch.object(os, "fsync", wraps=os.fsync) as fsync:
+                owner = threading.Thread(target=supervise, name="unit-original-producer")
+                owner.start()
+                try:
+                    self.assertTrue(entered["a"].wait(5))
+                    self.assertTrue(entered["b"].wait(5))
+                    self.assertFalse(entered["c"].is_set())
+                    self.assertFalse(done.is_set())
+                    self.assertEqual(phase, [])
+                    if fail:
+                        release["a"].set()
+                        self.assertTrue(producer.stopped.wait(5))
+                        self.assertFalse(done.is_set())
+                        self.assertFalse(closed["b"].is_set())
+                        self.assertFalse(entered["c"].is_set())
+                        release["b"].set()
+                    else:
+                        # b completes before a: contiguous audit order must
+                        # follow actual durable rows, not request start order.
+                        release["b"].set()
+                        self.assertTrue(entered["c"].wait(5))
+                        self.assertTrue(closed["b"].is_set())
+                        self.assertFalse(closed["a"].is_set())
+                        self.assertFalse(done.is_set())
+                        self.assertEqual(phase, [])
+                        release["a"].set()
+                        release["c"].set()
+                    self.assertTrue(done.wait(5))
+                finally:
+                    for event in release.values():
+                        event.set()
+                    owner.join(5)
+                self.assertFalse(owner.is_alive())
+                self.assertTrue(all(not timer.is_alive() for timer in timers))
+                self.assertTrue(all(closed[connection.name].is_set() for connection in connections))
+                self.assertTrue(all(connection.response is None or connection.response.closed
+                                    for connection in connections))
+
+            self.assertEqual(fsync.call_count, 2 if fail else 6)
+            rows = [strict_json(line) for line in (producer.output / "http-audit.jsonl").read_bytes().splitlines()]
+            self.assertEqual([row["sequence"] for row in rows], list(range(1, len(rows) + 1)))
+            if fail:
+                self.assertEqual(phase, [])
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], PreparationFailures)
+                self.assertEqual({item["reason"] for item in errors[0].details()},
+                                 {"controlled original a refusal", "controlled original b refusal"})
+                self.assertEqual(producer.count, 2)
+                self.assertEqual({row["identity"]["namespace"] for row in rows}, {"a", "b"})
+                producer.fail(str(errors[0]))
+                failed = strict_json((producer.output / "FAILED.json").read_bytes())
+                self.assertEqual(len(failed["errors"]), 2)
+                self.assertFalse((producer.output / "READY.json").exists())
+            else:
+                self.assertEqual(errors, [])
+                self.assertEqual(phase, ["independent-verification"])
+                self.assertEqual(producer.count, 3)
+                self.assertEqual(producer.mutations, 3)
+                self.assertEqual([row["identity"]["namespace"] for row in rows][0], "b")
+                self.assertEqual({row["identity"]["namespace"] for row in rows}, {"a", "b", "c"})
+                oracle = [strict_json(line) for line in (producer.output / "metadata-oracle.jsonl").read_bytes().splitlines()]
+                self.assertEqual({row["namespace"] for row in oracle}, {"a", "b", "c"})
+                producer.audit.close()
+                producer.oracle.close()
+
+    def test_two_actual_lanes_and_durable_rows_precede_independent_verification(self):
+        self.exercise_two_lanes(False)
+
+    def test_failure_stops_queued_namespace_and_joins_both_actual_requests_with_all_causes(self):
+        self.exercise_two_lanes(True)
+
+    def test_request_primary_and_both_close_failures_are_retained_after_actual_timer_join(self):
+        from email.message import Message
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.fixture(directory)
+            connection, response = Mock(), Mock()
+            headers = Message()
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = "2"
+            response.headers, response.status = headers, 200
+            response.read.side_effect = Refusal("controlled original body refusal")
+            response.close.side_effect = OSError(5, "controlled response close")
+            connection.close.side_effect = OSError(9, "controlled connection close")
+            connection.getresponse.return_value = response
+            timers = []
+            real_timer = threading.Timer
+
+            def timer(interval, callback):
+                owner = real_timer(interval, callback)
+                timers.append(owner)
+                return owner
+
+            with patch.object(http.client, "HTTPConnection", return_value=connection), \
+                    patch.object(threading, "Timer", timer):
+                with self.assertRaises(PreparationFailures) as caught:
+                    producer.request("POST", "/a", {"operation": "create"}, {})
+            self.assertTrue(all(not owner.is_alive() for owner in timers))
+            response.close.assert_called_once()
+            connection.close.assert_called_once()
+            details = caught.exception.details()
+            self.assertEqual(len(details), 3)
+            self.assertEqual(details[0]["reason"], "controlled original body refusal")
+            self.assertEqual({item["errno"] for item in details[1:]}, {5, 9})
+            producer.failures.extend(caught.exception.failures)
+            producer.fail(str(caught.exception))
+            failed = strict_json((producer.output / "FAILED.json").read_bytes())
+            self.assertEqual(failed["errors"], details)
+            self.assertEqual(len((producer.output / "http-audit.jsonl").read_bytes().splitlines()), 1)
+
+    def test_start_exception_after_launch_retains_and_joins_original_worker(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.fixture(directory)
+            entered, release, done = threading.Event(), threading.Event(), threading.Event()
+            errors, launched = [], []
+            real_start = threading.Thread.start
+
+            def operation(name):
+                entered.set()
+                self.assertTrue(release.wait(5), "original capture not released")
+                return name
+
+            def interrupted_start(owner):
+                real_start(owner)
+                launched.append(owner)
+                self.assertTrue(entered.wait(5))
+                raise KeyboardInterrupt()
+
+            def supervise():
+                try:
+                    producer.run_namespace_work(["a"], operation)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    done.set()
+
+            owner = threading.Thread(target=supervise)
+            with patch.object(threading.Thread, "start", interrupted_start):
+                real_start(owner)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertTrue(producer.stopped.wait(5))
+                    self.assertFalse(done.is_set())
+                    self.assertTrue(launched[0].is_alive())
+                finally:
+                    release.set()
+                    owner.join(5)
+            self.assertFalse(owner.is_alive())
+            self.assertTrue(all(not child.is_alive() for child in launched))
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], PreparationFailures)
+            self.assertEqual(errors[0].details()[0]["exception"], "KeyboardInterrupt")
+            self.assertFalse(producer.startup_unknown)
+            producer.fail(str(errors[0]))
+            self.assertFalse((producer.output / "READY.json").exists())
+
+    def test_original_owner_deadline_stops_dispatch_without_starting_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.fixture(directory, int(time.time() * 1000) - 1)
+            entered = []
+            with self.assertRaises(PreparationFailures) as caught:
+                producer.run_namespace_work(["a", "b", "c"], lambda name: entered.append(name))
+            self.assertEqual(entered, [])
+            self.assertEqual(producer.count, 0)
+            self.assertEqual(len(caught.exception.details()), 1)
+            self.assertEqual(caught.exception.details()[0]["reason"], "preparation absolute deadline expired")
+            producer.fail(str(caught.exception))
+            self.assertFalse((producer.output / "READY.json").exists())
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
@@ -1194,13 +1649,18 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--preflight-receipt", type=Path)
     parser.add_argument("--ready-receipt", type=Path)
+    parser.add_argument("--owner-work-deadline-unix-ms", type=int)
     args = parser.parse_args()
     if args.self_test:
-        need(not any((args.freeze, args.phase, args.output, args.preflight_receipt, args.ready_receipt)),
+        need(not any((args.freeze, args.phase, args.output, args.preflight_receipt, args.ready_receipt,
+                          args.owner_work_deadline_unix_ms)),
              "self-test cannot accept service arguments")
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ParserTests)
+        suite = unittest.TestSuite([
+            unittest.defaultTestLoader.loadTestsFromTestCase(ParserTests),
+            unittest.defaultTestLoader.loadTestsFromTestCase(ProvisioningTests),
+        ])
         passed = unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
-        print("Pure-local parser tests only; no HTTP or provider acceptance.")
+        print("Local parser and producer-owner tests; fake HTTP only, no provider acceptance.")
         return 0 if passed else 1
     need(args.freeze and args.phase and args.output, "freeze, phase and output are required")
     need((args.phase == "bulk") == bool(args.preflight_receipt),
@@ -1208,7 +1668,8 @@ def main():
     need((args.phase == "verify-after-drop") == bool(args.ready_receipt),
          "only verify-after-drop requires READY receipt")
     freeze, freeze_sha = validate_freeze(args.freeze)
-    producer = Producer(freeze, freeze_sha, args.phase, args.output)
+    producer = Producer(freeze, freeze_sha, args.phase, args.output,
+                        args.owner_work_deadline_unix_ms)
     try:
         if args.phase == "preflight":
             details = producer.preflight()
@@ -1221,6 +1682,8 @@ def main():
                           "http_requests": receipt["http_requests"], "freeze_sha256": freeze_sha}))
         return 0
     except Refusal as error:
+        if isinstance(error, PreparationFailures) and not producer.failures:
+            producer.failures.extend(error.failures)
         producer.fail(str(error))
         raise
     except (OSError, KeyError, TypeError, ValueError, KeyboardInterrupt):

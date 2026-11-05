@@ -444,7 +444,11 @@ pub fn factory_from_host(
         fn participation(&self) -> ParticipationRef {
             self.participation
         }
-        fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+        fn materialize(
+            &self,
+            request: SharedFactsRequest<'_>,
+            _control: &dyn novarocks_worker::ParticipationMaterializationControl,
+        ) -> Result<(), HostRejection> {
             assert_eq!(request.participation(), self.participation);
             self.original.materialize(request)
         }
@@ -476,7 +480,11 @@ impl ParticipationHostInstance for MetadataParticipationHost {
     fn participation(&self) -> ParticipationRef {
         self.0
     }
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        _control: &dyn novarocks_worker::ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
         assert_eq!(request.participation(), self.0);
         Ok(())
     }
