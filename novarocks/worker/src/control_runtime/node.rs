@@ -1106,9 +1106,11 @@ impl WorkerNodeHost {
             task,
             reason: request.reason(),
         };
-        if host.has_retired_task_read(task) {
+        let awaiting_seal = host.task_read_awaits_seal(task);
+        if host.has_retired_task_read(task) || awaiting_seal {
             // The original physical retirement proof replaces the departed
-            // producer; the same Participation Core still owns its replay answer.
+            // producer. Until that actual transfer, the same paid R waits
+            // without borrowing the Task's closing causal sources.
             let (work, handle) = match host.admit_request(
                 &self.requests,
                 self.next_source(),
@@ -1131,7 +1133,12 @@ impl WorkerNodeHost {
                     .into());
                 }
             };
-            return match host.submit_retired_task_command(work, command) {
+            let submission = if awaiting_seal {
+                host.submit_deferred_task_read(work, command)
+            } else {
+                host.submit_retired_task_command(work, command)
+            };
+            return match submission {
                 Ok(()) => Ok(NodeCancelHandle::Participation(handle)),
                 Err(original) => Err(NodeHostRefusal::new(
                     "Cancel retained Task original handoff",
