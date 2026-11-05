@@ -4098,7 +4098,7 @@ pub(crate) mod tests {
         );
 
         capabilities.remove(&descriptor);
-        assert!(capabilities.participation_admission_aborted(context.query_execution_id()));
+        assert!(capabilities.participation_admission_aborted(participation.query_execution_id()));
         let rejection = capabilities
             .install(Arc::new(late_descriptor))
             .expect_err("a create already in flight cannot reopen a closed participation");

@@ -1797,7 +1797,7 @@ impl RootSessionState {
             }
             1 => {
                 if !self.state().completed {
-                    self.channel.close(RootRetentionClose::ContextAborted);
+                    self.channel.close(RootRetentionClose::ParticipationAborted);
                     #[cfg(test)]
                     {
                         let observer = self.after_cleanup_close.lock().unwrap().take();

@@ -2083,7 +2083,7 @@ mod tests {
         let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
         let binding = bind_fixture(&fixture, kind);
         let exact = participation(&fixture);
-        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
         let deadline = fixture
             .controls
             .restart_claim(exact)
@@ -2179,7 +2179,7 @@ mod tests {
             QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
         );
         let exact = participation(&fixture);
-        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
         let deadline = fixture
             .controls
             .restart_claim(exact)
@@ -2217,7 +2217,7 @@ mod tests {
             QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
         );
         let exact = participation(&fixture);
-        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
         let deadline = fixture
             .controls
             .restart_claim(exact)
@@ -2263,7 +2263,7 @@ mod tests {
         let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
         let binding = bind_fixture(&fixture, kind);
         let exact = participation(&fixture);
-        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
         let deadline = fixture
             .controls
             .restart_claim(exact)

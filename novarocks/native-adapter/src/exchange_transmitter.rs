@@ -653,7 +653,7 @@ pub(crate) mod tests {
             );
             rx.recv_timeout(Duration::from_secs(2)).unwrap()
         };
-        let context = novarocks_execution_contract::ParticipationRef::new(
+        let participation = novarocks_execution_contract::ParticipationRef::new(
             stream.destination().query_execution_id(),
             novarocks_types::identity::FrontendProcessId::new_v7(),
             stream.destination().backend_process_id(),
@@ -663,20 +663,20 @@ pub(crate) mod tests {
             call(stream, ExchangeDemandOperation::StopSender),
             ExchangeDemandCallOutcome::NotProcessed(_)
         ));
-        capabilities.close_participation(context);
+        capabilities.close_participation(participation);
         assert!(matches!(
             call(stream, ExchangeDemandOperation::StopSender),
             ExchangeDemandCallOutcome::NotProcessed(_)
         ));
         let other_execution = QueryExecutionId::new(
-            context.query_execution_id().query_id(),
+            participation.query_execution_id().query_id(),
             AttemptId::new(2).unwrap(),
         )
         .unwrap();
         capabilities.abort_participation(novarocks_execution_contract::ParticipationRef::new(
             other_execution,
-            context.frontend_process_id(),
-            context.backend_process_id(),
+            participation.frontend_process_id(),
+            participation.backend_process_id(),
         ));
         assert!(matches!(
             call(stream, ExchangeDemandOperation::StopSender),
@@ -684,7 +684,7 @@ pub(crate) mod tests {
         ));
         // The original positive abort fences all routes and late installation
         // even after their receiver descriptors have actually been removed.
-        capabilities.abort_participation(context);
+        capabilities.abort_participation(participation);
         assert!(
             matches!(call(stream, ExchangeDemandOperation::StopSender), ExchangeDemandCallOutcome::RouteRetired(actual) if actual == stream)
         );
@@ -697,7 +697,7 @@ pub(crate) mod tests {
         let remote_stream = ExchangeStreamIdentity::try_new(
             stream.source(),
             remote,
-            stream.destination_fragment_instance_id(),
+            stream.destination_task_key(),
             stream.destination_node(),
         )
         .unwrap();
@@ -712,7 +712,7 @@ pub(crate) mod tests {
             call(stream, ExchangeDemandOperation::Register(demand)),
             ExchangeDemandCallOutcome::NotProcessed(_)
         ));
-        capabilities.forget_context(context);
+        capabilities.forget_participation(participation);
         assert!(matches!(
             call(stream, ExchangeDemandOperation::StopSender),
             ExchangeDemandCallOutcome::NotProcessed(_)
