@@ -105,7 +105,7 @@ pub struct StatementAdmission {
     pub kind: StatementKind,
     pub shape: StatementOutputShape,
 }
-// Design: ADR-0213 (docs/adr/ADR-0213-sole-trino-entry-and-application-owned-completion.md)
+// Design: ADR-0217 (docs/adr/ADR-0217-sole-trino-entry-and-application-owned-completion.md)
 impl StatementAdmission {
     pub fn from_statement(statement: &novarocks_parser::ast::Statement) -> Self {
         use novarocks_parser::ast::{DmlStatement, Statement};

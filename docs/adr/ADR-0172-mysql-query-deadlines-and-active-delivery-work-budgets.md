@@ -5,9 +5,9 @@ domain: [distributed-query-lifecycle]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0213]
+partially-superseded-by: [ADR-0217]
 partially-superseded-scope:
-  ADR-0213: "MySQL writer cumulative delivery budget, receipts, Closing and startup projection are retired; original query deadlines, typed causes, success visibility and actual resource-exit rules remain active."
+  ADR-0217: "MySQL writer cumulative delivery budget, receipts, Closing and startup projection are retired; original query deadlines, typed causes, success visibility and actual resource-exit rules remain active."
 date: 2026-10-13
 provenance:
   - "discussion: 2026-10-13 MySQL producer waiting, cumulative active delivery work and bounded Closing"

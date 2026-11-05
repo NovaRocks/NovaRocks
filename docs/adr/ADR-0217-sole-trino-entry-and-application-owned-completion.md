@@ -1,5 +1,5 @@
 ---
-id: ADR-0213
+id: ADR-0217
 title: "Trino is the sole client entry and completion retains application authors"
 domain: [distributed-query-lifecycle, runtime-role, sql-language, error-contracts, frontend-dml]
 status: active

@@ -218,7 +218,7 @@ SQL client
   保留原领域的 Counted/NoCount；Query Application 从原 AST 冻结静态完成形状，Trino 只投影
   `columns`、`data`、`updateType` 与 `updateCount`。普通/MOR 取同 Session 完整冻结的 Root
   计数，COW 取原 selection，CTAS 等最终 CREATE；无真实计数时为 NULL，不能填零。
-  计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0213。
+  计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0217。
 
 - `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
   Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
@@ -259,7 +259,7 @@ SQL client
   Trino HTTP：`server.rs` 组合监听与 drain，`driver.rs` 投影原语句结果，
   `registry.rs` 保管不可变页、重放与结算，`body.rs` 保管实际响应写出，
   `error_mapping.rs` 编码 typed 错误。根结果只使用显式 TrinoJson 呈现事实；Internal
-  Scalar/CountOnly/Arrow IPC 保留原领域。见 ADR-0203、ADR-0213。
+  Scalar/CountOnly/Arrow IPC 保留原领域。见 ADR-0203、ADR-0217。
 
 ### 4.3 Native Compiled Package and BE Preparation
 
@@ -602,7 +602,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 6. 客户端沿准确 continuation URI 的 DELETE 请求取消，由 Query Application 原语句 owner
    续接 Native `AbortParticipation`。HTTP 连接不是查询身份；旧连接寻址的 KILL / SHOW
    PROCESSLIST 在准入时 typed 拒绝。取消不代替原本地编排、远端 Unknown publication
-   或 residual 的实际退出；稳定 owner 继续保管原责任与容量。见 ADR-0198、ADR-0213。
+   或 residual 的实际退出；稳定 owner 继续保管原责任与容量。见 ADR-0198、ADR-0217。
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -1087,7 +1087,7 @@ suspected case against a clean server before attributing it to the change.
   `compiled_writer_binding.rs`、`compiled_runtime_filter.rs`，pipeline 见 Execution
   `exec/pipeline/builder/compiled.rs`。先读 ADR-0185，禁止恢复 v1 decoder/构造桥。
 - **Trino protocol behavior**: inspect `novarocks/trino-adapter/src/{server,driver,registry,body,error_mapping}.rs`;
-  read ADR-0203 and ADR-0213 before changing page acknowledgement or completion projection.
+  read ADR-0203 and ADR-0217 before changing page acknowledgement or completion projection.
 - **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
   admission and routing, then the specific flow under
   `novarocks/frontend-application/src/query_execution/dml/**` (`insert.rs`,
@@ -1101,7 +1101,7 @@ suspected case against a clean server before attributing it to the change.
   chain is retired.
   Common logical execution policy and identity are in `novarocks/query-application/src/coordination/**`.
   Preserve cumulative effects through `novarocks/query-application/src/api/result.rs`
-  and Trino success/error projection; consult ADR-0198 and ADR-0213 before changing these boundaries.
+  and Trino success/error projection; consult ADR-0198 and ADR-0217 before changing these boundaries.
   资源修改沿原 worker、Transport 与结果预算 owner；保留 typed Source、完整 D 和实际退出证据。
   局部组件通过不证明原生调用面或最终全工作区验证完成。
 - **Iceberg 提交、冲突与清理**：从 `novarocks/connector/iceberg/src/commit/{model,dependency,staging}/**`、

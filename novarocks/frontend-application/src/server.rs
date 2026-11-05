@@ -1212,7 +1212,7 @@ where
     combine_server_and_shutdown(result, stopped)
 }
 
-// Design: ADR-0213 (docs/adr/ADR-0213-sole-trino-entry-and-application-owned-completion.md)
+// Design: ADR-0217 (docs/adr/ADR-0217-sole-trino-entry-and-application-owned-completion.md)
 fn emit_frontend_trino_ready(bind_addr: std::net::SocketAddr, user: &str) {
     info!(
         "standalone Trino server listening on {} (user={})",
