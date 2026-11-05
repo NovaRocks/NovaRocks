@@ -157,8 +157,15 @@ pub fn validate_argument_observed(
         }
         if argument.constant_value().is_none() {
             let shared = std::cell::RefCell::new(&mut work);
+            // Scalar demand broadcasts one immutable physical row. Validate
+            // that row once while preserving the kernel's full output demand.
             let rows = selection
                 .iter()
+                .take(if matches!(argument, EvaluatedArgument::Scalar(_)) {
+                    1
+                } else {
+                    selection.len()
+                })
                 .enumerate()
                 .map(|(ordinal, row)| argument.value_row(ordinal, row));
             novarocks_value_arrays::hydrate::validate_required_rows_observed(
