@@ -262,20 +262,20 @@ impl ConnectorControlResolver for CountedResolver {
         &self,
         _: &ConnectorInstanceId,
     ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
-        panic!("must keep the acquired lease")
+        panic!("must keep the acquired planning pin")
     }
     fn observe_current_control_runtime(
         &self,
         _: &ConnectorInstanceId,
     ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
-        panic!("must keep the acquired lease")
+        panic!("must keep the acquired planning pin")
     }
     fn acquire_current(
         &self,
         _: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
         self.counts.acquired.fetch_add(1, Ordering::Relaxed);
-        Ok(ConnectorControlPlanningLease::new(
+        Ok(ConnectorControlPlanningPin::new(
             self.binding.clone(),
             || {},
         ))
@@ -353,7 +353,7 @@ fn source_kind(error: CatalogResolutionError) -> ConnectorErrorKind {
 }
 
 #[test]
-fn one_lease_table_success_does_not_probe_a_view() {
+fn one_planning_pin_table_success_does_not_probe_a_view() {
     let resolver = fixture(None, Some(None));
     let ConnectorQueryRelationMaterialization::Table {
         materialization,
@@ -364,7 +364,7 @@ fn one_lease_table_success_does_not_probe_a_view() {
     };
     assert!(selection.is_none());
     assert_eq!(
-        materialization.planning_lease.control_runtime_id(),
+        materialization.planning_pin.control_runtime_id(),
         resolver.binding.control_runtime_id()
     );
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
@@ -381,7 +381,7 @@ fn only_actual_table_absence_enters_the_same_generation_view_capability() {
     };
     assert_eq!(view.definition.version.as_ref(), "observed-v1");
     assert_eq!(
-        view.planning_lease.control_runtime_id(),
+        view.planning_pin.control_runtime_id(),
         resolver.binding.control_runtime_id()
     );
     assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
@@ -439,7 +439,7 @@ async fn async_view_capture_prepares_then_creates_without_a_joining_reload() {
     assert_eq!(resolver.counts.view_load.load(Ordering::Relaxed), 0);
 }
 #[tokio::test]
-async fn historical_selection_uses_the_same_lease_and_actual_selected_schema() {
+async fn historical_selection_uses_the_same_planning_pin_and_actual_selected_schema() {
     let resolver = fixture(None, Some(None));
     let ConnectorQueryRelationMaterialization::Table {
         materialization,
@@ -464,7 +464,7 @@ async fn historical_selection_uses_the_same_lease_and_actual_selected_schema() {
         &arrow::datatypes::DataType::Int32
     );
     assert_eq!(
-        materialization.planning_lease.control_runtime_id(),
+        materialization.planning_pin.control_runtime_id(),
         resolver.binding.control_runtime_id()
     );
     assert_eq!(
@@ -684,12 +684,12 @@ mod gated_original;
 fn a_provider_table_from_another_relation_cannot_be_relabelled_as_the_requested_input() {
     for (namespace, table) in [("other", "orders"), ("db", "other")] {
         let resolver = fixture(None, Some(None));
-        let (lease, expected, context) =
+        let (planning_pin, expected, context) =
             begin(&resolver, context(), &need("SELECT x FROM ice.db.orders")).unwrap();
         let mut returned = expected.clone();
         returned.namespace = namespace.into();
         returned.table = table.into();
-        let metadata = lease
+        let metadata = planning_pin
             .binding()
             .metadata()
             .load_frontend_table(ConnectorTableRequest {
@@ -698,7 +698,7 @@ fn a_provider_table_from_another_relation_cannot_be_relabelled_as_the_requested_
                 context,
             })
             .unwrap();
-        let error = match finish_table(metadata, lease, None, &expected) {
+        let error = match finish_table(metadata, planning_pin, None, &expected) {
             Err(error) => error,
             Ok(_) => panic!("a different relation cannot supply the requested table"),
         };

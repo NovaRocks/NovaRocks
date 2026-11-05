@@ -233,7 +233,7 @@ fn preparation(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparat
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn original_gate_keeps_one_table_to_view_lease_and_statement_memo() {
+async fn original_gate_keeps_one_table_to_view_planning_pin_and_statement_memo() {
     with_gate(|gate, context| {
         Box::pin(async move {
             let resolver = fixture(Some(absent()), Some(None));

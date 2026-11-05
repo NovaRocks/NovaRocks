@@ -33,7 +33,7 @@ use novarocks_proto_models::{
 use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation};
 
 fn authored_schema_package(unrelated: bool) -> (Vec<u8>, u32) {
-    let (bytes, _) = select_one_producer();
+    let (bytes, _) = select_sql_producer("SELECT CAST(1 AS BIGINT)");
     let mut package = wire::FragmentPackage::decode(bytes.as_slice()).unwrap();
     // Preserve the real FE expression/request/control/constant package. These
     // additional unused source-shape declarations are still fully validated.
@@ -50,7 +50,7 @@ fn authored_schema_package(unrelated: bool) -> (Vec<u8>, u32) {
             }
             _ => None,
         })
-        .expect("SELECT 1 has an explicitly authored Int64 carrier");
+        .expect("the BIGINT constant query has an explicitly authored Int64 carrier");
     let first = types
         .fields
         .iter()

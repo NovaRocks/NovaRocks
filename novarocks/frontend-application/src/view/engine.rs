@@ -213,12 +213,13 @@ impl ViewEngine for FrontendViewEngine {
         target: &ViewTarget,
         context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, novarocks_query_application::api::CommandError> {
-        let lease =
+        let planning_pin =
             crate::connector::metadata_binding_typed(self.connector_control(), &target.catalog)
                 .map_err(crate::connector::mutation::command_error_from_connector)?;
-        let context = crate::connector::context_for_planning_pin_typed(&lease, context.clone())
-            .map_err(crate::connector::mutation::command_error_from_connector)?;
-        let binding = lease.binding();
+        let context =
+            crate::connector::context_for_planning_pin_typed(&planning_pin, context.clone())
+                .map_err(crate::connector::mutation::command_error_from_connector)?;
+        let binding = planning_pin.binding();
         let capability = binding.view_metadata().ok_or_else(|| {
             crate::connector::mutation::command_error_from_connector(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,

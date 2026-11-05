@@ -24,7 +24,7 @@ use novarocks_query_application::system_catalog_rewrite::{
     SystemCatalogFacts, SystemCatalogFactsPort,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorError, ConnectorErrorKind,
+    ConnectorControlPlanningPin, ConnectorControlRegistry, ConnectorError, ConnectorErrorKind,
     ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorListingBound,
     ConnectorListingBudget, ConnectorNamespaceIdentity, ConnectorRequestContext,
     ConnectorTableIdentity,
@@ -79,23 +79,24 @@ impl FrontendSystemCatalogFacts {
         &self,
         request: &ConnectorRequestContext,
         catalog_name: &str,
-    ) -> Result<Option<(ConnectorControlPlanningLease, ConnectorRequestContext)>, SqlCompileError>
+    ) -> Result<Option<(ConnectorControlPlanningPin, ConnectorRequestContext)>, SqlCompileError>
     {
         definition_check_active(request)?;
-        let lease = match crate::connector::metadata_binding_typed(
+        let planning_pin = match crate::connector::metadata_binding_typed(
             self.connector_control.as_ref(),
             catalog_name,
         ) {
-            Ok(lease) => lease,
+            Ok(planning_pin) => planning_pin,
             // Only an absent catalog declines this virtual relation. Listing
             // errors after admission still belong to this exact generation.
             Err(error) if error.kind() == ConnectorErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(definition_error(error)),
         };
-        let context = crate::connector::context_for_planning_lease_typed(&lease, request.clone())
-            .map_err(definition_error)?;
+        let context =
+            crate::connector::context_for_planning_pin_typed(&planning_pin, request.clone())
+                .map_err(definition_error)?;
         definition_check_active(&context)?;
-        Ok(Some((lease, context)))
+        Ok(Some((planning_pin, context)))
     }
 }
 
@@ -248,13 +249,13 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         if catalog_name == novarocks_types::naming::DEFAULT_CATALOG {
             return self.definition_local_facts(request).map(Some);
         }
-        let Some((lease, context)) = self.definition_binding(request, catalog_name)? else {
+        let Some((planning_pin, context)) = self.definition_binding(request, catalog_name)? else {
             return Ok(None);
         };
-        let instance_id = lease.binding().descriptor().instance_id.clone();
+        let instance_id = planning_pin.binding().descriptor().instance_id.clone();
         let mut budget =
             ConnectorListingBudget::new(ConnectorListingBound::V1).map_err(definition_error)?;
-        let namespaces = lease
+        let namespaces = planning_pin
             .binding()
             .metadata()
             .list_namespaces(ConnectorListNamespacesRequest {
@@ -273,7 +274,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                     instance_id: instance_id.clone(),
                     namespace: schema.as_str().into(),
                 };
-                let tables = lease
+                let tables = planning_pin
                     .binding()
                     .metadata()
                     .list_tables(ConnectorListTablesRequest {
@@ -305,13 +306,14 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             if catalog_name == novarocks_types::naming::DEFAULT_CATALOG {
                 return self.definition_local_facts(request).map(Some);
             }
-            let Some((lease, context)) = self.definition_binding(request, catalog_name)? else {
+            let Some((planning_pin, context)) = self.definition_binding(request, catalog_name)?
+            else {
                 return Ok(None);
             };
-            let instance_id = lease.binding().descriptor().instance_id.clone();
+            let instance_id = planning_pin.binding().descriptor().instance_id.clone();
             let mut budget =
                 ConnectorListingBudget::new(ConnectorListingBound::V1).map_err(definition_error)?;
-            let namespaces = lease
+            let namespaces = planning_pin
                 .binding()
                 .metadata()
                 .list_namespaces_async(ConnectorListNamespacesRequest {
@@ -331,7 +333,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                         instance_id: instance_id.clone(),
                         namespace: schema.as_str().into(),
                     };
-                    let tables = lease
+                    let tables = planning_pin
                         .binding()
                         .metadata()
                         .list_tables_async(ConnectorListTablesRequest {
@@ -378,18 +380,18 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         include_table_names: bool,
     ) -> futures::future::BoxFuture<'a, Result<Option<SystemCatalogFacts>, String>> {
         Box::pin(async move {
-            let lease = match crate::connector::acquire_metadata_planning_pin(
+            let planning_pin = match crate::connector::acquire_metadata_planning_pin(
                 self.connector_control.as_ref(),
                 catalog_name,
             ) {
-                Ok(lease) => lease,
+                Ok(planning_pin) => planning_pin,
                 Err(_) => return Ok(None),
             };
             let mut budget = ConnectorListingBudget::new(ConnectorListingBound::V1)
                 .map_err(|e| e.to_string())?;
             let mut schema_names =
                 crate::connector::metadata_list_namespaces_with_planning_pin_async(
-                    lease.clone(),
+                    planning_pin.clone(),
                     request.clone(),
                     budget.remaining_bound(),
                 )
@@ -406,7 +408,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             if include_table_names {
                 for schema in &schema_names {
                     let tables = crate::connector::metadata_list_tables_with_planning_pin_async(
-                        &lease,
+                        &planning_pin,
                         request.clone(),
                         schema,
                         budget.remaining_bound(),
@@ -431,23 +433,23 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         catalog_name: &str,
         include_table_names: bool,
     ) -> Result<Option<SystemCatalogFacts>, String> {
-        let lease = match crate::connector::acquire_metadata_planning_pin(
+        let planning_pin = match crate::connector::acquire_metadata_planning_pin(
             self.connector_control.as_ref(),
             catalog_name,
         ) {
-            Ok(lease) => lease,
+            Ok(planning_pin) => planning_pin,
             // Preserve the pre-existing unknown-catalog path: the regular SQL
             // resolver owns rendering that error after this rewriter declines.
             Err(_) => return Ok(None),
         };
-        let listing_lease = lease.clone();
+        let listing_lease = planning_pin.clone();
         let (schema_names, table_names) = bounded_external_names(
             ConnectorListingBound::V1,
             include_table_names,
             |bound| {
                 Ok(
                     crate::connector::metadata_list_namespaces_with_planning_pin(
-                        lease,
+                        planning_pin,
                         request.clone(),
                         bound,
                     )?

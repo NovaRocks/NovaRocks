@@ -1,5 +1,5 @@
 ---
-id: ADR-0215
+id: ADR-0218
 title: "SQL owns output declarations and stored-view relation analysis"
 domain: [sql-compiler, sql-language, error-contracts]
 status: active

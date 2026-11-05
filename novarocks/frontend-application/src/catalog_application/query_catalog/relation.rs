@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! One exact control lease for an ordinary table/view or historical decision.
+//! One exact control planning pin for an ordinary table/view or historical decision.
 
 use super::{CatalogResolutionError, CatalogResolutionResult, ConnectorQueryTableMaterialization};
 use crate::connector::schema_creation::FrontendSchemaLoad;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 pub struct ConnectorQueryViewMaterialization {
     pub(crate) definition: Arc<SqlViewDefinition>,
     // Retains the actual observation generation without granting a scan token.
-    pub(crate) planning_lease: ConnectorControlPlanningLease,
+    pub(crate) planning_pin: ConnectorControlPlanningPin,
 }
 
 pub enum ConnectorQueryRelationMaterialization {
@@ -49,7 +49,7 @@ pub(crate) fn begin(
     context: ConnectorRequestContext,
     need: &CatalogRelationNeed,
 ) -> CatalogResolutionResult<(
-    ConnectorControlPlanningLease,
+    ConnectorControlPlanningPin,
     ConnectorTableIdentity,
     ConnectorRequestContext,
 )> {
@@ -62,20 +62,20 @@ pub(crate) fn begin(
         ));
     }
     let relation = need.relation();
-    let lease = crate::connector::metadata_binding_typed(controls, &relation.catalog)
+    let planning_pin = crate::connector::metadata_binding_typed(controls, &relation.catalog)
         .map_err(CatalogResolutionError::from_connector)?;
-    let context = crate::connector::context_for_planning_lease_typed(&lease, context)
+    let context = crate::connector::context_for_planning_pin_typed(&planning_pin, context)
         .map_err(CatalogResolutionError::from_connector)?;
     context
         .original_operation_control()
         .check_active()
         .map_err(CatalogResolutionError::from_connector)?;
     let identity = ConnectorTableIdentity {
-        instance_id: lease.binding().descriptor().instance_id.clone(),
+        instance_id: planning_pin.binding().descriptor().instance_id.clone(),
         namespace: relation.namespace.as_str().into(),
         table: relation.table.as_str().into(),
     };
-    Ok((lease, identity, context))
+    Ok((planning_pin, identity, context))
 }
 
 pub(crate) fn project_reference(
@@ -91,7 +91,7 @@ pub(crate) fn project_reference(
 
 pub(crate) fn project_view(
     value: ConnectorViewMetadataValue,
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryViewMaterialization> {
     match value.definition.dialect {
@@ -140,7 +140,7 @@ pub(crate) fn project_view(
     })?;
     Ok(ConnectorQueryViewMaterialization {
         definition,
-        planning_lease: lease,
+        planning_pin,
     })
 }
 
@@ -153,7 +153,7 @@ pub(crate) fn no_view_capability() -> CatalogResolutionError {
 
 pub(crate) fn finish_table(
     metadata: ConnectorTableMetadata,
-    lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     selection: Option<SqlTimeTravelSnapshotBindingFacts>,
     expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryRelationMaterialization> {
@@ -169,7 +169,7 @@ pub(crate) fn finish_table(
             ConnectorTableResolution::HistoricalSnapshot(binding.snapshot_id())
         });
     let materialization =
-        super::connector_table_materialization_for_resolution(metadata, lease, resolution)
+        super::connector_table_materialization_for_resolution(metadata, planning_pin, resolution)
             .map_err(CatalogResolutionError::failed)?;
     Ok(ConnectorQueryRelationMaterialization::Table {
         materialization: Box::new(materialization),
@@ -182,9 +182,9 @@ pub(crate) fn load_relation(
     context: ConnectorRequestContext,
     need: &CatalogRelationNeed,
 ) -> CatalogResolutionResult<ConnectorQueryRelationMaterialization> {
-    let (lease, identity, context) = begin(controls, context, need)?;
+    let (planning_pin, identity, context) = begin(controls, context, need)?;
     let selection = if need.version().is_some() {
-        let references = lease
+        let references = planning_pin
             .binding()
             .metadata()
             .read_reference_facts(ConnectorReadReferenceFactsRequest {
@@ -210,7 +210,7 @@ pub(crate) fn load_relation(
         .map_or(ConnectorTableResolution::StrictBaseTable, |binding| {
             ConnectorTableResolution::HistoricalSnapshot(binding.snapshot_id())
         });
-    match lease
+    match planning_pin
         .binding()
         .metadata()
         .load_frontend_table(ConnectorTableRequest {
@@ -218,9 +218,9 @@ pub(crate) fn load_relation(
             resolution,
             context: context.clone(),
         }) {
-        Ok(metadata) => finish_table(metadata, lease, selection, &identity),
+        Ok(metadata) => finish_table(metadata, planning_pin, selection, &identity),
         Err(error) if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound => {
-            let capability = lease
+            let capability = planning_pin
                 .binding()
                 .view_metadata()
                 .ok_or_else(no_view_capability)?;
@@ -238,7 +238,8 @@ pub(crate) fn load_relation(
             .map_err(|error| {
                 super::connector_table_resolution_error(error, &identity.namespace, &identity.table)
             })?;
-            project_view(value, lease, &identity).map(ConnectorQueryRelationMaterialization::View)
+            project_view(value, planning_pin, &identity)
+                .map(ConnectorQueryRelationMaterialization::View)
         }
         Err(error) => Err(super::connector_table_resolution_error(
             error,
@@ -253,9 +254,9 @@ pub(crate) async fn load_relation_async(
     context: ConnectorRequestContext,
     need: &CatalogRelationNeed,
 ) -> CatalogResolutionResult<ConnectorQueryRelationMaterialization> {
-    let (lease, identity, context) = begin(controls, context, need)?;
+    let (planning_pin, identity, context) = begin(controls, context, need)?;
     let selection = if need.version().is_some() {
-        let references = lease
+        let references = planning_pin
             .binding()
             .metadata()
             .read_reference_facts_async(ConnectorReadReferenceFactsRequest {
@@ -283,7 +284,7 @@ pub(crate) async fn load_relation_async(
             ConnectorTableResolution::HistoricalSnapshot(binding.snapshot_id())
         });
     match crate::connector::schema_creation::load_frontend_table_async(
-        lease.binding().metadata().as_ref(),
+        planning_pin.binding().metadata().as_ref(),
         ConnectorTableRequest {
             table: identity.clone(),
             resolution,
@@ -292,9 +293,9 @@ pub(crate) async fn load_relation_async(
     )
     .await
     {
-        Ok(metadata) => finish_table(metadata, lease, selection, &identity),
+        Ok(metadata) => finish_table(metadata, planning_pin, selection, &identity),
         Err(error) if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound => {
-            let capability = lease
+            let capability = planning_pin
                 .binding()
                 .view_metadata()
                 .ok_or_else(no_view_capability)?;
@@ -313,7 +314,8 @@ pub(crate) async fn load_relation_async(
             .map_err(|error| {
                 super::connector_table_resolution_error(error, &identity.namespace, &identity.table)
             })?;
-            project_view(value, lease, &identity).map(ConnectorQueryRelationMaterialization::View)
+            project_view(value, planning_pin, &identity)
+                .map(ConnectorQueryRelationMaterialization::View)
         }
         Err(error) => Err(super::connector_table_resolution_error(
             error,

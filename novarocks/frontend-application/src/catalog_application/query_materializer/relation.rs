@@ -97,10 +97,10 @@ impl CatalogServiceMaterializer<'_> {
                 crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error,
             )?;
             let observed = async {
-                let (lease, identity, context) = projection::begin(controls, context, need)?;
+                let (planning_pin, identity, context) = projection::begin(controls, context, need)?;
                 let selection = if need.version().is_some() {
                     let references = io
-                        .reference_facts(&lease, identity.clone(), context.clone())
+                        .reference_facts(&planning_pin, identity.clone(), context.clone())
                         .await
                         .map_err(|error| {
                             super::super::query_catalog::connector_table_resolution_error(
@@ -127,7 +127,7 @@ impl CatalogServiceMaterializer<'_> {
                     });
                 match io
                     .metadata(
-                        &lease,
+                        &planning_pin,
                         context.clone(),
                         &identity.namespace,
                         &identity.table,
@@ -135,12 +135,14 @@ impl CatalogServiceMaterializer<'_> {
                     )
                     .await
                 {
-                    Ok(metadata) => projection::finish_table(metadata, lease, selection, &identity),
+                    Ok(metadata) => {
+                        projection::finish_table(metadata, planning_pin, selection, &identity)
+                    }
                     Err(error)
                         if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound =>
                     {
                         let view = io
-                            .view_metadata(&lease, identity.clone(), context)
+                            .view_metadata(&planning_pin, identity.clone(), context)
                             .await
                             .map_err(|error| {
                                 super::super::query_catalog::connector_table_resolution_error(
@@ -149,7 +151,7 @@ impl CatalogServiceMaterializer<'_> {
                                     &identity.table,
                                 )
                             })?;
-                        projection::project_view(view, lease, &identity)
+                        projection::project_view(view, planning_pin, &identity)
                             .map(ConnectorQueryRelationMaterialization::View)
                     }
                     Err(error) => Err(
@@ -167,7 +169,7 @@ impl CatalogServiceMaterializer<'_> {
         let admission = self.original_catalog_admission(&relation.catalog).and_then(|current| {
             if current == observation { Ok(()) } else {
                 Err(crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error(
-                    "catalog attachment generation changed while acquiring its planning lease"))
+                    "catalog attachment generation changed while acquiring its planning pin"))
             }
         });
         let fact = result.map_err(original_relation_error)?;
@@ -247,7 +249,7 @@ impl CatalogServiceMaterializer<'_> {
             }
             MemoizedQueryRelation::View(view) => {
                 if view
-                    .planning_lease
+                    .planning_pin
                     .binding()
                     .descriptor()
                     .instance_id

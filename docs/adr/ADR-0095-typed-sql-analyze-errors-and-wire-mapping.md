@@ -5,10 +5,10 @@ domain: [error-contracts]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0187, ADR-0217, ADR-0215]
+partially-superseded-by: [ADR-0187, ADR-0217, ADR-0218]
 partially-superseded-scope:
   ADR-0217: "MySQL ErrorKind, errno and SQLSTATE projection is retired; analyzer-owned code/span, transport-neutral UserError and the existing ADR-0187 partial supersede remain active."
-  ADR-0215: "MV carriers preserve every original AnalyzeError; the former historical MV String-facade exemption is replaced. SQL code/span and protocol ownership remain unchanged."
+  ADR-0218: "MV carriers preserve every original AnalyzeError; the former historical MV String-facade exemption is replaced. SQL code/span and protocol ownership remain unchanged."
   ADR-0187: "Known non-analyze execution facts remain typed even without SQL source/span; Analyze code/span and the separate historical MV lineage facade remain unchanged."
 date: 2026-08-21
 provenance:

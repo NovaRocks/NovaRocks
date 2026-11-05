@@ -357,7 +357,6 @@ fn preflight_source_policy_core<H>(
             string_bytes: field.name().len(),
             ..Counts::default()
         };
-        let mut reader_prefix = *prefix;
         let current = std::cell::RefCell::new(&mut **admission);
         let mut scratch_gate = |layout: std::alloc::Layout| {
             let mut admission = current.borrow_mut();
@@ -401,7 +400,7 @@ fn preflight_source_policy_core<H>(
             let facts = Policy(true)
                 .numeric(headers.schema())
                 .and_then(|schema| {
-                    Policy(true).numeric(writer_resources::reader_facts(schema, reader_prefix))
+                    Policy(true).numeric(writer_resources::reader_facts(schema, *prefix))
                 })
                 .map_err(control_cause)?;
             current

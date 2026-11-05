@@ -38,7 +38,7 @@ pub struct ConnectorListViewsRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-// Design: ADR-0215 (docs/adr/ADR-0215-sql-output-declarations-and-stored-view-analysis.md)
+// Design: ADR-0218 (docs/adr/ADR-0218-sql-output-declarations-and-stored-view-analysis.md)
 pub struct ConnectorViewMetadataValue {
     pub identity: ConnectorViewIdentity,
     pub definition: ConnectorViewDefinition,

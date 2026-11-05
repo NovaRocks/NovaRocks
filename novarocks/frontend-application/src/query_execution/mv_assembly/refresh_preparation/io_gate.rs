@@ -108,11 +108,11 @@ enum Request {
         include_tables: bool,
     },
     ReferenceFacts {
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest,
     },
     ViewMetadata {
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         request: novarocks_spi::connector::ConnectorViewRequest,
     },
     Metadata {
@@ -553,8 +553,11 @@ impl MvRefreshPreparationIo {
                         drop(child);
                         Response::SystemCatalogFactsReady
                     }
-                    Request::ReferenceFacts { lease, request } => {
-                        let mut child = lease
+                    Request::ReferenceFacts {
+                        planning_pin,
+                        request,
+                    } => {
+                        let mut child = planning_pin
                             .binding()
                             .metadata()
                             .read_reference_facts_async(request);
@@ -576,8 +579,11 @@ impl MvRefreshPreparationIo {
                         drop(child);
                         Response::ReferenceFactsReady
                     }
-                    Request::ViewMetadata { lease, request } => {
-                        let capability = lease
+                    Request::ViewMetadata {
+                        planning_pin,
+                        request,
+                    } => {
+                        let capability = planning_pin
                             .binding()
                             .view_metadata()
                             .expect("view capability admitted before requesting I/O");
@@ -914,7 +920,7 @@ impl MvRefreshPreparationIo {
         result?;
         let mut result = None;
         self.admission.take_admitted_in(&mut result)?;
-        Ok(result.expect("successful MV admission installs the original lease"))
+        Ok(result.expect("successful MV admission installs the original planning_pin"))
     }
     pub(crate) async fn install_current(
         &self,
@@ -1021,15 +1027,15 @@ impl MvRefreshPreparationIo {
     }
     pub(crate) async fn reference_facts(
         &self,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         identity: ConnectorTableIdentity,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError> {
-        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
         context.original_operation_control().check_active()?;
         let Response::ReferenceFactsReady = self
             .exchange(Request::ReferenceFacts {
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest {
                     table: identity,
                     context,
@@ -1048,13 +1054,13 @@ impl MvRefreshPreparationIo {
 
     pub(crate) async fn view_metadata(
         &self,
-        lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         identity: ConnectorTableIdentity,
         context: ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::ConnectorViewMetadataValue, ConnectorError> {
-        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
         context.original_operation_control().check_active()?;
-        let capability = lease.binding().view_metadata().ok_or_else(|| {
+        let capability = planning_pin.binding().view_metadata().ok_or_else(|| {
             ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::Unsupported,
                 "connector generation does not declare view metadata capability",
@@ -1062,7 +1068,7 @@ impl MvRefreshPreparationIo {
         })?;
         let Response::ViewMetadataReady = self
             .exchange(Request::ViewMetadata {
-                lease: lease.clone(),
+                planning_pin: planning_pin.clone(),
                 request: novarocks_spi::connector::ConnectorViewRequest {
                     view: novarocks_spi::connector::ConnectorViewIdentity {
                         instance_id: identity.instance_id,
