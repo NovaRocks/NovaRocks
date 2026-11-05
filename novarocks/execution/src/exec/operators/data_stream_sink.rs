@@ -2029,7 +2029,7 @@ impl OperatorLifecycle for DataStreamSinkOperator {
                 // Sample only the original frozen sender roster. Busy locks
                 // mean unavailable, never an empty group or an exit proof.
                 let sender_state = self.send_group.try_diagnostic_state();
-                tracing::debug!(?task, finst = ?self.fragment_instance_id,
+                tracing::debug!(?task, task_key = ?self.task_key,
                     driver_id = self.driver_id, dest_node = self.input.dest_node_id,
                     exiting = self.exiting, aborting = self.aborting.load(Ordering::Acquire),
                     finishing = self.finishing.load(Ordering::Acquire), ?sender_state,
