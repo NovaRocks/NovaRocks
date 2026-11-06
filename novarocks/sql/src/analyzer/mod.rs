@@ -3321,6 +3321,44 @@ mod tests {
     }
 
     #[test]
+    fn trino_struct_dereferences_keep_natural_and_computed_names() {
+        for (sql, expected_name, expected_type) in [
+            (
+                "SELECT s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                Some("a"),
+                DataType::Int32,
+            ),
+            (
+                "SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);",
+                None,
+                DataType::Int32,
+            ),
+            (
+                "SELECT (s).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                Some("a"),
+                DataType::Int32,
+            ),
+            (
+                "SELECT (CAST(s AS STRUCT<a bigint>)).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                None,
+                DataType::Int64,
+            ),
+            (
+                "SELECT s.A FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;",
+                Some("A"),
+                DataType::Int32,
+            ),
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let (resolved, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+            assert_eq!(resolved.output_columns.len(), 1, "{sql}");
+            let output = &resolved.output_columns[0];
+            assert_eq!(output.field_name.as_deref(), expected_name, "{sql}");
+            assert_eq!(output.value_type.data_type(), &expected_type, "{sql}");
+        }
+    }
+
+    #[test]
     fn anonymous_relation_labels_never_resolve_as_sql_names() {
         for sql in [
             "SELECT _col0 FROM (SELECT 1) AS t",
