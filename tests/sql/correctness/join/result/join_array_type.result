@@ -85,12 +85,12 @@ i_1	i_1
 
 -- query 16
 -- legacy
-count(*)
+_col0
 3
 
 -- query 17
 -- legacy
-count(*)
+_col0
 1
 
 -- query 18

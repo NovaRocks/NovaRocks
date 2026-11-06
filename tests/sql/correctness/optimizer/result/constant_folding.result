@@ -1,11 +1,11 @@
 -- query 4
 -- types	bigint
-(40000 + 2000) + 96
+_col0
 42096
 
 -- query 5
 -- types	varchar
-date_format('2020-01-01', '%Y-%m')
+_col0
 2020-01
 
 -- query 6
@@ -20,12 +20,12 @@ id
 
 -- query 11
 -- types	double
-1 / 0
+_col0
 NULL
 
 -- query 13
 -- types	bigint
-(40000 + 2000) + 96
+_col0
 42096
 
 -- query 14

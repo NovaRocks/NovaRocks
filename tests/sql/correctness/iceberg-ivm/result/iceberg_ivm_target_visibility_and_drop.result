@@ -6,5 +6,5 @@ order_id	amount
 
 -- query 4
 -- types	bigint
-count(*)
+_col0
 2

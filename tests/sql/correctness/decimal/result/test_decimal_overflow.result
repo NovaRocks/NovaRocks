@@ -1,91 +1,91 @@
 -- query 2
 -- types	decimal(38, 36)
-274.97790000000000000000 * ((round(1103.00000000000000000000 * 1.0000, 16)) / (round(1103.00000000000000000000, 16)))
+_col0
 NULL
 
 -- query 4
 -- types	decimal(9, 0)
-CAST((c_d32 * c_d32) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 5
 -- types	decimal(9, 0)
-CAST((c_d32 * c_d32) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 6
 -- types	decimal(18, 0)
-CAST((c_d64 * c_d64) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 7
 -- types	decimal(18, 0)
-CAST((c_d64 * c_d64) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 8
 -- types	decimal(38, 0)
-CAST((c_d128 * c_d128) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 9
 -- types	decimal(38, 0)
-CAST((c_d128 * c_d128) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 10
 -- types	decimal(9, 0)
-CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
+_col0
 1000000
 
 -- query 11
 -- types	decimal(9, 0)
-CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
+_col0
 -1000000
 
 -- query 12
 -- types	decimal(18, 0)
-CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
+_col0
 10000000000000
 
 -- query 13
 -- types	decimal(18, 0)
-CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
+_col0
 -10000000000000
 
 -- query 14
 -- types	decimal(38, 0)
-CAST((c_d128 * 1.000000000) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 15
 -- types	decimal(38, 0)
-CAST((c_d128 * 1.000000000) AS DECIMAL128(38,0))
+_col0
 NULL
 
 -- query 22
 -- types	decimal(9, 0)
-CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
+_col0
 1000000
 
 -- query 23
 -- types	decimal(9, 0)
-CAST((c_d32 * 1.000) AS DECIMAL128(38,0))
+_col0
 -1000000
 
 -- query 24
 -- types	decimal(18, 0)
-CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
+_col0
 10000000000000
 
 -- query 25
 -- types	decimal(18, 0)
-CAST((c_d64 * 1.000000) AS DECIMAL128(38,0))
+_col0
 -10000000000000
 
 -- query 28
 -- types	decimal(38, 20)
-c_id - 1.12345678901234567890
+_col0
 -0.12345678901234567890
 
 -- query 29

@@ -1,6 +1,6 @@
 -- query 8
 -- types	integer	bigint	integer
-max(c3)	sc3	c0
+_col0	sc3	c0
 8	10003	0
 8	10000	1
 8	9998	2
@@ -8,7 +8,7 @@ max(c3)	sc3	c0
 
 -- query 9
 -- types	integer	bigint	integer
-max(c3)	sc3	c1
+_col0	sc3	c1
 0	0	0
 1	1112	1
 2	2222	2

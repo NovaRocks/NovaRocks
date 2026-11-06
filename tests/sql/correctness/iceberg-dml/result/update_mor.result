@@ -5,7 +5,7 @@ id	v
 2	b
 
 -- query 4
--- legacy
+-- types	bigint	varchar
 id	v
 1	a
 2	bb

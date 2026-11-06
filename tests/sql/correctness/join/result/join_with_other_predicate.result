@@ -1,19 +1,19 @@
 -- query 6
 -- types	bigint
-count(*)
+_col0
 40960
 
 -- query 7
 -- types	bigint
-count(*)
+_col0
 40960
 
 -- query 8
 -- types	bigint
-count(*)
+_col0
 40960
 
 -- query 9
 -- types	bigint
-count(*)
+_col0
 40960

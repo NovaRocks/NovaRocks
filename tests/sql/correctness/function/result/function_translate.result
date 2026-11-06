@@ -1,66 +1,66 @@
 -- query 1
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), 'a', 'b'))), 0)
+_col0
 1624733713
 
 -- query 2
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(concat(repeat('a', (1024 * 1024) - (1024 * 3)), repeat('膨', 1024)), '膨', 'p'))), 0)
+_col0
 -308607422
 
 -- query 3
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(concat('a', repeat('b', ((1024 * 1024) - 1) - 2)), 'a', '膨'))), 0)
+_col0
 777398045
 
 -- query 7
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), from_str, to_str))), 0)
+_col0
 1624733713
 
 -- query 10
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(concat(repeat('a', (1024 * 1024) - (1024 * 3)), repeat('膨', 1024)), from_str, to_str))), 0)
+_col0
 -308607422
 
 -- query 13
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(concat('a', repeat('b', ((1024 * 1024) - 1) - 2)), from_str, to_str))), 0)
+_col0
 777398045
 
 -- query 16
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), from_str, to_str))), 0)
+_col0
 0
 
 -- query 18
 -- types	varchar
-translate('a|b|c', 'ab', '123')
+_col0
 1|2|c
 
 -- query 19
 -- types	varchar
-translate('a|b|c', 'abc', '12')
+_col0
 1|2|
 
 -- query 20
 -- types	varchar
-translate('C|S', 'CS', '测试')
+_col0
 测|试
 
 -- query 21
 -- types	varchar
-translate('测|试', '测试', 'CS')
+_col0
 C|S
 
 -- query 22
 -- types	varchar
-translate('测|试', '测试', 'C')
+_col0
 C|
 
 -- query 25
 -- types	varchar
-translate(src, from_str, to_str)
+_col0
 测|试
 1|2|c
 1|2|
@@ -69,902 +69,902 @@ C|
 
 -- query 33
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, to_str))), 0)
+_col0
 -86245165969
 
 -- query 34
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ab', '123'))), 0)
+_col0
 86181275310
 
 -- query 35
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'abc', '12'))), 0)
+_col0
 39300678040
 
 -- query 36
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'CS', '测试'))), 0)
+_col0
 291352620470
 
 -- query 37
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '测试', 'CS'))), 0)
+_col0
 -473683291648
 
 -- query 38
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '测试', 'C'))), 0)
+_col0
 -261631635524
 
 -- query 40
 -- types	varchar
-translate('abc', 'ab', '')
+_col0
 c
 
 -- query 41
 -- types	varchar
-translate('abc', '', 'ab')
+_col0
 abc
 
 -- query 49
 -- types	varchar
-translate('abc', 'ab', NULL)
+_col0
 NULL
 
 -- query 50
 -- types	varchar
-translate('abc', NULL, 'ab')
+_col0
 NULL
 
 -- query 51
 -- types	varchar
-translate(NULL, 'CS', '测试')
+_col0
 NULL
 
 -- query 54
 -- types	varchar
-translate(src, from_str, to_str)
+_col0
 NULL
 NULL
 NULL
 
 -- query 63
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, to_str))), 0)
+_col0
 -9273119353
 
 -- query 64
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', to_str))), 0)
+_col0
 -22759771935
 
 -- query 65
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', NULL))), 0)
+_col0
 0
 
 -- query 66
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', '1d44cdQjCX'))), 0)
+_col0
 -15403808815
 
 -- query 67
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', 'hdA4ZE'))), 0)
+_col0
 -24092076350
 
 -- query 68
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', '4AlJzF'))), 0)
+_col0
 -1691897153
 
 -- query 69
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', to_str))), 0)
+_col0
 -6047668112
 
 -- query 70
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', NULL))), 0)
+_col0
 0
 
 -- query 71
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', '1d44cdQjCX'))), 0)
+_col0
 -14679810324
 
 -- query 72
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', to_str))), 0)
+_col0
 6117043467
 
 -- query 73
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', '1d44cdQjCX'))), 0)
+_col0
 -15175674670
 
 -- query 74
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', 'hdA4ZE'))), 0)
+_col0
 1122895566
 
 -- query 75
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', to_str))), 0)
+_col0
 -9201369252
 
 -- query 76
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', NULL))), 0)
+_col0
 0
 
 -- query 77
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', '4AlJzF'))), 0)
+_col0
 32149779
 
 -- query 78
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, '1d44cdQjCX'))), 0)
+_col0
 8038977823
 
 -- query 79
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, NULL, '1d44cdQjCX'))), 0)
+_col0
 0
 
 -- query 80
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, 'hdA4ZE'))), 0)
+_col0
 -3519052013
 
 -- query 81
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, NULL, 'hdA4ZE'))), 0)
+_col0
 0
 
 -- query 82
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, NULL))), 0)
+_col0
 0
 
 -- query 83
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, NULL, NULL))), 0)
+_col0
 0
 
 -- query 84
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, from_str, '4AlJzF'))), 0)
+_col0
 3752409022
 
 -- query 85
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, NULL, '4AlJzF'))), 0)
+_col0
 0
 
 -- query 86
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('4*一测1-F六g五八G八😇I测iJ😂id3-b二j(试&九e^二h&H二cæB%AæB]g0六[', from_str, to_str))), 0)
+_col0
 -20138841983
 
 -- query 87
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('æ˜三3h(DIä1j七F试a四G1I›43e›🙂GA二˜##ac五HjD😄jä', from_str, to_str))), 0)
+_col0
 10595944852
 
 -- query 88
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('[˜一Gi', from_str, to_str))), 0)
+_col0
 70372815234
 
 -- query 89
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('e四i)1😄eJD^*C2ù-Fj]测七', from_str, to_str))), 0)
+_col0
 11079547357
 
 -- query 90
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('^😂2æ六d]iBdcc五4?a(😂B1七八1[DC三四])(E0æIæ八一', from_str, to_str))), 0)
+_col0
 -3203593422
 
 -- query 91
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('', from_str, to_str))), 0)
+_col0
 -87849464430
 
 -- query 92
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(NULL, from_str, to_str))), 0)
+_col0
 0
 
 -- query 93
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('›gH六🙂九›-一B#二EC(', from_str, to_str))), 0)
+_col0
 -30345492435
 
 -- query 94
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('f^ä?]GhB三˜&Hb]A😂七七æ六?', from_str, to_str))), 0)
+_col0
 28728196157
 
 -- query 95
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('J😇D]&4', from_str, to_str))), 0)
+_col0
 -78344961444
 
 -- query 96
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('试ù^d二八0', from_str, to_str))), 0)
+_col0
 -119311709439
 
 -- query 97
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('四1h', from_str, to_str))), 0)
+_col0
 91564110027
 
 -- query 98
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('0', from_str, to_str))), 0)
+_col0
 -116630637114
 
 -- query 99
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate('七', from_str, to_str))), 0)
+_col0
 -88010173341
 
 -- query 100
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(']一', from_str, to_str))), 0)
+_col0
 -58659638217
 
 -- query 101
 -- types	varchar
-translate('f›˜IGi?hB?😄二E[-E$›)😂›f)0六2e)八2d测Ih四]四c九DFa^', ')0f)›Z', 'ldbcEEDFIG')
+_col0
 bE˜IGi?hB?😄二E[-E$El😂Ebld六2el八2d测Ih四]四c九DFa^
 
 -- query 102
 -- types	varchar
-translate('3bh$^)g(G八?八-cd4一I3D三cFe二#AICâ😄cB#五ää', '在4A7三g', 'tbDbkc')
+_col0
 3bh$^)c(G八?八-cdb一I3DkcFe二#DICâ😄cB#五ää
 
 -- query 103
 -- types	varchar
-translate('七ca&+âDù三˜六九#ûc+%六h$›B测æ四🙂七â*1*', NULL, 'a1B1DhDhgDc')
+_col0
 NULL
 
 -- query 104
 -- types	varchar
-translate('hC😇😇3?', 'hCCChh5C3DH3y', '3ChC03Chl3h3')
+_col0
 3C😇😇l?
 
 -- query 105
 -- types	varchar
-translate('试&4😂', 'T4😂😂&试t&&试4', '4&&试ä&试xHZ&K4')
+_col0
 &ä&&
 
 -- query 106
 -- types	varchar
-translate('-二c%🙂G九c%^#C-^h四›九0三', 'b›不%G试0九cd二cc', '3GCChhc')
+_col0
 -C🙂hC^#C-^h四Gc三
 
 -- query 107
 -- types	varchar
-translate('九Bb-jâC2三Eû🙂F*)0😄æEbjû四八九😂d*â˜D1ceJ🙂›八+-32ùG˜试4', 'bbbF1DI', NULL)
+_col0
 NULL
 
 -- query 108
 -- types	varchar
-translate('?h*I3hD›j测八â]fG1🙂GBB4试dijæ0gg1😄F🙂â四三&e*[九', NULL, '›âx3&B')
+_col0
 NULL
 
 -- query 109
 -- types	varchar
-translate('æ˜😂😂gD›E测JE一˜3😄i四五äF3^ùHâ)九geHF😄˜1h五&I#a', 'MFivH3', 'ggFUEEa3')
+_col0
 æ˜😂😂gD›E测JE一˜E😄F四五ägE^ùEâ)九geEg😄˜1h五&I#a
 
 -- query 110
 -- types	varchar
-translate(')AI😂#æ?Fûg2äDû试九', 'gggwA2uVFUd3D', 'Y4RFIx2I')
+_col0
 )II😂#æ?ûYxäû试九
 
 -- query 111
 -- types	varchar
-translate(NULL, 'USYiLqixr', '7iext05GARPW4A')
+_col0
 NULL
 
 -- query 112
 -- types	varchar
-translate('ie4eC[g-2九*I😄八jfI😄八)a九âäE🙂4?1一æ六😄4🙂ù四3九3j一?', 'Jg😍9😂😍I一?😄ùC', '3Najg2ei44I')
+_col0
 ie4e[N-2九*e4八jfe4八)a九âäE🙂441iæ六44🙂I四3九3ji4
 
 -- query 113
 -- types	varchar
-translate('E2#›&I+%', 'I2EIE2C2222II', '试I😄%›E+EI😍测&')
+_col0
 😄I#›&试+%
 
 -- query 114
 -- types	varchar
-translate('(Fd$bFfäF五九二Ij', 'FFNj九bd试jf九ä', NULL)
+_col0
 NULL
 
 -- query 115
 -- types	varchar
-translate(']3😇😂二五I+IGa##E八Hæah', '二五#Ea]', 'caIhVya3HIIfGJ')
+_col0
 y3😇😂caI+IGVIIh八HæVh
 
 -- query 116
 -- types	varchar
-translate('六eJH五C九^', 'eAYeeCJH', '^五e九九C')
+_col0
 六^五C九^
 
 -- query 117
 -- types	varchar
-translate('六😄1C›+eJ二%â七😂H[]›aHù一', 'HoaAmFe1JN', NULL)
+_col0
 NULL
 
 -- query 118
 -- types	varchar
-translate(NULL, 'bCb0r0NTh', 'DJBQcsGL99EDOU')
+_col0
 NULL
 
 -- query 119
 -- types	varchar
-translate('😄4jCdha九?😇3H]Fef4试八hgF五五J三c)🙂七2%hF🙂a-If😂a›[#j˜J', '4cxIhufm3hn', '5GxFgChdkHdIa')
+_col0
 😄5jCdga九?😇kH]Feh5试八ggF五五J三G)🙂七2%gF🙂a-Fh😂a›[#j˜J
 
 -- query 120
 -- types	varchar
-translate('h', 'hhzhhhhhChFh', 'hhhh8hhh')
+_col0
 h
 
 -- query 121
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜â测😄a试'))), 0)
+_col0
 -18777612328
 
 -- query 122
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜试'))), 0)
+_col0
 -24312133682
 
 -- query 123
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜âa试'))), 0)
+_col0
 -17664875903
 
 -- query 124
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜a'))), 0)
+_col0
 -7748478770
 
 -- query 125
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', 'â测😄a'))), 0)
+_col0
 -5671249146
 
 -- query 126
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', 'â测试'))), 0)
+_col0
 -21220295577
 
 -- query 127
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '测😄a试'))), 0)
+_col0
 -18656381789
 
 -- query 128
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '测😄'))), 0)
+_col0
 -20066567366
 
 -- query 129
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜😄试'))), 0)
+_col0
 -10705596896
 
 -- query 130
 -- types	bigint
-ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜测😄'))), 0)
+_col0
 -6254708075
 
 -- query 131
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '测')
+_col0
 ˜›测ä试😂ab
 
 -- query 132
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', 'b')
+_col0
 ˜›bä试😂ab
 
 -- query 133
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', 'b测')
+_col0
 ˜›bä测试😂ab
 
 -- query 134
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '😂')
+_col0
 ˜›😂ä试😂ab
 
 -- query 135
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '😂测')
+_col0
 ˜›😂ä测试😂ab
 
 -- query 136
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '😂b')
+_col0
 ˜›😂äb试😂ab
 
 -- query 137
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '😂b测')
+_col0
 ˜›😂äb试测😂ab
 
 -- query 138
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '试')
+_col0
 ˜›试ä试😂ab
 
 -- query 139
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '试测')
+_col0
 ˜›试ä测试😂ab
 
 -- query 140
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测😄', '试b')
+_col0
 ˜›试äb试😂ab
 
 -- query 141
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '测')
+_col0
 ˜›âä测😄😂ab
 
 -- query 142
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', 'b')
+_col0
 ˜›âäb😄😂ab
 
 -- query 143
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', 'b测')
+_col0
 ˜›âäb测😄😂ab
 
 -- query 144
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '😂')
+_col0
 ˜›âä😂😄😂ab
 
 -- query 145
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '😂测')
+_col0
 ˜›âä😂测😄😂ab
 
 -- query 146
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '😂b')
+_col0
 ˜›âä😂b😄😂ab
 
 -- query 147
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '😂b测')
+_col0
 ˜›âä😂b😄😂ab
 
 -- query 148
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '试')
+_col0
 ˜›âä试😄😂ab
 
 -- query 149
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '试测')
+_col0
 ˜›âä试测😄😂ab
 
 -- query 150
 -- types	varchar
-translate('˜›âä测试😄😂ab', '测试', '试b')
+_col0
 ˜›âä试b😄😂ab
 
 -- query 151
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '测')
+_col0
 测›ä测试😂ab
 
 -- query 152
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', 'b')
+_col0
 b›ä测试😂ab
 
 -- query 153
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', 'b测')
+_col0
 b›测ä测试😂ab
 
 -- query 154
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '😂')
+_col0
 😂›ä测试😂ab
 
 -- query 155
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '😂测')
+_col0
 😂›测ä测试😂ab
 
 -- query 156
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '😂b')
+_col0
 😂›bä测试😂ab
 
 -- query 157
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '😂b测')
+_col0
 😂›bä测试测😂ab
 
 -- query 158
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '试')
+_col0
 试›ä测试😂ab
 
 -- query 159
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '试测')
+_col0
 试›测ä测试😂ab
 
 -- query 160
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â😄', '试b')
+_col0
 试›bä测试😂ab
 
 -- query 161
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '测')
+_col0
 ˜›测ä测😄😂b
 
 -- query 162
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', 'b')
+_col0
 ˜›bä测😄😂b
 
 -- query 163
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', 'b测')
+_col0
 ˜›bä测😄😂测b
 
 -- query 164
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '😂')
+_col0
 ˜›😂ä测😄😂b
 
 -- query 165
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '😂测')
+_col0
 ˜›😂ä测😄😂测b
 
 -- query 166
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '😂b')
+_col0
 ˜›😂ä测😄😂bb
 
 -- query 167
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '😂b测')
+_col0
 ˜›😂ä测测😄😂bb
 
 -- query 168
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '试')
+_col0
 ˜›试ä测😄😂b
 
 -- query 169
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '试测')
+_col0
 ˜›试ä测😄😂测b
 
 -- query 170
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'âa试', '试b')
+_col0
 ˜›试ä测😄😂bb
 
 -- query 171
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '测')
+_col0
 测›âä测😄😂ab
 
 -- query 172
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', 'b')
+_col0
 b›âä测😄😂ab
 
 -- query 173
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', 'b测')
+_col0
 b›âä测测😄😂ab
 
 -- query 174
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '😂')
+_col0
 😂›âä测😄😂ab
 
 -- query 175
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '😂测')
+_col0
 😂›âä测测😄😂ab
 
 -- query 176
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '😂b')
+_col0
 😂›âä测b😄😂ab
 
 -- query 177
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '😂b测')
+_col0
 😂›âä测b😄😂ab
 
 -- query 178
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '试')
+_col0
 试›âä测😄😂ab
 
 -- query 179
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '试测')
+_col0
 试›âä测测😄😂ab
 
 -- query 180
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜试', '试b')
+_col0
 试›âä测b😄😂ab
 
 -- query 181
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '测')
+_col0
 测›ä试😄😂ab
 
 -- query 182
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', 'b')
+_col0
 b›ä试😄😂ab
 
 -- query 183
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', 'b测')
+_col0
 b›测ä试😄😂ab
 
 -- query 184
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '😂')
+_col0
 😂›ä试😄😂ab
 
 -- query 185
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '😂测')
+_col0
 😂›测ä试😄😂ab
 
 -- query 186
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '😂b')
+_col0
 😂›bä试😄😂ab
 
 -- query 187
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '😂b测')
+_col0
 😂›bä测试😄😂ab
 
 -- query 188
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '试')
+_col0
 试›ä试😄😂ab
 
 -- query 189
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '试测')
+_col0
 试›测ä试😄😂ab
 
 -- query 190
 -- types	varchar
-translate('˜›âä测试😄😂ab', '˜â测', '试b')
+_col0
 试›bä试😄😂ab
 
 -- query 191
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '测')
+_col0
 ˜›测ä测试😄😂ab
 
 -- query 192
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', 'b')
+_col0
 ˜›bä测试😄😂ab
 
 -- query 193
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', 'b测')
+_col0
 ˜›bä测试😄😂ab
 
 -- query 194
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '😂')
+_col0
 ˜›😂ä测试😄😂ab
 
 -- query 195
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '😂测')
+_col0
 ˜›😂ä测试😄😂ab
 
 -- query 196
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '😂b')
+_col0
 ˜›😂ä测试😄😂ab
 
 -- query 197
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '😂b测')
+_col0
 ˜›😂ä测试😄😂ab
 
 -- query 198
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '试')
+_col0
 ˜›试ä测试😄😂ab
 
 -- query 199
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '试测')
+_col0
 ˜›试ä测试😄😂ab
 
 -- query 200
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â', '试b')
+_col0
 ˜›试ä测试😄😂ab
 
 -- query 201
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '测')
+_col0
 ˜›测ä😄😂b
 
 -- query 202
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', 'b')
+_col0
 ˜›bä😄😂b
 
 -- query 203
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', 'b测')
+_col0
 ˜›bä测😄😂b
 
 -- query 204
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '😂')
+_col0
 ˜›😂ä😄😂b
 
 -- query 205
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '😂测')
+_col0
 ˜›😂ä测😄😂b
 
 -- query 206
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '😂b')
+_col0
 ˜›😂äb😄😂b
 
 -- query 207
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '😂b测')
+_col0
 ˜›😂äb😄😂测b
 
 -- query 208
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '试')
+_col0
 ˜›试ä😄😂b
 
 -- query 209
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '试测')
+_col0
 ˜›试ä测😄😂b
 
 -- query 210
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'â测a试', '试b')
+_col0
 ˜›试äb😄😂b
 
 -- query 211
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '测')
+_col0
 ˜›âä测测😂b
 
 -- query 212
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', 'b')
+_col0
 ˜›âä测b😂b
 
 -- query 213
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', 'b测')
+_col0
 ˜›âä测b😂测b
 
 -- query 214
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '😂')
+_col0
 ˜›âä测😂😂b
 
 -- query 215
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '😂测')
+_col0
 ˜›âä测😂😂测b
 
 -- query 216
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '😂b')
+_col0
 ˜›âä测😂😂bb
 
 -- query 217
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '😂b测')
+_col0
 ˜›âä测测😂😂bb
 
 -- query 218
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '试')
+_col0
 ˜›âä测试😂b
 
 -- query 219
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '试测')
+_col0
 ˜›âä测试😂测b
 
 -- query 220
 -- types	varchar
-translate('˜›âä测试😄😂ab', '😄a试', '试b')
+_col0
 ˜›âä测试😂bb
 
 -- query 221
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '测')
+_col0
 ˜›âä测试😄😂测b
 
 -- query 222
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', 'b')
+_col0
 ˜›âä测试😄😂bb
 
 -- query 223
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', 'b测')
+_col0
 ˜›âä测试😄😂bb
 
 -- query 224
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '😂')
+_col0
 ˜›âä测试😄😂😂b
 
 -- query 225
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '😂测')
+_col0
 ˜›âä测试😄😂😂b
 
 -- query 226
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '😂b')
+_col0
 ˜›âä测试😄😂😂b
 
 -- query 227
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '😂b测')
+_col0
 ˜›âä测试😄😂😂b
 
 -- query 228
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '试')
+_col0
 ˜›âä测试😄😂试b
 
 -- query 229
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '试测')
+_col0
 ˜›âä测试😄😂试b
 
 -- query 230
 -- types	varchar
-translate('˜›âä测试😄😂ab', 'a', '试b')
+_col0
 ˜›âä测试😄😂试b

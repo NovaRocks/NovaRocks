@@ -1,106 +1,106 @@
 -- query 12
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 14
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 15
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 16
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 17
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 18
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 19
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 20
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 21
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 22
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 23
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 24
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 25
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 26
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 27
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 29
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 30
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 31
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 32
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 39
 -- types	integer	bigint	integer
-max(c3)	sc3	c0
+_col0	sc3	c0
 8	9000	0
 8	9000	1
 8	9000	2
@@ -108,7 +108,7 @@ max(c3)	sc3	c0
 
 -- query 40
 -- types	integer	bigint	integer
-max(c3)	sc3	c1
+_col0	sc3	c1
 NULL	NULL	NULL
 0	0	0
 1	1000	1
@@ -122,7 +122,7 @@ NULL	NULL	NULL
 
 -- query 42
 -- types	integer	bigint	integer
-max(c3)	sc3	c0
+_col0	sc3	c0
 8	9000	0
 8	9000	1
 8	9000	2
@@ -130,7 +130,7 @@ max(c3)	sc3	c0
 
 -- query 43
 -- types	integer	bigint	integer
-max(c3)	sc3	c1
+_col0	sc3	c1
 NULL	NULL	NULL
 0	0	0
 1	1000	1
@@ -144,7 +144,7 @@ NULL	NULL	NULL
 
 -- query 44
 -- types	integer	bigint	varchar
-max(c3)	sc3	c2
+_col0	sc3	c2
 NULL	NULL	NULL
 0	0	0
 1	1000	1
@@ -158,37 +158,37 @@ NULL	NULL	NULL
 
 -- query 48
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 49
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 50
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 52
 -- types	bigint
-sum(c3)
+_col0
 
 -- query 53
 -- types	bigint
-sum(c3)
+_col0
 
 -- query 54
 -- types	bigint
-sum(c3)
+_col0
 
 -- query 57
 -- legacy
-count(*)
+_col0
 10
 
 -- query 58
 -- legacy
-count(*)
+_col0
 10

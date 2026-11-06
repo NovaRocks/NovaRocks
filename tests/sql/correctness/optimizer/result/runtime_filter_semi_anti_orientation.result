@@ -1,9 +1,9 @@
 -- query 9
 -- types	bigint
-count(*)
+_col0
 3
 
 -- query 10
 -- types	bigint
-count(*)
+_col0
 99997

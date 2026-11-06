@@ -1,99 +1,99 @@
 -- query 2
 -- types	bigint
-count(*)
+_col0
 20
 
 -- query 3
 -- types	bigint
-count(*)
+_col0
 13
 
 -- query 4
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 5
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 6
 -- types	bigint
-count(*)
+_col0
 2
 
 -- query 7
 -- types	bigint
-count(*)
+_col0
 13
 
 -- query 8
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 9
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 10
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 11
 -- types	bigint
-count(*)
+_col0
 2
 
 -- query 12
 -- types	bigint
-count(*)
+_col0
 1
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 2
 
 -- query 14
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 15
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 16
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 17
 -- types	bigint
-count(*)
+_col0
 10
 
 -- query 18
 -- types	bigint
-count(*)
+_col0
 10000
 
 -- query 19
 -- types	bigint
-count(*)
+_col0
 1000
 
 -- query 21
 -- legacy
-count(*)
+_col0
 7
 
 -- query 24
 -- legacy
-count(*)
+_col0
 7

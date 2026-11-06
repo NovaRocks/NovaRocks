@@ -1,14 +1,14 @@
 -- query 10
 -- types	bigint
-sum(l_ext)
+_col0
 750
 
 -- query 11
 -- types	bigint
-sum(l_ext)
+_col0
 750
 
 -- query 13
 -- types	bigint
-sum(l_ext)
+_col0
 750

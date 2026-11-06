@@ -1,6 +1,6 @@
 -- query 3
 -- legacy
-sum(c1)	sum(unnest)
+_col0	_col1
 36904	75405543
 
 -- query 4

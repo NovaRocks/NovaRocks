@@ -1,119 +1,119 @@
 -- query 9
 -- types	integer
-percentile_cont(score, 0)
+_col0
 90
 
 -- query 10
 -- types	integer
-percentile_cont(score, 0.25)
+_col0
 91
 
 -- query 11
 -- types	integer
-percentile_cont(score, 0.5)
+_col0
 92
 
 -- query 12
 -- types	integer
-percentile_cont(score, 0.75)
+_col0
 93
 
 -- query 13
 -- types	integer
-percentile_cont(score, 1)
+_col0
 94
 
 -- query 14
 -- types	date
-percentile_cont(date, 0)
+_col0
 2018-01-01
 
 -- query 15
 -- types	date
-percentile_cont(date, 0.25)
+_col0
 2019-01-01
 
 -- query 16
 -- types	date
-percentile_cont(date, 0.5)
+_col0
 2020-01-01
 
 -- query 17
 -- types	date
-percentile_cont(date, 0.75)
+_col0
 2021-01-01
 
 -- query 18
 -- types	date
-percentile_cont(date, 1)
+_col0
 2022-01-01
 
 -- query 19
 -- types	timestamp(6)
-percentile_cont(datetime, 0)
+_col0
 2018-01-01 00:00:01.000000
 
 -- query 20
 -- types	timestamp(6)
-percentile_cont(datetime, 0.25)
+_col0
 2019-01-01 00:00:01.000000
 
 -- query 21
 -- types	timestamp(6)
-percentile_cont(datetime, 0.5)
+_col0
 2020-01-01 00:00:01.000000
 
 -- query 22
 -- types	timestamp(6)
-percentile_cont(datetime, 0.75)
+_col0
 2021-01-01 00:00:01.000000
 
 -- query 23
 -- types	timestamp(6)
-percentile_cont(datetime, 1)
+_col0
 2022-01-01 00:00:01.000000
 
 -- query 24
 -- types	double
-percentile_cont(db, 0)
+_col0
 11.1
 
 -- query 25
 -- types	double
-percentile_cont(db, 0.25)
+_col0
 11.2
 
 -- query 26
 -- types	double
-percentile_cont(db, 0.5)
+_col0
 11.3
 
 -- query 27
 -- types	double
-percentile_cont(db, 0.75)
+_col0
 11.4
 
 -- query 28
 -- types	double
-percentile_cont(db, 1)
+_col0
 11.5
 
 -- query 31
 -- types	double
-percentile_cont(db, CAST(1.0 AS double))
+_col0
 11.5
 
 -- query 32
 -- types	double
-percentile_cont(db, CAST(0.5 AS double))
+_col0
 11.3
 
 -- query 34
 -- types	bigint
-percentile_cont(1, CAST(1.0 AS double))
+_col0
 1
 
 -- query 35
 -- types	bigint
-percentile_cont(1, CAST(0.5 AS double))
+_col0
 1

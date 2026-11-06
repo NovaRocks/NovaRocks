@@ -1,11 +1,11 @@
 -- query 5
 -- types	bigint
-ndv(c1)
+_col0
 1005
 
 -- query 6
 -- types	integer	bigint
-c2	ndv(c1)
+c2	_col1
 1	1
 2	1
 3	1
@@ -19,12 +19,12 @@ c2	ndv(c1)
 
 -- query 7
 -- types	bigint
-approx_count_distinct(c1)
+_col0
 1005
 
 -- query 8
 -- types	integer	bigint
-c2	approx_count_distinct(c1)
+c2	_col1
 1	1
 2	1
 3	1
@@ -38,12 +38,12 @@ c2	approx_count_distinct(c1)
 
 -- query 9
 -- types	bigint
-ds_hll_count_distinct(c1)
+_col0
 1000
 
 -- query 10
 -- types	integer	bigint
-c2	ds_hll_count_distinct(c1)
+c2	_col1
 1	1
 2	1
 3	1
@@ -57,12 +57,12 @@ c2	ds_hll_count_distinct(c1)
 
 -- query 15
 -- types	bigint
-hll_union_agg(hll_hash(c1))
+_col0
 1001
 
 -- query 16
 -- types	integer	bigint
-c2	hll_union_agg(hll_hash(c1))
+c2	_col1
 1	1
 2	1
 3	1

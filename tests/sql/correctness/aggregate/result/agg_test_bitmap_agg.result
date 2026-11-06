@@ -1,66 +1,66 @@
 -- query 4
 -- types	varchar
-bitmap_to_string(bitmap_agg(c2))
+_col0
 0,1
 
 -- query 5
 -- types	varchar
-bitmap_to_string(bitmap_agg(c3))
+_col0
 11,22,33
 
 -- query 6
 -- types	varchar
-bitmap_to_string(bitmap_agg(c4))
+_col0
 111,222,333
 
 -- query 7
 -- types	varchar
-bitmap_to_string(bitmap_agg(c5))
+_col0
 1111,2222,3333
 
 -- query 9
 -- types	varchar
-bitmap_to_string(bitmap_agg(c7))
+_col0
 111111,222222,333333
 
 -- query 10
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c2)))
+_col0
 0,1
 
 -- query 11
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c3)))
+_col0
 11,22,33
 
 -- query 12
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c4)))
+_col0
 111,222,333
 
 -- query 13
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c5)))
+_col0
 1111,2222,3333
 
 -- query 25
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c2)))
+_col0
 0,1
 
 -- query 26
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c3)))
+_col0
 11,22,33
 
 -- query 27
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c4)))
+_col0
 111,222,333
 
 -- query 28
 -- legacy
-c1	bitmap_to_string(bitmap_union(to_bitmap(c2)))	bitmap_to_string(bitmap_union(to_bitmap(c3)))	bitmap_to_string(bitmap_agg(c4))
+c1	_col1	_col2	_col3
 1	1	11	111
 2	0	22	222
 3	1	33	333
@@ -70,7 +70,7 @@ c1	bitmap_to_string(bitmap_union(to_bitmap(c2)))	bitmap_to_string(bitmap_union(t
 
 -- query 29
 -- legacy
-c1	count(DISTINCT c2)	bitmap_union(to_bitmap(c3))	bitmap_agg(c4)
+c1	_col1	_col2	_col3
 1	1	NULL	NULL
 2	1	NULL	NULL
 3	1	NULL	NULL
@@ -80,7 +80,7 @@ c1	count(DISTINCT c2)	bitmap_union(to_bitmap(c3))	bitmap_agg(c4)
 
 -- query 30
 -- legacy
-c1	bitmap_union_count(to_bitmap(c4))	bitmap_to_string(bitmap_agg(c4))
+c1	_col1	_col2
 1	1	111
 2	1	222
 3	1	333
@@ -90,7 +90,7 @@ c1	bitmap_union_count(to_bitmap(c4))	bitmap_to_string(bitmap_agg(c4))
 
 -- query 31
 -- types	integer	bigint	bigint	bigint
-c1	multi_distinct_count(c2)	multi_distinct_count(c3)	multi_distinct_count(c4)
+c1	_col1	_col2	_col3
 1	1	1	1
 2	1	1	1
 3	1	1	1
@@ -100,7 +100,7 @@ c1	multi_distinct_count(c2)	multi_distinct_count(c3)	multi_distinct_count(c4)
 
 -- query 32
 -- types	integer	bigint	bigint	bigint
-c1	count(DISTINCT c2)	count(DISTINCT c3)	count(DISTINCT c4)
+c1	_col1	_col2	_col3
 1	1	1	1
 2	1	1	1
 3	1	1	1
@@ -110,22 +110,22 @@ c1	count(DISTINCT c2)	count(DISTINCT c3)	count(DISTINCT c4)
 
 -- query 43
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c2)))
+_col0
 0,1
 
 -- query 44
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c3)))
+_col0
 11,22,33
 
 -- query 45
 -- legacy
-bitmap_to_string(bitmap_union(to_bitmap(c4)))
+_col0
 111,222,333
 
 -- query 46
 -- legacy
-ifnull(nullif(bitmap_to_string(bitmap_union(to_bitmap(c2))), ''), 'NULL')	ifnull(nullif(bitmap_to_string(bitmap_union(to_bitmap(c3))), ''), 'NULL')	ifnull(nullif(bitmap_to_string(bitmap_agg(c4)), ''), 'NULL')
+_col0	_col1	_col2
 1	11	111
 0	22	222
 1	33	333
@@ -135,7 +135,7 @@ NULL	NULL	NULL
 
 -- query 47
 -- legacy
-c1	count(DISTINCT c2)	bitmap_union(to_bitmap(c3))	bitmap_agg(c4)
+c1	_col1	_col2	_col3
 1	1	NULL	NULL
 2	1	NULL	NULL
 3	1	NULL	NULL
@@ -145,7 +145,7 @@ c1	count(DISTINCT c2)	bitmap_union(to_bitmap(c3))	bitmap_agg(c4)
 
 -- query 48
 -- legacy
-c1	bitmap_union_count(to_bitmap(c4))	bitmap_to_string(bitmap_agg(c4))
+c1	_col1	_col2
 1	1	111
 2	1	222
 3	1	333

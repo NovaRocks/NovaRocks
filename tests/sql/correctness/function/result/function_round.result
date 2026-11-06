@@ -1,39 +1,39 @@
 -- query 3
 -- types	boolean
-(round(id_double)) <=> (round(NULL))
+_col0
 true
 
 -- query 4
 -- types	boolean
-(dround(id_double)) <=> (dround(NULL))
+_col0
 true
 
 -- query 5
 -- types	boolean
-(round(id_double, id_int)) <=> (round(NULL, NULL))
+_col0
 true
 
 -- query 6
 -- types	boolean
-(round(id_double, id_int)) <=> (round(id_double, NULL))
+_col0
 true
 
 -- query 7
 -- types	boolean
-(round(id_double, id_int)) <=> (round(NULL, id_int))
+_col0
 true
 
 -- query 8
 -- types	boolean
-(dround(id_double, id_int)) <=> (dround(NULL, NULL))
+_col0
 true
 
 -- query 9
 -- types	boolean
-(dround(id_double, id_int)) <=> (dround(id_double, NULL))
+_col0
 true
 
 -- query 10
 -- types	boolean
-(dround(id_double, id_int)) <=> (dround(NULL, id_int))
+_col0
 true

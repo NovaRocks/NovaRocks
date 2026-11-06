@@ -1,20 +1,20 @@
 -- query 1
--- types	array(tinyint)
+-- types	array(integer)
 value
 [30,null,40,10]
 
 -- query 2
--- types	array(tinyint)
+-- types	array(integer)
 value
 [30,10,20]
 
 -- query 3
--- types	array(tinyint)
+-- types	array(integer)
 value
 [8,7,9]
 
 -- query 4
--- types	array(tinyint)
+-- types	array(integer)
 value
 [30,10,40,20]
 
@@ -29,7 +29,7 @@ value
 []
 
 -- query 7
--- types	array(tinyint)
+-- types	array(integer)
 value
 [8,7,null]
 

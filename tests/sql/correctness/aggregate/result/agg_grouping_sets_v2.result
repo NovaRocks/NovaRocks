@@ -51,7 +51,7 @@ NULL	2020-10-23 12:12:12.000000	12
 2020-10-26	NULL	NULL
 
 -- query 9
--- types	date	bigint	bigint	bigint
+-- types	date	bigint	integer	bigint
 k1	f1	f2	v1
 NULL	1	1	12
 2020-10-22	0	0	3
@@ -61,7 +61,7 @@ NULL	1	1	12
 2020-10-26	0	0	NULL
 
 -- query 10
--- types	date	timestamp(6)	bigint	bigint	bigint
+-- types	date	timestamp(6)	bigint	integer	bigint
 k1	k2	f1	f2	v1
 2020-10-22	2020-10-23 12:12:12.000000	0	0	3
 2020-10-23	2020-10-23 12:12:12.000000	0	0	3
@@ -71,7 +71,7 @@ k1	k2	f1	f2	v1
 NULL	NULL	3	3	12
 
 -- query 11
--- types	date	timestamp(6)	bigint	bigint	bigint
+-- types	date	timestamp(6)	bigint	integer	bigint
 k1	k2	f1	f2	v1
 2020-10-22	2020-10-23 12:12:12.000000	0	0	3
 2020-10-23	2020-10-23 12:12:12.000000	0	0	3
@@ -88,7 +88,7 @@ NULL	2020-10-23 12:12:12.000000	2	2	12
 NULL	NULL	3	3	12
 
 -- query 12
--- types	date	timestamp(6)	bigint	bigint	bigint
+-- types	date	timestamp(6)	bigint	integer	bigint
 k1	k2	f1	f2	v1
 2020-10-22	2020-10-23 12:12:12.000000	0	0	3
 2020-10-23	2020-10-23 12:12:12.000000	0	0	3
@@ -103,7 +103,7 @@ k1	k2	f1	f2	v1
 NULL	NULL	3	3	12
 
 -- query 13
--- types	bigint	date	bigint	timestamp(6)	bigint
+-- types	bigint	date	integer	timestamp(6)	integer
 v1	k1	f_k1	k2	f_k2
 1	NULL	1	NULL	1
 1	2020-10-22	0	NULL	1
@@ -117,7 +117,7 @@ v1	k1	f_k1	k2	f_k2
 0	2020-10-26	0	NULL	1
 
 -- query 14
--- types	bigint	bigint	bigint	date	bigint	timestamp(6)	bigint
+-- types	bigint	bigint	bigint	date	integer	timestamp(6)	integer
 v1	v2	v3	k1	f_k1	k2	f_k2
 4	1	1	NULL	1	NULL	1
 1	1	1	2020-10-22	0	NULL	1
@@ -131,7 +131,7 @@ v1	v2	v3	k1	f_k1	k2	f_k2
 0	0	0	2020-10-26	0	NULL	1
 
 -- query 15
--- types	bigint	bigint	bigint	date	bigint	timestamp(6)	bigint
+-- types	bigint	bigint	bigint	date	integer	timestamp(6)	integer
 v1	v2	v3	k1	f_k1	k2	f_k2
 4	1	1	NULL	1	NULL	1
 1	1	1	2020-10-22	0	NULL	1

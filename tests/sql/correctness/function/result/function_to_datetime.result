@@ -1,51 +1,51 @@
 -- query 3
 -- types	varchar
-@@time_zone
+_col0
 Asia/Shanghai
 
 -- query 4
 -- legacy
-to_datetime(1598306400, 0)
+_col0
 2020-08-25 06:00:00
 
 -- query 5
 -- legacy
-to_datetime(1598306400)
+_col0
 2020-08-25 06:00:00
 
 -- query 6
 -- legacy
-to_datetime(1598306400123, 3)
+_col0
 2020-08-25 06:00:00.123000
 
 -- query 7
 -- legacy
-to_datetime(1598306400123456, 6)
+_col0
 2020-08-25 06:00:00.123456
 
 -- query 8
 -- legacy
-to_datetime(0, 0)
+_col0
 1970-01-01 08:00:00
 
 -- query 9
 -- legacy
-to_datetime(253402243199, 0)
+_col0
 9999-12-31 15:59:59
 
 -- query 10
 -- legacy
-to_datetime(1598306400, 10)
+_col0
 NULL
 
 -- query 11
 -- legacy
-to_datetime(1598306400, NULL)
+_col0
 NULL
 
 -- query 12
 -- legacy
-to_datetime(NULL, NULL)
+_col0
 NULL
 
 -- query 13

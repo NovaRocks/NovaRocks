@@ -1,6 +1,6 @@
 -- query 6
 -- types	integer	bigint
-c0	sum(c1)
+c0	_col1
 1	1
 2	2
 3	3
@@ -9,7 +9,7 @@ c0	sum(c1)
 
 -- query 8
 -- types	integer	bigint
-c0	sum(c1)
+c0	_col1
 1	1
 2	2
 3	3
@@ -18,7 +18,7 @@ c0	sum(c1)
 
 -- query 12
 -- types	integer	bigint
-c0	sum(c1)
+c0	_col1
 1	4095
 2	4094
 3	4093

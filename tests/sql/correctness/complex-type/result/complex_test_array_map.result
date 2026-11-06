@@ -13,7 +13,7 @@ t1_id	t2_id	arr_largeint
 
 -- query 13
 -- legacy
-array_map(arg -> (bool_1 AND bool_2) AND bool_3, arr)	array_map(arg -> (bool_1 AND bool_3) AND bool_2, arr)
+_col0	_col1
 [1]	[1]
 [1]	[1]
 

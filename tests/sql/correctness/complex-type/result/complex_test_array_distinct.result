@@ -1,4 +1,4 @@
 -- query 6
 -- legacy
-array_length(array_distinct(c2))
+_col0
 100000

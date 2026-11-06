@@ -1,71 +1,71 @@
 -- query 5
 -- legacy
-map_size(map_agg(c1, c3))
+_col0
 5
 
 -- query 6
 -- legacy
-map_agg(c1, c3)[1]
+_col0
 11
 
 -- query 7
 -- legacy
-map_agg(c1, c3)[2]
+_col0
 22
 
 -- query 8
 -- legacy
-map_agg(c1, c3)[3]
+_col0
 33
 
 -- query 9
 -- legacy
-map_agg(c1, c3)[4]
+_col0
 11
 
 -- query 10
 -- types	tinyint
-map_agg(c1, c3)[5]
+_col0
 NULL
 
 -- query 11
 -- legacy
-map_size(map_agg(c5, c6))
+_col0
 4
 
 -- query 12
 -- legacy
-map_agg(c5, c6)[1111]
+_col0
 11111
 
 -- query 13
 -- legacy
-map_size(map_agg(c6, c10))
+_col0
 4
 
 -- query 14
 -- legacy
-map_agg(c6, c10)[11111]
+_col0
 2024-09-01 18:00:00
 
 -- query 15
 -- legacy
-map_agg(c6, c10)[22222]
+_col0
 2024-09-02 11:00:00
 
 -- query 16
 -- legacy
-map_size(map_agg(c8, c5))
+_col0
 4
 
 -- query 17
 -- legacy
-map_agg(c8, c5)[1.1]
+_col0
 1111
 
 -- query 18
 -- legacy
-map_agg(c8, c5)[4.4]
+_col0
 4444
 
 -- query 19
@@ -97,72 +97,72 @@ NULL	{}
 
 -- query 23
 -- legacy
-map_size(map_agg(c1, c3))
+_col0
 5
 
 -- query 24
 -- legacy
-map_agg(c1, c3)[1]
+_col0
 11
 
 -- query 25
 -- legacy
-map_agg(c1, c3)[2]
+_col0
 22
 
 -- query 26
 -- legacy
-map_agg(c1, c3)[3]
+_col0
 33
 
 -- query 27
 -- legacy
-map_agg(c1, c3)[4]
+_col0
 11
 
 -- query 28
 -- types	tinyint
-map_agg(c1, c3)[5]
+_col0
 NULL
 
 -- query 29
 -- legacy
-map_size(map_agg(c5, c6))
+_col0
 4
 
 -- query 30
 -- legacy
-map_agg(c5, c6)[1111]
+_col0
 11111
 
 -- query 31
 -- legacy
-map_size(map_agg(c6, c10))
+_col0
 4
 
 -- query 32
 -- legacy
-map_agg(c6, c10)[11111]
+_col0
 2024-09-01 18:00:00
 
 -- query 33
 -- legacy
-map_agg(c6, c10)[22222]
+_col0
 2024-09-02 11:00:00
 
 -- query 34
 -- legacy
-map_size(map_agg(c8, c5))
+_col0
 4
 
 -- query 35
 -- legacy
-map_agg(c8, c5)[1.1]
+_col0
 1111
 
 -- query 36
 -- legacy
-map_agg(c8, c5)[4.4]
+_col0
 4444
 
 -- query 37

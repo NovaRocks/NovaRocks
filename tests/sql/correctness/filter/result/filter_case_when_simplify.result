@@ -641,7 +641,7 @@ JAPAN	2022-01-01	23456	75	NULL
 USA	2022-01-03	54321	75	NULL
 
 -- query 43
--- types	integer	bigint	bigint	bigint
+-- types	integer	integer	integer	integer
 ship_mode	layer0	layer1	layer2
 75	0	0	1
 75	0	0	1

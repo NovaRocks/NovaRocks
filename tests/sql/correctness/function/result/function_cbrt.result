@@ -1,29 +1,29 @@
 -- query 1
 -- types	double
-cbrt(27)
+_col0
 3.0
 
 -- query 2
 -- types	double
-cbrt(0.0)
+_col0
 0.0
 
 -- query 3
 -- types	double
-cbrt(-27)
+_col0
 -3.0
 
 -- query 4
 -- types	double
-cbrt(3.1415)
+_col0
 1.4645774892350487
 
 -- query 5
 -- types	double
-cbrt(-3.1415)
+_col0
 -1.4645774892350487
 
 -- query 6
 -- types	double
-cbrt(NULL)
+_col0
 NULL

@@ -1,46 +1,46 @@
 -- query 2
 -- types	timestamp(6)
-to_datetime_ntz(1598306400, 0)
+_col0
 2020-08-24 22:00:00.000000
 
 -- query 3
 -- types	timestamp(6)
-to_datetime_ntz(1598306400)
+_col0
 2020-08-24 22:00:00.000000
 
 -- query 4
 -- types	timestamp(6)
-to_datetime_ntz(1598306400123, 3)
+_col0
 2020-08-24 22:00:00.123000
 
 -- query 5
 -- types	timestamp(6)
-to_datetime_ntz(1598306400123456, 6)
+_col0
 2020-08-24 22:00:00.123456
 
 -- query 6
 -- types	timestamp(6)
-to_datetime_ntz(0, 0)
+_col0
 1970-01-01 00:00:00.000000
 
 -- query 7
 -- types	timestamp(6)
-to_datetime_ntz(253402243199, 0)
+_col0
 9999-12-31 07:59:59.000000
 
 -- query 8
 -- types	timestamp(6)
-to_datetime_ntz(1598306400, 10)
+_col0
 NULL
 
 -- query 9
 -- types	timestamp(6)
-to_datetime_ntz(1598306400, NULL)
+_col0
 NULL
 
 -- query 10
 -- types	timestamp(6)
-to_datetime_ntz(NULL, NULL)
+_col0
 NULL
 
 -- query 11

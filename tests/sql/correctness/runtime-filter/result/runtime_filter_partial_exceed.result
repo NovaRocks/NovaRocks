@@ -1,14 +1,14 @@
 -- query 2
 -- types	bigint
-count(1)
+_col0
 9550
 
 -- query 3
 -- types	bigint
-count(1)
+_col0
 9550
 
 -- query 4
 -- types	bigint
-count(1)
+_col0
 9550

@@ -1,4 +1,4 @@
 -- query 1
--- types	bigint	bigint	bigint	double	bigint	bigint
+-- types	bigint	bigint	bigint	double	integer	integer
 c_all	c_not_null	s_v	avg_v	min_v	max_v
 0	0	NULL	NULL	NULL	NULL

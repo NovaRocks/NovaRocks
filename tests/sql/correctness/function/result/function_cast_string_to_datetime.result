@@ -1,339 +1,339 @@
 -- query 1
 -- types	bigint
-(((ifnull(sum(murmur_hash3_32(CAST(date_str AS datetime))), 0)) + (ifnull(sum(murmur_hash3_32(CAST(date_str_with_whitespace AS datetime))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str AS datetime))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str_with_whitespace AS datetime))), 0))
+_col0
 -1396525594308
 
 -- query 2
 -- types	bigint
-(((ifnull(sum(murmur_hash3_32(CAST(date_str AS datetime))), 0)) + (ifnull(sum(murmur_hash3_32(CAST(date_str_with_whitespace AS datetime))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str AS datetime))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str_with_whitespace AS datetime))), 0))
+_col0
 -1396525594308
 
 -- query 3
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 4
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 00:00:00.000000
 
 -- query 5
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 6
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 7
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 8
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 9
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 00:00:00.000000
 
 -- query 10
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 11
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 12
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 13
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 14
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 00:00:00.000000
 
 -- query 15
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 16
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 17
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 18
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 00:00:00.000000
 
 -- query 19
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 20
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 21
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 22
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 23
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 24
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 25
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 26
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-02-29 00:00:00.000000
 
 -- query 27
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-02-28 00:00:00.000000
 
 -- query 28
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2000-02-29 00:00:00.000000
 
 -- query 29
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2000-02-28 00:00:00.000000
 
 -- query 30
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2021-02-28 00:00:00.000000
 
 -- query 31
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2100-02-28 00:00:00.000000
 
 -- query 32
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 33
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 34
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 35
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 36
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 37
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 38
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 0210-02-28 00:00:00.000000
 
 -- query 39
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 40
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2100-02-28 00:00:00.000000
 
 -- query 41
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 42
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 43
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2100-02-08 00:00:00.000000
 
 -- query 44
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2100-02-02 00:00:00.000000
 
 -- query 45
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 46
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 47
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123456
 
 -- query 48
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.100000
 
 -- query 49
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 50
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123000
 
 -- query 51
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 52
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 53
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.000000
 
 -- query 54
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2020-01-01 01:02:03.123456
 
 -- query 55
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 56
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 57
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 58
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 59
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 60
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 61
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 62
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2024-01-01 23:59:59.000000
 
 -- query 63
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2024-01-01 00:00:00.000000
 
 -- query 64
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2024-01-01 01:59:00.000000
 
 -- query 65
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 2024-01-01 01:30:59.000000
 
 -- query 66
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 67
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL
 
 -- query 68
 -- types	timestamp(6)
-CAST(column_0 AS datetime)
+_col0
 NULL

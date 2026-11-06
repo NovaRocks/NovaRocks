@@ -1,56 +1,56 @@
 -- query 3
 -- types	integer
-field(1, 1, 1)
+_col0
 1
 
 -- query 4
 -- types	integer
-field(1.0, 1.0, 1.0)
+_col0
 1
 
 -- query 5
 -- types	integer
-field(01.0, 001.0, 0001.0)
+_col0
 1
 
 -- query 6
 -- types	integer
-field('01.0', 001.0, 0001.0)
+_col0
 1
 
 -- query 7
 -- types	integer
-field('01', '1')
+_col0
 0
 
 -- query 8
 -- types	integer
-field('01', '1', 1)
+_col0
 1
 
 -- query 9
 -- types	integer
-field('a', 'b')
+_col0
 0
 
 -- query 10
 -- types	integer
-field('a', 'b', 1)
+_col0
 0
 
 -- query 11
 -- types	integer
-field(NULL, NULL, 1)
+_col0
 0
 
 -- query 12
 -- types	integer
-field(NULL, NULL)
+_col0
 0
 
 -- query 13
 -- types	integer	varchar	double	integer	integer
-c1	c2	c3	c1	field(c1, 3, 2, 1, 0)
+c1	c2	c3	c1	_col4
 3	rocks	1.1111	3	1
 2	star	5.0	2	2
 1	world	6.01	1	3
@@ -58,7 +58,7 @@ c1	c2	c3	c1	field(c1, 3, 2, 1, 0)
 
 -- query 14
 -- types	integer	varchar	double	integer	integer
-c1	c2	c3	c1	field(c1, 2, 1, 3, 0)
+c1	c2	c3	c1	_col4
 2	star	5.0	2	1
 1	world	6.01	1	2
 3	rocks	1.1111	3	3
@@ -66,7 +66,7 @@ c1	c2	c3	c1	field(c1, 2, 1, 3, 0)
 
 -- query 15
 -- types	integer	varchar	double	integer	integer
-c1	c2	c3	c1	field(c1, 1, 1, 1, 1)
+c1	c2	c3	c1	_col4
 0	hello	5.5	0	0
 2	star	5.0	2	0
 3	rocks	1.1111	3	0
@@ -98,32 +98,32 @@ c1	c2	c3
 
 -- query 22
 -- types	integer
-field(vv.c1, vvv.c1)
+_col0
 1
 
 -- query 23
 -- types	integer
-field(v.c1, v.c1)
+_col0
 1
 
 -- query 24
 -- types	integer
-field(v.c1, vv.c1)
+_col0
 1
 
 -- query 27
 -- types	integer
-field(dv.c1, dvv.c1)
+_col0
 0
 
 -- query 28
 -- types	integer
-field(dv.c1, dv.c1)
+_col0
 1
 
 -- query 29
 -- types	integer
-field(dv.c1, vv.c1, dvv.c1)
+_col0
 0
 
 -- query 32

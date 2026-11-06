@@ -1,6 +1,6 @@
 -- query 5
 -- legacy
-array_contains([1, 2, 3, 4], 1)
+_col0
 1
 1
 1
@@ -14,7 +14,7 @@ array_contains([1, 2, 3, 4], 1)
 
 -- query 6
 -- legacy
-array_position([1, 2, 3, 4], 1)
+_col0
 1
 1
 1
@@ -28,7 +28,7 @@ array_position([1, 2, 3, 4], 1)
 
 -- query 7
 -- legacy
-array_contains([1, 2, 3, 4], NULL)
+_col0
 0
 0
 0
@@ -42,7 +42,7 @@ array_contains([1, 2, 3, 4], NULL)
 
 -- query 8
 -- legacy
-array_position([1, 2, 3, 4], NULL)
+_col0
 0
 0
 0
@@ -56,7 +56,7 @@ array_position([1, 2, 3, 4], NULL)
 
 -- query 9
 -- legacy
-array_contains([1, 2, 3, NULL], NULL)
+_col0
 1
 1
 1
@@ -70,7 +70,7 @@ array_contains([1, 2, 3, NULL], NULL)
 
 -- query 10
 -- legacy
-array_position([1, 2, 3, NULL], NULL)
+_col0
 4
 4
 4
@@ -84,7 +84,7 @@ array_position([1, 2, 3, NULL], NULL)
 
 -- query 11
 -- legacy
-array_contains(NULL, NULL)
+_col0
 NULL
 NULL
 NULL
@@ -98,7 +98,7 @@ NULL
 
 -- query 12
 -- legacy
-array_position(NULL, NULL)
+_col0
 NULL
 NULL
 NULL
@@ -112,137 +112,137 @@ NULL
 
 -- query 14
 -- legacy
-sum(array_contains(array_generate(1000), pk))
+_col0
 1000
 
 -- query 15
 -- legacy
-sum(array_contains(array_generate(1000), 100))
+_col0
 1001
 
 -- query 16
 -- legacy
-sum(array_position(array_generate(1000), pk))
+_col0
 500500
 
 -- query 17
 -- legacy
-sum(array_position(array_generate(1000), 100))
+_col0
 100100
 
 -- query 18
 -- legacy
-sum(array_contains(array_append(array_generate(1000), NULL), pk))
+_col0
 1000
 
 -- query 19
 -- legacy
-sum(array_contains(array_append(array_generate(1000), NULL), NULL))
+_col0
 1001
 
 -- query 20
 -- legacy
-sum(array_contains(arr_bigint, 100))
+_col0
 2
 
 -- query 21
 -- legacy
-sum(array_position(arr_bigint, 100))
+_col0
 101
 
 -- query 22
 -- legacy
-sum(array_contains(arr_str, md5sum(100)))
+_col0
 1
 
 -- query 23
 -- legacy
-sum(array_position(arr_str, md5sum(100)))
+_col0
 1
 
 -- query 24
 -- legacy
-sum(array_contains(arr_decimal, pk))
+_col0
 1000
 
 -- query 25
 -- legacy
-sum(array_position(arr_decimal, pk))
+_col0
 1000
 
 -- query 26
 -- legacy
-sum(array_contains(arr_decimal, 100))
+_col0
 2
 
 -- query 27
 -- legacy
-sum(array_position(arr_decimal, 100))
+_col0
 101
 
 -- query 29
 -- legacy
-sum(array_contains(array_repeat('abcdefg', 10000), 'abcdefg'))
+_col0
 1001
 
 -- query 30
 -- legacy
-sum(array_contains(array_repeat('abcdefg', 10000), str))
+_col0
 0
 
 -- query 33
 -- legacy
-array_contains(v1, 1.1)
+_col0
 1
 
 -- query 34
 -- legacy
-array_contains(v2, [1.1])
+_col0
 1
 
 -- query 35
 -- legacy
-array_contains(v3, [[1.1]])
+_col0
 1
 
 -- query 36
 -- legacy
-array_contains(v2, v1)
+_col0
 1
 
 -- query 37
 -- legacy
-array_contains(v3, v2)
+_col0
 1
 
 -- query 38
 -- legacy
-array_position(v1, 1.1)
+_col0
 1
 
 -- query 39
 -- legacy
-array_position(v2, [1.1])
+_col0
 1
 
 -- query 40
 -- legacy
-array_position(v3, [[1.1]])
+_col0
 1
 
 -- query 41
 -- legacy
-array_position(v2, v1)
+_col0
 1
 
 -- query 42
 -- legacy
-array_position(v3, v2)
+_col0
 1
 
 -- query 45
 -- legacy
-array_contains_all(arr_0, arr_1)
+_col0
 1
 1
 0
@@ -255,7 +255,7 @@ NULL
 
 -- query 46
 -- legacy
-array_contains_all(arr_1, arr_0)
+_col0
 0
 0
 0
@@ -268,7 +268,7 @@ NULL
 
 -- query 47
 -- legacy
-array_contains_all(arr_0, arr_2)
+_col0
 1
 1
 0
@@ -281,7 +281,7 @@ NULL
 
 -- query 48
 -- legacy
-array_contains_all(arr_2, arr_0)
+_col0
 0
 0
 0
@@ -294,7 +294,7 @@ NULL
 
 -- query 49
 -- legacy
-array_contains_all(arr_1, arr_2)
+_col0
 1
 1
 1
@@ -307,7 +307,7 @@ NULL
 
 -- query 50
 -- legacy
-array_contains_all(arr_2, arr_1)
+_col0
 0
 0
 1
@@ -320,7 +320,7 @@ NULL
 
 -- query 51
 -- legacy
-array_contains_all([1, 2, 3, 4], arr_0)
+_col0
 1
 0
 0
@@ -333,7 +333,7 @@ array_contains_all([1, 2, 3, 4], arr_0)
 
 -- query 52
 -- legacy
-array_contains_all([1, 2, 3, 4], arr_1)
+_col0
 1
 0
 1
@@ -346,7 +346,7 @@ NULL
 
 -- query 53
 -- legacy
-array_contains_all([1, 2, 3, 4, NULL], arr_1)
+_col0
 1
 1
 1
@@ -359,7 +359,7 @@ NULL
 
 -- query 54
 -- legacy
-array_contains_all(arr_0, [1, NULL])
+_col0
 0
 1
 1
@@ -372,7 +372,7 @@ array_contains_all(arr_0, [1, NULL])
 
 -- query 55
 -- legacy
-array_contains_all(arr_0, [])
+_col0
 1
 1
 1
@@ -385,7 +385,7 @@ array_contains_all(arr_0, [])
 
 -- query 56
 -- legacy
-array_contains_all(NULL, arr_0)
+_col0
 NULL
 NULL
 NULL
@@ -398,7 +398,7 @@ NULL
 
 -- query 57
 -- legacy
-array_contains_all(arr_1, NULL)
+_col0
 NULL
 NULL
 NULL
@@ -411,22 +411,22 @@ NULL
 
 -- query 60
 -- legacy
-array_contains_all(array_repeat('abcdefg', 1000), array_repeat('abcdef', 2000))
+_col0
 0
 
 -- query 63
 -- legacy
-array_contains_all(array_generate(1000), array_generate(2000))
+_col0
 0
 
 -- query 64
 -- legacy
-array_contains_all(array_generate(2000), array_generate(1000))
+_col0
 1
 
 -- query 65
 -- legacy
-array_contains_seq(arr_0, arr_1)
+_col0
 1
 0
 0
@@ -439,7 +439,7 @@ NULL
 
 -- query 66
 -- legacy
-array_contains_seq(arr_1, arr_0)
+_col0
 0
 0
 0
@@ -452,7 +452,7 @@ NULL
 
 -- query 67
 -- legacy
-array_contains_seq(arr_0, arr_2)
+_col0
 1
 1
 0
@@ -465,7 +465,7 @@ NULL
 
 -- query 68
 -- legacy
-array_contains_seq(arr_2, arr_0)
+_col0
 0
 0
 0
@@ -478,7 +478,7 @@ NULL
 
 -- query 69
 -- legacy
-array_contains_seq(arr_1, arr_2)
+_col0
 1
 1
 1
@@ -491,7 +491,7 @@ NULL
 
 -- query 70
 -- legacy
-array_contains_seq(arr_2, arr_1)
+_col0
 0
 0
 1
@@ -504,7 +504,7 @@ NULL
 
 -- query 71
 -- legacy
-array_contains_seq([1, 2, 3, 4], arr_0)
+_col0
 1
 0
 0
@@ -517,7 +517,7 @@ array_contains_seq([1, 2, 3, 4], arr_0)
 
 -- query 72
 -- legacy
-array_contains_seq([1, 2, 3, 4], arr_1)
+_col0
 1
 0
 1
@@ -530,7 +530,7 @@ NULL
 
 -- query 73
 -- legacy
-array_contains_seq([1, 2, 3, 4, NULL], arr_1)
+_col0
 1
 0
 1
@@ -543,7 +543,7 @@ NULL
 
 -- query 74
 -- legacy
-array_contains_seq(arr_0, [1, NULL])
+_col0
 0
 0
 0
@@ -556,7 +556,7 @@ array_contains_seq(arr_0, [1, NULL])
 
 -- query 75
 -- legacy
-array_contains_seq(arr_0, [])
+_col0
 1
 1
 1
@@ -569,7 +569,7 @@ array_contains_seq(arr_0, [])
 
 -- query 76
 -- legacy
-array_contains_seq(NULL, arr_0)
+_col0
 NULL
 NULL
 NULL
@@ -582,7 +582,7 @@ NULL
 
 -- query 77
 -- legacy
-array_contains_seq(arr_1, NULL)
+_col0
 NULL
 NULL
 NULL
@@ -595,57 +595,57 @@ NULL
 
 -- query 78
 -- legacy
-array_contains_seq([1, 1, 2, 3], [1, 1])
+_col0
 1
 
 -- query 79
 -- legacy
-array_contains_seq([1, 1, 2, 3], [1, 2])
+_col0
 1
 
 -- query 80
 -- legacy
-array_contains_seq([1, 1, 2, 3], [1, 3])
+_col0
 0
 
 -- query 81
 -- legacy
-array_contains_seq([1, 1, 2, 3], [2, 3])
+_col0
 1
 
 -- query 82
 -- legacy
-array_contains_seq([1, 1, 2, 3], [1, 1, 2])
+_col0
 1
 
 -- query 83
 -- legacy
-array_contains_seq([NULL, NULL, 1, 2], [NULL])
+_col0
 1
 
 -- query 84
 -- legacy
-array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL])
+_col0
 1
 
 -- query 85
 -- legacy
-array_contains_seq([NULL, NULL, 1, 2], [NULL, 1])
+_col0
 1
 
 -- query 86
 -- legacy
-array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL, 1])
+_col0
 1
 
 -- query 87
 -- legacy
-array_contains_seq([NULL, NULL, 1, 2], [NULL, 1, 2])
+_col0
 1
 
 -- query 90
 -- legacy
-array_contains_seq(array_append(array_repeat(1, 1000), 2), array_append(array_repeat(1, 500), 2))
+_col0
 1
 
 -- query 97
@@ -2008,7 +2008,7 @@ id
 
 -- query 319
 -- legacy
-id	array_position(array_map, map{'a':1,'b':2})
+id	_col1
 1	1
 2	0
 3	NULL
@@ -2016,7 +2016,7 @@ id	array_position(array_map, map{'a':1,'b':2})
 
 -- query 320
 -- legacy
-id	array_position(array_map, map{'c':3,'d':4})
+id	_col1
 1	2
 2	0
 3	NULL
@@ -2024,7 +2024,7 @@ id	array_position(array_map, map{'c':3,'d':4})
 
 -- query 321
 -- legacy
-id	array_position(array_map, map{'x':5,'y':6})
+id	_col1
 1	0
 2	1
 3	NULL
@@ -2032,7 +2032,7 @@ id	array_position(array_map, map{'x':5,'y':6})
 
 -- query 322
 -- legacy
-id	array_position(array_map, NULL)
+id	_col1
 1	0
 2	0
 3	NULL
@@ -2040,7 +2040,7 @@ id	array_position(array_map, NULL)
 
 -- query 323
 -- legacy
-id	array_position(array_map, map{})
+id	_col1
 1	0
 2	0
 3	NULL
@@ -2048,7 +2048,7 @@ id	array_position(array_map, map{})
 
 -- query 324
 -- legacy
-id	array_position(array_json, '{"key1": 100, "key2": 200}')
+id	_col1
 1	1
 2	0
 3	NULL
@@ -2056,7 +2056,7 @@ id	array_position(array_json, '{"key1": 100, "key2": 200}')
 
 -- query 325
 -- legacy
-id	array_position(array_json, '{"key3": 300}')
+id	_col1
 1	2
 2	0
 3	NULL
@@ -2064,7 +2064,7 @@ id	array_position(array_json, '{"key3": 300}')
 
 -- query 326
 -- legacy
-id	array_position(array_json, '{"key5": 500, "key6": 600}')
+id	_col1
 1	0
 2	2
 3	NULL
@@ -2072,7 +2072,7 @@ id	array_position(array_json, '{"key5": 500, "key6": 600}')
 
 -- query 327
 -- legacy
-id	array_position(array_json, NULL)
+id	_col1
 1	0
 2	0
 3	NULL
@@ -2080,7 +2080,7 @@ id	array_position(array_json, NULL)
 
 -- query 328
 -- legacy
-id	array_position(array_json, '{}')
+id	_col1
 1	0
 2	0
 3	NULL
@@ -2088,7 +2088,7 @@ id	array_position(array_json, '{}')
 
 -- query 329
 -- legacy
-id	array_position(array_struct, row(10, 'hello'))
+id	_col1
 1	1
 2	0
 3	NULL
@@ -2096,7 +2096,7 @@ id	array_position(array_struct, row(10, 'hello'))
 
 -- query 330
 -- legacy
-id	array_position(array_struct, row(20, 'world'))
+id	_col1
 1	2
 2	0
 3	NULL
@@ -2104,7 +2104,7 @@ id	array_position(array_struct, row(20, 'world'))
 
 -- query 331
 -- legacy
-id	array_position(array_struct, row(40, 'database'))
+id	_col1
 1	0
 2	2
 3	NULL
@@ -2112,7 +2112,7 @@ id	array_position(array_struct, row(40, 'database'))
 
 -- query 332
 -- legacy
-id	array_position(array_struct, NULL)
+id	_col1
 1	0
 2	0
 3	NULL
@@ -2120,15 +2120,15 @@ id	array_position(array_struct, NULL)
 
 -- query 333
 -- legacy
-array_contains([NULL], NULL)	array_position([NULL], NULL)
+_col0	_col1
 1	1
 
 -- query 337
 -- legacy
-pk	array_contains(arr_bigint, 1000)	arr_bigint
+pk	_col1	arr_bigint
 0	0	[0,0,0,0,0,0,0,0,0,0]
 
 -- query 338
 -- legacy
-pk	array_length(arr_bigint)	arr_bigint
+pk	_col1	arr_bigint
 0	10	[0,0,0,0,0,0,0,0,0,0]

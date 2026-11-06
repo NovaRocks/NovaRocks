@@ -1,6 +1,6 @@
 -- query 2
 -- types	varchar
-group_concat(v ORDER BY id ASC SEPARATOR ', ')
+_col0
 a, b
 
 -- query 3

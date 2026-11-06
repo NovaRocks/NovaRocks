@@ -1,96 +1,96 @@
 -- query 1
 -- types	varchar
-regexp_replace('abcd', '.*', 'xx')
+_col0
 xx
 
 -- query 2
 -- types	varchar
-regexp_replace('abcd', 'a.*', 'xx')
+_col0
 xx
 
 -- query 3
 -- types	varchar
-regexp_replace('abcd', '.*abc.*', 'xx')
+_col0
 xx
 
 -- query 4
 -- types	varchar
-regexp_replace('abcd', '.*cd', 'xx')
+_col0
 xx
 
 -- query 5
 -- types	varchar
-regexp_replace('abcd', 'bc', 'xx')
+_col0
 axxd
 
 -- query 6
 -- types	varchar
-regexp_replace('', '', 'xx')
+_col0
 xx
 
 -- query 7
 -- types	varchar
-regexp_replace(NULL, '', 'xx')
+_col0
 NULL
 
 -- query 8
 -- types	varchar
-regexp_replace('abc中文def', '中文', 'xx')
+_col0
 abcxxdef
 
 -- query 9
 -- types	varchar
-"regexp_replace('abc中文def', '[\\p{Han}]+', 'xx')"
+_col0
 abcxxdef
 
 -- query 10
 -- types	varchar
-regexp_replace('a b c', ' ', '-')
+_col0
 a-b-c
 
 -- query 11
 -- types	varchar
-regexp_replace('           XXXX', '       ', '')
+_col0
     XXXX
 
 -- query 12
 -- types	varchar
-regexp_replace('xxxx', 'x', '-')
+_col0
 "----"
 
 -- query 13
 -- types	varchar
-regexp_replace('xxxx', 'xx', '-')
+_col0
 "--"
 
 -- query 14
 -- types	varchar
-regexp_replace('xxxx', 'xxx', '-')
+_col0
 -x
 
 -- query 15
 -- types	varchar
-regexp_replace('xxxx', 'xxxx', '-')
+_col0
 -
 
 -- query 16
 -- types	varchar
-regexp_replace('xxxx', 'not', 'xxxxxxxx')
+_col0
 xxxx
 
 -- query 17
 -- types	varchar
-regexp_replace('xxaxx', 'xx', 'aaa')
+_col0
 aaaaaaa
 
 -- query 18
 -- types	varchar
-regexp_replace('xaxaxax', 'xax', '-')
+_col0
 -a-
 
 -- query 19
 -- types	varchar	varchar	varchar	varchar
-str	regex	replaced	regexp_replace(str, regex, replaced)
+str	regex	replaced	_col3
 NULL	""	xx	NULL
 ""	""	xx	xx
            XXXX	"       "	""	    XXXX
@@ -111,246 +111,246 @@ xxxx	xxxx	-	-
 
 -- query 20
 -- types	varchar
-regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0)
+_col0
 ["bCd","xCe"]
 
 -- query 21
 -- types	varchar
-regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 0)
+_col0
 ["bCd","xCe"]
 ["bCd","xCe"]
 
 -- query 22
 -- types	varchar
-regexp_extract_all(str, regex, 0)
+_col0
 ["bCd","xCe"]
 ["bCd","xCe"]
 
 -- query 23
 -- types	varchar
-regexp_extract_all(str, regex, pos)
+_col0
 []
 ["bCd","xCe"]
 
 -- query 24
 -- types	varchar
-regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos)
+_col0
 []
 ["bCd","xCe"]
 
 -- query 25
 -- types	varchar
-regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', pos)
+_col0
 []
 ["bCd","xCe"]
 
 -- query 26
 -- types	varchar
-regexp_extract_all('AbCdExCeF', regex, pos)
+_col0
 []
 ["bCd","xCe"]
 
 -- query 27
 -- types	varchar
-regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', pos)
+_col0
 []
 ["bCd","xCe"]
 
 -- query 28
 -- types	varchar
-regexp_extract_all('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 3)
+_col0
 []
 
 -- query 29
 -- types	varchar
-regexp_extract_all(str, '([[:lower:]]+)C([[:lower:]]+)', 3)
+_col0
 []
 []
 
 -- query 30
 -- types	varchar
-regexp_extract_all(str, regex, 3)
+_col0
 []
 []
 
 -- query 31
 -- types	integer
-regexp_position('a.b:c;d', '[.]')
+_col0
 2
 
 -- query 32
 -- types	integer
-"regexp_position('a.b:c;d', '[\\.:;]', 2)"
+_col0
 2
 
 -- query 33
 -- types	integer
-regexp_position('a.b:c;d', ':')
+_col0
 4
 
 -- query 34
 -- types	integer
-regexp_position('a,b,c', ',')
+_col0
 2
 
 -- query 35
 -- types	integer
-regexp_position('a1b2c3d', '[0-9]')
+_col0
 2
 
 -- query 36
 -- types	integer
-regexp_position('a,b,c', ',', 3)
+_col0
 4
 
 -- query 37
 -- types	integer
-regexp_position('a1b2c3d', '[0-9]', 5)
+_col0
 6
 
 -- query 38
 -- types	integer
-regexp_position('a1b2c3d4e', '[0-9]', 4, 2)
+_col0
 6
 
 -- query 39
 -- types	integer
-regexp_position('a1b2c3d', '[0-9]', 4, 3)
+_col0
 -1
 
 -- query 40
 -- types	integer
-regexp_position('a1b2c3d', '', 1)
+_col0
 1
 
 -- query 41
 -- types	integer
-regexp_position('a1b2c3d', '', 2)
+_col0
 2
 
 -- query 42
 -- types	integer
-regexp_position('a1b2c3d', '', 2, 2)
+_col0
 3
 
 -- query 43
 -- types	integer
-regexp_position('a1b2c3d', '', 2, 6)
+_col0
 7
 
 -- query 44
 -- types	integer
-regexp_position('a1b2c3d', '', 2, 7)
+_col0
 8
 
 -- query 45
 -- types	integer
-regexp_position('a1b2c3d', '', 2, 8)
+_col0
 -1
 
 -- query 46
 -- types	integer
-regexp_position('', ',')
+_col0
 -1
 
 -- query 47
 -- types	integer
-regexp_position('', ',', 4)
+_col0
 -1
 
 -- query 48
 -- types	integer
-regexp_position('', ',', 4, 2)
+_col0
 -1
 
 -- query 49
 -- types	integer
-regexp_position('a,b,c', ',', 2)
+_col0
 2
 
 -- query 50
 -- types	integer
-regexp_position('a1b2c3d', '[0-9]', 4)
+_col0
 4
 
 -- query 51
 -- types	integer
-regexp_position('a,b,c', ',', 1000)
+_col0
 -1
 
 -- query 52
 -- types	integer
-regexp_position('a,b,c', ',', 8)
+_col0
 -1
 
 -- query 53
 -- types	integer
-regexp_position('有朋$%X自9远方来', '[0-9]', 7)
+_col0
 7
 
 -- query 54
 -- types	integer
-regexp_position('有朋$%X自9远方9来', '[0-9]', 10, 1)
+_col0
 10
 
 -- query 55
 -- types	integer
-regexp_position('有朋$%X自9远方9来', '[0-9]', 10, 2)
+_col0
 -1
 
 -- query 56
 -- types	integer
-regexp_position('有朋$%X自9远方9来', '来', 999)
+_col0
 -1
 
 -- query 57
 -- types	integer
-regexp_position('行成于思str而毁123于随', '于', 3, 2)
+_col0
 13
 
 -- query 58
 -- types	integer
-regexp_position('行成于思str而毁123于随', '', 3, 1)
+_col0
 3
 
 -- query 59
 -- types	integer
-regexp_position('行成于思str而毁123于随', '', 3, 2)
+_col0
 4
 
 -- query 60
 -- types	integer
-regexp_position(column_0, 'T')
+_col0
 11
 
 -- query 61
 -- types	integer
-regexp_position(column_0, '61')
+_col0
 15
 
 -- query 62
 -- types	integer
-regexp_position(column_0, '0', 1, 3)
+_col0
 9
 
 -- query 63
 -- types	integer
-regexp_position(column_0, 'Z', 20)
+_col0
 -1
 
 -- query 64
 -- types	integer
-regexp_position(column_0, '01', 12, 2)
+_col0
 -1
 
 -- query 66
 -- types	integer
-regexp_position(column_0, 'x')
+_col0
 NULL
 
 -- query 67
 -- types	varchar	varchar	integer
-str	pattern	regexp_position(str, pattern)
+str	pattern	_col2
 NULL	NULL	NULL
 NULL	[0-9]	NULL
 ""	.	-1
@@ -364,7 +364,7 @@ test@email.com	@[a-zA-Z]+	5
 
 -- query 68
 -- types	varchar	varchar	integer	integer
-str	pattern	start_pos	regexp_position(str, pattern, start_pos)
+str	pattern	start_pos	_col3
 NULL	NULL	1	NULL
 NULL	[0-9]	1	NULL
 ""	.	1	-1
@@ -378,7 +378,7 @@ test@email.com	@[a-zA-Z]+	1	5
 
 -- query 69
 -- types	varchar	varchar	integer	integer	integer
-str	pattern	start_pos	occurrence	regexp_position(str, pattern, start_pos, occurrence)
+str	pattern	start_pos	occurrence	_col4
 NULL	NULL	1	1	NULL
 NULL	[0-9]	1	1	NULL
 ""	.	1	1	-1
@@ -392,127 +392,127 @@ test@email.com	@[a-zA-Z]+	1	1	5
 
 -- query 70
 -- types	integer
-regexp_position(NULL, '[0-9]')
+_col0
 NULL
 
 -- query 71
 -- types	integer
-regexp_position('test', NULL)
+_col0
 NULL
 
 -- query 72
 -- types	integer
-regexp_position(NULL, NULL)
+_col0
 NULL
 
 -- query 73
 -- types	integer
-regexp_position(NULL, '[0-9]', 1)
+_col0
 NULL
 
 -- query 74
 -- types	integer
-regexp_position('test', NULL, 1)
+_col0
 NULL
 
 -- query 75
 -- types	integer
-regexp_position('test', '[0-9]', NULL)
+_col0
 NULL
 
 -- query 76
 -- types	integer
-regexp_position(NULL, '[0-9]', 1, 1)
+_col0
 NULL
 
 -- query 77
 -- types	integer
-regexp_position('test', NULL, 1, 1)
+_col0
 NULL
 
 -- query 78
 -- types	integer
-regexp_position('test', '[0-9]', NULL, 1)
+_col0
 NULL
 
 -- query 79
 -- types	integer
-regexp_position('test', '[0-9]', 1, NULL)
+_col0
 NULL
 
 -- query 86
 -- types	integer
-regexp_position('test', '[0-9]', 0)
+_col0
 -1
 
 -- query 87
 -- types	integer
-regexp_position('test', '[0-9]', -1)
+_col0
 -1
 
 -- query 88
 -- types	integer
-regexp_position('test', '[0-9]', 1, 0)
+_col0
 -1
 
 -- query 89
 -- types	integer
-regexp_position('test', '[0-9]', 1, -1)
+_col0
 -1
 
 -- query 90
 -- types	bigint
-regexp_count('abc123def456', '[0-9]')
+_col0
 6
 
 -- query 91
 -- types	bigint
-"regexp_count('test.com test.net test.org', '\\.')"
+_col0
 3
 
 -- query 92
 -- types	bigint
-"regexp_count('a b  c   d', '\\s+')"
+_col0
 3
 
 -- query 93
 -- types	bigint
-regexp_count('ababababab', 'ab')
+_col0
 5
 
 -- query 94
 -- types	bigint
-regexp_count('', '.')
+_col0
 0
 
 -- query 95
 -- types	bigint
-regexp_count(NULL, '.')
+_col0
 NULL
 
 -- query 96
 -- types	bigint
-regexp_count('abc', NULL)
+_col0
 NULL
 
 -- query 97
 -- types	bigint
-"regexp_count('abc中文def', '[\\p{Han}]+')"
+_col0
 1
 
 -- query 98
 -- types	bigint
-regexp_count('AbCdExCeF', 'C')
+_col0
 2
 
 -- query 99
 -- types	bigint
-"regexp_count('1a 2b 14m', '\\d+')"
+_col0
 3
 
 -- query 100
 -- types	varchar	varchar	bigint
-str	regex	regexp_count(str, regex)
+str	regex	_col2
 NULL	.	NULL
 ""	.	0
 a b  c   d	"\\s+"	3
@@ -522,7 +522,7 @@ test.com test.net test.org	"\\."	3
 
 -- query 101
 -- types	varchar	varchar	bigint
-str	regex	regexp_count(str, regex)
+str	regex	_col2
 abc123def456	[0-9	NULL
 repetition test	?invalid	NULL
 test string	(unclosed	NULL
@@ -530,28 +530,28 @@ valid test	valid	1
 
 -- query 105
 -- types	bigint
-regexp_count('test string', 'a{,}')
+_col0
 0
 
 -- query 106
 -- types	bigint
-regexp_count(NULL, '[0-9')
+_col0
 NULL
 
 -- query 108
 -- types	bigint
-regexp_count('test', NULL)
+_col0
 NULL
 
 -- query 109
 -- types	varchar
-regexp_replace(column_value, '_package_.*', '')
+_col0
 activity_60
 activity_50
 
 -- query 110
 -- types	varchar
-regexp_replace(column_value, '_package_.*', '')
+_col0
 activity_50
 activity_60
 activity_70
@@ -560,7 +560,7 @@ test
 
 -- query 111
 -- types	varchar
-regexp_replace(column_value, '_[0-9]+', '_X')
+_col0
 activity_X_package_X
 activity_X_package_X
 activity_X_package_X
@@ -569,7 +569,7 @@ test_package_suffix
 
 -- query 112
 -- types	varchar
-regexp_replace(column_value, '_package_', '_pkg_')
+_col0
 activity_50_pkg_7
 activity_60_pkg_2
 activity_70_pkg_1

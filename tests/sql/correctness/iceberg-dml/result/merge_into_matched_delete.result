@@ -11,12 +11,12 @@ snaps_before
 1
 
 -- query 5
--- legacy
+-- types	bigint
 snaps_after
 2
 
 -- query 6
--- legacy
+-- types	bigint	varchar
 id	v
 1	a
 3	c

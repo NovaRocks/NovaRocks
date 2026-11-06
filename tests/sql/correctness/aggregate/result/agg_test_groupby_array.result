@@ -1,9 +1,9 @@
 -- query 3
 -- legacy
-count(*)
+_col0
 2
 
 -- query 7
 -- legacy
-count()
+_col0
 101
