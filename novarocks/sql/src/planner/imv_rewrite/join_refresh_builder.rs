@@ -240,11 +240,12 @@ enum JoinApplyActionProjection {
     ConstantInsert,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JoinRefreshTargetLocatorBinding {
     pub(crate) target_binding: SqlTableBindingId,
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
+    pub(crate) target_columns: std::sync::Arc<[ColumnDef]>,
 }
 
 impl JoinRefreshTargetLocatorBinding {
@@ -255,6 +256,7 @@ impl JoinRefreshTargetLocatorBinding {
             target_binding: snapshot.target_binding,
             target_table_uuid: snapshot.target_table_uuid.clone(),
             target_snapshot_id: snapshot.target_snapshot_id,
+            target_columns: std::sync::Arc::clone(&snapshot.target_columns),
         }
     }
 }
@@ -356,10 +358,13 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     );
+    let target_apply_key = target_apply_key_declaration(locator, &apply_key_input)?;
     let locator_apply_key = output_column_from_factory(
         column_ref_factory,
-        &apply_key_input.name,
-        apply_key_input.value_type.clone(),
+        &target_apply_key.name,
+        target_apply_key
+            .declared_value_type()
+            .map_err(|error| error.to_string())?,
         false,
     );
     let aggregate = build_payload_coalesce_aggregate(
@@ -736,6 +741,7 @@ fn build_locator_join_shell(
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
 ) -> Result<LogicalPlanNode, String> {
+    let right_apply_key = target_apply_key_declaration(locator, left_apply_key)?;
     let right_scan = build_target_locator_scan(
         desc,
         locator,
@@ -758,9 +764,11 @@ fn build_locator_join_shell(
             kind: ExprKind::ColumnRef {
                 column_id: right_apply_key_id,
                 qualifier: None,
-                column: left_apply_key.name.clone(),
+                column: right_apply_key.name.clone(),
             },
-            value_type: left_apply_key.value_type.clone(),
+            value_type: right_apply_key
+                .declared_value_type()
+                .map_err(|error| error.to_string())?,
         },
     );
     Ok(LogicalPlanNode::new(
@@ -774,6 +782,42 @@ fn build_locator_join_shell(
     ))
 }
 
+fn target_apply_key_declaration<'a>(
+    locator: &'a JoinRefreshTargetLocatorBinding,
+    source: &OutputColumn,
+) -> Result<&'a ColumnDef, String> {
+    let mut matches = locator
+        .target_columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(&source.name));
+    let target = matches.next().ok_or_else(|| {
+        format!(
+            "join target locator is missing sealed apply-key column `{}`",
+            source.name
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "join target locator has duplicate sealed apply-key column `{}`",
+            source.name
+        ));
+    }
+    if !target
+        .declared_value_type()
+        .map_err(|error| error.to_string())?
+        .same_physical_binding_ignoring_root_nullability_observed(&source.value_type, || {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("infallible checked type comparison")
+    {
+        return Err(format!(
+            "join target locator sealed apply-key column `{}` differs from its source domain",
+            source.name
+        ));
+    }
+    Ok(target)
+}
+
 fn build_target_locator_scan(
     desc: &JoinRefreshDescriptor,
     locator: &JoinRefreshTargetLocatorBinding,
@@ -784,10 +828,11 @@ fn build_target_locator_scan(
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
 ) -> Result<LogicalPlanNode, String> {
-    let columns = vec![
-        ColumnDef::from_value_type(apply_key.name.clone(), apply_key.value_type.clone(), None)
-            .map_err(|error| format!("invalid IMV locator apply-key declaration: {error}"))?,
-    ];
+    let target_apply_key = target_apply_key_declaration(locator, apply_key)?;
+    let target_apply_key_type = target_apply_key
+        .declared_value_type()
+        .map_err(|error| error.to_string())?;
+    let columns = vec![target_apply_key.clone()];
     let metadata_columns = vec![
         ColumnDef {
             name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
@@ -821,8 +866,8 @@ fn build_target_locator_scan(
     let scan_columns = vec![
         output_column(
             right_apply_key_id,
-            &apply_key.name,
-            apply_key.value_type.clone(),
+            &target_apply_key.name,
+            target_apply_key_type,
             false,
         ),
         output_column(
@@ -1333,15 +1378,22 @@ fn project_item_for_mapping(
             }
             validate_input_column(input_columns, &desc.left_row_id_column)?;
             validate_input_column(input_columns, &desc.right_row_id_column)?;
-            join_row_key_expr(
+            let expr = join_row_key_expr(
                 function_catalog,
-                desc,
+                (&desc.left_row_id_column, &desc.right_row_id_column),
                 left_object_id,
                 right_object_id,
                 policy,
                 constant_policy,
                 control,
-            )?
+            )?;
+            if expr.value_type != desc.join_apply_key_column.value_type {
+                return Err(
+                    "join refresh derived apply-key declaration differs from its resolved binding"
+                        .into(),
+                );
+            }
+            expr
         }
     };
 
@@ -1403,9 +1455,9 @@ fn is_internal_output_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
-fn join_row_key_expr(
+pub(crate) fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-    desc: &JoinRefreshDescriptor,
+    row_id_columns: (&OutputColumn, &OutputColumn),
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     policy: novarocks_type_contract::DecimalOverflowPolicy,
@@ -1414,9 +1466,9 @@ fn join_row_key_expr(
 ) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         object_id_binary_literal(left_object_id),
-        column_ref(&desc.left_row_id_column),
+        column_ref(row_id_columns.0),
         object_id_binary_literal(right_object_id),
-        column_ref(&desc.right_row_id_column),
+        column_ref(row_id_columns.1),
     ];
     let binding = crate::analysis::resolve_function_binding(
         function_catalog,
@@ -1488,8 +1540,9 @@ mod tests {
     };
     use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode, LogicalUnionNode};
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
-    use crate::planner::payload::PlanValuesNode;
+    use crate::planner::payload::{PlanScanNode, PlanValuesNode};
     use crate::planner::table::sql_mv_target_locator_scan;
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn apply_key_project_uses_output_mappings_and_validates_sources() {
@@ -1542,6 +1595,154 @@ mod tests {
         assert_payload_item(&project.items[0]);
         assert_join_apply_key_item(&project.items[1]);
         assert_action_item(&project.items[2]);
+    }
+
+    #[test]
+    fn append_project_preserves_nullable_binding_and_rejects_forged_nonnull_key() {
+        for nullable in [false, true] {
+            let mut desc = test_descriptor(JoinRefreshMode::Full);
+            desc.left_row_id_column.value_type =
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable);
+            desc.right_row_id_column.value_type = desc.left_row_id_column.value_type.clone();
+            let left_object = test_object_id(b"left-object");
+            let right_object = test_object_id(b"right-object");
+            let resolved = super::join_row_key_expr(
+                crate::functions::builtin_sql_function_catalog(),
+                (&desc.left_row_id_column, &desc.right_row_id_column),
+                &left_object,
+                &right_object,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            assert_eq!(resolved.value_type.nullable(), nullable);
+            desc.join_apply_key_column.value_type = resolved.value_type.clone();
+            for mapping in &mut desc.output_mappings {
+                if matches!(mapping.source, JoinRefreshOutputSource::JoinApplyKey(_)) {
+                    mapping.mv_output_column.value_type = resolved.value_type.clone();
+                }
+            }
+            let input = test_values_plan(vec![
+                desc.payload_columns[0].clone(),
+                desc.left_row_id_column.clone(),
+                desc.right_row_id_column.clone(),
+            ]);
+            let build = |desc: &JoinRefreshDescriptor| {
+                super::build_join_apply_key_append_project(
+                    crate::functions::builtin_sql_function_catalog(),
+                    input.clone(),
+                    desc,
+                    &left_object,
+                    &right_object,
+                    desc.join_apply_key_column.column_id.0,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    crate::constant::test_constant_policy(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+            };
+            let plan = build(&desc).unwrap();
+            let LogicalPlanKind::Project(project) = plan.kind else {
+                panic!("append project")
+            };
+            let key = project
+                .items
+                .iter()
+                .find(|item| {
+                    item.output_name == crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
+                })
+                .unwrap();
+            assert_eq!(key.expr.value_type, resolved.value_type);
+            if nullable {
+                desc.join_apply_key_column.value_type =
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false);
+                for mapping in &mut desc.output_mappings {
+                    if matches!(mapping.source, JoinRefreshOutputSource::JoinApplyKey(_)) {
+                        mapping.mv_output_column.value_type =
+                            desc.join_apply_key_column.value_type.clone();
+                    }
+                }
+                assert!(
+                    build(&desc)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("differs from its resolved binding")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn locator_uses_sealed_required_key_independently_of_nullable_source() {
+        let mut desc = test_coalesce_descriptor();
+        desc.join_apply_key_column.value_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        for mapping in &mut desc.output_mappings {
+            if matches!(mapping.source, JoinRefreshOutputSource::JoinApplyKey(_)) {
+                mapping.mv_output_column.value_type = desc.join_apply_key_column.value_type.clone();
+            }
+        }
+        let mut factory = test_coalesce_factory();
+        let plan = super::build_join_delta_coalesce_plan_with_locator(
+            test_branch_union(&desc),
+            &desc,
+            &test_locator_binding(),
+            &mut factory,
+            100,
+            101,
+            102,
+            103,
+            104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        fn locator_scan(plan: &LogicalPlanNode) -> Option<&PlanScanNode> {
+            if let LogicalPlanKind::Scan(scan) = &plan.kind
+                && sql_mv_target_locator_scan(&scan.table.source).is_some()
+            {
+                return Some(scan);
+            }
+            plan.children.iter().find_map(locator_scan)
+        }
+        let scan = locator_scan(&plan).unwrap();
+        let key = &scan.columns[0];
+        assert!(!key.value_type.nullable());
+        assert_eq!(
+            scan.table.columns[0].declared_value_type().unwrap(),
+            key.value_type
+        );
+        assert_eq!(factory.get(key.column_id).value_type, key.value_type);
+        assert!(desc.join_apply_key_column.value_type.nullable());
+    }
+
+    #[test]
+    fn locator_rejects_missing_duplicate_and_wrong_domain_sealed_keys() {
+        let source = test_coalesce_descriptor().join_apply_key_column;
+        let mut locator = test_locator_binding();
+        locator.target_columns = Vec::<ColumnDef>::new().into();
+        assert!(
+            super::target_apply_key_declaration(&locator, &source)
+                .unwrap_err()
+                .contains("missing sealed")
+        );
+        locator = test_locator_binding();
+        locator.target_columns = vec![locator.target_columns[0].clone(); 2].into();
+        assert!(
+            super::target_apply_key_declaration(&locator, &source)
+                .unwrap_err()
+                .contains("duplicate sealed")
+        );
+        locator = test_locator_binding();
+        let mut target = locator.target_columns[0].clone();
+        target.data_type = DataType::Int64;
+        locator.target_columns = vec![target].into();
+        assert!(
+            super::target_apply_key_declaration(&locator, &source)
+                .unwrap_err()
+                .contains("differs from its source domain")
+        );
     }
 
     #[test]
@@ -1707,9 +1908,17 @@ mod tests {
                 value_type: value_type.clone(),
                 is_internal: false,
             };
+            let locator = super::JoinRefreshTargetLocatorBinding {
+                target_columns: vec![
+                    ColumnDef::from_value_type(key.name.clone(), key.value_type.clone(), None)
+                        .unwrap(),
+                ]
+                .into(),
+                ..test_locator_binding()
+            };
             let plan = super::build_target_locator_scan(
                 &test_coalesce_descriptor(),
-                &test_locator_binding(),
+                &locator,
                 &key,
                 ColumnId(2),
                 ColumnId(3),
@@ -1759,9 +1968,16 @@ mod tests {
             .unwrap(),
             is_internal: false,
         };
+        let locator = super::JoinRefreshTargetLocatorBinding {
+            target_columns: vec![
+                ColumnDef::from_value_type(key.name.clone(), key.value_type.clone(), None).unwrap(),
+            ]
+            .into(),
+            ..test_locator_binding()
+        };
         let plan = super::build_target_locator_scan(
             &test_coalesce_descriptor(),
-            &test_locator_binding(),
+            &locator,
             &key,
             ColumnId(2),
             ColumnId(3),
@@ -2205,6 +2421,14 @@ mod tests {
             target_binding: crate::compiler::mv_rewrite::test_target_binding(),
             target_table_uuid: "target-uuid".to_string(),
             target_snapshot_id: Some(77),
+            target_columns: vec![ColumnDef {
+                name: crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }]
+            .into(),
         }
     }
 

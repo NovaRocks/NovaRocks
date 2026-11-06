@@ -20,6 +20,9 @@ code-anchors:
   - "novarocks/connector/iceberg/src/storage_inspector.rs (source snapshot observations)"
   - "novarocks/spi/src/connector/mv_storage_observation.rs (MvSourceSchemaObservation)"
   - "novarocks/frontend-application/src/mv/domain/refresh/target_apply.rs (base eligibility)"
+  - "novarocks/sql/src/planner/imv_rewrite/row_id_column.rs (lineage read declarations)"
+  - "novarocks/sql/src/planner/imv_rewrite/target_locator.rs (sealed target key declarations)"
+  - "novarocks/sql/src/mv_refresh/first_refresh.rs (resolved join-key declarations)"
   - "novarocks/frontend-application/src/query_execution/dml/mutation_flow.rs (duplicate assertions)"
   - "idl/novarocks/physical_package_v2.proto (PerKeyRowCountAssertion)"
   - "novarocks/execution/src/exec/operators/assert_num_rows_processor.rs (keyed assertion failure)"
@@ -64,6 +67,8 @@ Trino 的 MERGE 规划对 `(unique_id, case_number)` 做 MarkDistinct：已匹�
 7. **协议投影规则。** Trino 边界只按声明原因投影 `MERGE_TARGET_ROW_MULTIPLE_MATCHES`、119 与 USER_ERROR。MERGE 文本为 `One MERGE target table row matched more than one source row`；UPDATE FROM 使用 UPDATE 替换 MERGE。文本不加内部 code 前缀或发布终态后缀，诊断继续保留原失败位置和发布事实。其他失败映射不变。
 8. **精确版本规则。** package 新增声明身份是计划合同变化，随 plan contract revision 与原生 exact-island 身份更新。无旧格式透明读取、跨版本降级或 statement-text fallback。断言成功、写入提交与实际退出仍分别取证。
 9. **阶段范围。** 用户在RWM-5执行中明确选择：本次119、多键与NoAction对齐限定MOR。仍可达的COW UPDATE/UPDATE FROM保留独立consumer，普通重复拒绝尚无计划119身份。完整FE effects把matched UPDATE的MERGE也计入Delete，当前所有SQL MERGE均由Provider路由MOR，属于本次合同；保留COW MERGE helper的旧NoAction过滤不可误报为现产品缺口。RWM-7切换UPDATE、RWM-8删除遗留COW后收敛，不另造临时COW机制或事后统一映射Connector错误；共享metadata声明仍须逐列准确。
+
+读取类型与写入业务键分别保真：`_file`、`_pos` 的读取声明非空，两列 lineage 的读取声明可空。MV 注入、UNION 与 first refresh 保留原来源的完整类型，派生 Join key 采用真实函数 binding 的结果。目标 locator 的字段、factory 与引用使用同一冻结目标 schema 的完整声明；不能把左侧可空键当成目标列，也不能从目标必填反推来源非空。缺失或重复目标事实明确拒绝；实际 NULL 值检查和必填 apply key 约束仍由原作者执行。
 
 本条仅替代 ADR-0055 中依赖 `write.row-lineage` 的历史准入描述与其妥协 1 的 v2 加属性不可写限制；Provider 策略唯一、DELETE 按格式版本、SQL 谓词合法性与其余有效裁决保留。
 

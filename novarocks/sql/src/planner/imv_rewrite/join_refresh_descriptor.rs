@@ -222,7 +222,6 @@ impl JoinRefreshDescriptor {
             .name
             .eq_ignore_ascii_case(crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
             || *self.join_apply_key_column.value_type.data_type() != DataType::Utf8
-            || self.join_apply_key_column.value_type.nullable()
             || !self.join_apply_key_column.is_internal
         {
             return Err("join refresh descriptor has invalid join apply-key column".to_string());
@@ -817,13 +816,24 @@ mod tests {
     }
 
     #[test]
+    fn derived_join_key_descriptor_accepts_nullable_source_without_changing_its_type() {
+        let mut desc = valid_descriptor();
+        desc.join_apply_key_column.value_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        for mapping in &mut desc.output_mappings {
+            if matches!(mapping.source, JoinRefreshOutputSource::JoinApplyKey(_)) {
+                mapping.mv_output_column.value_type = desc.join_apply_key_column.value_type.clone();
+            }
+        }
+        assert!(desc.validate().is_ok());
+        assert!(desc.join_apply_key_column.value_type.nullable());
+    }
+
+    #[test]
     fn rejects_descriptor_with_invalid_join_apply_key_column() {
         let mut desc = valid_descriptor();
-        desc.join_apply_key_column.value_type = desc
-            .join_apply_key_column
-            .value_type
-            .with_nullable(true)
-            .unwrap();
+        desc.join_apply_key_column.value_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true);
         assert_invalid(desc, "invalid join apply-key column");
     }
 

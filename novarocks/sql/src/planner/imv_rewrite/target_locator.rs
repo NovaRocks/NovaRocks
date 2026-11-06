@@ -123,6 +123,7 @@ struct LocatorJoinInput {
     action: OutputColumn,
     left_apply_key: OutputColumn,
     target_apply_key_column: String,
+    target_apply_key_type: novarocks_type_contract::FunctionValueType,
     branch: Option<LocatorBranchInput>,
 }
 
@@ -130,6 +131,7 @@ struct LocatorJoinInput {
 struct LocatorBranchInput {
     left: OutputColumn,
     target_column: String,
+    target_value_type: novarocks_type_contract::FunctionValueType,
 }
 
 fn target_locator_join_input(
@@ -173,28 +175,62 @@ fn target_locator_join_input(
     }
     let action = action.clone();
     let left_apply_key = left_apply_key.clone();
-    let branch = contract.branch.as_ref().and_then(|branch| {
-        let left = output
-            .iter()
-            .find(|column| {
+    let branch = contract
+        .branch
+        .as_ref()
+        .map(|branch| -> Result<_, String> {
+            let left = output.iter().find(|column| {
                 column
                     .name
                     .eq_ignore_ascii_case(&branch.branch_id_column_name)
                     || column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
-            })?
-            .clone();
-        Some(LocatorBranchInput {
-            left,
-            target_column: branch.branch_id_column_name.clone(),
+            });
+            let Some(left) = left else {
+                return Ok(None);
+            };
+            let left = left.clone();
+            Ok(Some(LocatorBranchInput {
+                left,
+                target_column: branch.branch_id_column_name.clone(),
+                target_value_type: target_column_value_type(
+                    &ext.snapshot.target_columns,
+                    &branch.branch_id_column_name,
+                )?,
+            }))
         })
-    });
+        .transpose()?
+        .flatten();
     Ok(Some(LocatorJoinInput {
         output,
         action,
         left_apply_key,
         target_apply_key_column: contract.target.hidden_apply_key.column_name.clone(),
+        target_apply_key_type: target_column_value_type(
+            &ext.snapshot.target_columns,
+            &contract.target.hidden_apply_key.column_name,
+        )?,
         branch,
     }))
+}
+
+fn target_column_value_type(
+    columns: &[ColumnDef],
+    name: &str,
+) -> Result<novarocks_type_contract::FunctionValueType, String> {
+    let mut matches = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(name));
+    let column = matches
+        .next()
+        .ok_or_else(|| format!("IMV target locator requires sealed target column `{name}`"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "IMV target locator requires unique sealed target column `{name}`"
+        ));
+    }
+    column
+        .declared_value_type()
+        .map_err(|error| format!("invalid IMV locator target column `{name}` declaration: {error}"))
 }
 
 fn build_target_locator_join(
@@ -213,13 +249,13 @@ fn build_target_locator_join(
     let right_apply_key_id = allocate_imv_column(
         ctx,
         &input.target_apply_key_column,
-        input.left_apply_key.value_type.clone(),
+        input.target_apply_key_type.clone(),
     )?;
     let right_branch_id = input
         .branch
         .as_ref()
         .map(|branch| {
-            allocate_imv_column(ctx, &branch.target_column, branch.left.value_type.clone())
+            allocate_imv_column(ctx, &branch.target_column, branch.target_value_type.clone())
         })
         .transpose()?;
     let right_file_id = allocate_imv_column(
@@ -383,7 +419,7 @@ fn build_target_locator_scan(
     let mut columns = vec![
         ColumnDef::from_value_type(
             input.target_apply_key_column.clone(),
-            input.left_apply_key.value_type.clone(),
+            input.target_apply_key_type.clone(),
             None,
         )
         .map_err(|error| format!("invalid IMV locator apply-key declaration: {error}"))?,
@@ -392,7 +428,7 @@ fn build_target_locator_scan(
         columns.push(
             ColumnDef::from_value_type(
                 branch.target_column.clone(),
-                branch.left.value_type.clone(),
+                branch.target_value_type.clone(),
                 None,
             )
             .map_err(|error| format!("invalid IMV locator branch declaration: {error}"))?,
@@ -431,14 +467,14 @@ fn build_target_locator_scan(
     let mut scan_columns = vec![output_column(
         right_apply_key_id,
         &input.target_apply_key_column,
-        input.left_apply_key.value_type.clone(),
+        input.target_apply_key_type.clone(),
         false,
     )];
     if let (Some(branch), Some(column_id)) = (&input.branch, right_branch_id) {
         scan_columns.push(output_column(
             column_id,
             &branch.target_column,
-            branch.left.value_type.clone(),
+            branch.target_value_type.clone(),
             false,
         ));
     }
@@ -530,7 +566,7 @@ fn target_locator_join_condition(
                 qualifier: None,
                 column: input.target_apply_key_column.clone(),
             },
-            value_type: input.left_apply_key.value_type.clone(),
+            value_type: input.target_apply_key_type.clone(),
         },
     );
     let mut condition = binary(delete_only, BinOp::And, apply_key_eq);
@@ -547,7 +583,7 @@ fn target_locator_join_condition(
                     qualifier: None,
                     column: branch.target_column.clone(),
                 },
-                value_type: branch.left.value_type.clone(),
+                value_type: branch.target_value_type.clone(),
             },
         );
         condition = binary(condition, BinOp::And, branch_eq);
@@ -675,4 +711,172 @@ fn is_internal_output_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
         || name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
         || name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::column_id::ColumnRefFactory;
+    use crate::compiler::mv_rewrite::SqlImvBranchContract;
+    use crate::planner::imv_rewrite::annotation::ImvPlanAnnotation;
+    use novarocks_type_contract::FunctionValueType;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    fn target_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn context(target_columns: Vec<ColumnDef>) -> RewriteContext<'static> {
+        let mut snapshot = (*crate::compiler::mv_rewrite::test_incremental_snapshot()).clone();
+        snapshot.target_columns = Arc::from(target_columns);
+        Arc::make_mut(&mut snapshot.schema_contract).branch = Some(SqlImvBranchContract {
+            branch_id_column_name: BRANCH_ID_COLUMN_NAME.to_string(),
+        });
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        let mut factory = ColumnRefFactory::new();
+        factory.reserve_until(100);
+        ctx.set_column_ref_factory(Rc::new(RefCell::new(factory)));
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            snapshot: Arc::new(snapshot),
+            annotation: ImvPlanAnnotation::default(),
+        });
+        ctx
+    }
+
+    fn source_plan(key_nullable: bool, branch_nullable: bool) -> LogicalPlanNode {
+        let output = [
+            output_column(
+                ColumnId(1),
+                HIDDEN_APPLY_KEY_COLUMN_NAME,
+                FunctionValueType::new(DataType::Int64, key_nullable),
+                true,
+            ),
+            output_column(
+                ColumnId(2),
+                BRANCH_ID_COLUMN_NAME,
+                FunctionValueType::new(DataType::Int32, branch_nullable),
+                true,
+            ),
+            ImvActionColumn::output_column(ColumnId(3)),
+        ];
+        LogicalPlanNode::new(
+            LogicalPlanKind::Project(PlanProjectNode {
+                items: output.iter().map(project_item_for_output_column).collect(),
+                output_qualifier: None,
+            }),
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn find_ref_type(expr: &TypedExpr, id: ColumnId) -> Option<&FunctionValueType> {
+        match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } if *column_id == id => Some(&expr.value_type),
+            ExprKind::BinaryOp { left, right, .. } => {
+                find_ref_type(left, id).or_else(|| find_ref_type(right, id))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn target_locator_uses_sealed_target_types_independently_of_source_nullability() {
+        for target_key_nullable in [false, true] {
+            let target_branch_nullable = !target_key_nullable;
+            let columns = vec![
+                target_column(
+                    HIDDEN_APPLY_KEY_COLUMN_NAME,
+                    DataType::Int64,
+                    target_key_nullable,
+                ),
+                target_column(
+                    BRANCH_ID_COLUMN_NAME,
+                    DataType::Int32,
+                    target_branch_nullable,
+                ),
+            ];
+            let ctx = context(columns.clone());
+            let source = source_plan(!target_key_nullable, !target_branch_nullable);
+            let input = target_locator_join_input(&source, &ctx).unwrap().unwrap();
+            assert_eq!(
+                input.left_apply_key.value_type.nullable(),
+                !target_key_nullable
+            );
+            assert_eq!(
+                input.branch.as_ref().unwrap().left.value_type.nullable(),
+                !target_branch_nullable
+            );
+            let plan = build_target_locator_join(source, input, &ctx).unwrap();
+            let join_plan = plan.unary_input();
+            let LogicalPlanKind::Join(join) = &join_plan.kind else {
+                panic!("expected locator join");
+            };
+            let LogicalPlanKind::Scan(scan) = &join_plan.right().kind else {
+                panic!("expected target scan");
+            };
+            let factory = ctx.column_ref_factory().unwrap().borrow();
+            for (target, output) in columns.iter().zip(&scan.columns) {
+                let expected = target.declared_value_type().unwrap();
+                assert_eq!(output.value_type, expected);
+                assert_eq!(factory.value_type(output.column_id), Some(&expected));
+                assert_eq!(
+                    find_ref_type(join.condition.as_ref().unwrap(), output.column_id),
+                    Some(&expected)
+                );
+            }
+            assert_eq!(
+                scan.table.columns,
+                columns
+                    .iter()
+                    .map(|column| {
+                        ColumnDef::from_value_type(
+                            column.name.clone(),
+                            column.declared_value_type().unwrap(),
+                            None,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            );
+            for column in &scan.table.iceberg_row_lineage_metadata_columns {
+                assert_eq!(column.nullable, is_row_lineage_locator_name(&column.name));
+            }
+        }
+    }
+
+    #[test]
+    fn target_locator_rejects_missing_or_ambiguous_sealed_target_columns() {
+        let key = target_column(HIDDEN_APPLY_KEY_COLUMN_NAME, DataType::Int64, false);
+        let branch = target_column(BRANCH_ID_COLUMN_NAME, DataType::Int32, false);
+        for missing in [HIDDEN_APPLY_KEY_COLUMN_NAME, BRANCH_ID_COLUMN_NAME] {
+            let columns = [key.clone(), branch.clone()]
+                .into_iter()
+                .filter(|column| column.name != missing)
+                .collect();
+            let error = target_locator_join_input(&source_plan(true, true), &context(columns))
+                .err()
+                .expect("missing target fact must fail");
+            assert!(error.contains(missing), "{error}");
+        }
+        for duplicated in [key.clone(), branch.clone()] {
+            let mut duplicate = duplicated.clone();
+            duplicate.name = duplicate.name.to_ascii_uppercase();
+            let error = target_locator_join_input(
+                &source_plan(true, true),
+                &context(vec![key.clone(), branch.clone(), duplicate]),
+            )
+            .err()
+            .expect("ambiguous target fact must fail");
+            assert!(error.contains("unique sealed target column"), "{error}");
+            assert!(error.contains(&duplicated.name), "{error}");
+        }
+    }
 }

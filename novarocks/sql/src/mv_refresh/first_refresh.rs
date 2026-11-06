@@ -1802,23 +1802,32 @@ fn build_join_first_refresh_append_logical_plan(
         None,
     );
     reserve_factory_for_plan(&mut factory, &input)?;
+    let join_apply_key_type = crate::planner::imv_rewrite::join_refresh_builder::join_row_key_expr(
+        function_catalog,
+        (&left_row_id, &right_row_id),
+        &left.table_object_id,
+        &right.table_object_id,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )?
+    .value_type;
     let join_apply_key_id = factory.create(
         None,
         "__nova_join_row_key".to_string(),
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
+        join_apply_key_type.clone(),
     );
     let action_id = factory.create(
         None,
         crate::common::CHANGE_OP_COLUMN.to_string(),
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int8, false),
     );
-    let join_apply_key = output_column(
-        join_apply_key_id,
-        "__nova_join_row_key",
-        arrow::datatypes::DataType::Utf8,
-        false,
-        true,
-    );
+    let join_apply_key = crate::analysis::OutputColumn {
+        column_id: join_apply_key_id,
+        name: "__nova_join_row_key".to_string(),
+        value_type: join_apply_key_type,
+        is_internal: true,
+    };
     let action = output_column(
         action_id,
         crate::common::CHANGE_OP_COLUMN,
