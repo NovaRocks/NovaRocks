@@ -80,6 +80,25 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_mv_apply_agg_${uuid0};
 USE ns_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
+INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
+  (1, 'east', 10),
+  (2, 'east', -10),
+  (3, 'west', 5);
+INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
+  (10, 'east'),
+  (20, 'west');
+INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
+  (1, 10, 100),
+  (2, 20, 50);
+INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} VALUES
+  (1, 'k1', 10),
+  (2, 'k2', 5);
+INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} VALUES
+  (3, 'k1', 100),
+  (4, 'k3', 7);
 CREATE MATERIALIZED VIEW agg_apply_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -106,25 +125,6 @@ UNION ALL
 SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM t2_${uuid0}
 GROUP BY region;
-
--- query 2
--- @skip_result_check=true
-INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
-  (1, 'east', 10),
-  (2, 'east', -10),
-  (3, 'west', 5);
-INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
-  (10, 'east'),
-  (20, 'west');
-INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
-  (1, 10, 100),
-  (2, 20, 50);
-INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t1_${uuid0} VALUES
-  (1, 'k1', 10),
-  (2, 'k2', 5);
-INSERT INTO ice_mv_apply_agg_${uuid0}.ns_${uuid0}.t2_${uuid0} VALUES
-  (3, 'k1', 100),
-  (4, 'k3', 7);
 REFRESH MATERIALIZED VIEW agg_apply_mv_${uuid0};
 REFRESH MATERIALIZED VIEW join_agg_apply_mv_${uuid0};
 REFRESH MATERIALIZED VIEW branch_agg_apply_mv_${uuid0};
