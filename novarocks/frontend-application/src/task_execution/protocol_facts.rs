@@ -76,7 +76,7 @@ impl FrozenAttemptProtocol {
             || !writers.is_subset(&identities)
             || summary_sources
                 .iter()
-                .any(|(_, sources)| !sources.is_subset(&identities))
+                .any(|(_, sources)| sources.is_empty() || !sources.is_subset(&identities))
             || tasks
                 .iter()
                 .any(|task| task.query_execution_id() != root.query_execution_id())
@@ -672,9 +672,8 @@ mod tests {
                 [identity(1), identity(2), identity(3)].into(),
                 writers.iter().map(|task| identity(*task)).collect(),
                 PerKind {
-                    write_counts: Some(
-                        summary_sources.iter().map(|task| identity(*task)).collect(),
-                    ),
+                    write_counts: (!summary_sources.is_empty())
+                        .then(|| summary_sources.iter().map(|task| identity(*task)).collect()),
                     delete_verification: None,
                 },
             )
@@ -1120,5 +1119,33 @@ mod tests {
             .unwrap();
         tracker.observe(&take(&mut receiver)).unwrap();
         assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
+    }
+
+    #[test]
+    fn frozen_protocol_refuses_a_kind_with_no_source_instead_of_vacuous_completion() {
+        for kind in SummaryKind::ALL {
+            let mut sources = PerKind::empty();
+            sources.insert(kind, BTreeSet::new());
+            assert!(
+                FrozenAttemptProtocol::from_tasks(
+                    plan(),
+                    identity(1),
+                    [identity(1), identity(2)].into(),
+                    [identity(2)].into(),
+                    sources,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            FrozenAttemptProtocol::from_tasks(
+                plan(),
+                identity(1),
+                [identity(1), identity(2)].into(),
+                [identity(2)].into(),
+                PerKind::empty(),
+            )
+            .is_ok()
+        );
     }
 }

@@ -277,17 +277,6 @@ impl DecodedPreparedWriteSet {
         self.row_count
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "RWM-10 consumes the exact decoded verification value."
-        )
-    )]
-    pub(crate) const fn delete_verification(&self) -> Option<DeleteVerificationCounts> {
-        self.delete_verification
-    }
-
     pub(crate) fn fragments(&self) -> &[(WriteTargetOrdinal, Vec<u8>)] {
         &self.fragments
     }
@@ -1963,7 +1952,6 @@ pub(crate) mod tests {
             decoder.observe_root_eof().unwrap();
             let prepared = decoder.finish().unwrap();
             assert_eq!(prepared.row_count(), 17);
-            assert_eq!(prepared.delete_verification(), Some(value));
             let (rows, actual, fragments, statistics, _, _) = prepared.into_parts();
             assert_eq!((rows, actual), (17, Some(value)));
             assert!(fragments.is_empty());
@@ -1996,6 +1984,6 @@ pub(crate) mod tests {
         decoder.apply_chunk(&chunk(vec![summary(23)])).unwrap();
         let prepared = finish(decoder).unwrap();
         assert_eq!(prepared.row_count(), 23);
-        assert_eq!(prepared.delete_verification(), None);
+        assert_eq!(prepared.into_parts().1, None);
     }
 }

@@ -135,6 +135,14 @@ impl WriteCompletionTracker {
                 "a distributed write declares no writer task".to_owned(),
             ));
         }
+        if summary_sources
+            .iter()
+            .any(|(_, sources)| sources.is_empty())
+        {
+            return Err(TaskExecutionError::Schedule(
+                "a declared summary kind has no source task".to_owned(),
+            ));
+        }
         let pending_writers = writers
             .iter()
             .map(|&writer| (writer, TaskState::Planned))
@@ -715,5 +723,25 @@ mod tests {
             refused.execution_verdict(false),
             WriteVerdict::UndeclaredWriter(source)
         );
+    }
+
+    #[test]
+    fn a_present_summary_kind_requires_a_real_source_but_absent_kinds_are_legal() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        for kind in SummaryKind::ALL {
+            let mut sources = PerKind::empty();
+            sources.insert(kind, BTreeSet::new());
+            assert!(matches!(
+                WriteCompletionTracker::try_new(root, [writer], sources),
+                Err(TaskExecutionError::Schedule(_)),
+            ));
+        }
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], PerKind::empty()).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
     }
 }

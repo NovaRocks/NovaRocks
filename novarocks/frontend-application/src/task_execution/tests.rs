@@ -9101,7 +9101,7 @@ fn manifest_pending_release_fixture_with_writers(
                 plan,
                 &writers,
                 &novarocks_result_contract::PerKind {
-                    write_counts: Some(summary_sources.clone()),
+                    write_counts: (!summary_sources.is_empty()).then(|| summary_sources.clone()),
                     delete_verification: None,
                 },
             )
