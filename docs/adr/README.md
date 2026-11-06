@@ -125,6 +125,7 @@ code-anchors:
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
+- [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0214](ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md) — 在线数据为何在准备期冻结完整布局、只传独立标准批次，并分开物理NULL、逻辑requiredness、原预算与真实线程退出（active；补充ADR-0209，普通root IPC保持）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
@@ -242,6 +243,7 @@ code-anchors:
 
 资源沿用原 executor、Transport 和结果预算；普通 Full 是可取消背压。完整依赖事实约束来源与责任，不构成另一套工作类别或依赖域配额。计算位置、仍活数据和残留责任分别退出，超时不证明实际退出。公平推进以资源可用、依赖能够返回为条件；共享 worker 全部永久阻塞时，健康请求与结算也可能不可用，不据此承诺故障隔离或新增 worker 最低数。
 
+- [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）
@@ -516,6 +518,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### crate-boundary
 
+- [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor）
 - [ADR-0215](ADR-0215-released-iceberg-package-provenance.md) — Iceberg 正式发布为何以 registry 原包为来源、无分歧包退出 vendor，并分离发布与验证 lock（active；部分替代 ADR-0174 来源、macro 保留与四 path 妥协；HMS 继续 vendor 的部分由 ADR-0216 部分替代，core 的保留规则仍有效）
 
