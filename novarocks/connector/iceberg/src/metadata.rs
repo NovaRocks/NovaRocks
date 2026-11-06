@@ -3073,10 +3073,29 @@ mod plan_splits_pruning_tests {
 
     #[test]
     fn snapshot_metadata_projects_to_schema_without_current_partition_membership() {
+        for initial_version in [FormatVersion::V3, FormatVersion::V2] {
+            assert_snapshot_metadata_projects_to_schema_without_current_partition_membership(
+                initial_version,
+            );
+        }
+    }
+
+    fn assert_snapshot_metadata_projects_to_schema_without_current_partition_membership(
+        initial_version: FormatVersion,
+    ) {
         use crate::iceberg::spec::{Literal, Transform};
         use novarocks_spi::connector::ConnectorColumnDefault;
 
         let (_executor, _warehouse, provider) = provider();
+        let label = |write_default: &str| {
+            let field = NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
+                .with_write_default(Literal::string(write_default));
+            if initial_version == FormatVersion::V3 {
+                field.with_initial_default(Literal::string("old-read"))
+            } else {
+                field
+            }
+        };
         let old_schema = Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::optional(
@@ -3084,11 +3103,7 @@ mod plan_splits_pruning_tests {
                     "id",
                     Type::Primitive(PrimitiveType::Long),
                 )),
-                Arc::new(
-                    NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
-                        .with_initial_default(Literal::string("old-read"))
-                        .with_write_default(Literal::string("old-write")),
-                ),
+                Arc::new(label("old-write")),
             ])
             .build()
             .unwrap();
@@ -3097,7 +3112,7 @@ mod plan_splits_pruning_tests {
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
             "file:///to-metadata".to_string(),
-            FormatVersion::V2,
+            initial_version,
             HashMap::from([
                 ("write.row-lineage".to_string(), "false".to_string()),
                 ("unique_constraints".to_string(), "id".to_string()),
@@ -3125,7 +3140,7 @@ mod plan_splits_pruning_tests {
                     additional_properties: HashMap::new(),
                 })
                 .with_schema_id(schema_id);
-            if parent.is_some() {
+            if initial_version == FormatVersion::V3 || parent.is_some() {
                 builder.with_row_range(0, 0).build()
             } else {
                 builder.build()
@@ -3151,11 +3166,7 @@ mod plan_splits_pruning_tests {
                     "future",
                     Type::Primitive(PrimitiveType::Int),
                 )),
-                Arc::new(
-                    NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String))
-                        .with_initial_default(Literal::string("old-read"))
-                        .with_write_default(Literal::string("new-write")),
-                ),
+                Arc::new(label("new-write")),
                 Arc::new(NestedField::optional(
                     1,
                     "id",
@@ -3286,7 +3297,10 @@ mod plan_splits_pruning_tests {
         );
         assert!(selected_source.format_v3);
         assert_eq!(selected_source.selected_snapshot_id, Some(101));
-        assert!(!selected_source.selected_snapshot_has_row_range);
+        assert_eq!(
+            selected_source.selected_snapshot_has_row_range,
+            initial_version == FormatVersion::V3
+        );
         assert_eq!(current_source.selected_snapshot_id, Some(102));
         assert!(current_source.selected_snapshot_has_row_range);
         assert_eq!(selected_source.object_id, current_source.object_id);
@@ -3382,8 +3396,42 @@ mod plan_splits_pruning_tests {
                 .map(|field| field.name().clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(&to), ["id", "label", "_file", "_pos"]);
-        assert_eq!(names(&current), ["future", "label", "id", "_file", "_pos"]);
+        // Format belongs to the table even when the selected snapshot predates
+        // v3: lineage columns remain visible and nullable in the read schema.
+        assert_eq!(
+            names(&to),
+            [
+                "id",
+                "label",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
+        );
+        assert_eq!(
+            names(&current),
+            [
+                "future",
+                "label",
+                "id",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
+        );
+        for metadata in [&to, &current] {
+            for name in ["_row_id", "_last_updated_sequence_number"] {
+                assert!(
+                    metadata
+                        .schema()
+                        .field_with_name(name)
+                        .unwrap()
+                        .is_nullable()
+                );
+            }
+        }
         assert_eq!(
             to.execution_schema()
                 .schema()
@@ -3391,16 +3439,23 @@ mod plan_splits_pruning_tests {
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect::<Vec<_>>(),
-            ["id", "label", "_file", "_pos"]
+            [
+                "id",
+                "label",
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
         );
-        assert_eq!(to.planning_facts.column_facts().len(), 4);
+        assert_eq!(to.planning_facts.column_facts().len(), 6);
         assert_eq!(
             to.planning_facts
                 .column_facts()
                 .iter()
                 .map(|f| f.field_ordinal())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3]
+            [0, 1, 2, 3, 4, 5]
         );
         assert_eq!(to.planning_facts.column_facts()[1].write_default(), None);
         assert_eq!(
@@ -3408,8 +3463,16 @@ mod plan_splits_pruning_tests {
             Some(&ConnectorColumnDefault::String(Arc::from("new-write")))
         );
         let initial = crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
-        assert!(to.schema().field(1).metadata()[initial].contains("old-read"));
-        assert!(current.schema().field(1).metadata()[initial].contains("old-read"));
+        let expected_initial =
+            (initial_version == FormatVersion::V3).then_some(serde_json::json!("old-read"));
+        for schema in [to.schema(), current.schema()] {
+            let actual_initial = schema
+                .field(1)
+                .metadata()
+                .get(initial)
+                .map(|value| serde_json::from_str::<serde_json::Value>(value).unwrap());
+            assert_eq!(actual_initial, expected_initial);
+        }
         assert_eq!(to.planning_facts.partition_source_column_ordinals(), None);
         assert!(
             to.planning_facts.column_facts().iter().all(|fact| {

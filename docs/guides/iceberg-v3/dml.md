@@ -144,6 +144,8 @@ USING (SELECT id, user_id, amount, ts FROM orders_changes) s
 
 要求基表 v3；`write.row-lineage` 不参与准入。
 
+MOR路径按目标行物理位置与命中子句判重，未命中子句的匹配行也参与；重复返回Trino119，UPDATE FROM使用UPDATE原文。当前COW的UPDATE/UPDATE FROM与matched-UPDATE MERGE仍用独立的选择与消费路径，普通重复拒绝没有该119身份，未命中WHEN的匹配行仍先过滤。只有INSERT或可DELETE的MERGE由Provider路由MOR。全路径一致随RWM-7切换与RWM-8退役COW完成，不能把当前MOR验证解释为COW也已对齐。
+
 ### ❌ MERGE INTO 写指定 branch
 
 phase 1 仅覆盖 INSERT / UPDATE / DELETE 写指定 branch，MERGE INTO 暂未支持。
