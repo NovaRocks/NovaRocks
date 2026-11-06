@@ -9,11 +9,11 @@ _col0
 126
 
 -- query 5
--- types	bigint
+-- types	integer
 _col0
 -1
 
 -- query 6
--- types	bigint
+-- types	integer
 _col0
 -1

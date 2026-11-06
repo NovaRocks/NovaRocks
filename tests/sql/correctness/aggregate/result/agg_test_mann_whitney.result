@@ -114,14 +114,14 @@ _col0
 NULL
 
 -- query 27
--- types	bigint	varchar
+-- types	integer	varchar
 _col0	_col1
 1	{"Error": "All numbers in both samples are identical."}
 2	[1, 0.9772498680518208]
 0	{"Error": "All numbers in both samples are identical."}
 
 -- query 28
--- types	bigint	varchar
+-- types	integer	varchar
 _col0	_col1
 
 -- query 29

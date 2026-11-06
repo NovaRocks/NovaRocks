@@ -20,7 +20,7 @@ PLAN FRAGMENT 1
   2:SCAN ${case_db}.cost_model_explain_t stats={rows=990}
        TABLE: ${case_db}.cost_model_explain_t
        columns: k, v
-       predicates: CAST(v AS Int64) > 10
+       predicates: v > 10
 
 -- query 7
 -- types	varchar

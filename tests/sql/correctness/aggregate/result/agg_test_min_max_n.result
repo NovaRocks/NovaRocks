@@ -89,27 +89,27 @@ _col0
 [111,111,111,111,111]
 
 -- query 22
--- types	bigint	array(integer)
+-- types	integer	array(integer)
 g	_col1
 0	[111,111]
 1	[111,111]
 
 -- query 23
--- types	bigint	array(varchar)
+-- types	integer	array(varchar)
 g	_col1
 0	["varchar1","varchar2"]
 1	["varchar1","varchar1"]
 2	["varchar1","varchar1"]
 
 -- query 24
--- types	bigint	array(varchar)
+-- types	integer	array(varchar)
 g	_col1
 0	["varchar1","varchar2"]
 1	["varchar1","varchar1"]
 2	["varchar1","varchar1"]
 
 -- query 25
--- types	bigint	array(date)
+-- types	integer	array(date)
 g	_col1
 0	["2021-01-01","2021-01-02"]
 1	["2021-01-01","2021-01-01"]
@@ -117,16 +117,16 @@ g	_col1
 3	["2021-01-01","2021-01-02"]
 
 -- query 26
--- types	array(bigint)
+-- types	array(integer)
 _col0
 [1]
 
 -- query 27
--- types	array(bigint)
+-- types	array(integer)
 _col0
 [1,2,3]
 
 -- query 28
--- types	array(bigint)
+-- types	array(integer)
 _col0
 [1]

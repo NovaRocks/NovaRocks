@@ -52,4 +52,4 @@ PLAN FRAGMENT 3
      TABLE: ${case_db}.g3_pt_a
      columns: k, v
      min-max stats
-     predicates: CAST(a.v AS Int64) > 0 AND a.k IS NOT NULL
+     predicates: a.v > 0 AND a.k IS NOT NULL

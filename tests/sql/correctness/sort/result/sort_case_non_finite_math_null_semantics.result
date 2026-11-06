@@ -1,5 +1,5 @@
 -- query 1
--- types	bigint	double
+-- types	integer	double
 id	k
 7	3.5
 9	2.2

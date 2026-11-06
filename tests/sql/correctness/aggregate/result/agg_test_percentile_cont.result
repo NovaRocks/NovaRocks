@@ -109,11 +109,11 @@ _col0
 11.3
 
 -- query 34
--- types	bigint
+-- types	integer
 _col0
 1
 
 -- query 35
--- types	bigint
+-- types	integer
 _col0
 1

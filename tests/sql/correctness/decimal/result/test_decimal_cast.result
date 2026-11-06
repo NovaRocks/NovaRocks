@@ -71,7 +71,7 @@ k1	_col1	_col2	_col3	_col4
 8	-12.0	-214748364.0	-922337203685477580.0	NULL
 
 -- query 8
--- types	bigint	bigint	bigint	bigint	varchar
+-- types	bigint	integer	integer	bigint	varchar
 k1	_col1	_col2	_col3	c_largeint * 0
 1	0	0	0	0
 2	0	0	0	0
@@ -83,7 +83,7 @@ k1	_col1	_col2	_col3	c_largeint * 0
 8	0	0	0	0
 
 -- query 9
--- types	bigint	bigint	bigint	bigint	varchar
+-- types	bigint	integer	integer	bigint	varchar
 k1	_col1	_col2	_col3	c_largeint * 1
 1	127	2147483647	9223372036854775807	170141183460469231731687303715884105727
 2	-128	-2147483648	-9223372036854775808	-170141183460469231731687303715884105728

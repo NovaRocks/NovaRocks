@@ -76,7 +76,7 @@ datetime
 -- query 16
 -- types	varchar
 _col0
-array<tinyint>
+array<int>
 
 -- query 17
 -- legacy
@@ -86,12 +86,12 @@ varchar
 -- query 18
 -- legacy
 _col0
-map<tinyint,varchar>
+map<int,varchar>
 
 -- query 19
 -- legacy
 _col0
-struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>
+struct<col1 int, col2 int, col3 int, col4 int>
 
 -- query 20
 -- types	varchar

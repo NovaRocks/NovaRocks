@@ -26,6 +26,6 @@ PLAN FRAGMENT 1
       8:VALUES (1 rows) stats={rows=1}
 
 -- query 3
--- types	bigint	bigint
+-- types	integer	bigint
 k	total_v
 1	30

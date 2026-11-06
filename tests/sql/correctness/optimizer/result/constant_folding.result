@@ -1,5 +1,5 @@
 -- query 4
--- types	bigint
+-- types	integer
 _col0
 42096
 
@@ -18,13 +18,8 @@ id
 id
 2
 
--- query 11
--- types	double
-_col0
-NULL
-
 -- query 13
--- types	bigint
+-- types	integer
 _col0
 42096
 
@@ -44,22 +39,22 @@ folded_abs
 7
 
 -- query 19
--- types	bigint
+-- types	integer
 folded_if
 10
 
 -- query 20
--- types	bigint
+-- types	integer
 folded_coalesce
 8
 
 -- query 21
--- types	bigint
+-- types	integer
 folded_ifnull
 9
 
 -- query 22
--- types	bigint
+-- types	integer
 folded_nullif
 NULL
 
@@ -134,22 +129,22 @@ folded_abs
 7
 
 -- query 38
--- types	bigint
+-- types	integer
 folded_if
 10
 
 -- query 39
--- types	bigint
+-- types	integer
 folded_coalesce
 8
 
 -- query 40
--- types	bigint
+-- types	integer
 folded_ifnull
 9
 
 -- query 41
--- types	bigint
+-- types	integer
 folded_nullif
 NULL
 

@@ -76,7 +76,7 @@ INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES (4, 7);
 -- Default EXPLAIN REFRESH should print the actual refresh logical plan.
 -- @skip_result_check=true
 -- @result_contains=LEFT OUTER JOIN
--- @result_contains=predicate: v2 > 0
+-- @result_contains=predicate: v2 > CAST(0 AS Int64)
 -- @result_contains=__nova_base_row_id
 -- @result_not_contains=source:
 EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
@@ -85,7 +85,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 -- VERBOSE should include the same refresh plan shape plus refresh source detail.
 -- @skip_result_check=true
 -- @result_contains=LEFT OUTER JOIN
--- @result_contains=predicate: v2 > 0
+-- @result_contains=predicate: v2 > CAST(0 AS Int64)
 -- @result_contains=__nova_base_row_id
 -- @result_contains=source: IcebergDeltaTable
 -- @result_contains=source: IcebergMvTargetLocator

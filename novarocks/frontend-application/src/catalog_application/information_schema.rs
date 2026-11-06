@@ -46,6 +46,23 @@ enum InfoColumn {
     InactiveReason,
 }
 
+// The source column owns values/types; the admitted projection keeps only
+// its original public spelling. Borrow names from the original AST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InfoProjection<'a> {
+    column: InfoColumn,
+    output_name: &'a str,
+}
+
+impl InfoProjection<'_> {
+    fn canonical(column: InfoColumn) -> Self {
+        Self {
+            column,
+            output_name: column.sql_name(),
+        }
+    }
+}
+
 impl InfoColumn {
     fn parse(name: &str) -> Option<Self> {
         match normalize_column_name(name).as_str() {
@@ -125,7 +142,9 @@ fn local_query_error(
         message,
     )
 }
-fn materialized_view_projection(query: &ast::Query) -> Result<Option<Vec<InfoColumn>>, String> {
+fn materialized_view_projection(
+    query: &ast::Query,
+) -> Result<Option<Vec<InfoProjection<'_>>>, String> {
     if !is_local_materialized_views_query(query) {
         return Ok(None);
     }
@@ -136,7 +155,7 @@ fn materialized_view_projection(query: &ast::Query) -> Result<Option<Vec<InfoCol
 }
 fn render_materialized_view_rows(
     query: &ast::Query,
-    projection: &[InfoColumn],
+    projection: &[InfoProjection<'_>],
     mut rows: Vec<MaterializedViewInfoRow>,
 ) -> Result<StatementResult, String> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -245,23 +264,35 @@ fn is_information_schema_materialized_views(factor: &ast::TableFactor) -> bool {
     )
 }
 
-fn projection_columns(select: &ast::Select) -> Result<Vec<InfoColumn>, String> {
+fn projection_columns(select: &ast::Select) -> Result<Vec<InfoProjection<'_>>, String> {
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
             ast::SelectItem::Wildcard { .. } => {
-                columns.extend([
-                    InfoColumn::TableSchema,
-                    InfoColumn::TableName,
-                    InfoColumn::IsActive,
-                    InfoColumn::InactiveReason,
-                ]);
+                columns.extend(
+                    [
+                        InfoColumn::TableSchema,
+                        InfoColumn::TableName,
+                        InfoColumn::IsActive,
+                        InfoColumn::InactiveReason,
+                    ]
+                    .map(InfoProjection::canonical),
+                );
             }
             ast::SelectItem::UnnamedExpr(expr) => {
-                columns.push(expr_column(expr)?);
+                let column = expr_column(expr)?;
+                let output_name = expr_column_name(expr)
+                    .expect("a validated direct-column projection retains its original spelling");
+                columns.push(InfoProjection {
+                    column,
+                    output_name,
+                });
             }
-            ast::SelectItem::ExprWithAlias { expr, .. } => {
-                columns.push(expr_column(expr)?);
+            ast::SelectItem::ExprWithAlias { expr, alias, .. } => {
+                columns.push(InfoProjection {
+                    column: expr_column(expr)?,
+                    output_name: alias.value.as_str(),
+                });
             }
             ast::SelectItem::QualifiedWildcard { .. } => {
                 return Err(
@@ -284,7 +315,7 @@ fn expr_column(expr: &ast::Expr) -> Result<InfoColumn, String> {
             printer::print_expr(expr)
         )
     })?;
-    InfoColumn::parse(&name)
+    InfoColumn::parse(name)
         .ok_or_else(|| format!("unknown information_schema.materialized_views column `{name}`"))
 }
 
@@ -327,7 +358,7 @@ fn comparison_column_value<'a>(
     column_expr: &'a ast::Expr,
     value_expr: &'a ast::Expr,
 ) -> Option<(InfoColumn, String)> {
-    let column = expr_column_name(column_expr).and_then(|name| InfoColumn::parse(&name))?;
+    let column = expr_column_name(column_expr).and_then(InfoColumn::parse)?;
     let value = string_literal(value_expr)?;
     Some((column, value))
 }
@@ -354,7 +385,7 @@ fn apply_order_by(query: &ast::Query, rows: &mut [MaterializedViewInfoRow]) -> R
 }
 
 fn build_query_result(
-    columns: &[InfoColumn],
+    columns: &[InfoProjection<'_>],
     rows: &[MaterializedViewInfoRow],
 ) -> Result<QueryResult, String> {
     let bound = novarocks_query_application::api::LocalResultBound::V1;
@@ -365,7 +396,7 @@ fn build_query_result(
         rows.iter().fold(sum, |sum, row| {
             sum.saturating_add(
                 novarocks_query_application::api::LocalResultBound::cell_bytes(
-                    row_string_value(row, *column).map_or(0, str::len),
+                    row_string_value(row, column.column).map_or(0, str::len),
                 ),
             )
         })
@@ -375,17 +406,17 @@ fn build_query_result(
         .iter()
         .map(|column| {
             QueryResultColumn::new(
-                column.sql_name(),
+                column.output_name,
                 novarocks_type_contract::FunctionValueType::new(
-                    column.data_type(),
-                    column.nullable(),
+                    column.column.data_type(),
+                    column.column.nullable(),
                 ),
             )
         })
         .collect::<Vec<_>>();
     let arrays = columns
         .iter()
-        .map(|column| build_column_array(*column, rows))
+        .map(|column| build_column_array(column.column, rows))
         .collect::<Vec<_>>();
     build_arrow_query_result(query_columns, arrays)
         .map_err(|e| format!("build information_schema.materialized_views result failed: {e}"))
@@ -426,10 +457,12 @@ fn row_sort_value(row: &MaterializedViewInfoRow, column: InfoColumn) -> &str {
     row_string_value(row, column).unwrap_or_default()
 }
 
-fn expr_column_name(expr: &ast::Expr) -> Option<String> {
+fn expr_column_name(expr: &ast::Expr) -> Option<&str> {
     match expr {
-        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
+        ast::Expr::Identifier(ident) => Some(ident.value.as_str()),
+        ast::Expr::CompoundIdentifier(parts) => {
+            parts.parts.last().map(|ident| ident.value.as_str())
+        }
         _ => None,
     }
 }
@@ -504,6 +537,157 @@ mod tests {
             }
         }
     }
+    fn parsed_projection_query(sql: &str) -> ast::Query {
+        let mut statements = novarocks_parser::parse(sql).unwrap();
+        match statements.remove(0) {
+            ast::Statement::Query(query) => query,
+            _ => panic!("expected an original parsed query"),
+        }
+    }
+
+    #[test]
+    fn local_projection_names_preserve_ast_spelling_without_changing_cells() {
+        use arrow::array::{Array, StringArray};
+        let rows = vec![
+            MaterializedViewInfoRow {
+                table_schema: "sales".into(),
+                table_name: "z_mv".into(),
+                is_active: false,
+                inactive_reason: Some("paused".into()),
+            },
+            MaterializedViewInfoRow {
+                table_schema: "other".into(),
+                table_name: "skip_mv".into(),
+                is_active: true,
+                inactive_reason: None,
+            },
+            MaterializedViewInfoRow {
+                table_schema: "sales".into(),
+                table_name: "a_mv".into(),
+                is_active: true,
+                inactive_reason: None,
+            },
+        ];
+        for (sql, names, star) in [
+            (
+                "SELECT table_name, is_active, inactive_reason FROM information_schema.materialized_views WHERE table_schema = 'sales' ORDER BY table_name",
+                vec!["table_name", "is_active", "inactive_reason"],
+                false,
+            ),
+            (
+                "SELECT m.TaBlE_NaMe, m.IS_ACTIVE, m.Inactive_Reason FROM information_schema.materialized_views AS m WHERE m.table_schema = 'sales' ORDER BY m.table_name",
+                vec!["TaBlE_NaMe", "IS_ACTIVE", "Inactive_Reason"],
+                false,
+            ),
+            (
+                "SELECT table_name AS `ViewLabel`, is_active AS `LiveFlag`, inactive_reason AS `Why` FROM information_schema.materialized_views WHERE table_schema = 'sales' ORDER BY table_name",
+                vec!["ViewLabel", "LiveFlag", "Why"],
+                false,
+            ),
+            (
+                "SELECT * FROM information_schema.materialized_views WHERE table_schema = 'sales' ORDER BY table_name",
+                vec!["TABLE_SCHEMA", "TABLE_NAME", "IS_ACTIVE", "INACTIVE_REASON"],
+                true,
+            ),
+        ] {
+            let query = parsed_projection_query(sql);
+            let projection = materialized_view_projection(&query).unwrap().unwrap();
+            let StatementResult::Query(result) =
+                render_materialized_view_rows(&query, &projection, rows.clone()).unwrap()
+            else {
+                panic!("expected local Arrow rows")
+            };
+            assert_eq!(
+                result
+                    .columns
+                    .iter()
+                    .map(|column| column.name())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert_eq!(result.row_count(), 2);
+            assert_eq!(result.batches.len(), 1);
+            let batch = &result.batches[0];
+            let schema_fields = batch.schema();
+            assert_eq!(
+                schema_fields
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            let offset = usize::from(star);
+            if star {
+                let schema = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(schema.value(0), "sales");
+                assert_eq!(schema.value(1), "sales");
+                assert_eq!(schema.null_count(), 0);
+            }
+            let table = batch
+                .column(offset)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!([table.value(0), table.value(1)], ["a_mv", "z_mv"]);
+            assert_eq!(table.null_count(), 0);
+            let active = batch
+                .column(offset + 1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            assert!(active.value(0));
+            assert!(!active.value(1));
+            assert_eq!(active.null_count(), 0);
+            let reason = batch
+                .column(offset + 2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert!(reason.is_null(0));
+            assert_eq!(reason.value(1), "paused");
+            assert_eq!(reason.null_count(), 1);
+            for (ordinal, column) in result.columns.iter().enumerate() {
+                assert_eq!(
+                    column.data_type(),
+                    if ordinal == offset + 1 {
+                        &DataType::Boolean
+                    } else {
+                        &DataType::Utf8
+                    }
+                );
+                assert_eq!(column.nullable(), ordinal == offset + 2);
+                assert_eq!(
+                    schema_fields.field(ordinal).is_nullable(),
+                    ordinal == offset + 2
+                );
+            }
+        }
+        for (sql, message) in [
+            (
+                "SELECT m.* FROM information_schema.materialized_views AS m",
+                "does not support qualified wildcard",
+            ),
+            (
+                "SELECT table_name + 1 FROM information_schema.materialized_views",
+                "unsupported information_schema.materialized_views projection",
+            ),
+            (
+                "SELECT unknown_mv_column FROM information_schema.materialized_views",
+                "unknown information_schema.materialized_views column",
+            ),
+        ] {
+            assert!(
+                materialized_view_projection(&parsed_projection_query(sql))
+                    .unwrap_err()
+                    .contains(message)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -541,10 +725,14 @@ mod bounded_source_tests {
             inactive_reason: None,
         };
         assert!(
-            build_query_result(&[InfoColumn::TableName; 8], std::slice::from_ref(&row)).is_err()
+            build_query_result(
+                &[InfoProjection::canonical(InfoColumn::TableName); 8],
+                std::slice::from_ref(&row)
+            )
+            .is_err()
         );
         let error = build_query_result(
-            &vec![InfoColumn::IsActive; 4097],
+            &vec![InfoProjection::canonical(InfoColumn::IsActive); 4097],
             std::slice::from_ref(&row),
         )
         .unwrap_err();
@@ -670,6 +858,69 @@ mod original_read_tests {
             new.failure_cause().is_none(),
             "a local column error must not invent a provider fact"
         );
+        drop(port);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn original_information_schema_route_preserves_ast_names_and_exact_schema() {
+        let mut host = crate::state_store::testing::open_persistent(format!(
+            "information-schema-names-{}",
+            uuid::Uuid::now_v7()
+        ))
+        .await;
+        let (_owner, execution) = execution();
+        let port = readiness(host.state_store().unwrap()).await;
+        for (sql, names) in [
+            (
+                "SELECT table_name, is_active, inactive_reason FROM information_schema.materialized_views",
+                vec!["table_name", "is_active", "inactive_reason"],
+            ),
+            (
+                "SELECT m.TaBlE_NaMe, m.IS_ACTIVE, m.Inactive_Reason FROM information_schema.materialized_views AS m",
+                vec!["TaBlE_NaMe", "IS_ACTIVE", "Inactive_Reason"],
+            ),
+            (
+                "SELECT table_name AS `ViewLabel`, is_active AS `LiveFlag`, inactive_reason AS `Why` FROM information_schema.materialized_views",
+                vec!["ViewLabel", "LiveFlag", "Why"],
+            ),
+            (
+                "SELECT * FROM information_schema.materialized_views",
+                vec!["TABLE_SCHEMA", "TABLE_NAME", "IS_ACTIVE", "INACTIVE_REASON"],
+            ),
+        ] {
+            let selected = query(sql);
+            let StatementResult::Query(result) =
+                try_query_materialized_views_in(&port, &selected, Arc::new(execution.clone()))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected the original local route")
+            };
+            assert_eq!(
+                result
+                    .columns
+                    .iter()
+                    .map(|column| column.name())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert_eq!(result.row_count(), 0);
+            let offset = usize::from(names.len() == 4);
+            for (ordinal, column) in result.columns.iter().enumerate() {
+                assert_eq!(
+                    column.data_type(),
+                    if ordinal == offset + 1 {
+                        &DataType::Boolean
+                    } else {
+                        &DataType::Utf8
+                    }
+                );
+                assert_eq!(column.nullable(), ordinal == offset + 2);
+            }
+        }
         drop(port);
         host.shutdown(Instant::now() + Duration::from_secs(5))
             .await
