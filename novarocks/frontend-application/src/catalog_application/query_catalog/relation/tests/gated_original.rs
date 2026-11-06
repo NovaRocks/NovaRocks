@@ -621,3 +621,167 @@ async fn original_system_gate_memo_keeps_the_same_typed_source_without_table_or_
         assert!(bindings.captured_bindings().is_empty());
     })).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn captured_numeric_overlay_keeps_the_original_binding_on_every_fact_path() {
+    use crate::catalog_application::{
+        query_bindings::QueryTableBindingKey,
+        query_materializer::{
+            QueryLocalTableOverlay, connector_query_binding_from_materialization,
+        },
+    };
+    use novarocks_sql::compiler::{CatalogRelationOutcome, SqlCompileError};
+
+    with_gate(|gate, context| {
+        Box::pin(async move {
+            let resolver = fixture(None, Some(None));
+            let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+            let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+            // Acquire real Historical(10) metadata before any request binding
+            // exists. This fixture's Current schema is BIGINT, not INTEGER.
+            let request = need("SELECT x FROM ice.db.orders FOR VERSION AS OF 'backup'");
+            let ConnectorQueryRelationMaterialization::Table {
+                materialization,
+                selection,
+            } = load_relation_async(&resolver, context.clone(), &request)
+                .await
+                .unwrap()
+            else {
+                panic!("one original Provider table materialization");
+            };
+            assert_eq!(selection.unwrap().snapshot_id(), 10);
+            let original_pin = materialization.planning_pin.clone();
+            let original_handle = materialization.read_table.clone();
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_observed = factory_calls.clone();
+            assert!(bindings.captured_bindings().is_empty());
+            let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+                Some("ice"),
+                &service,
+                bindings.clone(),
+                iceberg_table_binding_loader(&resolver, context.clone()),
+                vec![QueryLocalTableOverlay::for_catalog(
+                    "ice",
+                    "db",
+                    "orders",
+                    QueryTableBindingKey::snapshot("ice", "db", "orders", 10),
+                    move |token| {
+                        factory_observed.fetch_add(1, Ordering::Relaxed);
+                        connector_query_binding_from_materialization(
+                            materialization.as_ref().clone(),
+                            "ice",
+                            "db",
+                            "orders",
+                            token,
+                        )
+                    },
+                )],
+            );
+            let sql = "SELECT x FROM ice.db.orders FOR VERSION AS OF 10";
+            let source = preparation(sql);
+            let request = &source.needs()[0];
+            let sync = materializer.resolve_relation_fact(request).unwrap();
+            let CatalogRelationOutcome::Resolved(table) = sync.outcome() else {
+                panic!("the first lookup must materialize the overlay");
+            };
+            let original_token = novarocks_sql::planning::catalog::table_binding_id(table);
+            assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+            let asynchronous = materializer
+                .resolve_relation_fact_async(request)
+                .await
+                .unwrap();
+            let original = drive(
+                gate,
+                materializer.resolve_original_relation_fact(
+                    request,
+                    &resolver,
+                    context.clone(),
+                    gate,
+                ),
+            )
+            .await
+            .unwrap();
+            for fact in [sync, asynchronous, original] {
+                assert_eq!(fact.id(), request.id());
+                let CatalogRelationOutcome::Resolved(table) = fact.outcome() else {
+                    panic!("the admitted numeric snapshot must resolve");
+                };
+                let catalog = novarocks_sql::planning::catalog::catalog_table(table);
+                assert_eq!(catalog.identity, request.relation().clone());
+                assert_eq!(
+                    catalog.columns[0].data_type,
+                    arrow::datatypes::DataType::Int32
+                );
+                assert_eq!(
+                    novarocks_sql::planning::catalog::frozen_input_snapshot_id(table),
+                    Some(10),
+                );
+                assert_eq!(
+                    novarocks_sql::planning::catalog::table_binding_id(table),
+                    original_token,
+                );
+                preparation(sql).capture(&[fact]).unwrap();
+            }
+            // A same-name overlay cannot resolve a different snapshot or a
+            // reference whose meaning would require another observation.
+            for sql in [
+                "SELECT x FROM ice.db.orders FOR VERSION AS OF 11",
+                "SELECT x FROM ice.db.orders FOR VERSION AS OF 'backup'",
+            ] {
+                let source = preparation(sql);
+                let request = &source.needs()[0];
+                for error in [
+                    materializer.resolve_relation_fact(request).unwrap_err(),
+                    materializer
+                        .resolve_relation_fact_async(request)
+                        .await
+                        .unwrap_err(),
+                ] {
+                    let SqlCompileError::Analyze(error) = error else {
+                        panic!("the original typed historical refusal must remain");
+                    };
+                    assert_eq!(
+                        error.kind(),
+                        novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape,
+                    );
+                }
+                let error = drive(
+                    gate,
+                    materializer.resolve_original_relation_fact(
+                        request,
+                        &resolver,
+                        context.clone(),
+                        gate,
+                    ),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.analyze_error().unwrap().kind(),
+                    novarocks_sql::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape,
+                );
+            }
+            let captured = bindings.captured_bindings();
+            let [(token, physical)] = captured.as_slice() else {
+                panic!("all fact paths must retain one original binding");
+            };
+            assert_eq!(*token, original_token);
+            let scan = physical.scan_materialization.as_ref().unwrap();
+            assert_eq!(scan.table, original_handle);
+            assert_eq!(scan.selector, ConnectorReadSelector::SnapshotId(10));
+            assert_eq!(
+                scan.planning_pin.control_runtime_id(),
+                original_pin.control_runtime_id(),
+            );
+            assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.acquired.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.reference.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.table_prepare.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.table_create.load(Ordering::Relaxed), 1);
+            assert_eq!(resolver.counts.table_load.load(Ordering::Relaxed), 0);
+            assert_eq!(resolver.counts.view_prepare.load(Ordering::Relaxed), 0);
+            assert_eq!(resolver.counts.view_load.load(Ordering::Relaxed), 0);
+        })
+    })
+    .await;
+}

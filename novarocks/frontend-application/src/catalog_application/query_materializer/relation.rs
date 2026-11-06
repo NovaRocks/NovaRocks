@@ -464,18 +464,44 @@ impl CatalogServiceMaterializer<'_> {
         need: &CatalogRelationNeed,
     ) -> Option<Result<CatalogRelationFact, SqlCompileError>> {
         let relation = need.relation();
-        if relation.catalog != "default_catalog"
-            && self
-                .query_overlay(
-                    Some(&relation.catalog),
-                    &relation.namespace,
-                    &relation.table,
-                )
-                .is_none()
-        {
+        let overlay = self.query_overlay(
+            Some(&relation.catalog),
+            &relation.namespace,
+            &relation.table,
+        );
+        if relation.catalog != "default_catalog" && overlay.is_none() {
             return None;
         }
         if let Some(version) = need.version() {
+            // A captured source already owns this exact numeric snapshot.
+            // Keep its original binding and validate the actual selector;
+            // an overlay cannot resolve another snapshot or a named ref.
+            if let Some(novarocks_sql::planning::catalog::SqlTimeTravelSelection::SnapshotId(
+                snapshot,
+            )) = need.selection_key()
+                && overlay.as_ref().is_some_and(|overlay| {
+                    overlay.key
+                        == QueryTableBindingKey::snapshot(
+                            &relation.catalog,
+                            &relation.namespace,
+                            &relation.table,
+                            *snapshot,
+                        )
+                })
+            {
+                return Some(
+                    self.resolve_table_for_analysis_once(
+                        Some(&relation.catalog),
+                        &relation.namespace,
+                        &relation.table,
+                    )
+                    .map_err(CatalogResolutionError::into_compile)
+                    .and_then(|table| {
+                        CatalogRelationFact::resolved_captured_snapshot(need, table)
+                            .map_err(fact_error)
+                    }),
+                );
+            }
             return Some(Err(
                 novarocks_sql::analyze_error::AnalyzeError::unsupported_query_shape(
                     "historical selection is not supplied by a local or generated relation",
