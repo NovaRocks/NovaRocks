@@ -473,19 +473,25 @@ impl CatalogServiceMaterializer<'_> {
             return None;
         }
         if let Some(version) = need.version() {
+            let selection = match novarocks_sql::planning::catalog::parse_time_travel_selection(
+                version,
+                &relation.fqn(),
+            ) {
+                Ok(selection) => selection,
+                Err(error) => return Some(Err(error.into())),
+            };
             // A captured source already owns this exact numeric snapshot.
             // Keep its original binding and validate the actual selector;
             // an overlay cannot resolve another snapshot or a named ref.
-            if let Some(novarocks_sql::planning::catalog::SqlTimeTravelSelection::SnapshotId(
-                snapshot,
-            )) = need.selection_key()
+            if let novarocks_sql::planning::catalog::SqlTimeTravelSelection::SnapshotId(snapshot) =
+                selection
                 && overlay.as_ref().is_some_and(|overlay| {
                     overlay.key
                         == QueryTableBindingKey::snapshot(
                             &relation.catalog,
                             &relation.namespace,
                             &relation.table,
-                            *snapshot,
+                            snapshot,
                         )
                 })
             {
