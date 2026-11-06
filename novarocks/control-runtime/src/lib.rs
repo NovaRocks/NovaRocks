@@ -24,6 +24,7 @@ pub mod actor_turn;
 pub mod completion;
 pub mod continuation;
 pub mod exit_custody;
+pub mod exit_work;
 pub mod header_readiness;
 pub mod notify;
 pub mod obligation;

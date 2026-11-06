@@ -46,6 +46,7 @@ struct ControlCall {
 struct Scripted {
     grant: AtomicBool,
     hold_controls: AtomicBool,
+    refuse_retry: AtomicBool,
     control_calls: Mutex<VecDeque<ControlCall>>,
     calls: Mutex<VecDeque<Call>>,
     demands: Mutex<Vec<ExchangeDemandEntry>>,
@@ -197,8 +198,19 @@ impl ExchangeFrameTransmitter for Scripted {
     fn forget_unit_facts(&self, stream: ExchangeStreamIdentity) {
         self.watches.lock().unwrap().remove(&stream);
     }
-    fn schedule_unit_retry(&self, _delay: Duration, retry: Retry) -> Result<(), FailureFact> {
-        self.retries.lock().unwrap().push_back(retry);
+    fn schedule_unit_retry(
+        &self,
+        _delay: Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        retry: Retry,
+    ) -> Result<(), FailureFact> {
+        if self.refuse_retry.load(Ordering::Acquire) {
+            return Err(contract_failure());
+        }
+        self.retries.lock().unwrap().push_back(Box::new(move || {
+            retry();
+            drop(activity);
+        }));
         Ok(())
     }
 }
@@ -1587,7 +1599,7 @@ fn control_callback_and_route_retirement_preserve_the_actual_request_captures() 
         "original demand reply lost".into(),
     ));
     assert!(!sender.try_diagnostic_snapshot().unwrap().demand_active);
-    assert_eq!(sender.snapshot().active_control_calls, 1);
+    assert_eq!(sender.snapshot().active_control_calls, 2);
     sender.stop();
     let stop = transport.control_calls.lock().unwrap().pop_front().unwrap();
     assert_eq!(
@@ -1598,21 +1610,149 @@ fn control_callback_and_route_retirement_preserve_the_actual_request_captures() 
         "original stop reply lost".into(),
     ));
     assert!(!sender.try_diagnostic_snapshot().unwrap().stop_active);
-    assert_eq!(sender.snapshot().active_control_calls, 2);
+    assert_eq!(sender.snapshot().active_control_calls, 4);
     sender.retire_after_route_retirement();
     assert_eq!(
         sender.snapshot().stop_obligation,
         ExchangeSenderStopState::RouteRetired
     );
-    assert_eq!(sender.snapshot().active_control_calls, 2);
+    assert_eq!(sender.snapshot().active_control_calls, 4);
     assert_eq!(scheduler.snapshot().calls, 0);
     assert_eq!(scheduler.snapshot().bytes, 0);
     drop(demand.activity);
-    assert_eq!(sender.snapshot().active_control_calls, 1);
+    assert_eq!(sender.snapshot().active_control_calls, 3);
     drop(stop.activity);
+    assert_eq!(sender.snapshot().active_control_calls, 2);
+    transport.retry();
+    assert_eq!(sender.snapshot().active_control_calls, 1);
+    transport.retry();
     assert_eq!(sender.snapshot().active_control_calls, 0);
     assert_eq!(
         sender.snapshot().stop_obligation,
         ExchangeSenderStopState::RouteRetired
     );
+}
+
+// Correctness of query-owned retries: group idleness is the actual join gate;
+// the scripted carrier lets us hold the timer without relying on wall time.
+#[test]
+fn a_demand_retry_keeps_the_sender_group_live_until_the_timer_exits() {
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use crate::runtime::task::io::exchange_edge::{ExchangeDestinationKey, ExchangeEdgeGates};
+    use crate::runtime::task::io::exchange_sender_group::ExchangeSenderGroup;
+    use crate::task_execution::domain::{EdgeOpenVersion, ExchangeEdgeId};
+    use novarocks_execution_contract::TaskFailurePhase;
+
+    let transport = Scripted::granting();
+    transport
+        .demand_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown(
+            "demand reply lost".into(),
+        ));
+    let template = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    let config = template.config.clone();
+    drop(template);
+    let stream = config.stream;
+    let task_owner = crate::runtime::task_control::test_support::owner_for(stream.source().task());
+    let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
+        task_owner.view(TaskFailurePhase::Execution),
+    )));
+    let edge = ExchangeEdgeId::new(1).unwrap();
+    let gates = ExchangeEdgeGates::try_new([(
+        edge,
+        vec![ExchangeDestinationKey::new(
+            stream.destination_task_key(),
+            stream.destination_node().get(),
+        )],
+    )])
+    .unwrap();
+    gates
+        .open(EdgeOpenVersion::new(1).unwrap(), &[edge])
+        .unwrap();
+    let group = ExchangeSenderGroup::new();
+    group
+        .bind(
+            control,
+            vec![config],
+            transport.clone(),
+            scheduler(16),
+            gates,
+        )
+        .unwrap();
+    group
+        .publish(stream, &Bytes::from_static(b"one"), false)
+        .unwrap();
+    assert_eq!(transport.retries.lock().unwrap().len(), 1);
+    group.cancel();
+    assert!(
+        !group.is_idle(),
+        "sleeping retry remains owned after cancellation"
+    );
+    transport.retry();
+    assert!(
+        group.is_idle(),
+        "the final timer exit releases the join gate"
+    );
+}
+
+#[test]
+fn retry_submission_refusal_releases_its_control_activity() {
+    let transport = Scripted::granting();
+    transport.refuse_retry.store(true, Ordering::Release);
+    transport
+        .demand_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown(
+            "demand reply lost".into(),
+        ));
+    let sender = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    publish(&sender, b"one", false);
+    assert!(matches!(
+        sender.snapshot().status,
+        ExchangeStreamSenderStatus::Failed(_)
+    ));
+    assert_eq!(sender.snapshot().active_control_calls, 0);
+    assert!(transport.retries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn dropping_a_retry_after_its_sender_exits_does_not_retain_or_decrement_it() {
+    let transport = Scripted::granting();
+    transport
+        .demand_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Unknown(
+            "demand reply lost".into(),
+        ));
+    let sender = sender(
+        transport.clone(),
+        scheduler(16),
+        1,
+        ExchangeDeliveryRequirement::DemandDriven,
+    );
+    publish(&sender, b"one", false);
+    assert_eq!(sender.snapshot().active_control_calls, 1);
+    let retry = transport.retries.lock().unwrap().pop_front().unwrap();
+    let weak = Arc::downgrade(&sender);
+    drop(sender);
+    assert!(
+        weak.upgrade().is_none(),
+        "retry activity only holds a weak sender"
+    );
+    drop(retry);
+    assert!(weak.upgrade().is_none());
 }

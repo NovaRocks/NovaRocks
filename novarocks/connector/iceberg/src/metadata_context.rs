@@ -2212,6 +2212,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let rebuilt = cached
@@ -2305,6 +2306,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let control = IcebergMetadataResources::new(binding, runtime.handle().clone());
@@ -2347,6 +2349,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let context = IcebergMetadataContext::try_new(

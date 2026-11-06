@@ -1184,8 +1184,13 @@ mod tests {
                 StdArc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
             let io_spawner: StdArc<dyn FileIoSpawner> =
                 StdArc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
-            let binding =
-                IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
+            let binding = IcebergReadBinding::new(
+                None,
+                FsAccessResolver::new(),
+                file_runtime,
+                novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
+                io_spawner,
+            );
             let context = binding
                 .file_read_context(
                     FileCancellation::new(),
@@ -2617,9 +2622,6 @@ mod tests {
                 },
             )))
         }
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-            self.handle.spawn_blocking(job);
-        }
     }
     struct FlightFixture {
         runtime: tokio::runtime::Runtime,
@@ -2669,7 +2671,7 @@ mod tests {
             );
             let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
             let range = service.bind(
-                novarocks_fs::FileRangeScope::try_new(1, 2, 1, 3, 4, 5).unwrap(),
+                novarocks_fs::FileRangeScope::for_test(1, 2, 1, 3, 4, 5).unwrap(),
                 operations.clone(),
             );
             let context = FileReadContext {

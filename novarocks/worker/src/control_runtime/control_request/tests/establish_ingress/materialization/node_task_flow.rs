@@ -516,6 +516,7 @@ impl ExchangeFrameTransmitter for Ports {
     fn schedule_unit_retry(
         &self,
         _: Duration,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
         _: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
         panic!("CountOnly Root fixture attempted Unit retry")

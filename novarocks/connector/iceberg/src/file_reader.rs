@@ -1409,9 +1409,6 @@ pub(crate) mod tests {
                 "identified range admission is exhausted",
             ))
         }
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-            job();
-        }
     }
     #[test]
     fn delete_async_range_admission_retains_resource_exhausted_and_physical_exit() {
@@ -1439,7 +1436,7 @@ pub(crate) mod tests {
         );
         let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
         let range = service.bind(
-            novarocks_fs::FileRangeScope::try_new(1, 2, 1, 3, 4, 5).unwrap(),
+            novarocks_fs::FileRangeScope::for_test(1, 2, 1, 3, 4, 5).unwrap(),
             operations.clone(),
         );
         let context = FileReadContext {

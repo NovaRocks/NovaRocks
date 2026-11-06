@@ -659,9 +659,10 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
     fn schedule_unit_retry(
         &self,
         delay: Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         task: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), novarocks_failure_contract::FailureFact> {
-        self.unit.schedule_unit_retry(delay, task)
+        self.unit.schedule_unit_retry(delay, activity, task)
     }
 }
 

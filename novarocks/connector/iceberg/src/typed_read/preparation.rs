@@ -1199,7 +1199,7 @@ mod tests {
                 as Arc<dyn FileIoRuntime>,
             io_spawner,
             range: Some(service.bind(
-                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
             )),
         };
@@ -1652,9 +1652,6 @@ mod tests {
                     payload_drops: self.payload_drops.clone(),
                 },
             ))
-        }
-        fn spawn_detached_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {
-            unreachable!("not used by a watcher");
         }
     }
     #[tokio::test]

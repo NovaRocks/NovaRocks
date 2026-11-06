@@ -2530,7 +2530,13 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
         let io_spawner: Arc<dyn FileIoSpawner> =
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
-        IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner)
+        IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            file_runtime,
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
+            io_spawner,
+        )
     }
 
     fn iceberg_schema() -> IcebergSchema {
@@ -3260,7 +3266,7 @@ mod tests {
                 harness._runtime.handle().clone(),
             )
             .bind(
-                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
             ),
         );
@@ -4261,7 +4267,7 @@ mod tests {
                 harness._runtime.handle().clone(),
             )
             .bind(
-                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
                 task_operations.clone(),
             ),
         );
@@ -4333,7 +4339,7 @@ mod tests {
                 harness._runtime.handle().clone(),
             )
             .bind(
-                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
             ),
         );

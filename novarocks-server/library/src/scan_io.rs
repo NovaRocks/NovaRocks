@@ -162,17 +162,6 @@ impl FileIoSpawner for TrackedFileIoSpawner {
             }
         }))
     }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        let Ok(flight) = self.flight.enter() else {
-            tracing::warn!("discarded credential refresh after backend scan I/O admission closed");
-            return;
-        };
-        self.inner.spawn_detached_blocking(Box::new(move || {
-            let _flight = flight;
-            job();
-        }));
-    }
 }
 
 /// Backend scan filesystem services injected into the Iceberg read binding.
@@ -188,19 +177,19 @@ pub struct ScanIoServices {
 impl ScanIoServices {
     /// The scan I/O runtime itself: typed scan streams are polled and closed
     /// inside its context.
-    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+    pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
         self.handle.clone()
     }
 
-    pub fn file_runtime(&self) -> Arc<dyn FileIoRuntime> {
+    pub(crate) fn file_runtime(&self) -> Arc<dyn FileIoRuntime> {
         Arc::clone(&self.file_runtime)
     }
 
-    pub fn file_io_spawner(&self) -> Arc<dyn FileIoSpawner> {
+    pub(crate) fn file_io_spawner(&self) -> Arc<dyn FileIoSpawner> {
         Arc::clone(&self.file_io_spawner)
     }
 
-    pub fn range_service(&self) -> Arc<FileRangeService> {
+    pub(crate) fn range_service(&self) -> Arc<FileRangeService> {
         Arc::clone(&self.range_service)
     }
 
@@ -320,13 +309,14 @@ mod tests {
 
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
-        services
+        let mut blocked = services
             .file_io_spawner()
-            .spawn_detached_blocking(Box::new(move || {
+            .spawn(Box::pin(async move {
                 started.send(()).expect("notify blocking start");
-                release_rx.recv().expect("release blocking refresh");
-            }));
-        started_rx.await.expect("blocking refresh started");
+                release_rx.recv().expect("release blocking file work");
+            }))
+            .expect("spawn blocking file work");
+        started_rx.await.expect("blocking file work started");
 
         let task = services
             .file_io_spawner()
@@ -347,7 +337,8 @@ mod tests {
             .err()
             .expect("closed scan I/O rejects new work");
         assert_eq!(refused.kind(), novarocks_fs::FileErrorKind::Cancelled);
-        release.send(()).expect("release blocking refresh");
+        release.send(()).expect("release blocking file work");
+        blocked.drain().await.expect("blocking file work exited");
         shutdown.await.expect("join shutdown").expect("shutdown");
     }
 

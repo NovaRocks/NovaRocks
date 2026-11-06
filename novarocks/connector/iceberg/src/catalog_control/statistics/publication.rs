@@ -488,6 +488,7 @@ mod tests {
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                     runtime.handle().clone(),
                 )),
+                novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
                 Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                     runtime.handle().clone(),
                 )),

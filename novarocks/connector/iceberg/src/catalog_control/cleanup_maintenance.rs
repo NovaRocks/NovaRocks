@@ -1421,6 +1421,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
@@ -2312,6 +2313,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),

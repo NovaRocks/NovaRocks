@@ -361,7 +361,7 @@ mod tests {
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 io_spawner: spawner,
                 range: Some(service.bind(
-                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
                     novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
                 )),
             },
@@ -418,7 +418,7 @@ mod tests {
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 io_spawner: spawner,
                 range: Some(service.bind(
-                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
                     novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
                 )),
             },

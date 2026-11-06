@@ -786,6 +786,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
@@ -929,12 +930,17 @@ mod tests {
             runtime: Arc::clone(&file_runtime),
             io_spawner: Arc::clone(&io_spawner),
             range: Some(service.bind(
-                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
             )),
         };
-        let binding =
-            IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            file_runtime,
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
+            io_spawner,
+        );
         let provider = IcebergPageSourceProvider::new(
             binding,
             context,

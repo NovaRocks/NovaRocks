@@ -102,10 +102,15 @@ pub struct ExchangeCallActivity {
 }
 
 impl ExchangeCallActivity {
-    pub fn new(on_exit: impl FnOnce() + Send + 'static) -> Self {
+    pub(crate) fn new(on_exit: impl FnOnce() + Send + 'static) -> Self {
         Self {
             on_exit: Some(Box::new(on_exit)),
         }
+    }
+
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test(on_exit: impl FnOnce() + Send + 'static) -> Self {
+        Self::new(on_exit)
     }
 }
 

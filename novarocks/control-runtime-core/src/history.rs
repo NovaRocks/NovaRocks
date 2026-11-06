@@ -171,6 +171,13 @@ pub enum HistoryFact {
         generation: Generation,
         parent: Option<ScopedWorkRef>,
     },
+    ScopeRemoved {
+        scope: ScopeId,
+    },
+    WorkUnresolved {
+        scope: ScopeId,
+        work: WorkId,
+    },
     ScopeClosed {
         scope: ScopeId,
     },

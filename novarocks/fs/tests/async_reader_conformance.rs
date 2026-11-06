@@ -110,10 +110,6 @@ impl FileIoSpawner for OrderedGateSpawner {
             task.await;
         })))
     }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
-    }
 }
 
 /// Counts file tasks, one per storage read segment or stat.
@@ -126,10 +122,6 @@ impl FileIoSpawner for CountingSpawner {
     fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         self.spawned.fetch_add(1, Ordering::SeqCst);
         Ok(FileIoJob::new(self.handle.spawn(task)))
-    }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
     }
 }
 
@@ -225,7 +217,7 @@ fn request_through(
             io_spawner: spawner,
             range: service.map(|(service, operations)| {
                 service.bind(
-                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
                     operations,
                 )
             }),

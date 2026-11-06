@@ -3560,6 +3560,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
@@ -3623,9 +3624,11 @@ mod tests {
         ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
             panic!("refused catalog mutation must not spawn FileIO")
         }
+    }
 
-        fn spawn_detached_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {
-            panic!("refused catalog mutation must not spawn blocking FileIO")
+    impl novarocks_fs::RefreshExecutor for RefuseFileIo {
+        fn execute(&self, _: Box<dyn FnOnce() + Send + 'static>) {
+            panic!("refused catalog mutation must not refresh credentials")
         }
     }
 
@@ -3669,6 +3672,7 @@ mod tests {
         let binding = IcebergReadBinding::new(
             None,
             novarocks_fs::FsAccessResolver::new(),
+            Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
         );
@@ -8195,6 +8199,7 @@ mod tests {
         let binding = IcebergReadBinding::new(
             None,
             novarocks_fs::FsAccessResolver::new(),
+            Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
         );
