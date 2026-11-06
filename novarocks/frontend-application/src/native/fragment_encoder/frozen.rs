@@ -736,7 +736,7 @@ pub(crate) mod tests {
             )]
         );
         assert!(!facts.declares_table_writer());
-        assert_eq!(facts.summary_outputs().is_empty(), true);
+        assert!(facts.summary_outputs().is_empty());
         assert!(facts.carries_runtime_filter_bindings());
         let frozen = wire::FrozenFragment::decode(artifact.content().bytes().clone())
             .expect("FrozenFragment");

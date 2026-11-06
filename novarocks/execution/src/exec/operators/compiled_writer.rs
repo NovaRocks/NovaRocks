@@ -172,7 +172,7 @@ fn compiled_finish_core(
     display_id: i32,
     binding: &TableFinishRuntimeBinding,
     error: &Arc<RuntimeErrorState>,
-    logical: bool,
+    has_summary_inputs: bool,
 ) -> ExecutionResult<TableFinishOperatorFactory> {
     let node = program.graph().nodes().get(id.index()).ok_or_else(|| {
         failure::contract(format_args!(
@@ -194,9 +194,9 @@ fn compiled_finish_core(
             id.index()
         )));
     };
-    if !input_roles.summaries.is_empty() != logical {
+    if input_roles.summaries.is_empty() == has_summary_inputs {
         return Err(failure::contract(
-            "compiled finish factory differs from its explicit count mode",
+            "compiled finish factory differs from its explicit summary input declaration",
         ));
     }
     let input = inputs

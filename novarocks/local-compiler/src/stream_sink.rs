@@ -736,12 +736,10 @@ pub(crate) fn lower_summary_outputs_with_creation<H>(
             let mut found = None;
             for cut in package.cuts().outbound.iter() {
                 work.step()?;
-                if cut.edge == summary.edge {
-                    if found.replace(cut).is_some() {
-                        return Err(
-                            FragmentCompileError::Invalid("duplicate summary output cut").into(),
-                        );
-                    }
+                if cut.edge == summary.edge && found.replace(cut).is_some() {
+                    return Err(
+                        FragmentCompileError::Invalid("duplicate summary output cut").into(),
+                    );
                 }
             }
             let cut = found.ok_or(FragmentCompileError::Invalid(

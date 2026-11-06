@@ -171,7 +171,7 @@ fn build_logical_finish(
     node_id: i32,
     inputs: &[ProgramNodeId],
     roles: novarocks_result_contract::FinishInputs,
-    layouts: &novarocks_result_contract::PerKind<novarocks_local_program::StaticLayout>,
+    layouts: &novarocks_result_contract::PerKind<Box<novarocks_local_program::StaticLayout>>,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
@@ -222,7 +222,7 @@ fn build_logical_finish(
                 kind,
                 handle,
                 binding.sources.clone(),
-                layout.clone(),
+                layout.as_ref().clone(),
             )?,
         );
     }

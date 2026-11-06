@@ -97,6 +97,10 @@ impl InternalDomainFailure {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Cold per-consumer state already has one Collecting box created after the original Internal capacity check; boxing a variant would add another allocation."
+)]
 pub(crate) enum InternalDomainState {
     Statistics(StatisticsRootResultDecoder),
     WriteComputation {

@@ -474,7 +474,7 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         OutputRole::Summary(novarocks_physical_plan::SummaryKind::WriteCounts),
         ROUTER,
         FragmentOutputPort::Summary(novarocks_physical_plan::SummaryKind::WriteCounts),
-        &summary.columns.values(),
+        summary.columns.values(),
         FINISH,
         summary_receiver,
         &summary_values,

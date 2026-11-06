@@ -849,11 +849,23 @@ pub(crate) fn lower_finish_with_creation<H>(
         }
         channels.extend(statistics.channels);
         work.flush()?;
+        // Optional layouts own separate fixed-size backing, so adding a kind
+        // does not enlarge every ProgramNodeKind (including ordinary reads).
+        let mut summary_layouts = novarocks_local_program::PerKind::empty();
+        for (kind, (_, layout)) in input.summaries.iter() {
+            work.flush()?;
+            creation
+                .request_layout(std::alloc::Layout::new::<StaticLayout>())
+                .map_err(crate::FragmentCreationError::Creator)?;
+            let layout = Box::new((*layout).clone());
+            work.flush()?;
+            summary_layouts.insert(kind, layout);
+        }
         Ok(LoweredFinish {
             kind: ProgramNodeKind::TableFinish {
                 count_mode: spec.count_mode,
                 input_roles: spec.inputs,
-                summary_layouts: input.summaries.map(|_, (_, layout)| layout.clone()),
+                summary_layouts,
                 inputs: {
                     let mut inputs = vec![child; node.inputs.len()];
                     inputs[spec.inputs.writer_results as usize] = child;

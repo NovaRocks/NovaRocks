@@ -841,7 +841,7 @@ fn decode_summary_value(
         SummaryKind::WriteCounts => SummaryValue::WriteCounts(
             LogicalChangeCounts::try_from_wire(wire[0], wire[1], wire[2]).map_err(|error| {
                 summary_failure(SummaryFailure::Count {
-                    kind: kind,
+                    kind,
                     cause: SummaryMergeError::WriteCounts(error),
                 })
             })?,
@@ -860,7 +860,7 @@ fn decode_summary_value(
                 DeleteVerificationCounts::try_from_wire(wire[0], wire[1], wire[2], fingerprint)
                     .map_err(|error| {
                         summary_failure(SummaryFailure::Count {
-                            kind: kind,
+                            kind,
                             cause: SummaryMergeError::DeleteVerification(error),
                         })
                     })?,

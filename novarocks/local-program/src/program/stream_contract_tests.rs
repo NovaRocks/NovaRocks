@@ -230,7 +230,7 @@ fn program_summary_table_rejects_duplicate_kinds_and_all_current_node_authors() 
             graph.nodes().to_vec(),
             graph.root(),
             graph.expressions().clone(),
-            graph.profile().clone(),
+            graph.profile(),
             graph.requirements().clone(),
             graph.sink().cloned(),
             summaries,
@@ -345,7 +345,7 @@ fn finish_graph(shape: SummaryInput) -> Result<LocalProgramGraph, LocalProgramEr
             },
         },
         summary_layouts: novarocks_result_contract::PerKind {
-            write_counts: Some(summary_layout.clone()),
+            write_counts: Some(Box::new(summary_layout.clone())),
             delete_verification: None,
         },
         expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],

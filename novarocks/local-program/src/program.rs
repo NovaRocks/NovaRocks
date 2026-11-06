@@ -635,7 +635,7 @@ pub enum ProgramNodeKind {
     TableFinish {
         count_mode: novarocks_result_contract::FinishCountMode,
         input_roles: novarocks_result_contract::FinishInputs,
-        summary_layouts: novarocks_result_contract::PerKind<StaticLayout>,
+        summary_layouts: novarocks_result_contract::PerKind<Box<StaticLayout>>,
         inputs: Vec<ProgramNodeId>,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_multiplex_layout: StaticLayout,

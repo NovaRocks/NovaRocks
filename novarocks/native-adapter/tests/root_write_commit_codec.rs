@@ -69,7 +69,7 @@ unsafe impl GlobalAlloc for Probe {
 static ALLOCATOR: Probe = Probe;
 
 #[derive(Clone)]
-enum Row {
+enum ExpectedRecord {
     RowCount(i64),
     DeleteVerification([i64; 3], [u8; 16]),
     Fragment(i32, Vec<u8>),
@@ -95,8 +95,8 @@ fn artifact(
     blob: &str,
     body: &[u8],
     properties: &[(&str, &str)],
-) -> Row {
-    Row::Artifact {
+) -> ExpectedRecord {
+    ExpectedRecord::Artifact {
         target,
         fields: fields.to_vec(),
         blob: blob.into(),
@@ -108,7 +108,7 @@ fn artifact(
     }
 }
 
-fn batch(rows: &[Row]) -> RecordBatch {
+fn batch(rows: &[ExpectedRecord]) -> RecordBatch {
     let schema = root_write_result_schema();
     let mut requested = Vec::new();
     let mut matched = Vec::new();
@@ -128,7 +128,7 @@ fn batch(rows: &[Row]) -> RecordBatch {
     let mut values = Vec::new();
     let mut entry_valid = Vec::new();
     for row in rows {
-        if let Row::DeleteVerification(counts, fingerprint) = row {
+        if let ExpectedRecord::DeleteVerification(counts, fingerprint) = row {
             requested.push(Some(counts[0]));
             matched.push(Some(counts[1]));
             insufficient.push(Some(counts[2]));
@@ -140,10 +140,10 @@ fn batch(rows: &[Row]) -> RecordBatch {
             fingerprints.append_null();
         }
         let (kind, target, count, fragment, artifact) = match row.clone() {
-            Row::RowCount(count) => (1, None, Some(count), None, None),
-            Row::DeleteVerification(_, _) => (4, None, None, None, None),
-            Row::Fragment(target, bytes) => (2, Some(target), None, Some(bytes), None),
-            Row::Artifact {
+            ExpectedRecord::RowCount(count) => (1, None, Some(count), None, None),
+            ExpectedRecord::DeleteVerification(_, _) => (4, None, None, None, None),
+            ExpectedRecord::Fragment(target, bytes) => (2, Some(target), None, Some(bytes), None),
+            ExpectedRecord::Artifact {
                 target,
                 fields,
                 blob,
@@ -156,7 +156,7 @@ fn batch(rows: &[Row]) -> RecordBatch {
                 None,
                 Some((fields, blob, body, properties)),
             ),
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind,
                 target,
                 count,
@@ -291,9 +291,9 @@ fn records(mut bytes: &[u8]) -> Vec<(WriteCommitRecordHeader, Vec<u8>)> {
 #[test]
 fn summary_fragment_and_artifact_records_are_exact() {
     let rows = [
-        Row::Fragment(2, b"frag".to_vec()),
+        ExpectedRecord::Fragment(2, b"frag".to_vec()),
         artifact(2, &[7, 3], "theta", &[0, 255], &[("k", "vv"), ("a", "")]),
-        Row::RowCount(41),
+        ExpectedRecord::RowCount(41),
     ];
     let encoded = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     assert!(encoded.error.is_none());
@@ -341,8 +341,8 @@ fn tiny_outputs_and_large_bodies_produce_identical_bytes_in_bounded_turns() {
     let body = vec![0x5a; 200 * 1024];
     let rows = [
         artifact(1, &[1], "b", &body, &[]),
-        Row::Fragment(1, vec![9; 70 * 1024]),
-        Row::RowCount(0),
+        ExpectedRecord::Fragment(1, vec![9; 70 * 1024]),
+        ExpectedRecord::RowCount(0),
     ];
     let whole = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     let tiny = encode(batch(&rows), WriteCommitTotals::default(), 7);
@@ -354,7 +354,7 @@ fn tiny_outputs_and_large_bodies_produce_identical_bytes_in_bounded_turns() {
 #[test]
 fn a_second_summary_is_refused_before_its_header_and_across_batches() {
     let encoded = encode(
-        batch(&[Row::RowCount(1), Row::RowCount(2)]),
+        batch(&[ExpectedRecord::RowCount(1), ExpectedRecord::RowCount(2)]),
         WriteCommitTotals::default(),
         1 << 20,
     );
@@ -366,11 +366,11 @@ fn a_second_summary_is_refused_before_its_header_and_across_batches() {
     );
     assert!(encoded.totals.row_count_seen());
     let first = encode(
-        batch(&[Row::RowCount(1)]),
+        batch(&[ExpectedRecord::RowCount(1)]),
         WriteCommitTotals::default(),
         1 << 20,
     );
-    let second = encode(batch(&[Row::RowCount(1)]), first.totals, 1 << 20);
+    let second = encode(batch(&[ExpectedRecord::RowCount(1)]), first.totals, 1 << 20);
     assert_eq!(second.error, Some(WriteCommitCodecError::DuplicateRowCount));
     assert!(second.bytes.is_empty());
     assert_eq!(
@@ -382,7 +382,7 @@ fn a_second_summary_is_refused_before_its_header_and_across_batches() {
 #[test]
 fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
     let oversized = encode(
-        batch(&[Row::Fragment(
+        batch(&[ExpectedRecord::Fragment(
             1,
             vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
         )]),
@@ -392,7 +392,7 @@ fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
     assert_eq!(oversized.error, Some(WriteCommitCodecError::FragmentLimit));
     assert!(oversized.bytes.is_empty());
     let exact = encode(
-        batch(&[Row::Fragment(
+        batch(&[ExpectedRecord::Fragment(
             1,
             vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
         )]),
@@ -400,7 +400,8 @@ fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
         1 << 20,
     );
     assert!(exact.error.is_none());
-    let many = vec![Row::Fragment(1, vec![1]); MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1];
+    let many =
+        vec![ExpectedRecord::Fragment(1, vec![1]); MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1];
     let entries = encode(batch(&many), WriteCommitTotals::default(), 1 << 20);
     assert_eq!(entries.error, Some(WriteCommitCodecError::FragmentLimit));
     assert_eq!(
@@ -414,7 +415,7 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
     let long_value = "v".repeat(MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES);
     let cases = [
         (
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind: 1,
                 target: Some(1),
                 count: Some(1),
@@ -423,7 +424,7 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
             WriteCommitCodecError::Shape,
         ),
         (
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind: 9,
                 target: None,
                 count: Some(1),
@@ -431,8 +432,14 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
             },
             WriteCommitCodecError::Kind,
         ),
-        (Row::RowCount(-1), WriteCommitCodecError::RowCount),
-        (Row::Fragment(-3, vec![1]), WriteCommitCodecError::Target),
+        (
+            ExpectedRecord::RowCount(-1),
+            WriteCommitCodecError::RowCount,
+        ),
+        (
+            ExpectedRecord::Fragment(-3, vec![1]),
+            WriteCommitCodecError::Target,
+        ),
         (
             artifact(1, &[], "b", &[], &[]),
             WriteCommitCodecError::FieldIds,
@@ -475,7 +482,7 @@ fn foreign_schema_is_refused_at_construction() {
 #[test]
 fn header_parse_refuses_forged_declarations() {
     let encoded = encode(
-        batch(&[Row::Fragment(1, b"x".to_vec())]),
+        batch(&[ExpectedRecord::Fragment(1, b"x".to_vec())]),
         WriteCommitTotals::default(),
         1 << 20,
     );
@@ -510,9 +517,9 @@ fn header_parse_refuses_forged_declarations() {
 #[test]
 fn record_views_return_exactly_what_was_encoded() {
     let rows = [
-        Row::Fragment(3, b"fragment".to_vec()),
+        ExpectedRecord::Fragment(3, b"fragment".to_vec()),
         artifact(3, &[9, 4], "theta", b"body", &[("k", "v"), ("kk", "")]),
-        Row::RowCount(12),
+        ExpectedRecord::RowCount(12),
     ];
     let encoded = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     let mut rest = encoded.bytes.as_slice();
@@ -546,8 +553,8 @@ fn record_views_return_exactly_what_was_encoded() {
 #[test]
 fn deletion_verification_roundtrips_fixed_little_endian_payload_across_one_byte_turns() {
     let rows = [
-        Row::RowCount(7),
-        Row::DeleteVerification([3, 2, 1], [9; 16]),
+        ExpectedRecord::RowCount(7),
+        ExpectedRecord::DeleteVerification([3, 2, 1], [9; 16]),
     ];
     let output = encode(batch(&rows), WriteCommitTotals::default(), 1);
     assert_eq!(output.error, None);
@@ -577,7 +584,10 @@ fn deletion_verification_roundtrips_fixed_little_endian_payload_across_one_byte_
 
 #[test]
 fn duplicate_or_negative_verification_is_refused_before_its_header() {
-    let good = [Row::RowCount(0), Row::DeleteVerification([0; 3], [0; 16])];
+    let good = [
+        ExpectedRecord::RowCount(0),
+        ExpectedRecord::DeleteVerification([0; 3], [0; 16]),
+    ];
     let prefix = encode(batch(&good), WriteCommitTotals::default(), 7);
     let mut duplicate =
         WriteCommitEncoder::try_new(batch(&[good[1].clone()]), prefix.totals).unwrap();
@@ -589,7 +599,7 @@ fn duplicate_or_negative_verification_is_refused_before_its_header() {
     assert_eq!(untouched, [0xA5; 64]);
     for counts in [[-1, 0, 0], [0, -1, 0], [0, 0, -1]] {
         let output = encode(
-            batch(&[Row::DeleteVerification(counts, [0; 16])]),
+            batch(&[ExpectedRecord::DeleteVerification(counts, [0; 16])]),
             WriteCommitTotals::default(),
             1,
         );

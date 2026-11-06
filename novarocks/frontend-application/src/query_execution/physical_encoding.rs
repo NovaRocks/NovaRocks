@@ -47,6 +47,7 @@ use crate::query_execution::artifact::native_submission::{
 };
 use crate::query_execution::attempt_plan_facts::{
     AttemptEdgeFacts, AttemptPartitionKind, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
+    WriteRootFacts,
 };
 use crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 use crate::query_execution::fragment_scheduling::{
@@ -888,13 +889,7 @@ fn wire_node_id(node: NodeId) -> Result<i32, String> {
 fn completed_plan_write_root_facts(
     plan: &PhysicalPlan,
     writes: bool,
-) -> Result<
-    Option<(
-        Vec<WriteTargetOrdinal>,
-        novarocks_result_contract::PerKind<()>,
-    )>,
-    String,
-> {
+) -> Result<Option<WriteRootFacts>, String> {
     if !writes {
         return Ok(None);
     }
@@ -912,8 +907,8 @@ fn completed_plan_write_root_facts(
     let NodeKind::TableFinish(finish) = &node.kind else {
         return Err("completed write Root is not its original TableFinish".into());
     };
-    Ok(Some((
-        finish.expected_target_ordinals.to_vec(),
+    Ok(Some(WriteRootFacts::new(
+        finish.expected_target_ordinals.clone(),
         finish.inputs.summaries.map(|_, _| ()),
     )))
 }
@@ -941,12 +936,12 @@ mod tests {
     #[test]
     fn write_root_kinds_are_taken_from_the_original_finish_declaration() {
         let (plan, _session) = crate::query_execution::package_writes::tests::insert_values_plan();
-        let (targets, kinds) = completed_plan_write_root_facts(&plan, true)
+        let root = completed_plan_write_root_facts(&plan, true)
             .unwrap()
             .unwrap();
-        assert_eq!(targets, [WriteTargetOrdinal::try_new(0).unwrap()]);
+        assert_eq!(root.targets(), [WriteTargetOrdinal::try_new(0).unwrap()]);
         assert!(
-            kinds.is_empty(),
+            root.summary_kinds().is_empty(),
             "ordinary INSERT does not acquire logical count or verification authorship"
         );
     }
