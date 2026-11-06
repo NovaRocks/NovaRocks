@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Writer and logical-summary source terminals and accepted final-info validation.
+//! Writer and per-kind summary-source terminals and accepted final-info validation.
 //!
 //! The registered result consumer proves complete local End consumption.
 //! This module owns only the independent Task-terminal half for writers and
-//! logical-summary sources; prepared facts and external publication stay with
+//! summary sources; prepared facts and external publication stay with
 //! their original domain authors. Protocol terminals never prove physical exit.
 
+use novarocks_result_contract::{PerKind, SummaryKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::task_execution::status_validation::verify_final_info;
@@ -44,10 +45,11 @@ pub enum WriteVerdict {
     Complete,
     /// The attempt latched a failure or an abort.
     AttemptFailed,
-    /// A writer, logical summary source, or root finish task has not completed.
+    /// A writer, declared summary source, or root finish task has not completed.
     TaskNotFinished {
         task: TaskIdentity,
         state: TaskState,
+        summary_kind: Option<SummaryKind>,
     },
     /// A task outside the declared writer set reported writer facts, so the
     /// declared set is not the real one and "every writer finished" cannot be
@@ -74,8 +76,16 @@ impl std::fmt::Display for WriteVerdict {
         match self {
             Self::Complete => formatter.write_str("complete"),
             Self::AttemptFailed => formatter.write_str("attempt failed"),
-            Self::TaskNotFinished { task, state } => {
-                write!(formatter, "task {task} is {state}")
+            Self::TaskNotFinished {
+                task,
+                state,
+                summary_kind,
+            } => {
+                if let Some(kind) = summary_kind {
+                    write!(formatter, "{kind} summary task {task} is {state}")
+                } else {
+                    write!(formatter, "task {task} is {state}")
+                }
             }
             Self::UndeclaredWriter(task) => {
                 write!(
@@ -97,18 +107,18 @@ impl std::fmt::Display for WriteVerdict {
 #[derive(Clone, Debug)]
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,
-    summary_sources: BTreeSet<TaskIdentity>,
+    summary_sources: PerKind<BTreeSet<TaskIdentity>>,
     root_finish: TaskIdentity,
     // Each original writer remains here until its current status satisfies
     // this owner's success-compatible rule. Verdicts never rescan completed writers.
     pending_writers: BTreeMap<TaskIdentity, TaskState>,
-    pending_summary_sources: BTreeMap<TaskIdentity, TaskState>,
+    pending_summary_sources: PerKind<BTreeMap<TaskIdentity, TaskState>>,
     root_state: TaskState,
     undeclared_writers: BTreeSet<TaskIdentity>,
 }
 
 impl WriteCompletionTracker {
-    /// Freezes independent writer and logical-summary source Task sets.
+    /// Freezes independent writer and per-kind summary-source Task sets.
     /// Ordinary writes declare an empty summary-source set.
     ///
     /// A write with no declared writer is refused rather than treated as a
@@ -117,10 +127,9 @@ impl WriteCompletionTracker {
     pub fn try_new(
         root_finish: TaskIdentity,
         writers: impl IntoIterator<Item = TaskIdentity>,
-        summary_sources: impl IntoIterator<Item = TaskIdentity>,
+        summary_sources: PerKind<BTreeSet<TaskIdentity>>,
     ) -> Result<Self, TaskExecutionError> {
         let writers: BTreeSet<TaskIdentity> = writers.into_iter().collect();
-        let summary_sources: BTreeSet<TaskIdentity> = summary_sources.into_iter().collect();
         if writers.is_empty() {
             return Err(TaskExecutionError::Schedule(
                 "a distributed write declares no writer task".to_owned(),
@@ -130,10 +139,16 @@ impl WriteCompletionTracker {
             .iter()
             .map(|&writer| (writer, TaskState::Planned))
             .collect();
-        let pending_summary_sources = summary_sources
-            .iter()
-            .map(|&source| (source, TaskState::Planned))
-            .collect();
+        let mut pending_summary_sources = PerKind::empty();
+        for (kind, sources) in summary_sources.iter() {
+            pending_summary_sources.insert(
+                kind,
+                sources
+                    .iter()
+                    .map(|&source| (source, TaskState::Planned))
+                    .collect(),
+            );
+        }
         Ok(Self {
             writers,
             summary_sources,
@@ -166,18 +181,22 @@ impl WriteCompletionTracker {
                 self.pending_writers.insert(identity, status.state());
             }
         }
-        if self.summary_sources.contains(&identity) {
-            // The original BE completion owner must validate MustDrain
-            // retirement before publishing a success-compatible terminal.
-            // A FE status cannot manufacture that physical-exit proof.
-            if status.state() == TaskState::Finished
-                || (status.state() == TaskState::Canceled
-                    && status.is_success_compatible_terminal())
-            {
-                self.pending_summary_sources.remove(&identity);
-            } else {
-                self.pending_summary_sources
-                    .insert(identity, status.state());
+        for (kind, sources) in self.summary_sources.iter() {
+            if sources.contains(&identity) {
+                // Original BE retirement proves strict delivery; membership and
+                // FE status observation never manufacture a physical-exit fact.
+                let pending = self
+                    .pending_summary_sources
+                    .get_mut(kind)
+                    .expect("pending kinds retain the frozen source declaration");
+                if status.state() == TaskState::Finished
+                    || (status.state() == TaskState::Canceled
+                        && status.is_success_compatible_terminal())
+                {
+                    pending.remove(&identity);
+                } else {
+                    pending.insert(identity, status.state());
+                }
             }
         }
         // Summary membership grants no writer authority.
@@ -202,15 +221,26 @@ impl WriteCompletionTracker {
             return WriteVerdict::UndeclaredWriter(undeclared);
         }
         if let Some((&task, &state)) = self.pending_writers.first_key_value() {
-            return WriteVerdict::TaskNotFinished { task, state };
+            return WriteVerdict::TaskNotFinished {
+                task,
+                state,
+                summary_kind: None,
+            };
         }
-        if let Some((&task, &state)) = self.pending_summary_sources.first_key_value() {
-            return WriteVerdict::TaskNotFinished { task, state };
+        for (kind, pending) in self.pending_summary_sources.iter() {
+            if let Some((&task, &state)) = pending.first_key_value() {
+                return WriteVerdict::TaskNotFinished {
+                    task,
+                    state,
+                    summary_kind: Some(kind),
+                };
+            }
         }
         if self.root_state != TaskState::Finished {
             return WriteVerdict::TaskNotFinished {
                 task: self.root_finish,
                 state: self.root_state,
+                summary_kind: None,
             };
         }
         WriteVerdict::Complete
@@ -232,7 +262,7 @@ pub fn accept_final_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteCompletionTracker, WriteVerdict};
+    use super::{PerKind, SummaryKind, WriteCompletionTracker, WriteVerdict};
     use crate::task_execution::error::TaskExecutionError;
     use novarocks_execution::task_execution::{
         AbortCause, CancelReason, FinalTaskInfo, TaskIdentity, TaskOutputFacts, TaskState,
@@ -241,6 +271,16 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use std::collections::BTreeSet;
+
+    fn summaries(
+        sources: impl IntoIterator<Item = TaskIdentity>,
+    ) -> PerKind<BTreeSet<TaskIdentity>> {
+        PerKind {
+            write_counts: Some(sources.into_iter().collect()),
+            delete_verification: None,
+        }
+    }
 
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(5, 6), AttemptId::new(1).expect("nonzero"))
@@ -287,7 +327,8 @@ mod tests {
         let root = identity(1, 1, backend);
         let writer = identity(2, 2, backend);
         let source = identity(3, 3, backend);
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], summaries([source])).unwrap();
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         assert_eq!(
@@ -295,6 +336,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: source,
                 state: TaskState::Planned,
+                summary_kind: Some(SummaryKind::WriteCounts),
             }
         );
         tracker.observe_status(&status(source, 2, TaskState::Running));
@@ -303,6 +345,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: source,
                 state: TaskState::Running,
+                summary_kind: Some(SummaryKind::WriteCounts),
             }
         );
         tracker.observe_status(&status(source, 3, TaskState::Finished));
@@ -317,7 +360,8 @@ mod tests {
         let writer = identity(2, 2, backend);
         let source = identity(3, 3, backend);
         let foreign = identity(3, 3, BackendProcessId::new_v7());
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], summaries([source])).unwrap();
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(foreign, 2, TaskState::Finished));
@@ -326,6 +370,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: source,
                 state: TaskState::Planned,
+                summary_kind: Some(SummaryKind::WriteCounts),
             }
         );
         tracker.observe_status(&status(source, 2, TaskState::Aborted));
@@ -334,7 +379,8 @@ mod tests {
             verdict,
             WriteVerdict::TaskNotFinished {
                 task: source,
-                state: TaskState::Aborted
+                state: TaskState::Aborted,
+                summary_kind: Some(SummaryKind::WriteCounts),
             }
         );
         assert!(
@@ -349,7 +395,8 @@ mod tests {
         let root = identity(1, 1, backend);
         let writer = identity(2, 2, backend);
         let source = identity(3, 3, backend);
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], summaries([source])).unwrap();
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(
@@ -364,7 +411,7 @@ mod tests {
     #[test]
     fn one_exact_task_status_can_satisfy_multiple_declared_roles() {
         let root = identity(1, 1, BackendProcessId::new_v7());
-        let mut tracker = WriteCompletionTracker::try_new(root, [root], [root]).unwrap();
+        let mut tracker = WriteCompletionTracker::try_new(root, [root], summaries([root])).unwrap();
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
     }
@@ -375,7 +422,8 @@ mod tests {
         let root = identity(1, 1, backend);
         let writer = identity(2, 2, backend);
         let source = identity(3, 3, backend);
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], summaries([source])).unwrap();
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(source, 2, TaskState::Canceled));
@@ -388,14 +436,16 @@ mod tests {
         let writer_one = identity(2, 1, backend);
         let writer_two = identity(2, 2, backend);
         let root = identity(1, 3, backend);
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer_one, writer_two], [])
-            .expect("a declared writer set");
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer_one, writer_two], PerKind::empty())
+                .expect("a declared writer set");
 
         assert_eq!(
             tracker.execution_verdict(false),
             WriteVerdict::TaskNotFinished {
                 task: writer_one,
                 state: TaskState::Planned,
+                summary_kind: None,
             },
             "silence from a writer is not evidence that it finished"
         );
@@ -407,6 +457,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: writer_two,
                 state: TaskState::Flushing,
+                summary_kind: None,
             }
         );
 
@@ -416,6 +467,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: root,
                 state: TaskState::Planned,
+                summary_kind: None,
             },
             "the root finish task is not optional"
         );
@@ -432,8 +484,8 @@ mod tests {
         let backend = BackendProcessId::new_v7();
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
-        let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], PerKind::empty())
+            .expect("a declared writer set");
 
         // The task verdict is only one half of the write gate. This normal
         // stand-down is accepted here because the other half -- a complete
@@ -445,6 +497,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: root,
                 state: TaskState::Planned,
+                summary_kind: None,
             },
             "a normal writer cancel is not sufficient without the Root terminal"
         );
@@ -457,8 +510,8 @@ mod tests {
         let backend = BackendProcessId::new_v7();
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
-        let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], PerKind::empty())
+            .expect("a declared writer set");
 
         let completed_then_canceled = TaskStatus::try_new(
             writer,
@@ -482,8 +535,8 @@ mod tests {
         let writer = identity(2, 1, backend);
         let undeclared = identity(2, 7, backend);
         let root = identity(1, 3, backend);
-        let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], PerKind::empty())
+            .expect("a declared writer set");
 
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
@@ -505,7 +558,7 @@ mod tests {
     fn a_write_with_no_declared_writer_is_refused_rather_than_trivially_complete() {
         let root = identity(1, 3, BackendProcessId::new_v7());
         assert!(matches!(
-            WriteCompletionTracker::try_new(root, [], []),
+            WriteCompletionTracker::try_new(root, [], PerKind::empty()),
             Err(TaskExecutionError::Schedule(_))
         ));
     }
@@ -515,8 +568,8 @@ mod tests {
         let backend = BackendProcessId::new_v7();
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
-        let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], PerKind::empty())
+            .expect("a declared writer set");
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         // Every task reached FINISHED, so only the latch stands between this
@@ -532,7 +585,8 @@ mod tests {
         let writer = identity(2, 1, backend);
         let root = identity(1, 1, backend);
         for state in [TaskState::Finished, TaskState::Running, TaskState::Aborted] {
-            let mut tracker = WriteCompletionTracker::try_new(root, [writer], []).unwrap();
+            let mut tracker =
+                WriteCompletionTracker::try_new(root, [writer], PerKind::empty()).unwrap();
             tracker.observe_status(&status(root, 2, TaskState::Finished));
             tracker.observe_status(&status(writer, 2, state));
             let verdict = tracker.execution_verdict(false);
@@ -543,7 +597,8 @@ mod tests {
                     verdict,
                     WriteVerdict::TaskNotFinished {
                         task: writer,
-                        state
+                        state,
+                        summary_kind: None,
                     }
                 );
                 assert_eq!(verdict.is_pending(), state == TaskState::Running);
@@ -563,7 +618,12 @@ mod tests {
             TaskState::Failing,
         ] {
             assert!(
-                WriteVerdict::TaskNotFinished { task, state }.is_pending(),
+                WriteVerdict::TaskNotFinished {
+                    task,
+                    state,
+                    summary_kind: None,
+                }
+                .is_pending(),
                 "{state} may still publish a later terminal"
             );
         }
@@ -574,7 +634,12 @@ mod tests {
             TaskState::Failed,
         ] {
             assert!(
-                !WriteVerdict::TaskNotFinished { task, state }.is_pending(),
+                !WriteVerdict::TaskNotFinished {
+                    task,
+                    state,
+                    summary_kind: None,
+                }
+                .is_pending(),
                 "{state} is conclusive"
             );
         }
@@ -596,5 +661,59 @@ mod tests {
             super::accept_final_info(&later, &info),
             Err(TaskExecutionError::FinalInfo(_))
         ));
+    }
+
+    #[test]
+    fn each_summary_kind_requires_its_own_exact_sources_and_keeps_repeated_status_idempotent() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let declared = PerKind {
+            write_counts: Some([writer].into()),
+            delete_verification: Some([source].into()),
+        };
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], declared).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        let pending = WriteVerdict::TaskNotFinished {
+            task: source,
+            state: TaskState::Planned,
+            summary_kind: Some(SummaryKind::DeleteVerification),
+        };
+        assert_eq!(tracker.execution_verdict(false), pending);
+        assert!(pending.to_string().contains("delete-verification"));
+        let foreign = identity(3, 3, BackendProcessId::new_v7());
+        tracker.observe_status(&status(foreign, 2, TaskState::Finished));
+        assert_eq!(tracker.execution_verdict(false), pending);
+        tracker.observe_status(&status(source, 2, TaskState::Canceled));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
+    }
+
+    #[test]
+    fn one_task_can_finish_both_summary_kinds_without_granting_writer_authority() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let declared = PerKind {
+            write_counts: Some([source].into()),
+            delete_verification: Some([source].into()),
+        };
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer], declared.clone()).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        tracker.observe_status(&status(source, 2, TaskState::Finished));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
+        let mut refused = WriteCompletionTracker::try_new(root, [writer], declared).unwrap();
+        refused.observe_status(
+            &status(source, 2, TaskState::Finished).with_writer(TaskWriterFacts::empty()),
+        );
+        assert_eq!(
+            refused.execution_verdict(false),
+            WriteVerdict::UndeclaredWriter(source)
+        );
     }
 }

@@ -258,7 +258,12 @@ async fn run_arrival_order_with_summary_source(
     let frozen_targets =
         [novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).unwrap()];
     let seed = WriteComputationSeed {
-        contract: RootWriteDecodeContract::try_new(&frozen_targets, session.targets()).unwrap(),
+        contract: RootWriteDecodeContract::try_new(
+            &frozen_targets,
+            session.targets(),
+            novarocks_result_contract::PerKind::empty(),
+        )
+        .unwrap(),
         decode: session.computation_decode(&frozen_targets).unwrap(),
         session: Arc::clone(&session),
         initial: Arc::clone(&credentials),

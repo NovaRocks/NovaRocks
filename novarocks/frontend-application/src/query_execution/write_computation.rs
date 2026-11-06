@@ -20,6 +20,7 @@
 use super::*;
 use crate::query_execution::write_result::RootWriteDecodeFailure;
 use novarocks_proto_codec::connector_write::{ConnectorWriteCodecError, ValidatedCommitFragment};
+use novarocks_result_contract::DeleteVerificationCounts;
 use novarocks_spi::connector::ConnectorWriteFragmentWireDecoder;
 use std::sync::Weak;
 
@@ -41,6 +42,7 @@ pub(crate) struct SessionDecodedWriteSegment {
         novarocks_query_application::api::PlanSeal,
     )>,
     prepared: ConnectorPreparedWriteSet,
+    delete_verification: Option<DeleteVerificationCounts>,
     fragment_sizes: Vec<usize>,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
@@ -82,8 +84,14 @@ impl WriteComputationDecode {
         // Decoding borrows the same original byte author while every canonical
         // input remains live; each new outer buffer pays its coexistence first.
         let decoded = self.interpret_borrowed(&prepared)?;
-        let (_row_count, fragments, statistics, retention, production_execution) =
-            prepared.into_parts();
+        let (
+            _row_count,
+            delete_verification,
+            fragments,
+            statistics,
+            retention,
+            production_execution,
+        ) = prepared.into_parts();
         let fragment_sizes = fragments.iter().map(|(_, bytes)| bytes.len()).collect();
         drop(fragments);
         if let Some(retention) = &retention {
@@ -95,6 +103,7 @@ impl WriteComputationDecode {
             origin: Arc::clone(&self.origin),
             production_execution,
             prepared: decoded,
+            delete_verification,
             fragment_sizes,
             statistics,
             retention,
@@ -153,9 +162,21 @@ impl WriteComputationDecode {
 pub(crate) struct AcceptedWriteSegment {
     origin: Arc<()>,
     row_count: u64,
+    delete_verification: Option<DeleteVerificationCounts>,
     empty: bool,
 }
 impl AcceptedWriteSegment {
+    /// Evidence from this exact computation cut, never the Session's query union.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "RWM-10 reads this attempt's accepted verification evidence."
+        )
+    )]
+    pub(crate) const fn delete_verification(&self) -> Option<DeleteVerificationCounts> {
+        self.delete_verification
+    }
     pub(crate) fn row_count(&self) -> u64 {
         self.row_count
     }
@@ -229,6 +250,7 @@ impl ConnectorWriteSession {
         crate::query_execution::write_result::RootWriteDecodeContract::try_new(
             query_targets,
             self.targets(),
+            novarocks_result_contract::PerKind::empty(),
         )
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
         Ok(WriteComputationDecode {
@@ -317,6 +339,7 @@ impl ConnectorWriteSession {
         }
         let SessionDecodedWriteSegment {
             prepared,
+            delete_verification,
             fragment_sizes,
             statistics,
             retention,
@@ -453,6 +476,7 @@ impl ConnectorWriteSession {
             AcceptedWriteSegment {
                 origin: Arc::clone(&self.decode_origin),
                 row_count,
+                delete_verification,
                 empty,
             },
             notification,
@@ -573,5 +597,30 @@ mod outer_byte_budget_tests {
         drop((binding, window));
         root.owner.complete();
         root.business.release();
+    }
+
+    #[test]
+    fn verification_value_follows_only_its_original_received_computation_cut() {
+        use crate::query_execution::write_session::tests::{fixture_with_outcome, known_committed};
+        let fixture = fixture_with_outcome(1, 1, known_committed());
+        let value = DeleteVerificationCounts::try_new(7, 5, 1, u128::MAX).unwrap();
+        for (rows, verification) in [(3, Some(value)), (5, None)] {
+            let prepared = DecodedPreparedWriteSet::for_test(rows, Vec::new());
+            let prepared = match verification {
+                Some(value) => prepared.with_test_delete_verification(value),
+                None => prepared,
+            };
+            let segment = fixture
+                .session
+                .computation_decode(&fixture.session.expected_targets())
+                .unwrap()
+                .interpret(prepared)
+                .unwrap();
+            let accepted = fixture.session.receiving_port().accept(segment).unwrap();
+            assert_eq!(accepted.row_count(), rows);
+            assert_eq!(accepted.delete_verification(), verification);
+            assert!(accepted.belongs_to(&fixture.session));
+        }
+        assert_eq!(fixture.session.accumulated_row_count().unwrap(), 8);
     }
 }

@@ -43,6 +43,7 @@ use crate::query_execution::internal_result_cpu::InternalResultRetention;
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
 };
+use novarocks_result_contract::{DeleteVerificationCounts, PerKind, SummaryKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
@@ -75,6 +76,7 @@ use novarocks_spi::connector::{
 
 pub(crate) type RootWriteResultParts = (
     u64,
+    Option<DeleteVerificationCounts>,
     Vec<(WriteTargetOrdinal, Vec<u8>)>,
     Vec<WriteStatisticsArtifact>,
     Option<InternalResultRetention>,
@@ -204,6 +206,7 @@ impl RootWriteDecodeFailure {
 #[derive(Debug)]
 pub(crate) struct DecodedPreparedWriteSet {
     row_count: u64,
+    delete_verification: Option<DeleteVerificationCounts>,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: Vec<WriteStatisticsArtifact>,
     #[cfg(test)]
@@ -226,6 +229,7 @@ impl DecodedPreparedWriteSet {
     ) -> Self {
         Self {
             row_count,
+            delete_verification: None,
             fragments,
             statistics: Vec::new(),
             retention: None,
@@ -242,12 +246,19 @@ impl DecodedPreparedWriteSet {
     ) -> Self {
         Self {
             row_count,
+            delete_verification: None,
             fragments,
             statistics,
             retention: None,
             local_decode: true,
             production_execution: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_delete_verification(mut self, value: DeleteVerificationCounts) -> Self {
+        self.delete_verification = Some(value);
+        self
     }
 
     #[cfg(test)]
@@ -264,6 +275,17 @@ impl DecodedPreparedWriteSet {
 
     pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "RWM-10 consumes the exact decoded verification value."
+        )
+    )]
+    pub(crate) const fn delete_verification(&self) -> Option<DeleteVerificationCounts> {
+        self.delete_verification
     }
 
     pub(crate) fn fragments(&self) -> &[(WriteTargetOrdinal, Vec<u8>)] {
@@ -299,6 +321,7 @@ impl DecodedPreparedWriteSet {
     pub(crate) fn into_parts(self) -> RootWriteResultParts {
         (
             self.row_count,
+            self.delete_verification,
             self.fragments,
             self.statistics,
             self.retention,
@@ -313,6 +336,7 @@ impl DecodedPreparedWriteSet {
 pub(crate) struct RootWriteDecodeContract {
     expected_targets: BTreeSet<WriteTargetOrdinal>,
     expected_artifacts: BTreeSet<(WriteTargetOrdinal, StatisticsArtifactIdentity)>,
+    declared_summary_kinds: PerKind<()>,
     #[cfg(test)]
     schema: RootWriteResultSchema,
 }
@@ -321,6 +345,7 @@ impl RootWriteDecodeContract {
     pub(crate) fn try_new(
         query_targets: &[WriteTargetOrdinal],
         session_targets: &[novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan],
+        declared_summary_kinds: PerKind<()>,
     ) -> Result<Self, String> {
         novarocks_spi::connector::write_stack::validate_query_target_ordinals(query_targets)
             .map_err(|error| format!("write Root query target set: {error}"))?;
@@ -355,6 +380,7 @@ impl RootWriteDecodeContract {
         Ok(Self {
             expected_targets,
             expected_artifacts,
+            declared_summary_kinds,
             #[cfg(test)]
             schema: RootWriteResultSchema::new(),
         })
@@ -368,6 +394,7 @@ impl RootWriteDecodeContract {
         Self {
             expected_targets: targets.into_iter().collect(),
             expected_artifacts: artifacts.into_iter().collect(),
+            declared_summary_kinds: PerKind::empty(),
             schema: RootWriteResultSchema::new(),
         }
     }
@@ -394,6 +421,7 @@ pub(crate) struct RootWriteResultDecoder {
     relayed_record_count: u64,
     contract: RootWriteDecodeContract,
     rows: WriteRowCountAccumulator,
+    delete_verification: Option<DeleteVerificationCounts>,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
     statistics: BTreeMap<(WriteTargetOrdinal, StatisticsArtifactIdentity), WriteStatisticsArtifact>,
@@ -420,6 +448,7 @@ impl RootWriteResultDecoder {
             ),
             contract,
             rows: WriteRowCountAccumulator::new(),
+            delete_verification: None,
             ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             statistics: BTreeMap::new(),
@@ -720,8 +749,31 @@ impl RootWriteResultDecoder {
 
         match kind {
             RootRowKind::DeleteVerification => {
-                return Err(
-                    "write Root contains undeclared summary kind DeleteVerification".into(),
+                if self
+                    .contract
+                    .declared_summary_kinds
+                    .get(SummaryKind::DeleteVerification)
+                    .is_none()
+                {
+                    return Err(
+                        "write Root contains undeclared summary kind DeleteVerification".into(),
+                    );
+                }
+                self.delete_verification = Some(
+                    DeleteVerificationCounts::try_from_wire(
+                        verification[0].expect("validated verification count"),
+                        verification[1].expect("validated verification count"),
+                        verification[2].expect("validated verification count"),
+                        fingerprint.expect("validated fingerprint"),
+                    )
+                    .map_err(|error| {
+                        RootWriteDecodeFailure::source(
+                            novarocks_spi::connector::ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                                error.to_string(),
+                            ),
+                        )
+                    })?,
                 );
             }
             RootRowKind::RowCount => {
@@ -895,6 +947,15 @@ impl RootWriteResultDecoder {
         self.membership.finish().map_err(|error| {
             RootWriteDecodeFailure::source(error).context("write Root membership")
         })?;
+        if self
+            .contract
+            .declared_summary_kinds
+            .get(SummaryKind::DeleteVerification)
+            .is_some()
+            && self.delete_verification.is_none()
+        {
+            return Err("write Root is missing declared summary kind DeleteVerification".into());
+        }
         let observed = self.statistics.keys().cloned().collect::<BTreeSet<_>>();
         if observed != self.contract.expected_artifacts {
             let missing = self
@@ -909,6 +970,7 @@ impl RootWriteResultDecoder {
         }
         Ok(DecodedPreparedWriteSet {
             row_count: self.rows.get(),
+            delete_verification: self.delete_verification,
             fragments: self.fragments,
             statistics: self.statistics.into_values().collect(),
             retention: self.retention,
@@ -1851,5 +1913,89 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("undeclared summary kind DeleteVerification")
         );
+    }
+
+    fn verification_chunk(value: DeleteVerificationCounts) -> Chunk {
+        let template = chunk(vec![summary(0)]);
+        let mut columns = template.columns().to_vec();
+        columns[0] = Arc::new(Int8Array::from(vec![RootRowKind::DELETE_VERIFICATION]));
+        columns[2] = arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, 1);
+        let (counts, fingerprint) = value.into_wire();
+        for (index, value) in [8, 9, 10].into_iter().zip(counts) {
+            columns[index] = Arc::new(Int64Array::from(vec![Some(value)]));
+        }
+        let mut builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
+        builder.append_value(fingerprint).unwrap();
+        columns[11] = Arc::new(builder.finish());
+        Chunk::try_new_with_columns(template.chunk_schema_ref(), columns).unwrap()
+    }
+
+    fn declared_verification_decoder() -> RootWriteResultDecoder {
+        let mut contract = RootWriteDecodeContract::for_test(targets(1), std::iter::empty());
+        contract.declared_summary_kinds.delete_verification = Some(());
+        RootWriteResultDecoder::for_test_local(contract)
+    }
+
+    #[test]
+    fn declared_verification_is_exact_once_and_preserves_values_in_both_root_forms() {
+        use novarocks_native_adapter::root_write_commit_codec::{
+            WriteCommitEncoder, WriteCommitTotals,
+        };
+        let value = DeleteVerificationCounts::try_new(9, 6, 2, u128::MAX - 3).unwrap();
+        let verification = verification_chunk(value);
+        for relayed in [false, true] {
+            let mut decoder = declared_verification_decoder();
+            if relayed {
+                let row_count = records(vec![summary(17)]);
+                decoder.apply_record(&row_count[0]).unwrap();
+                let mut encoder = WriteCommitEncoder::try_new(
+                    verification.record_batch().clone(),
+                    WriteCommitTotals::default(),
+                )
+                .unwrap();
+                let mut bytes = [0; 128];
+                let turn = encoder.step(&mut bytes).unwrap();
+                decoder.apply_record(&bytes[..turn.emitted_bytes]).unwrap();
+            } else {
+                decoder.apply_chunk(&chunk(vec![summary(17)])).unwrap();
+                decoder.apply_chunk(&verification).unwrap();
+            }
+            decoder.observe_root_eof().unwrap();
+            let prepared = decoder.finish().unwrap();
+            assert_eq!(prepared.row_count(), 17);
+            assert_eq!(prepared.delete_verification(), Some(value));
+            let (rows, actual, fragments, statistics, _, _) = prepared.into_parts();
+            assert_eq!((rows, actual), (17, Some(value)));
+            assert!(fragments.is_empty());
+            assert!(statistics.is_empty());
+        }
+        let mut missing = declared_verification_decoder();
+        missing.apply_chunk(&chunk(vec![summary(17)])).unwrap();
+        missing.observe_root_eof().unwrap();
+        assert!(
+            missing
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("missing declared summary kind DeleteVerification")
+        );
+        let mut duplicate = declared_verification_decoder();
+        duplicate.apply_chunk(&verification).unwrap();
+        assert!(duplicate.apply_chunk(&verification).is_err());
+        let mut no_eof = declared_verification_decoder();
+        no_eof.apply_chunk(&chunk(vec![summary(17)])).unwrap();
+        no_eof.apply_chunk(&verification).unwrap();
+        assert!(no_eof.finish().unwrap_err().to_string().contains("EOF"));
+    }
+
+    #[test]
+    fn write_counts_declaration_still_uses_the_ordinary_row_count_record() {
+        let mut contract = RootWriteDecodeContract::for_test(targets(1), std::iter::empty());
+        contract.declared_summary_kinds.write_counts = Some(());
+        let mut decoder = RootWriteResultDecoder::for_test_local(contract);
+        decoder.apply_chunk(&chunk(vec![summary(23)])).unwrap();
+        let prepared = finish(decoder).unwrap();
+        assert_eq!(prepared.row_count(), 23);
+        assert_eq!(prepared.delete_verification(), None);
     }
 }

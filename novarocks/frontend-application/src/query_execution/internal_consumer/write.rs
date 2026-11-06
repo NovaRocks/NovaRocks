@@ -76,8 +76,15 @@ impl WriteComputationSeed {
             .ok_or_else(|| {
                 domain_error("write computation has no original frozen TableFinish targets")
             })?;
-        let contract =
-            RootWriteDecodeContract::try_new(targets, session.targets()).map_err(|_| {
+        let summary_kinds = *template
+            .native_manifest_template()
+            .plan_facts()
+            .write_root_summary_kinds()
+            .ok_or_else(|| {
+                domain_error("write computation has no original frozen summary declaration")
+            })?;
+        let contract = RootWriteDecodeContract::try_new(targets, session.targets(), summary_kinds)
+            .map_err(|_| {
                 domain_error("write root targets differ from the original sealed session")
             })?;
         let decode = session

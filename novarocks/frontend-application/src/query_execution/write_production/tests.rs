@@ -130,7 +130,12 @@ fn decoder(
 ) -> RootWriteResultDecoder {
     let targets = [WriteTargetOrdinal::try_new(0).unwrap()];
     let mut decoder = RootWriteResultDecoder::for_test_local(
-        RootWriteDecodeContract::try_new(&targets, session.targets()).unwrap(),
+        RootWriteDecodeContract::try_new(
+            &targets,
+            session.targets(),
+            novarocks_result_contract::PerKind::empty(),
+        )
+        .unwrap(),
     );
     decoder.bind_production_execution(execution, plan);
     decoder

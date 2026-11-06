@@ -475,7 +475,12 @@ mod tests {
         let target = WriteTargetOrdinal::try_new(0).unwrap();
         for _ in 0..2 {
             let mut decoder = RootWriteResultDecoder::new_with_capacity(
-                RootWriteDecodeContract::try_new(&[target], fixture.session.targets()).unwrap(),
+                RootWriteDecodeContract::try_new(
+                    &[target],
+                    fixture.session.targets(),
+                    novarocks_result_contract::PerKind::empty(),
+                )
+                .unwrap(),
                 &binding,
             )
             .unwrap();

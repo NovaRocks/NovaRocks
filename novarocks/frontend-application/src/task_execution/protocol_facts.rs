@@ -25,6 +25,9 @@ use novarocks_coordination_contract::{AttemptActivationIdentity, SelectedTaskTer
 use novarocks_execution_contract::{TaskIdentity, TaskStatus};
 use novarocks_query_application::api::PlanSeal;
 use novarocks_query_application::coordination::NativeAttemptDrive;
+use novarocks_result_contract::PerKind;
+#[cfg(test)]
+use novarocks_result_contract::SummaryKind;
 use novarocks_types::{QueryExecutionId, TaskId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -38,14 +41,14 @@ struct FrozenAttemptProtocol {
     tasks: Box<[TaskIdentity]>,
     indices: BTreeMap<TaskId, usize>,
     writers: BTreeSet<TaskIdentity>,
-    summary_sources: BTreeSet<TaskIdentity>,
+    summary_sources: PerKind<BTreeSet<TaskIdentity>>,
 }
 impl FrozenAttemptProtocol {
     fn from_graph(
         plan: PlanSeal,
         graph: &TaskGraph,
         writers: &BTreeSet<TaskIdentity>,
-        summary_sources: &BTreeSet<TaskIdentity>,
+        summary_sources: &PerKind<BTreeSet<TaskIdentity>>,
     ) -> Result<Self, TaskExecutionError> {
         Self::from_tasks(
             plan,
@@ -60,7 +63,7 @@ impl FrozenAttemptProtocol {
         root: TaskIdentity,
         tasks: Box<[TaskIdentity]>,
         writers: BTreeSet<TaskIdentity>,
-        summary_sources: BTreeSet<TaskIdentity>,
+        summary_sources: PerKind<BTreeSet<TaskIdentity>>,
     ) -> Result<Self, TaskExecutionError> {
         let indices = tasks
             .iter()
@@ -71,7 +74,9 @@ impl FrozenAttemptProtocol {
         if indices.len() != tasks.len()
             || !identities.contains(&root)
             || !writers.is_subset(&identities)
-            || !summary_sources.is_subset(&identities)
+            || summary_sources
+                .iter()
+                .any(|(_, sources)| !sources.is_subset(&identities))
             || tasks
                 .iter()
                 .any(|task| task.query_execution_id() != root.query_execution_id())
@@ -260,7 +265,7 @@ impl AttemptProtocolFactsPublisher {
         plan: PlanSeal,
         graph: &TaskGraph,
         writers: &BTreeSet<TaskIdentity>,
-        summary_sources: &BTreeSet<TaskIdentity>,
+        summary_sources: &PerKind<BTreeSet<TaskIdentity>>,
     ) -> Result<(Self, AttemptProtocolFactsReceiver), TaskExecutionError> {
         Ok(Self::pair(FrozenAttemptProtocol::from_graph(
             plan,
@@ -561,7 +566,7 @@ impl WriteProtocolTracker {
             tracker: WriteCompletionTracker::try_new(
                 changes.frozen.root,
                 changes.frozen.writers.iter().copied(),
-                changes.frozen.summary_sources.iter().copied(),
+                changes.frozen.summary_sources.clone(),
             )?,
         };
         tracker.observe(changes)?;
@@ -666,7 +671,12 @@ mod tests {
                 identity(1),
                 [identity(1), identity(2), identity(3)].into(),
                 writers.iter().map(|task| identity(*task)).collect(),
-                summary_sources.iter().map(|task| identity(*task)).collect(),
+                PerKind {
+                    write_counts: Some(
+                        summary_sources.iter().map(|task| identity(*task)).collect(),
+                    ),
+                    delete_verification: None,
+                },
             )
             .unwrap(),
         )
@@ -703,6 +713,7 @@ mod tests {
             WriteVerdict::TaskNotFinished {
                 task: identity(3),
                 state: TaskState::Planned,
+                summary_kind: Some(SummaryKind::WriteCounts),
             }
         );
         publisher
@@ -749,7 +760,10 @@ mod tests {
                 identity(1),
                 [identity(1), identity(2)].into(),
                 [identity(2)].into(),
-                [identity(3)].into(),
+                PerKind {
+                    write_counts: Some([identity(3)].into()),
+                    delete_verification: None
+                },
             )
             .is_err()
         );
@@ -766,7 +780,10 @@ mod tests {
                 identity(1),
                 [identity(1), identity(2)].into(),
                 [identity(2)].into(),
-                [foreign].into(),
+                PerKind {
+                    write_counts: None,
+                    delete_verification: Some([foreign].into())
+                },
             )
             .is_err()
         );
@@ -813,7 +830,8 @@ mod tests {
             tracker.execution_verdict(),
             WriteVerdict::TaskNotFinished {
                 task: identity(2),
-                state: TaskState::Planned
+                state: TaskState::Planned,
+                summary_kind: None,
             }
         );
         publisher
@@ -1059,5 +1077,48 @@ mod tests {
         next.bind_identity(activation(1)).unwrap();
         next.publish_updates(0, vec![], None, false).unwrap();
         assert!(tracker.observe(&take(&mut replacement)).is_err());
+    }
+
+    #[test]
+    fn frozen_protocol_keeps_kind_specific_sources_through_delta_coalescing() {
+        let (mut publisher, mut receiver) = AttemptProtocolFactsPublisher::pair(
+            FrozenAttemptProtocol::from_tasks(
+                plan(),
+                identity(1),
+                [identity(1), identity(2), identity(3)].into(),
+                [identity(2)].into(),
+                PerKind {
+                    write_counts: Some([identity(2)].into()),
+                    delete_verification: Some([identity(3)].into()),
+                },
+            )
+            .unwrap(),
+        );
+        publisher.bind_identity(activation(1)).unwrap();
+        publisher
+            .publish_updates(
+                1,
+                vec![update(1, status(1, 2)), update(2, status(2, 2))],
+                None,
+                false,
+            )
+            .unwrap();
+        let mut tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
+        assert_eq!(
+            tracker.execution_verdict(),
+            WriteVerdict::TaskNotFinished {
+                task: identity(3),
+                state: TaskState::Planned,
+                summary_kind: Some(SummaryKind::DeleteVerification),
+            }
+        );
+        publisher
+            .publish_updates(2, vec![update(3, running(3, 2))], None, false)
+            .unwrap();
+        publisher
+            .publish_updates(3, vec![update(3, status(3, 3))], None, false)
+            .unwrap();
+        tracker.observe(&take(&mut receiver)).unwrap();
+        assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
     }
 }

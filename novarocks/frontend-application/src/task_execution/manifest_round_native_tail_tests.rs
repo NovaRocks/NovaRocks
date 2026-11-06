@@ -131,7 +131,10 @@ mod native_tail {
                 .install_protocol_facts(
                     plan,
                     &BTreeSet::from([writer_task]),
-                    &BTreeSet::from([source_task]),
+                    &novarocks_result_contract::PerKind {
+                        write_counts: Some(BTreeSet::from([source_task])),
+                        delete_verification: None,
+                    },
                 )
                 .unwrap();
             let source = round.take_root_status_source().unwrap();
