@@ -2408,7 +2408,7 @@ mod tests {
             cleanup: Mutex::new(Vec::new()),
         });
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
-            crate::runtime::task_control::TaskExecutionControl::new(
+            crate::runtime::task_control::TaskExecutionControl::for_test(
                 port.identity(),
                 port.clone(),
                 TaskFailurePhase::Execution,

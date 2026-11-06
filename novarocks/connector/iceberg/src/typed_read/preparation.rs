@@ -1200,7 +1200,7 @@ mod tests {
             io_spawner,
             range: Some(service.bind(
                 FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
-                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
             )),
         };
         let planner = Arc::new(move |_context: FileReadContext| {
@@ -1275,7 +1275,8 @@ mod tests {
     #[tokio::test]
     async fn reclaim_preserves_a_real_error_and_wakes_actual_drain_waiter() {
         let shared = Shared::new();
-        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         let original = ConnectorError::new(
             novarocks_spi::connector::ConnectorErrorKind::CorruptData,
             "saved candidate error",
@@ -1320,7 +1321,8 @@ mod tests {
     #[tokio::test]
     async fn reclaim_keeps_a_physical_error_published_after_generation_changed() {
         let shared = Shared::new();
-        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         shared.lock().phase = Phase::Reading;
         let (release, gate) = tokio::sync::oneshot::channel();
         start_owned_test_watcher(
@@ -1515,7 +1517,7 @@ mod tests {
         use novarocks_spi::connector::read_stack::{
             ConnectorOperationExit, ConnectorSourceExitProof, ConnectorSourceFailureEvent,
         };
-        let root = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let root = novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         let child = root.child().expect("child");
         let mut events = root.claim_failure_receiver().expect("unique root receiver");
         let shared = Shared::new();
@@ -1667,7 +1669,8 @@ mod tests {
             RejectMode::ProjectionPanic,
             RejectMode::SourceDropPanic,
         ] {
-            let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+            let operations =
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
             let mut events = operations.claim_failure_receiver().unwrap();
             let shared = Shared::new();
             {

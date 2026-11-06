@@ -1598,7 +1598,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -1638,7 +1638,7 @@ mod tests {
             Handle::current(),
         );
         let mut read = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -1647,7 +1647,7 @@ mod tests {
             )
             .expect("read admitted");
         let mut stat = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .stat_wait(file, FileCancellation::new())
             .await
             .expect("stat admitted");
@@ -1679,7 +1679,7 @@ mod tests {
             Handle::current(),
         );
         let mut read = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -1688,7 +1688,7 @@ mod tests {
             )
             .expect("read admitted");
         let FileStatStart::Started(mut stat) = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_stat(file, FileCancellation::new())
             .expect("stat admission")
         else {
@@ -1719,7 +1719,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let charge = Arc::new(());
         let request = source
@@ -1752,7 +1752,7 @@ mod tests {
         );
 
         // A request that already exited keeps nothing it is handed.
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 2), operations.clone());
         let mut request = source
             .start(
@@ -1782,7 +1782,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let mut request = source
             .start(
@@ -1853,7 +1853,7 @@ mod tests {
             Handle::current(),
         );
         // Another source holds the only slot and the only queue entry.
-        let other = service.bind(scope(1, 2), ConnectorSourceOperations::new());
+        let other = service.bind(scope(1, 2), ConnectorSourceOperations::for_test());
         let mut running = other
             .start(
                 FileRangeClass::Demand,
@@ -1871,7 +1871,7 @@ mod tests {
             )
             .expect("queued");
 
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let waiting = tokio::spawn({
             let file = file.clone();
@@ -1933,8 +1933,8 @@ mod tests {
             Handle::current(),
         );
         // Two scan nodes of one Task: one query, two sources.
-        let first_operations = ConnectorSourceOperations::new();
-        let second_operations = ConnectorSourceOperations::new();
+        let first_operations = ConnectorSourceOperations::for_test();
+        let second_operations = ConnectorSourceOperations::for_test();
         let first = service.bind(scope(1, 1), first_operations.clone());
         let second = service.bind(scope(1, 2), second_operations.clone());
         let mut first_read = first
@@ -2021,7 +2021,7 @@ mod tests {
             scan_runtime.handle().clone(),
         );
         let _guard = io_runtime.enter();
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let mut stuck = blocked_service
             .bind(scope(1, 1), operations.clone())
             .start(
@@ -2080,7 +2080,7 @@ mod tests {
         // failure cannot replace that missing physical-exit evidence.
         for unresolved_first in [true, false] {
             let (_dir, file) = fixture();
-            let operations = ConnectorSourceOperations::new();
+            let operations = ConnectorSourceOperations::for_test();
             let ticket = operations.admit(Arc::new(|| {})).expect("admit request");
             let service = FileRangeService::new(
                 NonZeroUsize::new(2).unwrap(),
@@ -2172,7 +2172,7 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut request = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start_with_present(
                 FileRangeClass::Demand,
                 file,
@@ -2209,7 +2209,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2252,7 +2252,7 @@ mod tests {
                 .expect("prepared wrong file");
             assert!(
                 service
-                    .bind(scope(1, 1), ConnectorSourceOperations::new())
+                    .bind(scope(1, 1), ConnectorSourceOperations::for_test())
                     .try_start_with_present(
                         FileRangeClass::Demand,
                         file.clone(),
@@ -2279,7 +2279,7 @@ mod tests {
             .expect("prepared middle span");
         std::fs::remove_file(dir.path().join("range.parquet")).expect("remove source");
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start_wait_with_present(file, range(0, 12), FileCancellation::new(), Some(present))
             .await
             .expect("accepted request");
@@ -2303,7 +2303,7 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut partial = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start_with_present(
                 FileRangeClass::Demand,
                 file,
@@ -2341,7 +2341,7 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2351,7 +2351,7 @@ mod tests {
             .expect("first");
         assert_eq!(spawner.started(), 1);
         let mut speculative = match service
-            .bind(scope(1, 2), ConnectorSourceOperations::new())
+            .bind(scope(1, 2), ConnectorSourceOperations::for_test())
             .try_start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2364,7 +2364,7 @@ mod tests {
             FileRangeStart::Deferred => panic!("unexpected defer"),
         };
         let mut later_demand = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2421,7 +2421,7 @@ mod tests {
             Handle::current(),
         );
         let mut active = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2430,7 +2430,7 @@ mod tests {
             )
             .expect("active");
         let mut waiting = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2440,7 +2440,7 @@ mod tests {
             .expect("waiting");
         assert!(matches!(
             service
-                .bind(scope(3, 1), ConnectorSourceOperations::new())
+                .bind(scope(3, 1), ConnectorSourceOperations::for_test())
                 .try_start(
                     FileRangeClass::Prefetch,
                     file,
@@ -2499,7 +2499,7 @@ mod tests {
             Handle::current(),
         );
         let mut q1s1 = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2508,7 +2508,7 @@ mod tests {
             )
             .expect("first");
         let mut q1s1_next = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2517,7 +2517,7 @@ mod tests {
             )
             .expect("same source");
         let mut q1s2 = service
-            .bind(scope(1, 2), ConnectorSourceOperations::new())
+            .bind(scope(1, 2), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2526,7 +2526,7 @@ mod tests {
             )
             .expect("other source");
         let mut q2s1 = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2578,7 +2578,7 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2587,7 +2587,7 @@ mod tests {
             )
             .expect("active demand");
         let mut queued = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2599,7 +2599,7 @@ mod tests {
         let waiting_file = file.clone();
         let waiting = tokio::spawn(async move {
             waiting_service
-                .bind(scope(3, 1), ConnectorSourceOperations::new())
+                .bind(scope(3, 1), ConnectorSourceOperations::for_test())
                 .start_wait(waiting_file, range(8, 4), FileCancellation::new())
                 .await
         });
@@ -2612,7 +2612,7 @@ mod tests {
         assert_eq!(service.demand_waiters.load(Ordering::SeqCst), 1);
         assert!(matches!(
             service
-                .bind(scope(4, 1), ConnectorSourceOperations::new())
+                .bind(scope(4, 1), ConnectorSourceOperations::for_test())
                 .try_start(
                     FileRangeClass::Prefetch,
                     file,
@@ -2664,7 +2664,7 @@ mod tests {
             runtime.handle().clone(),
         );
         let mut request = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start(
                 FileRangeClass::Prefetch,
                 file,
@@ -2725,7 +2725,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2772,7 +2772,7 @@ mod tests {
             Handle::current(),
         );
         let mut prefetch = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2799,7 +2799,7 @@ mod tests {
         .expect("first segment exits");
         assert_eq!(spawner.started(), 1, "queued segment remains paused");
         let mut demand = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2880,7 +2880,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let mut request = service
             .bind(scope(1, 1), operations.clone())
             .start(

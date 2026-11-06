@@ -1481,8 +1481,9 @@ mod tests {
             missing.is_err(),
             "BE scan cannot invent a scheduling source"
         );
-        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope");
-        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let scope = ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).expect("scope");
+        let operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         let request = request.with_execution_source(scope, operations.clone());
         let context = binding
             .for_request(request.clone())

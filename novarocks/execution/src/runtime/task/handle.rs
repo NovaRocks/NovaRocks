@@ -2372,6 +2372,9 @@ impl LocalTaskPrepareContext {
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn TaskResultWriter>,
         event_sink: Arc<dyn TaskEventSink>,
+        identity: novarocks_execution_contract::TaskIdentity,
+        control: Arc<crate::runtime::task_control::TaskExecutionControl>,
+        completion: novarocks_execution_contract::AdmittedWorkParts<super::ExecutionFailure>,
     ) -> Self {
         Self {
             profiler,
@@ -2389,9 +2392,9 @@ impl LocalTaskPrepareContext {
             edge_gates: None,
             root_result_session: None,
             result_spec: None,
-            result_identity: None,
-            task_control: None,
-            completion_work: None,
+            result_identity: Some(identity),
+            task_control: Some(control),
+            completion_work: Some(completion),
             root_sink_dop: None,
             execution_runtime: None,
             query_memory: None,
@@ -2544,69 +2547,6 @@ impl LocalTaskPrepareContext {
     pub fn with_exchange_receiver_port(mut self, port: Arc<dyn ExchangeReceiverPort>) -> Self {
         self.exchange_receiver_port = port;
         self
-    }
-
-    /// Builds a context for callers that do not participate in native
-    /// runtime-filter execution (including backend integration tests).
-    pub fn without_runtime_filter(
-        profiler: Option<Profiler>,
-        mem_tracker: Option<Arc<MemTracker>>,
-        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        result_writer: Arc<dyn TaskResultWriter>,
-        event_sink: Arc<dyn TaskEventSink>,
-    ) -> Self {
-        Self::new(
-            profiler,
-            mem_tracker,
-            None,
-            exchange_transmitter,
-            result_writer,
-            event_sink,
-        )
-    }
-
-    pub fn new_with_execution_overrides(
-        profiler: Option<Profiler>,
-        mem_tracker: Option<Arc<MemTracker>>,
-        result_spec: Option<ResultWriteSpec>,
-        root_sink_dop: Option<i32>,
-        _group_execution_scan_dop: Option<i32>,
-        exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        result_writer: Arc<dyn TaskResultWriter>,
-        event_sink: Arc<dyn TaskEventSink>,
-    ) -> Self {
-        Self {
-            profiler,
-            mem_tracker,
-            runtime_filter: None,
-            exchange_transmitter,
-            #[cfg(novarocks_dev_controls)]
-            exchange_test_observer: None,
-            #[cfg(novarocks_dev_controls)]
-            join_build_control: None,
-            #[cfg(novarocks_dev_controls)]
-            query_tracker_witness: std::sync::Weak::new(),
-            result_writer,
-            event_sink,
-            edge_gates: None,
-            root_result_session: None,
-            result_spec,
-            result_identity: None,
-            task_control: None,
-            completion_work: None,
-            root_sink_dop,
-            execution_runtime: None,
-            query_memory: None,
-            commit_port: Arc::new(UnavailableTaskCommitPort),
-            exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
-            receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
-            #[cfg(test)]
-            prepare_failure: None,
-            #[cfg(test)]
-            cleanup_faults: ResourceCleanupFaults::default(),
-            #[cfg(test)]
-            start_failure: None,
-        }
     }
 
     fn cleanup_faults(&self) -> ResourceCleanupFaults {

@@ -81,6 +81,7 @@ pub struct DriverGroupCompletion {
     resources_finisher: Arc<completion_custody::OnceCustody<DriverGroupStoppedFact>>,
     wall_time: Arc<completion_custody::OnceCustody<DriverGroupStoppedFact>>,
     control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    #[cfg(test)]
     local_completion: std::sync::OnceLock<crate::runtime::local_completion::LocalCompletionPoller>,
 }
 
@@ -131,6 +132,7 @@ impl DriverGroupCompletion {
                 completion_custody::CompletionKind::WallTime,
             ),
             control,
+            #[cfg(test)]
             local_completion: std::sync::OnceLock::new(),
         })
     }
@@ -260,6 +262,7 @@ impl DriverGroupCompletion {
             .expect("original dormant wall-time role has no bound callback or prior work");
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_local_completion_poller(
         &self,
         poller: crate::runtime::local_completion::LocalCompletionPoller,
@@ -273,6 +276,7 @@ impl DriverGroupCompletion {
     fn run_completion_work(&self, stopped: &DriverGroupStoppedFact) {
         self.wall_time.invoke(stopped, &self.control);
         self.resources_finisher.invoke(stopped, &self.control);
+        #[cfg(test)]
         if let Some(poller) = self.local_completion.get() {
             // The original callback's stack and return-publication step have
             // finished before this taskless barrier can invoke its one child.
@@ -288,6 +292,7 @@ impl DriverGroupCompletion {
         self.resources_finisher.bind(slot)?;
         if let Some(stopped) = self.stopped_fact() {
             self.resources_finisher.invoke(&stopped, &self.control);
+            #[cfg(test)]
             if let Some(driver) = self.local_completion.get() {
                 driver.run();
             }

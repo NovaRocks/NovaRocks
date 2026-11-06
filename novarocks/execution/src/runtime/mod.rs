@@ -10,6 +10,7 @@ pub mod execution_health;
 pub mod execution_runtime;
 pub mod execution_services;
 pub mod kernel_memory;
+#[cfg(test)]
 pub(crate) mod local_completion;
 pub mod mem_tracker;
 pub mod observable;

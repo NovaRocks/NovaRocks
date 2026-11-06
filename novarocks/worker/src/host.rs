@@ -77,17 +77,23 @@ pub struct TaskPreparationView {
     owner: std::sync::Weak<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
     identity: novarocks_execution_contract::TaskIdentity,
     cadence: std::time::Duration,
+    admission: Option<novarocks_control_runtime::obligation::AdmissionProof>,
 }
 
 impl TaskPreparationView {
     pub(crate) fn from_execution_port(
         owner: &Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
         cadence: std::time::Duration,
+        admission: Result<
+            novarocks_control_runtime::obligation::AdmissionProof,
+            novarocks_control_runtime::transaction::RuntimeError,
+        >,
     ) -> Self {
         Self {
             owner: Arc::downgrade(owner),
             identity: owner.identity(),
             cadence,
+            admission: admission.ok(),
         }
     }
     pub const fn identity(&self) -> novarocks_execution_contract::TaskIdentity {
@@ -116,6 +122,8 @@ pub struct TaskPreparationContext<'a> {
     cadence: std::time::Duration,
     readiness_waker: std::task::Waker,
     preparation_capture: Option<TaskPreparationCapture>,
+    admission: novarocks_control_runtime::obligation::AdmissionProof,
+    task_key: novarocks_types::UniqueId,
 }
 impl<'a> TaskPreparationContext<'a> {
     pub(crate) fn from_admitted(
@@ -124,6 +132,8 @@ impl<'a> TaskPreparationContext<'a> {
         cadence: std::time::Duration,
         capture: TaskPreparationCapture,
         readiness_waker: std::task::Waker,
+        admission: novarocks_control_runtime::obligation::AdmissionProof,
+        task_key: novarocks_types::UniqueId,
     ) -> Result<
         Self,
         (
@@ -143,6 +153,8 @@ impl<'a> TaskPreparationContext<'a> {
             cadence,
             readiness_waker,
             preparation_capture: Some(capture),
+            admission,
+            task_key,
         })
     }
     #[cfg(test)]
@@ -165,19 +177,52 @@ impl<'a> TaskPreparationContext<'a> {
         self.children.register(child)
     }
     pub fn view(&self) -> crate::TaskPreparationView {
-        crate::TaskPreparationView::from_execution_port(&self.owner, self.cadence)
+        crate::TaskPreparationView::from_execution_port(
+            &self.owner,
+            self.cadence,
+            Ok(self.admission.clone()),
+        )
     }
     pub fn runtime_control(
         &self,
     ) -> Arc<novarocks_execution::runtime::task_control::TaskExecutionControl> {
         Arc::new(
             novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+                &self.admission,
                 self.owner.identity(),
                 self.owner.clone(),
                 novarocks_execution_contract::TaskFailurePhase::Execution,
             )
             .expect("admitted preparation retains its exact Task port"),
         )
+    }
+    pub fn scan_sources(&self) -> TaskScanSourceIssuer {
+        TaskScanSourceIssuer {
+            admission: self.admission.clone(),
+            execution: self.owner.identity().query_execution_id(),
+            task_key: self.task_key,
+        }
+    }
+    pub fn scan_source(
+        &self,
+        node_id: i32,
+    ) -> Result<
+        (
+            novarocks_spi::connector::ConnectorRangeScope,
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        self.scan_sources().issue(node_id)
+    }
+    #[cfg(test)]
+    pub(crate) fn admission_for_test(
+        &self,
+    ) -> (
+        novarocks_control_runtime::obligation::AdmissionProof,
+        novarocks_types::UniqueId,
+    ) {
+        (self.admission.clone(), self.task_key)
     }
     /// Move the complete original capture once, before the Native builder
     /// attaches any kernel or completion callback. An error returns no partial
@@ -188,6 +233,81 @@ impl<'a> TaskPreparationContext<'a> {
             .ok_or(TaskPreparationCaptureTaken)
     }
 }
+/// An opaque, Task-specific source issuer. It carries signed placement facts,
+/// never general work-derivation authority or a capacity grant.
+#[derive(Clone)]
+pub struct TaskScanSourceIssuer {
+    admission: novarocks_control_runtime::obligation::AdmissionProof,
+    execution: novarocks_types::QueryExecutionId,
+    task_key: novarocks_types::UniqueId,
+}
+impl TaskScanSourceIssuer {
+    /// Worker supplies every identity component from its original Task record;
+    /// the execution host supplies only the scan node from the compiled program.
+    pub fn issue(
+        &self,
+        node_id: i32,
+    ) -> Result<
+        (
+            novarocks_spi::connector::ConnectorRangeScope,
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations,
+        ),
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let range = novarocks_spi::connector::ConnectorRangeScope::admitted(
+            &self.admission,
+            self.execution.query_id().high(),
+            self.execution.query_id().low(),
+            self.execution.attempt_id().get(),
+            self.task_key.high(),
+            self.task_key.low(),
+            node_id,
+        )?;
+        Ok((
+            range,
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::root(&self.admission),
+        ))
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test(
+        execution: novarocks_types::QueryExecutionId,
+        task_key: novarocks_types::UniqueId,
+    ) -> Self {
+        use novarocks_control_runtime::transaction::RuntimeLedger;
+        use novarocks_control_runtime_core::{
+            capacity::ReservationResources,
+            identity::Generation,
+            scope::{WorkAdmission, WorkKind},
+        };
+        let ledger = RuntimeLedger::new(Default::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut work, mut capacity) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let issuer = Self {
+            admission: work.child_authority().unwrap().verify_live().unwrap(),
+            execution,
+            task_key,
+        };
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        ledger.reap_scope_ready(scope.id(), 1).unwrap();
+        capacity.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+        issuer
+    }
+}
+
 #[derive(Debug)]
 pub struct TaskPreparationCaptureTaken;
 impl fmt::Display for TaskPreparationCaptureTaken {
@@ -216,7 +336,7 @@ pub struct PreparationControlLoan<'a> {
 }
 
 #[derive(Debug)]
-struct PreparationOwnerUnavailable;
+pub(crate) struct PreparationOwnerUnavailable;
 impl std::fmt::Display for PreparationOwnerUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("preparation requires a live, unfinished Task owner")
@@ -235,14 +355,17 @@ impl novarocks_execution_contract::failure::FailureProjection for PreparationOwn
 impl<'a> PreparationControlLoan<'a> {
     pub(crate) fn from_view(view: &'a crate::TaskPreparationView) -> Self {
         let (owner, cadence) = view.control();
-        let control = owner.map(|owner| {
-            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
-                owner.identity(),
-                owner,
-                novarocks_execution_contract::TaskFailurePhase::Preparation,
-            )
-            .expect("preparation borrows its exact Task owner")
-        });
+        let control = owner
+            .zip(view.admission.as_ref())
+            .and_then(|(owner, admission)| {
+                novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+                    admission,
+                    view.identity,
+                    owner,
+                    novarocks_execution_contract::TaskFailurePhase::Preparation,
+                )
+                .ok()
+            });
         Self {
             control,
             cadence,

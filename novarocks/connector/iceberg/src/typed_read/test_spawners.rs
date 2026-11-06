@@ -85,7 +85,7 @@ pub(crate) fn route_reads_through(
     spawner: Arc<dyn FileIoSpawner>,
     handle: tokio::runtime::Handle,
 ) -> ConnectorSourceOperations {
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     context.io_spawner = Arc::clone(&spawner);
     context.range = Some(
         FileRangeService::new(

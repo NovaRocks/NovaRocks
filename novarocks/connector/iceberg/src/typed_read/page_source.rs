@@ -3267,7 +3267,7 @@ mod tests {
             )
             .bind(
                 FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
-                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
             ),
         );
         let schema = iceberg_schema();
@@ -4257,7 +4257,7 @@ mod tests {
             started: std::sync::atomic::AtomicUsize::new(0),
         });
         let task_operations =
-            novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         harness.context.range = Some(
             FileRangeService::new(
                 NonZeroUsize::new(2).unwrap(),
@@ -4340,7 +4340,7 @@ mod tests {
             )
             .bind(
                 FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
-                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
             ),
         );
         harness.delete_manager = Arc::new(DeleteManager::new(

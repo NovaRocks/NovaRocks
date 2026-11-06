@@ -609,7 +609,10 @@ pub(crate) enum ExecutionReason {
     LogicalChangeCount = 613,
     LogicalSummaryContract = 614,
     FanoutRequiredBranchWithdrawn = 615,
+    // Taskless completion is test-only; 639 and 640 remain reserved in production.
+    #[cfg(test)]
     SettlementContinuationPanicked = 639,
+    #[cfg(test)]
     CompletionWorkUnresolved = 640,
     TaskExecutionOwnerRetired = 641,
     ReceiverConstructionClosed = 642,

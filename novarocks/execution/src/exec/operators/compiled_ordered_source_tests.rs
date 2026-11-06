@@ -58,7 +58,7 @@ impl Pages {
             closes: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             consumed: AtomicUsize::new(0),
-            operations: ConnectorSourceOperations::new(),
+            operations: ConnectorSourceOperations::for_test(),
         })
     }
     fn push(&self, chunk: Chunk) {

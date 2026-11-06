@@ -931,7 +931,7 @@ mod tests {
             io_spawner: Arc::clone(&io_spawner),
             range: Some(service.bind(
                 FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
-                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
             )),
         };
         let binding = IcebergReadBinding::new(

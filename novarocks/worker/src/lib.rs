@@ -89,7 +89,7 @@ mod task_preparation_limits;
 mod task_reporter;
 pub use host::{
     TaskPreparationCapture, TaskPreparationCaptureTaken, TaskPreparationContext,
-    TaskPreparationView,
+    TaskPreparationView, TaskScanSourceIssuer,
 };
 pub mod typed_connector_runtime;
 pub mod typed_page_source;

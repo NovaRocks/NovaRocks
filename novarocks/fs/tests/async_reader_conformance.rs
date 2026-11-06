@@ -318,7 +318,7 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
         Arc::clone(&spawner),
         Some((
             service(Arc::clone(&spawner), &handle, 2),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     let expected = collect(open_file_reader(blocking).expect("open").as_mut()).expect("read");
@@ -328,7 +328,7 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
         Arc::clone(&spawner),
         Some((
             service(Arc::clone(&spawner), &handle, 2),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     let actual = handle.block_on(async {
@@ -355,7 +355,7 @@ fn awaited_footer_and_page_indexes_read_what_the_blocking_path_reads() {
             Arc::clone(&as_spawner),
             Some((
                 service(as_spawner, &handle, 2),
-                ConnectorSourceOperations::new(),
+                ConnectorSourceOperations::for_test(),
             )),
         );
         let context = request.context.clone();
@@ -435,7 +435,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
     let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     let mut request = request_through(
         &large.file,
         &handle,
@@ -493,7 +493,7 @@ fn a_failed_range_stops_its_sibling_and_the_error_wins() {
     let gated = OrderedGateSpawner::new(handle.clone(), true);
     gated.fail_unrun(0);
     let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     let mut request = request_through(
         &large.file,
         &handle,
@@ -542,7 +542,7 @@ fn concurrent_ranges_of_a_small_file_share_one_whole_file_read() {
         Arc::clone(&as_spawner),
         Some((
             service(as_spawner, &handle, 4),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     request.options.coalesce_reads = false;

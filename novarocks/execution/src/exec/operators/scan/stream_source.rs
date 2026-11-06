@@ -977,7 +977,6 @@ mod tests {
     }
 
     /// What the scripted stream does, shared with the test.
-    #[derive(Default)]
     struct StreamControl {
         chunks: Mutex<VecDeque<Chunk>>,
         error: Mutex<Option<crate::runtime::task::ExecutionFailure>>,
@@ -997,6 +996,28 @@ mod tests {
         requires_close_body: AtomicBool,
         operations: ConnectorSourceOperations,
         terminations: AtomicUsize,
+    }
+
+    impl Default for StreamControl {
+        fn default() -> Self {
+            Self {
+                chunks: Default::default(),
+                error: Default::default(),
+                close_check: Default::default(),
+                observation_check: Default::default(),
+                termination_check: Default::default(),
+                backpressure_release_check: Default::default(),
+                ended: Default::default(),
+                waker: Default::default(),
+                wake_inside_poll: Default::default(),
+                staged: Default::default(),
+                polls: Default::default(),
+                close_requested: Default::default(),
+                requires_close_body: Default::default(),
+                operations: ConnectorSourceOperations::for_test(),
+                terminations: Default::default(),
+            }
+        }
     }
 
     impl StreamControl {

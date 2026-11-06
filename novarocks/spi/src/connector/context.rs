@@ -101,7 +101,44 @@ pub struct ConnectorRangeScope {
 }
 
 impl ConnectorRangeScope {
-    pub fn try_new(
+    /// The identity owner supplies exact placement facts and a live-work proof.
+    pub fn admitted(
+        _admission: &novarocks_control_runtime::obligation::AdmissionProof,
+        query_high: i64,
+        query_low: i64,
+        attempt: u64,
+        fragment_high: i64,
+        fragment_low: i64,
+        node_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        Self::from_parts(
+            query_high,
+            query_low,
+            attempt,
+            fragment_high,
+            fragment_low,
+            node_id,
+        )
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test(
+        query_high: i64,
+        query_low: i64,
+        attempt: u64,
+        fragment_high: i64,
+        fragment_low: i64,
+        node_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        Self::from_parts(
+            query_high,
+            query_low,
+            attempt,
+            fragment_high,
+            fragment_low,
+            node_id,
+        )
+    }
+    fn from_parts(
         query_high: i64,
         query_low: i64,
         attempt: u64,
@@ -1016,11 +1053,11 @@ mod tests {
             (1, 2, 1, 3, 4, -1),
         ] {
             assert!(
-                ConnectorRangeScope::try_new(parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,)
+                ConnectorRangeScope::for_test(parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,)
                     .is_err()
             );
         }
-        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("exact scope");
+        let scope = ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).expect("exact scope");
         let request = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
             ConnectorStopOwner::new().view(),
@@ -1028,7 +1065,7 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("request")
-        .with_execution_source(scope, ConnectorSourceOperations::new());
+        .with_execution_source(scope, ConnectorSourceOperations::for_test());
         assert_eq!(request.clone().range_scope(), Some(scope));
         let ticket = request
             .source_operations()

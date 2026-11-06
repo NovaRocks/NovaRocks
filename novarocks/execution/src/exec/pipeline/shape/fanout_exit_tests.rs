@@ -130,7 +130,7 @@ fn state() -> (Arc<Port>, Arc<RuntimeState>) {
         cleanups: AtomicUsize::new(0),
     });
     let control =
-        TaskExecutionControl::new(port.identity(), port.clone(), TaskFailurePhase::Execution)
+        TaskExecutionControl::for_test(port.identity(), port.clone(), TaskFailurePhase::Execution)
             .unwrap();
     let failures = Arc::new(RuntimeErrorState::for_task(Arc::new(control)));
     (

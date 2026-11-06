@@ -160,7 +160,25 @@ impl fmt::Debug for TaskExecutionControl {
     }
 }
 impl TaskExecutionControl {
+    /// Worker issues this token after checking its admitted preparation work.
+    /// The proof is point-in-time and does not grant capacity or derivation.
     pub fn new(
+        _admission: &novarocks_control_runtime::obligation::AdmissionProof,
+        identity: TaskIdentity,
+        owner: Arc<dyn TaskExecutionPort>,
+        phase: TaskFailurePhase,
+    ) -> Result<Self, TaskControlIdentityMismatch> {
+        Self::from_owner(identity, owner, phase)
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test(
+        identity: TaskIdentity,
+        owner: Arc<dyn TaskExecutionPort>,
+        phase: TaskFailurePhase,
+    ) -> Result<Self, TaskControlIdentityMismatch> {
+        Self::from_owner(identity, owner, phase)
+    }
+    fn from_owner(
         identity: TaskIdentity,
         owner: Arc<dyn TaskExecutionPort>,
         phase: TaskFailurePhase,
@@ -573,7 +591,7 @@ pub(crate) mod test_support {
             })
         }
         pub(crate) fn view(self: &Arc<Self>, phase: TaskFailurePhase) -> TaskExecutionControl {
-            TaskExecutionControl::new(self.identity, self.clone(), phase).unwrap()
+            TaskExecutionControl::for_test(self.identity, self.clone(), phase).unwrap()
         }
         #[cfg(test)]
         pub(crate) fn issue_fixture_completion_work(
@@ -774,7 +792,7 @@ pub(crate) mod test_support {
             })
         }
         pub(crate) fn view(self: &Arc<Self>, phase: TaskFailurePhase) -> TaskExecutionControl {
-            TaskExecutionControl::new(self.identity(), self.clone(), phase).unwrap()
+            TaskExecutionControl::for_test(self.identity(), self.clone(), phase).unwrap()
         }
         #[cfg(test)]
         pub(crate) fn issue_fixture_completion_work(
@@ -1653,8 +1671,9 @@ pub(crate) mod test_support {
     fn another_task_port_is_rejected_before_work_is_bound() {
         let owner = Owner::new();
         let other = Owner::new();
-        let error = TaskExecutionControl::new(other.identity, owner, TaskFailurePhase::Execution)
-            .unwrap_err();
+        let error =
+            TaskExecutionControl::for_test(other.identity, owner, TaskFailurePhase::Execution)
+                .unwrap_err();
         assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     }
 }

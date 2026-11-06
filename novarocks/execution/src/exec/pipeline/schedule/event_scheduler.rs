@@ -1621,7 +1621,7 @@ mod tests {
             None,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
                 Arc::new(
-                    crate::runtime::task_control::TaskExecutionControl::new(
+                    crate::runtime::task_control::TaskExecutionControl::for_test(
                         owner.identity(),
                         owner.clone(),
                         TaskFailurePhase::Execution,

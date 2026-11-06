@@ -362,7 +362,7 @@ mod tests {
                 io_spawner: spawner,
                 range: Some(service.bind(
                     FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
-                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
                 )),
             },
             None,
@@ -419,7 +419,7 @@ mod tests {
                 io_spawner: spawner,
                 range: Some(service.bind(
                     FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
-                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
                 )),
             },
             None,

@@ -2616,21 +2616,29 @@ impl TaskPreparationJob {
                     .installation_failed = true;
                 return;
             }
-            let preparation = crate::TaskPreparationContext::from_admitted(
-                binding.port.execution_port(),
-                &binding.children,
-                binding.cadence,
-                binding.preparation_capture,
-                std::task::Waker::from(
-                    owner
-                        .root_wake
-                        .as_ref()
-                        .expect("original preparation Root readiness source")
-                        .clone(),
-                ),
-            )
-            .expect("same original preparation roles");
             let prepared = (|| {
+                let admission = parent.admission_proof().map_err(|_| {
+                    crate::HostRejection::from_domain(
+                        novarocks_execution_contract::TaskFailureCategory::Internal,
+                        crate::host::PreparationOwnerUnavailable,
+                    )
+                })?;
+                let preparation = crate::TaskPreparationContext::from_admitted(
+                    binding.port.execution_port(),
+                    &binding.children,
+                    binding.cadence,
+                    binding.preparation_capture,
+                    std::task::Waker::from(
+                        owner
+                            .root_wake
+                            .as_ref()
+                            .expect("original preparation Root readiness source")
+                            .clone(),
+                    ),
+                    admission,
+                    request.descriptor().task_key(),
+                )
+                .expect("same original preparation roles");
                 // This pure journal refusal belongs to the original already
                 // Accepted preparation. Its payload, unused roles and failure
                 // publication exit through this real physical invocation.

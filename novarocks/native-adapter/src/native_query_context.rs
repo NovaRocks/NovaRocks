@@ -507,6 +507,11 @@ impl NativeTaskAdmissionResources {
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn TaskResultWriter>,
         event_sink: Arc<dyn TaskEventSink>,
+        identity: novarocks_execution_contract::TaskIdentity,
+        control: Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>,
+        completion: novarocks_execution_contract::AdmittedWorkParts<
+            novarocks_execution::runtime::task::ExecutionFailure,
+        >,
     ) -> LocalTaskPrepareContext {
         #[cfg(novarocks_dev_controls)]
         let query_tracker_witness = Arc::downgrade(&self.query_mem_tracker);
@@ -517,6 +522,9 @@ impl NativeTaskAdmissionResources {
             exchange_transmitter,
             result_writer,
             event_sink,
+            identity,
+            control,
+            completion,
         )
         .with_query_memory(self.query_memory)
         .with_task_commit_port(Arc::new(WorkerSinkCommitPort));

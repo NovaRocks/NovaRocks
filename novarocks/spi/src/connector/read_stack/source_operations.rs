@@ -205,7 +205,7 @@ struct SourceFault {
     cause: SourceFaultCause,
     consumed: bool,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConnectorSourceOperations {
     inner: Arc<Mutex<SourceState>>,
 }
@@ -261,8 +261,18 @@ impl SourceState {
     }
 }
 impl ConnectorSourceOperations {
-    pub fn new() -> Self {
-        Self::default()
+    /// Issued by an application owner while its admitted work is live.
+    pub fn root(_admission: &novarocks_control_runtime::obligation::AdmissionProof) -> Self {
+        Self::empty()
+    }
+    fn empty() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SourceState::default())),
+        }
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test() -> Self {
+        Self::empty()
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, SourceState> {
         self.inner
@@ -290,7 +300,7 @@ impl ConnectorSourceOperations {
         })
     }
     pub fn child(&self) -> Result<Self, ConnectorError> {
-        let child = Self::new();
+        let child = Self::empty();
         let weak = Arc::downgrade(&child.inner);
         let ticket = self.admit(Arc::new(move || {
             if let Some(inner) = weak.upgrade() {
@@ -542,7 +552,7 @@ mod author_tests {
     }
     #[test]
     fn child_work_failure_reaches_original_root_before_sibling_exit_and_is_consumed_once() {
-        let root = ConnectorSourceOperations::new();
+        let root = ConnectorSourceOperations::for_test();
         let child = root.child().unwrap();
         let mut events = root.claim_failure_receiver().unwrap();
         let duplicate = root.claim_failure_receiver().err().unwrap();
@@ -594,7 +604,7 @@ mod author_tests {
     }
     #[test]
     fn stop_ending_its_ticket_then_panicking_keeps_original_slot_and_later_work_failure_visible() {
-        let root = ConnectorSourceOperations::new();
+        let root = ConnectorSourceOperations::for_test();
         let mut events = root.claim_failure_receiver().unwrap();
         let ticket = Arc::new(Mutex::new(None::<ConnectorOperationTicket>));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -673,7 +683,7 @@ mod author_tests {
     }
     #[test]
     fn callback_owner_destruction_is_a_separate_real_exit_phase() {
-        let root = ConnectorSourceOperations::new();
+        let root = ConnectorSourceOperations::for_test();
         let mut events = root.claim_failure_receiver().unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let payload_drops = Arc::new(AtomicUsize::new(0));
@@ -714,7 +724,7 @@ mod author_tests {
     }
     #[test]
     fn child_unknown_callback_custody_is_retained_by_the_original_root_after_child_drop() {
-        let root = ConnectorSourceOperations::new();
+        let root = ConnectorSourceOperations::for_test();
         let child = root.child().unwrap();
         let mut events = root.claim_failure_receiver().unwrap();
         let payload_drops = Arc::new(AtomicUsize::new(0));
@@ -764,7 +774,7 @@ mod author_tests {
     }
     #[test]
     fn borrowed_work_report_preserves_its_slot_before_authored_cleanup_and_later_exit() {
-        let root = ConnectorSourceOperations::new();
+        let root = ConnectorSourceOperations::for_test();
         let child = root.child().unwrap();
         let mut events = root.claim_failure_receiver().unwrap();
         let failed = child.admit(Arc::new(|| {})).unwrap();

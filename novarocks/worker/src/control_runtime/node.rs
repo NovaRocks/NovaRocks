@@ -575,7 +575,7 @@ impl WorkerNodeHost {
             return None;
         }
         Some(Arc::new(
-            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+            novarocks_execution::runtime::task_control::TaskExecutionControl::for_test(
                 identity,
                 owner.port().execution_port(),
                 novarocks_execution_contract::TaskFailurePhase::Execution,
@@ -1393,13 +1393,12 @@ impl WorkerNodeHost {
             .map_err(|original| NodeHostRefusal::new("Root drain wake", original))
     }
     pub(crate) fn confirm_ingress_closed(&self) -> Result<(), NodeHostRefusal> {
+        // The original owner publishes and wakes under this same lock. A
+        // poller can retire Root after unlock, so a second wake is not valid.
         self.control
             .lock()
             .confirm_ingress_closed()
-            .map_err(|original| NodeHostRefusal::new("Root physical ingress closure", original))?;
-        self.runtime
-            .notify_host_actor(&self.root_registration)
-            .map_err(|original| NodeHostRefusal::new("Root ingress closure wake", original))
+            .map_err(|original| NodeHostRefusal::new("Root physical ingress closure", original))
     }
     /// An already admitted neutral request moves directly to the same Root.
     pub(crate) fn observe_ticket(

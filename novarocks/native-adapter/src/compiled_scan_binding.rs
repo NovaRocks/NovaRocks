@@ -62,13 +62,11 @@ use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
 use novarocks_spi::connector::read_stack::{
     Assignment, CompleteAllDynamicFilter, ConnectorDataCacheOptions,
     ConnectorPageSourceProviderOptions, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
-    ConnectorSourceOperations,
 };
 use novarocks_spi::connector::{
-    ConnectorRangeScope, ConnectorRequestContext, ConnectorStopView,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorRequestContext, ConnectorStopView, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-use novarocks_types::UniqueId;
 use novarocks_worker::typed_connector_runtime::TypedConnectorScanSource;
 use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 use novarocks_worker::{TypedConnectorReadDescriptor, TypedScanRuntime};
@@ -83,7 +81,7 @@ pub(crate) struct CompiledScanTaskFacts<'a> {
     #[cfg(novarocks_dev_controls)]
     pub(crate) observation_controls:
         Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
-    pub(crate) task_key: UniqueId,
+    pub(crate) scan_sources: novarocks_worker::TaskScanSourceIssuer,
     pub(crate) query_options: &'a QueryOptions,
     pub(crate) stop: ConnectorStopView,
     /// The runtime-filter bindings the task's package numbers.
@@ -431,16 +429,10 @@ pub(crate) fn bind_compiled_scan(
     let descriptor =
         TypedConnectorReadDescriptor::new(relation.table().clone(), assignments, dynamic_filter);
 
-    let execution_id = task.runtime.execution_id();
-    let range_scope = ConnectorRangeScope::try_new(
-        execution_id.query_id().high(),
-        execution_id.query_id().low(),
-        execution_id.attempt_id().get(),
-        task.task_key.high(),
-        task.task_key.low(),
-        scan_node,
-    )
-    .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
+    let (range_scope, operations) = task
+        .scan_sources
+        .issue(scan_node)
+        .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let (_, query_expire) = novarocks_execution::runtime::query_options::query_expire_durations(
         Some(task.query_options),
     );
@@ -455,7 +447,7 @@ pub(crate) fn bind_compiled_scan(
     .map(|request| {
         request
             .with_storage_resolver(task.runtime.storage_resolver())
-            .with_execution_source(range_scope, ConnectorSourceOperations::new())
+            .with_execution_source(range_scope, operations)
     })
     .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
     let reader_policy = reader_policy(task.query_options)

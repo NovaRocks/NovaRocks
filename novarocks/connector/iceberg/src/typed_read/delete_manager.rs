@@ -2669,7 +2669,8 @@ mod tests {
                 gate.clone(),
                 runtime.handle().clone(),
             );
-            let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+            let operations =
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
             let range = service.bind(
                 novarocks_fs::FileRangeScope::for_test(1, 2, 1, 3, 4, 5).unwrap(),
                 operations.clone(),

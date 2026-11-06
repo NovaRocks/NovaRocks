@@ -92,13 +92,23 @@ struct Custody {
 pub(crate) struct PreparationParent {
     scope: ScopeHandle,
     work: WorkId,
+    authority: Result<novarocks_control_runtime::obligation::WorkChildAuthority, RuntimeError>,
 }
 impl PreparationParent {
     pub(crate) fn from_admitted(work: &WorkObligation) -> Self {
         Self {
             scope: work.scope().clone(),
             work: work.id(),
+            authority: work.child_authority(),
         }
+    }
+    pub(crate) fn admission_proof(
+        &self,
+    ) -> Result<novarocks_control_runtime::obligation::AdmissionProof, RuntimeError> {
+        self.authority
+            .as_ref()
+            .map_err(|error| *error)?
+            .verify_live()
     }
     #[cfg(test)]
     pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepRegistration, RuntimeError> {

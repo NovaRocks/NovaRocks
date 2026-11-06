@@ -997,7 +997,7 @@ impl NativeTaskExecutionHost {
             program,
             &CompiledScanTaskFacts {
                 runtime: &typed_runtime,
-                task_key: descriptor_task_key,
+                scan_sources: preparation_scope.scan_sources(),
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
                 runtime_filters,
@@ -1137,14 +1137,14 @@ impl NativeTaskExecutionHost {
                 Arc::clone(&self.exchange_transmitter),
                 Arc::clone(&self.result_writer),
                 event_sink,
+                identity,
+                task_control,
+                admitted_work,
             )
             .with_task_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
-            .with_task_control(task_control)
-            .with_completion_work(admitted_work)
-            .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = &self.test_controls {

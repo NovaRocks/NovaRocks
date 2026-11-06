@@ -243,7 +243,7 @@ fn parquet_decoder_promotes_partial_backing_and_reads_only_its_gap() {
     request.prepared_input = Some(prepared);
     request.context.range = Some(service.bind(
         FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
-        novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+        novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test(),
     ));
     let mut reader = open_file_reader(request).expect("open from partial input");
     let batches = collect(reader.as_mut()).expect("decode promoted input");

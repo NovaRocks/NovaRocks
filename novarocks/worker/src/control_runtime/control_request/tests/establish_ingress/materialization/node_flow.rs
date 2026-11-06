@@ -828,6 +828,16 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
     if !wait_until(|| scene.runtime.is_empty() && scene.ledger.is_empty()) {
         scene.fail("Root actual metadata and Scope drain timeout", ());
     }
+    // A repeated physical-close observation must stay idempotent after the
+    // same Root has retired; it cannot enqueue another wake to that old actor.
+    if let Err(original) = scene.node.confirm_ingress_closed() {
+        scene.fail(
+            "Node repeated ingress close after actual Root retirement",
+            original,
+        );
+    }
+    assert!(scene.runtime.is_empty());
+    assert!(scene.ledger.is_empty());
     finish_scene(scene, workers, close_kind, shutdown_task_ports);
 }
 

@@ -69,6 +69,7 @@ pub struct PreparedPipelineExecution {
 }
 
 impl PreparedPipelineExecution {
+    #[cfg(test)]
     pub(crate) fn admit_local_completion_poller(
         &self,
         poller: crate::runtime::local_completion::LocalCompletionPoller,

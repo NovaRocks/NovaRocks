@@ -1478,8 +1478,12 @@ mod cleanup_notification_tests {
         });
         let weak_port = Arc::downgrade(&port);
         let control = Arc::new(
-            TaskExecutionControl::new(port.identity(), port.clone(), TaskFailurePhase::Execution)
-                .unwrap(),
+            TaskExecutionControl::for_test(
+                port.identity(),
+                port.clone(),
+                TaskFailurePhase::Execution,
+            )
+            .unwrap(),
         );
         let state = RuntimeErrorState::for_task(control.clone());
         let tracker =
