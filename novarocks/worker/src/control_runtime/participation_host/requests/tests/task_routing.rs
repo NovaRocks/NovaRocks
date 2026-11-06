@@ -215,7 +215,18 @@ fn closed_task_command_expires_before_read_seal(
                 deadline,
             )
             .unwrap();
-        host.submit_deferred_task_read(work, command(task)).unwrap();
+        if let Err(original) = host.submit_deferred_task_read(work, command(task)) {
+            // The old Cancel match refuses before submitting this R. Retire
+            // its actual unused holders before reporting the regression.
+            drop(original);
+            drop(host);
+            drop(handle);
+            assert!(advance(&mut f, work));
+            assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
+            assert_eq!(ready.registered(), 0);
+            finish_task_fixture(f, task);
+            panic!("a closed Task read must retain its original R until the actual seal");
+        }
         (work, handle)
     };
     let original = handle.request();
