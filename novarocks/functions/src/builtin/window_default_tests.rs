@@ -327,10 +327,11 @@ fn i32_formatter_preserves_bounds_nulls_scalar_and_original_constant_ordinal() {
         let out = r.evaluate_complete(input, 3, &Control::default()).unwrap();
         assert_eq!(strings(&out), expected);
     }
-    assert!(matches!(
-        r.evaluate_complete(EvaluatedArgument::Scalar(&values), 4, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
-    ));
+    crate::kernel_control::test_contract::exact(
+        &r.evaluate_complete(EvaluatedArgument::Scalar(&values), 4, &Control::default())
+            .unwrap_err(),
+        crate::EvaluationContractError::ArgumentLength,
+    );
     let baseline = Control::default();
     r.evaluate_complete(EvaluatedArgument::Column(&values), 4, &baseline)
         .unwrap();
