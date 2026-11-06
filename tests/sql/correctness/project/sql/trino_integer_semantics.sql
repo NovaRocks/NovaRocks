@@ -191,4 +191,3 @@ SELECT GROUPING(a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,
 -- query 37
 -- Reference: G04_bit_order
 SELECT grouping(a,b) FROM (VALUES (1,2)) AS t(a,b) GROUP BY GROUPING SETS ((a),(b),()) ORDER BY 1;
-
