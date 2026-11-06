@@ -1061,3 +1061,34 @@ fn reversed_route_partial_merge_preserves_the_first_actually_accepted_nan_repres
     }
     assert_eq!(nonempty, 1);
 }
+
+#[test]
+fn content_nan_bits_use_fixed_ieee_literals_and_preserve_every_other_input_bit() {
+    use crate::exec::hash_table::hash::{content_f32_bits, content_f64_bits};
+    for bits in [
+        0x7ff8_0000_0000_0001,
+        0xfff8_0000_0000_0907,
+        0x7ff0_0000_0000_0001,
+    ] {
+        assert_eq!(
+            content_f64_bits(f64::from_bits(bits)),
+            0x7ff8_0000_0000_0000
+        );
+    }
+    for bits in [0x7fc0_0001, 0xffc0_0917, 0x7f80_0001] {
+        assert_eq!(content_f32_bits(f32::from_bits(bits)), 0x7fc0_0000);
+    }
+    for bits in [
+        0,
+        0x8000_0000_0000_0000,
+        1,
+        0x3ff0_0000_0000_0000,
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000,
+    ] {
+        assert_eq!(content_f64_bits(f64::from_bits(bits)), bits);
+    }
+    for bits in [0, 0x8000_0000, 1, 0x3f80_0000, 0x7f80_0000, 0xff80_0000] {
+        assert_eq!(content_f32_bits(f32::from_bits(bits)), bits);
+    }
+}
