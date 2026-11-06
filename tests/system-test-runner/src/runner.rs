@@ -11,14 +11,7 @@ use novarocks_cluster_harness::{CrossProcessCluster, CrossProcessClusterOptions}
 use std::fs;
 
 pub fn run(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
-    let exact =
-        cli.exact_mysql_execution_binding.is_some() || cli.held_native_execution_binding.is_some();
-    let result = run_dispatch(cli, build);
-    if exact {
-        finish_exact_mysql_scenario(result.err(), Ok(()), Ok(()))
-    } else {
-        result
-    }
+    run_dispatch(cli, build)
 }
 
 fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> Result<()> {
@@ -81,128 +74,6 @@ fn run_dispatch(cli: Cli, build: crate::build_information::BuildInformation) -> 
         return Ok(());
     }
     let config = RunnerConfig::from_cli(&cli, build)?;
-    if let Some(binding) = &config.held_native_execution_binding {
-        #[cfg(unix)]
-        {
-            use crate::exact_native_admission::held_native_admission;
-            anyhow::ensure!(
-                config.cluster_size == 3
-                    && config.launch_profile
-                        == novarocks_cluster_harness::LaunchProfile::FaultScenario,
-                "held native admission requires fault-scenario 1FE+3BE"
-            );
-            let admitted = held_native_admission::admit(
-                binding,
-                &config.binary,
-                &config.base_config_path,
-                &config.build,
-            )?;
-            let scene = scenarios::exact_mysql_native_driver::held_late_ack_from_admitted(
-                admitted.for_scene(),
-                config.held_live_collector_fences,
-            )?;
-            anyhow::ensure!(
-                cli.only.is_empty() || (cli.only.len() == 1 && cli.only[0] == scene.name()),
-                "held native selector differs from admitted case"
-            );
-            let primary = run_one(scene.as_ref(), &config);
-            // Re-admission is preparation only, never a renewed scene20/protocol5.
-            // All role cleanup has already settled through original run_one ownership.
-            let postrun = held_native_admission::admit(
-                binding,
-                &config.binary,
-                &config.base_config_path,
-                &config.build,
-            )
-            .and_then(|after| {
-                anyhow::ensure!(
-                    after == admitted,
-                    "held admission changed during original scene"
-                );
-                Ok(())
-            });
-            return finish_exact_mysql_scenario(primary.err(), postrun, Ok(()));
-        }
-        #[cfg(not(unix))]
-        bail!("held native admission requires Unix original role ownership");
-    }
-    if let Some(binding) = &config.exact_mysql_execution_binding {
-        #[cfg(unix)]
-        {
-            if config.cluster_size != 3
-                || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario
-            {
-                bail!("exact MySQL execution requires fault-scenario 1FE+3BE");
-            }
-            let admitted = crate::exact_native_admission::admit(
-                binding,
-                &config.binary,
-                &config.base_config_path,
-                &config.build,
-            )?;
-            let exact =
-                scenarios::exact_mysql_native_driver::scenarios_from_admitted(admitted.clone())?;
-            let selected = select_exact(&exact, &cli.only)?;
-            for scenario in selected {
-                let current = crate::exact_native_admission::admit(
-                    binding,
-                    &config.binary,
-                    &config.base_config_path,
-                    &config.build,
-                )?;
-                anyhow::ensure!(
-                    current == admitted,
-                    "original admission changed before exact scene launch"
-                );
-                run_one(scenario, &config)?;
-                // Final source/binary drift is an admission failure even when
-                // the original scene already settled successfully. This new
-                // preparation check cannot renew its original 20-second clock.
-                let after = crate::exact_native_admission::admit(
-                    binding,
-                    &config.binary,
-                    &config.base_config_path,
-                    &config.build,
-                )?;
-                anyhow::ensure!(
-                    after == admitted,
-                    "original admission changed during exact scene"
-                );
-            }
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        bail!("exact MySQL execution requires Unix original fixture ownership");
-    }
-    if let Some(binding) = &cli.hms_bulk_readonly_binding {
-        #[cfg(unix)]
-        {
-            let scenario = scenarios::hms_bulk_readonly_native::HmsBulkReadonlyNative::admit(
-                binding,
-                &config.binary,
-                &config.base_config_path,
-                &config.build,
-            )?;
-            let result = run_one(&scenario, &config);
-            let recheck = scenario.recheck_admission();
-            return finish_exact_mysql_scenario(result.err(), recheck, Ok(()));
-        }
-        #[cfg(not(unix))]
-        bail!("HMS readonly bulk requires original Unix role owners");
-    }
-    if let Some(binding) = &cli.hms_classification_binding {
-        if config.cluster_size != 3
-            || config.launch_profile != novarocks_cluster_harness::LaunchProfile::FaultScenario
-        {
-            bail!("HMS classification preflight requires fault-scenario 1FE+3BE");
-        }
-        let scenario =
-            scenarios::hms_classification_preflight::HmsClassificationPreflight::from_binding(
-                binding,
-                &config.base_config_path,
-            )?;
-        return run_one(&scenario, &config);
-    }
     let selected = select(&scenarios, &cli.only)?;
     if selected.is_empty() {
         bail!("no system scenarios are registered");
@@ -259,22 +130,6 @@ fn scenario_declarations(
         })
         .collect::<Vec<_>>();
     Ok(serde_json::json!({"schema": 1, "scenarios": entries}))
-}
-
-#[cfg(unix)]
-fn select_exact<'a>(
-    scenarios: &'a [Box<dyn Scenario>],
-    only: &[String],
-) -> Result<Vec<&'a dyn Scenario>> {
-    if only.is_empty() {
-        return Ok(scenarios.iter().map(|scenario| scenario.as_ref()).collect());
-    }
-    let unique: std::collections::BTreeSet<_> = only.iter().collect();
-    anyhow::ensure!(
-        only.len() <= scenarios.len() && unique.len() == only.len(),
-        "exact matrix selectors must be unique original cases"
-    );
-    select(scenarios, only)
 }
 
 fn select<'a>(
@@ -340,12 +195,10 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     match settlement.write() {
         Ok(()) => result,
         Err(error) => {
-            let bounded = config.exact_mysql_execution_binding.is_some()
-                || config.held_native_execution_binding.is_some()
-                || result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| exact_mysql_failure_presentation(error).is_some());
+            let bounded = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| observed_failure_presentation(error).is_some());
             finish_prelaunch_scenario(bounded, result.err(), Err(error), Ok(()))
         }
     }
@@ -360,8 +213,7 @@ fn run_one_inner(
     if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
         bail!("system scenario {} is disabled: {reason}", scenario.name());
     }
-    let bounded_binding = config.exact_mysql_execution_binding.is_some()
-        || config.held_native_execution_binding.is_some();
+    let bounded_binding = false;
     let preparation_budget = (|| -> Result<_> {
         config.fixture_budget.check_work()?;
         Ok(std::time::Instant::now()
@@ -397,21 +249,6 @@ fn run_one_inner(
             }
         };
     settlement.launch_config_succeeded();
-    // The explicit FE-child fixture pair is the existing activation contract.
-    // Capture only once before launch; serial startup consumes this original budget.
-    let exact_mysql_clock = match crate::scenario::ExactMysqlPrelaunchClock::capture(
-        &launch_config.child_environment,
-    ) {
-        Ok(clock) => clock,
-        Err(error) => {
-            return finish_prelaunch_scenario(
-                bounded_binding,
-                Some(error),
-                Ok(()),
-                settlement.teardown(scenario),
-            );
-        }
-    };
     let root_observation_clock = match scenario.root_observation_deadline() {
         Ok(clock) => clock,
         Err(error) => {
@@ -423,29 +260,18 @@ fn run_one_inner(
             );
         }
     };
-    if exact_mysql_clock.is_some() && root_observation_clock.is_some() {
-        return finish_exact_mysql_scenario(
-            Some(anyhow::anyhow!(
-                "neutral root source cannot activate an exact MySQL gate owner"
-            )),
-            Ok(()),
-            settlement.teardown(scenario),
-        );
-    }
-    let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
-    let original_deadline = exact_mysql_clock
-        .map(|clock| clock.deadline())
-        .or(root_observation_clock)
-        .map_or(scenario_deadline, |deadline| {
-            deadline.min(scenario_deadline)
-        });
+    let bounded_original = root_observation_clock.is_some();
+    let original_deadline = root_observation_clock.map_or(scenario_deadline, |deadline| {
+        deadline.min(scenario_deadline)
+    });
 
     let preparation = (|| -> Result<_> {
         if bounded_original {
-            crate::scenario::ExactMysqlPrelaunchClock::validate_launch(
-                config.launch_profile,
-                config.cluster_size,
-            )?;
+            anyhow::ensure!(
+                config.launch_profile == novarocks_cluster_harness::LaunchProfile::FaultScenario
+                    && config.cluster_size == 3,
+                "original root observation requires fault-scenario 1FE+3BE before role launch"
+            );
         }
         let fe_binary = resolve_binary(
             launch_config.binary_layout.frontend,
@@ -464,7 +290,7 @@ fn run_one_inner(
     let (fe_binary, be_binaries) = match preparation {
         Ok(binaries) => binaries,
         Err(error) if bounded_original => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_observed_scenario(Some(error), Ok(()), settlement.teardown(scenario));
         }
         Err(error) => {
             return finish_prelaunch_scenario(
@@ -528,7 +354,7 @@ fn run_one_inner(
                 .backend_retained_byte_limits
                 .is_empty())
     {
-        return finish_exact_mysql_scenario(
+        return finish_observed_scenario(
             Some(anyhow::anyhow!(
                 "original source requires direct original roles"
             )),
@@ -538,35 +364,14 @@ fn run_one_inner(
     }
     settlement.cluster_launch_attempted();
     let prepared_check =
-        |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
+        |_artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
             anyhow::ensure!(
                 std::time::Instant::now() < original_deadline,
                 "original system preparation deadline expired"
             );
-            if bounded_original {
-                scenario.freeze_prepared_exact_config(
-                    artifact,
-                    &scenario_root,
-                    original_deadline,
-                )?;
-            }
             anyhow::ensure!(
                 std::time::Instant::now() < original_deadline,
                 "original system preparation completion was late"
-            );
-            Ok(())
-        };
-    let log_check =
-        |role: &str, source: &novarocks_cluster_harness::ManagedProcessLogSource| -> Result<()> {
-            anyhow::ensure!(
-                std::time::Instant::now() < original_deadline,
-                "original system log source deadline expired"
-            );
-            let (device, inode) = source.original_durable_log_identity()?;
-            scenario.observe_original_durable_log_owner(role, device, inode)?;
-            anyhow::ensure!(
-                std::time::Instant::now() < original_deadline,
-                "original log owner source completion was late"
             );
             Ok(())
         };
@@ -576,11 +381,10 @@ fn run_one_inner(
         launch_config.native_fault_proxies,
         launch_config.native_root_reply_fault,
         Some(&prepared_check),
-        config.held_live_collector_fences.then_some(
-            &log_check
-                as &dyn Fn(&str, &novarocks_cluster_harness::ManagedProcessLogSource) -> Result<()>,
-        ),
-        scenario_budget.with_work_deadline_limit(original_deadline),
+        None,
+        scenario_budget
+            .clone()
+            .with_work_deadline_limit(original_deadline),
     )
     .with_context(|| format!("launch system scenario {}", scenario.name()));
     let handle = match handle {
@@ -588,7 +392,7 @@ fn run_one_inner(
         Err(error) => {
             settlement.cluster_launch_failed(&error);
             if bounded_original {
-                return finish_exact_mysql_scenario(
+                return finish_observed_scenario(
                     Some(error),
                     Ok(()),
                     settlement.teardown(scenario),
@@ -609,6 +413,7 @@ fn run_one_inner(
         scenario_root,
         timeout: config.timeout,
         original_deadline,
+        fixture_budget: scenario_budget.with_work_deadline_limit(original_deadline),
         binary: config.binary.clone(),
         compatible_binary: config.compatible_binary.clone(),
         other_island_binary: config.other_island_binary.clone(),
@@ -616,7 +421,6 @@ fn run_one_inner(
         cluster_size: config.cluster_size,
         launch_profile: config.launch_profile,
         build: config.build,
-        exact_mysql_clock,
     });
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context).and_then(|()| {
@@ -630,7 +434,7 @@ fn run_one_inner(
         let evidence_path = match context.write_evidence(ScenarioEvidenceOutcome::Failed) {
             Ok(path) => path.display().to_string(),
             Err(_) if bounded_original => {
-                "unavailable (exact fixture evidence write failed)".to_string()
+                "unavailable (original source evidence write failed)".to_string()
             }
             Err(evidence_error) => format!("unavailable ({evidence_error:#})"),
         };
@@ -646,13 +450,8 @@ fn run_one_inner(
             novarocks_cluster_harness::LaunchProfile::FaultScenario => "fault-scenario",
             novarocks_cluster_harness::LaunchProfile::Performance => "performance",
         };
-        let exact_binding = config
-            .exact_mysql_execution_binding
-            .as_ref()
-            .map(|path| format!(" --exact-mysql-execution-binding {}", path.display()))
-            .unwrap_or_default();
         eprintln!(
-            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}",
+            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}",
             context.name(),
             config.binary.display(),
             config.base_config_path.display(),
@@ -660,17 +459,12 @@ fn run_one_inner(
             config.cluster_size,
             config.timeout.as_secs(),
             launch_profile,
-            exact_binding,
         );
-        let cluster_cleanup = if exact_mysql_clock.is_some() {
-            context.shutdown_exact_mysql_fixture()
-        } else {
-            context.shutdown()
-        };
+        let cluster_cleanup = context.shutdown();
         settlement.cluster_shutdown(&cluster_cleanup);
         let fixture_cleanup = settlement.teardown(scenario);
         if bounded_original {
-            return finish_exact_mysql_scenario(
+            return finish_observed_scenario(
                 Some(result.expect_err("failed scenario retains its original error")),
                 cluster_cleanup,
                 fixture_cleanup,
@@ -696,16 +490,13 @@ fn run_one_inner(
         };
     }
     context.action("scenario assertions passed");
-    let cluster_cleanup = if exact_mysql_clock.is_some() {
-        context.shutdown_exact_mysql_fixture()
-    } else {
-        context.shutdown()
-    }
-    .with_context(|| format!("cleanup system scenario {}", context.name()));
+    let cluster_cleanup = context
+        .shutdown()
+        .with_context(|| format!("cleanup system scenario {}", context.name()));
     settlement.cluster_shutdown(&cluster_cleanup);
     let fixture_cleanup = settlement.teardown(scenario);
     if bounded_original {
-        finish_exact_mysql_scenario(None, cluster_cleanup, fixture_cleanup)?;
+        finish_observed_scenario(None, cluster_cleanup, fixture_cleanup)?;
     } else {
         match (cluster_cleanup, fixture_cleanup) {
             (Ok(()), Ok(())) => {}
@@ -728,9 +519,6 @@ fn run_one_inner(
     // The original deadline includes all final durable evidence. The outer
     // wrapper writes only on paths that have not already published this record.
     settlement.write()?;
-    if let Some(clock) = exact_mysql_clock {
-        clock.remaining("settled original role and final evidence completion")?;
-    }
     if let Some(deadline) = root_observation_clock {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
@@ -955,7 +743,7 @@ pub(crate) fn fixture_admission_rejected(error: &anyhow::Error) -> bool {
                 .as_ref()
                 .is_some_and(fixture_admission_rejected);
     }
-    if let Some(failure) = error.downcast_ref::<ExactMysqlScenarioFailure>() {
+    if let Some(failure) = error.downcast_ref::<ObservedScenarioFailure>() {
         return failure.cluster.is_none()
             && failure.fixture.is_none()
             && failure
@@ -975,7 +763,7 @@ fn finish_prelaunch_scenario(
     fixture: Result<()>,
 ) -> Result<()> {
     if bounded {
-        return finish_exact_mysql_scenario(primary, settlement, fixture);
+        return finish_observed_scenario(primary, settlement, fixture);
     }
     let settlement = settlement.err();
     let fixture = fixture.err();
@@ -990,29 +778,29 @@ fn finish_prelaunch_scenario(
     .into())
 }
 
-// Preserve the actual primary and cleanup sources for this explicit fixture only.
-struct ExactMysqlScenarioFailure {
+// Preserve original source and actual cleanup errors through bounded presentation.
+struct ObservedScenarioFailure {
     primary: Option<anyhow::Error>,
     cluster: Option<anyhow::Error>,
     fixture: Option<anyhow::Error>,
 }
-impl std::fmt::Display for ExactMysqlScenarioFailure {
+impl std::fmt::Display for ObservedScenarioFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "exact MySQL scenario failed: primary={} role_cleanup={} fixture_cleanup={}",
+            "observed scenario failed: primary={} role_cleanup={} fixture_cleanup={}",
             self.primary.is_some(),
             self.cluster.is_some(),
             self.fixture.is_some()
         )
     }
 }
-impl std::fmt::Debug for ExactMysqlScenarioFailure {
+impl std::fmt::Debug for ObservedScenarioFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
-impl std::error::Error for ExactMysqlScenarioFailure {
+impl std::error::Error for ObservedScenarioFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.primary
             .as_ref()
@@ -1021,7 +809,7 @@ impl std::error::Error for ExactMysqlScenarioFailure {
             .map(|error| error.as_ref())
     }
 }
-fn finish_exact_mysql_scenario(
+fn finish_observed_scenario(
     primary: Option<anyhow::Error>,
     cluster: Result<()>,
     fixture: Result<()>,
@@ -1031,7 +819,7 @@ fn finish_exact_mysql_scenario(
     if primary.is_none() && cluster.is_none() && fixture.is_none() {
         Ok(())
     } else {
-        Err(ExactMysqlScenarioFailure {
+        Err(ObservedScenarioFailure {
             primary,
             cluster,
             fixture,
@@ -1040,18 +828,18 @@ fn finish_exact_mysql_scenario(
     }
 }
 #[cfg(all(test, unix))]
-mod exact_mysql_cleanup_tests {
+mod observed_cleanup_tests {
     use super::*;
     #[test]
-    fn exact_cleanup_keeps_owned_primary_and_secondary_error_sources() {
+    fn cleanup_keeps_owned_primary_and_secondary_error_sources() {
         let primary = std::fs::File::open("/dev/null/no-original-file").unwrap_err();
-        let error = finish_exact_mysql_scenario(
+        let error = finish_observed_scenario(
             Some(primary.into()),
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into()),
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
         )
         .unwrap_err();
-        let owned = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
+        let owned = error.downcast_ref::<ObservedScenarioFailure>().unwrap();
         assert!(
             owned
                 .primary
@@ -1071,206 +859,35 @@ mod exact_mysql_cleanup_tests {
             std::io::ErrorKind::BrokenPipe
         );
         assert!(owned.fixture.is_some());
-        assert!(finish_exact_mysql_scenario(None, Ok(()), Ok(())).is_ok());
+        assert!(finish_observed_scenario(None, Ok(()), Ok(())).is_ok());
     }
 }
 
-/// Exact fixture error sources can contain raw child output. Preserve them for
+/// Original source errors can contain raw child output. Preserve them for
 /// typed inspection while terminal presentation uses only the bounded verdict.
-pub(crate) fn exact_mysql_failure_presentation(error: &anyhow::Error) -> Option<String> {
+pub(crate) fn observed_failure_presentation(error: &anyhow::Error) -> Option<String> {
     error
         .chain()
-        .find_map(|source| source.downcast_ref::<ExactMysqlScenarioFailure>())
+        .find_map(|source| source.downcast_ref::<ObservedScenarioFailure>())
         .map(|failure| failure.to_string())
 }
 
 #[cfg(test)]
-mod exact_mysql_presentation_tests {
+mod observed_presentation_tests {
     use super::*;
-    #[cfg(unix)]
-    #[test]
-    fn original_binding_parse_error_remains_owned_but_terminal_is_finite() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let binding = root.path().join("binding.json");
-        let base = root.path().join("base.toml");
-        let canary = "0123456789abcdef0123456789abcdef";
-        fs::write(&binding, format!("{{\"{canary}\":true}}"))?;
-        fs::write(&base, "[server]\nhost='127.0.0.1'\n")?;
-        let cli = Cli::parse([
-            "--binary".into(),
-            std::env::current_exe()?.display().to_string(),
-            "--config".into(),
-            base.display().to_string(),
-            "--artifact-root".into(),
-            root.path().join("artifacts").display().to_string(),
-            "--launch-profile".into(),
-            "fault-scenario".into(),
-            "--cluster-size".into(),
-            "3".into(),
-            "--exact-mysql-execution-binding".into(),
-            binding.display().to_string(),
-        ])?;
-        let result = run(cli, crate::build_information::BuildInformation::fixture());
-        root.close()?;
-        let error = result.unwrap_err();
-        assert!(error.chain().any(|source| source.is::<serde_json::Error>()));
-        assert!(format!("{error:#}").contains(canary));
-        assert!(
-            !exact_mysql_failure_presentation(&error)
-                .unwrap()
-                .contains(canary)
-        );
-        Ok(())
-    }
-    #[cfg(unix)]
-    #[test]
-    fn explicit_exact_selection_includes_all_and_refuses_duplicate_or_foreign_cases() {
-        let scenarios = crate::scenarios::all();
-        assert_eq!(
-            select_exact(&scenarios, &[]).unwrap().len(),
-            scenarios.len()
-        );
-        let name = scenarios[0].name().to_owned();
-        assert_eq!(
-            select_exact(&scenarios, std::slice::from_ref(&name))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(select_exact(&scenarios, &[name.clone(), name]).is_err());
-        assert!(select_exact(&scenarios, &["foreign-original-case".into()]).is_err());
-    }
     #[test]
     fn terminal_presentation_does_not_expand_retained_raw_source_canary() {
         let canary = "0123456789abcdef0123456789abcdef";
         let original = std::io::Error::other(format!("actual child tail: {canary}"));
-        let error = finish_exact_mysql_scenario(Some(original.into()), Ok(()), Ok(())).unwrap_err();
+        let error = finish_observed_scenario(Some(original.into()), Ok(()), Ok(())).unwrap_err();
         // The original source remains inspectable; the main terminal path uses
         // this exact bounded formatter instead of anyhow's expanded chain.
         assert!(format!("{error:#}").contains(canary));
         let shown =
-            exact_mysql_failure_presentation(&error.context("outer scenario context")).unwrap();
+            observed_failure_presentation(&error.context("outer scenario context")).unwrap();
         assert!(shown.contains("primary=true"));
         assert!(!shown.contains(canary));
-        assert!(exact_mysql_failure_presentation(&anyhow::anyhow!("ordinary")).is_none());
-    }
-}
-
-#[cfg(test)]
-mod exact_mysql_prelaunch_teardown_tests {
-    use super::*;
-    use crate::scenario::{ScenarioBinary, ScenarioLaunchConfig};
-    use novarocks_cluster_harness::{CrossProcessChildEnvironment, LaunchProfile};
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-    struct Fixture {
-        frontend: ScenarioBinary,
-        backends: Vec<ScenarioBinary>,
-        teardowns: AtomicUsize,
-    }
-    impl Scenario for Fixture {
-        fn name(&self) -> &'static str {
-            "component/exact-prelaunch-refusal"
-        }
-        fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
-            let mut environment = CrossProcessChildEnvironment::default();
-            environment.fe.insert(
-                "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET".into(),
-                "unused-private-path".into(),
-            );
-            environment.fe.insert(
-                "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX".into(),
-                "synthetic-only".into(),
-            );
-            Ok(ScenarioLaunchConfig {
-                child_environment: environment,
-                binary_layout: crate::scenario::ScenarioBinaryLayout {
-                    frontend: self.frontend,
-                    backends: self.backends.clone(),
-                },
-                ..ScenarioLaunchConfig::default()
-            })
-        }
-        fn run(&self, _: &mut ScenarioContext) -> Result<()> {
-            panic!("prelaunch refusal must never launch a role")
-        }
-        fn teardown(&self) -> Result<()> {
-            self.teardowns.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-    #[test]
-    fn exact_prelaunch_topology_and_both_binary_resolution_errors_teardown_once() {
-        let root =
-            std::env::temp_dir().join(format!("novarocks-exact-prelaunch-{}", std::process::id()));
-        let mut config = RunnerConfig {
-            build: crate::build_information::BuildInformation::fixture(),
-            binary: root.join("deliberately-no-binary"),
-            compatible_binary: None,
-            other_island_binary: None,
-            base_config_path: root.join("deliberately-no-config"),
-            artifact_root: root.clone(),
-            cluster_size: 3,
-            timeout: Duration::from_secs(20),
-            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
-                3600,
-            )
-            .unwrap(),
-            launch_profile: LaunchProfile::FaultScenario,
-            exact_mysql_execution_binding: None,
-            held_native_execution_binding: None,
-            held_live_collector_fences: false,
-        };
-        let mut observations = Vec::new();
-        for (profile, count, frontend, backends) in [
-            (
-                LaunchProfile::FaultScenario,
-                2,
-                ScenarioBinary::Primary,
-                vec![],
-            ),
-            (
-                LaunchProfile::Performance,
-                3,
-                ScenarioBinary::Primary,
-                vec![],
-            ),
-            (
-                LaunchProfile::FaultScenario,
-                3,
-                ScenarioBinary::Compatible,
-                vec![],
-            ),
-            (
-                LaunchProfile::FaultScenario,
-                3,
-                ScenarioBinary::Primary,
-                vec![ScenarioBinary::OtherIsland; 3],
-            ),
-        ] {
-            config.launch_profile = profile;
-            config.cluster_size = count;
-            let fixture = Fixture {
-                frontend,
-                backends,
-                teardowns: AtomicUsize::new(0),
-            };
-            observations.push((
-                run_one(&fixture, &config),
-                fixture.teardowns.load(Ordering::SeqCst),
-            ));
-        }
-        let cleanup = std::fs::remove_dir_all(&root);
-        assert!(cleanup.is_ok());
-        for (verdict, teardowns) in observations {
-            let error = verdict.expect_err("invalid launch input cannot start roles");
-            let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
-            assert!(
-                failure.primary.is_some() && failure.cluster.is_none() && failure.fixture.is_none()
-            );
-            assert_eq!(teardowns, 1);
-        }
+        assert!(observed_failure_presentation(&anyhow::anyhow!("ordinary")).is_none());
     }
 }
 
@@ -1287,7 +904,6 @@ mod neutral_root_prelaunch_tests {
     enum Mode {
         LaunchFailure,
         ClockFailure,
-        BothClocks,
         Neutral,
     }
     #[derive(Debug)]
@@ -1334,16 +950,6 @@ mod neutral_root_prelaunch_tests {
             // An absent compatible binary makes any missed early guard fail at
             // a different branch without ever starting a role.
             config.binary_layout.frontend = ScenarioBinary::Compatible;
-            if matches!(self.mode, Mode::BothClocks) {
-                config.child_environment.fe.insert(
-                    "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET".into(),
-                    "unused-private-path".into(),
-                );
-                config.child_environment.fe.insert(
-                    "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX".into(),
-                    "synthetic-only".into(),
-                );
-            }
             Ok(config)
         }
         fn root_observation_deadline(&self) -> Result<Option<Instant>> {
@@ -1379,9 +985,6 @@ mod neutral_root_prelaunch_tests {
             )
             .unwrap(),
             launch_profile: LaunchProfile::FaultScenario,
-            exact_mysql_execution_binding: None,
-            held_native_execution_binding: None,
-            held_live_collector_fences: false,
         }
     }
     fn assert_source(error: &anyhow::Error, expected: &Arc<u8>) {
@@ -1428,9 +1031,9 @@ mod neutral_root_prelaunch_tests {
         let rejection =
             || novarocks_cluster_harness::fixture_run::rejected(anyhow::anyhow!("invalid input"));
         assert!(fixture_admission_rejected(&rejection()));
-        let clean = finish_exact_mysql_scenario(Some(rejection()), Ok(()), Ok(())).unwrap_err();
+        let clean = finish_observed_scenario(Some(rejection()), Ok(()), Ok(())).unwrap_err();
         assert!(fixture_admission_rejected(&clean));
-        let cleanup_failure = finish_exact_mysql_scenario(
+        let cleanup_failure = finish_observed_scenario(
             Some(rejection()),
             Ok(()),
             Err(anyhow::anyhow!("cleanup failed")),
@@ -1453,7 +1056,7 @@ mod neutral_root_prelaunch_tests {
             assert_source(failure.primary.as_ref().unwrap(), &fixture.primary);
             assert_source(failure.fixture.as_ref().unwrap(), &fixture.secondary);
             assert!(failure.settlement.is_none());
-            assert!(exact_mysql_failure_presentation(&error).is_none());
+            assert!(observed_failure_presentation(&error).is_none());
             let shown = format!("{error:#}");
             assert!(shown.contains("original prelaunch component source"));
             if matches!(mode, Mode::LaunchFailure) {
@@ -1465,52 +1068,7 @@ mod neutral_root_prelaunch_tests {
             assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
         }
     }
-    #[test]
-    fn explicit_exact_and_held_bindings_keep_prelaunch_errors_bounded_and_owned() {
-        for exact in [true, false] {
-            let root = tempfile::tempdir().unwrap();
-            let fixture = Fixture::new(Mode::LaunchFailure);
-            let mut config = configuration(root.path());
-            if exact {
-                config.exact_mysql_execution_binding = Some(root.path().join("binding.json"));
-            } else {
-                config.held_native_execution_binding = Some(root.path().join("binding.json"));
-            }
-            let error = run_one(&fixture, &config).unwrap_err();
-            let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
-            assert_source(failure.primary.as_ref().unwrap(), &fixture.primary);
-            assert_source(failure.fixture.as_ref().unwrap(), &fixture.secondary);
-            assert!(failure.cluster.is_none());
-            assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                exact_mysql_failure_presentation(&error).unwrap(),
-                "exact MySQL scenario failed: primary=true role_cleanup=false fixture_cleanup=true"
-            );
-            assert!(format!("{error:#}").contains("prepare original fixture"));
-        }
-    }
 
-    #[test]
-    fn conflicting_neutral_and_exact_clocks_refuse_before_binary_resolution() {
-        let root =
-            std::env::temp_dir().join(format!("novarocks-neutral-conflict-{}", std::process::id()));
-        let fixture = Fixture::new(Mode::BothClocks);
-        let outcome = run_one(&fixture, &configuration(&root));
-        let cleanup = std::fs::remove_dir_all(&root);
-        assert!(cleanup.is_ok());
-        let error = outcome.unwrap_err();
-        let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
-        assert!(
-            failure
-                .primary
-                .as_ref()
-                .unwrap()
-                .to_string()
-                .contains("neutral root source cannot activate")
-        );
-        assert!(failure.cluster.is_none() && failure.fixture.is_none());
-        assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
-    }
     #[test]
     fn neutral_topology_and_binary_refusals_keep_one_original_teardown() {
         let root =
@@ -1528,7 +1086,7 @@ mod neutral_root_prelaunch_tests {
             let cleanup = std::fs::remove_dir_all(&root);
             assert!(cleanup.is_ok());
             let error = outcome.unwrap_err();
-            let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
+            let failure = error.downcast_ref::<ObservedScenarioFailure>().unwrap();
             assert!(
                 failure.primary.is_some() && failure.cluster.is_none() && failure.fixture.is_none()
             );
@@ -1624,9 +1182,6 @@ mod settlement_integration_tests {
             )
             .unwrap(),
             launch_profile: novarocks_cluster_harness::LaunchProfile::FaultScenario,
-            exact_mysql_execution_binding: None,
-            held_native_execution_binding: None,
-            held_live_collector_fences: false,
         }
     }
     #[test]

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Independent original-BE marker observation for the exact MySQL fixture.
+//! Independent original-BE marker observation for the original Native root.
 //! Prepared markers are source observations, never Installed or body/ACK authority.
 use super::result_delivery_root_protocol::parse_created_task_candidates;
 use crate::scenario::ScenarioContext;
@@ -86,7 +86,6 @@ struct LogDelta {
 
 #[derive(Clone, Copy)]
 pub(crate) enum FrontendIdentitySource {
-    ExactMysqlFixture,
     RootObservation,
 }
 pub(crate) struct IndependentRootObserver {
@@ -113,30 +112,11 @@ pub(crate) struct IndependentRootTarget {
 fn before_deadline(deadline: Instant) -> Result<()> {
     ensure!(
         Instant::now() < deadline,
-        "original exact MySQL root observation deadline expired"
+        "original Native root observation deadline expired"
     );
     Ok(())
 }
 impl IndependentRootObserver {
-    /// Original snapshot sizes only; no new read, payload alias or target authority.
-    pub(crate) fn original_baseline_log_bytes(&self) -> [u64; BACKENDS] {
-        self.before.map(|anchor| anchor.bytes)
-    }
-
-    /// Call only after original idle/root-zero baseline and before the sole target SQL.
-    /// expected_frontend must come from the independent actual-FE stdout marker.
-    pub(crate) fn capture_baseline(
-        context: &mut ScenarioContext,
-        expected_frontend: FrontendProcessId,
-    ) -> Result<Self> {
-        let original_deadline = context.exact_mysql_deadline()?;
-        Self::capture_baseline_until(
-            context,
-            expected_frontend,
-            original_deadline,
-            FrontendIdentitySource::ExactMysqlFixture,
-        )
-    }
     pub(crate) fn capture_baseline_until(
         context: &mut ScenarioContext,
         expected_frontend: FrontendProcessId,
@@ -151,7 +131,7 @@ impl IndependentRootObserver {
         );
         let actual_backends = context
             .handle()
-            .original_exact_mysql_backend_process_ids(original_deadline)?;
+            .original_backend_process_ids(original_deadline)?;
         let snapshots = read_logs(context, [None; BACKENDS], original_deadline)?;
         ensure!(
             context.recheck_live_process_launch_identities()? == original_roles,
@@ -203,7 +183,6 @@ impl IndependentRootObserver {
             serde_json::json!({"backend_index":backend,"identity":identity(*task)})).collect();
         Ok(
             serde_json::json!({"schema_version":1,"source":match self.source {
-            FrontendIdentitySource::ExactMysqlFixture=>"ExactMysqlFixture",
             FrontendIdentitySource::RootObservation=>"RootObservation"},
             "frontend":target.frontend.to_string(),"root":identity(target.root),
             "root_backend_index":target.root_backend_index,
@@ -215,11 +194,6 @@ impl IndependentRootObserver {
             "baseline_sha256":target.baseline_sha256,"after_log_bytes":target.after_log_bytes,
             "after_sha256":target.after_sha256}),
         )
-    }
-    /// Call once the original gate is actually held, before cancellation/health SQL.
-    /// This emits no SQL target, Root RPC, proxy, registry entry, ACK or authority.
-    pub(crate) fn observe(&self, context: &mut ScenarioContext) -> Result<IndependentRootTarget> {
-        self.observe_until(context, self.original_deadline)
     }
     /// Metadata can precede BE preparation. Wait only for typed incomplete
     /// publication, retaining the original phase deadline and all fatal errors.
@@ -240,12 +214,6 @@ impl IndependentRootObserver {
             "root observer step renews original clock"
         );
         before_deadline(step_deadline)?;
-        if matches!(self.source, FrontendIdentitySource::ExactMysqlFixture) {
-            ensure!(
-                context.exact_mysql_deadline()? == self.original_deadline,
-                "root observer was given a different original exact clock"
-            );
-        }
         ensure!(
             context.recheck_live_process_launch_identities()? == self.original_roles,
             "original role instance changed before root observation"
@@ -253,7 +221,7 @@ impl IndependentRootObserver {
         ensure!(
             context
                 .handle()
-                .original_exact_mysql_backend_process_ids(step_deadline)?
+                .original_backend_process_ids(step_deadline)?
                 == self.actual_backends,
             "actual live backend descriptor UUID changed"
         );
@@ -991,49 +959,5 @@ mod tests {
             .is_err()
         );
         assert!(scan(&mut PanicRead, 1, None, Instant::now()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod binding_projection_tests {
-    use super::super::exact_mysql_native_oracle::ActualBinding;
-    use super::*;
-    use crate::exact_mysql_target_binding::OriginalTargetBinding;
-    #[test]
-    fn independent_source_binding_preserves_every_raw_domain_and_descriptor() {
-        let (snapshots, processes) = super::tests::fixtures(&[2, 1]);
-        let mut target = super::tests::resolve_fixture(&snapshots, &processes).unwrap();
-        let mut raw = OriginalTargetBinding {
-            frontend_process_id: target.frontend,
-            connection_id: 71,
-            connection_generation: 19,
-            session_connection_id: 71,
-            session_key: 23,
-            statement_generation: 29,
-            sql_sha256: [31; 32],
-        };
-        let binding = ActualBinding::from_original_sources(raw, &target).unwrap();
-        assert_eq!(binding.connection.generation, 19);
-        assert_eq!(
-            (binding.statement.session_key, binding.statement.generation),
-            (23, 29)
-        );
-        assert_eq!(
-            (
-                binding.root.query_high,
-                binding.root.query_low,
-                binding.root.attempt
-            ),
-            (0, -7, 2)
-        );
-        assert_eq!(binding.backend_uuid_from_role, processes[2].to_bytes());
-        raw.session_connection_id = 72;
-        assert!(ActualBinding::from_original_sources(raw, &target).is_err());
-        raw.session_connection_id = 71;
-        raw.frontend_process_id = FrontendProcessId::new_v7();
-        assert!(ActualBinding::from_original_sources(raw, &target).is_err());
-        raw.frontend_process_id = target.frontend;
-        target.backend_process_from_descriptor = processes[0];
-        assert!(ActualBinding::from_original_sources(raw, &target).is_err());
     }
 }

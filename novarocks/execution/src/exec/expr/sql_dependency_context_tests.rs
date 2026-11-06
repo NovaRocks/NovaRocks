@@ -49,7 +49,15 @@ fn statement() -> StatementAdmissionContext {
         QueryCancellationSource::new().view(),
         SessionOptimizerSettings::default(),
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        Some(
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
+        ),
     )
 }
 
@@ -73,7 +81,15 @@ fn sql_dependency_context_default_admission_and_round_have_no_observer() {
         QueryCancellationSource::new().view(),
         SessionOptimizerSettings::default(),
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        Some(
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
+        ),
     ));
     assert!(request.execution().fold_dependency_observer().is_none());
 }

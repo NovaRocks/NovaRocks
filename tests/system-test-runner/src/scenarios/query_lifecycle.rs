@@ -1,9 +1,10 @@
-use crate::actors::mysql as mysql_actor;
-use crate::actors::mysql_stream::MysqlStream;
+use super::result_delivery_deadline::set_query_timeout;
+use super::trino_protocol::{observation, require_error};
+use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
+use crate::actors::trino_protocol::TrinoClient;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
     CrossProcessNativeFaultProxyConfig, QueryExecutionResourceSnapshot,
     QueryLifecycleStructuredSnapshot, TestClusterOwner,
@@ -62,7 +63,7 @@ fn fault_statement(sql: &str, fault: &'static str) -> StatementSpec {
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedBaseline::default()),
-        Box::new(MysqlDisconnect),
+        Box::new(ClientAbandonment),
         Box::new(QueryTimeout),
         Box::new(NoEffectReadAfterBackendExit::default()),
         Box::new(LiveBackendPartition::default()),
@@ -146,167 +147,136 @@ impl Scenario for LiveBackendPartition {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let old_connection = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
-        let old_observation =
-            self.intent
-                .take(0)?
-                .arm(context, old_connection.connection_id(), NID2_FENCE_QUERY)?;
-        let old_read = start_partitioned_read(old_connection)?;
-        context.action(
-            "started an unread distributed read whose admitted backend will be partitioned",
-        );
-        await_resource_activity(context, &baseline)?;
-        let target = await_fresh_task_create(context, &create_counts)?;
-        let process_before = context.process_ids().backends[target];
-        let proxy = context
-            .handle()
-            .native_fault_proxy(target)
-            .with_context(|| format!("obtain Native fault proxy for admitted BE[{target}]"))?;
-        await_proxy_connection(context, &proxy, target)?;
-        context.action(format!(
-            "observed old attempt TaskCreate and a live Native connection on BE[{target}]"
-        ));
+        use super::paimon::scan_statement_actor::combine;
 
-        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
-        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Paused);
-        context.action(format!(
-            "paused both Native transport directions for admitted, still-running BE[{target}]"
-        ));
-        await_backend_revoked_for_future_admission(context, target, process_before)?;
-        context.action(format!(
-            "confirmed BE[{target}] retained process identity {process_before} while FE revoked it for future admission"
-        ));
-        match old_read.done.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            Ok(outcome) => bail!(
-                "old read became terminal while BE[{target}] remained partitioned: {outcome:?}"
-            ),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                bail!("old read actor disconnected while BE[{target}] remained partitioned")
+        let deadline = context.deadline();
+        let selected = self.intent.take(0)?;
+        let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        let pending = session.submit(NID2_FENCE_QUERY)?;
+        let cancel = pending.cancel_handle();
+        let (pending, old_observation) =
+            selected.arm_pending(context, pending, NID2_FENCE_QUERY)?;
+        let partition = thread::scope(|scope| -> Result<_> {
+            let (done_tx, done) = mpsc::sync_channel(1);
+            let worker = scope.spawn(move || -> Result<()> {
+                match done_tx.send(session.run_pending(pending)) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::SendError(Err(error))) => Err(error.into()),
+                    Err(mpsc::SendError(Ok(_))) => bail!("old read result receiver closed"),
+                }
+            });
+            let mut paused = None;
+            let phase = (|| -> Result<_> {
+                await_resource_activity(context, &baseline)?;
+                let target = await_fresh_task_create(context, &create_counts)?;
+                let process_before = context.process_ids().backends[target];
+                let proxy = context.handle().native_fault_proxy(target)?;
+                await_proxy_connection(context, &proxy, target)?;
+                let proxy = paused.insert(proxy);
+                proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+                proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Paused);
+                context.action(format!(
+                    "paused both directions for admitted live BE[{target}]"
+                ));
+                await_backend_revoked_for_future_admission(context, target, process_before)?;
+                assert_partition_read_pending(&done, target)?;
+
+                let mut independent =
+                    SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+                let terminal = run_observed_baseline(
+                    context,
+                    &mut independent,
+                    &self.intent.take(1)?,
+                    "post-partition independent",
+                )?;
+                let participants = task_evidence::assert_query_completed_across_boundary(
+                    context,
+                    &terminal,
+                    "post-partition independent read",
+                )?;
+                ensure!(
+                    !participants.contains(&target),
+                    "fresh read used revoked BE[{target}]: {participants:?}"
+                );
+                assert_partition_read_pending(&done, target)?;
+                context.action(format!(
+                    "independent query used {participants:?} while original query stayed pending and BE[{target}] was revoked"
+                ));
+                Ok((target, process_before))
+            })();
+            if let Some(proxy) = paused {
+                proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
+                proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
+                context.action("restored both Native transport directions");
             }
+            let primary = phase.and_then(|(target, process_before)| {
+                let result = done
+                    .recv_timeout(context.remaining("await restored old read")?)
+                    .context("old read did not finish after Native transport restoration")??;
+                ensure!(
+                    result.columns.len() == 1
+                        && result.columns[0].name == "v"
+                        && result.columns[0].type_signature.raw_type == "boolean"
+                        && result.columns[0].type_signature.arguments.is_empty()
+                        && result.rows
+                            == [
+                                vec![TrinoValue::Boolean(true)],
+                                vec![TrinoValue::Boolean(true)]
+                            ],
+                    "restored old read returned unexpected result: {result:?}"
+                );
+                Ok((target, process_before))
+            });
+            let cancelled = if primary.is_err() {
+                cancel.delete(deadline).map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+            let joined = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("old live-partition read actor panicked"))
+                .and_then(|result| result);
+            combine(primary, combine(cancelled, joined))
+        });
+        let terminal = partition.and_then(|(target, process_before)| {
+            let terminal = context
+                .handle()
+                .await_query_lifecycle_statement_observation(&old_observation, true, deadline)?;
+            ensure!(
+                terminal.attempt_id == 1,
+                "restored old read unexpectedly replaced its attempt: {}",
+                terminal.attempt_id
+            );
+            ensure!(
+                context.process_ids().backends[target] == process_before,
+                "BE[{target}] process identity changed during a live transport partition"
+            );
+            context.action(format!(
+                "restored old attempt completed without replacing BE[{target}] process identity"
+            ));
+            Ok(())
+        });
+        let drained = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&old_observation, deadline);
+        let convergence = await_resource_convergence(context, &baseline);
+        combine(terminal, combine(drained, convergence))
+    }
+}
+
+fn assert_partition_read_pending(
+    done: &mpsc::Receiver<std::result::Result<StatementResult, StatementFailure>>,
+    target: usize,
+) -> Result<()> {
+    match done.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Ok(outcome) => {
+            bail!("old read became terminal while BE[{target}] remained partitioned: {outcome:?}")
         }
-
-        let mut independent = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
-        let independent_observation =
-            self.intent
-                .take(1)?
-                .arm(context, independent.connection_id(), BASELINE_QUERY)?;
-        execute_baseline_query(&mut independent, "post-partition independent")?;
-        independent.finish()?;
-        let deadline = context.deadline();
-        let independent_terminal = context
-            .handle()
-            .await_query_lifecycle_statement_observation(
-                &independent_observation,
-                true,
-                deadline,
-            )?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&independent_observation)?;
-        let independent_participants = task_evidence::assert_query_completed_across_boundary(
-            context,
-            &independent_terminal,
-            "post-partition independent read",
-        )?;
-        ensure!(
-            !independent_participants.contains(&target),
-            "fresh read used revoked BE[{target}]: {independent_participants:?}"
-        );
-        context.action(format!(
-            "completed a new attempt on live participants {independent_participants:?}, excluding partitioned BE[{target}]"
-        ));
-
-        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
-        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
-        context.action(format!(
-            "restored both Native transport directions for BE[{target}]"
-        ));
-        let old_rows = old_read
-            .done
-            .recv_timeout(context.remaining("await restored old read")?)
-            .context("old read did not finish after Native transport restoration")??;
-        old_read
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("old live-partition read actor panicked"))??;
-        ensure!(
-            old_rows == vec![1, 1],
-            "restored old read returned unexpected rows: {old_rows:?}"
-        );
-        let deadline = context.deadline();
-        let old_terminal = context
-            .handle()
-            .await_query_lifecycle_statement_observation(&old_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&old_observation)?;
-        ensure!(
-            old_terminal.attempt_id == 1,
-            "restored old read unexpectedly replaced its attempt: {}",
-            old_terminal.attempt_id
-        );
-        ensure!(
-            context.process_ids().backends[target] == process_before,
-            "BE[{target}] process identity changed during a live transport partition"
-        );
-        context.action(format!(
-            "restored old attempt completed without replacing BE[{target}] process identity"
-        ));
-        await_resource_convergence(context, &baseline)
-    }
-}
-
-struct JoinedClientThread(Option<thread::JoinHandle<Result<()>>>);
-impl JoinedClientThread {
-    fn join(mut self) -> std::thread::Result<Result<()>> {
-        self.0.take().expect("Native SQL client exists").join()
-    }
-}
-impl Drop for JoinedClientThread {
-    fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
-            match client.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("Original SQL actor cleanup failed: {error:#}"),
-                Err(_) => eprintln!("Original SQL actor panicked during actual join"),
-            }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            bail!("old read actor disconnected while BE[{target}] remained partitioned")
         }
     }
-}
-
-struct PendingPartitionedRead {
-    thread: JoinedClientThread,
-    done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
-}
-
-fn start_partitioned_read(
-    connection: mysql_actor::DeadlineConnection,
-) -> Result<PendingPartitionedRead> {
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let thread = thread::Builder::new()
-        .name("live-backend-partition-read".to_string())
-        .spawn(move || -> Result<()> {
-            connection.run(|connection| {
-                let outcome = connection.query(NID2_FENCE_QUERY);
-                done_tx
-                    .send(outcome)
-                    .context("publish live-partition read result")
-            })
-        })
-        .context("start live-partition read actor")?;
-    Ok(PendingPartitionedRead {
-        thread: JoinedClientThread(Some(thread)),
-        done,
-    })
 }
 
 fn ordinary_frontend_has_test_controls(records: &serde_json::Value) -> Result<bool> {
@@ -402,39 +372,39 @@ impl DistributedBaseline {
                 .query_execution_resource_snapshot()?
                 .context("binary baseline peer did not expose the public query-resource oracle")?;
             context.action("captured binary artifact native 1FE+3BE query-resource baseline");
-            let query = mysql_actor::connect_until(
-                peer.mysql_user(),
-                peer.runtime().fe_mysql_port,
-                deadline,
-            )
-            .and_then(|connection| {
-                connection.run(|connection| {
-                    for level in ["package", "wipe"] {
-                        let sql = format!(
-                            "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(table => 'ns.mv', level => '{level}')"
-                        );
-                        match connection.query_drop(&sql) {
-                            Err(mysql::Error::MySqlError(error)) => {
-                                ensure!(
-                                    error.code == 1105
-                                        && error.state == "HY000"
-                                        && ordinary_call_refusal_matches(&error.message, controls_compiled),
-                                    "ordinary test-only CALL returned another SQL failure: {error}"
-                                );
-                            }
-                            Err(error) => {
-                                return Err(anyhow::Error::new(error)
-                                    .context("binary test-only CALL did not return a public SQL error"));
-                            }
-                            Ok(()) => bail!("binary artifact accepted test-only {level} CALL"),
+            let query = (|| -> Result<()> {
+                let mut session =
+                    SqlSession::new(peer.sql_user(), peer.runtime().fe_trino_port, deadline)?;
+                for level in ["package", "wipe"] {
+                    let sql = format!(
+                        "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(table => 'ns.mv', level => '{level}')"
+                    );
+                    match session.execute(&sql) {
+                        Err(StatementFailure::Trino(error)) => {
+                            ensure!(
+                                error.error_code == 65536
+                                    && error.error_name == "GENERIC_INTERNAL_ERROR"
+                                    && error.error_type == "INTERNAL_ERROR"
+                                    && ordinary_call_refusal_matches(
+                                        &error.message,
+                                        controls_compiled
+                                    ),
+                                "ordinary test-only CALL returned another SQL failure: {error:?}"
+                            );
                         }
+                        Err(error) => {
+                            return Err(anyhow::Error::new(error).context(
+                                "binary test-only CALL did not return a public SQL error",
+                            ));
+                        }
+                        Ok(_) => bail!("binary artifact accepted test-only {level} CALL"),
                     }
-                    for ordinal in ["binary first", "binary second", "binary third"] {
-                        execute_baseline_query(connection, ordinal)?;
-                    }
-                    Ok(())
-                })
-            });
+                }
+                for ordinal in ["binary first", "binary second", "binary third"] {
+                    assert_baseline_rows(&session.execute(BASELINE_QUERY)?, ordinal)?;
+                }
+                Ok(())
+            })();
             let convergence = peer
                 .await_query_execution_resource_convergence(&baseline, deadline)
                 .context("await binary baseline public query-resource convergence");
@@ -445,7 +415,7 @@ impl DistributedBaseline {
                         "ordinary baseline original deadline expired before resource convergence completed"
                     );
                     context.action(
-                        "ordinary artifact rejected package/wipe CALL through public SQL errors, then returned [1, 2] for all three baseline queries; its socket joined and query resources converged",
+                        "ordinary artifact rejected package/wipe CALL through public SQL errors, then returned [1, 2] for all three baseline queries; all original statements reached terminal pages and query resources converged",
                     );
                     Ok(())
                 }
@@ -519,51 +489,21 @@ impl Scenario for DistributedBaseline {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let mut connection = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
-        context.action("connected baseline client through public MySQL protocol");
-
-        let first_observation =
-            self.intent
-                .take(0)?
-                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
-        execute_baseline_query(&mut connection, "first")?;
         let deadline = context.deadline();
-        let first = context
-            .handle()
-            .await_query_lifecycle_statement_observation(&first_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&first_observation)?;
-
-        let second_observation =
-            self.intent
-                .take(1)?
-                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
-        execute_baseline_query(&mut connection, "second")?;
-        let deadline = context.deadline();
-        let second = context
-            .handle()
-            .await_query_lifecycle_statement_observation(&second_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&second_observation)?;
-        let third_observation =
-            self.intent
-                .take(2)?
-                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
-        execute_baseline_query(&mut connection, "third")?;
-        let deadline = context.deadline();
-        let third = context
-            .handle()
-            .await_query_lifecycle_statement_observation(&third_observation, true, deadline)?;
-        context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&third_observation)?;
-        let snapshots = [&first, &second, &third];
+        let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+        let mut snapshots = Vec::new();
+        for (index, ordinal) in ["first", "second", "third"].into_iter().enumerate() {
+            snapshots.push(run_observed_baseline(
+                context,
+                &mut session,
+                &self.intent.take(index)?,
+                ordinal,
+            )?);
+        }
+        let [first, second, third] = snapshots.as_slice() else {
+            unreachable!("exactly three selected baseline statements")
+        };
+        let snapshots = [first, second, third];
         assert_process_attribution(&snapshots)?;
         assert_process_attribution_diagnostics(context, &snapshots)?;
         context.action(format!(
@@ -574,14 +514,13 @@ impl Scenario for DistributedBaseline {
             third.local_sequence,
         ));
 
-        connection.finish()?;
         await_resource_convergence(context, &baseline)
     }
 }
 
-struct MysqlDisconnect;
+struct ClientAbandonment;
 
-impl Scenario for MysqlDisconnect {
+impl Scenario for ClientAbandonment {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
             "query_lifecycle",
@@ -592,28 +531,107 @@ impl Scenario for MysqlDisconnect {
     }
 
     fn name(&self) -> &'static str {
-        "query-lifecycle/mysql-disconnect"
+        "query-lifecycle/client-abandonment"
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_millis(300_000);
         require_three_backends(context)?;
+        ensure!(
+            context.remaining("observe default Trino client inactivity deadline")?
+                > CLIENT_IDLE_TIMEOUT + IO_TIMEOUT_CAP,
+            "client abandonment needs a case budget beyond the production 300-second timeout"
+        );
         let baseline = resource_snapshot(context)?;
-        context.action("captured query-resource baseline");
-
-        let stream = MysqlStream::query(
-            context.mysql_user(),
-            context.mysql_port(),
-            "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
-            bounded_io_timeout(context, "open disconnecting MySQL client")?,
+        let before = observation(context, "lifecycle-abandon-before")?;
+        ensure!(before.active == 0, "expected an idle Trino registry");
+        let actor = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            context.deadline(),
+            &context.scenario_root().join("abandon-http"),
         )?;
-        context.action("sent a blocking query through a raw public MySQL connection");
-        await_resource_activity(context, &baseline)?;
-        context.action("observed in-flight distributed query resources");
-
-        stream.shutdown()?;
-        context.action("closed the raw public MySQL client connection");
-
-        await_resource_convergence(context, &baseline)
+        let mut live_uri = None;
+        let outcome = (|| -> Result<()> {
+            let post = actor.submit(NID2_FENCE_QUERY)?;
+            live_uri = post.next_uri()?;
+            let admitted = post.assert_success()?;
+            let id = admitted["id"]
+                .as_str()
+                .context("POST omitted query identity")?;
+            let first = live_uri.as_deref().context("POST omitted nextUri")?;
+            let last_request_started = Instant::now();
+            let running = actor.get(first)?;
+            live_uri = running.next_uri()?;
+            let value = running.assert_success()?;
+            ensure!(
+                value["id"] == id && value.get("data").is_none() && live_uri.is_some(),
+                "first GET did not leave the original query running without rows"
+            );
+            await_resource_activity(context, &baseline)?;
+            context.action(
+                "observed the original distributed query before stopping continuation requests",
+            );
+            let mut samples = Vec::new();
+            // Only the management endpoint is polled while the query is idle.
+            // A statement GET, HEAD, or DELETE here would renew its timer.
+            let after = loop {
+                let elapsed = last_request_started.elapsed();
+                let snapshot = observation(context, "lifecycle-abandon-idle")?;
+                samples.push(serde_json::json!({
+                    "elapsed_ms": elapsed.as_millis(),
+                    "active": snapshot.active,
+                    "abandoned": snapshot.abandoned,
+                }));
+                if snapshot.active == 0 {
+                    ensure!(
+                        last_request_started.elapsed() >= CLIENT_IDLE_TIMEOUT,
+                        "query settled before the production inactivity timeout"
+                    );
+                    break snapshot;
+                }
+                ensure!(
+                    snapshot.active == 1 && snapshot.abandoned == before.abandoned,
+                    "unexpected registry transition while the original client was idle"
+                );
+                ensure!(
+                    elapsed < CLIENT_IDLE_TIMEOUT + IO_TIMEOUT_CAP,
+                    "original query did not settle after the production inactivity timeout"
+                );
+                thread::sleep(
+                    context
+                        .remaining("observe client inactivity")?
+                        .min(Duration::from_secs(1)),
+                );
+            };
+            std::fs::write(
+                context.scenario_root().join("abandonment-clock.json"),
+                serde_json::to_vec_pretty(&samples)?,
+            )?;
+            ensure!(
+                after.abandoned == before.abandoned + 1
+                    && after.complete == before.complete
+                    && after.failed == before.failed
+                    && after.client_cancel == before.client_cancel,
+                "client inactivity did not produce exactly one abandonment settlement"
+            );
+            let terminal = actor.get(live_uri.as_deref().context("missing idle continuation")?)?;
+            let value = require_error(&terminal, (2, "ABANDONED_QUERY", "USER_ERROR"))?;
+            ensure!(
+                value["id"] == id,
+                "abandonment changed the original query id"
+            );
+            live_uri = None;
+            Ok(())
+        })();
+        let cleanup = cancel_live_trino_query(&actor, live_uri.as_deref());
+        let convergence = await_resource_convergence(context, &baseline);
+        if outcome.is_err() || cleanup.is_err() || convergence.is_err() {
+            bail!(
+                "Trino lifecycle abandonment failed: outcome={outcome:?}, cleanup={cleanup:?}, convergence={convergence:?}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -638,37 +656,98 @@ impl Scenario for QueryTimeout {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let mut stream = MysqlStream::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            bounded_io_timeout(context, "open timeout MySQL client")?,
+        let deadline = Instant::now() + bounded_io_timeout(context, "Trino lifecycle timeout")?;
+        let mut actor = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            deadline,
+            &context.scenario_root().join("timeout-http"),
         )?;
-        context.action("connected timeout client through public MySQL protocol");
-        stream.send_query("SET query_timeout = 1")?;
-        stream.expect_ok_packet("SET query_timeout")?;
-        context.action("set query_timeout = 1 through the public MySQL protocol");
-
-        stream.send_query(
-            "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
-        )?;
-        context.action("sent a blocking query expected to time out");
-        await_resource_activity(context, &baseline)?;
-        context.action("observed in-flight distributed query resources before timeout");
-        let error = stream.read_timeout_query_error()?;
-        ensure!(
-            error.starts_with("[query.execution.deadline_exceeded]"),
-            "expected MySQL timeout error, got: {error}"
-        );
-        context.action(format!("received expected MySQL timeout error: {error}"));
-
-        await_resource_convergence(context, &baseline)
+        let mut live_uri = None;
+        let outcome = (|| -> Result<()> {
+            set_query_timeout(&mut actor, 1, &mut live_uri)?;
+            let post = actor.submit(NID2_FENCE_QUERY)?;
+            live_uri = post.next_uri()?;
+            let submitted = post.assert_success()?;
+            let id = submitted["id"]
+                .as_str()
+                .context("POST omitted query identity")?;
+            let first = live_uri.as_deref().context("POST omitted nextUri")?;
+            // The first GET starts execution and can wait as long as this query's
+            // deadline. Observe its Native resources while the original GET runs.
+            let (first_page, activity) = thread::scope(|scope| {
+                let get = scope.spawn(|| actor.get(first));
+                let activity = (|| -> Result<_> {
+                    while !get.is_finished() {
+                        let snapshot = resource_snapshot(context)?;
+                        if snapshot != baseline && !get.is_finished() {
+                            return Ok(snapshot);
+                        }
+                        thread::sleep(RESOURCE_POLL_INTERVAL);
+                    }
+                    bail!("initial GET completed before observing in-flight Native resources");
+                })();
+                (get.join(), activity)
+            });
+            let mut page = first_page.map_err(|_| anyhow::anyhow!("initial GET panicked"))??;
+            live_uri = page.next_uri()?;
+            let activity = activity?;
+            std::fs::write(
+                context.scenario_root().join("timeout-native-activity.txt"),
+                format!("baseline={baseline:#?}\nin_flight={activity:#?}\n"),
+            )?;
+            context.action("observed in-flight distributed query resources before timeout");
+            loop {
+                let value = page.json()?;
+                ensure!(
+                    value["id"] == id,
+                    "Trino continuation changed the original query id"
+                );
+                if let Some(uri) = live_uri.as_deref() {
+                    page.assert_success()?;
+                    ensure!(
+                        value.get("data").is_none(),
+                        "query produced data before its original deadline"
+                    );
+                    page = actor.get(uri)?;
+                    live_uri = page.next_uri()?;
+                } else {
+                    require_error(
+                        &page,
+                        (131075, "EXCEEDED_TIME_LIMIT", "INSUFFICIENT_RESOURCES"),
+                    )?;
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        let cleanup = cancel_live_trino_query(&actor, live_uri.as_deref());
+        let convergence = await_resource_convergence(context, &baseline);
+        if outcome.is_err() || cleanup.is_err() || convergence.is_err() {
+            bail!(
+                "Trino lifecycle timeout failed: outcome={outcome:?}, cleanup={cleanup:?}, convergence={convergence:?}"
+            );
+        }
+        Ok(())
     }
+}
+
+fn cancel_live_trino_query(actor: &TrinoClient, live_uri: Option<&str>) -> Result<()> {
+    if let Some(uri) = live_uri {
+        let response = actor.delete(uri)?;
+        ensure!(
+            response.status == 204,
+            "cleanup DELETE returned {}",
+            response.status
+        );
+    }
+    Ok(())
 }
 
 /// A read may replace its attempt only before it has made any result visible.
 ///
-/// This case deliberately keeps the public MySQL stream unread until after the
-/// selected BE has exited. A fresh task-create marker is the admission witness:
+/// This case stops continuation requests after the first empty Trino page
+/// until the selected BE has exited. A fresh task-create marker is the admission witness:
 /// it identifies the process that accepted this exact in-flight attempt without
 /// guessing a scheduler placement. The slow expression is workload, not the
 /// oracle; the marker is what orders the kill after task admission.
@@ -729,47 +808,111 @@ impl Scenario for NoEffectReadAfterBackendExit {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut stream = MysqlStream::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("open no-effect recovery MySQL client")?,
-        )?;
-        let observation =
-            self.intent
-                .take(0)?
-                .arm(context, stream.connection_id()?, NID2_FENCE_QUERY)?;
-        stream.send_query(NID2_FENCE_QUERY)?;
-        context.action(
-            "sent an unread no-effect distributed read through a raw public MySQL connection",
-        );
+        use super::paimon::scan_statement_actor::combine;
 
-        let target = await_fresh_task_create(context, &create_counts)?;
-        context.action(format!(
-            "observed a fresh TaskCreate admission for the unread read on BE[{target}]"
-        ));
-        context
-            .handle()
-            .kill_be(target)
-            .with_context(|| format!("kill admitted BE[{target}] without restarting it"))?;
-        await_backend_exit(context, target)?;
-        context.action(format!(
-            "confirmed BE[{target}] exited while the public client had not read a result"
-        ));
-
-        assert_two_sleep_rows(&mut stream)?;
         let deadline = context.deadline();
-        let terminal = context
-            .handle()
-            .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
-        std::fs::write(
-            context
-                .scenario_root()
-                .join("no-effect-recovery-terminal.txt"),
-            format!("{terminal:#?}\n"),
+        let actor = TrinoClient::new(
+            context.trino_port(),
+            context.sql_user(),
+            deadline,
+            &context.scenario_root().join("no-effect-recovery-http"),
         )?;
-        context
+        let selected = self.intent.take(0)?;
+        let post = actor.submit(NID2_FENCE_QUERY)?;
+        let mut live = post.next_uri()?;
+        let armed = (|| -> Result<_> {
+            let value = post.assert_success()?;
+            let id = value["id"]
+                .as_str()
+                .context("POST omitted query identity")?;
+            ensure!(live.is_some(), "POST omitted first continuation");
+            let observation = selected.arm_client_query(context, id, NID2_FENCE_QUERY)?;
+            Ok((id.to_owned(), observation))
+        })();
+        let (id, observation) = match armed {
+            Ok(armed) => armed,
+            Err(error) => {
+                return combine(Err(error), cancel_live_trino_query(&actor, live.as_deref()));
+            }
+        };
+
+        let recovery = (|| -> Result<_> {
+            let initial = actor.get(live.as_deref().context("missing first continuation")?)?;
+            live = initial.next_uri()?;
+            let value = initial.assert_success()?;
+            ensure!(
+                value["id"] == id && value.get("data").is_none() && live.is_some(),
+                "first GET did not preserve the original running query without visible rows"
+            );
+            let target = await_fresh_task_create(context, &create_counts)?;
+            context.action(format!(
+                "observed a fresh TaskCreate for the original unread query on BE[{target}]"
+            ));
+            context
+                .handle()
+                .kill_be(target)
+                .with_context(|| format!("kill admitted BE[{target}] without restarting it"))?;
+            await_backend_exit(context, target)?;
+            context.action(format!(
+                "confirmed BE[{target}] exited before fetching any result rows"
+            ));
+
+            let mut rows = 0;
+            while let Some(uri) = live.as_deref() {
+                let page = actor.get(uri)?;
+                let value = page.assert_success()?;
+                ensure!(
+                    value["id"] == id,
+                    "recovery changed the original Trino query identity"
+                );
+                live = page.next_uri()?;
+                if let Some(data) = value.get("data") {
+                    let columns = &value["columns"];
+                    ensure!(
+                        columns.as_array().is_some_and(|columns| columns.len() == 1)
+                            && columns[0]["name"] == "v"
+                            && columns[0]["typeSignature"]["rawType"] == "boolean"
+                            && columns[0]["typeSignature"]["arguments"] == serde_json::json!([]),
+                        "recovered read changed its boolean result declaration"
+                    );
+                    for row in data.as_array().context("invalid recovered data array")? {
+                        ensure!(
+                            *row == serde_json::json!([true]),
+                            "invalid recovered row: {row}"
+                        );
+                        rows += 1;
+                    }
+                }
+                if live.is_none() {
+                    ensure!(
+                        value["stats"]["state"] == "FINISHED"
+                            && value.get("data").is_none()
+                            && value.get("updateType").is_none()
+                            && value.get("updateCount").is_none(),
+                        "recovered read did not reach a successful query terminal"
+                    );
+                }
+            }
+            ensure!(
+                rows == 2,
+                "recovered read returned {rows} rows instead of two"
+            );
+            let terminal = context
+                .handle()
+                .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+            std::fs::write(
+                context
+                    .scenario_root()
+                    .join("no-effect-recovery-terminal.txt"),
+                format!("{terminal:#?}\n"),
+            )?;
+            Ok((target, terminal))
+        })();
+        let cancelled = cancel_live_trino_query(&actor, live.as_deref());
+        let drained = context
             .handle()
-            .drain_query_lifecycle_statement_observation(&observation)?;
+            .drain_query_lifecycle_statement_binding(&observation, deadline);
+        let (target, terminal) = combine(recovery, combine(cancelled, drained))?;
         ensure!(
             terminal.attempt_id == 2,
             "no-effect read after BE exit must complete on replacement attempt 2, got attempt {}",
@@ -1114,34 +1257,74 @@ fn run_nid2_fence(
 ) -> Result<()> {
     require_three_backends(context)?;
     let baseline = resource_snapshot(context)?;
-    let mut connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    let observation = selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
-    let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
-    context.action(format!(
-        "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
-        fence.fault
-    ));
+    use super::paimon::scan_statement_actor::combine;
 
-    let observed = observe_nid2_fence(context, fence, &tokens, &observation, &mut connection);
+    let deadline = context.deadline();
+    let actor = TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
+        deadline,
+        &context.scenario_root().join("nid2-http"),
+    )?;
+    let post = actor.submit(NID2_FENCE_QUERY)?;
+    let mut live = post.next_uri()?;
+    let mut observation = None;
+    let observed = (|| -> Result<_> {
+        let submitted = post.assert_success()?;
+        let id = submitted["id"]
+            .as_str()
+            .context("POST omitted query identity")?;
+        ensure!(live.is_some(), "POST omitted first continuation");
+        let armed = observation.insert(selected.arm_client_query(context, id, NID2_FENCE_QUERY)?);
+        let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
+        context.action(format!(
+            "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
+            fence.fault
+        ));
+
+        let error = loop {
+            let page = actor.get(live.as_deref().context("missing NID-2 continuation")?)?;
+            let value = page.json()?;
+            ensure!(
+                value["id"] == id,
+                "NID-2 continuation changed query identity"
+            );
+            live = page.next_uri()?;
+            if live.is_none() {
+                let error =
+                    require_error(&page, (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"))?;
+                ensure!(
+                    error["stats"]["state"] == "FAILED",
+                    "NID-2 terminal state changed"
+                );
+                break error["error"]["message"]
+                    .as_str()
+                    .context("NID-2 refusal omitted its message")?
+                    .to_owned();
+            }
+            page.assert_success()?;
+            ensure!(
+                value.get("data").is_none(),
+                "NID-2 exposed rows before its refusal"
+            );
+        };
+        let backend = observe_nid2_fence(context, fence, &tokens, armed, &error)?;
+        Ok((backend, error))
+    })();
+    let cancelled = cancel_live_trino_query(&actor, live.as_deref());
     let cleared = context
         .handle()
         .clear_query_lifecycle_faults()
         .with_context(|| format!("clear {} tokens", fence.fault));
-    let closed = connection.finish();
-    let drained = context
-        .handle()
-        .drain_query_lifecycle_statement_observation(&observation)
-        .context("drain NID-2 statement observation");
-    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
-        crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed),
-        drained,
-    );
-    let (backend, error) =
-        crate::scenarios::paimon::scan_statement_actor::combine(observed, cleanup)?;
+    let drained = if let Some(observation) = observation {
+        context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, deadline)
+            .context("drain NID-2 statement observation")
+    } else {
+        Ok(())
+    };
+    let (backend, error) = combine(observed, combine(cancelled, combine(cleared, drained)))?;
     await_resource_convergence(context, &baseline)?;
     context.action(format!(
         "BE[{backend}] published {} and the frontend fenced {}: {error}",
@@ -1150,23 +1333,14 @@ fn run_nid2_fence(
     Ok(())
 }
 
-/// Runs the query under one armed fence and returns the backend that fired
-/// together with the client-visible refusal.
+/// Correlate the public refusal with the original Native fence observation.
 fn observe_nid2_fence(
     context: &mut ScenarioContext,
     fence: &Nid2Fence,
     tokens: &[String],
     observation: &novarocks_cluster_harness::QueryLifecycleStatementObservation,
-    connection: &mut mysql::Conn,
-) -> Result<(usize, String)> {
-    let error = match connection.query::<i64, _>(NID2_FENCE_QUERY) {
-        Ok(rows) => bail!(
-            "{} was armed on every backend but the public query returned {rows:?} instead of \
-             failing closed",
-            fence.fault
-        ),
-        Err(error) => error.to_string(),
-    };
+    error: &str,
+) -> Result<usize> {
     for fragment in fence.error_fragments {
         ensure!(
             error.contains(fragment),
@@ -1196,24 +1370,7 @@ fn observe_nid2_fence(
             fence.fault,
         );
     }
-    Ok((backend, error))
-}
-
-/// Select the finite all-backend fault set for this exact connected submission.
-/// No trigger file or fresh token may nominate an unrelated next statement.
-pub(super) fn arm_on_every_backend(
-    context: &mut ScenarioContext,
-    selected: &SelectedStatement,
-    fault: &'static str,
-    connection_id: u32,
-    sql: &str,
-) -> Result<novarocks_cluster_harness::QueryLifecycleStatementObservation> {
-    ensure!(
-        selected.faults.len() == REQUIRED_BACKENDS
-            && (0..REQUIRED_BACKENDS).all(|index| selected.faults.contains(&(index, fault))),
-        "all-backend arming differs from the exact finite fault set"
-    );
-    selected.arm(context, connection_id, sql)
+    Ok(backend)
 }
 
 /// Waits until some backend logged `marker` carrying one of `tokens`.
@@ -1345,67 +1502,6 @@ fn await_backend_revoked_for_future_admission(
 /// The delayed read returns two `sleep(10)` values. We intentionally begin
 /// reading only after the BE exit above, so this validates both result delivery
 /// and that no result became visible before recovery was required.
-pub(super) fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
-    let mut packets = Vec::with_capacity(6);
-    for (offset, operation) in [
-        "recovered read column count",
-        "recovered read column definition",
-        "recovered read metadata terminator",
-        "recovered read first row",
-        "recovered read second row",
-        "recovered read terminal",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let packet = stream.read_packet(operation)?;
-        ensure!(
-            packet.sequence() == offset as u8 + 1,
-            "recovered read packet {} had sequence {}, expected {}",
-            offset + 1,
-            packet.sequence(),
-            offset + 1
-        );
-        // An ERR terminates the response; no later result packet will arrive.
-        ensure!(
-            !packet.is_error(),
-            "recovered read packet {} was a MySQL error: {:?}",
-            offset + 1,
-            packet.payload()
-        );
-        packets.push(packet);
-    }
-    ensure!(
-        packets[0].payload() == [1],
-        "recovered read expected one result column, got {:?}",
-        packets[0].payload()
-    );
-    ensure!(
-        !packets[1].is_result_terminator(),
-        "recovered read column definition was a terminator: {:?}",
-        packets[1].payload()
-    );
-    ensure!(
-        packets[2].is_result_terminator(),
-        "recovered read metadata did not terminate: {:?}",
-        packets[2].payload()
-    );
-    for (ordinal, packet) in packets[3..5].iter().enumerate() {
-        ensure!(
-            packet.payload() == [1, b'1'],
-            "recovered read row {} expected sleep result 1, got {:?}",
-            ordinal + 1,
-            packet.payload()
-        );
-    }
-    ensure!(
-        packets[5].is_result_terminator() && !packets[5].has_more_results(),
-        "recovered read did not end with one terminal success packet: {:?}",
-        packets[5].payload()
-    );
-    Ok(())
-}
-
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let actual = context.handle().be_count();
     ensure!(
@@ -1426,15 +1522,44 @@ pub(super) fn resource_snapshot(
         .context("cross-process harness did not expose the query-resource oracle")
 }
 
-fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result<()> {
-    let rows: Vec<i64> = connection
-        .query(BASELINE_QUERY)
-        .with_context(|| format!("execute {ordinal} distributed baseline query"))?;
+fn assert_baseline_rows(result: &StatementResult, ordinal: &str) -> Result<()> {
     ensure!(
-        rows == vec![1, 2],
-        "{ordinal} distributed baseline query returned unexpected rows: {rows:?}"
+        sql::integer_column(result)? == [1, 2],
+        "{ordinal} distributed baseline returned unexpected rows: {:?}",
+        result.rows
     );
     Ok(())
+}
+
+fn run_observed_baseline(
+    context: &mut ScenarioContext,
+    session: &mut SqlSession,
+    selected: &SelectedStatement,
+    ordinal: &str,
+) -> Result<QueryLifecycleStructuredSnapshot> {
+    use super::paimon::scan_statement_actor::combine;
+
+    let deadline = context.deadline();
+    let pending = session.submit(BASELINE_QUERY)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending(context, pending, BASELINE_QUERY)?;
+    let result = session.run_pending(pending);
+    let cancelled = if matches!(&result, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+    {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    let primary = (|| -> Result<_> {
+        assert_baseline_rows(&result?, ordinal)?;
+        context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)
+    })();
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    combine(primary, combine(cancelled, drained))
 }
 
 fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -> Result<()> {

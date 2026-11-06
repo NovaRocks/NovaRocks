@@ -25,7 +25,7 @@ pub struct RequestSessionContext {
     current_database: String,
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
-    presentation: novarocks_result_contract::ClientPresentationFamily,
+    presentation: Option<novarocks_result_contract::ClientPresentationFamily>,
 }
 
 impl RequestSessionContext {
@@ -34,7 +34,7 @@ impl RequestSessionContext {
         current_database: String,
         optimizer_settings: SessionOptimizerSettings,
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
-        presentation: novarocks_result_contract::ClientPresentationFamily,
+        presentation: Option<novarocks_result_contract::ClientPresentationFamily>,
     ) -> Self {
         Self {
             current_catalog,
@@ -45,8 +45,8 @@ impl RequestSessionContext {
         }
     }
 
-    pub fn presentation(&self) -> &novarocks_result_contract::ClientPresentationFamily {
-        &self.presentation
+    pub fn presentation(&self) -> Option<&novarocks_result_contract::ClientPresentationFamily> {
+        self.presentation.as_ref()
     }
 
     pub fn current_catalog(&self) -> Option<&str> {

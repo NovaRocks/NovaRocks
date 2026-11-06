@@ -28,8 +28,7 @@ use crate::workload_lifecycle::{FrontendCatalogSourceMode, FrontendServingSnapsh
 use novarocks_query_application::serving_admission::FrontendServingState;
 
 pub(crate) mod dml_publication;
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-mod hms_listing_observation;
+
 mod http;
 mod management;
 pub(crate) mod native_transport;

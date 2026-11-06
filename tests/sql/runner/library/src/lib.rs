@@ -9732,12 +9732,10 @@ mod tests {
             }],
             fe_http_port: 28080,
             fe_grpc_port: 29070,
-            fe_mysql_port: 29030,
             fe_trino_port: 28081,
         };
         let base = r#"
 [standalone_server]
-mysql_port = 9030
 trino_port = 8080
 
 [[connector.credentials]]
@@ -9781,10 +9779,6 @@ access_key_secret = "admin123"
                 .unwrap()
                 .len(),
             1
-        );
-        assert_eq!(
-            fe_value["standalone_server"]["mysql_port"].as_integer(),
-            Some(29030)
         );
         assert_eq!(
             fe_value["standalone_server"]["trino_port"].as_integer(),
@@ -9905,7 +9899,7 @@ access_key_secret = "admin123"
     }
 
     #[test]
-    fn cross_process_target_port_prefers_server_handle_port() {
+    fn cross_process_target_port_prefers_cluster_owner_port() {
         let runner_config = crate::types::RunnerConfig::default();
         let port = crate::resolve_effective_target_port(Some(12345), None, &runner_config)
             .expect("server-provided port should bypass external port resolution");

@@ -15,20 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
-use mysql::{Row, Value};
 use novarocks_cluster_harness::{
-    NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
-    RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
-    RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalRollup,
-    RuntimeFilterTerminalTotals, RuntimeFilterTerminalTotalsTelemetry, TestClusterOwner,
+    NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStatementObservation,
+    QueryLifecycleStructuredSnapshot, RuntimeFilterParticipantTerminalDetails,
+    RuntimeFilterParticipantTerminalTelemetry, RuntimeFilterParticipantTerminalTelemetryValue,
+    RuntimeFilterTerminalRollup, RuntimeFilterTerminalTotals, RuntimeFilterTerminalTotalsTelemetry,
+    TestClusterOwner,
 };
+use novarocks_test_trino_client::{CancelHandle, Column, PendingStatement, TrinoError};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -136,7 +140,7 @@ impl Scenario for AcceptedAfterAckDrop {
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
-            vec![retry_spec()],
+            vec![retry_spec(), candidate_spec()],
             &[],
             cluster_size,
             binary,
@@ -145,7 +149,7 @@ impl Scenario for AcceptedAfterAckDrop {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_accepted_after_ack_drop(context, &self.intent.take(0)?)
+        run_accepted_after_ack_drop(context, &self.intent.take(0)?, &self.intent.take(1)?)
     }
 }
 
@@ -372,7 +376,7 @@ impl Scenario for NativeTrustDirectional {
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         Ok(Some(self.intent.freeze(
-            vec![retry_spec(), cancel_spec()],
+            vec![retry_spec(), cancel_spec(), candidate_spec()],
             &[],
             cluster_size,
             binary,
@@ -381,7 +385,7 @@ impl Scenario for NativeTrustDirectional {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_accepted_after_ack_drop(context, &self.intent.take(0)?)?;
+        run_accepted_after_ack_drop(context, &self.intent.take(0)?, &self.intent.take(2)?)?;
         run_cancel_with_terminal_ack_replay(context, &self.intent.take(1)?)?;
         context.action("proved FE-to-BE task admission and control, and BE-to-BE Runtime Filter transport, using the same 1FE+3BE Native trust profile");
         Ok(())
@@ -391,93 +395,130 @@ impl Scenario for NativeTrustDirectional {
 fn run_accepted_after_ack_drop(
     context: &mut ScenarioContext,
     selected: &SelectedStatement,
+    candidate: &SelectedStatement,
 ) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(context, "connect retry scenario control session")?;
-    control.run(|control| {
-    let tables = create_runtime_filter_tables(context, control, "retry")?;
-    configure_partitioned_runtime_filter(control)?;
-    assert_partitioned_runtime_filter_plan(control, &tables)?;
-    let before_candidate_execution_id = latest_execution_id(context)?;
+    let mut control = connect_control(context, "connect retry scenario control session")?;
+    let deadline = context.deadline();
+    (|| {
+        let control = &mut control;
+        let tables = create_runtime_filter_tables(context, control, "retry")?;
+        configure_partitioned_runtime_filter(control, deadline)?;
+        assert_partitioned_runtime_filter_plan(control, &tables, deadline)?;
+        let candidate_query = runtime_filter_count_query(&tables);
+        let (pending, candidate_observation) =
+            arm_selected(context, control, candidate, &candidate_query)?;
+        let candidate_phase = (|| {
+            let candidate_rows = integer_rows(rf_run_pending(control, pending, deadline)?)?;
+            ensure!(
+                candidate_rows == [30],
+                "Runtime Filter candidate query returned unexpected rows: {candidate_rows:?}"
+            );
+            // The public result can precede the original Worker contributions.
+            // Await this exact statement's terminal facts before reading them.
+            let candidate_snapshot = context
+                .handle()
+                .await_query_lifecycle_statement_observation(
+                    &candidate_observation,
+                    true,
+                    candidate.deadline,
+                )?;
+            assert_remote_contribution_candidate(&candidate_snapshot)?;
+            context.action(
+                "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
+            );
+            Ok(())
+        })();
+        let candidate_drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&candidate_observation, candidate.deadline);
+        merge_cleanup(candidate_phase, candidate_drain)?;
+        let baseline = resource_snapshot(context)?;
+        let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
 
-    let candidate_rows: Vec<i64> = control
-        .query(runtime_filter_count_query(&tables))
-        .context("execute native partitioned Runtime Filter candidate query")?;
-    ensure!(
-        candidate_rows == [30],
-        "Runtime Filter candidate query returned unexpected rows: {candidate_rows:?}"
-    );
-    let candidate_snapshot =
-        await_terminal_snapshot(context, before_candidate_execution_id.as_deref())?;
-    assert_remote_contribution_candidate(&candidate_snapshot)?;
-    context.action(
-        "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
-    );
-    let baseline = resource_snapshot(context)?;
-    let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+        context.action(
+            "armed one Accepted-after-ACK-drop Runtime Filter fault for every native participant",
+        );
 
-    context.action(
-        "armed one Accepted-after-ACK-drop Runtime Filter fault for every native participant",
-    );
-
-    let query = runtime_filter_held_count_query(&tables);
-    let mut target_connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    configure_partitioned_runtime_filter(&mut target_connection)?;
-    let observation = selected.arm(context, target_connection.connection_id(), &query)?;
-    let target = start_held_runtime_filter_count_query(target_connection, query)?;
-    let phase = (|| -> Result<Vec<(i64, bool)>> {
-    target
+        let query = runtime_filter_held_count_query(&tables);
+        let mut target_connection =
+            connect_control(context, "connect selected Runtime Filter session")?;
+        configure_partitioned_runtime_filter(&mut target_connection, deadline)?;
+        let (pending, observation) = arm_selected(context, &target_connection, selected, &query)?;
+        let selected_phase = (|| {
+            let target =
+                start_held_runtime_filter_count_query(target_connection, pending, deadline)?;
+            let phase = (|| -> Result<Vec<(i64, bool)>> {
+                target
         .ready
-        .recv_timeout(context.remaining("receive held Runtime Filter retry connection id")?)
+        .recv_timeout(context.remaining("receive held Runtime Filter retry query id")?)
         .context(
-            "held Runtime Filter retry query terminated before publishing its connection id",
+            "held Runtime Filter retry query terminated before publishing its actual query id",
         )?;
-    context.action("started a held Runtime Filter retry query through public MySQL");
-    await_ack_drop_while_query_active(
-        context,
-        ACK_DROP_RENDEZVOUS_FAULT_KIND,
-        selected,
-        &baseline,
-        &created_baseline,
-        &target.done,
-    )?;
-    context.action(
+                context.action("started a held Runtime Filter retry query through public Trino");
+                await_ack_drop_while_query_active(
+                    context,
+                    ACK_DROP_RENDEZVOUS_FAULT_KIND,
+                    selected,
+                    &baseline,
+                    &created_baseline,
+                    &target.done,
+                )?;
+                context.action(
         "observed the Accepted ACK-drop token consumed while the Runtime Filter query remained active",
     );
 
-    let rows = target
-        .done
-        .recv_timeout(context.remaining("await held Runtime Filter retry query completion")?)
-        .context("held Runtime Filter retry query did not complete before scenario deadline")?
-        .context("execute native partitioned Runtime Filter query with ACK-drop fault")?;
-        Ok(rows)
-    })();
-    let rows = settle_query(target.thread, &target.done, phase)?;
-    ensure!(
-        rows == [(30, true)],
-        "Runtime Filter retry query returned unexpected rows: {rows:?}"
-    );
-    context.action("completed the partitioned Runtime Filter query with expected row count");
+                let rows = target
+                    .done
+                    .recv_timeout(
+                        context.remaining("await held Runtime Filter retry query completion")?,
+                    )
+                    .context(
+                        "held Runtime Filter retry query did not complete before scenario deadline",
+                    )?
+                    .context(
+                        "execute native partitioned Runtime Filter query with ACK-drop fault",
+                    )?;
+                Ok(rows)
+            })();
+            let rows = settle_query(target.thread, &target.done, phase)?;
+            ensure!(
+                rows == [(30, true)],
+                "Runtime Filter retry query returned unexpected rows: {rows:?}"
+            );
+            context
+                .action("completed the partitioned Runtime Filter query with expected row count");
 
-    let snapshot = context
-        .handle()
-        .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)?;
-    context
-        .handle()
-        .drain_query_lifecycle_statement_observation(&observation)?;
-    assert_retry_duplicate_conformance(&snapshot)?;
-    context
-        .action("typed terminal oracle proved a retried sender route and receiver-side duplicate");
-    context
-        .handle()
-        .clear_query_lifecycle_faults()
-        .context("clear Runtime Filter ACK-drop fault tokens")?;
-    Ok(())
-    })
+            let snapshot = context
+                .handle()
+                .await_query_lifecycle_statement_observation(
+                    &observation,
+                    true,
+                    selected.deadline,
+                )?;
+            assert_retry_duplicate_conformance(&snapshot)?;
+            context.action(
+                "typed terminal oracle proved a retried sender route and receiver-side duplicate",
+            );
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear Runtime Filter ACK-drop fault tokens")?;
+            Ok(())
+        })();
+        let binding_drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let fault_cleanup = if selected_phase.is_err() {
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original Runtime Filter fault bindings after failed phase")
+        } else {
+            Ok(())
+        };
+        merge_cleanup(selected_phase, merge_cleanup(binding_drain, fault_cleanup))
+    })()
 }
 
 /// Cancellation of an in-flight Runtime Filter query whose terminal
@@ -495,7 +536,7 @@ fn run_accepted_after_ack_drop(
 ///
 /// The cancellation half is delivery, not the client's error: a client error is
 /// also what a timeout looks like. `NOVAROCKS_PARTICIPATION_ABORT_APPLIED` is the
-/// only evidence that KILL QUERY reached the backends.
+/// only evidence that public cancellation reached the backends.
 ///
 /// What is deliberately not asserted here: the retired protocol's complete
 /// per-participant Runtime Filter terminal rollup. On the task path a backend's
@@ -510,141 +551,165 @@ fn run_cancel_with_terminal_ack_replay(
     selected: &SelectedStatement,
 ) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(context, "connect cancellation scenario control session")?;
-    control.run(|control| {
-    let tables = create_runtime_filter_tables(context, control, "cancel")?;
-    let baseline = resource_snapshot(context)?;
-    // Captured before the query under test starts, so every count below is this
-    // query's own. The fixture setup above already ran distributed statements.
-    let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
-    let ack_dropped_baseline = be_marker_counts(context, TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER)?;
-    let duplicate_baseline = be_marker_counts(context, TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER)?;
-    let abort_baseline = be_marker_counts(context, PARTICIPATION_ABORT_APPLIED_MARKER)?;
+    let mut control = connect_control(context, "connect cancellation scenario control session")?;
+    let deadline = context.deadline();
+    (|| {
+        let control = &mut control;
+        let tables = create_runtime_filter_tables(context, control, "cancel")?;
+        let baseline = resource_snapshot(context)?;
+        // Captured before the query under test starts, so every count below is this
+        // query's own. The fixture setup above already ran distributed statements.
+        let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+        let ack_dropped_baseline =
+            be_marker_counts(context, TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER)?;
+        let duplicate_baseline = be_marker_counts(context, TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER)?;
+        let abort_baseline = be_marker_counts(context, PARTICIPATION_ABORT_APPLIED_MARKER)?;
 
-    let query = runtime_filter_blocking_query(&tables);
-    let mut target_connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    configure_partitioned_runtime_filter(&mut target_connection)?;
-    selected.arm(context, target_connection.connection_id(), &query)?;
-    let target = start_blocking_runtime_filter_query(target_connection, query)?;
-    let phase = (|| -> Result<()> {
-    let connection_id = target
-        .ready
-        .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
-        .context("Runtime Filter query terminated before publishing its connection id")?;
-    context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_ack_drop_while_query_active(
-        context,
-        ACK_DROP_FAULT_KIND,
-        selected,
-        &baseline,
-        &created_baseline,
-        &target.done,
-    )?;
-    context.action(
+        let query = runtime_filter_blocking_query(&tables);
+        let mut target_connection =
+            connect_control(context, "connect selected Runtime Filter session")?;
+        configure_partitioned_runtime_filter(&mut target_connection, deadline)?;
+        let (pending, observation) = arm_selected(context, &target_connection, selected, &query)?;
+        let selected_phase = (|| {
+            let target = start_blocking_runtime_filter_query(target_connection, pending, deadline)?;
+            let phase = (|| -> Result<()> {
+                let _client_query_id = target
+                    .ready
+                    .recv_timeout(context.remaining("receive Runtime Filter query id")?)
+                    .context(
+                        "Runtime Filter query terminated before publishing its actual query id",
+                    )?;
+                context.action(
+                    "started an in-flight native Runtime Filter query through public Trino",
+                );
+                await_ack_drop_while_query_active(
+                    context,
+                    ACK_DROP_FAULT_KIND,
+                    selected,
+                    &baseline,
+                    &created_baseline,
+                    &target.done,
+                )?;
+                context.action(
         "observed a receiver-Accepted Runtime Filter contribution while the EES task query remained active",
     );
-    await_total_advanced(
-        context,
-        TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER,
-        &ack_dropped_baseline,
-        1,
-    )?;
-    await_total_advanced(
-        context,
-        TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER,
-        &duplicate_baseline,
-        1,
-    )?;
-    context.action(
+                await_total_advanced(
+                    context,
+                    TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER,
+                    &ack_dropped_baseline,
+                    1,
+                )?;
+                await_total_advanced(
+                    context,
+                    TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER,
+                    &duplicate_baseline,
+                    1,
+                )?;
+                context.action(
         "observed the terminal task-update acknowledgement dropped and its exact resend recognised as a duplicate assignment",
     );
 
-    control
-        .query_drop(format!("KILL QUERY {connection_id}"))
-        .context("cancel Runtime Filter query through public MySQL KILL QUERY")?;
-    assert_cancelled_query(
-        &target.done,
-        context.remaining("await Runtime Filter query cancellation")?,
-    )?;
-        Ok(())
-    })();
-    settle_query(target.thread, &target.done, phase)?;
-    context.action("cancelled the active Runtime Filter query through public MySQL");
+                target
+                    .thread
+                    .delete()
+                    .context("cancel Runtime Filter query through same Trino continuation")?;
+                assert_cancelled_query(
+                    &target.done,
+                    context.remaining("await Runtime Filter query cancellation")?,
+                )?;
+                Ok(())
+            })();
+            settle_query(target.thread, &target.done, phase)?;
+            context.action("cancelled the active Runtime Filter query through public Trino");
 
-    // A query context exists only where the scheduler placed work. This query
-    // has completed its distributed join before its root sleep, so its active
-    // participant set is not the three-node cluster. One abort marker is the
-    // exact proof that public KILL reached the remaining live backend; asking
-    // for two would assert a placement the task graph no longer has.
-    await_backends_advanced(
-        context,
-        PARTICIPATION_ABORT_APPLIED_MARKER,
-        &abort_baseline,
-        1,
-    )?;
-    context.action("observed the cancellation applied as an abort on a live backend");
-    context
-        .handle()
-        .clear_query_lifecycle_faults()
-        .context("clear terminal task-update ACK-drop replay fault tokens")?;
-    let deadline = context.deadline();
-    context
-        .handle()
-        .await_query_execution_resource_convergence(&baseline, deadline)
-        .context("await resource convergence after Runtime Filter cancellation")?;
-    Ok(())
-    })
+            // A query context exists only where the scheduler placed work. This query
+            // has completed its distributed join before its root sleep, so its active
+            // participant set is not the three-node cluster. One abort marker is the
+            // exact proof that public cancellation reached the remaining live backend; asking
+            // for two would assert a placement the task graph no longer has.
+            await_backends_advanced(
+                context,
+                PARTICIPATION_ABORT_APPLIED_MARKER,
+                &abort_baseline,
+                1,
+            )?;
+            context.action("observed the cancellation applied as an abort on a live backend");
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear terminal task-update ACK-drop replay fault tokens")?;
+            let deadline = context.deadline();
+            context
+                .handle()
+                .await_query_execution_resource_convergence(&baseline, deadline)
+                .context("await resource convergence after Runtime Filter cancellation")?;
+            Ok(())
+        })();
+        let binding_drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let fault_cleanup = if selected_phase.is_err() {
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original Runtime Filter fault bindings after failed phase")
+        } else {
+            Ok(())
+        };
+        merge_cleanup(selected_phase, merge_cleanup(binding_drain, fault_cleanup))
+    })()
 }
 
 fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(context, "connect NCP-5 profile control session")?;
-    control.run(|control| {
-    let tables = create_ncp5_pruning_tables(context, control)?;
-    configure_partitioned_runtime_filter(control)?;
-    assert_partitioned_runtime_filter_plan(control, &tables)?;
-    let query = runtime_filter_count_query(&tables);
+    let mut control = connect_control(context, "connect NCP-5 profile control session")?;
+    let deadline = context.deadline();
+    (|| {
+        let control = &mut control;
+        let tables = create_ncp5_pruning_tables(context, control)?;
+        configure_partitioned_runtime_filter(control, deadline)?;
+        assert_partitioned_runtime_filter_plan(control, &tables, deadline)?;
+        let query = runtime_filter_count_query(&tables);
 
-    control
-        .query_drop("SET enable_global_runtime_filter = false")
+        rf_execute(
+            control,
+            "SET enable_global_runtime_filter = false",
+            deadline,
+        )
         .context("disable Runtime Filter for NCP-5 baseline")?;
-    let disabled: Vec<i64> = control
-        .query(&query)
-        .context("execute NCP-5 Runtime Filter disabled baseline")?;
+        let disabled: Vec<i64> = rf_execute(control, &query, deadline)
+            .and_then(integer_rows)
+            .context("execute NCP-5 Runtime Filter disabled baseline")?;
 
-    control
-        .query_drop("SET enable_global_runtime_filter = true")
-        .context("enable Runtime Filter for NCP-5 candidate")?;
-    let enabled: Vec<i64> = control
-        .query(&query)
-        .context("execute NCP-5 Runtime Filter candidate")?;
-    ensure!(
-        enabled == disabled && enabled == [1000],
-        "NCP-5 Runtime Filter changed query correctness: disabled={disabled:?}, enabled={enabled:?}"
-    );
-    context.action("proved Runtime Filter on/off row fingerprint equivalence");
+        rf_execute(control, "SET enable_global_runtime_filter = true", deadline)
+            .context("enable Runtime Filter for NCP-5 candidate")?;
+        let enabled: Vec<i64> = rf_execute(control, &query, deadline)
+            .and_then(integer_rows)
+            .context("execute NCP-5 Runtime Filter candidate")?;
+        ensure!(
+            enabled == disabled && enabled == [1000],
+            "NCP-5 Runtime Filter changed query correctness: disabled={disabled:?}, enabled={enabled:?}"
+        );
+        context.action("proved Runtime Filter on/off row fingerprint equivalence");
 
-    // PARTITIONED coverage above is the aggregation/correctness gate. Its
-    // blocking wait graph may deliberately reject an FE source wait, so use
-    // the direct-source BROADCAST phase to prove the bounded-wait pruning
-    // optimization without weakening cycle safety.
-    configure_broadcast_runtime_filter(control)?;
-    let profile: Vec<String> = control
-        .query(format!("EXPLAIN ANALYZE {query}"))
-        .context("collect NCP-5 broadcast feedback profile")?;
-    let profile = profile.join("\n");
-    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
-    assert_positive_profile_counter(&profile, "ConnectorWholeFilesPruned")?;
-    assert_positive_profile_counter(&profile, "ConnectorFileRowGroupsPruned")?;
-    context.action(
+        // PARTITIONED coverage above is the aggregation/correctness gate. Its
+        // blocking wait graph may deliberately reject an FE source wait, so use
+        // the direct-source BROADCAST phase to prove the bounded-wait pruning
+        // optimization without weakening cycle safety.
+        configure_broadcast_runtime_filter(control, deadline)?;
+        let profile: Vec<String> =
+            rf_execute(control, format!("EXPLAIN ANALYZE {query}"), deadline)
+                .and_then(text_rows)
+                .context("collect NCP-5 broadcast feedback profile")?;
+        let profile = profile.join("\n");
+        assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+        assert_positive_profile_counter(&profile, "ConnectorWholeFilesPruned")?;
+        assert_positive_profile_counter(&profile, "ConnectorFileRowGroupsPruned")?;
+        context.action(
         "EXPLAIN ANALYZE proved broadcast FE feedback reached Iceberg whole-file dynamic pruning",
     );
-    Ok(())
-    })
+        Ok(())
+    })()
 }
 
 /// A backend that publishes a domain under the wrong contract digest must fail
@@ -662,46 +727,64 @@ fn run_ncp5_feedback_contract_digest_corrupt(
     selected: &SelectedStatement,
 ) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(context, "connect NCP-5 corrupt-feedback control session")?;
-    control.run(|control| {
+    let mut control = connect_control(context, "connect NCP-5 corrupt-feedback control session")?;
+    let deadline = context.deadline();
+    (|| {
+        let control = &mut control;
         let tables = create_ncp5_pruning_tables(context, control)?;
-        configure_broadcast_runtime_filter(control)?;
+        configure_broadcast_runtime_filter(control, deadline)?;
         let baseline = resource_snapshot(context)?;
         let corrupt_baseline =
             be_marker_counts(context, TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER)?;
         let query = format!("EXPLAIN ANALYZE {}", runtime_filter_count_query(&tables));
-        selected.arm(context, control.connection_id(), &query)?;
-        context.action(
-            "armed an active-attempt Runtime Filter feedback contract-digest corruption fault",
-        );
+        let (pending, observation) = arm_selected(context, control, selected, &query)?;
+        let selected_phase = (|| {
+            context.action(
+                "armed an active-attempt Runtime Filter feedback contract-digest corruption fault",
+            );
 
-        let error = control
-            .query::<String, _>(format!(
-                "EXPLAIN ANALYZE {}",
-                runtime_filter_count_query(&tables)
-            ))
-            .expect_err("active-attempt feedback contract corruption must fail the query closed");
-        await_total_advanced(
-            context,
-            TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER,
-            &corrupt_baseline,
-            1,
-        )?;
-        context.action(format!(
-            "public MySQL query failed closed after invalid Runtime Filter feedback: {error}"
-        ));
-        context
+            let error = rf_run_pending(control, pending, deadline)
+                .and_then(text_rows)
+                .err()
+                .context(
+                    "active-attempt feedback contract corruption must fail the query closed",
+                )?;
+            public_sql_error(&error)?;
+            await_total_advanced(
+                context,
+                TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER,
+                &corrupt_baseline,
+                1,
+            )?;
+            context.action(format!(
+                "public Trino query failed closed after invalid Runtime Filter feedback: {error}"
+            ));
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear feedback contract-digest corruption fault token")?;
+            let deadline = context.deadline();
+            context
+                .handle()
+                .await_query_execution_resource_convergence(&baseline, deadline)
+                .context("await resource convergence after fail-closed feedback rejection")?;
+            context
+                .action("typed resource oracle confirmed fail-closed feedback cleanup converged");
+            Ok(())
+        })();
+        let binding_drain = context
             .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear feedback contract-digest corruption fault token")?;
-        let deadline = context.deadline();
-        context
-            .handle()
-            .await_query_execution_resource_convergence(&baseline, deadline)
-            .context("await resource convergence after fail-closed feedback rejection")?;
-        context.action("typed resource oracle confirmed fail-closed feedback cleanup converged");
-        Ok(())
-    })
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let fault_cleanup = if selected_phase.is_err() {
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original Runtime Filter fault bindings after failed phase")
+        } else {
+            Ok(())
+        };
+        merge_cleanup(selected_phase, merge_cleanup(binding_drain, fault_cleanup))
+    })()
 }
 
 /// A channel with no usable domain must fail open: correct rows, no pruning.
@@ -717,43 +800,56 @@ fn run_ncp5_feedback_unavailable(
     selected: &SelectedStatement,
 ) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(
+    let mut control = connect_control(
         context,
         "connect NCP-5 unavailable-feedback control session",
     )?;
-    control.run(|control| {
+    let deadline = context.deadline();
+    (|| {
+        let control = &mut control;
         let tables = create_ncp5_pruning_tables(context, control)?;
-        configure_broadcast_runtime_filter(control)?;
+        configure_broadcast_runtime_filter(control, deadline)?;
         let unavailable_baseline = be_marker_counts(context, TASK_FEEDBACK_UNAVAILABLE_MARKER)?;
         let query = format!("EXPLAIN ANALYZE {}", runtime_filter_count_query(&tables));
-        selected.arm(context, control.connection_id(), &query)?;
-        let profile: Vec<String> = control
-            .query(format!(
-                "EXPLAIN ANALYZE {}",
-                runtime_filter_count_query(&tables)
-            ))
-            .context("typed unavailable feedback must remain query-correct")?;
-        let profile = profile.join("\n");
-        assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
-        ensure!(
-            profile.contains("ConnectorWholeFilesPruned=0"),
-            "typed unavailable must fail open for FE whole-file pruning; profile={profile}"
-        );
-        await_total_advanced(
-            context,
-            TASK_FEEDBACK_UNAVAILABLE_MARKER,
-            &unavailable_baseline,
-            1,
-        )?;
-        context
-            .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear feedback unavailable fault tokens")?;
-        context.action(
+        let (pending, observation) = arm_selected(context, control, selected, &query)?;
+        let selected_phase = (|| {
+            let profile: Vec<String> = rf_run_pending(control, pending, deadline)
+                .and_then(text_rows)
+                .context("typed unavailable feedback must remain query-correct")?;
+            let profile = profile.join("\n");
+            assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+            ensure!(
+                profile.contains("ConnectorWholeFilesPruned=0"),
+                "typed unavailable must fail open for FE whole-file pruning; profile={profile}"
+            );
+            await_total_advanced(
+                context,
+                TASK_FEEDBACK_UNAVAILABLE_MARKER,
+                &unavailable_baseline,
+                1,
+            )?;
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear feedback unavailable fault tokens")?;
+            context.action(
             "typed unavailable feedback preserved correctness and disabled FE whole-file pruning",
         );
-        Ok(())
-    })
+            Ok(())
+        })();
+        let binding_drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let fault_cleanup = if selected_phase.is_err() {
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original Runtime Filter fault bindings after failed phase")
+        } else {
+            Ok(())
+        };
+        merge_cleanup(selected_phase, merge_cleanup(binding_drain, fault_cleanup))
+    })()
 }
 
 /// Feedback that names an attempt other than the running one must be fenced
@@ -791,42 +887,60 @@ fn run_nid2_foreign_attempt_rejection(
     selected: &SelectedStatement,
 ) -> Result<()> {
     require_three_backends(context)?;
-    let control = connect_control(context, "connect NID-2 foreign-attempt control session")?;
-    control.run(|control| {
-    let tables = create_ncp5_pruning_tables(context, control)?;
-    configure_broadcast_runtime_filter(control)?;
-    let baseline = resource_snapshot(context)?;
-    let foreign_baseline = be_marker_counts(context, TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER)?;
-    let query = format!("EXPLAIN ANALYZE {}", runtime_filter_count_query(&tables));
-    selected.arm(context, control.connection_id(), &query)?;
-    context.action("armed a foreign-attempt Runtime Filter feedback fault on every backend");
-
-    let error = control
-        .query::<String, _>(format!(
-            "EXPLAIN ANALYZE {}",
-            runtime_filter_count_query(&tables)
-        ))
-        .expect_err("feedback naming another attempt must fail the query closed");
-    await_total_advanced(
-        context,
-        TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER,
-        &foreign_baseline,
-        1,
-    )?;
-    context
-        .handle()
-        .clear_query_lifecycle_faults()
-        .context("clear foreign-attempt Runtime Filter feedback fault tokens")?;
+    let mut control = connect_control(context, "connect NID-2 foreign-attempt control session")?;
     let deadline = context.deadline();
-    context
-        .handle()
-        .await_query_execution_resource_convergence(&baseline, deadline)
-        .context("await resource convergence after fail-closed foreign-attempt rejection")?;
-    context.action(format!(
+    (|| {
+        let control = &mut control;
+        let tables = create_ncp5_pruning_tables(context, control)?;
+        configure_broadcast_runtime_filter(control, deadline)?;
+        let baseline = resource_snapshot(context)?;
+        let foreign_baseline = be_marker_counts(context, TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER)?;
+        let query = format!("EXPLAIN ANALYZE {}", runtime_filter_count_query(&tables));
+        let (pending, observation) = arm_selected(context, control, selected, &query)?;
+        let selected_phase = (|| {
+            context
+                .action("armed a foreign-attempt Runtime Filter feedback fault on every backend");
+
+            let error = rf_run_pending(control, pending, deadline)
+                .and_then(text_rows)
+                .err()
+                .context("feedback naming another attempt must fail the query closed")?;
+            public_sql_error(&error)?;
+            await_total_advanced(
+                context,
+                TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER,
+                &foreign_baseline,
+                1,
+            )?;
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear foreign-attempt Runtime Filter feedback fault tokens")?;
+            let deadline = context.deadline();
+            context
+                .handle()
+                .await_query_execution_resource_convergence(&baseline, deadline)
+                .context(
+                    "await resource convergence after fail-closed foreign-attempt rejection",
+                )?;
+            context.action(format!(
         "Runtime Filter feedback naming a foreign attempt was fenced ahead of the pruning winner and failed the query closed: {error}"
     ));
-    Ok(())
-    })
+            Ok(())
+        })();
+        let binding_drain = context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+        let fault_cleanup = if selected_phase.is_err() {
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("end original Runtime Filter fault bindings after failed phase")
+        } else {
+            Ok(())
+        };
+        merge_cleanup(selected_phase, merge_cleanup(binding_drain, fault_cleanup))
+    })()
 }
 
 #[derive(Clone)]
@@ -851,6 +965,13 @@ fn ncp5_tables() -> RuntimeFilterTables {
         database: "rf_ncp5_db".into(),
         probe: "probe".into(),
         build: "build".into(),
+    }
+}
+fn candidate_spec() -> StatementSpec {
+    StatementSpec {
+        sql: runtime_filter_count_query(&runtime_filter_tables("retry")),
+        faults: vec![],
+        observations: vec![],
     }
 }
 fn retry_spec() -> StatementSpec {
@@ -908,6 +1029,144 @@ fn feedback_spec(kind: &'static str) -> StatementSpec {
     }
 }
 
+fn rf_execute(
+    control: &mut SqlSession,
+    query: impl AsRef<str>,
+    deadline: Instant,
+) -> Result<StatementResult> {
+    let pending = control.submit(query)?;
+    rf_run_pending(control, pending, deadline)
+}
+fn rf_run_pending(
+    control: &mut SqlSession,
+    pending: PendingStatement,
+    deadline: Instant,
+) -> Result<StatementResult> {
+    let cancel = pending.cancel_handle();
+    let response = control.run_pending(pending);
+    let cleanup = if matches!(&response, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+    {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    merge_cleanup(response.map_err(anyhow::Error::from), cleanup)
+}
+fn arm_selected(
+    context: &mut ScenarioContext,
+    control: &SqlSession,
+    selected: &SelectedStatement,
+    query: &str,
+) -> Result<(PendingStatement, QueryLifecycleStatementObservation)> {
+    let pending = control.submit(query)?;
+    let cancel = pending.cancel_handle();
+    match selected.arm_client_query(context, &pending.query_id, query) {
+        Ok(observation) => Ok((pending, observation)),
+        Err(primary) => merge_cleanup(
+            Err(primary),
+            cancel.delete(selected.deadline).map_err(Into::into),
+        ),
+    }
+}
+fn public_sql_error(error: &anyhow::Error) -> Result<&TrinoError> {
+    match error
+        .chain()
+        .find_map(|source| source.downcast_ref::<StatementFailure>())
+    {
+        Some(StatementFailure::Trino(error)) => Ok(error),
+        Some(actual) => Err(anyhow::Error::new(actual.clone())
+            .context("Runtime Filter expected original Trino SQL failure")),
+        None => bail!("Runtime Filter failure has no original Trino SQL source: {error:#}"),
+    }
+}
+fn require_column(columns: &[Column], index: usize, expected: &str) -> Result<()> {
+    let column = columns
+        .get(index)
+        .context("Runtime Filter result column missing")?;
+    // String's Trino signature carries the protocol's unbounded VARCHAR
+    // length. Integer/boolean scalars carry no type arguments. Keep the
+    // original nominal type and its full declared signature separate.
+    let arguments_match = if expected == "varchar" {
+        column.type_signature.arguments.as_slice()
+            == [novarocks_test_trino_client::TypeArgument::Long(
+                2_147_483_647,
+            )]
+    } else {
+        column.type_signature.arguments.is_empty()
+    };
+    ensure!(
+        column.type_signature.raw_type == expected && arguments_match,
+        "Runtime Filter expected {expected} result column, got {column:?}"
+    );
+    Ok(())
+}
+fn integer_rows(result: StatementResult) -> Result<Vec<i64>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 1,
+        "Runtime Filter COUNT requires one result column"
+    );
+    require_column(&result.columns, 0, "bigint")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(value)] => Ok(*value),
+            _ => bail!("Runtime Filter COUNT requires one non-null BIGINT: {row:?}"),
+        })
+        .collect()
+}
+fn text_rows(result: StatementResult) -> Result<Vec<String>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 1,
+        "Runtime Filter profile requires one result column"
+    );
+    require_column(&result.columns, 0, "varchar")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut cells = row.into_iter();
+            match (cells.next(), cells.next()) {
+                (Some(TrinoValue::Text(value)), None) => Ok(value),
+                actual => {
+                    bail!("Runtime Filter profile requires one non-null text value: {actual:?}")
+                }
+            }
+        })
+        .collect()
+}
+fn held_count_rows(result: StatementResult) -> Result<Vec<(i64, bool)>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 2,
+        "held Runtime Filter query requires two result columns"
+    );
+    require_column(&result.columns, 0, "bigint")?;
+    require_column(&result.columns, 1, "boolean")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(value), TrinoValue::Boolean(complete)] => Ok((*value, *complete)),
+            _ => bail!("held Runtime Filter query requires BIGINT and BOOLEAN values: {row:?}"),
+        })
+        .collect()
+}
+fn blocking_rows(result: StatementResult) -> Result<Vec<bool>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 1,
+        "blocking Runtime Filter query requires one result column"
+    );
+    require_column(&result.columns, 0, "boolean")?;
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Boolean(value)] => Ok(*value),
+            _ => bail!("blocking Runtime Filter SLEEP requires a non-null BOOLEAN: {row:?}"),
+        })
+        .collect()
+}
+
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let actual = context.handle().be_count();
     ensure!(
@@ -919,23 +1178,21 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn connect_control(
-    context: &ScenarioContext,
-    operation: &str,
-) -> Result<mysql_actor::DeadlineConnection> {
+fn connect_control(context: &ScenarioContext, operation: &str) -> Result<SqlSession> {
     context.remaining(operation)?;
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+    Ok(SqlSession::new(
+        context.sql_user(),
+        context.trino_port(),
         context.deadline(),
-    )
+    )?)
 }
 
 fn create_runtime_filter_tables(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     suffix: &str,
 ) -> Result<RuntimeFilterTables> {
+    let deadline = context.deadline();
     let warehouse = context
         .runtime_dir()
         .join("warehouses")
@@ -943,45 +1200,52 @@ fn create_runtime_filter_tables(
     std::fs::create_dir_all(&warehouse)
         .with_context(|| format!("create Runtime Filter warehouse {}", warehouse.display()))?;
     let tables = runtime_filter_tables(suffix);
-    create_hadoop_catalog(control, &tables.catalog, &warehouse)?;
-    control
-        .query_drop(format!(
-            "CREATE DATABASE {}.{}",
-            tables.catalog, tables.database
-        ))
-        .context("create Runtime Filter scenario database")?;
-    control
-        .query_drop(format!(
+    create_hadoop_catalog(control, &tables.catalog, &warehouse, context.deadline())?;
+    rf_execute(
+        control,
+        format!("CREATE DATABASE {}.{}", tables.catalog, tables.database),
+        deadline,
+    )
+    .context("create Runtime Filter scenario database")?;
+    rf_execute(
+        control,
+        format!(
             "CREATE TABLE {}.{}.{} (id INT NOT NULL, k INT)",
             tables.catalog, tables.database, tables.probe
-        ))
-        .context("create Runtime Filter probe table")?;
-    control
-        .query_drop(format!(
+        ),
+        deadline,
+    )
+    .context("create Runtime Filter probe table")?;
+    rf_execute(
+        control,
+        format!(
             "CREATE TABLE {}.{}.{} (k INT, flag VARCHAR(8))",
             tables.catalog, tables.database, tables.build
-        ))
-        .context("create Runtime Filter build table")?;
-    control
-        .query_drop(format!(
+        ),
+        deadline,
+    )
+    .context("create Runtime Filter build table")?;
+    rf_execute(control, format!(
             "INSERT INTO {}.{}.{} SELECT generate_series, generate_series % 600 FROM TABLE(generate_series(1, 6000))",
             tables.catalog, tables.database, tables.probe
-        ))
+        ), deadline)
         .context("write Runtime Filter probe rows")?;
     for partition in 0..REQUIRED_BACKENDS {
-        control
-            .query_drop(format!(
+        rf_execute(control, format!(
                 "INSERT INTO {}.{}.{} SELECT (generate_series * 3 + {partition}) % 600, CASE WHEN generate_series = 1 THEN 'Y' ELSE 'N' END FROM TABLE(generate_series(1, 200))",
                 tables.catalog, tables.database, tables.build
-            ))
+            ), deadline)
             .with_context(|| format!("write Runtime Filter build partition {partition}"))?;
     }
-    control
-        .query_drop(format!(
+    rf_execute(
+        control,
+        format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.probe
-        ))
-        .context("analyze Runtime Filter probe table")?;
+        ),
+        deadline,
+    )
+    .context("analyze Runtime Filter probe table")?;
     wait_for_statistics_job_success(
         context,
         control,
@@ -989,12 +1253,15 @@ fn create_runtime_filter_tables(
         &tables.database,
         &tables.probe,
     )?;
-    control
-        .query_drop(format!(
+    rf_execute(
+        control,
+        format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.build
-        ))
-        .context("analyze Runtime Filter build table")?;
+        ),
+        deadline,
+    )
+    .context("analyze Runtime Filter build table")?;
     wait_for_statistics_job_success(
         context,
         control,
@@ -1012,62 +1279,77 @@ fn create_runtime_filter_tables(
 /// statistics before they are expanded into splits.
 fn create_ncp5_pruning_tables(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
 ) -> Result<RuntimeFilterTables> {
+    let deadline = context.deadline();
     let warehouse = context.runtime_dir().join("warehouses").join("ncp-5");
     std::fs::create_dir_all(&warehouse)
         .with_context(|| format!("create NCP-5 warehouse {}", warehouse.display()))?;
     let tables = ncp5_tables();
-    create_hadoop_catalog(control, &tables.catalog, &warehouse)?;
-    control
-        .query_drop(format!(
-            "CREATE DATABASE {}.{}",
-            tables.catalog, tables.database
-        ))
-        .context("create NCP-5 database")?;
-    control
-        .query_drop(format!(
+    create_hadoop_catalog(control, &tables.catalog, &warehouse, context.deadline())?;
+    rf_execute(
+        control,
+        format!("CREATE DATABASE {}.{}", tables.catalog, tables.database),
+        deadline,
+    )
+    .context("create NCP-5 database")?;
+    rf_execute(
+        control,
+        format!(
             "CREATE TABLE {}.{}.{} (id INT NOT NULL, k INT)",
             tables.catalog, tables.database, tables.probe
-        ))
-        .context("create NCP-5 probe table")?;
-    control
-        .query_drop(format!(
+        ),
+        deadline,
+    )
+    .context("create NCP-5 probe table")?;
+    rf_execute(
+        control,
+        format!(
             "ALTER TABLE {}.{}.{} SET TBLPROPERTIES ('write.parquet.row-group-size-bytes'='1024')",
             tables.catalog, tables.database, tables.probe
-        ))
-        .context("set NCP-5 probe row-group size")?;
-    control
-        .query_drop(format!(
+        ),
+        deadline,
+    )
+    .context("set NCP-5 probe row-group size")?;
+    rf_execute(
+        control,
+        format!(
             "CREATE TABLE {}.{}.{} (k INT, flag VARCHAR(8))",
             tables.catalog, tables.database, tables.build
-        ))
-        .context("create NCP-5 build table")?;
+        ),
+        deadline,
+    )
+    .context("create NCP-5 build table")?;
     for range in 0..REQUIRED_BACKENDS {
         let lower = range * 200;
-        control
-            .query_drop(format!(
+        rf_execute(control, format!(
                 "INSERT INTO {}.{}.{} SELECT {} + generate_series, {} + FLOOR((generate_series - 1) / 1000) FROM TABLE(generate_series(1, 200000))",
                 tables.catalog,
                 tables.database,
                 tables.probe,
                 range * 10_000,
                 lower,
-            ))
+            ), deadline)
             .with_context(|| format!("write NCP-5 probe range {range}"))?;
     }
-    control
-        .query_drop(format!(
+    rf_execute(
+        control,
+        format!(
             "INSERT INTO {}.{}.{} VALUES (3, 'Y'), (3, 'N'), (4, 'N')",
             tables.catalog, tables.database, tables.build
-        ))
-        .context("write NCP-5 selective build rows")?;
-    control
-        .query_drop(format!(
+        ),
+        deadline,
+    )
+    .context("write NCP-5 selective build rows")?;
+    rf_execute(
+        control,
+        format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.probe
-        ))
-        .context("analyze NCP-5 probe table")?;
+        ),
+        deadline,
+    )
+    .context("analyze NCP-5 probe table")?;
     wait_for_statistics_job_success(
         context,
         control,
@@ -1075,12 +1357,15 @@ fn create_ncp5_pruning_tables(
         &tables.database,
         &tables.probe,
     )?;
-    control
-        .query_drop(format!(
+    rf_execute(
+        control,
+        format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.build
-        ))
-        .context("analyze NCP-5 build table")?;
+        ),
+        deadline,
+    )
+    .context("analyze NCP-5 build table")?;
     wait_for_statistics_job_success(
         context,
         control,
@@ -1099,20 +1384,25 @@ fn create_ncp5_pruning_tables(
 /// attempt from consuming that arm after setup has returned.
 fn wait_for_statistics_job_success(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<()> {
     loop {
-        let rows: Vec<Row> = control
-            .query("SHOW ANALYZE JOBS")
+        let result = rf_execute(control, "SHOW ANALYZE JOBS", context.deadline())
             .context("observe submitted NCP-5 ANALYZE job")?;
+        ensure!(
+            result.is_result_set(),
+            "SHOW ANALYZE JOBS lost its declared result set"
+        );
+        let columns = result.columns;
+        let rows = result.rows;
         let mut matches = Vec::new();
         for row in rows {
-            if analyze_job_field(&row, "catalog")?.as_deref() == Some(catalog)
-                && analyze_job_field(&row, "namespace")?.as_deref() == Some(namespace)
-                && analyze_job_field(&row, "table")?.as_deref() == Some(table)
+            if analyze_job_field(&columns, &row, "catalog")?.as_deref() == Some(catalog)
+                && analyze_job_field(&columns, &row, "namespace")?.as_deref() == Some(namespace)
+                && analyze_job_field(&columns, &row, "table")?.as_deref() == Some(table)
             {
                 matches.push(row);
             }
@@ -1127,10 +1417,10 @@ fn wait_for_statistics_job_success(
                 "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
             );
         }
-        let job_id = analyze_job_field(&job, "job_id")?
+        let job_id = analyze_job_field(&columns, &job, "job_id")?
             .filter(|value| !value.is_empty())
             .context("NCP-5 ANALYZE job observation has no job_id")?;
-        let state = analyze_job_field(&job, "state")?
+        let state = analyze_job_field(&columns, &job, "state")?
             .filter(|value| !value.is_empty())
             .context("NCP-5 ANALYZE job observation has no state")?;
         match state.as_str() {
@@ -1142,7 +1432,8 @@ fn wait_for_statistics_job_success(
                 thread::sleep(Duration::from_millis(20));
             }
             _ => {
-                let detail = analyze_job_field(&job, "error_message")?.unwrap_or_default();
+                let detail =
+                    analyze_job_field(&columns, &job, "error_message")?.unwrap_or_default();
                 bail!(
                     "NCP-5 ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
                 );
@@ -1151,58 +1442,64 @@ fn wait_for_statistics_job_success(
     }
 }
 
-fn analyze_job_field(row: &Row, name: &str) -> Result<Option<String>> {
-    let index = row
-        .columns_ref()
+fn analyze_job_field(columns: &[Column], row: &[TrinoValue], name: &str) -> Result<Option<String>> {
+    let index = columns
         .iter()
-        .position(|column| column.name_str().eq_ignore_ascii_case(name))
+        .position(|column| column.name.eq_ignore_ascii_case(name))
         .with_context(|| format!("NCP-5 ANALYZE job observation omitted column {name}"))?;
+    require_column(columns, index, "varchar")?;
     match row
-        .as_ref(index)
+        .get(index)
         .context("NCP-5 ANALYZE job observation value is missing")?
     {
-        Value::NULL => Ok(None),
-        Value::Bytes(bytes) => Ok(Some(
-            String::from_utf8(bytes.clone())
-                .context("NCP-5 ANALYZE job observation is not UTF-8")?,
-        )),
-        Value::Int(value) => Ok(Some(value.to_string())),
-        Value::UInt(value) => Ok(Some(value.to_string())),
-        Value::Float(value) => Ok(Some(value.to_string())),
-        Value::Double(value) => Ok(Some(value.to_string())),
+        TrinoValue::Null => Ok(None),
+        TrinoValue::Text(value) => Ok(Some(value.clone())),
         _ => bail!("NCP-5 ANALYZE job observation column {name} has an unsupported value type"),
     }
 }
 
-fn create_hadoop_catalog(control: &mut mysql::Conn, catalog: &str, warehouse: &Path) -> Result<()> {
+fn create_hadoop_catalog(
+    control: &mut SqlSession,
+    catalog: &str,
+    warehouse: &Path,
+    deadline: Instant,
+) -> Result<()> {
     let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
-    control
-        .query_drop(format!(
+    rf_execute(control, format!(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
-        ))
+        ), deadline)
         .with_context(|| format!("create local Hadoop Iceberg catalog {catalog}"))
+        .map(|_| ())
 }
 
-fn configure_broadcast_runtime_filter(control: &mut mysql::Conn) -> Result<()> {
+fn configure_broadcast_runtime_filter(control: &mut SqlSession, deadline: Instant) -> Result<()> {
     configure_runtime_filter(
         control,
         "SET cbo_broadcast_node_mem_budget_bytes = 10737418240",
+        deadline,
     )
 }
 
-fn configure_partitioned_runtime_filter(control: &mut mysql::Conn) -> Result<()> {
-    configure_runtime_filter(control, "SET cbo_broadcast_node_mem_budget_bytes = 0")
+fn configure_partitioned_runtime_filter(control: &mut SqlSession, deadline: Instant) -> Result<()> {
+    configure_runtime_filter(
+        control,
+        "SET cbo_broadcast_node_mem_budget_bytes = 0",
+        deadline,
+    )
 }
 
-fn configure_runtime_filter(control: &mut mysql::Conn, join_distribution: &str) -> Result<()> {
+fn configure_runtime_filter(
+    control: &mut SqlSession,
+    join_distribution: &str,
+    deadline: Instant,
+) -> Result<()> {
     for setting in [
         "SET global_runtime_filter_build_max_size = 10737418240",
         "SET global_runtime_filter_probe_min_selectivity = 0.0",
         join_distribution,
         "SET disable_optimizer_rules = ''",
     ] {
-        control
-            .query_drop(setting)
+        rf_execute(control, setting, deadline)
             .with_context(|| format!("configure Runtime Filter setting {setting}"))?;
     }
     Ok(())
@@ -1219,15 +1516,17 @@ fn runtime_filter_count_query(tables: &RuntimeFilterTables) -> String {
 }
 
 fn assert_partitioned_runtime_filter_plan(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     tables: &RuntimeFilterTables,
+    deadline: Instant,
 ) -> Result<()> {
-    let explain: Vec<String> = control
-        .query(format!(
-            "EXPLAIN VERBOSE {}",
-            runtime_filter_count_query(tables)
-        ))
-        .context("explain native partitioned Runtime Filter candidate query")?;
+    let explain: Vec<String> = rf_execute(
+        control,
+        format!("EXPLAIN VERBOSE {}", runtime_filter_count_query(tables)),
+        deadline,
+    )
+    .and_then(text_rows)
+    .context("explain native partitioned Runtime Filter candidate query")?;
     let explain = explain.join("\n");
     ensure!(
         explain.contains("HASH JOIN (PARTITIONED"),
@@ -1291,24 +1590,6 @@ fn runtime_filter_counting_join(tables: &RuntimeFilterTables) -> String {
         probe = tables.probe,
         build = tables.build,
     )
-}
-
-fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
-    Ok(context
-        .handle()
-        .query_lifecycle_structured_snapshot()?
-        .and_then(|snapshot| snapshot.execution_id))
-}
-
-fn await_terminal_snapshot(
-    context: &mut ScenarioContext,
-    before_execution_id: Option<&str>,
-) -> Result<QueryLifecycleStructuredSnapshot> {
-    let deadline = context.deadline();
-    context
-        .handle()
-        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
-        .context("await a new typed Runtime Filter terminal snapshot")
 }
 
 fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionResourceSnapshot> {
@@ -1402,14 +1683,13 @@ fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     selected: &SelectedStatement,
     baseline: &QueryExecutionResourceSnapshot,
     created_baseline: &[usize],
-    done: &mpsc::Receiver<std::result::Result<Vec<T>, mysql::Error>>,
+    done: &mpsc::Receiver<Result<Vec<T>>>,
 ) -> Result<()> {
     let mut latest = None;
     loop {
         match done.try_recv() {
-            Ok(result) => bail!(
-                "Runtime Filter retry query reached terminal before the Accepted ACK-drop was observed: {result:?}; baseline={baseline:?}; latest={latest:?}"
-            ),
+            Ok(Err(error)) => return Err(error.context(format!("Runtime Filter retry query reached terminal before the Accepted ACK-drop was observed; baseline={baseline:?}; latest={latest:?}"))),
+            Ok(Ok(rows)) => bail!("Runtime Filter retry query reached terminal before the Accepted ACK-drop was observed: {rows:?}; baseline={baseline:?}; latest={latest:?}"),
             Err(mpsc::TryRecvError::Disconnected) => {
                 bail!("Runtime Filter retry query actor disconnected before ACK-drop observation")
             }
@@ -1433,9 +1713,8 @@ fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
         latest = Some((hit_count, query_active, current));
         if hit_count > 0 && query_active {
             match done.try_recv() {
-                Ok(result) => bail!(
-                    "Runtime Filter retry query reached terminal during the Accepted ACK-drop observation: {result:?}; baseline={baseline:?}; latest={latest:?}"
-                ),
+                Ok(Err(error)) => return Err(error.context(format!("Runtime Filter retry query reached terminal during the Accepted ACK-drop observation; baseline={baseline:?}; latest={latest:?}"))),
+                Ok(Ok(rows)) => bail!("Runtime Filter retry query reached terminal during the Accepted ACK-drop observation: {rows:?}; baseline={baseline:?}; latest={latest:?}"),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     bail!(
                         "Runtime Filter retry query actor disconnected during ACK-drop observation"
@@ -1511,22 +1790,23 @@ impl std::error::Error for RuntimeFilterCleanupFailure {
     }
 }
 
-/// All returned actor phases join the same original worker before inspecting
-/// its remaining result. Drop remains only a panic-unwind fallback.
+/// All returned actor phases settle the exact query and actually join the same
+/// original worker. Raw non-Trino refusal remains nonterminal after Join.
 fn settle_query<T, R>(
-    actor: JoinedClientThread,
-    done: &mpsc::Receiver<mysql::Result<Vec<T>>>,
+    mut actor: JoinedClientThread,
+    done: &mpsc::Receiver<Result<Vec<T>>>,
     primary: Result<R>,
 ) -> Result<R> {
-    let joined = actor
-        .join()
-        .map_err(|payload| {
-            anyhow::Error::from(RuntimeFilterActorPanic(std::sync::Mutex::new(payload)))
-        })
-        .and_then(|result| result);
+    let cancellation = if primary.is_err() {
+        actor.cancel_active()
+    } else {
+        Ok(())
+    };
+    let joined = merge_cleanup(actor.join(), cancellation);
     let pending = match done.try_recv() {
-        Ok(Err(error)) => Err(anyhow::Error::from(error)
-            .context("original Runtime Filter SQL result failed during cleanup")),
+        Ok(Err(error)) => {
+            Err(error.context("original Runtime Filter SQL result failed during cleanup"))
+        }
         _ => Ok(()),
     };
     merge_cleanup(merge_cleanup(primary, joined), pending)
@@ -1545,99 +1825,194 @@ impl std::fmt::Debug for RuntimeFilterActorPanic {
 }
 impl std::error::Error for RuntimeFilterActorPanic {}
 
-struct JoinedClientThread(Option<thread::JoinHandle<Result<()>>>);
+enum RuntimeFilterCancellation {
+    Submitted {
+        cancel: Box<CancelHandle>,
+        deadline: Instant,
+    },
+    #[cfg(test)]
+    NoSubmission,
+}
+struct JoinedClientThread {
+    thread: Option<thread::JoinHandle<Result<()>>>,
+    cancellation: RuntimeFilterCancellation,
+    nonterminal: Arc<AtomicBool>,
+}
 impl JoinedClientThread {
-    fn join(mut self) -> std::thread::Result<Result<()>> {
-        self.0
+    fn delete(&self) -> Result<()> {
+        match &self.cancellation {
+            RuntimeFilterCancellation::Submitted { cancel, deadline } => {
+                Ok(cancel.delete(*deadline)?)
+            }
+            #[cfg(test)]
+            RuntimeFilterCancellation::NoSubmission => Ok(()),
+        }
+    }
+    fn cancel_active(&self) -> Result<()> {
+        if self.nonterminal.load(Ordering::Acquire)
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            self.delete()?;
+        }
+        Ok(())
+    }
+    fn join(&mut self) -> Result<()> {
+        let joined = self
+            .thread
             .take()
-            .expect("Runtime Filter SQL client exists")
+            .context("Runtime Filter SQL client already joined")?
             .join()
+            .map_err(|payload| {
+                anyhow::Error::from(RuntimeFilterActorPanic(std::sync::Mutex::new(payload)))
+            })
+            .and_then(|outcome| outcome);
+        let cancellation = if self.nonterminal.load(Ordering::Acquire) {
+            self.delete()
+        } else {
+            Ok(())
+        };
+        merge_cleanup(joined, cancellation)
+    }
+    #[cfg(test)]
+    fn unsubmitted_worker(thread: thread::JoinHandle<Result<()>>) -> Self {
+        Self {
+            thread: Some(thread),
+            cancellation: RuntimeFilterCancellation::NoSubmission,
+            nonterminal: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 impl Drop for JoinedClientThread {
     fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
-            match client.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("Original SQL actor cleanup failed: {error:#}"),
-                Err(_) => eprintln!("Original SQL actor panicked during actual join"),
+        if self.thread.is_some() {
+            let cancellation = self.cancel_active();
+            let joined = self.join();
+            if let Err(error) = merge_cleanup(joined, cancellation) {
+                eprintln!("Original Runtime Filter SQL actor cleanup failed: {error:#}");
             }
         }
     }
 }
-
 struct BlockingQuery {
-    ready: mpsc::Receiver<u32>,
-    done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    ready: mpsc::Receiver<String>,
+    done: mpsc::Receiver<Result<Vec<bool>>>,
     thread: JoinedClientThread,
 }
-
 struct HeldCountQuery {
-    ready: mpsc::Receiver<u32>,
-    done: mpsc::Receiver<std::result::Result<Vec<(i64, bool)>, mysql::Error>>,
+    ready: mpsc::Receiver<String>,
+    done: mpsc::Receiver<Result<Vec<(i64, bool)>>>,
     thread: JoinedClientThread,
 }
+fn publish_result<T>(sender: &mpsc::SyncSender<Result<T>>, outcome: Result<T>) -> Result<()> {
+    match sender.send(outcome) {
+        Ok(()) => Ok(()),
+        Err(mpsc::SendError(Err(actual))) => {
+            Err(actual.context("original Runtime Filter query failed after result owner closed"))
+        }
+        Err(mpsc::SendError(Ok(_))) => {
+            bail!("original Runtime Filter result owner closed before delivery")
+        }
+    }
+}
+type StartedRuntimeFilterQuery<T> = (
+    mpsc::Receiver<String>,
+    mpsc::Receiver<Result<Vec<T>>>,
+    JoinedClientThread,
+);
 
-fn start_held_runtime_filter_count_query(
-    connection: mysql_actor::DeadlineConnection,
-    query: String,
-) -> Result<HeldCountQuery> {
+fn start_runtime_filter_query<T: Send + 'static>(
+    mut session: SqlSession,
+    pending: PendingStatement,
+    deadline: Instant,
+    decode: fn(StatementResult) -> Result<Vec<T>>,
+) -> Result<StartedRuntimeFilterQuery<T>> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
-    let thread = thread::spawn(move || -> Result<()> {
-        connection.run(|connection| {
+    let cancel = pending.cancel_handle();
+    // Before the first GET, no server terminal has been observed.
+    let nonterminal = Arc::new(AtomicBool::new(true));
+    let worker_nonterminal = nonterminal.clone();
+    let thread = thread::Builder::new()
+        .name("runtime-filter-sql".into())
+        .spawn(move || -> Result<()> {
             ready_tx
-                .send(connection.connection_id())
-                .context("publish held Runtime Filter count query connection id")?;
-            mysql_actor::publish_result(&done_tx, connection.query::<(i64, bool), _>(query))
-                .context("publish held Runtime Filter count query result")?;
-            Ok(())
-        })
-    });
+                .send(pending.query_id.clone())
+                .context("publish actual Runtime Filter Pending query id")?;
+            let response = session.run_pending(pending);
+            worker_nonterminal.store(
+                matches!(&response, Err(error) if !matches!(error, StatementFailure::Trino(_))),
+                Ordering::Release,
+            );
+            publish_result(
+                &done_tx,
+                response.map_err(anyhow::Error::from).and_then(decode),
+            )
+        });
+    match thread {
+        Ok(thread) => Ok((
+            ready,
+            done,
+            JoinedClientThread {
+                thread: Some(thread),
+                cancellation: RuntimeFilterCancellation::Submitted {
+                    cancel: Box::new(cancel),
+                    deadline,
+                },
+                nonterminal,
+            },
+        )),
+        Err(primary) => merge_cleanup(
+            Err(primary.into()),
+            cancel.delete(deadline).map_err(Into::into),
+        ),
+    }
+}
+fn start_held_runtime_filter_count_query(
+    session: SqlSession,
+    pending: PendingStatement,
+    deadline: Instant,
+) -> Result<HeldCountQuery> {
+    let (ready, done, thread) =
+        start_runtime_filter_query(session, pending, deadline, held_count_rows)?;
     Ok(HeldCountQuery {
         ready,
         done,
-        thread: JoinedClientThread(Some(thread)),
+        thread,
     })
 }
-
 fn start_blocking_runtime_filter_query(
-    connection: mysql_actor::DeadlineConnection,
-    query: String,
+    session: SqlSession,
+    pending: PendingStatement,
+    deadline: Instant,
 ) -> Result<BlockingQuery> {
-    let (ready_tx, ready) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let thread = thread::spawn(move || -> Result<()> {
-        connection.run(|connection| {
-            ready_tx
-                .send(connection.connection_id())
-                .context("publish blocking Runtime Filter query connection id")?;
-            mysql_actor::publish_result(&done_tx, connection.query::<i64, _>(query))
-                .context("publish blocking Runtime Filter query result")?;
-            Ok(())
-        })
-    });
+    let (ready, done, thread) =
+        start_runtime_filter_query(session, pending, deadline, blocking_rows)?;
     Ok(BlockingQuery {
         ready,
         done,
-        thread: JoinedClientThread(Some(thread)),
+        thread,
     })
 }
-
 fn assert_cancelled_query(
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    done: &mpsc::Receiver<Result<Vec<bool>>>,
     timeout: Duration,
 ) -> Result<()> {
     let result = done
         .recv_timeout(timeout)
         .context("Runtime Filter query did not terminate before scenario deadline")?;
     let error = match result {
-        Ok(rows) => bail!("Runtime Filter query unexpectedly succeeded after KILL QUERY: {rows:?}"),
+        Ok(rows) => bail!("Runtime Filter query unexpectedly succeeded after DELETE: {rows:?}"),
         Err(error) => error,
     };
-    match error {
-        mysql::Error::MySqlError(error) if error.code == 1317 => Ok(()),
-        other => bail!("expected MySQL cancellation error 1317, received {other}"),
+    let wire = public_sql_error(&error)?;
+    if wire.error_code == 3 && wire.error_name == "USER_CANCELED" && wire.error_type == "USER_ERROR"
+    {
+        Ok(())
+    } else {
+        Err(error.context("expected original Trino USER_CANCELED (3, USER_ERROR)"))
     }
 }
 
@@ -1974,17 +2349,53 @@ mod returned_error_cleanup_tests {
     use super::*;
 
     #[test]
+    fn string_signature_keeps_unbounded_varchar_length_and_scalar_nominal_types() {
+        let column = |raw: &str, arguments: serde_json::Value| -> Column {
+            serde_json::from_value(serde_json::json!({
+                "name":"catalog", "type":raw,
+                "typeSignature":{"rawType":raw,"arguments":arguments}
+            }))
+            .unwrap()
+        };
+        // Independent protocol literal already protected by columns.rs;
+        // neither a SHOW result nor a client parser supplies this expectation.
+        let string = column(
+            "varchar",
+            serde_json::json!([{"kind":"LONG","value":2147483647}]),
+        );
+        require_column(&[string], 0, "varchar").unwrap();
+        for arguments in [
+            serde_json::json!([]),
+            serde_json::json!([{"kind":"LONG","value":64}]),
+        ] {
+            assert!(require_column(&[column("varchar", arguments)], 0, "varchar").is_err());
+        }
+        assert!(require_column(&[column("bigint", serde_json::json!([]))], 0, "varchar").is_err());
+        for raw in ["bigint", "boolean"] {
+            require_column(&[column(raw, serde_json::json!([]))], 0, raw).unwrap();
+            assert!(
+                require_column(
+                    &[column(raw, serde_json::json!([{"kind":"LONG","value":1}]))],
+                    0,
+                    raw
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn failed_phase_retains_actual_join_and_unconsumed_sql_failures() {
-        let (sender, done) = mpsc::sync_channel::<mysql::Result<Vec<i64>>>(1);
-        let actor = JoinedClientThread(Some(thread::spawn(move || -> Result<()> {
-            mysql_actor::publish_result(
+        let (sender, done) = mpsc::sync_channel::<Result<Vec<i64>>>(1);
+        let actor = JoinedClientThread::unsubmitted_worker(thread::spawn(move || -> Result<()> {
+            publish_result(
                 &sender,
-                Err(mysql::Error::from(std::io::Error::other(
-                    "pending SQL failure",
+                Err(anyhow::Error::from(StatementFailure::Transport(
+                    "pending SQL failure".into(),
                 ))),
             )?;
             Err(anyhow::anyhow!("actual worker cleanup failure"))
-        })));
+        }));
         let phase: Result<()> = Err(anyhow::anyhow!("original observation failure"));
         let error = settle_query(actor, &done, phase).unwrap_err();
         let text = format!("{error:#}");
@@ -2000,16 +2411,36 @@ mod returned_error_cleanup_tests {
 
     #[test]
     fn consumed_expected_query_error_is_not_reintroduced_by_settle() {
-        let (sender, done) = mpsc::sync_channel::<mysql::Result<Vec<i64>>>(1);
-        let actor = JoinedClientThread(Some(thread::spawn(move || -> Result<()> {
-            mysql_actor::publish_result(
+        let (sender, done) = mpsc::sync_channel::<Result<Vec<i64>>>(1);
+        let actor = JoinedClientThread::unsubmitted_worker(thread::spawn(move || -> Result<()> {
+            publish_result(
                 &sender,
-                Err(mysql::Error::from(std::io::Error::other(
-                    "already checked cancellation",
+                Err(anyhow::Error::from(StatementFailure::Transport(
+                    "already checked cancellation".into(),
                 ))),
             )
-        })));
+        }));
         assert!(done.recv().unwrap().is_err());
         settle_query(actor, &done, Ok(())).unwrap();
+    }
+    #[test]
+    fn cancellation_requires_actual_trino_user_canceled() {
+        let (sender, done) = mpsc::sync_channel(1);
+        let wire: TrinoError = serde_json::from_value(serde_json::json!({
+            "message":"original cancellation", "errorCode":3,
+            "errorName":"USER_CANCELED", "errorType":"USER_ERROR"
+        }))
+        .unwrap();
+        sender
+            .send(Err(anyhow::Error::from(StatementFailure::Trino(wire))))
+            .unwrap();
+        assert_cancelled_query(&done, Duration::ZERO).unwrap();
+        sender
+            .send(Err(anyhow::Error::from(StatementFailure::Http {
+                status: 503,
+                body: "USER_CANCELED code=3".into(),
+            })))
+            .unwrap();
+        assert!(assert_cancelled_query(&done, Duration::ZERO).is_err());
     }
 }

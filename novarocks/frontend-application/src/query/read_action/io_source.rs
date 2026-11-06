@@ -79,7 +79,16 @@ impl ReadMetadataIoSource {
     }
 }
 fn work_error(error: WorkError) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, error.to_string())
+    let kind = match &error {
+        WorkError::Cancelled(_) | WorkError::Closed | WorkError::Released => {
+            ConnectorErrorKind::Cancelled
+        }
+        WorkError::Capacity(_) | WorkError::CapacityWaitTimeout | WorkError::ArithmeticOverflow => {
+            ConnectorErrorKind::ResourceExhausted
+        }
+        _ => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::from_domain(kind, error)
 }
 impl ConnectorIoAdmissionPort for ReadMetadataIoSource {
     fn configure_read_source(

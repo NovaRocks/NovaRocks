@@ -21,11 +21,13 @@
 //! coarse check only rejects large regressions; it is not a formal benchmark.
 
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
-use super::provider_mysql_actors::{MysqlActor, record_cancelled_proxy_read};
-use crate::actors::mysql as mysql_actor;
+use super::provider_mysql_actors::{
+    ProviderActor, finish_provider_operation, provider_failure_receipt,
+    record_cancelled_proxy_read, unsigned_first, unsigned_pairs, unsigned_rows,
+};
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, LaunchProfile,
@@ -414,14 +416,11 @@ impl Scenario for CatalogPlanningResponsibility {
         let fixtures = fixtures
             .as_ref()
             .context("UEA-4A-4 fixture was not prepared")?;
-        let mut control = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect UEA-4A-4 responsibility setup")?,
-        )?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         for fixture in [&fixtures.iceberg, &fixtures.paimon] {
             control
-                .query_drop(fixture.catalog_sql(
+                .execute(fixture.catalog_sql(
                     true,
                     if fixture.provider == "iceberg" {
                         fixtures.iceberg_slow.endpoint()
@@ -429,9 +428,11 @@ impl Scenario for CatalogPlanningResponsibility {
                         fixtures.paimon_slow.endpoint()
                     },
                 ))
+                .map(|_| ())
                 .with_context(|| format!("create {} held-read catalog", fixture.provider))?;
             control
-                .query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .execute(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .map(|_| ())
                 .with_context(|| format!("create {} independent catalog", fixture.provider))?;
         }
         drop(control);
@@ -499,26 +500,31 @@ impl Scenario for CatalogPlanningResponsibility {
             &paimon_followup,
             fixtures.paimon.facts.row_count,
         )?;
-        let mut control = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect independent catalog owner")?,
-        )?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         for fixture in [&fixtures.iceberg, &fixtures.paimon] {
             let table = fixture.table_name(false);
-            let mut rows = control
-                .query_iter(format!("EXPLAIN SELECT COUNT(*) FROM {table}"))
+            let rows = control
+                .execute(format!("EXPLAIN SELECT COUNT(*) FROM {table}"))
                 .with_context(|| {
                     format!(
                         "EXPLAIN {} through provider metadata planning",
                         fixture.provider
                     )
                 })?;
-            let mut row_count = 0;
-            for row in rows.by_ref() {
-                row.with_context(|| format!("read {} EXPLAIN row", fixture.provider))?;
-                row_count += 1;
-            }
+            ensure!(
+                rows.is_result_set()
+                    && rows.columns.len() == 1
+                    && rows.columns[0].type_signature.raw_type == "varchar",
+                "EXPLAIN returned non-text metadata: {rows:?}"
+            );
+            ensure!(
+                rows.rows
+                    .iter()
+                    .all(|row| matches!(row.as_slice(), [TrinoValue::Text(_)])),
+                "EXPLAIN returned non-text plan cells: {rows:?}"
+            );
+            let row_count = rows.rows.len();
             ensure!(
                 row_count > 0,
                 "{} EXPLAIN returned no plan rows",
@@ -597,18 +603,17 @@ impl Scenario for CatalogPlanningNoFeQuota {
         let fixtures = fixtures
             .as_ref()
             .context("UEA-4A-4 fixture was not prepared")?;
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect UEA-4A-4 no-quota session")?,
-        )?;
+        let mut connection =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         for fixture in [&fixtures.iceberg, &fixtures.paimon] {
             connection
-                .query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .execute(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .map(|_| ())
                 .with_context(|| format!("create {} no-quota catalog", fixture.provider))?;
             let table = fixture.table_name(false);
             let count: Option<u64> = connection
-                .query_first(format!("SELECT COUNT(*) FROM {table}"))
+                .execute(format!("SELECT COUNT(*) FROM {table}"))
+                .and_then(unsigned_first)
                 .with_context(|| format!("read {} through admitted execution", fixture.provider))?;
             ensure!(
                 count == Some(fixture.facts.row_count),
@@ -623,20 +628,23 @@ impl Scenario for CatalogPlanningNoFeQuota {
         let baseline = resource_baseline(context)?;
         let paimon_table = fixtures.paimon.table_name(false);
         let budget_error = connection
-            .query::<mysql::Row, _>(format!(
+            .execute(format!(
                 "SELECT /*+ SET_VAR(query_mem_limit=1) */ * FROM {paimon_table}"
             ))
             .expect_err("one-byte query memory budget must reject the admitted Paimon read");
-        ensure!(
-            budget_error
+        if !(matches!(&budget_error, StatementFailure::Trino(_))
+            && budget_error
                 .to_string()
                 .to_ascii_lowercase()
-                .contains("memory"),
-            "low-budget Paimon read failed for another reason: {budget_error}"
-        );
+                .contains("memory"))
+        {
+            return Err(anyhow::Error::new(budget_error)
+                .context("low-budget Paimon read failed for another reason"));
+        }
         await_resource_convergence(context, &baseline, "Paimon BE capacity refusal")?;
         let recovered_rows: Option<u64> = connection
-            .query_first(format!("SELECT COUNT(*) FROM {paimon_table}"))
+            .execute(format!("SELECT COUNT(*) FROM {paimon_table}"))
+            .and_then(unsigned_first)
             .context("read Paimon after BE capacity refusal")?;
         ensure!(
             recovered_rows == Some(fixtures.paimon.facts.row_count),
@@ -717,20 +725,19 @@ impl Scenario for IcebergHeldReadCancellation {
             .context("UEA-4A-4 fixture was not prepared")?;
         let fixture = &fixtures.iceberg;
         let proxy = &fixtures.iceberg_slow;
-        let mut control = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect Iceberg held-read setup session")?,
-        )?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         control
-            .query_drop(fixture.catalog_sql(true, proxy.endpoint()))
+            .execute(fixture.catalog_sql(true, proxy.endpoint()))
+            .map(|_| ())
             .context("create Iceberg held-read catalog")?;
         control
-            .query_drop(
+            .execute(
                 fixtures
                     .paimon
                     .catalog_sql(false, &fixtures.paimon.facts.s3_endpoint),
             )
+            .map(|_| ())
             .context("create independent Paimon follow-up catalog")?;
         let table = fixture.table_name(true);
         let read_sql = format!("SELECT COUNT(*) FROM {table} WHERE id BETWEEN 1 AND 1000");
@@ -754,13 +761,11 @@ impl Scenario for IcebergHeldReadCancellation {
                 owner == "sdk-manifest",
             )?;
         }
-        let mut control = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect post-cancellation Iceberg session")?,
-        )?;
+        let mut control =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         let count: Option<u64> = control
-            .query_first(format!("SELECT COUNT(*) FROM {table}"))
+            .execute(format!("SELECT COUNT(*) FROM {table}"))
+            .and_then(unsigned_first)
             .context("read Iceberg table after held cancellations")?;
         ensure!(
             count == Some(fixture.facts.row_count),
@@ -851,16 +856,20 @@ fn run_iceberg_held_deadline(
     let baseline = resource_baseline(context)?;
     let hold = proxy.hold_next_read_with_suffix(".avro")?;
     let query = sql.to_owned();
-    let mut query_actor = MysqlActor::spawn(context, "iceberg-deadline-q1", move |connection| {
-        connection
-            .query_drop("SET query_timeout = 1")
-            .context("set one-second statement deadline")?;
-        Ok(connection.query::<u64, _>(query))
-    })?;
+    let mut query_actor = ProviderActor::spawn(
+        context,
+        "iceberg-deadline-q1",
+        move |connection, statements| {
+            statements
+                .run(connection, "SET query_timeout = 1")?
+                .context("set one-second statement deadline")?;
+            Ok(statements.run(connection, query)?.and_then(unsigned_rows))
+        },
+    )?;
     let mut followup_actor = None;
     let mut entered = false;
     let operation = (|| -> Result<()> {
-        query_actor.connection_id(context.remaining("await deadline query connection")?)?;
+        query_actor.wait_started(context.remaining("await deadline query connection")?)?;
         hold.wait_until_entered(
             context
                 .remaining("observe held Iceberg deadline manifest read")?
@@ -873,10 +882,14 @@ fn run_iceberg_held_deadline(
                 .remaining("await statement deadline while S3 is held")?
                 .min(Duration::from_secs(10)),
         )?;
-        ensure!(
-            matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.message.to_ascii_lowercase().contains("timed out")),
-            "held Iceberg query did not return a deadline terminal: {result:?}"
-        );
+        let error = result.err().context(
+            "held Iceberg query unexpectedly succeeded instead of its deadline terminal",
+        )?;
+        if !matches!(&error, StatementFailure::Trino(error) if error.error_code == 131075 && error.error_name == "EXCEEDED_TIME_LIMIT" && error.error_type == "INSUFFICIENT_RESOURCES")
+        {
+            return Err(anyhow::Error::new(error)
+                .context("held Iceberg query did not return its original deadline terminal"));
+        }
         let state = frontend_workload_state(context)?;
         ensure!(
             state
@@ -887,17 +900,18 @@ fn run_iceberg_held_deadline(
         );
         context.action("Q1 returned a statement-timeout terminal and released admission while its SDK manifest read remained held");
         let query = followup_sql.to_owned();
-        followup_actor = Some(MysqlActor::spawn(
+        followup_actor = Some(ProviderActor::spawn(
             context,
             "iceberg-deadline-q2",
-            move |connection| {
-                connection
-                    .query_first::<u64, _>(query)
+            move |connection, statements| {
+                statements
+                    .run(connection, query)?
+                    .and_then(unsigned_first)
                     .context("read Q2 after Iceberg deadline")
             },
         )?);
         let actor = followup_actor.as_mut().expect("follow-up actor installed");
-        actor.connection_id(context.remaining("await deadline follow-up connection")?)?;
+        actor.wait_started(context.remaining("await deadline follow-up connection")?)?;
         let observed = actor
             .receive(
                 context
@@ -946,9 +960,25 @@ fn run_iceberg_held_deadline(
                 .map(|_| ()),
         );
     }
-    collect_actor_cleanup(&mut cleanup, "join Q1", query_actor.finish(context));
+    collect_actor_cleanup(
+        &mut cleanup,
+        "join Q1",
+        query_actor.finish_with(context, |result| {
+            result.map(|_| ()).map_err(anyhow::Error::from)
+        }),
+    );
     if let Some(actor) = &mut followup_actor {
-        collect_actor_cleanup(&mut cleanup, "join Q2", actor.finish(context));
+        collect_actor_cleanup(
+            &mut cleanup,
+            "join Q2",
+            actor.finish_with(context, |observed| {
+                ensure!(
+                    observed == Some(followup_count),
+                    "unconsumed original follow-up count differs: {observed:?}"
+                );
+                Ok(())
+            }),
+        );
     }
     collect_actor_cleanup(
         &mut cleanup,
@@ -987,15 +1017,21 @@ fn run_held_provider_read(
     };
     let query = sql.to_owned();
     let label = format!("{provider}-{owner}");
-    let mut query_actor = MysqlActor::spawn(context, &format!("{label}-q1"), move |connection| {
-        Ok(connection.query::<u64, _>(query))
-    })?;
+    let mut query_actor = ProviderActor::spawn(
+        context,
+        &format!("{label}-q1"),
+        move |connection, statements| {
+            Ok(statements.run(connection, query)?.and_then(unsigned_rows))
+        },
+    )?;
     let mut kill_actor = None;
     let mut followup_actor = None;
     let mut entered = false;
+    // This original early observation can outlive a later follow-up failure.
+    // Keep the single moved result outside the fallible business closure.
+    let mut early_result = None;
     let operation = (|| -> Result<()> {
-        let connection_id =
-            query_actor.connection_id(context.remaining("receive held provider connection ID")?)?;
+        query_actor.wait_started(context.remaining("receive held provider connection ID")?)?;
         hold.wait_until_entered(
             context
                 .remaining("observe real held provider object read")?
@@ -1003,12 +1039,13 @@ fn run_held_provider_read(
         )?;
         entered = true;
         let held_snapshot = proxy.snapshot();
-        kill_actor = Some(MysqlActor::spawn(
+        let original_query = query_actor.current_query()?;
+        kill_actor = Some(ProviderActor::spawn(
             context,
             &format!("{label}-kill"),
-            move |control| {
-                control
-                    .query_drop(format!("KILL QUERY {connection_id}"))
+            move |_control, _statements| {
+                original_query
+                    .cancel()
                     .context("cancel held provider query")
             },
         )?);
@@ -1020,20 +1057,21 @@ fn run_held_provider_read(
                     .remaining("await held provider KILL QUERY")?
                     .min(Duration::from_secs(10)),
             )?;
-        let early_result = query_actor.try_result()?;
+        early_result = query_actor.try_result()?;
         if expect_independent_followup {
             let query = followup_sql.to_owned();
-            followup_actor = Some(MysqlActor::spawn(
+            followup_actor = Some(ProviderActor::spawn(
                 context,
                 &format!("{label}-q2"),
-                move |connection| {
-                    connection
-                        .query_first::<u64, _>(query)
+                move |connection, statements| {
+                    statements
+                        .run(connection, query)?
+                        .and_then(unsigned_first)
                         .context("independent query while provider read held")
                 },
             )?);
             let actor = followup_actor.as_mut().expect("follow-up actor installed");
-            actor.connection_id(context.remaining("await held provider follow-up connection")?)?;
+            actor.wait_started(context.remaining("await held provider follow-up connection")?)?;
             let observed = actor.receive(
                 context
                     .remaining("await independent provider query")?
@@ -1050,14 +1088,19 @@ fn run_held_provider_read(
                 .remaining("observe cancelled provider request exit")?
                 .min(Duration::from_secs(30)),
         )?;
-        let result = match early_result {
+        let result = match early_result.take() {
             Some(result) => result,
             None => query_actor.receive(context.remaining("await held provider query exit")?)?,
         };
-        ensure!(
-            matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
-            "{provider} {owner} query did not report cancellation after S3 release: {result:?}"
-        );
+        let error = result
+            .err()
+            .context("held provider query unexpectedly succeeded after cancellation")?;
+        if !matches!(&error, StatementFailure::Trino(error) if error.error_code == 3 && error.error_name == "USER_CANCELED" && error.error_type == "USER_ERROR")
+        {
+            return Err(anyhow::Error::new(error).context(format!(
+                "{provider} {owner} query did not report cancellation after S3 release"
+            )));
+        }
         let after = proxy.snapshot();
         ensure!(
             after.gets + after.heads >= held_snapshot.gets + held_snapshot.heads
@@ -1067,6 +1110,11 @@ fn run_held_provider_read(
         Ok(())
     })();
     let mut cleanup = Vec::new();
+    if let Some(Err(actual)) = early_result.take() {
+        cleanup.push(anyhow::Error::new(actual).context(
+            "original early Q1 result retained after a later held-read operation failure",
+        ));
+    }
     if operation.is_err() {
         collect_actor_cleanup(&mut cleanup, "cancel Q1", query_actor.cancel(context));
         if let Some(actor) = &mut kill_actor {
@@ -1085,12 +1133,32 @@ fn run_held_provider_read(
                 .map(|_| ()),
         );
     }
-    collect_actor_cleanup(&mut cleanup, "join Q1", query_actor.finish(context));
+    collect_actor_cleanup(
+        &mut cleanup,
+        "join Q1",
+        query_actor.finish_with(context, |result| {
+            result.map(|_| ()).map_err(anyhow::Error::from)
+        }),
+    );
     if let Some(actor) = &mut kill_actor {
-        collect_actor_cleanup(&mut cleanup, "join control", actor.finish(context));
+        collect_actor_cleanup(
+            &mut cleanup,
+            "join control",
+            actor.finish_with(context, |()| Ok(())),
+        );
     }
     if let Some(actor) = &mut followup_actor {
-        collect_actor_cleanup(&mut cleanup, "join Q2", actor.finish(context));
+        collect_actor_cleanup(
+            &mut cleanup,
+            "join Q2",
+            actor.finish_with(context, |observed| {
+                ensure!(
+                    observed == Some(followup_count),
+                    "unconsumed original follow-up count differs: {observed:?}"
+                );
+                Ok(())
+            }),
+        );
     }
     collect_actor_cleanup(
         &mut cleanup,
@@ -1110,9 +1178,9 @@ fn run_held_provider_read(
     finish_held_evidence(context, &label, operation, cleanup)
 }
 
-fn collect_actor_cleanup(errors: &mut Vec<String>, phase: &str, result: Result<()>) {
+fn collect_actor_cleanup(errors: &mut Vec<anyhow::Error>, phase: &str, result: Result<()>) {
     if let Err(error) = result {
-        errors.push(format!("{phase}: {error:#}"));
+        errors.push(error.context(phase.to_owned()));
     }
 }
 
@@ -1120,22 +1188,24 @@ fn finish_held_evidence(
     context: &ScenarioContext,
     label: &str,
     operation: Result<()>,
-    cleanup: Vec<String>,
+    mut cleanup: Vec<anyhow::Error>,
 ) -> Result<()> {
-    let evidence = fs::write(
-        context.scenario_root().join(format!("{label}-exit.json")),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "operation_error":operation.as_ref().err().map(|error| format!("{error:#}")),
-            "cleanup_errors":cleanup,"actual_actor_joins_completed":true,
-        }))?,
-    );
-    operation?;
-    ensure!(
-        cleanup.is_empty(),
-        "held provider cleanup failed: {cleanup:?}"
-    );
-    evidence?;
-    Ok(())
+    let evidence = (|| -> Result<()> {
+        fs::write(
+            context.scenario_root().join(format!("{label}-exit.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operation_error":operation.as_ref().err().map(provider_failure_receipt),
+                "cleanup_errors":cleanup.iter().map(provider_failure_receipt).collect::<Vec<_>>(),
+                "actual_actor_joins_completed":true,
+                "causal_priority":"original operation first; post-cancel/Join results remain actual secondary objects",
+            }))?,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = evidence {
+        cleanup.push(error.context("persist original provider exit evidence"));
+    }
+    finish_provider_operation(operation, cleanup)
 }
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -1189,11 +1259,8 @@ impl Scenario for CatalogPlanningSmoke {
             .as_ref()
             .context("provider fixtures were not prepared")?;
         let baseline = resource_baseline(context)?;
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect provider smoke")?,
-        )?;
+        let mut connection =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         for (fixture, proxy) in [
             (&fixtures.iceberg, &fixtures.iceberg_slow),
             (&fixtures.paimon, &fixtures.paimon_slow),
@@ -1202,7 +1269,9 @@ impl Scenario for CatalogPlanningSmoke {
                 (false, fixture.facts.s3_endpoint.as_str()),
                 (true, proxy.endpoint()),
             ] {
-                connection.query_drop(fixture.catalog_sql(slow, endpoint))?;
+                connection
+                    .execute(fixture.catalog_sql(slow, endpoint))
+                    .map(|_| ())?;
                 verify_provider_rows(&mut connection, &fixture.table_name(slow), fixture)?;
             }
         }
@@ -1220,16 +1289,21 @@ impl Scenario for CatalogPlanningSmoke {
 /// The producer inserts 32 consecutive IDs per commit and stores the commit
 /// ordinal as value. This formula is independent of either native query result.
 fn verify_provider_rows(
-    connection: &mut mysql::Conn,
+    connection: &mut SqlSession,
     table: &str,
     fixture: &CheckedFixture,
 ) -> Result<()> {
+    verify_provider_result(
+        connection.execute(format!("SELECT id, value FROM {table} ORDER BY id"))?,
+        fixture,
+    )
+}
+fn verify_provider_result(result: StatementResult, fixture: &CheckedFixture) -> Result<()> {
     ensure!(
         fixture.facts.row_count.is_multiple_of(32),
         "provider fixture does not match its 32-row input batches"
     );
-    let actual: Vec<(u64, u64)> =
-        connection.query(format!("SELECT id, value FROM {table} ORDER BY id"))?;
+    let actual = unsigned_pairs(result)?;
     let expected = (0..fixture.facts.row_count)
         .map(|id| (id, id / 32))
         .collect::<Vec<_>>();
@@ -1296,13 +1370,14 @@ fn run_queued_provider(
     proxy: &DelayedS3Proxy,
 ) -> Result<()> {
     let baseline = resource_baseline(context)?;
-    let mut connection = mysql_actor::connect(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.remaining("connect queued provider setup")?,
-    )?;
-    connection.query_drop(fixture.catalog_sql(true, proxy.endpoint()))?;
-    connection.query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))?;
+    let mut connection =
+        SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    connection
+        .execute(fixture.catalog_sql(true, proxy.endpoint()))
+        .map(|_| ())?;
+    connection
+        .execute(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+        .map(|_| ())?;
     drop(connection);
     let hold = proxy.hold_next_read_with_suffix(".parquet")?;
     let mut actors = Vec::new();
@@ -1312,12 +1387,20 @@ fn run_queued_provider(
         for index in 0..2 {
             let facts = fixture.clone();
             let table = facts.table_name(index == 0);
-            actors.push(MysqlActor::spawn(
+            actors.push(ProviderActor::spawn(
                 context,
                 &format!("{}-queued-{index}", fixture.provider),
-                move |connection| verify_provider_rows(connection, &table, &facts),
+                move |connection, statements| {
+                    verify_provider_result(
+                        statements.run(
+                            connection,
+                            format!("SELECT id, value FROM {table} ORDER BY id"),
+                        )??,
+                        &facts,
+                    )
+                },
             )?);
-            actors[index].connection_id(context.remaining("await queued provider connection")?)?;
+            actors[index].wait_started(context.remaining("await queued provider connection")?)?;
             if index == 0 {
                 hold.wait_until_entered(
                     context
@@ -1413,12 +1496,14 @@ fn run_queued_provider(
         );
     }
     for (index, actor) in actors.iter_mut().enumerate() {
-        collect_actor_cleanup(&mut cleanup, "actual join", actor.finish(context));
-        if !completed[index]
-            && let Err(error) = actor.try_result()
-        {
-            cleanup.push(format!("actor {index} result after cleanup: {error:#}"));
-        }
+        collect_actor_cleanup(
+            &mut cleanup,
+            "actual join and original result",
+            actor.finish_with(context, |()| {
+                completed[index] = true;
+                Ok(())
+            }),
+        );
     }
     collect_actor_cleanup(
         &mut cleanup,

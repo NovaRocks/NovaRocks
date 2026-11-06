@@ -1836,7 +1836,9 @@ mod tests {
             )
             .unwrap();
             let runtime = ActorRuntime::new();
+            let backend = BackendProcessId::new_v7();
             let core = ControlCore::new(
+                backend,
                 ControlConfig {
                     max_pending_requests: positions,
                     step_budget: ControlCore::MAX_STEP_WORK,
@@ -1874,7 +1876,7 @@ mod tests {
                 QueryExecutionId::new(QueryId::new(7001, 7002), AttemptId::new(1).unwrap())
                     .unwrap(),
                 FrontendProcessId::new_v7(),
-                BackendProcessId::new_v7(),
+                backend,
             );
             Self {
                 positions,

@@ -22,11 +22,11 @@
 //! protocol conformance is covered by its dedicated scenarios.
 
 use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
-use crate::actors::mysql as mysql_actor;
-use crate::actors::mysql_stream::{AsyncMysqlStream, MysqlStream};
+use crate::actors::sql::{
+    self, PendingStatement, SqlSession, StatementFailure, StatementResult, TrinoValue,
+};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::process_resources::{
     ProcessResourceMonitor, ProcessResourceSampler,
 };
@@ -43,10 +43,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 #[path = "query_concurrency_controls.rs"]
 mod concurrency_controls;
+#[path = "query_concurrency_trino.rs"]
+mod concurrency_trino;
 use concurrency_controls::{JoinedThread, created_for};
+use concurrency_trino::TierClient;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::sync::Barrier;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 const REQUIRED_BACKENDS: usize = 3;
 const TIERS: [usize; 3] = [16, 64, 256];
@@ -62,9 +65,8 @@ const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const QUERY_TIMEOUT_SECONDS: u64 = 5;
 const TERMINAL_TIMEOUT_SECONDS: u64 = 1;
 const REMOTE_CLEANUP_TIMEOUT_MS: u64 = 500;
-// This scenario must prove 256 logical MySQL roots, not allocate one OS
-// thread per root. Sixteen I/O workers keep the 256-socket fan-in making
-// progress while preserving a fixed, platform-safe harness bound.
+// One bounded async runtime drives every client through its first GET and
+// continuation pages while preserving the original sixteen-worker bound.
 const CLIENT_RUNTIME_THREADS: usize = 16;
 // `sleep` evaluates in the BE after the one-row source is distributed. It is
 // deliberately a one-row source so each of the three admitted drivers uses
@@ -85,7 +87,7 @@ struct QueryConcurrency;
 
 /// A compact, functional companion to the 16/64/256 fan-in measurement.
 ///
-/// It uses the same public MySQL and native 1FE+3BE path, but stops once the
+/// It uses the same public Trino and native 1FE+3BE path, but stops once the
 /// warehouse queue has been observed. This makes the single warehouse permit
 /// an independently runnable product acceptance case rather than an inferred
 /// property of the larger thread-growth experiment.
@@ -188,7 +190,7 @@ impl Scenario for TerminalReleasesSlot {
         let baseline_resources = query_resources(context)?;
         let creates = task_create_counts(context)?;
         let selected = self.intent.take(0)?;
-        let mut first = start_timed_hold(context, &selected)?;
+        let (first, observation) = start_timed_hold(context, &selected)?;
         let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
@@ -209,7 +211,7 @@ impl Scenario for TerminalReleasesSlot {
         })?;
         context.action("observed q2 in the sole warehouse admission queue");
 
-        assert_timeout_terminal(first.read_timeout_query_error()?, "q1")?;
+        assert_trino_timeout(first.finish(context)?, "q1")?;
         let state =
             await_frontend_state(context, "observe q1 terminal releases its slot", |state| {
                 state.workload.governance.admitted_queries == 1
@@ -224,15 +226,7 @@ impl Scenario for TerminalReleasesSlot {
             "received q1 terminal and observed q2 hold the released permit while q1 BE work remained live",
         );
 
-        let rows = second
-            .done
-            .recv_timeout(context.remaining("await q2 after q1 terminal")?)
-            .context("q2 did not start after q1 released the warehouse slot")??;
-        second
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("q2 actor panicked"))??;
-        ensure!(rows == vec![1], "q2 returned unexpected rows: {rows:?}");
+        assert_follow_up(&second.finish(context)??)?;
         ensure!(
             query_resources(context)? != baseline_resources,
             "q1 physical work ended before the scenario could prove the terminal/physical overlap"
@@ -247,6 +241,7 @@ impl Scenario for TerminalReleasesSlot {
         context.action(
             "q2 completed before q1's delayed Worker cleanup; restoring Native transport then converged real resources",
         );
+        drain_timed_hold(context, &observation)?;
         Ok(())
     }
 }
@@ -314,7 +309,7 @@ impl Scenario for RemoteCleanupRetires {
         let baseline_governance = frontend_state(context)?.workload.governance;
         let creates = task_create_counts(context)?;
         let selected = self.intent.take(0)?;
-        let mut stream = start_timed_hold(context, &selected)?;
+        let (query, observation) = start_timed_hold(context, &selected)?;
         let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
@@ -322,7 +317,7 @@ impl Scenario for RemoteCleanupRetires {
         pause_native(&proxy);
         let _restore_native = RestoreNative(proxy.clone());
         await_resource_activity(context, &baseline_resources)?;
-        assert_timeout_terminal(stream.read_timeout_query_error()?, "partitioned query")?;
+        assert_trino_timeout(query.finish(context)?, "partitioned query")?;
 
         let retired = await_frontend_state(
             context,
@@ -359,6 +354,7 @@ impl Scenario for RemoteCleanupRetires {
         context.action("completed a new query after finite FE retirement without replacing the unreachable endpoint");
 
         resume_native(&proxy);
+        drain_timed_hold(context, &observation)?;
         await_resource_convergence(context, &baseline_resources)
     }
 }
@@ -426,7 +422,7 @@ impl Scenario for LateParticipationLeaseExpiry {
         let baseline_governance = frontend_state(context)?.workload.governance;
         let creates = task_create_counts(context)?;
         let selected = self.intent.take(0)?;
-        let mut stream = start_timed_hold(context, &selected)?;
+        let (query, observation) = start_timed_hold(context, &selected)?;
         let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
@@ -434,7 +430,7 @@ impl Scenario for LateParticipationLeaseExpiry {
         pause_native(&proxy);
         let _restore_native = RestoreNative(proxy.clone());
         await_resource_activity(context, &baseline_resources)?;
-        assert_timeout_terminal(stream.read_timeout_query_error()?, "late-work query")?;
+        assert_trino_timeout(query.finish(context)?, "late-work query")?;
         await_frontend_state(
             context,
             "await FE retirement before lease expiry",
@@ -471,6 +467,7 @@ impl Scenario for LateParticipationLeaseExpiry {
         );
         execute_follow_up_query(context)?;
         context.action("restored delayed Native traffic and completed a fresh query without reviving the retired attempt");
+        drain_timed_hold(context, &observation)?;
         Ok(())
     }
 }
@@ -521,10 +518,12 @@ impl Scenario for QueryConcurrency {
             "{} requires native 1FE+3BE",
             context.name()
         );
-        let timeout = bounded_io_timeout(context, "connect concurrency control client")?;
         let mut control =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-        control.query_drop("SELECT 1")?;
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        ensure!(
+            sql::single_integer(&control.execute("SELECT 1")?)? == 1,
+            "invalid control query"
+        );
         let monitor = ProcessResourceMonitor::start_with_identities(
             context.process_resource_identities()?,
             context.name(),
@@ -534,9 +533,10 @@ impl Scenario for QueryConcurrency {
             let mut windows = Vec::with_capacity(TIERS.len());
             for tier in TIERS {
                 windows.push(run_tier(context, &monitor, tier)?);
-                control.query_drop("SELECT 1").with_context(|| {
-                    format!("prove control query remains live after tier {tier}")
-                })?;
+                ensure!(
+                    sql::single_integer(&control.execute("SELECT 1")?)? == 1,
+                    "control query did not return 1 after tier {tier}"
+                );
             }
             Ok::<_, anyhow::Error>(windows)
         })();
@@ -626,35 +626,36 @@ fn run_tier(
     let timeout = bounded_io_timeout(context, "connect held query clients")?;
     let runtime = bounded_client_runtime()?;
     let readers = runtime.block_on(start_held_query_readers(
-        context.mysql_user().to_owned(),
-        context.mysql_port(),
+        context.sql_user(),
+        context.trino_port(),
         timeout,
+        context.deadline(),
+        context.scenario_root().join(format!("tier-{tier}-http")),
         tier,
     ))?;
     let start_millis = monitor.elapsed_millis();
-    let observed = await_governance(context, tier, &readers)?;
-    assert_bounds(&observed, tier)?;
-    context.action(format!(
-        "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} result_window_positions={:?}",
-        observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.result_window_positions
-    ));
-    let outcomes = runtime.block_on(read_timeout_outcomes(readers))?;
+    let admission = await_governance(context, tier, &readers).and_then(|observed| {
+        assert_bounds(&observed, tier)?;
+        context.action(format!(
+            "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} result_window_positions={:?}",
+            observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.result_window_positions
+        ));
+        Ok(())
+    });
+    let outcomes = runtime.block_on(read_timeout_outcomes(readers));
     let mut terminal_failures = Vec::new();
-    for (index, (_connection, outcome)) in outcomes.iter().enumerate() {
-        match outcome {
-            Ok(error) if is_deadline_terminal(error) => {}
-            Ok(error) => terminal_failures.push(format!(
-                "client {index} returned a non-deadline terminal response: {error}"
-            )),
-            Err(error) => terminal_failures.push(format!(
-                "client {index} failed to read its deadline terminal: {error}"
-            )),
+    for (index, outcome) in outcomes.iter().enumerate() {
+        if let Err(error) = outcome {
+            terminal_failures.push(format!(
+                "client {index} did not observe a typed deadline terminal: {error:#}"
+            ));
         }
     }
+    if let Err(error) = admission {
+        terminal_failures.push(format!("exact admission failed: {error:#}"));
+    }
+
     if !terminal_failures.is_empty() {
-        // Retain every client socket until this diagnostic read. Dropping the
-        // sockets first would turn an absent deadline terminal into a client
-        // disconnect and conceal the FE owner state that must be investigated.
         let state = frontend_state(context)
             .map(|state| state.diagnostic())
             .unwrap_or_else(|error| format!("unavailable: {error:#}"));
@@ -687,69 +688,82 @@ fn bounded_client_runtime() -> Result<TokioRuntime> {
         .context("build bounded async concurrency client runtime")
 }
 
+type TierReader = JoinHandle<(TierClient, Result<()>)>;
+
 async fn start_held_query_readers(
-    user: String,
+    user: &str,
     port: u16,
     timeout: Duration,
+    deadline: Instant,
+    root: std::path::PathBuf,
     tier: usize,
-) -> Result<Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>> {
-    let mut connects = JoinSet::new();
-    for _ in 0..tier {
-        let user = user.clone();
-        connects.spawn(async move {
-            let mut connection = AsyncMysqlStream::connect(&user, port, timeout).await?;
-            connection
-                .send_query(&format!("SET query_timeout = {QUERY_TIMEOUT_SECONDS}"))
-                .await?;
-            connection.expect_ok_packet("SET query_timeout").await?;
-            Ok::<_, anyhow::Error>(connection)
-        });
+) -> Result<Vec<TierReader>> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(timeout)
+        .build()?;
+    let mut clients = Vec::with_capacity(tier);
+    // Per-client SET receipts are preparation. Complete them before the
+    // workload barrier so they do not add concurrent control roots to this
+    // fixture's exact query-root tier.
+    for index in 0..tier {
+        let mut actor = TierClient::new(
+            client.clone(),
+            port,
+            user.to_owned(),
+            timeout,
+            deadline,
+            root.join(format!("{index:03}")),
+        )?;
+        let result = actor.prepare(QUERY_TIMEOUT_SECONDS).await;
+        let result = settle_tier_actor(&mut actor, result).await;
+        super::paimon::scan_statement_actor::combine(result, actor.persist())?;
+        clients.push(actor);
     }
-    let mut connections = Vec::with_capacity(tier);
-    while let Some(result) = connects.join_next().await {
-        connections.push(result.context("concurrent held-query client task panicked")??);
-    }
-    ensure!(
-        connections.len() == tier,
-        "expected {tier} held-query clients, connected {}",
-        connections.len()
-    );
 
     let gate = Arc::new(Barrier::new(tier + 1));
-    let reads = connections
+    let reads = clients
         .into_iter()
-        .map(|mut connection| {
+        .map(|mut actor| {
             let gate = Arc::clone(&gate);
             tokio::spawn(async move {
                 gate.wait().await;
-                let outcome = async {
-                    connection.send_query(HELD_QUERY).await?;
-                    connection.read_timeout_query_error().await
-                }
-                .await;
-                (connection, outcome)
+                let result = actor.run_timeout(HELD_QUERY, QUERY_TIMEOUT_SECONDS).await;
+                let result = settle_tier_actor(&mut actor, result).await;
+                (actor, result)
             })
         })
         .collect();
-    // Keep the original actor's causality: every client starts receiving its
-    // statement terminal immediately after it sends the query. Waiting for
-    // every write to finish before creating readers can strand roots behind
-    // the FE control queue even though their deadline has elapsed.
     gate.wait().await;
     Ok(reads)
 }
 
-async fn read_timeout_outcomes(
-    reads: Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>,
-) -> Result<Vec<(AsyncMysqlStream, Result<String>)>> {
+async fn settle_tier_actor(actor: &mut TierClient, primary: Result<()>) -> Result<()> {
+    if primary.is_ok() {
+        return Ok(());
+    }
+    let cancelled = actor.cancel().await;
+    super::paimon::scan_statement_actor::combine(
+        primary,
+        super::paimon::scan_statement_actor::combine(cancelled, actor.persist()),
+    )
+}
+
+async fn read_timeout_outcomes(reads: Vec<TierReader>) -> Vec<Result<()>> {
     let mut outcomes = Vec::with_capacity(reads.len());
     for read in reads {
-        outcomes.push(
-            read.await
-                .context("concurrent held-query read task panicked")?,
-        );
+        outcomes.push(match read.await {
+            Ok((actor, result)) => {
+                super::paimon::scan_statement_actor::combine(result, actor.persist())
+            }
+            Err(error) => {
+                Err(anyhow::Error::new(error).context("concurrent Trino reader did not join"))
+            }
+        });
     }
-    Ok(outcomes)
+    outcomes
 }
 
 fn frontend_state(context: &mut ScenarioContext) -> Result<FrontendState> {
@@ -768,7 +782,7 @@ fn frontend_state(context: &mut ScenarioContext) -> Result<FrontendState> {
 fn await_governance(
     context: &mut ScenarioContext,
     tier: usize,
-    readers: &[JoinHandle<(AsyncMysqlStream, Result<String>)>],
+    readers: &[TierReader],
 ) -> Result<Governance> {
     let mut peak_active = 0;
     let mut peak_roots = 0;
@@ -1077,76 +1091,163 @@ impl Drop for RestoreNative {
 fn start_timed_hold(
     context: &mut ScenarioContext,
     selected: &SelectedStatement,
-) -> Result<MysqlStream> {
-    let mut stream = MysqlStream::connect(
-        context.mysql_user(),
-        context.mysql_port(),
-        bounded_io_timeout(context, "connect timed hold client")?,
-    )?;
-    stream.send_query(&format!("SET query_timeout = {TERMINAL_TIMEOUT_SECONDS}"))?;
-    stream.expect_ok_packet("SET query_timeout for timed hold")?;
-    selected.arm(context, stream.connection_id()?, HELD_QUERY)?;
-    stream.send_query(HELD_QUERY)?;
-    Ok(stream)
-}
-
-struct PendingFollowUpQuery {
-    thread: JoinedThread<Result<()>>,
-    done: mpsc::Receiver<Result<Vec<i64>>>,
-}
-
-fn start_follow_up_query(context: &ScenarioContext) -> Result<PendingFollowUpQuery> {
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
+) -> Result<(
+    PendingConcurrencyQuery,
+    novarocks_cluster_harness::QueryLifecycleStatementObservation,
+)> {
     let deadline = context.deadline();
-    let thread = thread::Builder::new()
-        .name("query-concurrency-follow-up".to_string())
-        .spawn(move || -> Result<()> {
-            mysql_actor::connect_until(&user, port, deadline)?.run(|connection| {
-                let rows = connection
-                    .query("SELECT sleep(1) FROM TABLE(generate_series(1, 1))")
-                    .context("run q2 after q1 terminal")?;
-                done_tx.send(Ok(rows)).context("publish q2 rows")
-            })
-        })
-        .context("start q2 waiting client")?;
-    Ok(PendingFollowUpQuery {
-        thread: JoinedThread::new(thread),
-        done,
-    })
+    let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let completion = session.execute(format!("SET query_timeout = {TERMINAL_TIMEOUT_SECONDS}"))?;
+    ensure!(
+        completion.update_type.as_deref() == Some("SET SESSION")
+            && completion.update_count.is_none()
+            && completion.columns.is_empty()
+            && completion.rows.is_empty()
+            && session
+                .session()
+                .properties
+                .get("query_timeout")
+                .is_some_and(|value| value == &TERMINAL_TIMEOUT_SECONDS.to_string(),),
+        "timed hold omitted its exact query_timeout SessionEffect"
+    );
+    let pending = session.submit(HELD_QUERY)?;
+    let (pending, observation) = selected.arm_pending(context, pending, HELD_QUERY)?;
+    Ok((
+        PendingConcurrencyQuery::start(session, pending, deadline)?,
+        observation,
+    ))
+}
+
+fn drain_timed_hold(
+    context: &mut ScenarioContext,
+    observation: &novarocks_cluster_harness::QueryLifecycleStatementObservation,
+) -> Result<()> {
+    let deadline = context.deadline();
+    context
+        .handle()
+        .drain_query_lifecycle_statement_binding(observation, deadline)
+}
+
+type QueryResponse = std::result::Result<StatementResult, StatementFailure>;
+
+struct PendingConcurrencyQuery {
+    thread: Option<JoinedThread<Result<()>>>,
+    done: mpsc::Receiver<QueryResponse>,
+    cancel: novarocks_test_trino_client::CancelHandle,
+    deadline: Instant,
+}
+
+impl PendingConcurrencyQuery {
+    fn start(
+        mut session: SqlSession,
+        pending: PendingStatement,
+        deadline: Instant,
+    ) -> Result<Self> {
+        use super::paimon::scan_statement_actor::combine;
+
+        let cancel = pending.cancel_handle();
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("query-concurrency-trino".to_owned())
+            .spawn(move || -> Result<()> {
+                match done_tx.send(session.run_pending(pending)) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::SendError(Err(error))) => Err(error.into()),
+                    Err(mpsc::SendError(Ok(_))) => bail!("Trino result receiver closed"),
+                }
+            });
+        match worker {
+            Ok(worker) => Ok(Self {
+                thread: Some(JoinedThread::new(worker)),
+                done,
+                cancel,
+                deadline,
+            }),
+            Err(error) => combine(
+                Err(error.into()),
+                cancel.delete(deadline).map_err(Into::into),
+            ),
+        }
+    }
+
+    fn finish(mut self, context: &ScenarioContext) -> Result<QueryResponse> {
+        use super::paimon::scan_statement_actor::combine;
+
+        let received = self
+            .done
+            .recv_timeout(context.remaining("await original Trino query")?)
+            .context("original Trino query did not return a result");
+        let cancelled = if !matches!(&received, Ok(Ok(_) | Err(StatementFailure::Trino(_)))) {
+            self.cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
+        combine(received, combine(cancelled, self.join()))
+    }
+
+    fn join(&mut self) -> Result<()> {
+        self.thread
+            .take()
+            .expect("Trino query thread exists")
+            .join()
+            .map_err(|_| anyhow::anyhow!("Trino query actor panicked"))?
+    }
+}
+
+impl Drop for PendingConcurrencyQuery {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            if let Err(error) = self.cancel.delete(self.deadline) {
+                eprintln!("Cancel original concurrency query failed: {error}");
+            }
+            if let Err(error) = self.join() {
+                eprintln!("Join original concurrency query failed: {error:#}");
+            }
+        }
+    }
+}
+
+const FOLLOW_UP_QUERY: &str = "SELECT sleep(1) FROM TABLE(generate_series(1, 1))";
+
+fn start_follow_up_query(context: &ScenarioContext) -> Result<PendingConcurrencyQuery> {
+    let deadline = context.deadline();
+    let session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let pending = session.submit(FOLLOW_UP_QUERY)?;
+    PendingConcurrencyQuery::start(session, pending, deadline)
 }
 
 fn execute_follow_up_query(context: &ScenarioContext) -> Result<()> {
-    let mut connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    let rows: Vec<i64> = connection
-        .query("SELECT sleep(1) FROM TABLE(generate_series(1, 1))")
-        .context("run post-retirement distributed query")?;
-    ensure!(
-        rows == vec![1],
-        "post-retirement query returned unexpected rows: {rows:?}"
-    );
-    connection.finish()?;
-    Ok(())
+    assert_follow_up(&start_follow_up_query(context)?.finish(context)??)
 }
 
-fn assert_timeout_terminal(error: String, query: &str) -> Result<()> {
+fn assert_follow_up(result: &StatementResult) -> Result<()> {
     ensure!(
-        is_deadline_terminal(&error),
-        "{query} returned an unexpected terminal instead of timeout: {error}"
+        result.is_result_set()
+            && result.columns.len() == 1
+            && result.columns[0].type_signature.raw_type == "boolean"
+            && result.columns[0].type_signature.arguments.is_empty()
+            && result.rows == [vec![TrinoValue::Boolean(true)]],
+        "follow-up query returned unexpected typed result: {result:?}"
     );
     Ok(())
 }
 
-fn is_deadline_terminal(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("timed out")
-        || normalized.contains("timeout")
-        || normalized.contains("deadline")
+fn assert_trino_timeout(response: QueryResponse, query: &str) -> Result<()> {
+    match response {
+        Err(StatementFailure::Trino(error))
+            if error.error_code == 131075
+                && error.error_name == "EXCEEDED_TIME_LIMIT"
+                && error.error_type == "INSUFFICIENT_RESOURCES" =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "{query} returned an unexpected terminal instead of timeout"
+        ))),
+        Ok(result) => bail!("{query} completed instead of timing out: {result:?}"),
+    }
 }
 
 fn await_frontend_state(

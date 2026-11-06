@@ -16,12 +16,14 @@
 // under the License.
 
 //! Finite connector statements and their original per-phase observation needs.
-use super::{ConnectorRead, IdleMysqlConnection};
-use crate::actors::mysql as mysql_actor;
+use super::{
+    ConnectorRead, ConnectorSqlOutcome, connector_bigint_rows, connector_integer_rows,
+    connector_sql_outcome, publish_connector_result, run_original_connector_pending,
+};
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult};
 use crate::scenario::ScenarioContext;
 use crate::scenarios::native_sql_controls::SelectedStatement;
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::{FromRow, Queryable};
 use novarocks_cluster_harness::{
     QueryLifecycleStatementObservation, TestClusterOwner,
     test_sessions::{ClusterTestSessionPlan, RoleLaunchReference, RoleSlot},
@@ -534,15 +536,15 @@ fn materialized_inserts(
 pub(super) fn observed_fixture(
     context: &mut ScenarioContext,
     owner: &Owner,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     table: &str,
     warehouse: &Path,
 ) -> Result<()> {
     super::create_catalog(control, catalog, warehouse)?;
-    control.query_drop(format!("CREATE DATABASE {catalog}.{database}"))?;
-    control.query_drop(format!(
+    control.execute(format!("CREATE DATABASE {catalog}.{database}"))?;
+    control.execute(format!(
         "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
     ))?;
     for (index, range) in ["1, 100000", "100001, 200000", "200001, 300000"]
@@ -566,76 +568,68 @@ pub(super) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(primary), Err(cleanup)) => {
-            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
+            Err(primary.context(format!("cleanup failed: {cleanup:#}")))
         }
     }
 }
-pub(super) fn outcome<T: FromRow>(
+pub(super) fn outcome(
     context: &mut ScenarioContext,
     selected: &Selected,
-    conn: &mut mysql::Conn,
+    conn: &mut SqlSession,
     sql: &str,
-) -> Result<std::result::Result<Vec<T>, mysql::Error>> {
-    let observation = selected.statement.arm(context, conn.connection_id(), sql)?;
-    let result = conn.query(sql);
-    let fence = public_error_successor_fence(conn, &result);
+) -> Result<std::result::Result<StatementResult, StatementFailure>> {
+    let pending = conn.submit(sql)?;
+    let (pending, observation) = selected.statement.arm_pending(context, pending, sql)?;
+    let result = run_original_connector_pending(conn, pending, selected.statement.deadline);
+    let fence = match &result {
+        Ok(result) => public_error_successor_fence(conn, result, selected.statement.deadline),
+        Err(_) => Ok(()),
+    };
     let observed = settle_statement_observation(
         context,
         &observation,
-        result.is_ok(),
+        matches!(&result, Ok(Ok(_))),
         selected.statement.deadline,
     );
     let cleanup = with_cleanup(fence, observed);
-    if let Err(cleanup) = cleanup {
-        return match result {
-            Ok(_) => Err(cleanup.context("connector SQL succeeded but cleanup failed")),
-            Err(sql_error) => Err(anyhow::Error::from(sql_error)
-                .context(format!("connector SQL failed; cleanup failed: {cleanup:#}"))),
-        };
+    match result {
+        Ok(result) => match cleanup {
+            Ok(()) => Ok(result),
+            Err(cleanup) => match result {
+                Ok(_) => Err(cleanup.context("connector SQL succeeded but cleanup failed")),
+                Err(primary) => Err(anyhow::Error::new(primary)
+                    .context(format!("connector cleanup failed: {cleanup:#}"))),
+            },
+        },
+        Err(primary) => with_cleanup(Err(primary), cleanup),
     }
-    Ok(result)
 }
-pub(super) fn query<T: FromRow>(
+pub(super) fn query(
     context: &mut ScenarioContext,
     selected: &Selected,
-    conn: &mut mysql::Conn,
+    conn: &mut SqlSession,
     sql: &str,
-) -> Result<Vec<T>> {
+) -> Result<StatementResult> {
     outcome(context, selected, conn, sql)?.map_err(anyhow::Error::from)
 }
 pub(super) fn execute(
     context: &mut ScenarioContext,
     selected: &Selected,
-    conn: &mut mysql::Conn,
+    conn: &mut SqlSession,
     sql: &str,
 ) -> Result<()> {
-    let observation = selected.statement.arm(context, conn.connection_id(), sql)?;
-    let result = conn.query_drop(sql);
-    let fence = public_error_successor_fence(conn, &result);
-    let observed = settle_statement_observation(
-        context,
-        &observation,
-        result.is_ok(),
-        selected.statement.deadline,
-    );
-    with_cleanup(
-        result.map_err(anyhow::Error::from),
-        with_cleanup(fence, observed),
-    )
+    query(context, selected, conn, sql).map(|_| ())
 }
-
 fn public_error_successor_fence<T>(
-    conn: &mut mysql::Conn,
-    result: &mysql::Result<T>,
+    conn: &mut SqlSession,
+    result: &std::result::Result<T, StatementFailure>,
+    deadline: Instant,
 ) -> Result<()> {
-    if !matches!(result, Err(mysql::Error::MySqlError(_))) {
+    if !matches!(result, Err(StatementFailure::Trino(_))) {
         return Ok(());
     }
-    // The caller retains the original deadline watchdog on this connection.
-    // A successful successor proves FE statement-generation reuse, not BE exit.
-    let rows: Vec<i64> = conn
-        .query("SELECT 1")
-        .context("execute connector successor after public SQL error")?;
+    let pending = conn.submit("SELECT 1")?;
+    let rows = connector_integer_rows(run_original_connector_pending(conn, pending, deadline)??)?;
     ensure!(
         rows == [1],
         "connector successor after public SQL error returned {rows:?}, expected [1]"
@@ -656,7 +650,7 @@ fn settle_statement_observation(
             .map(|_| ());
         let drained = context
             .handle()
-            .drain_query_lifecycle_statement_observation(observation);
+            .drain_query_lifecycle_statement_binding(observation, deadline);
         with_cleanup(observed, drained)
     } else {
         // A failed attempt may have no release-contribution snapshot. This only
@@ -667,7 +661,9 @@ fn settle_statement_observation(
     }
 }
 
-fn pending_query_error<T>(result: &mpsc::Receiver<mysql::Result<T>>) -> Result<()> {
+fn pending_query_error<T>(
+    result: &mpsc::Receiver<std::result::Result<T, StatementFailure>>,
+) -> Result<()> {
     match result.try_recv() {
         Ok(Err(error)) => Err(error.into()),
         Ok(Ok(_)) | Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => Ok(()),
@@ -676,10 +672,12 @@ fn pending_query_error<T>(result: &mpsc::Receiver<mysql::Result<T>>) -> Result<(
 
 pub(super) struct Reader {
     pub read: ConnectorRead,
-    pub connection_id: u32,
+    pub client_query_id: String,
+    pub cancel: novarocks_test_trino_client::CancelHandle,
     observation: QueryLifecycleStatementObservation,
     selected: Selected,
-    query_succeeded: Arc<AtomicBool>,
+    query_outcome: Arc<Mutex<Option<ConnectorSqlOutcome>>>,
+    skip_retired_socket_probe: Arc<AtomicBool>,
 }
 impl Reader {
     pub fn start(
@@ -689,54 +687,70 @@ impl Reader {
         port: u16,
         dop: Option<NonZeroU32>,
     ) -> Result<Self> {
-        let mut conn = mysql_actor::connect_for_cancellation_until(user, port, context.deadline())?;
-        let id = conn.connection_id();
-        let prepared = (|| {
-            if let Some(dop) = dop {
-                conn.query_drop(format!("SET pipeline_dop = {}", dop.get()))?;
-            }
-            selected.statement.arm(context, id, &selected.statement.sql)
-        })();
-        let observation = match prepared {
-            Ok(observation) => observation,
-            Err(error) => return with_cleanup(Err(error), conn.finish()),
-        };
-        let deadline = selected.statement.deadline;
-        let sql = selected.statement.sql.clone();
+        let deadline = context.deadline();
+        let mut conn = SqlSession::new(user, port, deadline)?;
+        if let Some(dop) = dop {
+            conn.execute(format!("SET pipeline_dop = {}", dop.get()))?;
+        }
+        let pending = conn.submit(&selected.statement.sql)?;
+        let id = pending.query_id.clone();
+        let cancel = pending.cancel_handle();
+        let (pending, observation) =
+            selected
+                .statement
+                .arm_pending(context, pending, &selected.statement.sql)?;
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let (done_tx, done) = mpsc::sync_channel(1);
         let (probe, probe_rx) = mpsc::sync_channel(1);
         let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::channel();
-        let query_succeeded = Arc::new(AtomicBool::new(false));
-        let worker_query_succeeded = Arc::clone(&query_succeeded);
+        let query_outcome = Arc::new(Mutex::new(None));
+        let saved = query_outcome.clone();
+        let skip_retired_socket_probe = Arc::new(AtomicBool::new(false));
+        let worker_skip_probe = skip_retired_socket_probe.clone();
+        let worker_id = id.clone();
         let worker = thread::Builder::new()
             .name("connector-selected-reader".into())
             .spawn(move || {
-                let phase = (|| -> Result<()> {
-                    ready_tx
-                        .send(id)
-                        .context("publish selected connector reader connection")?;
-                    let result = conn.query::<i64, _>(sql);
-                    // The phase may consume the result, so retain its actual SQL
-                    // classification independently until this actor is joined.
-                    worker_query_succeeded.store(result.is_ok(), Ordering::Release);
-                    mysql_actor::publish_result(&done_tx, result)
-                        .context("publish selected connector reader result")?;
-                    probe_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .context("receive selected connector probe")?;
-                    mysql_actor::publish_result(
-                        &probe_result_tx,
-                        conn.query_first::<i64, _>("SELECT 1"),
-                    )
-                    .context("publish selected connector probe")?;
-                    release_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .context("release selected connector reader")?;
-                    Ok(())
-                })();
-                with_cleanup(phase, conn.finish())
+                ready_tx
+                    .send(worker_id)
+                    .context("publish selected connector actual client query")?;
+                let result = conn.run_pending(pending);
+                *saved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(connector_sql_outcome(&result));
+                publish_connector_result(&done_tx, result.and_then(connector_bigint_rows))
+                    .context("publish selected connector reader result")?;
+                probe_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .context("receive selected connector probe")?;
+                // The original parent explicitly retires this carrier-only
+                // socket probe after FE exit or when the scenario has retired
+                // the socket assertion. Waking this stage supplies no query
+                // completion or physical exit; the actor still releases/joins.
+                if !worker_skip_probe.load(Ordering::Acquire) {
+                    let probe_result = match conn.submit("SELECT 1") {
+                        Ok(pending) => run_original_connector_pending(
+                            &mut conn, pending, deadline,
+                        )?
+                        .and_then(|result| {
+                            connector_integer_rows(result).and_then(|rows| match rows.as_slice() {
+                                [value] => Ok(Some(*value)),
+                                _ => Err(StatementFailure::Protocol(format!(
+                                    "connector probe expected one integer row: {rows:?}"
+                                ))),
+                            })
+                        }),
+                        Err(error) => Err(error),
+                    };
+                    publish_connector_result(&probe_result_tx, probe_result)
+                        .context("publish selected connector probe")?;
+                }
+                release_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .context("release selected connector reader")?;
+                Ok(())
             });
         match worker {
             Ok(thread) => Ok(Self {
@@ -748,17 +762,20 @@ impl Reader {
                     release,
                     thread,
                 },
-                connection_id: id,
+                client_query_id: id,
+                cancel,
                 observation,
                 selected: selected.clone(),
-                query_succeeded,
+                query_outcome,
+                skip_retired_socket_probe,
             }),
-            Err(error) => with_cleanup(
-                Err(error.into()),
-                context
+            Err(primary) => {
+                let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
+                let drained = context
                     .handle()
-                    .drain_query_lifecycle_statement_observation(&observation),
-            ),
+                    .drain_query_lifecycle_statement_binding(&observation, deadline);
+                with_cleanup(Err(primary.into()), with_cleanup(cancelled, drained))
+            }
         }
     }
     pub fn start_with_hold(
@@ -767,49 +784,75 @@ impl Reader {
         user: &str,
         port: u16,
     ) -> Result<Self> {
-        let started = Self::start(context, selected, user, port, None);
-        match started {
+        match Self::start(context, selected, user, port, None) {
             Ok(reader) => Ok(reader),
-            Err(error) => with_cleanup(Err(error), selected.release(HOLD)),
+            Err(primary) => with_cleanup(Err(primary), selected.release(HOLD)),
         }
     }
     pub fn finish_after<T>(
         self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
+        _control: &mut SqlSession,
         phase: Result<T>,
     ) -> Result<T> {
-        self.finish_inner(context, control, phase, false)
+        self.finish_inner(context, phase, false, false)
     }
-    /// Call only after restart_fe_until proved the old role/session exited.
+    /// Call only after the original restart owner proved the old FE physically exited.
     pub fn finish_after_fe_exit<T>(
         self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
+        _control: &mut SqlSession,
         phase: Result<T>,
     ) -> Result<T> {
-        self.finish_inner(context, control, phase, true)
+        self.finish_inner(context, phase, true, true)
+    }
+    /// The HTTP cancellation scene has retired the old socket assertion.
+    /// Close that original actor stage explicitly before consuming its Join.
+    pub fn finish_after_retiring_socket_probe<T>(
+        self,
+        context: &mut ScenarioContext,
+        phase: Result<T>,
+    ) -> Result<T> {
+        self.finish_inner(context, phase, false, true)
     }
     fn finish_inner<T>(
         self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
         phase: Result<T>,
         fe_exited: bool,
+        retire_socket_probe: bool,
     ) -> Result<T> {
-        let interrupted = if phase.is_err() && !self.read.thread.is_finished() && !fe_exited {
-            control
-                .query_drop(format!("KILL QUERY {}", self.connection_id))
-                .context("cancel owned selected connector reader")
+        let before = *self
+            .query_outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut attempted_cancel = false;
+        let mut interrupted = if !fe_exited
+            && phase.is_err()
+            && !matches!(
+                before,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            ) {
+            attempted_cancel = true;
+            self.cancel
+                .delete(self.selected.statement.deadline)
+                .map_err(anyhow::Error::from)
         } else {
             Ok(())
         };
+        if interrupted.is_err() {
+            interrupted = with_cleanup(interrupted, context.shutdown());
+        }
         let released = if phase.is_err() {
             self.selected.release(HOLD)
         } else {
             Ok(())
         };
-        if phase.is_err() {
+        if retire_socket_probe {
+            self.skip_retired_socket_probe
+                .store(true, Ordering::Release);
+        }
+        if phase.is_err() || retire_socket_probe {
             let _ = self.read.probe.try_send(());
             let _ = self.read.release.send(());
         }
@@ -819,19 +862,42 @@ impl Reader {
             .join()
             .map_err(|_| anyhow::anyhow!("selected connector reader panicked"))
             .and_then(|result| result);
+        let after = *self
+            .query_outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !fe_exited
+            && !attempted_cancel
+            && !matches!(
+                after,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            )
+        {
+            let cancelled = self
+                .cancel
+                .delete(self.selected.statement.deadline)
+                .map_err(anyhow::Error::from);
+            interrupted = with_cleanup(
+                interrupted,
+                if cancelled.is_err() {
+                    with_cleanup(cancelled, context.shutdown())
+                } else {
+                    cancelled
+                },
+            );
+        }
         let pending = with_cleanup(
             pending_query_error(&self.read.done),
             pending_query_error(&self.read.probe_result),
         );
-        let cleanup = if fe_exited {
+        let observed = if fe_exited {
             Ok(())
         } else {
-            let deadline = context.deadline();
             settle_statement_observation(
                 context,
                 &self.observation,
-                self.query_succeeded.load(Ordering::Acquire),
-                deadline,
+                after == Some(ConnectorSqlOutcome::Success),
+                self.selected.statement.deadline,
             )
         };
         with_cleanup(
@@ -842,66 +908,8 @@ impl Reader {
                 ),
                 pending,
             ),
-            cleanup,
+            observed,
         )
-    }
-}
-
-pub(super) struct Idle {
-    pub client: IdleMysqlConnection,
-    id: u32,
-}
-impl Idle {
-    pub fn start(context: &ScenarioContext, user: &str, port: u16) -> Result<Self> {
-        let mut conn = mysql_actor::connect_until(user, port, context.deadline())?;
-        let id = conn.connection_id();
-        let deadline = context.deadline();
-        let (ready_tx, ready) = mpsc::sync_channel(1);
-        let (probe, probe_rx) = mpsc::sync_channel(1);
-        let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name("connector-idle-client".into())
-            .spawn(move || {
-                let phase = (|| -> Result<()> {
-                    ready_tx.send(id).context("publish idle connector client")?;
-                    probe_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .context("receive idle connector probe")?;
-                    probe_result_tx
-                        .send(conn.query_first::<i64, _>("SELECT 1"))
-                        .context("publish idle connector result")?;
-                    Ok(())
-                })();
-                with_cleanup(phase, conn.finish())
-            })?;
-        Ok(Self {
-            client: IdleMysqlConnection {
-                ready,
-                probe,
-                probe_result,
-                thread,
-            },
-            id,
-        })
-    }
-    pub fn finish_after(self, control: &mut mysql::Conn, phase: Result<()>) -> Result<()> {
-        let killed = if phase.is_err() && !self.client.thread.is_finished() {
-            control
-                .query_drop(format!("KILL {}", self.id))
-                .context("close idle connector client")
-        } else {
-            Ok(())
-        };
-        if phase.is_err() {
-            let _ = self.client.probe.try_send(());
-        }
-        let joined = self
-            .client
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("idle connector client panicked"))
-            .and_then(|result| result);
-        with_cleanup(with_cleanup(phase, killed), joined)
     }
 }
 
@@ -949,20 +957,22 @@ mod tests {
 
     #[test]
     fn joined_reader_preserves_pending_query_and_probe_failures() {
-        let (done_tx, done) = mpsc::sync_channel::<mysql::Result<Vec<i64>>>(1);
-        let (probe_tx, probe) = mpsc::sync_channel::<mysql::Result<Option<i64>>>(1);
+        let (done_tx, done) =
+            mpsc::sync_channel::<std::result::Result<Vec<i64>, StatementFailure>>(1);
+        let (probe_tx, probe) =
+            mpsc::sync_channel::<std::result::Result<Option<i64>, StatementFailure>>(1);
         let actor = thread::spawn(move || -> Result<()> {
-            mysql_actor::publish_result(
+            publish_connector_result(
                 &done_tx,
-                Err(mysql::Error::from(std::io::Error::other(
-                    "pending reader SQL failure",
-                ))),
+                Err(StatementFailure::Transport(
+                    "pending reader SQL failure".into(),
+                )),
             )?;
-            mysql_actor::publish_result(
+            publish_connector_result(
                 &probe_tx,
-                Err(mysql::Error::from(std::io::Error::other(
-                    "pending reader probe failure",
-                ))),
+                Err(StatementFailure::Transport(
+                    "pending reader probe failure".into(),
+                )),
             )?;
             Err(anyhow::anyhow!("reader socket cleanup failure"))
         });

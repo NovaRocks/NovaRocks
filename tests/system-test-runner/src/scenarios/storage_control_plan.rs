@@ -17,12 +17,13 @@
 
 //! Storage consumers declare one exact authority intent before role startup.
 use super::{
-    ConnectorRead, VENDED_EXECUTION_CREDENTIAL_GENERATION, VENDED_EXECUTION_CREDENTIAL_NAME,
+    ConnectorRead, ConnectorSqlOutcome, VENDED_EXECUTION_CREDENTIAL_GENERATION,
+    VENDED_EXECUTION_CREDENTIAL_NAME, connector_bigint_rows, connector_integer_rows,
+    connector_sql_outcome, publish_connector_result, run_original_connector_pending,
 };
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementFailure};
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_failpoint::session::DomainGrant;
@@ -31,7 +32,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -360,14 +361,7 @@ fn record(
 }
 
 pub(super) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
-    match (primary, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => {
-            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
-        }
-    }
+    crate::scenarios::paimon::scan_statement_actor::combine(primary, cleanup)
 }
 fn exact_sql(inputs: &Inputs, token: &str, sql: &str) -> Result<()> {
     ensure!(
@@ -379,56 +373,77 @@ fn exact_sql(inputs: &Inputs, token: &str, sql: &str) -> Result<()> {
     );
     Ok(())
 }
-pub(super) fn outcome<T: mysql::prelude::FromRow>(
+fn arm_original_pending(
     context: &mut ScenarioContext,
-    inputs: &Inputs,
-    conn: &mut mysql::Conn,
     token: &str,
     sql: &str,
-) -> Result<std::result::Result<Vec<T>, mysql::Error>> {
-    exact_sql(inputs, token, sql)?;
+    pending: novarocks_test_trino_client::PendingStatement,
+) -> Result<(
+    novarocks_test_trino_client::PendingStatement,
+    QueryLifecycleStatementObservation,
+)> {
+    let cancel = pending.cancel_handle();
     let deadline = context.deadline();
-    let observation = context.handle().arm_selected_statement_observation(
-        token,
-        conn.connection_id(),
-        sql,
-        deadline,
-    )?;
-    let result = conn.query(sql);
-    if let Err(cleanup) = context
+    match context
         .handle()
-        .drain_query_lifecycle_statement_observation(&observation)
-    {
-        let outcome = result
-            .as_ref()
-            .err()
-            .map_or_else(|| "success".to_string(), ToString::to_string);
-        bail!("statement outcome: {outcome}; drain failed: {cleanup:#}");
+        .arm_selected_statement_observation_for_client_query(
+            token,
+            &pending.query_id,
+            sql,
+            deadline,
+        ) {
+        Ok(observation) => Ok((pending, observation)),
+        Err(primary) => with_cleanup(
+            Err(primary),
+            cancel.delete(deadline).map_err(anyhow::Error::from),
+        ),
     }
-    Ok(result)
 }
-/// The original SQL result and its exact owner-authored terminal, observed
-/// before the same observation is drained. This value grants no control.
-pub(super) struct ObservedStorageOutcome<T> {
-    pub result: mysql::Result<Vec<T>>,
+pub(super) fn outcome(
+    context: &mut ScenarioContext,
+    inputs: &Inputs,
+    conn: &mut SqlSession,
+    token: &str,
+    sql: &str,
+) -> Result<std::result::Result<Vec<i64>, StatementFailure>> {
+    exact_sql(inputs, token, sql)?;
+    let pending = conn.submit(sql)?;
+    let (pending, observation) = arm_original_pending(context, token, sql, pending)?;
+    let result = run_original_connector_pending(conn, pending, context.deadline());
+    let drained = {
+        let original_deadline = context.deadline();
+        context
+            .handle()
+            .drain_query_lifecycle_statement_binding(&observation, original_deadline)
+    };
+    match result {
+        Ok(result) => match (result, drained) {
+            (result, Ok(())) => Ok(result.and_then(connector_bigint_rows)),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(anyhow::Error::new(primary)
+                .context(format!("Storage observation drain failed: {cleanup:#}"))),
+        },
+        Err(primary) => with_cleanup(Err(primary), drained),
+    }
+}
+/// Original typed SQL response and the same observation's actual terminal.
+pub(super) struct ObservedStorageOutcome {
+    pub result: std::result::Result<Vec<i64>, StatementFailure>,
     pub snapshot: novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
 }
-
-/// A SQL error consumed by a case remains diagnostic input when its new
-/// observation or semantic assertion fails. Expected SQL failure alone does
-/// not turn an otherwise successful case into failure.
-fn with_original_sql_failure<T>(
-    original_sql_failure: &mysql::Error,
-    outcome: Result<T>,
-) -> Result<T> {
-    outcome.with_context(|| format!("original Storage SQL failed: {original_sql_failure}"))
+fn with_original_sql_failure<T>(original: &StatementFailure, outcome: Result<T>) -> Result<T> {
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(observed) => Err(anyhow::Error::new(original.clone()).context(format!(
+            "Storage observation/assertion failed: {observed:#}"
+        ))),
+    }
 }
-
-fn finish_observed_outcome<T>(
-    result: mysql::Result<Vec<T>>,
+fn finish_observed_outcome(
+    result: std::result::Result<Vec<i64>, StatementFailure>,
     snapshot: Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
     drained: Result<()>,
-) -> Result<ObservedStorageOutcome<T>> {
+) -> Result<ObservedStorageOutcome> {
     let snapshot = with_cleanup(snapshot, drained);
     let snapshot = match &result {
         Ok(_) => snapshot.context("original Storage SQL succeeded"),
@@ -436,37 +451,37 @@ fn finish_observed_outcome<T>(
     }?;
     Ok(ObservedStorageOutcome { result, snapshot })
 }
-
-pub(super) fn observed_outcome<T: mysql::prelude::FromRow>(
+pub(super) fn observed_outcome(
     context: &mut ScenarioContext,
     inputs: &Inputs,
-    conn: &mut mysql::Conn,
+    conn: &mut SqlSession,
     token: &str,
     sql: &str,
-) -> Result<ObservedStorageOutcome<T>> {
+) -> Result<ObservedStorageOutcome> {
     exact_sql(inputs, token, sql)?;
+    let pending = conn.submit(sql)?;
+    let (pending, observation) = arm_original_pending(context, token, sql, pending)?;
+    let result = run_original_connector_pending(conn, pending, context.deadline());
     let deadline = context.deadline();
-    let observation = context.handle().arm_selected_statement_observation(
-        token,
-        conn.connection_id(),
-        sql,
-        deadline,
-    )?;
-    let result = conn.query(sql);
     let snapshot = context
         .handle()
         .await_query_lifecycle_statement_observation(&observation, false, deadline);
     let drained = context
         .handle()
-        .drain_query_lifecycle_statement_observation(&observation);
-    finish_observed_outcome(result, snapshot, drained)
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    match result {
+        Ok(result) => {
+            finish_observed_outcome(result.and_then(connector_bigint_rows), snapshot, drained)
+        }
+        Err(primary) => with_cleanup(Err(primary), with_cleanup(snapshot.map(|_| ()), drained)),
+    }
 }
 
 pub(super) fn assert_acquisition_failure(
     context: &mut ScenarioContext,
     snapshot: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
     code: u16,
-    original_sql_failure: &mysql::Error,
+    original_sql_failure: &StatementFailure,
 ) -> Result<()> {
     let asserted = (|| {
         check_acquisition_failure(context, snapshot, code)?;
@@ -474,10 +489,10 @@ pub(super) fn assert_acquisition_failure(
             .failure_detail
             .as_deref()
             .context("Storage acquisition failure omitted its original safe detail")?;
-        let server = check_acquisition_mysql_error(original_sql_failure, detail)?;
+        let server = check_acquisition_sql_error(original_sql_failure, detail)?;
         context.action(format!(
-            "observed original acquisition MySQL error code={} state={} descriptor=query.execution.dependency",
-            server.code, server.state
+            "observed original acquisition SQL error code={} name={} type={} descriptor=query.execution.dependency",
+            server.error_code, server.error_name, server.error_type
         ));
         Ok(())
     })();
@@ -487,23 +502,23 @@ pub(super) fn assert_acquisition_failure(
 /// Cross-check the original server packet against the same statement's
 /// owner-authored safe detail. A client transport failure proves no server
 /// failure descriptor, even if an independent Native terminal was observed.
-fn check_acquisition_mysql_error<'a>(
-    error: &'a mysql::Error,
+fn check_acquisition_sql_error<'a>(
+    error: &'a StatementFailure,
     safe_detail: &str,
-) -> Result<&'a mysql::MySqlError> {
-    let mysql::Error::MySqlError(server) = error else {
-        bail!("Storage acquisition failure did not return an original MySQL server error: {error}");
+) -> Result<&'a novarocks_test_trino_client::TrinoError> {
+    let StatementFailure::Trino(server) = error else {
+        bail!("Storage acquisition failure did not return an original Trino server error: {error}");
     };
     ensure!(
-        server.code == 1105 && server.state == "HY000",
-        "Storage acquisition failure changed its MySQL code/state: code={} state={}",
-        server.code,
-        server.state
+        server.error_code == 65542
+            && server.error_name == "REMOTE_TASK_ERROR"
+            && server.error_type == "INTERNAL_ERROR",
+        "Storage acquisition failure changed its exact SQL error identity: {server:?}"
     );
     let expected = format!("[query.execution.dependency] {safe_detail}");
     ensure!(
         server.message == expected,
-        "Storage acquisition MySQL message differs from its original safe projection: expected={expected:?} observed={:?}",
+        "Storage acquisition SQL message differs from its original safe projection: expected={expected:?} observed={:?}",
         server.message
     );
     Ok(server)
@@ -562,21 +577,23 @@ fn check_acquisition_failure(
     Ok(())
 }
 
-pub(super) fn query<T: mysql::prelude::FromRow>(
+pub(super) fn query(
     context: &mut ScenarioContext,
     inputs: &Inputs,
-    conn: &mut mysql::Conn,
+    conn: &mut SqlSession,
     token: &str,
     sql: &str,
-) -> Result<Vec<T>> {
+) -> Result<Vec<i64>> {
     outcome(context, inputs, conn, token, sql)?.map_err(anyhow::Error::from)
 }
 
 pub(super) struct SimpleRead {
-    pub result: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    pub result: mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
     thread: thread::JoinHandle<Result<()>>,
     observation: Option<QueryLifecycleStatementObservation>,
-    connection_id: u32,
+    cancel: novarocks_test_trino_client::CancelHandle,
+    deadline: Instant,
+    outcome: Arc<Mutex<Option<ConnectorSqlOutcome>>>,
 }
 impl SimpleRead {
     pub fn start(
@@ -588,118 +605,180 @@ impl SimpleRead {
         sql: &str,
     ) -> Result<Self> {
         exact_sql(inputs, token, sql)?;
-        let conn = mysql_actor::connect_for_cancellation_until(user, port, context.deadline())?;
-        let deadline = context.deadline();
-        let connection_id = conn.connection_id();
-        let observation = context.handle().arm_selected_statement_observation(
-            token,
-            connection_id,
-            sql,
-            deadline,
-        )?;
-        let sql = sql.to_owned();
-        let (sender, result) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("storage-exact-read".into())
-            .spawn(move || {
-                conn.run(|conn| {
-                    mysql_actor::publish_result(&sender, conn.query(sql))
-                        .context("publish exact Storage read result")?;
-                    Ok(())
-                })
-            });
-        match worker {
-            Ok(thread) => Ok(Self {
-                result,
-                thread,
-                observation: Some(observation),
-                connection_id,
-            }),
-            Err(error) => {
-                let drained = context
-                    .handle()
-                    .drain_query_lifecycle_statement_observation(&observation);
-                with_cleanup(Err(error.into()), drained)
-            }
-        }
+        let conn = SqlSession::new(user, port, context.deadline())?;
+        let pending = conn.submit(sql)?;
+        let (pending, observation) = arm_original_pending(context, token, sql, pending)?;
+        Self::spawn(
+            context,
+            conn,
+            pending,
+            Some(observation),
+            "storage-exact-read",
+        )
     }
-    /// This read has no marker oracle and consumes no statement/action grant.
     pub fn start_ordinary(
         context: &ScenarioContext,
         user: &str,
         port: u16,
         sql: &str,
     ) -> Result<Self> {
-        let conn = mysql_actor::connect_for_cancellation_until(user, port, context.deadline())?;
-        let connection_id = conn.connection_id();
-        let sql = sql.to_owned();
+        let mut conn = SqlSession::new(user, port, context.deadline())?;
+        let pending = conn.submit(sql)?;
+        let cancel = pending.cancel_handle();
+        let deadline = context.deadline();
+        let outcome = Arc::new(Mutex::new(None));
+        let saved = outcome.clone();
         let (sender, result) = mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("storage-ordinary-read".into())
             .spawn(move || {
-                conn.run(|conn| {
-                    mysql_actor::publish_result(&sender, conn.query(sql))
-                        .context("publish ordinary Storage read result")?;
-                    Ok(())
-                })
-            })?;
-        Ok(Self {
-            result,
-            thread,
-            observation: None,
-            connection_id,
-        })
+                let result = conn.run_pending(pending);
+                *saved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(connector_sql_outcome(&result));
+                publish_connector_result(&sender, result.and_then(connector_bigint_rows))
+                    .context("publish ordinary Storage read result")
+            });
+        match worker {
+            Ok(thread) => Ok(Self {
+                result,
+                thread,
+                observation: None,
+                cancel,
+                deadline,
+                outcome,
+            }),
+            Err(primary) => with_cleanup(
+                Err(primary.into()),
+                cancel.delete(deadline).map_err(anyhow::Error::from),
+            ),
+        }
+    }
+    fn spawn(
+        context: &mut ScenarioContext,
+        mut conn: SqlSession,
+        pending: novarocks_test_trino_client::PendingStatement,
+        observation: Option<QueryLifecycleStatementObservation>,
+        name: &'static str,
+    ) -> Result<Self> {
+        let cancel = pending.cancel_handle();
+        let deadline = context.deadline();
+        let outcome = Arc::new(Mutex::new(None));
+        let saved = outcome.clone();
+        let (sender, result) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new().name(name.into()).spawn(move || {
+            let result = conn.run_pending(pending);
+            *saved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(connector_sql_outcome(&result));
+            publish_connector_result(&sender, result.and_then(connector_bigint_rows))
+                .context("publish exact Storage read result")
+        });
+        match worker {
+            Ok(thread) => Ok(Self {
+                result,
+                thread,
+                observation,
+                cancel,
+                deadline,
+                outcome,
+            }),
+            Err(primary) => {
+                let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
+                let drained = observation.map_or(Ok(()), |observation| {
+                    context
+                        .handle()
+                        .drain_query_lifecycle_statement_binding(&observation, deadline)
+                });
+                with_cleanup(Err(primary.into()), with_cleanup(cancelled, drained))
+            }
+        }
     }
     pub fn terminal_snapshot(
         &self,
         context: &mut ScenarioContext,
-        original_sql_failure: &mysql::Error,
+        original_sql_failure: &StatementFailure,
     ) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
+        let deadline = context.deadline();
         let snapshot = self
             .observation
             .as_ref()
             .context("ordinary Storage read has no statement observation")
             .and_then(|observation| {
-                let deadline = context.deadline();
                 context
                     .handle()
                     .await_query_lifecycle_statement_observation(observation, false, deadline)
             });
         with_original_sql_failure(original_sql_failure, snapshot)
     }
-
     pub fn finish_after<T>(
         self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
+        _control: &mut SqlSession,
         phase: Result<T>,
     ) -> Result<T> {
-        let interrupt = if phase.is_err() && !self.thread.is_finished() {
-            control
-                .query_drop(format!("KILL QUERY {}", self.connection_id))
-                .context("cancel owned Storage actor during error cleanup")
+        let before = *self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attempted = phase.is_err()
+            && !matches!(
+                before,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            );
+        let mut cancelled = if attempted {
+            self.cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from)
         } else {
             Ok(())
         };
+        if cancelled.is_err() {
+            cancelled = with_cleanup(cancelled, context.shutdown());
+        }
         let joined = self
             .thread
             .join()
             .map_err(|_| anyhow::anyhow!("Storage query actor panicked"))
             .and_then(|result| result);
+        let after = *self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !attempted
+            && !matches!(
+                after,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            )
+        {
+            let deleted = self
+                .cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from);
+            cancelled = with_cleanup(
+                cancelled,
+                if deleted.is_err() {
+                    with_cleanup(deleted, context.shutdown())
+                } else {
+                    deleted
+                },
+            );
+        }
         let result_error = match self.result.try_recv() {
-            Ok(Err(error)) => Err(anyhow::Error::from(error)
+            Ok(Err(primary)) => Err(anyhow::Error::new(primary)
                 .context("original Storage SQL result failed during cleanup")),
             _ => Ok(()),
         };
-        let drained = match self.observation {
-            Some(observation) => context
+        let drained = self.observation.map_or(Ok(()), |observation| {
+            context
                 .handle()
-                .drain_query_lifecycle_statement_observation(&observation),
-            None => Ok(()),
-        };
+                .drain_query_lifecycle_statement_binding(&observation, self.deadline)
+        });
         with_cleanup(
             with_cleanup(
-                with_cleanup(with_cleanup(phase, interrupt), joined),
+                with_cleanup(with_cleanup(phase, cancelled), joined),
                 result_error,
             ),
             drained,
@@ -709,8 +788,11 @@ impl SimpleRead {
 
 pub(super) struct HeldRead {
     pub read: ConnectorRead,
-    pub connection_id: u32,
+    pub client_query_id: String,
+    pub cancel: novarocks_test_trino_client::CancelHandle,
+    deadline: Instant,
     observation: QueryLifecycleStatementObservation,
+    outcome: Arc<Mutex<Option<ConnectorSqlOutcome>>>,
 }
 impl HeldRead {
     pub fn start(
@@ -722,43 +804,54 @@ impl HeldRead {
         sql: &str,
     ) -> Result<Self> {
         exact_sql(inputs, token, sql)?;
-        let conn = mysql_actor::connect_for_cancellation_until(user, port, context.deadline())?;
-        let connection_id = conn.connection_id();
         let deadline = context.deadline();
-        let observation = context.handle().arm_selected_statement_observation(
-            token,
-            connection_id,
-            sql,
-            deadline,
-        )?;
+        let mut conn = SqlSession::new(user, port, deadline)?;
+        let pending = conn.submit(sql)?;
+        let client_query_id = pending.query_id.clone();
+        let cancel = pending.cancel_handle();
+        let (pending, observation) = arm_original_pending(context, token, sql, pending)?;
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let (done_tx, done) = mpsc::sync_channel(1);
         let (probe, probe_rx) = mpsc::sync_channel(1);
         let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
         let (release, release_rx) = mpsc::channel();
-        let sql = sql.to_owned();
+        let outcome = Arc::new(Mutex::new(None));
+        let saved = outcome.clone();
+        let id = client_query_id.clone();
         let worker = thread::Builder::new()
             .name("storage-exact-held-read".into())
             .spawn(move || {
-                conn.run(|conn| {
-                    ready_tx
-                        .send(connection_id)
-                        .context("publish exact held reader connection")?;
-                    mysql_actor::publish_result(&done_tx, conn.query::<i64, _>(sql))
-                        .context("publish exact held reader result")?;
-                    probe_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .context("receive reader connection probe")?;
-                    mysql_actor::publish_result(
-                        &probe_result_tx,
-                        conn.query_first::<i64, _>("SELECT 1"),
-                    )
-                    .context("publish reader connection probe")?;
-                    release_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                        .context("release exact held reader session")?;
-                    Ok(())
-                })
+                ready_tx
+                    .send(id)
+                    .context("publish exact held actual client query")?;
+                let result = conn.run_pending(pending);
+                *saved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(connector_sql_outcome(&result));
+                publish_connector_result(&done_tx, result.and_then(connector_bigint_rows))
+                    .context("publish exact held reader result")?;
+                probe_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .context("receive reader session probe")?;
+                let result = match conn.submit("SELECT 1") {
+                    Ok(pending) => run_original_connector_pending(&mut conn, pending, deadline)?
+                        .and_then(|result| {
+                            connector_integer_rows(result).and_then(|rows| match rows.as_slice() {
+                                [value] => Ok(Some(*value)),
+                                _ => Err(StatementFailure::Protocol(format!(
+                                    "Storage probe expected one integer row: {rows:?}"
+                                ))),
+                            })
+                        }),
+                    Err(error) => Err(error),
+                };
+                publish_connector_result(&probe_result_tx, result)
+                    .context("publish reader session probe")?;
+                release_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .context("release exact held reader session")?;
+                Ok(())
             });
         match worker {
             Ok(thread) => Ok(Self {
@@ -770,54 +863,92 @@ impl HeldRead {
                     release,
                     thread,
                 },
-                connection_id,
+                client_query_id,
+                cancel,
+                deadline,
                 observation,
+                outcome,
             }),
-            Err(error) => {
+            Err(primary) => {
+                let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
                 let drained = context
                     .handle()
-                    .drain_query_lifecycle_statement_observation(&observation);
-                with_cleanup(Err(error.into()), drained)
+                    .drain_query_lifecycle_statement_binding(&observation, deadline);
+                with_cleanup(Err(primary.into()), with_cleanup(cancelled, drained))
             }
         }
     }
     pub fn finish_after(
         self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
+        _control: &mut SqlSession,
         phase: Result<()>,
     ) -> Result<()> {
-        let interrupt = if phase.is_err() && !self.read.thread.is_finished() {
-            let result = control
-                .query_drop(format!("KILL QUERY {}", self.connection_id))
-                .context("cancel owned held Storage reader during error cleanup");
-            // A disconnected receiver means the actor exited; the actual join
-            // below resolves that fact and preserves its error or panic.
-            let _ = self.read.probe.try_send(());
-            let _ = self.read.release.send(());
-            result
+        let before = *self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attempted = phase.is_err()
+            && !matches!(
+                before,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            );
+        let mut cancelled = if attempted {
+            self.cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from)
         } else {
             Ok(())
         };
+        if cancelled.is_err() {
+            cancelled = with_cleanup(cancelled, context.shutdown());
+        }
+        if phase.is_err() {
+            let _ = self.read.probe.try_send(());
+            let _ = self.read.release.send(());
+        }
         let joined = self
             .read
             .thread
             .join()
             .map_err(|_| anyhow::anyhow!("held Storage reader panicked"))
             .and_then(|result| result);
+        let after = *self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !attempted
+            && !matches!(
+                after,
+                Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+            )
+        {
+            let deleted = self
+                .cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from);
+            cancelled = with_cleanup(
+                cancelled,
+                if deleted.is_err() {
+                    with_cleanup(deleted, context.shutdown())
+                } else {
+                    deleted
+                },
+            );
+        }
         let result_error = match self.read.done.try_recv() {
-            Ok(Err(error)) => Err(anyhow::Error::from(error)
+            Ok(Err(primary)) => Err(anyhow::Error::new(primary)
                 .context("original held Storage SQL result failed during cleanup")),
             _ => Ok(()),
         };
         let probe_error = pending_probe_error(&self.read.probe_result);
         let drained = context
             .handle()
-            .drain_query_lifecycle_statement_observation(&self.observation);
+            .drain_query_lifecycle_statement_binding(&self.observation, self.deadline);
         with_cleanup(
             with_cleanup(
                 with_cleanup(
-                    with_cleanup(with_cleanup(phase, interrupt), joined),
+                    with_cleanup(with_cleanup(phase, cancelled), joined),
                     result_error,
                 ),
                 probe_error,
@@ -827,7 +958,9 @@ impl HeldRead {
     }
 }
 
-fn pending_probe_error(receiver: &mpsc::Receiver<mysql::Result<Option<i64>>>) -> Result<()> {
+fn pending_probe_error(
+    receiver: &mpsc::Receiver<std::result::Result<Option<i64>, StatementFailure>>,
+) -> Result<()> {
     match receiver.try_recv() {
         Ok(Err(error)) => Err(anyhow::Error::from(error)
             .context("original held Storage connection probe failed during cleanup")),
@@ -841,13 +974,12 @@ mod tests {
 
     #[test]
     fn failed_phase_preserves_unconsumed_probe_error_after_actual_join() {
-        let (sender, result) = mpsc::sync_channel::<mysql::Result<Option<i64>>>(1);
+        let (sender, result) =
+            mpsc::sync_channel::<std::result::Result<Option<i64>, StatementFailure>>(1);
         let worker = thread::spawn(move || {
-            mysql_actor::publish_result(
+            publish_connector_result(
                 &sender,
-                Err(mysql::Error::from(std::io::Error::other(
-                    "actual probe failure",
-                ))),
+                Err(StatementFailure::Transport("actual probe failure".into())),
             )
         });
         let joined = worker.join().unwrap();
@@ -863,8 +995,8 @@ mod tests {
 
     #[test]
     fn observation_and_drain_failures_preserve_the_original_sql_failure() {
-        let result: mysql::Result<Vec<i64>> =
-            Err(std::io::Error::other("original SQL failure").into());
+        let result: std::result::Result<Vec<i64>, StatementFailure> =
+            Err(StatementFailure::Transport("original SQL failure".into()));
         let error = finish_observed_outcome(
             result,
             Err(anyhow::anyhow!("exact observation failure")),
@@ -886,8 +1018,9 @@ mod tests {
         ] {
             let (sender, receiver) = mpsc::sync_channel(1);
             let actor = thread::spawn(move || -> Result<()> {
-                let sql_result: mysql::Result<Vec<i64>> =
-                    Err(std::io::Error::other("consumed original SQL failure").into());
+                let sql_result: std::result::Result<Vec<i64>, StatementFailure> = Err(
+                    StatementFailure::Transport("consumed original SQL failure".into()),
+                );
                 sender
                     .send(sql_result)
                     .map_err(|_| anyhow::anyhow!("publish original SQL result"))?;
@@ -919,59 +1052,52 @@ mod tests {
 
     #[test]
     fn expected_sql_failure_does_not_replace_a_successful_observation() {
-        let sql_error: mysql::Error = std::io::Error::other("expected SQL failure").into();
+        let sql_error = StatementFailure::Transport("expected SQL failure".into());
         assert_eq!(with_original_sql_failure(&sql_error, Ok(7)).unwrap(), 7);
     }
 
     #[test]
-    fn acquisition_mysql_error_matches_the_exact_original_safe_projection() {
+    fn acquisition_sql_error_matches_the_exact_original_safe_projection() {
         let detail = "Dependency failure (reason 23:3) at operator 7 during Pull";
-        let error = mysql::Error::MySqlError(mysql::MySqlError {
-            code: 1105,
-            state: "HY000".into(),
-            message: "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull".into(),
-        });
-        let server = check_acquisition_mysql_error(&error, detail).unwrap();
-        assert_eq!(server.code, 1105);
-        assert_eq!(server.state, "HY000");
+        let error = StatementFailure::Trino(serde_json::from_value(json!({
+            "errorCode":65542, "errorName":"REMOTE_TASK_ERROR", "errorType":"INTERNAL_ERROR",
+            "message":"[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull",
+        })).unwrap());
+        let server = check_acquisition_sql_error(&error, detail).unwrap();
+        assert_eq!(server.error_code, 65542);
+        assert_eq!(server.error_name, "REMOTE_TASK_ERROR");
+        assert_eq!(server.error_type, "INTERNAL_ERROR");
     }
-
     #[test]
-    fn acquisition_mysql_error_rejects_client_io_and_other_server_projections() {
+    fn acquisition_sql_error_rejects_client_io_and_other_server_projections() {
         let detail = "Dependency failure (reason 23:3) at operator 7 during Pull";
-        let io: mysql::Error = std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "client disconnected before receiving the server error",
-        )
-        .into();
+        let io = StatementFailure::Transport(
+            "client disconnected before receiving the server error".into(),
+        );
         let rejected =
-            with_original_sql_failure(&io, check_acquisition_mysql_error(&io, detail)).unwrap_err();
+            with_original_sql_failure(&io, check_acquisition_sql_error(&io, detail)).unwrap_err();
         let text = format!("{rejected:#}");
-        assert!(text.contains("original MySQL server error"));
+        assert!(text.contains("original Trino server error"));
         assert!(text.contains("client disconnected before receiving the server error"));
-        for (code, state, message) in [
+        for (code, error_type, message) in [
             (
-                1105,
-                "HY000",
+                65542,
+                "INTERNAL_ERROR",
                 "[query.execution.dependency] Dependency failure (reason 23:3) at operator 8 during Pull",
             ),
             (
-                1045,
-                "HY000",
+                46,
+                "INTERNAL_ERROR",
                 "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull",
             ),
             (
-                1105,
-                "28000",
+                65542,
+                "USER_ERROR",
                 "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull",
             ),
         ] {
-            let error = mysql::Error::MySqlError(mysql::MySqlError {
-                code,
-                state: state.into(),
-                message: message.into(),
-            });
-            assert!(check_acquisition_mysql_error(&error, detail).is_err());
+            let error = StatementFailure::Trino(serde_json::from_value(json!({"errorCode":code,"errorName":"REMOTE_TASK_ERROR","errorType":error_type,"message":message})).unwrap());
+            assert!(check_acquisition_sql_error(&error, detail).is_err());
         }
     }
 

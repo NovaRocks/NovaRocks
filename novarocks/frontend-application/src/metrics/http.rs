@@ -33,8 +33,6 @@ use super::FrontendMetricsRegistry;
 
 /// Frontend-owned management HTTP listener.
 pub(crate) struct MetricsHttpServer {
-    #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-    listener_address: SocketAddr,
     shutdown_tx: Option<watch::Sender<bool>>,
     failure_rx: mpsc::Receiver<String>,
     join_handle: Option<JoinHandle<()>>,
@@ -88,19 +86,13 @@ impl MetricsHttpServer {
         #[cfg(novarocks_dev_controls)] statement_observation: Option<
             Arc<crate::preparation_diagnostics::StatementObservationOwner>,
         >,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")] hms_listing_observation: Option<
-            crate::server::HmsListingObservationHandler,
-        >,
     ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse frontend metrics HTTP bind address failed: {error}"))?;
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
             format!("bind frontend metrics HTTP listener on {bind_addr} failed: {error}")
         })?;
-        #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-        let listener_address = listener
-            .local_addr()
-            .map_err(|_| "read actual management listener address failed")?;
+
         listener.set_nonblocking(true).map_err(|error| {
             format!("configure frontend metrics HTTP listener on {bind_addr} failed: {error}")
         })?;
@@ -131,10 +123,7 @@ impl MetricsHttpServer {
                         #[cfg(novarocks_dev_controls)]
                         statement_observation,
                     );
-                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                    let app = app.merge(super::hms_listing_observation::router(
-                        hms_listing_observation,
-                    ));
+
                     axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             while !*shutdown_rx.borrow() {
@@ -168,8 +157,6 @@ impl MetricsHttpServer {
             let _ = failure_tx.send(error);
         });
         Ok(Self {
-            #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
-            listener_address,
             shutdown_tx: Some(shutdown_tx),
             failure_rx,
             join_handle: Some(join_handle),
@@ -226,79 +213,6 @@ fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    #[test]
-    fn original_management_listener_hosts_observation_and_joins_its_callback() {
-        use std::io::{Read, Write};
-        use std::sync::atomic::AtomicUsize;
-        use std::time::Duration;
-        struct Witness(Arc<AtomicBool>);
-        impl Drop for Witness {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let exited = Arc::new(AtomicBool::new(false));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let witness = Witness(exited.clone());
-        let marker = calls.clone();
-        let handler: crate::server::HmsListingObservationHandler = Arc::new(move |body| {
-            let _ = &witness;
-            assert_eq!(body, br#"{"operation":"snapshot"}"#);
-            marker.fetch_add(1, Ordering::SeqCst);
-            Ok(br#"{"domain":"original"}"#.to_vec())
-        });
-        let authority =
-            novarocks_memory::MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
-                64 * 1024 * 1024,
-                48 * 1024 * 1024,
-                16 * 1024 * 1024,
-            ))
-            .unwrap();
-        authority.install_control_branch(1024 * 1024).unwrap();
-        let mut server = MetricsHttpServer::start(
-            "127.0.0.1",
-            0,
-            FrontendMetricsRegistry::new().unwrap(),
-            Arc::new(crate::workload_lifecycle::LateBoundFrontendServingSnapshotReader::default()),
-            Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
-                novarocks_types::NativeCompatibilityId::new([7; 32]),
-            )),
-            None,
-            Arc::new(authority),
-            None,
-            #[cfg(novarocks_dev_controls)]
-            None,
-            Some(handler),
-        )
-        .unwrap();
-        let original_thread = server.join_handle.as_ref().unwrap().thread().id();
-        let mut client = std::net::TcpStream::connect(server.listener_address).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        client
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let body = br#"{"operation":"snapshot"}"#;
-        write!(client, "POST /debug/hms-listing-observation HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
-        client.write_all(body).unwrap();
-        let mut response = Vec::new();
-        client.take(4096).read_to_end(&mut response).unwrap();
-        assert!(response.starts_with(b"HTTP/1.1 200"));
-        assert!(response.ends_with(br#"{"domain":"original"}"#));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(!exited.load(Ordering::SeqCst));
-        assert_eq!(
-            server.join_handle.as_ref().unwrap().thread().id(),
-            original_thread
-        );
-        server.stop().unwrap();
-        assert!(server.join_handle.is_none());
-        assert!(exited.load(Ordering::SeqCst));
-        std::net::TcpListener::bind(server.listener_address).unwrap();
-    }
 
     #[test]
     fn metrics_bind_addr_accepts_ipv4_and_ipv6_literals() {

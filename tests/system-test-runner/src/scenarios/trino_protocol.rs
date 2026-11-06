@@ -25,14 +25,10 @@
 //! entrypoint owner maintains these cases with the default functional suite.
 use super::result_delivery_support::{await_idle, metric};
 use crate::{
-    actors::{
-        mysql as mysql_actor,
-        trino_protocol::{RawResponse, TrinoClient},
-    },
+    actors::trino_protocol::{RawResponse, TrinoClient},
     scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig},
 };
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
     CrossProcessConfigOverlay, TestClusterOwner,
     resource_registration::{self, Registration},
@@ -59,11 +55,12 @@ pub(super) fn scenarios() -> Vec<Box<dyn Scenario>> {
         Case::Session,
         Case::Delete,
         Case::Abandon,
-        Case::MysqlPositions,
         Case::Drain,
         Case::Refusals,
         Case::RowBudget,
         Case::UpdateType,
+        Case::Completion,
+        Case::StatementSize,
         Case::Info,
     ]
     .into_iter()
@@ -82,11 +79,12 @@ enum Case {
     Session,
     Delete,
     Abandon,
-    MysqlPositions,
     Drain,
     Refusals,
     RowBudget,
     UpdateType,
+    Completion,
+    StatementSize,
     Info,
 }
 struct TrinoProtocol {
@@ -105,11 +103,12 @@ impl Scenario for TrinoProtocol {
             Case::Session => "trino-protocol/session-effects",
             Case::Delete => "trino-protocol/delete-cancels",
             Case::Abandon => "trino-protocol/abandon-releases",
-            Case::MysqlPositions => "trino-protocol/independent-of-mysql-positions",
             Case::Drain => "trino-protocol/drain",
             Case::Refusals => "trino-protocol/refusals",
             Case::RowBudget => "trino-protocol/row-exceeds-page-budget",
             Case::UpdateType => "trino-protocol/ddl-update-type",
+            Case::Completion => "trino-protocol/command-completion-shape",
+            Case::StatementSize => "trino-protocol/statement-too-large",
             Case::Info => "trino-protocol/info-and-head",
         }
     }
@@ -141,7 +140,7 @@ impl Scenario for TrinoProtocol {
         await_idle(context, "trino", "before", epoch)?;
         let actor = TrinoClient::new(
             context.trino_port(),
-            context.mysql_user(),
+            context.sql_user(),
             context.deadline(),
             &context.scenario_root().join("trino-http"),
         )?;
@@ -154,7 +153,6 @@ impl Scenario for TrinoProtocol {
             }
             Case::Delete => cancel(context, &actor),
             Case::Abandon => abandon(context, &actor),
-            Case::MysqlPositions => mysql_positions(context, &actor),
             Case::Drain => drain(context, &actor),
             Case::Refusals => refusals(context, &actor),
             Case::RowBudget => row_budget(context, &actor),
@@ -162,9 +160,17 @@ impl Scenario for TrinoProtocol {
                 self.prepare_catalog(context, &actor)?;
                 update_types(context, &actor)
             }
+            Case::Completion => {
+                self.prepare_catalog(context, &actor)?;
+                command_completion(context, &actor)
+            }
+            Case::StatementSize => statement_size(context, &actor),
             Case::Info => info(context, &actor),
         };
-        if matches!(self.case, Case::Session | Case::UpdateType) {
+        if matches!(
+            self.case,
+            Case::Session | Case::UpdateType | Case::Completion
+        ) {
             let cleanup = success(&actor, "DROP CATALOG IF EXISTS trc1_catalog");
             match (outcome, cleanup) {
                 (Err(primary), Err(cleanup)) => {
@@ -276,7 +282,7 @@ fn success(actor: &TrinoClient, sql: &str) -> Result<Vec<RawResponse>> {
     );
     Ok(pages)
 }
-fn require_error(response: &RawResponse, expected: &str) -> Result<Value> {
+pub(super) fn require_error(response: &RawResponse, expected: (i64, &str, &str)) -> Result<Value> {
     ensure!(
         response.status == 200,
         "expected a Trino QueryError, got HTTP {}",
@@ -284,16 +290,24 @@ fn require_error(response: &RawResponse, expected: &str) -> Result<Value> {
     );
     let value = response.json()?;
     ensure!(
-        value["error"]["errorName"] == expected,
-        "expected {expected}, got {value}"
+        value["error"]["errorCode"].as_i64() == Some(expected.0)
+            && value["error"]["errorName"].as_str() == Some(expected.1)
+            && value["error"]["errorType"].as_str() == Some(expected.2),
+        "expected QueryError {expected:?}, got {value}"
     );
     ensure!(
         value.get("nextUri").is_none(),
         "error page contains nextUri"
     );
+    for field in ["columns", "data", "updateType", "updateCount"] {
+        ensure!(
+            value.get(field).is_none(),
+            "error page contains success field {field}"
+        );
+    }
     Ok(value)
 }
-fn failed_query(actor: &TrinoClient, sql: &str, expected: &str) -> Result<Value> {
+fn failed_query(actor: &TrinoClient, sql: &str, expected: (i64, &str, &str)) -> Result<Value> {
     let pages = actor.execute(sql)?;
     require_error(terminal(&pages)?, expected)
 }
@@ -335,7 +349,7 @@ fn paging(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
         let value = page.assert_success()?;
         let replay = actor.get(&uri)?;
         ensure!(
-            replay.body == page.body,
+            replay.status == page.status && replay.body == page.body,
             "same-token replay changed original response bytes"
         );
         ensure!(
@@ -378,7 +392,7 @@ fn paging(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
                 );
                 let replay = actor.get(&uri)?;
                 ensure!(
-                    replay.body == page.body,
+                    replay.status == page.status && replay.body == page.body,
                     "terminal tombstone replay changed bytes"
                 );
                 break;
@@ -421,14 +435,44 @@ fn interrupted(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()>
         let page = actor.get(&uri)?;
         let value = page.assert_success()?;
         if value.get("data").is_some() {
-            let partial = actor.interrupt(&uri, 128)?;
+            let mut held = actor.open_get(&uri)?;
+            let at_headers = held.observe_held()?;
+            ensure!(
+                at_headers.read_calls == 0
+                    && !at_headers.first_byte_observed
+                    && !at_headers.eof_observed,
+                "headers were confused with a first body read or EOF"
+            );
+            let partial = RawResponse {
+                status: held.status(),
+                headers: held.headers().clone(),
+                body: held.read_prefix(128)?,
+            };
+            let prefix = held.observe_held()?;
+            ensure!(
+                prefix.first_byte_observed && !prefix.eof_observed && prefix.read_bytes == 128,
+                "original strict prefix was not held before EOF"
+            );
+            let joined = held.interrupt();
+            joined.require_clean()?;
+            ensure!(
+                !joined.observation.eof_observed && joined.observation.read_bytes == 128,
+                "interruption drained the response or replaced the original prefix"
+            );
+            ensure!(
+                partial.status == page.status
+                    && partial.semantic_headers() == page.semantic_headers(),
+                "interrupted original response changed status or repeated headers"
+            );
             ensure!(
                 page.body.starts_with(&partial.body) && partial.body.len() < page.body.len(),
                 "interrupted response did not preserve a strict body prefix"
             );
             let replay = actor.get(&uri)?;
             ensure!(
-                replay.body == page.body && replay.semantic_headers() == page.semantic_headers(),
+                replay.status == page.status
+                    && replay.body == page.body
+                    && replay.semantic_headers() == page.semantic_headers(),
                 "interrupted response changed replay bytes/headers"
             );
             while let Some(next) = replay_next(actor, &uri)? {
@@ -440,7 +484,7 @@ fn interrupted(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()>
             .next_uri()?
             .context("query ended before interrupted data page")?;
     }
-    context.action("dropped a partial HTTP response, replayed identical full bytes, and completed the same query");
+    context.action("held original HTTP headers, observed a strict128-byte prefix before EOF, actually dropped/joined that reader, replayed identical full bytes/headers, and completed the same query");
     Ok(())
 }
 fn replay_next(actor: &TrinoClient, uri: &str) -> Result<Option<String>> {
@@ -512,16 +556,20 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
     );
     let mut timed = actor.clone();
     timed.apply_effects(end)?;
-    failed_query(&timed, "SELECT sleep(3)", "EXCEEDED_TIME_LIMIT")?;
+    failed_query(
+        &timed,
+        "SELECT sleep(3)",
+        (131075, "EXCEEDED_TIME_LIMIT", "INSUFFICIENT_RESOURCES"),
+    )?;
     failed_query(
         &actor.with_session(&[("x-trino-session", "trc_unknown_property=1")]),
         "SELECT 1",
-        "INVALID_SESSION_PROPERTY",
+        (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
     )?;
     failed_query(
         &actor.with_session(&[("x-trino-time-zone", "Mars/Olympus")]),
         "SELECT 1",
-        "NOT_SUPPORTED",
+        (13, "NOT_SUPPORTED", "USER_ERROR"),
     )?;
     let only_schema = actor.request(
         Method::POST,
@@ -554,12 +602,12 @@ fn cancel(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
         actor.delete(&uri)?.status == 204,
         "DELETE did not return 204"
     );
-    require_error(&actor.get(&uri)?, "USER_CANCELED")?;
+    require_error(&actor.get(&uri)?, (3, "USER_CANCELED", "USER_ERROR"))?;
     ensure!(
         actor.delete(&uri)?.status == 204,
         "repeated DELETE is not idempotent"
     );
-    require_error(&actor.get(&uri)?, "USER_CANCELED")?;
+    require_error(&actor.get(&uri)?, (3, "USER_CANCELED", "USER_ERROR"))?;
     let after = await_observation(context, "delete-after", |snapshot| snapshot.active == 0)?;
     ensure!(
         after.client_cancel == before.client_cancel + 1,
@@ -596,7 +644,7 @@ fn abandon(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     thread::sleep(Duration::from_millis(ABANDON_MS + 300));
     let result = actor.get(&uri)?;
     if result.status != 404 {
-        require_error(&result, "ABANDONED_QUERY")?;
+        require_error(&result, (2, "ABANDONED_QUERY", "USER_ERROR"))?;
     }
     let after = await_observation(context, "abandon-after", |snapshot| snapshot.active == 0)?;
     ensure!(
@@ -605,44 +653,6 @@ fn abandon(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     );
     context
         .action("verified POST-only expiry and executing-client abandonment release independently");
-    Ok(())
-}
-fn mysql_positions(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
-    let epoch = Instant::now();
-    let first = success(actor, "SELECT 1")?;
-    let terminal_uri = first
-        .iter()
-        .rev()
-        .skip(1)
-        .find_map(|page| page.next_uri().transpose())
-        .transpose()?
-        .context("first query omitted terminal ACK URI")?;
-    let first_terminal = terminal(&first)?.body.clone();
-    for _ in 1..513 {
-        success(actor, "SELECT 1")?;
-    }
-    ensure!(
-        epoch.elapsed() < Duration::from_secs(300),
-        "513 short queries did not overlap within the configured abandonment window"
-    );
-    ensure!(
-        actor.get(&terminal_uri)?.body == first_terminal,
-        "first tombstone did not survive the >512-query window"
-    );
-    let connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    connection.run(|connection| {
-        let result: Vec<u64> = connection.query("SELECT 1")?;
-        ensure!(
-            result == vec![1],
-            "MySQL entrypoint failed after Trino tombstones"
-        );
-        Ok(())
-    })?;
-    context.action("completed 513 Trino statements within one tombstone window and verified a fresh MySQL query");
     Ok(())
 }
 fn drain(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
@@ -667,7 +677,7 @@ fn drain(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
         thread::sleep(POLL);
     }
     let refusal = actor.submit("SELECT 1")?;
-    require_error(&refusal, "SERVER_SHUTTING_DOWN")?;
+    require_error(&refusal, (65545, "SERVER_SHUTTING_DOWN", "INTERNAL_ERROR"))?;
     loop {
         let page = actor.get(&uri)?;
         let value = page.assert_success()?;
@@ -722,13 +732,13 @@ fn refusals(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
         failed_query(
             &actor.with_session(&[(name, value)]),
             "SELECT 1",
-            "NOT_SUPPORTED",
+            (13, "NOT_SUPPORTED", "USER_ERROR"),
         )?;
     }
     let error = failed_query(
         actor,
         "SELECT CAST(1 AS LARGEINT) AS wide_value",
-        "NOT_SUPPORTED",
+        (13, "NOT_SUPPORTED", "USER_ERROR"),
     )?;
     ensure!(
         error["error"]["message"]
@@ -751,7 +761,11 @@ fn row_budget(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> 
     failed_query(
         actor,
         &format!("SELECT {fields}"),
-        "GENERIC_INSUFFICIENT_RESOURCES",
+        (
+            131072,
+            "GENERIC_INSUFFICIENT_RESOURCES",
+            "INSUFFICIENT_RESOURCES",
+        ),
     )?;
     let after = await_observation(context, "row-budget-after", |snapshot| snapshot.active == 0)?;
     ensure!(
@@ -770,21 +784,385 @@ fn update_types(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()
         ("DROP TABLE trc1_catalog.first.update_type", "DROP TABLE"),
         ("SET query_timeout = 60", "SET SESSION"),
     ] {
-        let pages = success(actor, sql)?;
-        let end = terminal(&pages)?.json()?;
-        ensure!(
-            end["updateType"] == expected,
-            "wrong updateType for {sql}: {end}"
-        );
-        ensure!(
-            end.get("columns")
-                .is_none_or(|columns| columns.as_array().is_some_and(Vec::is_empty)),
-            "completion-only statement exposed columns"
-        );
+        assert_raw_completion(actor, sql, expected, RawCompletionExpectation::Empty)?;
     }
     context.action("verified DDL and SET updateType names with no row columns");
     Ok(())
 }
+
+/// Independent scenario expectations, never derived from a returned counter,
+/// SQL text, writer metric or adapter type. CTAS's explicit original fixture
+/// calls this same raw oracle with its own finite source-row formula.
+#[derive(Clone, Copy)]
+pub(in crate::scenarios) enum RawCompletionExpectation {
+    Empty,
+    Counted(u64),
+    NoCount,
+}
+
+pub(in crate::scenarios) fn assert_raw_completion(
+    actor: &TrinoClient,
+    sql: &str,
+    update_type: &str,
+    expected: RawCompletionExpectation,
+) -> Result<String> {
+    let post = actor.submit(sql)?;
+    let mut cleanup_uri = post.next_uri().ok().flatten();
+    let phase = (|| -> Result<String> {
+        let initial = post.assert_success()?;
+        let query_id = initial["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("POST omitted query identity")?
+            .to_owned();
+        ensure!(
+            initial["stats"]["state"] == "QUEUED",
+            "POST did not register a queued query"
+        );
+        for field in ["updateType", "columns", "data", "updateCount"] {
+            ensure!(
+                initial.get(field).is_none(),
+                "pre-admission POST exposed {field}"
+            );
+        }
+        let mut uri = post
+            .next_uri()?
+            .context("POST omitted original continuation")?;
+        let columns = match expected {
+            RawCompletionExpectation::Empty => json!([]),
+            RawCompletionExpectation::Counted(_) | RawCompletionExpectation::NoCount => {
+                json!([{"name":"rows","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}}])
+            }
+        };
+        let mut admitted = false;
+        let mut data_seen = false;
+        loop {
+            // Only this current page and its same-token replay are in memory;
+            // no complete-query Vec<RawResponse> is retained by this oracle.
+            let page = actor.get(&uri)?;
+            cleanup_uri = Some(uri.clone());
+            let value = page.assert_success()?;
+            ensure!(
+                value["id"].as_str() == Some(query_id.as_str()),
+                "completion query identity changed"
+            );
+            let replay = actor.get(&uri)?;
+            ensure!(
+                page.status == replay.status
+                    && page.body == replay.body
+                    && page.semantic_headers() == replay.semantic_headers(),
+                "completion same-token replay changed bytes or repeated headers"
+            );
+            let next = page.next_uri()?;
+            // The wire cannot expose the internal admission timestamp. Before
+            // its first visible metadata only the entirely absent shape is
+            // legal; adapter gated tests prove immediate actual-admission
+            // publication. Once visible, both static fields must persist.
+            let any_completion_field = ["updateType", "columns", "data", "updateCount"]
+                .iter()
+                .any(|name| value.get(*name).is_some());
+            if !admitted && !any_completion_field {
+                ensure!(next.is_some(), "success ended before observable admission");
+            } else {
+                admitted = true;
+                ensure!(
+                    value["updateType"].as_str() == Some(update_type),
+                    "completion updateType changed or disappeared: {value}"
+                );
+                ensure!(
+                    value.get("columns") == Some(&columns),
+                    "completion static columns changed or disappeared: {value}"
+                );
+                match expected {
+                    RawCompletionExpectation::Empty => {
+                        ensure!(
+                            value.get("data").is_none() && value.get("updateCount").is_none(),
+                            "Empty completion exposed data or a fabricated count"
+                        );
+                    }
+                    RawCompletionExpectation::Counted(count) => {
+                        if let Some(data) = value.get("data") {
+                            ensure!(
+                                !data_seen && *data == json!([[count]]),
+                                "count data must be exactly one independently expected bigint cell"
+                            );
+                            ensure!(next.is_some(), "count data omitted its acknowledgement URI");
+                            data_seen = true;
+                        }
+                        if data_seen {
+                            ensure!(
+                                value.get("updateCount") == Some(&json!(count)),
+                                "actual count did not persist from its first data page"
+                            );
+                        } else {
+                            ensure!(
+                                value.get("updateCount").is_none(),
+                                "updateCount appeared before the actual count data page"
+                            );
+                        }
+                    }
+                    RawCompletionExpectation::NoCount => {
+                        ensure!(
+                            value.get("updateCount").is_none(),
+                            "NoCount fabricated an updateCount"
+                        );
+                        if let Some(data) = value.get("data") {
+                            ensure!(
+                                !data_seen && *data == json!([[null]]),
+                                "NoCount data must be exactly one NULL cell, never zero"
+                            );
+                            ensure!(
+                                next.is_some(),
+                                "NULL count data omitted its acknowledgement URI"
+                            );
+                            data_seen = true;
+                        }
+                    }
+                }
+            }
+            if let Some(next) = next {
+                uri = next;
+                continue;
+            }
+            ensure!(
+                admitted && value["stats"]["state"] == "FINISHED",
+                "completion omitted admission or actual terminal success"
+            );
+            ensure!(
+                value.get("data").is_none(),
+                "terminal success still contains data"
+            );
+            match expected {
+                RawCompletionExpectation::Empty => ensure!(!data_seen, "Empty produced a row"),
+                RawCompletionExpectation::Counted(_) | RawCompletionExpectation::NoCount => {
+                    ensure!(data_seen, "rows-bigint completion omitted its one data row")
+                }
+            }
+            return Ok(query_id.clone());
+        }
+    })();
+    finish_raw_registered(actor, cleanup_uri, phase)
+}
+
+fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
+    use RawCompletionExpectation::{Counted, Empty, NoCount};
+    // Same original local Hadoop warehouse owner as the existing session/DDL
+    // cases. Format3 row lineage is the already supported P01 DML input.
+    for (sql, update_type, expected) in [
+        (
+            "CREATE TABLE trc1_catalog.first.completion_items (id INT, v INT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            "CREATE TABLE",
+            Empty,
+        ),
+        (
+            "INSERT INTO trc1_catalog.first.completion_items VALUES (1, 10), (2, 20)",
+            "INSERT",
+            Counted(2),
+        ),
+        (
+            "UPDATE trc1_catalog.first.completion_items SET v = v + 1 WHERE id = 1",
+            "UPDATE",
+            Counted(1),
+        ),
+        (
+            "DELETE FROM trc1_catalog.first.completion_items WHERE id = 2",
+            "DELETE",
+            Counted(1),
+        ),
+        (
+            "MERGE INTO trc1_catalog.first.completion_items t USING (SELECT 1 AS id, 100 AS v UNION ALL SELECT 3, 300) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+            "MERGE",
+            Counted(2),
+        ),
+        (
+            "UPDATE trc1_catalog.first.completion_items SET v = 0 WHERE id = 99",
+            "UPDATE",
+            Counted(0),
+        ),
+        // Hadoop's StatementJob admission is AwaitTerminal. The supported
+        // plain ANALYZE waits for actual executor exit, then JobSubmitted is
+        // genuinely NoCount. WITH SYNC MODE/FULL are currently unsupported.
+        (
+            "ANALYZE TABLE trc1_catalog.first.completion_items",
+            "ANALYZE",
+            NoCount,
+        ),
+    ] {
+        let query_id = assert_raw_completion(actor, sql, update_type, expected)?;
+        context.action(format!(
+            "raw completion shape/replay verified client_query_id={query_id}"
+        ));
+    }
+    let rows = success(
+        actor,
+        "SELECT id, v FROM trc1_catalog.first.completion_items ORDER BY id",
+    )?;
+    let mut actual = Vec::new();
+    for page in rows {
+        if let Some(data) = page.json()?.get("data").and_then(Value::as_array) {
+            actual.extend(data.iter().cloned());
+        }
+    }
+    ensure!(
+        actual == vec![json!([1, 100]), json!([3, 300])],
+        "ordinary DML changed independently expected surviving rows"
+    );
+    context.action("raw Empty/INSERT2/UPDATE1/DELETE1/MERGE2/UPDATE0/ANALYZE-NULL passed; raw CTAS remains mandatory in the original explicit fenced REST supplement");
+    Ok(())
+}
+
+fn finish_raw_registered<T>(
+    actor: &TrinoClient,
+    cleanup_uri: Option<String>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(primary) => match cleanup_uri {
+            Some(uri) => match actor.delete(&uri) {
+                Ok(response) if response.status == 204 => Err(primary),
+                Ok(response) => anyhow::bail!(
+                    "{primary:#}; original raw-query cleanup returned HTTP {}",
+                    response.status
+                ),
+                Err(cleanup) => {
+                    anyhow::bail!("{primary:#}; original raw-query cleanup: {cleanup:#}")
+                }
+            },
+            None => anyhow::bail!(
+                "{primary:#}; original raw-query cleanup UNKNOWN: no valid returned continuation"
+            ),
+        },
+    }
+}
+
+fn assert_raw_query_size(actor: &TrinoClient, sql: &str, too_large: bool) -> Result<()> {
+    let post = actor.submit(sql)?;
+    let mut cleanup_uri = post.next_uri().ok().flatten();
+    let phase = (|| -> Result<()> {
+        let initial = post.assert_success()?;
+        let query_id = initial["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("query-size POST omitted original identity")?;
+        ensure!(
+            initial["stats"]["state"] == "QUEUED",
+            "query-size POST was not queued"
+        );
+        for field in ["updateType", "columns", "data", "updateCount"] {
+            ensure!(
+                initial.get(field).is_none(),
+                "query-size pre-admission POST exposed {field}"
+            );
+        }
+        let mut uri = post
+            .next_uri()?
+            .context("query-size POST omitted normal registered continuation")?;
+        let mut value_seen = false;
+        loop {
+            let page = actor.get(&uri)?;
+            cleanup_uri = Some(uri.clone());
+            ensure!(
+                page.status == 200,
+                "query size used an HTTP transport error instead of a registered result"
+            );
+            let value = page.json()?;
+            ensure!(
+                value["id"].as_str() == Some(query_id),
+                "query-size identity changed"
+            );
+            let replay = actor.get(&uri)?;
+            ensure!(
+                page.status == replay.status
+                    && page.body == replay.body
+                    && page.semantic_headers() == replay.semantic_headers(),
+                "query-size same-token replay changed bytes or repeated headers"
+            );
+            let next = page.next_uri()?;
+            if too_large {
+                for field in ["updateType", "columns", "data", "updateCount"] {
+                    ensure!(
+                        value.get(field).is_none(),
+                        "oversized query exposed success field {field}"
+                    );
+                }
+                if let Some(error) = value.get("error") {
+                    ensure!(
+                        error["errorCode"] == 35
+                            && error["errorName"] == "QUERY_TEXT_TOO_LARGE"
+                            && error["errorType"] == "USER_ERROR",
+                        "query size lost literal35 identity: {error}"
+                    );
+                    ensure!(next.is_none(), "query-size error retained a continuation");
+                    return Ok(());
+                }
+                ensure!(
+                    next.is_some(),
+                    "oversized query ended without its required error"
+                );
+            } else {
+                ensure!(
+                    value.get("error").is_none(),
+                    "exact-limit query failed: {}",
+                    value["error"]
+                );
+                ensure!(
+                    value.get("updateType").is_none() && value.get("updateCount").is_none(),
+                    "exact-limit SELECT became a completion"
+                );
+                if let Some(data) = value.get("data") {
+                    ensure!(
+                        !value_seen && *data == json!([[1]]),
+                        "exact-limit input did not return exactly one integer1"
+                    );
+                    ensure!(
+                        next.is_some(),
+                        "exact-limit data omitted its acknowledgement URI"
+                    );
+                    value_seen = true;
+                }
+                if next.is_none() {
+                    ensure!(
+                        value["stats"]["state"] == "FINISHED"
+                            && value_seen
+                            && value.get("data").is_none(),
+                        "exact-limit query did not finish after its actual one-row data page"
+                    );
+                    return Ok(());
+                }
+            }
+            uri = next.context("query-size page omitted continuation")?;
+        }
+    })();
+    finish_raw_registered(actor, cleanup_uri, phase)
+}
+fn statement_size(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
+    // Independent Trino483 default contract; do not import product constants.
+    const UTF16_UNITS: usize = 1_000_000;
+    fn padded(bytes: usize) -> String {
+        const PREFIX: &str = "SELECT 1 /*";
+        const SUFFIX: &str = "*/";
+        format!(
+            "{PREFIX}{}{SUFFIX}",
+            "x".repeat(bytes - PREFIX.len() - SUFFIX.len())
+        )
+    }
+    for (bytes, too_large) in [
+        (UTF16_UNITS, false),
+        (UTF16_UNITS + 1, true),
+        (3 * UTF16_UNITS + 1, true),
+    ] {
+        let sql = padded(bytes);
+        ensure!(
+            sql.len() == bytes && sql.encode_utf16().count() == bytes,
+            "independent query-size byte/code-unit input changed"
+        );
+        assert_raw_query_size(actor, &sql, too_large)?;
+    }
+    context.action("default1000000UTF16 exact SQL accepted; +1unit and3000001-byte legal comment SQL produced registered QueryError35/QUERY_TEXT_TOO_LARGE/USER_ERROR with exact replay");
+    Ok(())
+}
+
 fn info(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     let response = actor.get(&format!("{}/v1/info", actor.base()))?;
     ensure!(response.status == 200, "ServerInfo did not return HTTP 200");
@@ -856,14 +1234,14 @@ fn info(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
     Ok(())
 }
 #[derive(Clone, Debug)]
-struct Observation {
-    active: u64,
-    complete: u64,
-    failed: u64,
-    client_cancel: u64,
-    abandoned: u64,
+pub(super) struct Observation {
+    pub(super) active: u64,
+    pub(super) complete: u64,
+    pub(super) failed: u64,
+    pub(super) client_cancel: u64,
+    pub(super) abandoned: u64,
 }
-fn observation(context: &mut ScenarioContext, label: &str) -> Result<Observation> {
+pub(super) fn observation(context: &mut ScenarioContext, label: &str) -> Result<Observation> {
     let response = context
         .handle()
         .frontend_management_get("/metrics?type=json", Duration::from_secs(1))?;
@@ -948,7 +1326,7 @@ fn require_original_statement_held(context: &mut ScenarioContext, label: &str) -
     )?;
     Ok(())
 }
-fn await_observation(
+pub(super) fn await_observation(
     context: &mut ScenarioContext,
     label: &str,
     predicate: impl Fn(&Observation) -> bool,

@@ -65,6 +65,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from trino_query import run_text_column
+
 
 DEFAULT_CASES = (
     "tpc-h/q1", "tpc-h/q7", "tpc-h/q8", "tpc-h/q9",
@@ -88,7 +90,7 @@ def repo_root() -> Path:
 
 def case_to_sql_path(case_id: str) -> Path:
     suite, case = case_id.split("/", 1)
-    return repo_root() / "tests" / "sql" / "suites" / suite / "sql" / f"{case}.sql"
+    return repo_root() / "tests" / "sql" / "correctness" / suite / "sql" / f"{case}.sql"
 
 
 def case_default_database(case_id: str) -> str | None:
@@ -115,9 +117,19 @@ def safe_file_name(case_id: str) -> str:
     return case_id.replace("/", "__")
 
 
-def collect_case(endpoint: Endpoint, case_id: str, out_dir: Path, timeout: int) -> dict[str, int]:
+def run_novarocks(endpoint: Endpoint, raw_sql: str, timeout: float, database: str | None = None, *,
+                   artifact_receipt: str | None = None, nr_catalog: str | None = None) -> str:
+    return run_text_column(endpoint, explain_sql(raw_sql), timeout, database,
+                           receipt=artifact_receipt, catalog=nr_catalog)
+
+
+def collect_case(endpoint: Endpoint, case_id: str, out_dir: Path, timeout: int, *,
+                 artifact_receipt: str | None = None, nr_catalog: str | None = None) -> dict[str, int]:
     raw = case_to_sql_path(case_id).read_text()
-    explain = run_mysql(endpoint, explain_sql(raw), timeout, case_default_database(case_id))
+    explain = (run_novarocks(endpoint, raw, timeout, case_default_database(case_id),
+                              artifact_receipt=artifact_receipt, nr_catalog=nr_catalog)
+               if endpoint.dialect == "nr" else
+               run_mysql(endpoint, explain_sql(raw), timeout, case_default_database(case_id)))
     out_path = out_dir / endpoint.name / f"{safe_file_name(case_id)}.out"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(explain)
@@ -134,6 +146,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--case", action="append", dest="cases")
+    parser.add_argument("--artifact-receipt", default=None)
+    parser.add_argument("--nr-catalog", default=None)
     return parser.parse_args()
 
 
@@ -146,12 +160,15 @@ def main() -> int:
 
     rows = []
     summary = []
+    failures = []
     for case_id in cases:
         try:
             fe_counts = collect_case(fe, case_id, out_dir, args.timeout)
-            nr_counts = collect_case(nr, case_id, out_dir, args.timeout)
+            nr_counts = collect_case(nr, case_id, out_dir, args.timeout,
+                                     artifact_receipt=args.artifact_receipt, nr_catalog=args.nr_catalog)
         except Exception as exc:  # fail-loud per case, keep going
-            print(f"[skip] {case_id}: {exc}", file=sys.stderr)
+            failures.append({"case": case_id, "error": str(exc)})
+            print(f"[fail] {case_id}: {exc}", file=sys.stderr)
             continue
         fe_split = fe_counts["update"] + fe_counts["merge"]
         nr_split = nr_counts["local"] + nr_counts["global"]
@@ -160,11 +177,12 @@ def main() -> int:
 
     status = out_dir / "status"
     status.mkdir(parents=True, exist_ok=True)
+    (status / "aggregate_split_failures.json").write_text(json.dumps(failures, indent=2) + "\n")
     (status / "aggregate_split_summary.json").write_text(json.dumps(summary, indent=2))
     table = ["| case | FE split markers | NR split markers |", "|---|---:|---:|", *rows]
     (status / "aggregate_split_table.md").write_text("\n".join(table) + "\n")
     print("\n".join(table))
-    return 0
+    return int(bool(failures))
 
 
 if __name__ == "__main__":

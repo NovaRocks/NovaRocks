@@ -17,17 +17,15 @@
 
 //! Finite MV-owned launch declarations and exact statement observation cleanup.
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::StatementResult;
 use crate::scenario::ScenarioContext;
+use crate::scenarios::native_sql_controls::SelectedStatement;
+use crate::scenarios::paimon::scan_statement_actor::{ScanActor, combine};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
-use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 pub(in crate::scenarios) const REWRITE_SQL: &str =
@@ -288,32 +286,11 @@ pub(in crate::scenarios) fn first_refresh_plan(
 /// Keep the primary result and actual cleanup failure, without converting a
 /// missing action or failed drain into a successful scenario.
 pub(in crate::scenarios) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
-    match (primary, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => {
-            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
-        }
-    }
+    combine(primary, cleanup)
 }
 
 pub(in crate::scenarios) struct ObservedQuery {
-    receiver: Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
-    worker: Option<JoinHandle<Result<()>>>,
-    observation: QueryLifecycleStatementObservation,
-}
-
-impl Drop for ObservedQuery {
-    fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            match worker.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("Exact MV SQL actor cleanup failed: {error:#}"),
-                Err(_) => eprintln!("Exact MV SQL actor panicked during actual join"),
-            }
-        }
-    }
+    actor: ScanActor<StatementResult>,
 }
 
 impl ObservedQuery {
@@ -323,76 +300,45 @@ impl ObservedQuery {
         namespace: &str,
         run_token: &str,
     ) -> Result<Self> {
-        let mut conn = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
+        let selected = SelectedStatement {
+            sql: REWRITE_SQL.into(),
+            token: run_token.into(),
+            faults: Vec::new(),
+            deadline: context.deadline(),
+        };
+        let catalog = catalog.to_owned();
+        let namespace = namespace.to_owned();
+        let actor = ScanActor::start_with_setup(
+            context,
+            REWRITE_SQL.into(),
+            Some(selected),
+            move |session| {
+                session.execute(format!("SET CATALOG {catalog}"))?;
+                session.execute(format!("USE {namespace}"))?;
+                Ok(())
+            },
+            Ok,
         )?;
-        conn.query_drop(format!("SET CATALOG {catalog}"))?;
-        conn.query_drop(format!("USE {namespace}"))?;
-        let deadline = context.deadline();
-        let observation = context.handle().arm_selected_statement_observation(
-            run_token,
-            conn.connection_id(),
-            REWRITE_SQL,
-            deadline,
-        )?;
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("mv-exact-rewrite-query".into())
-            .spawn(move || -> Result<()> {
-                let result = conn
-                    .run(|conn| {
-                        conn.query(REWRITE_SQL)
-                            .context("execute exact rewritten aggregate query")
-                    })
-                    .map_err(|error| format!("{error:#}"));
-                sender
-                    .send(result)
-                    .map_err(|error| anyhow::anyhow!("exact MV query result owner closed: {error}"))
-            });
-        match worker {
-            Ok(worker) => Ok(Self {
-                receiver,
-                worker: Some(worker),
-                observation,
-            }),
-            Err(error) => {
-                let cleanup = context
-                    .handle()
-                    .drain_query_lifecycle_statement_observation(&observation);
-                with_cleanup(Err(error.into()), cleanup)
-            }
-        }
+        Ok(Self { actor })
     }
 
     pub(in crate::scenarios) fn is_finished(&self) -> bool {
-        self.worker
-            .as_ref()
-            .is_none_or(|worker| worker.is_finished())
+        self.actor.is_finished()
     }
 
-    fn finish(mut self, context: &mut ScenarioContext, action: &str) -> Result<Vec<(i32, i64)>> {
+    fn finish(self, context: &mut ScenarioContext, action: &str) -> Result<Vec<(i32, i64)>> {
         context.action(action);
         let result = context.remaining(action).and_then(|remaining| {
-            self.receiver
+            self.actor
+                .done
                 .recv_timeout(remaining)
                 .context("exact MV query did not finish")
-                .and_then(|result| result.map_err(anyhow::Error::msg))
+                .and_then(|result| result.map_err(anyhow::Error::new))
         });
-        // The actor owns its bounded MySQL connection. Join before draining
-        // the exact statement journal even when result delivery failed.
-        let joined = self
-            .worker
-            .take()
-            .expect("original exact MV query actor")
-            .join()
-            .map_err(|_| anyhow::anyhow!("exact MV query actor panicked"))
-            .and_then(|result| result);
-        let drained = context
-            .handle()
-            .drain_query_lifecycle_statement_observation(&self.observation);
-        with_cleanup(with_cleanup(result, joined), drained)
+        // The original actor cancels a nonterminal failure, joins its reader,
+        // and drains the same exact query binding with the original deadline.
+        let result = self.actor.settle(context, result)?;
+        crate::scenarios::mv_uea7::mv_rows(&result)
     }
 
     pub(in crate::scenarios) fn finish_after_release(
@@ -407,9 +353,7 @@ impl ObservedQuery {
         match (phase, result) {
             (Ok(()), result) => result,
             (Err(primary), Ok(_)) => Err(primary),
-            (Err(primary), Err(query)) => {
-                Err(anyhow::anyhow!("{primary:#}; query exit failed: {query:#}"))
-            }
+            (Err(primary), Err(query)) => with_cleanup(Err(primary), Err(query)),
         }
     }
 }

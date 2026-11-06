@@ -58,9 +58,6 @@ pub mod dml_admission;
 /// Read-only Catalog facts consumed by session SQL admission.
 pub mod catalog;
 
-/// Parser-admitted KILL statement execution over query and connection ports.
-pub mod kill;
-
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
 
@@ -81,22 +78,6 @@ pub trait SpecializedStatementRoute: Send + Sync {
             Err(crate::api::CommandError::new(
                 crate::api::CommandErrorKind::Unsupported,
                 "SHOW BACKENDS command route is unavailable",
-            ))
-        })
-    }
-
-    /// Projects this frontend's own session registry. `full` is MySQL's
-    /// opt-out of truncating the reported statement text.
-    fn execute_show_process_list(
-        &self,
-        _full: bool,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> CommandFuture {
-        Box::pin(async {
-            Err(crate::api::CommandError::new(
-                crate::api::CommandErrorKind::Unsupported,
-                "SHOW PROCESSLIST command route is unavailable",
             ))
         })
     }

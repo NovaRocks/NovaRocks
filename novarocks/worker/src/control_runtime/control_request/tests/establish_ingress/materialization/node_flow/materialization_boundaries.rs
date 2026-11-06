@@ -22,9 +22,15 @@ use std::sync::atomic::AtomicBool;
 
 type BoundaryScene = Scenario<ColdNotificationPool>;
 #[derive(Default)]
+struct BoundaryState {
+    released: bool,
+    requested_samples: usize,
+    samples: Vec<bool>,
+}
+#[derive(Default)]
 struct Boundary {
     entered: AtomicBool,
-    released: Mutex<bool>,
+    state: Mutex<BoundaryState>,
     changed: Condvar,
     forbidden: Mutex<Option<ParticipationRef>>,
     factory_thread: Mutex<Option<std::thread::ThreadId>>,
@@ -34,14 +40,40 @@ struct Boundary {
 }
 impl Boundary {
     fn release(&self) {
-        *self.released.lock().unwrap() = true;
+        self.state.lock().unwrap().released = true;
         self.changed.notify_all();
     }
-    fn materialize(&self) {
+    fn materialize(&self, control: &dyn crate::ParticipationMaterializationControl) {
         self.entered.store(true, Ordering::Release);
-        let mut released = self.released.lock().unwrap();
-        while !*released {
-            released = self.changed.wait(released).unwrap();
+        let mut state = self.state.lock().unwrap();
+        while !state.released {
+            while state.samples.len() < state.requested_samples {
+                // Only the original M thread reads the borrowed Scope control.
+                // The test thread receives observations, never the capability.
+                state.samples.push(control.is_stopped());
+                self.changed.notify_all();
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+    fn sample_control(&self) -> Option<bool> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        let index = state.requested_samples;
+        state.requested_samples += 1;
+        self.changed.notify_all();
+        loop {
+            if let Some(sample) = state.samples.get(index) {
+                return Some(*sample);
+            }
+            if state.released {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
         }
     }
 }
@@ -84,12 +116,16 @@ impl ParticipationHostInstance for BoundaryInstance {
     fn participation(&self) -> ParticipationRef {
         self.participation
     }
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        control: &dyn crate::ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
         assert_eq!(request.participation(), self.participation);
         self.calls.observe_host();
         self.calls.materializations.fetch_add(1, Ordering::SeqCst);
         *self.boundary.materialize_thread.lock().unwrap() = Some(std::thread::current().id());
-        self.boundary.materialize();
+        self.boundary.materialize(control);
         Ok(())
     }
     fn release(&self) -> ReleasedParticipationEvidence {
@@ -318,6 +354,11 @@ pub(super) fn accepted_creator_retains_only_participation_custody() {
     assert_eq!(source_drops.load(Ordering::SeqCst), 4);
 }
 pub(super) fn blocked_materialization_keeps_control_live() {
+    for lease_expired in [true, false] {
+        blocked_materialization_observes_original_stop(lease_expired);
+    }
+}
+fn blocked_materialization_observes_original_stop(lease_expired: bool) {
     let boundary = Arc::new(Boundary::default());
     let _release = ReleaseOnExit(boundary.clone());
     let StartedScenario {
@@ -340,25 +381,66 @@ pub(super) fn blocked_materialization_keeps_control_live() {
     ));
     let mut original = establish(&scene, operation(), raw);
     assert!(wait_until(|| boundary.entered.load(Ordering::Acquire)));
+    let before_quiesce = boundary.sample_control();
     quiesce(&scene, participation, 13, false, 2);
     assert!(wait_until(
         || scene.ledger.used(Dimension::Requests.id()) == 1
     ));
-    expire(&scene);
-    quiesce(&scene, participation, 14, true, 2);
+    let after_quiesce = boundary.sample_control();
+    let expected = if lease_expired {
+        expire(&scene);
+        quiesce(&scene, participation, 14, true, 2);
+        OperationOutcome::LeaseExpired
+    } else {
+        let mut abort = scene
+            .node
+            .submit_participation(
+                participation,
+                scene.node.next_source(),
+                operation_number(14),
+                deadline(),
+                ParticipationCommand::Abort {
+                    cause: novarocks_execution_contract::AbortCause::QueryFailed,
+                },
+            )
+            .unwrap();
+        let delivery = wait_delivery(&mut abort)
+            .expect("the real Abort completes while original materialization stays blocked");
+        assert_eq!(delivery.request(), abort.request());
+        assert!(
+            matches!(delivery.body(), ParticipationReplyBody::Participation(ack)
+            if ack.outcome == OperationOutcome::Accepted)
+        );
+        assert_eq!(scene.ledger.used(Dimension::Requests.id()), 2);
+        drop(delivery);
+        drop(abort);
+        OperationOutcome::ParticipationTerminalReceipt
+    };
     assert!(wait_until(
         || scene.ledger.used(Dimension::Requests.id()) == 1
     ));
-    assert!(original.try_take().is_none());
-    assert_eq!(scene.calls.releases.load(Ordering::SeqCst), 0);
-    assert_eq!(source_drops.load(Ordering::SeqCst), 0);
+    let after_stop = boundary.sample_control();
+    let repeated_stop = boundary.sample_control();
+    let original_still_pending = original.try_take().is_none();
+    let releases_before_materialization_exit = scene.calls.releases.load(Ordering::SeqCst);
+    let source_drops_before_materialization_exit = source_drops.load(Ordering::SeqCst);
+    // Stop observation must not substitute for the foreign call's real exit.
+    // Preserve the held observations, then release/join before asserting them.
     boundary.release();
-    settle_establish(&mut original, OperationOutcome::LeaseExpired);
+    settle_establish(&mut original, expected);
     drop(original);
     assert_eq!(getters.load(Ordering::SeqCst), 3);
     finish(scene, &boundary);
+    assert_eq!(before_quiesce, Some(false));
+    assert_eq!(after_quiesce, Some(false));
+    assert_eq!(after_stop, Some(true));
+    assert_eq!(repeated_stop, Some(true));
+    assert!(original_still_pending);
+    assert_eq!(releases_before_materialization_exit, 0);
+    assert_eq!(source_drops_before_materialization_exit, 0);
     assert_eq!(source_drops.load(Ordering::SeqCst), 4);
 }
+
 fn second_raw(
     participation: ParticipationRef,
     operation: TaskOperationId,

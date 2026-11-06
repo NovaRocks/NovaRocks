@@ -19,31 +19,13 @@
 use super::*;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 
-/// The original Server/MySQL limits, still enforced by that ingress owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrontendStatementIngress {
-    pub ordinary_connections: NonZeroUsize,
-    pub control_connections: NonZeroUsize,
-    pub ordinary_command_bytes: NonZeroUsize,
-    pub control_command_bytes: NonZeroUsize,
-}
 impl FrontendWorkloadCapacityProfile {
     pub fn try_for_native(
         inputs: FrontendNativeCapacityInputs,
         workload: &WorkloadConfig,
         result: FrontendResultCapacityProfile,
         transport: FrontendTaskTransportBudget,
-        ingress: FrontendStatementIngress,
     ) -> Result<Self, WorkError> {
-        Self::from_configuration(
-            inputs,
-            workload,
-            Some(result.declared()),
-            Some(transport),
-            Some(ingress),
-        )
-    }
-    pub fn statement_ingress(&self) -> Option<FrontendStatementIngress> {
-        self.statement_ingress
+        Self::from_configuration(inputs, workload, Some(result.declared()), Some(transport))
     }
 }

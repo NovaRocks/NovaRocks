@@ -88,7 +88,7 @@ use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
-/// Selects a finite direct hold only for the exact nominated admission context.
+/// Selects a finite direct hold only for the exact nominated admission participation.
 pub fn claim_native_ingress_hold(
     controls: &NativeTestControls,
     request: &tonic::Request<proto::ApplyTaskOperationsRequest>,
@@ -424,7 +424,7 @@ pub fn record_task_execution_failure(
 
 /// Holds one applied `EstablishParticipation` open until this process is gone.
 ///
-/// The context is installed before the wait begins, so the process the harness
+/// The participation is installed before the wait begins, so the process the harness
 /// replaces is one that really did admit this attempt. Without the wait a
 /// short query can finish between the marker and the harness's kill, which
 /// proves nothing about loss after admission -- the same reason the retired
@@ -444,7 +444,7 @@ pub fn record_task_execution_failure(
 /// wait is the normal case: the operation times out client-side and
 /// `ParticipationOwner` replays the exact same request.
 ///
-/// That replay reaches a process whose context is already installed, so the
+/// That replay reaches a process whose participation is already installed, so the
 /// registry answers `Idempotent` -- and `is_applied()` counts `Idempotent`, so
 /// the frontend would mark the establish acknowledged, `contexts_established()`
 /// would flip, and `close_after_control_ready()` would shut the pre-ready retry
@@ -483,6 +483,9 @@ pub fn arm_restart_after_establish_participation(
     Ok(())
 }
 
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const RESTART_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 pub fn restart_after_establish_participation(
     controls: &NativeTestControls,
     participation: ParticipationRef,
@@ -519,6 +522,163 @@ pub fn restart_after_establish_participation(
     Ok(())
 }
 
+/// The original Native RPC retains the actual Worker delivery while its
+/// already-applied establish waits for the runner. Idempotent replays enter
+/// the same hold; they cannot make an unacknowledged participation ControlReady.
+pub async fn restart_after_establish_participation_async(
+    controls: &NativeTestControls,
+    participation: ParticipationRef,
+    outcome: OperationOutcome,
+    original_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    if !matches!(
+        outcome,
+        OperationOutcome::Accepted | OperationOutcome::Idempotent
+    ) {
+        controls.disarm_restart(participation);
+        return Ok(());
+    }
+    let Some(scope) = controls.restart_claim(participation) else {
+        return Ok(());
+    };
+    if scope
+        .action_ended()
+        .map_err(tonic::Status::failed_precondition)?
+    {
+        // Dropping one RPC does not retire its finite action. Once the actual
+        // action ends, a later replay must not reconnect its old rendezvous.
+        controls.disarm_restart(participation);
+        return Ok(());
+    }
+    if outcome == OperationOutcome::Accepted {
+        let execution = participation.query_execution_id();
+        eprintln!(
+            "{} execution_id={}:{}:{} backend_index={} process_id={} token={}",
+            novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_OBSERVED,
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            scope.backend_index,
+            scope.process_id,
+            scope.token,
+        );
+    }
+    notify_runner_of_restart_after_establish_async(&scope, original_deadline).await?;
+    wait_for_restart_after_establish_participation_async(
+        controls,
+        participation,
+        original_deadline,
+    )
+    .await?;
+    if outcome == OperationOutcome::Accepted {
+        controls.disarm_restart(participation);
+    }
+    Ok(())
+}
+
+/// Wait before Task R handoff, using the same finite claim, release author and
+/// original request deadline. No spawned work outlives the original RPC.
+pub async fn wait_for_restart_after_establish_participation_async(
+    controls: &NativeTestControls,
+    participation: ParticipationRef,
+    original_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    let Some(scope) = controls.restart_claim(participation) else {
+        return Ok(());
+    };
+    let cancellation = scope.cancellation();
+    let deadline = original_deadline
+        .min(cancellation.deadline())
+        .min(std::time::Instant::now() + RESTART_WAIT);
+    let release = novarocks_failpoint::trigger_path(
+        scope.root(),
+        scope.backend_index,
+        QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
+    )
+    .with_extension("release");
+    while cancellation.is_active() && std::time::Instant::now() < deadline {
+        if !restart_after_establish_participation_holds_task_creation(controls, participation) {
+            return Ok(());
+        }
+        // The original selected action may end while its role remains alive.
+        // That is a release author, not proof that Worker work has exited.
+        if scope
+            .action_ended()
+            .map_err(tonic::Status::failed_precondition)?
+        {
+            return Ok(());
+        }
+        match std::fs::read_to_string(&release) {
+            Ok(token) if token.trim() == scope.token => {
+                let _ = std::fs::remove_file(&release);
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(tonic::Status::failed_precondition(format!(
+                    "read original restart release: {error}",
+                )));
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline.min(std::time::Instant::now() + RESTART_POLL),
+            )) => {},
+        }
+    }
+    Ok(())
+}
+
+async fn notify_runner_of_restart_after_establish_async(
+    scope: &NativeFaultClaim,
+    original_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&scope.token)
+        .map_err(tonic::Status::failed_precondition)?;
+    let cancellation = scope.cancellation();
+    let deadline = original_deadline
+        .min(cancellation.deadline())
+        .min(std::time::Instant::now() + RESTART_WAIT);
+    if !cancellation.is_active() || std::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    let rendezvous = async {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| {
+                format!("restart-after-establish runner rendezvous is unavailable: {error}")
+            })?;
+        stream
+            .write_all(scope.token.as_bytes())
+            .await
+            .map_err(|error| format!("write restart-after-establish rendezvous token: {error}"))?;
+        stream.shutdown().await.map_err(|error| {
+            format!("close restart-after-establish rendezvous write side: {error}")
+        })?;
+        scope.record_hit()?;
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte).await {
+            Ok(0) => Ok(()),
+            Ok(_) => Err("Native restart runner sent an invalid release instead of EOF".into()),
+            Err(error) => Err(format!("Native restart runner read failed: {error}")),
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(tonic::Status::failed_precondition(
+            "Native hold session closed or original deadline elapsed")),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rendezvous) => {
+            result.map_err(|_| tonic::Status::failed_precondition(
+                "Native hold session closed or original deadline elapsed"))?
+                .map_err(tonic::Status::failed_precondition)
+        }
+    }
+}
+
 /// Holds task creation for an establish rendezvous that has already published
 /// its marker.
 ///
@@ -526,8 +686,8 @@ pub fn restart_after_establish_participation(
 /// only the former leaves a scheduler race in which a parallel create can be
 /// admitted after the marker but before the runner kills the process. That is
 /// a different failure boundary from the one this fault claims to construct:
-/// the context would become ControlReady before the process loss. The hold is
-/// scoped to the exact context and exists only while the accepted establish is
+/// the participation would become ControlReady before the process loss. The hold is
+/// scoped to the exact participation and exists only while the accepted establish is
 /// parked, so it neither changes normal admission nor broadens the fault to
 /// other attempts.
 pub fn restart_after_establish_participation_holds_task_creation(
@@ -537,7 +697,7 @@ pub fn restart_after_establish_participation_holds_task_creation(
     controls.restart_claim(participation).is_some()
 }
 
-/// Waits for the exact runner-owned restart that holds this context's task
+/// Waits for the exact runner-owned restart that holds this participation's task
 /// creation. The scope was validated when the accepted establish armed the
 /// hold, so the registry can call this at its linearization point without
 /// re-reading fault configuration while it owns its lock.
@@ -571,8 +731,6 @@ impl novarocks_worker::TaskCreationGate for RestartAfterEstablishTaskCreationGat
 /// than with a release. The release path exists so a harness that only wants
 /// the rendezvous, without a replacement, can let the establish answer.
 fn wait_for_runner_owned_restart(scope: &NativeFaultClaim) {
-    const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-    const RESTART_POLL: std::time::Duration = std::time::Duration::from_millis(1);
     let root = scope.root();
     let release = novarocks_failpoint::trigger_path(
         root,
@@ -608,8 +766,7 @@ fn wait_for_runner_owned_restart(scope: &NativeFaultClaim) {
 fn notify_runner_of_restart_after_establish(scope: &NativeFaultClaim) -> Result<(), tonic::Status> {
     let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&scope.token)
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
-    let deadline = (std::time::Instant::now() + std::time::Duration::from_secs(30))
-        .min(scope.cancellation().deadline());
+    let deadline = (std::time::Instant::now() + RESTART_WAIT).min(scope.cancellation().deadline());
     let mut stream = match novarocks_failpoint::liveness::connect_until(&path, deadline, || {
         !scope.cancellation().is_active()
     }) {
@@ -759,6 +916,117 @@ pub fn task_update_terminal_ack_dropped(
     Err(tonic::Status::deadline_exceeded(
         "runner-owned TaskUpdate terminal acknowledgement dropped after acceptance",
     ))
+}
+
+/// Park the same decoded Create and admitted ingress before Worker handoff.
+/// The original RPC owns this socket, finite action and absolute deadline.
+pub async fn create_task_before_worker_hold_async(
+    controls: &NativeTestControls,
+    identity: TaskIdentity,
+    outbound_edges: usize,
+    original_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(scope) = controls
+        .claim_task(
+            QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
+            identity,
+            true,
+        )
+        .map_err(tonic::Status::failed_precondition)?
+    else {
+        return Ok(());
+    };
+    let cancellation = scope.cancellation();
+    let deadline = original_deadline
+        .min(cancellation.deadline())
+        .min(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    if scope
+        .action_ended()
+        .map_err(tonic::Status::failed_precondition)?
+        || !cancellation.is_active()
+        || std::time::Instant::now() >= deadline
+    {
+        return Ok(());
+    }
+    let execution = identity.query_execution_id();
+    let payload = format!(
+        "token={} execution_id={}:{}:{} stage={} task={} backend_index={} process_id={} outbound_edges={}\n",
+        scope.token,
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        scope.backend_index,
+        identity.backend_process_id(),
+        outbound_edges,
+    );
+    let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&scope.token)
+        .map_err(tonic::Status::failed_precondition)?;
+    let original = async {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| format!("connect pre-Worker Create rendezvous: {error}"))?;
+        if scope.action_ended()?
+            || !cancellation.is_active()
+            || std::time::Instant::now() >= deadline
+        {
+            return Ok(());
+        }
+        stream
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|error| format!("deliver pre-Worker Create identity: {error}"))?;
+        stream
+            .shutdown()
+            .await
+            .map_err(|error| format!("close pre-Worker Create write side: {error}"))?;
+        if scope.action_ended()? {
+            return Ok(());
+        }
+        scope.record_hit()?;
+        eprintln!(
+            "{} {}",
+            novarocks_failpoint::observation_marker::TASK_CREATE_BEFORE_WORKER_HELD,
+            payload.trim_end()
+        );
+        let mut release = [0_u8; 1];
+        match stream.read(&mut release).await {
+            Ok(1) if release == *b"R" => Ok(()),
+            Ok(_) => Err("Native hold runner disconnected or sent an invalid release".into()),
+            Err(error) => Err(format!("Native hold runner read failed: {error}")),
+        }
+    };
+    tokio::pin!(original);
+    loop {
+        if scope
+            .action_ended()
+            .map_err(tonic::Status::failed_precondition)?
+        {
+            return Ok(());
+        }
+        if !cancellation.is_active() || std::time::Instant::now() >= deadline {
+            return Err(tonic::Status::failed_precondition(
+                "Native hold session closed or original deadline elapsed",
+            ));
+        }
+        tokio::select! {
+            biased;
+            result = &mut original => {
+                // Ending this exact action is an independent release author.
+                // Plain EOF, cancellation or elapsed time does not prove it.
+                if scope.action_ended().map_err(tonic::Status::failed_precondition)? {
+                    return Ok(());
+                }
+                return result.map_err(tonic::Status::failed_precondition);
+            },
+            _ = cancellation.cancelled() => {},
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline.min(std::time::Instant::now() + std::time::Duration::from_millis(20)),
+            )) => {},
+        }
+    }
 }
 
 /// Holds only a runner-armed exact Create before the Worker accepts it.
@@ -1385,6 +1653,213 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    async fn receive_async_create(
+        listener: &tokio::net::UnixListener,
+    ) -> (tokio::net::UnixStream, String) {
+        use tokio::io::AsyncReadExt;
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut payload = String::new();
+        peer.read_to_string(&mut payload).await.unwrap();
+        (peer, payload)
+    }
+
+    #[tokio::test]
+    async fn async_create_hold_retains_exact_task_and_edges_until_original_release() {
+        use tokio::io::AsyncWriteExt;
+        let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        let identity = task(&fixture, 2);
+        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&fixture.token)
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = create_task_before_worker_hold_async(
+            &fixture.controls,
+            identity,
+            3,
+            Instant::now() + Duration::from_secs(3),
+        );
+        tokio::pin!(held);
+        let (mut peer, payload) = tokio::select! {
+            peer = receive_async_create(&listener) => peer,
+            result = &mut held => panic!("Create left before its original identity handoff: {result:?}"),
+        };
+        let execution = identity.query_execution_id();
+        assert_eq!(
+            payload,
+            format!(
+                "token={} execution_id={}:{}:{} stage={} task={} backend_index=0 process_id={} outbound_edges=3\n",
+                fixture.token,
+                execution.query_id().high(),
+                execution.query_id().low(),
+                execution.attempt_id().get(),
+                identity.stage_id().get(),
+                identity.task_id().get(),
+                identity.backend_process_id(),
+            )
+        );
+        std::future::poll_fn(|cx| match std::future::Future::poll(held.as_mut(), cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => panic!("Create left before R: {result:?}"),
+        })
+        .await;
+        // This same executor remains available while its original RPC is parked.
+        tokio::task::yield_now().await;
+        peer.write_all(b"R").await.unwrap();
+        held.await.unwrap();
+        assert!(fixture.role.scope().is_active());
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            1
+        );
+        end_fixture(&fixture, kind, &binding);
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_create_hold_plain_eof_is_failure_but_exact_action_end_releases() {
+        for ended in [false, true] {
+            let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+            let fixture = controlled(kind.as_str());
+            let binding = bind_fixture(&fixture, kind);
+            let path =
+                novarocks_failpoint::create_before_worker_rendezvous_socket_path(&fixture.token)
+                    .unwrap();
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let held = create_task_before_worker_hold_async(
+                &fixture.controls,
+                task(&fixture, 2),
+                1,
+                Instant::now() + Duration::from_secs(3),
+            );
+            tokio::pin!(held);
+            let (peer, _) = tokio::select! {
+                peer = receive_async_create(&listener) => peer,
+                result = &mut held => panic!("Create left before its runner accepted: {result:?}"),
+            };
+            if ended {
+                end_fixture(&fixture, kind, &binding);
+            }
+            // End releases while the actual peer is still open. Otherwise EOF
+            // must stay a failure and cannot impersonate the explicit R byte.
+            let result = if ended {
+                held.await
+            } else {
+                drop(peer);
+                held.await
+            };
+            if ended {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+                end_fixture(&fixture, kind, &binding);
+            }
+            assert!(fixture.role.scope().is_active());
+            drop(listener);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn async_create_hold_drop_keeps_original_action_until_ended_replay() {
+        let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&fixture.token)
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut original = Box::pin(create_task_before_worker_hold_async(
+            &fixture.controls,
+            task(&fixture, 2),
+            1,
+            deadline,
+        ));
+        let (peer, _) = tokio::select! {
+            peer = receive_async_create(&listener) => peer,
+            result = &mut original => panic!("Create left before original handoff: {result:?}"),
+        };
+        drop(original);
+        assert!(
+            !fixture
+                .controls
+                .claim_task(kind, task(&fixture, 2), true)
+                .unwrap()
+                .unwrap()
+                .action_ended()
+                .unwrap()
+        );
+        end_fixture(&fixture, kind, &binding);
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        create_task_before_worker_hold_async(&fixture.controls, task(&fixture, 2), 1, deadline)
+            .await
+            .unwrap();
+        assert!(fixture.role.scope().is_active());
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|e| e.event == "hit")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn async_create_hold_obeys_original_request_deadline_and_role_close() {
+        for close_role in [false, true] {
+            let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+            let mut fixture = controlled(kind.as_str());
+            let binding = bind_fixture(&fixture, kind);
+            let path =
+                novarocks_failpoint::create_before_worker_rendezvous_socket_path(&fixture.token)
+                    .unwrap();
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let deadline = Instant::now()
+                + if close_role {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_millis(100)
+                };
+            let held = create_task_before_worker_hold_async(
+                &fixture.controls,
+                task(&fixture, 2),
+                1,
+                deadline,
+            );
+            tokio::pin!(held);
+            let (peer, _) = tokio::select! {
+                peer = receive_async_create(&listener) => peer,
+                result = &mut held => panic!("Create left before its original handoff: {result:?}"),
+            };
+            if close_role {
+                fixture.runner.end_and_join().unwrap();
+            }
+            let error = held.await.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            if !close_role {
+                assert!(Instant::now() >= deadline);
+                assert!(fixture.role.scope().is_active());
+                end_fixture(&fixture, kind, &binding);
+            }
+            drop(peer);
+            drop(listener);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     #[test]
     fn root_start_action_is_left_unclaimed_by_ordinary_tasks_and_claimed_once_by_root() {
         let kind = QueryLifecycleFaultKind::RootTaskExecutionFailureBeforeData;
@@ -1599,5 +2074,247 @@ mod tests {
             &fixture.controls,
             exact
         ));
+    }
+
+    #[tokio::test]
+    async fn async_restart_holds_applied_replay_and_creation_until_the_original_action_ends() {
+        use tokio::io::AsyncReadExt;
+        let fixture = controlled("restart-after-establish-participation");
+        let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
+        let binding = bind_fixture(&fixture, kind);
+        let exact = participation(&fixture);
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
+        let deadline = fixture
+            .controls
+            .restart_claim(exact)
+            .unwrap()
+            .cancellation()
+            .deadline();
+        let path =
+            novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&fixture.token)
+                .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accepted = restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::Accepted,
+            deadline,
+        );
+        let replay = restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::Idempotent,
+            deadline,
+        );
+        tokio::pin!(accepted, replay);
+        let peers = async {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut first_token = Vec::new();
+            first.read_to_end(&mut first_token).await.unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut second_token = Vec::new();
+            second.read_to_end(&mut second_token).await.unwrap();
+            assert_eq!(first_token, fixture.token.as_bytes());
+            assert_eq!(second_token, fixture.token.as_bytes());
+            (first, second)
+        };
+        let peers = tokio::select! {
+            peers = peers => peers,
+            result = &mut accepted => panic!("applied establish answered before runner release: {result:?}"),
+            result = &mut replay => panic!("idempotent replay answered before runner release: {result:?}"),
+        };
+        let creation = wait_for_restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            deadline,
+        );
+        tokio::pin!(creation);
+        std::future::poll_fn(
+            |cx| match std::future::Future::poll(creation.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(result) => {
+                    panic!("creation passed the held exact participation: {result:?}")
+                }
+            },
+        )
+        .await;
+        let foreign = ParticipationRef::new(
+            fixture.execution,
+            fixture.frontend,
+            BackendProcessId::new_v7(),
+        );
+        wait_for_restart_after_establish_participation_async(&fixture.controls, foreign, deadline)
+            .await
+            .unwrap();
+        end_fixture(&fixture, kind, &binding);
+        drop(peers);
+        let (accepted, replay, creation) = tokio::join!(accepted, replay, creation);
+        accepted.unwrap();
+        replay.unwrap();
+        creation.unwrap();
+        assert!(fixture.role.scope().is_active());
+        assert!(!restart_after_establish_participation_holds_task_creation(
+            &fixture.controls,
+            exact
+        ));
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|event| event.event == "hit")
+                .count(),
+            1
+        );
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_restart_unapplied_establish_disarms_without_claiming_a_hit() {
+        let fixture = controlled("restart-after-establish-participation");
+        bind_fixture(
+            &fixture,
+            QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
+        );
+        let exact = participation(&fixture);
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
+        let deadline = fixture
+            .controls
+            .restart_claim(exact)
+            .unwrap()
+            .cancellation()
+            .deadline();
+        restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::NotReady,
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert!(!restart_after_establish_participation_holds_task_creation(
+            &fixture.controls,
+            exact
+        ));
+        assert!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .all(|event| event.event != "hit")
+        );
+    }
+
+    #[tokio::test]
+    async fn async_restart_role_close_returns_the_original_socket_wait_without_peer_eof() {
+        use tokio::io::AsyncReadExt;
+        let mut fixture = controlled("restart-after-establish-participation");
+        bind_fixture(
+            &fixture,
+            QueryLifecycleFaultKind::RestartAfterEstablishParticipation,
+        );
+        let exact = participation(&fixture);
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
+        let deadline = fixture
+            .controls
+            .restart_claim(exact)
+            .unwrap()
+            .cancellation()
+            .deadline();
+        let path =
+            novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&fixture.token)
+                .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let held = restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::Accepted,
+            deadline,
+        );
+        tokio::pin!(held);
+        let mut peer = tokio::select! {
+            peer = listener.accept() => peer.unwrap().0,
+            result = &mut held => panic!("establish answered before its runner accepted: {result:?}"),
+        };
+        let mut token = Vec::new();
+        tokio::select! {
+            result = peer.read_to_end(&mut token) => { result.unwrap(); },
+            result = &mut held => panic!("establish answered before its token handoff: {result:?}"),
+        }
+        assert_eq!(token, fixture.token.as_bytes());
+        fixture.runner.end_and_join().unwrap();
+        let error = held.await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!restart_after_establish_participation_holds_task_creation(
+            &fixture.controls,
+            exact
+        ));
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn async_restart_dropped_original_does_not_reenter_the_ended_action_on_replay() {
+        use tokio::io::AsyncReadExt;
+        let mut fixture = controlled("restart-after-establish-participation");
+        let kind = QueryLifecycleFaultKind::RestartAfterEstablishParticipation;
+        let binding = bind_fixture(&fixture, kind);
+        let exact = participation(&fixture);
+        arm_restart_after_establish_participation(&fixture.controls, exact).unwrap();
+        let deadline = fixture
+            .controls
+            .restart_claim(exact)
+            .unwrap()
+            .cancellation()
+            .deadline();
+        let path =
+            novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&fixture.token)
+                .unwrap();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let mut original = Box::pin(restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::Accepted,
+            deadline,
+        ));
+        let mut peer = tokio::select! {
+            peer = listener.accept() => peer.unwrap().0,
+            result = &mut original => panic!("original establish answered before runner accepted: {result:?}"),
+        };
+        let mut token = Vec::new();
+        tokio::select! {
+            result = peer.read_to_end(&mut token) => { result.unwrap(); },
+            result = &mut original => panic!("original establish answered before its token handoff: {result:?}"),
+        }
+        assert_eq!(token, fixture.token.as_bytes());
+        drop(original);
+        assert!(
+            restart_after_establish_participation_holds_task_creation(&fixture.controls, exact),
+            "caller cancellation cannot retire the original finite action"
+        );
+        end_fixture(&fixture, kind, &binding);
+        assert!(fixture.role.scope().is_active());
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        let replay = restart_after_establish_participation_async(
+            &fixture.controls,
+            exact,
+            OperationOutcome::Idempotent,
+            deadline,
+        )
+        .await;
+        let disarmed =
+            !restart_after_establish_participation_holds_task_creation(&fixture.controls, exact);
+        fixture.runner.end_and_join().unwrap();
+        drop(fixture);
+        assert!(
+            replay.is_ok(),
+            "ended action reentered its removed runner socket: {replay:?}"
+        );
+        assert!(disarmed);
     }
 }

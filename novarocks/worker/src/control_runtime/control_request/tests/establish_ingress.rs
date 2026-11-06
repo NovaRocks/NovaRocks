@@ -805,6 +805,7 @@ fn a_foreign_root_rejection_cannot_take_the_original_establish_raw_disposal() {
     );
     let foreign_actor = ActorId::new(2).unwrap();
     let foreign_core = ControlCore::new(
+        f.participation.backend_process_id(),
         ControlConfig {
             max_pending_requests: 1,
             step_budget: ControlCore::MAX_STEP_WORK,

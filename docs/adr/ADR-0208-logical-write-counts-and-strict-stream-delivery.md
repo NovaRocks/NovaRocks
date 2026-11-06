@@ -7,6 +7,8 @@ supersedes: []
 superseded-by: null
 partially-superseded-by: [ADR-0209]
 date: 2026-10-23
+related:
+  - "ADR-0217-sole-trino-entry-and-application-owned-completion.md (client completion projection supplements the logical count contract)"
 provenance:
   - "discussion: 2026-10-22 logical write summaries, independent routes and complete delivery"
   - "discussion: 2026-10-23 query-governed key state and transport flow-control ownership"

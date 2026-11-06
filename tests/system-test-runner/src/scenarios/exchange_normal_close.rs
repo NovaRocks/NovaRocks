@@ -627,28 +627,22 @@ fn fetch_rows(
                 let body = cursor.validate_body(profile, data.body())?;
                 for span in body.payload_spans() {
                     if let Some(length) = span.starts_row {
-                        // I64 ScalarText has at most 20 text bytes plus its
-                        // single MySQL length byte. This is the frozen fixture
+                        // One I64 JSON row has at most 20 number bytes plus
+                        // its two array brackets. This is the frozen fixture
                         // type, not an inferred Arrow slot or new product cap.
                         ensure!(
-                            row.is_empty() && length.get() <= 21,
+                            row.is_empty() && length.get() <= 22,
                             "B RootV1 row does not match its frozen single I64 occurrence"
                         );
                     }
                     row.extend_from_slice(span.bytes);
                     ensure!(
-                        row.len() <= 21,
+                        row.len() <= 22,
                         "B RootV1 exceeded its signed I64 row width"
                     );
                     if span.completes_row {
-                        let length = usize::from(*row.first().context("empty B RootV1 row")?);
-                        ensure!(
-                            (1..=20).contains(&length) && row.len() == length + 1,
-                            "B RootV1 row is NULL or not exactly one signed I64 cell"
-                        );
-                        let value = std::str::from_utf8(&row[1..])?
-                            .parse::<i64>()
-                            .context("B RootV1 cell is not signed BIGINT text")?;
+                        let [value] = serde_json::from_slice::<[i64; 1]>(&row)
+                            .context("B RootV1 row is not exactly one signed BIGINT JSON cell")?;
                         rows.push(value);
                         row.clear();
                     }

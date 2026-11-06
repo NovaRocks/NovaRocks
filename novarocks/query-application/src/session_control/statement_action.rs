@@ -24,15 +24,39 @@ use super::*;
 /// Immutable business completion facts selected by the original statement action.
 /// These values grant no statement visibility, publication or protocol authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StatementCommandCompletion {
-    affected_rows: u64,
+pub enum StatementCommandRowCount {
+    Counted(u64),
+    NoCount,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatementCommandCompletion {
+    Empty,
+    Rows(StatementCommandRowCount),
 }
 impl StatementCommandCompletion {
-    pub const fn new(affected_rows: u64) -> Self {
-        Self { affected_rows }
+    pub const fn new(rows: u64) -> Self {
+        Self::Rows(StatementCommandRowCount::Counted(rows))
     }
-    pub const fn affected_rows(&self) -> u64 {
-        self.affected_rows
+    pub const fn empty() -> Self {
+        Self::Empty
+    }
+    pub const fn no_count() -> Self {
+        Self::Rows(StatementCommandRowCount::NoCount)
+    }
+    pub const fn count(self) -> Option<u64> {
+        match self {
+            Self::Rows(StatementCommandRowCount::Counted(n)) => Some(n),
+            _ => None,
+        }
+    }
+    pub fn checked_row_value(self) -> Result<Option<i64>, &'static str> {
+        match self {
+            Self::Rows(StatementCommandRowCount::Counted(n)) => i64::try_from(n)
+                .map(Some)
+                .map_err(|_| "command count exceeds signed bigint"),
+            Self::Rows(StatementCommandRowCount::NoCount) => Ok(None),
+            Self::Empty => Err("empty completion has no count row"),
+        }
     }
 }
 
@@ -154,11 +178,88 @@ pub enum StatementActionWaitError {
         external_effect: Option<StatementExternalEffectDisposition>,
     },
 }
+/// Immutable output facts admitted by this same SQL session before publication.
+/// Background actions have no client projection and never construct this value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatementCompletionProjection {
+    shape: crate::session::StatementOutputShape,
+    family: novarocks_result_contract::ClientPresentationFamily,
+}
+impl StatementCompletionProjection {
+    pub fn new(
+        shape: crate::session::StatementOutputShape,
+        family: novarocks_result_contract::ClientPresentationFamily,
+    ) -> Self {
+        Self { shape, family }
+    }
+    pub fn shape(self) -> crate::session::StatementOutputShape {
+        self.shape
+    }
+    pub fn family(self) -> novarocks_result_contract::ClientPresentationFamily {
+        self.family
+    }
+}
+
 pub struct StatementActionReady {
     pub result: Result<StatementActionValue, QueryServiceError>,
+    completion_rows: Option<crate::api::OwnedLocalResult>,
+    completion_projection: Option<StatementCompletionProjection>,
     pub owner: GovernedQueryStatementOwner,
+    external_effect: Option<StatementExternalEffectDisposition>,
 }
 impl StatementActionReady {
+    pub fn new(
+        result: Result<StatementActionValue, QueryServiceError>,
+        owner: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            result,
+            owner,
+            completion_rows: None,
+            completion_projection: None,
+            external_effect: None,
+        }
+    }
+    /// Validate the Source's already-closed graph against its admitted facts.
+    /// A direct producer without a Source constructs once under its live owner.
+    pub fn prepare_completion(
+        &mut self,
+        shape: crate::session::StatementOutputShape,
+        family: novarocks_result_contract::ClientPresentationFamily,
+    ) {
+        let projection = StatementCompletionProjection::new(shape, family);
+        if let Some(original) = self.completion_projection {
+            if original != projection {
+                self.reject_completion_projection(QueryServiceError::new(
+                    crate::session_error::QueryServiceErrorKind::Internal,
+                    "command projection differs from its original admitted facts",
+                ));
+            }
+            return;
+        }
+        let prepared = prepare_completion_rows(&self.result, &self.owner, projection);
+        self.completion_projection = Some(projection);
+        install_completion_projection(
+            &mut self.result,
+            &mut self.completion_rows,
+            prepared,
+            self.external_effect,
+        );
+    }
+    pub fn reject_completion_projection(&mut self, error: QueryServiceError) {
+        // Keep the domain's original error if one already exists.
+        if self.result.is_err() {
+            return;
+        }
+        let selected = Err(match self.external_effect {
+            Some(effect) => error.attach_external_effect_disposition(effect),
+            None => error,
+        });
+        // Stabilize the selected cause before any old carrier destructor runs.
+        let original = std::mem::replace(&mut self.result, selected);
+        drop(original);
+        self.completion_rows.take();
+    }
     /// Validate before either move. Refusal leaves both stable slots unchanged.
     /// Success performs only moves and closed constructors, with no callback.
     pub fn transfer_protocol_in(
@@ -180,8 +281,13 @@ impl StatementActionReady {
         {
             return Err("ordinary Read has no original row output");
         }
+        if let Some(rows) = &ready.completion_rows
+            && !rows.is_for_scope(ready.owner.scope())
+        {
+            return Err("command result belongs to another statement");
+        }
         let ready = source.take().expect("checked original receiver");
-        *target = Some(match ready.result {
+        let mut output = match ready.result {
             Ok(StatementActionValue::Rows(execution)) => {
                 QuerySessionOutput::StreamingQuery(Box::new(
                     StreamingStatementResult::from_verified_execution(execution, ready.owner),
@@ -196,16 +302,102 @@ impl StatementActionReady {
                 )
             }
             Ok(StatementActionValue::Ok(completion)) => QuerySessionOutput::GovernedCompletion(
-                GovernedCompletionStatementResult::new(completion, ready.owner),
+                GovernedCompletionStatementResult::with_prepared_rows(
+                    completion,
+                    ready.completion_rows,
+                    ready.owner,
+                ),
             ),
             Err(error) => QuerySessionOutput::GovernedError(GovernedErrorStatementResult::new(
                 error,
                 ready.owner,
             )),
-        });
+        };
+        output.retain_original_external_effect(ready.external_effect);
+        *target = Some(output);
         Ok(())
     }
 }
+
+fn prepare_completion_rows(
+    result: &Result<StatementActionValue, QueryServiceError>,
+    owner: &GovernedQueryStatementOwner,
+    projection: StatementCompletionProjection,
+) -> Result<Option<crate::api::OwnedLocalResult>, String> {
+    use crate::session::StatementOutputShape;
+    let shape = projection.shape;
+    let completion = match result {
+        Err(_) => return Ok(None),
+        Ok(StatementActionValue::Rows(_) | StatementActionValue::Local(_))
+            if matches!(
+                shape,
+                StatementOutputShape::ResultSet | StatementOutputShape::UndeterminedCall
+            ) =>
+        {
+            return Ok(None);
+        }
+        Ok(StatementActionValue::SessionChanges(_)) if shape == StatementOutputShape::Empty => {
+            return Ok(None);
+        }
+        Ok(StatementActionValue::Ok(completion)) => *completion,
+        _ => return Err("result carrier differs from its admitted static shape".into()),
+    };
+    match (projection.shape, completion) {
+        (
+            StatementOutputShape::Empty | StatementOutputShape::UndeterminedCall,
+            StatementCommandCompletion::Empty,
+        ) => Ok(None),
+        (StatementOutputShape::Rows, StatementCommandCompletion::Rows(_)) => {
+            let count = completion.checked_row_value().map_err(str::to_string)?;
+            let window = owner
+                .result_window_alias()
+                .ok_or("command result has no original window")?;
+            let producer =
+                crate::api::LocalResultProducer::try_new(owner.scope(), window, projection.family)?;
+            producer
+                .produce(|| {
+                    crate::api::build_arrow_query_result(
+                        vec![crate::api::ResultField::new(
+                            "rows",
+                            novarocks_type_contract::FunctionValueType::new(
+                                arrow::datatypes::DataType::Int64,
+                                true,
+                            ),
+                        )],
+                        vec![Arc::new(arrow::array::Int64Array::from(vec![count]))],
+                    )
+                })
+                .map(Some)
+        }
+        _ => Err("command completion differs from its admitted static shape".into()),
+    }
+}
+
+fn install_completion_projection(
+    result: &mut Result<StatementActionValue, QueryServiceError>,
+    rows: &mut Option<crate::api::OwnedLocalResult>,
+    prepared: Result<Option<crate::api::OwnedLocalResult>, String>,
+    external_effect: Option<StatementExternalEffectDisposition>,
+) {
+    match prepared {
+        Ok(prepared_rows) => *rows = prepared_rows,
+        Err(message) => {
+            let error = QueryServiceError::new(
+                crate::session_error::QueryServiceErrorKind::Internal,
+                message,
+            );
+            let selected = Err(match external_effect {
+                Some(effect) => error.attach_external_effect_disposition(effect),
+                None => error,
+            });
+            // The same loan holds the selected error before an old Rows/Local
+            // carrier can invoke a foreign destructor or panic while exiting.
+            let original = std::mem::replace(result, selected);
+            drop(original);
+        }
+    }
+}
+
 /// Move-only observation of Ready. The original source STILL owns both the
 /// result and owner until silent installation in a real stable destination.
 pub struct StatementActionReceipt {
@@ -246,7 +438,13 @@ impl StatementActionReceipt {
             owner.restore_control_link(&self.service);
             let result = state.result.take().expect("checked original result");
             state.delivered = true;
-            *destination = Some(StatementActionReady { result, owner });
+            *destination = Some(StatementActionReady {
+                result,
+                owner,
+                completion_rows: state.completion_rows.take(),
+                completion_projection: self.source.completion_projection,
+                external_effect: state.external_effect,
+            });
         }
         assert!(
             self.service.port.detach_statement_action(
@@ -386,7 +584,7 @@ impl ActionBody {
             (Self::Background(action), ActionOwner::Background(owner)) => {
                 owner.poll(action.as_mut(), cx).map(|result| {
                     // Background actions return no SQL mutation count.
-                    result.map(|()| StatementActionValue::Ok(StatementCommandCompletion::new(0)))
+                    result.map(|()| StatementActionValue::Ok(StatementCommandCompletion::empty()))
                 })
             }
             _ => panic!("same original action and owner kind"),
@@ -410,6 +608,7 @@ impl ActionCancellation {
 struct StatementActionState {
     // Passive result backing drops before its original owner/window/payload.
     result: Option<Result<StatementActionValue, QueryServiceError>>,
+    completion_rows: Option<crate::api::OwnedLocalResult>,
     owner: Option<ActionOwner>,
     action: Option<ActionBody>,
     residual: Option<Box<dyn GovernedStatementResidual>>,
@@ -428,6 +627,7 @@ struct StatementActionState {
 }
 #[doc(hidden)]
 pub struct StatementActionSource {
+    completion_projection: Option<StatementCompletionProjection>,
     state: Mutex<StatementActionState>,
     waiter: AtomicWaker,
     abandoned: AtomicBool,
@@ -450,11 +650,18 @@ impl Wake for StatementActionWake {
     }
 }
 impl StatementActionSource {
-    fn empty(root: &Arc<StatementProgressSlot>) -> Arc<Self> {
-        Self::empty_with_root(Arc::downgrade(root))
+    fn empty(
+        root: &Arc<StatementProgressSlot>,
+        projection: StatementCompletionProjection,
+    ) -> Arc<Self> {
+        Self::empty_with_root(Arc::downgrade(root), Some(projection))
     }
-    fn empty_with_root(root: Weak<StatementProgressSlot>) -> Arc<Self> {
+    fn empty_with_root(
+        root: Weak<StatementProgressSlot>,
+        completion_projection: Option<StatementCompletionProjection>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            completion_projection,
             state: Mutex::new(StatementActionState {
                 owner: None,
                 action: None,
@@ -464,6 +671,7 @@ impl StatementActionSource {
                 delivered: false,
                 cancellation: None,
                 result: None,
+                completion_rows: None,
                 failure: None,
                 business_failed: false,
                 secondary: None,
@@ -517,7 +725,7 @@ impl StatementActionSource {
     }
     #[cfg(test)]
     pub(crate) fn dispose_poisoned_for_test(self: &Arc<Self>, service: &QueryControlService) {
-        let (action, owner, primary, secondary, residual, residual_work, settled) = {
+        let (action, owner, primary, secondary, residual, residual_work, result, rows, settled) = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             (
                 state.action.take(),
@@ -526,11 +734,14 @@ impl StatementActionSource {
                 state.secondary.take(),
                 state.residual.take(),
                 state.residual_work.take(),
+                state.result.take(),
+                state.completion_rows.take(),
                 state.settled,
             )
         };
         drop(action);
         drop(residual);
+        drop((result, rows));
         if let Some(work) = residual_work {
             work.complete_after_terminal_cancel_settled();
         }
@@ -706,10 +917,9 @@ impl StatementActionSource {
                 self.waiter.wake();
             }
             Ok(Poll::Ready(result)) => {
-                {
-                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    state.result = Some(result);
-                }
+                // The same original loan retains the selected value before
+                // any projection factory, arbitrary Drop or residual handoff.
+                loan.result = Some(result);
                 // A close failure preserves the whole action/owner even when
                 // its safe business result is Ready. It is not a fake panic.
                 if !self.retain_local_health(loan.action.as_ref().expect("same original action")) {
@@ -724,6 +934,36 @@ impl StatementActionSource {
                 // which must survive a subsequent action destructor panic.
                 if !self.retain_external_effect(loan.action.as_ref().expect("same original action"))
                 {
+                    drop(loan);
+                    self.waiter.wake();
+                    return;
+                }
+                let effect = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .external_effect;
+                let projected = catch_unwind(AssertUnwindSafe(|| {
+                    match (loan.owner.as_ref(), self.completion_projection) {
+                        (Some(ActionOwner::Sql(owner)), Some(projection)) => {
+                            let prepared = prepare_completion_rows(
+                                loan.result.as_ref().expect("same original selected result"),
+                                owner,
+                                projection,
+                            );
+                            install_completion_projection(
+                                loan.result.as_mut().expect("same original selected result"),
+                                &mut loan.completion_rows,
+                                prepared,
+                                effect,
+                            );
+                        }
+                        (Some(ActionOwner::Background(_)), None) => {}
+                        _ => panic!("same admitted SQL projection or Background owner"),
+                    }
+                }));
+                if let Err(primary) = projected {
+                    self.record_failure(primary);
                     drop(loan);
                     self.waiter.wake();
                     return;
@@ -908,6 +1148,7 @@ impl StatementActionSource {
             && state.retirement_complete
             && state.residual.is_none()
             && state.residual_work.is_none()
+            && state.completion_rows.is_none()
             && (state.settled || (state.owner.is_none() && state.result.is_none()))
     }
     fn retire_if_possible(self: &Arc<Self>) {
@@ -924,7 +1165,7 @@ impl StatementActionSource {
         if !self.abandoned.load(Ordering::Acquire) {
             return;
         }
-        let result = {
+        let (result, completion_rows) = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if !state.closed
                 || state.settled
@@ -935,11 +1176,11 @@ impl StatementActionSource {
             {
                 return;
             }
-            state.result.take()
+            (state.result.take(), state.completion_rows.take())
         };
         // The original owner remains in Source while result Drop runs. A
         // partial/destructive result exit does not become a successful close.
-        if let Err(primary) = catch_unwind(AssertUnwindSafe(|| drop(result))) {
+        if let Err(primary) = catch_unwind(AssertUnwindSafe(|| drop((result, completion_rows)))) {
             self.record_failure(primary);
             return;
         }
@@ -990,7 +1231,7 @@ impl StatementActionSource {
         self.waiter.wake();
     }
     pub(crate) fn empty_background() -> Arc<Self> {
-        Self::empty_with_root(Weak::new())
+        Self::empty_with_root(Weak::new(), None)
     }
     pub(crate) fn install_background(
         &self,
@@ -1199,6 +1440,8 @@ impl Drop for StatementCleanupLoan {
 }
 struct StatementPollLoan {
     source: Arc<StatementActionSource>,
+    result: Option<Result<StatementActionValue, QueryServiceError>>,
+    completion_rows: Option<crate::api::OwnedLocalResult>,
     action: Option<ActionBody>,
     owner: Option<ActionOwner>,
     residual: Option<Box<dyn GovernedStatementResidual>>,
@@ -1206,7 +1449,7 @@ struct StatementPollLoan {
 }
 impl StatementPollLoan {
     fn take(source: Arc<StatementActionSource>) -> Option<Self> {
-        let (action, owner, residual, residual_work) = {
+        let (action, owner, residual, residual_work, result, completion_rows) = {
             let mut state = source.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.polling || state.closed || state.failure.is_some() || state.action.is_none() {
                 return None;
@@ -1217,10 +1460,14 @@ impl StatementPollLoan {
                 state.owner.take(),
                 state.residual.take(),
                 state.residual_work.take(),
+                state.result.take(),
+                state.completion_rows.take(),
             )
         };
         Some(Self {
             source,
+            result,
+            completion_rows,
             action,
             owner,
             residual,
@@ -1235,6 +1482,9 @@ impl Drop for StatementPollLoan {
             state.owner.is_none() && state.action.is_none(),
             "same action loan returned once"
         );
+        assert!(state.result.is_none() && state.completion_rows.is_none());
+        state.result = self.result.take();
+        state.completion_rows = self.completion_rows.take();
         state.owner = self.owner.take();
         state.action = self.action.take();
         state.residual = self.residual.take();
@@ -1408,6 +1658,7 @@ impl QueryControlService {
         &self,
         owner: &mut Option<GovernedQueryStatementOwner>,
         action: &mut Option<Box<dyn GovernedStatementAction>>,
+        projection: StatementCompletionProjection,
         output: &mut Option<StatementActionWaiter>,
     ) -> Result<StatementActionAttempt, QueryControlError> {
         if owner.is_none() || action.is_none() || output.is_some() {
@@ -1423,7 +1674,7 @@ impl QueryControlService {
             .port
             .statement_progress_slot()
             .ok_or(QueryControlError::UnknownSession)?;
-        let source = StatementActionSource::empty(&root);
+        let source = StatementActionSource::empty(&root, projection);
         let result = self
             .port
             .publish_statement_action_in(owner, action, &source);
@@ -1493,5 +1744,39 @@ impl BackgroundActionResultGuard<'_> {
             Err(error) => super::background_source::BackgroundActionResultView::Failed(error),
             _ => unreachable!("closed Background action returns no SQL output"),
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn real_zero_unknown_and_empty_have_distinct_typed_values() {
+        assert_eq!(
+            StatementCommandCompletion::new(0).checked_row_value(),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            StatementCommandCompletion::no_count().checked_row_value(),
+            Ok(None)
+        );
+        assert!(
+            StatementCommandCompletion::empty()
+                .checked_row_value()
+                .is_err()
+        );
+        assert_ne!(
+            StatementCommandCompletion::new(0),
+            StatementCommandCompletion::no_count()
+        );
+        assert_eq!(
+            StatementCommandCompletion::new(i64::MAX as u64).checked_row_value(),
+            Ok(Some(i64::MAX))
+        );
+        assert!(
+            StatementCommandCompletion::new(i64::MAX as u64 + 1)
+                .checked_row_value()
+                .is_err()
+        );
     }
 }

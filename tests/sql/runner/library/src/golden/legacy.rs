@@ -292,7 +292,7 @@ fn old_temporal(sig: &TypeSignature, text: &str, nested: bool) -> Result<String>
 
 pub fn old_render_step(ctx: &OldRenderContext, results: &[StatementResult]) -> Result<ResultSet> {
     let mut output = ResultSet::default();
-    for result in results.iter().filter(|r| !r.columns.is_empty()) {
+    for result in results.iter().filter(|r| r.is_result_set()) {
         let names = result
             .columns
             .iter()
@@ -597,6 +597,7 @@ mod tests {
             query_id: "q".into(),
             pages: 1,
             update_type: None,
+            update_count: None,
         }
     }
     #[test]

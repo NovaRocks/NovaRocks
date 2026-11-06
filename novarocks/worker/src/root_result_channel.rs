@@ -3269,14 +3269,20 @@ mod tests {
         let mut name = String::with_capacity(name_capacity);
         name.push('x');
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
                 name,
                 field: RenderField {
                     native_type: NativeRenderType::String,
-                    presentation: RenderPresentation::ScalarText,
+                    presentation: RenderPresentation::TrinoValue,
                     nullable: true,
                 },
             }],
@@ -4111,7 +4117,7 @@ mod tests {
             (1, 0)
         );
         // A cancelled encoder still must actually relinquish its inputs and
-        // then explicitly finish. Closed retention never grants ContextHeld.
+        // then explicitly finish. Closed retention never grants ParticipationHeld.
         assert!(producer.finish_encoder().is_none());
         assert!(root.physical.producer_exited.load(Ordering::Acquire));
         assert!(!root.state.lock().unwrap().lifetime.root_finished());

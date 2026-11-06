@@ -2197,14 +2197,98 @@ struct ProductionPreparedState {
     refusal: Option<HostPreparationRefusal>,
     activated: bool,
     activation_queued: bool,
+    #[cfg(test)]
+    activation_checks_before_body_exit: usize,
+    #[cfg(test)]
+    production_visits_after_body_exit: usize,
+    #[cfg(test)]
+    activation_uninvoked_refusals: usize,
     retired: bool,
     retirement_started: bool,
     // One fixed cold-failure position: typed refusal OR panic, never both.
     retirement_failure: Option<ExecutionRetirementFailure>,
     terminal_return: Option<Arc<crate::task_lifecycle::PreparationTerminalReturn>>,
-    rollback_job_active: bool,
-    rollback_finished: bool,
+    rollback: PreparationRollbackReadiness,
 }
+/// Scheduling metadata for the same physical rollback. Readiness supplies no
+/// exit fact: a pending child still owes its original observation and cleanup.
+#[derive(Default)]
+struct PreparationRollbackReadiness {
+    active: bool,
+    finished: bool,
+    revisit: bool,
+}
+impl PreparationRollbackReadiness {
+    fn try_start(&mut self, allowed: bool) -> bool {
+        if self.active {
+            // This visit consumed a real readiness notice while its original
+            // physical job was still active. Preserve it through that return.
+            self.revisit = true;
+            return false;
+        }
+        if self.finished || !allowed {
+            return false;
+        }
+        self.active = true;
+        true
+    }
+    fn returned(&mut self, finished: bool) -> bool {
+        assert!(
+            self.active,
+            "the original physical rollback owns this return"
+        );
+        self.active = false;
+        self.finished = finished;
+        let revisit = std::mem::take(&mut self.revisit);
+        finished || revisit
+    }
+}
+
+#[cfg(test)]
+mod preparation_rollback_readiness_tests {
+    use super::PreparationRollbackReadiness;
+
+    #[test]
+    fn consumed_readiness_survives_the_active_rollback_return() {
+        let mut original = PreparationRollbackReadiness::default();
+        assert!(original.try_start(true));
+        // The poller consumes the original child's notification while its
+        // physical callback is still active. It cannot start a second job.
+        assert!(!original.try_start(true));
+        assert!(
+            original.returned(false),
+            "consumed readiness needs one revisit after Pending"
+        );
+        assert!(original.try_start(true));
+        assert!(
+            !original.returned(false),
+            "the consumed notification is used exactly once"
+        );
+        // Only a later actual child notification may request another visit.
+        assert!(original.try_start(true));
+        assert!(original.returned(true));
+        assert!(
+            !original.try_start(true),
+            "actual completed rollback is never restarted"
+        );
+    }
+
+    #[test]
+    fn pending_without_new_readiness_does_not_schedule_itself() {
+        let mut original = PreparationRollbackReadiness::default();
+        assert!(!original.try_start(false));
+        assert!(original.try_start(true));
+        assert!(
+            !original.returned(false),
+            "Pending alone must not create polling work"
+        );
+        // A later actual notification can schedule the same original job.
+        assert!(original.try_start(true));
+        assert!(original.returned(true));
+        assert!(!original.try_start(true));
+    }
+}
+
 enum ExecutionRetirementFailure {
     Rejected(std::mem::ManuallyDrop<Box<crate::HostRejection>>),
     Panicked(std::mem::ManuallyDrop<Box<dyn std::any::Any + Send>>),
@@ -2242,8 +2326,8 @@ impl TaskHostRecord {
                 state.installation_failed,
                 state.activated,
                 state.retired,
-                state.rollback_job_active,
-                state.rollback_finished,
+                state.rollback.active,
+                state.rollback.finished,
                 state.root.is_some(),
             )
         });
@@ -2300,20 +2384,15 @@ impl TaskHostRecord {
         }
         let owner = self.resources.production.as_ref()?;
         let mut state = owner.state.lock().expect("original preparation rollback");
-        if state.rollback_job_active
-            || state.rollback_finished
-            || state.terminal_return.is_none()
-            // A submitted runnable owns the original dormant kernel and its
-            // completion authorities. Its existing activation drains a stopped
-            // kernel through real cleanup; never-adopted rollback must not
-            // race that handoff and strand those same authorities.
-            || state.runnable.is_some()
-            || (!state.installation_failed
-                && (state.activated || !self.resources.port.is_stopped()))
-        {
+        let allowed = state.terminal_return.is_some()
+            // A submitted runnable retains the original kernel and completion
+            // authorities; its activation owns stopped cleanup.
+            && state.runnable.is_none()
+            && (state.installation_failed
+                || (!state.activated && self.resources.port.is_stopped()));
+        if !state.rollback.try_start(allowed) {
             return None;
         }
-        state.rollback_job_active = true;
         Some(
             super::participation_host::task_io::TaskIoHostJob::RollbackPreparation {
                 preparation: preparation.clone(),
@@ -2399,10 +2478,9 @@ impl ProductionPreparation {
             .state
             .lock()
             .expect("actual preparation rollback return");
-        state.rollback_job_active = false;
-        state.rollback_finished = finished;
+        let notify = state.rollback.returned(finished);
         drop(state);
-        if finished {
+        if notify {
             pending.pending();
         }
     }
@@ -2795,6 +2873,10 @@ impl ProductionPreparation {
                 tracing::debug!(pid = std::process::id(), key = ?preparation.key(),
                     "Original preparation refused its never-invoked activation capture");
                 drop(original);
+                #[cfg(test)]
+                {
+                    self.state.lock().unwrap().activation_uninvoked_refusals += 1;
+                }
                 false
             }
         }
@@ -2814,11 +2896,34 @@ impl TaskHostRecord {
     pub(crate) fn take_production_activation(
         &self,
     ) -> Option<super::participation_host::task_io::TaskIoHostJob> {
+        #[cfg(test)]
+        if let (Some(owner), Some(preparation)) =
+            (&self.resources.production, &self.resources.preparation)
+            && preparation
+                .host_children()
+                .is_some_and(|child| !child.body_has_exited())
+        {
+            owner
+                .state
+                .lock()
+                .unwrap()
+                .activation_checks_before_body_exit += 1;
+        }
         if !self.resources.port.current().installed() {
             return None;
         }
         let owner = self.resources.production.as_ref()?;
         let preparation = self.resources.preparation.as_ref()?;
+        // Installed can commit while the opaque call or its child return
+        // author is still live. Leave the original continuation unqueued;
+        // their real pending notice revisits this same Task after exit.
+        if !preparation.body_and_captures_exited()
+            || !preparation
+                .host_children()
+                .is_some_and(|child| child.body_has_exited())
+        {
+            return None;
+        }
         let mut state = owner.state.lock().expect("original production captures");
         if state.activation_queued || state.activated || state.runnable.is_none() {
             return None;
@@ -2833,6 +2938,35 @@ impl TaskHostRecord {
             },
         )
     }
+    #[cfg(test)]
+    pub(crate) fn activation_fixture_state(&self) -> (bool, usize, usize, usize) {
+        let Some(owner) = &self.resources.production else {
+            return (false, 0, 0, 0);
+        };
+        let state = owner.state.lock().unwrap();
+        (
+            state.activation_queued,
+            state.activation_checks_before_body_exit,
+            state.production_visits_after_body_exit,
+            state.activation_uninvoked_refusals,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn original_uninvoked_activation_for_rescue(
+        &self,
+    ) -> Option<(PreparationCustody, Arc<ProductionPreparation>)> {
+        let preparation = self.resources.preparation.as_ref()?;
+        let owner = self.resources.production.as_ref()?;
+        let state = owner.state.lock().unwrap();
+        assert!(!state.activated && state.runnable.is_some());
+        assert!(state.activation_checks_before_body_exit > 0);
+        assert!(self.resources.port.current().installed());
+        assert!(preparation.body_and_captures_exited());
+        assert!(preparation.host_children().is_some_and(
+            |child| child.body_has_exited() && child.original_adoption_unstarted_for_test()
+        ));
+        Some((preparation.clone(), owner.clone()))
+    }
 }
 
 impl TaskHostRecord {
@@ -2844,6 +2978,19 @@ impl TaskHostRecord {
         let Some(preparation) = self.resources.preparation.clone() else {
             return Ok(false);
         };
+        #[cfg(test)]
+        if preparation.body_and_captures_exited()
+            && preparation
+                .host_children()
+                .is_some_and(|child| child.body_has_exited())
+            && let Some(owner) = &self.resources.production
+        {
+            owner
+                .state
+                .lock()
+                .unwrap()
+                .production_visits_after_body_exit += 1;
+        }
         let mut progressed = false;
         if let Some(roles) = &self.resources.completion {
             let before = roles.settlement_phase();

@@ -101,7 +101,10 @@ ci_render_summary PASS
         self.assertIn(summary, result.stdout)
         self.assertIn(summary, step.read_bytes())
         for relative, contents in before.items():
-            self.assertEqual((artifact / "logs" / relative).read_bytes(), contents)
+            if any(part.startswith(".") for part in relative.parts):
+                self.assertFalse(os.path.lexists(artifact / "logs" / relative))
+            else:
+                self.assertEqual((artifact / "logs" / relative).read_bytes(), contents)
             self.assertEqual((self.logs / relative).read_bytes(), contents)
 
     def test_original_fail_fast_exit_and_full_diagnostics(self):

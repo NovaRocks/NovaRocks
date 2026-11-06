@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::mv_uea7::mv_public_error;
 use super::mv_uea7::{
     ManagedMvRestFixture, assert_rows, connect, execute, property, require_status_phase,
     require_three_backends, select_catalog_and_namespace, status,
 };
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -166,15 +166,14 @@ impl Scenario for MvIncarnationMismatch {
         )?;
 
         context.action("trigger a new managed write after another incarnation was observed");
-        let first_error =
-            match conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
-                Err(error) => error,
-                Ok(()) => bail!(
-                    "refresh committed after a different Current incarnation was persisted; {}",
-                    context.diagnostics()
-                ),
-            };
-        let message = first_error.to_string();
+        let first_error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+            Err(error) => error,
+            Ok(_) => bail!(
+                "refresh committed after a different Current incarnation was persisted; {}",
+                context.diagnostics()
+            ),
+        };
+        let message = mv_public_error(&first_error)?.message.clone();
         context.action(format!(
             "first refresh rejection after marker change: {message}"
         ));
@@ -196,14 +195,14 @@ impl Scenario for MvIncarnationMismatch {
         // A second attempt must not restore access or overwrite the remote
         // marker with the original value.
         context.action("verify the closed target does not readmit itself on retry");
-        if conn
-            .query_drop("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE")
-            .is_ok()
-        {
-            bail!(
+        match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+            Ok(_) => bail!(
                 "second refresh reopened management after incarnation mismatch; {}",
                 context.diagnostics()
-            );
+            ),
+            Err(error) => {
+                mv_public_error(&error)?;
+            }
         }
         let remote = load_rest_table(context, &rest_uri)?;
         ensure!(

@@ -1305,10 +1305,18 @@ impl ParticipationHostRecord {
                         self.ledger.clone(),
                     ));
                 }
-                if let Some(unused) = unused
-                    && !unused.try_retire()?
-                {
-                    return Ok(false);
+                if let Some(unused) = unused {
+                    let progress = unused.try_retire_progress()?;
+                    if !progress.retired {
+                        if progress.progressed {
+                            self.resources
+                                .requests
+                                .get(&work)
+                                .expect("same original Domain R")
+                                .note_input_progress();
+                        }
+                        return Ok(false);
+                    }
                 }
                 if let Some(original) = author.take()
                     && let Err(original) = original.withdraw_unused()
@@ -1358,12 +1366,23 @@ impl ParticipationHostRecord {
                         return Ok(false);
                     }
                 }
-                if let Some(sources) = unused_sources
-                    && !sources
-                        .try_retire(&self.ledger)
-                        .map_err(ParticipationRequestError::SourceSlots)?
-                {
-                    return Ok(false);
+                if let Some(sources) = unused_sources {
+                    let progress = sources
+                        .try_retire_progress(&self.ledger)
+                        .map_err(ParticipationRequestError::SourceSlots)?;
+                    if !progress.retired {
+                        // Continue this R's remaining metadata only after actual
+                        // retirement progress. A blocked physical role keeps its
+                        // original producer notice instead of polling itself.
+                        if progress.progressed {
+                            self.resources
+                                .requests
+                                .get(&work)
+                                .expect("same original Domain R")
+                                .note_input_progress();
+                        }
+                        return Ok(false);
+                    }
                 }
                 if let Some(original) = direct
                     && !self.retire_direct_domain_return(original)?
@@ -1495,13 +1514,13 @@ impl ParticipationHostRecord {
         if !original.core {
             return Ok(false);
         }
-        if !original.observer.is_retired() {
-            self.ledger
-                .reap_scope_ready(self.scope().id(), 1)
-                .map_err(ParticipationRequestError::Runtime)?;
-            if !original.observer.is_retired() {
-                return Ok(false);
-            }
+        if !original.observer.is_retired()
+            && !self
+                .ledger
+                .reap_observed_header(&original.observer)
+                .map_err(ParticipationRequestError::Runtime)?
+        {
+            return Ok(false);
         }
         original.retired = original
             .receipt
@@ -1773,5 +1792,205 @@ impl ParticipationRequestCustody {
         self.core_receipt = CoreReceipt::Abandoned;
         self.failed_message.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ParticipationHostRecord {
+    /// Exercise the original metadata owner through real queued R addresses.
+    /// Rescue after the observation is teardown, never part of the oracle.
+    pub(in crate::control_runtime::participation_host) fn domain_funding_ready_drain_for_test(
+        &mut self,
+        work: ScopedWorkRef,
+        ready: &ControlRequestReady,
+        retire_sources_before_return: bool,
+    ) -> bool {
+        let scope = self.scope().clone();
+        let generation = scope.gates().unwrap().generation;
+        let sibling_guard = scope
+            .reserve_child_next(
+                generation,
+                self.resources.metadata_resources[super::super::LIFETIME]
+                    .capacity
+                    .id(),
+                StorageNeed {
+                    work: 1,
+                    ..StorageNeed::default()
+                }
+                .resources()
+                .unwrap(),
+                WorkKind::Settlement,
+            )
+            .unwrap();
+        let (mut sibling, mut sibling_capacity) = sibling_guard.bind(WorkKind::Settlement).unwrap();
+        let sibling_observer = sibling.retirement_observer();
+        let funding = self
+            .try_reserve_task_request_funding(false)
+            .unwrap_or_else(|_| panic!("original Task domain funding"));
+        let mut domain = DomainRequest {
+            custody: None,
+            funding: DomainFunding::Task {
+                pending: Some(Box::new(funding)),
+                author: None,
+                custody: None,
+                outer: None,
+                unused: None,
+                direct: None,
+                unused_sources: None,
+            },
+            projection: Arc::new(Mutex::new(None)),
+            pending: None,
+            ticket: None,
+            projected: true,
+            feedback_inputs: [None, None],
+            feedback_observer: None,
+            retired: false,
+        };
+        // This production transition creates the original Source2 partial and
+        // direct return; no test manufactures a report/exit/retirement fact.
+        let author = self.take_domain_author(&mut domain, None).unwrap();
+        let DomainFunding::Task {
+            direct,
+            unused_sources,
+            ..
+        } = &mut domain.funding
+        else {
+            unreachable!();
+        };
+        let target = direct.as_ref().unwrap();
+        assert_eq!(sibling.reference().scope, target.work.scope);
+        assert!(sibling.reference().work < target.work.work);
+        let target_observer = target.observer.clone();
+        if retire_sources_before_return {
+            let sources = unused_sources.as_mut().unwrap();
+            // Fixture setup only: the real direct body is still held, so no
+            // ready target/sibling can consume the source reaper's turns.
+            for _ in 0..8 {
+                if sources.try_retire_progress(&self.ledger).unwrap().retired {
+                    break;
+                }
+            }
+            assert!(sources.is_empty());
+        }
+        author
+            .withdraw_unused()
+            .unwrap_or_else(|_| panic!("actual unused domain return"));
+        sibling.start().unwrap();
+        sibling.body_exited().unwrap();
+        sibling.captures_exited().unwrap();
+        assert!(
+            direct
+                .as_ref()
+                .unwrap()
+                .receipt
+                .exit_custody
+                .actual_exit_ready()
+                .unwrap()
+        );
+        assert_eq!(sibling_observer.header_holders(), Some((0, 0)));
+        assert_eq!(target_observer.header_holders(), Some((0, 0)));
+        assert!(!sibling_observer.is_retired());
+        assert!(!target_observer.is_retired());
+        self.resources.requests.get_mut(&work).unwrap().domain = Some(domain);
+        let ports = TaskIoPorts::default();
+        let mut dispatched = 0;
+        // Consume only original queued notices, as io_handoff does. A false
+        // handler return cannot manufacture another dispatch in this loop.
+        while let Some(original) = ready.next_participation_ready(self.registration()) {
+            assert_eq!(original, work);
+            dispatched += 1;
+            assert!(dispatched <= 32, "finite original metadata continuation");
+            self.advance_domain_request(original, &ports).unwrap();
+            self.advance_request_notification(original, &ports).unwrap();
+            self.advance_request(original).unwrap();
+        }
+        let settled_without_another_event =
+            target_observer.is_retired() && !self.resources.requests.contains_key(&work);
+        // Finish every real fixture original before the caller asserts RED.
+        // These direct rescue calls are deliberately outside the observation.
+        for _ in 0..16 {
+            if !self.resources.requests.contains_key(&work) {
+                break;
+            }
+            self.advance_domain_request(work, &ports).unwrap();
+            self.advance_request_notification(work, &ports).unwrap();
+            self.advance_request(work).unwrap();
+        }
+        assert!(
+            !self.resources.requests.contains_key(&work),
+            "fixture R rescue"
+        );
+        assert!(self.ledger.reap_observed_header(&sibling_observer).unwrap());
+        let quota = sibling_capacity.resources().unwrap().quota;
+        sibling_capacity.release_quota(&quota).unwrap();
+        sibling_capacity.finish().unwrap();
+        drop(sibling);
+        settled_without_another_event
+    }
+}
+
+#[cfg(test)]
+impl ParticipationHostRecord {
+    /// Cover the untouched Task funding parcel, before any domain author was taken.
+    pub(in crate::control_runtime::participation_host) fn pending_domain_funding_ready_drain_for_test(
+        &mut self,
+        work: ScopedWorkRef,
+        ready: &ControlRequestReady,
+    ) -> bool {
+        let funding = self
+            .try_reserve_task_request_funding(false)
+            .unwrap_or_else(|_| panic!("original pending Task domain funding"));
+        assert!(funding.author.work.scope().same_scope(self.scope()));
+        let observer = funding.author.work.retirement_observer();
+        self.resources.requests.get_mut(&work).unwrap().domain = Some(DomainRequest {
+            custody: None,
+            funding: DomainFunding::Task {
+                pending: Some(Box::new(funding)),
+                author: None,
+                custody: None,
+                outer: None,
+                unused: None,
+                direct: None,
+                unused_sources: None,
+            },
+            projection: Arc::new(Mutex::new(None)),
+            pending: None,
+            ticket: None,
+            projected: true,
+            feedback_inputs: [None, None],
+            feedback_observer: None,
+            retired: false,
+        });
+        let ports = TaskIoPorts::default();
+        let mut dispatched = 0;
+        // Only existing original ready marks may drive the observed handler.
+        // retire_domain_funding itself converts pending into the real partial.
+        while let Some(original) = ready.next_participation_ready(self.registration()) {
+            assert_eq!(original, work);
+            dispatched += 1;
+            assert!(
+                dispatched <= 32,
+                "finite original pending-funding continuation"
+            );
+            self.advance_domain_request(original, &ports).unwrap();
+            self.advance_request_notification(original, &ports).unwrap();
+            self.advance_request(original).unwrap();
+        }
+        let settled_without_another_event =
+            observer.is_retired() && !self.resources.requests.contains_key(&work);
+        // Rescue is explicit fixture teardown, outside the recorded oracle.
+        for _ in 0..16 {
+            if !self.resources.requests.contains_key(&work) {
+                break;
+            }
+            self.advance_domain_request(work, &ports).unwrap();
+            self.advance_request_notification(work, &ports).unwrap();
+            self.advance_request(work).unwrap();
+        }
+        assert!(
+            !self.resources.requests.contains_key(&work),
+            "pending funding fixture R rescue"
+        );
+        settled_without_another_event
     }
 }

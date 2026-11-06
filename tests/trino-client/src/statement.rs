@@ -39,9 +39,31 @@ pub struct TrinoClient {
     client: Client,
     base: Url,
     config: ClientConfig,
+    request_timeout_cap: Option<Duration>,
 }
 impl TrinoClient {
     pub fn new(config: ClientConfig) -> Result<Self, StatementFailure> {
+        Self::with_request_timeout_cap(config, None)
+    }
+
+    /// Cap each complete HTTP request while retaining the caller's absolute deadline.
+    /// This bounds a request, not a whole statement, session, or socket idle interval.
+    pub fn new_with_request_timeout_cap(
+        config: ClientConfig,
+        cap: Duration,
+    ) -> Result<Self, StatementFailure> {
+        if cap.is_zero() {
+            return Err(StatementFailure::protocol(
+                "HTTP request timeout cap must be positive",
+            ));
+        }
+        Self::with_request_timeout_cap(config, Some(cap))
+    }
+
+    fn with_request_timeout_cap(
+        config: ClientConfig,
+        request_timeout_cap: Option<Duration>,
+    ) -> Result<Self, StatementFailure> {
         let mut base = Url::parse("http://localhost")
             .map_err(|e| StatementFailure::protocol(e.to_string()))?;
         base.set_host(Some(&config.host))
@@ -58,8 +80,20 @@ impl TrinoClient {
             client,
             base,
             config,
+            request_timeout_cap,
         })
     }
+
+    fn request_timeout(&self, deadline: Instant) -> Result<Duration, StatementFailure> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(StatementFailure::Deadline)?;
+        Ok(self
+            .request_timeout_cap
+            .map_or(remaining, |cap| cap.min(remaining)))
+    }
+
     pub fn submit(
         &self,
         session: &ClientSession,
@@ -109,6 +143,7 @@ impl TrinoClient {
             initial_next_uri: page.next_uri.clone(),
             pages: 1,
             update_type: page.update_type.clone(),
+            update_count: page.update_count,
         };
         if let Some(error) = page.error {
             return Err(StatementFailure::Trino(error));
@@ -164,15 +199,12 @@ impl TrinoClient {
         sql: Option<&str>,
         deadline: Instant,
     ) -> Result<Response, StatementFailure> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or(StatementFailure::Deadline)?;
+        let timeout = self.request_timeout(deadline)?;
         let mut request = self
             .client
             .request(method, uri)
             .headers(headers.clone())
-            .timeout(remaining);
+            .timeout(timeout);
         if let Some(sql) = sql {
             request = request.body(sql.to_owned());
         }
@@ -215,6 +247,7 @@ struct Page {
     data: Option<Vec<Vec<Box<RawValue>>>>,
     error: Option<TrinoError>,
     update_type: Option<String>,
+    update_count: Option<u64>,
 }
 
 fn parse_page(bytes: &[u8]) -> Result<Page, StatementFailure> {
@@ -292,6 +325,7 @@ impl PendingStatement {
         let mut rows = Vec::new();
         let mut pages = 0;
         let mut update_type = None;
+        let mut update_count = None;
         let (mut page, mut headers) = self
             .initial
             .take()
@@ -343,6 +377,14 @@ impl PendingStatement {
             if let Some(error) = page.error {
                 return Err(StatementFailure::Trino(error));
             }
+            if let Some(count) = page.update_count {
+                if update_count.is_some_and(|previous| previous != count) {
+                    return Err(StatementFailure::protocol(
+                        "updateCount changed between Trino pages",
+                    ));
+                }
+                update_count = Some(count);
+            }
             if let Some(update) = page.update_type {
                 update_type = Some(update);
             }
@@ -354,6 +396,7 @@ impl PendingStatement {
                         query_id: self.query_id.clone(),
                         pages,
                         update_type,
+                        update_count,
                     },
                     effects,
                 ));
@@ -366,6 +409,9 @@ impl PendingStatement {
             self.progress.pages += 1;
             if page.update_type.is_some() {
                 self.progress.update_type = page.update_type.clone();
+            }
+            if page.update_count.is_some() {
+                self.progress.update_count = page.update_count;
             }
             headers = response.headers;
         }
@@ -396,16 +442,13 @@ impl CancelHandle {
         let Some(uri) = uri else {
             return Ok(());
         };
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or(StatementFailure::Deadline)?;
+        let timeout = self.client.request_timeout(deadline)?;
         let response = self
             .client
             .client
             .delete(uri)
             .headers(self.headers.clone())
-            .timeout(remaining)
+            .timeout(timeout)
             .send()
             .map_err(|e| request_error(e, deadline))?;
         let status = response.status().as_u16();

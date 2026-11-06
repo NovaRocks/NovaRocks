@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot;
+use novarocks_execution_contract::{TaskIdentity, TaskStatusVersion};
 use novarocks_query_application::session_control::{ClientQueryId, SessionToken, StatementToken};
 use novarocks_types::{QueryExecutionId, QueryId};
 
@@ -41,8 +42,6 @@ pub(crate) struct ControlRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatementObservationArmRequest {
     pub run_token: String,
-    #[serde(default, deserialize_with = "deserialize_observation_target")]
-    pub connection_id: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_observation_target")]
     pub client_query_id: Option<String>,
     pub sql_sha256: String,
@@ -59,19 +58,16 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ObservationTarget {
-    Connection(u32),
     ClientQuery(ClientQueryId),
 }
 
 impl StatementObservationArmRequest {
     fn target(&self) -> Result<ObservationTarget, String> {
-        match (&self.connection_id, &self.client_query_id) {
-            (Some(connection), None) if *connection != 0 => {
-                Ok(ObservationTarget::Connection(*connection))
-            }
-            (None, Some(query)) => ClientQueryId::parse(query).map(ObservationTarget::ClientQuery),
-            _ => Err("statement observation requires exactly one nonzero connection id or client query id".into()),
-        }
+        self.client_query_id
+            .as_deref()
+            .ok_or_else(|| "statement observation requires a client query id".to_owned())
+            .and_then(ClientQueryId::parse)
+            .map(ObservationTarget::ClientQuery)
     }
 }
 
@@ -86,6 +82,26 @@ pub(crate) struct StatementObservationResponse {
     pub query_local_sequence: Option<u64>,
     pub attempt_id: Option<u64>,
     pub snapshot: Option<serde_json::Value>,
+    pub root_status: Option<StatementRootStatusResponse>,
+}
+
+/// Scalar facts copied only by the original TaskRound root-status author.
+/// This value owns no execution, admission, result or cleanup authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StatementRootStatusObservation {
+    pub(crate) root: TaskIdentity,
+    pub(crate) installed: bool,
+    pub(crate) status_version: TaskStatusVersion,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StatementRootStatusResponse {
+    pub execution_id: String,
+    pub stage_id: u32,
+    pub task_id: u32,
+    pub backend_process_id: String,
+    pub installed: bool,
+    pub status_version: u64,
 }
 
 const MAX_STATEMENT_OBSERVERS: usize = 64;
@@ -95,8 +111,6 @@ pub(crate) type StatementInputFreezer =
 pub(crate) type StatementNominationFreezer = Arc<
     dyn Fn(&StatementInputNomination, &StatementWorkNomination) -> Result<(), String> + Send + Sync,
 >;
-pub(crate) type StatementSessionResolver =
-    Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>;
 
 /// An observation capability only: neither its lifetime nor its contents
 /// control admission, execution, recovery, result visibility, or cleanup.
@@ -117,6 +131,7 @@ struct StatementObserver {
     logical_query: Option<QueryId>,
     execution: Option<QueryExecutionId>,
     snapshot: Option<Box<QueryLifecycleConvergenceSnapshot>>,
+    root_status: Option<StatementRootStatusObservation>,
 }
 
 #[derive(Default)]
@@ -187,6 +202,7 @@ impl StatementObservers {
                 logical_query: None,
                 execution: None,
                 snapshot: None,
+                root_status: None,
             },
         );
         Ok(())
@@ -252,6 +268,47 @@ impl StatementObservers {
         run.logical_query = Some(execution.query_id());
         run.execution = Some(execution);
         run.snapshot = None;
+        run.root_status = None;
+    }
+
+    fn root_observer_for_execution(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Option<StatementObservationHandle> {
+        let (token, run) = self.runs.iter().find(|(_, run)| {
+            run.execution == Some(execution)
+                && run.statement.is_some()
+                && run.binding_error.is_none()
+        })?;
+        Some(StatementObservationHandle {
+            run_token: token.clone(),
+            generation: run.generation,
+            owner: None,
+        })
+    }
+
+    fn publish_root_status(
+        &mut self,
+        handle: &StatementObservationHandle,
+        fact: StatementRootStatusObservation,
+    ) {
+        let Some(run) = self.run_mut(handle) else {
+            return;
+        };
+        if run.statement.is_none()
+            || run.binding_error.is_some()
+            || run.execution != Some(fact.root.query_execution_id())
+        {
+            return;
+        }
+        if run.root_status.is_some_and(|previous| {
+            previous.root != fact.root
+                || previous.status_version > fact.status_version
+                || (previous.installed && !fact.installed)
+        }) {
+            return;
+        }
+        run.root_status = Some(fact);
     }
 
     fn publish(&mut self, snapshot: &QueryLifecycleConvergenceSnapshot) {
@@ -286,12 +343,6 @@ impl StatementObservers {
             schema_version: 1,
             run_token: token.to_owned(),
             work_id: run.statement.map(|statement| match &run.target {
-                ObservationTarget::Connection(connection) => format!(
-                    "statement:{}:{}:{}",
-                    connection,
-                    statement.session().key().get(),
-                    statement.generation()
-                ),
                 ObservationTarget::ClientQuery(query) => format!(
                     "client-query:{}:{}:{}",
                     query,
@@ -315,6 +366,22 @@ impl StatementObservers {
             query_local_sequence: attribution.map(|attribution| attribution.sequence().get()),
             attempt_id: run.execution.map(|execution| execution.attempt_id().get()),
             snapshot,
+            root_status: run.root_status.map(|fact| {
+                let execution = fact.root.query_execution_id();
+                StatementRootStatusResponse {
+                    execution_id: format!(
+                        "{}:{}:{}",
+                        execution.query_id().high(),
+                        execution.query_id().low(),
+                        execution.attempt_id().get()
+                    ),
+                    stage_id: fact.root.stage_id().get(),
+                    task_id: fact.root.task_id().get(),
+                    backend_process_id: fact.root.backend_process_id().to_string(),
+                    installed: fact.installed,
+                    status_version: fact.status_version.get(),
+                }
+            }),
         })
     }
 
@@ -334,7 +401,6 @@ pub(crate) struct StatementObservationOwner {
     observed_hit: std::sync::atomic::AtomicBool,
     input_freezer: std::sync::OnceLock<StatementInputFreezer>,
     nomination_freezer: std::sync::OnceLock<StatementNominationFreezer>,
-    session_resolver: std::sync::OnceLock<StatementSessionResolver>,
     state: Mutex<StatementObservers>,
 }
 impl std::fmt::Debug for StatementObservationOwner {
@@ -385,7 +451,6 @@ impl StatementObservationOwner {
             observed_hit: std::sync::atomic::AtomicBool::new(false),
             input_freezer: std::sync::OnceLock::new(),
             nomination_freezer: std::sync::OnceLock::new(),
-            session_resolver: std::sync::OnceLock::new(),
             state: Mutex::new(StatementObservers::default()),
         })))
     }
@@ -416,21 +481,7 @@ impl StatementObservationOwner {
         }
         // Reject malformed, duplicate, full or exhausted journals before a
         // finite domain can preserve an otherwise unaccepted input.
-        let sql_digest = state.validate_arm(&request)?;
-        let session = match request.target()? {
-            ObservationTarget::Connection(connection) => {
-                let session = self
-                    .session_resolver
-                    .get()
-                    .ok_or("statement observation session owner is not installed")?(
-                    connection
-                )?;
-                self.freeze_session_input(session, &request.run_token, sql_digest)?;
-                Some(session)
-            }
-            ObservationTarget::ClientQuery(_) => None,
-        };
-        state.arm(request, session)
+        state.arm(request, None)
     }
     fn input_for_session(
         &self,
@@ -510,16 +561,6 @@ impl StatementObservationOwner {
             return Err("statement observation session is closed".into());
         }
         state.drain(token)
-    }
-    /// Server composition installs the one actual QueryControl owner. Neither
-    /// the request nor the declaration can supply this identity resolver.
-    pub(crate) fn install_session_resolver(
-        &self,
-        resolver: StatementSessionResolver,
-    ) -> Result<(), String> {
-        self.session_resolver
-            .set(resolver)
-            .map_err(|_| "statement observation session owner was already installed".to_owned())
     }
     pub(crate) fn install_input_freezer(
         &self,
@@ -629,6 +670,21 @@ impl StatementObservationOwner {
         handle.owner = Some(Arc::downgrade(self));
         Some(handle)
     }
+    /// Resolve the existing journal generation only after its exact attempt
+    /// binding. The returned handle keeps the same weak owner and no grant.
+    pub(crate) fn root_observer_for_execution(
+        self: &Arc<Self>,
+        execution: QueryExecutionId,
+    ) -> Option<StatementObservationHandle> {
+        let mut state = self.state.lock().ok()?;
+        if !self.active(&mut state) {
+            return None;
+        }
+        let mut handle = state.root_observer_for_execution(execution)?;
+        handle.owner = Some(Arc::downgrade(self));
+        Some(handle)
+    }
+
     pub(crate) fn publish(&self, snapshot: &QueryLifecycleConvergenceSnapshot) {
         if let Ok(mut state) = self.state.lock()
             && self.active(&mut state)
@@ -696,6 +752,17 @@ impl StatementObservationHandle {
         let run = state.run_mut(self)?;
         Some((self.run_token.clone(), run.statement?))
     }
+    pub(crate) fn publish_root_status(&self, fact: StatementRootStatusObservation) {
+        let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        if let Ok(mut state) = owner.state.lock()
+            && owner.active(&mut state)
+        {
+            state.publish_root_status(self, fact);
+        }
+    }
+
     pub(crate) fn bind_attempt(&self, execution: QueryExecutionId) {
         let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
             return;
@@ -783,8 +850,7 @@ mod authorization_tests {
             .arm(
                 StatementObservationArmRequest {
                     run_token: "authorized-statement".to_owned(),
-                    connection_id: Some(91),
-                    client_query_id: None,
+                    client_query_id: Some("20261029_120000_00091_abcde".into()),
                     sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
                 },
                 SessionToken::new(
@@ -818,8 +884,11 @@ mod statement_observation_tests {
     fn arm_request(token: &str, connection_id: u32, sql: &str) -> StatementObservationArmRequest {
         StatementObservationArmRequest {
             run_token: token.to_owned(),
-            connection_id: Some(connection_id),
-            client_query_id: None,
+            client_query_id: Some(if connection_id == 0 {
+                "invalid".into()
+            } else {
+                format!("20261029_120000_{connection_id:05}_abcde")
+            }),
             sql_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
         }
     }
@@ -852,8 +921,149 @@ mod statement_observation_tests {
         }
     }
 
+    fn original_root_fact(
+        execution: QueryExecutionId,
+        installed: bool,
+        version: u64,
+    ) -> StatementRootStatusObservation {
+        StatementRootStatusObservation {
+            root: TaskIdentity::new(
+                execution,
+                novarocks_types::StageId::new(2).unwrap(),
+                novarocks_types::TaskId::new(3).unwrap(),
+                novarocks_types::BackendProcessId::new_v7(),
+            ),
+            installed,
+            status_version: TaskStatusVersion::new(version).unwrap(),
+        }
+    }
+
     #[test]
-    fn statement_observation_matches_exact_connection_sql_and_statement_owner() {
+    fn root_observation_keeps_actual_installed_bit_and_exact_root_version() {
+        let mut state = StatementObservers::default();
+        let session = statement(7, 9, 12).session();
+        state
+            .arm(arm_request("selected-root", 7, "SELECT 1"), session)
+            .unwrap();
+        let handle = state
+            .bind_statement(statement(7, 9, 12), "SELECT 1")
+            .unwrap();
+        let execution = execution(-19, 41, 1);
+        state.bind_attempt(&handle, execution);
+        let original = original_root_fact(execution, false, 1);
+        state.publish_root_status(&handle, original);
+        let response = state
+            .response("selected-root")
+            .unwrap()
+            .root_status
+            .unwrap();
+        assert!(!response.installed);
+        assert_eq!(response.status_version, 1);
+        assert_eq!(response.execution_id, "-19:41:1");
+        assert_eq!(response.stage_id, 2);
+        assert_eq!(response.task_id, 3);
+        assert_eq!(
+            response.backend_process_id,
+            original.root.backend_process_id().to_string()
+        );
+        let installed = StatementRootStatusObservation {
+            installed: true,
+            ..original
+        };
+        state.publish_root_status(&handle, installed);
+        state.publish_root_status(&handle, original);
+        let foreign = original_root_fact(execution, true, 3);
+        state.publish_root_status(&handle, foreign);
+        let response = state
+            .response("selected-root")
+            .unwrap()
+            .root_status
+            .unwrap();
+        assert!(response.installed);
+        assert_eq!(
+            response.status_version, 1,
+            "a different full root cannot replace the original"
+        );
+        let advanced = StatementRootStatusObservation {
+            status_version: TaskStatusVersion::new(4).unwrap(),
+            ..installed
+        };
+        state.publish_root_status(&handle, advanced);
+        state.publish_root_status(&handle, installed);
+        assert_eq!(
+            state
+                .response("selected-root")
+                .unwrap()
+                .root_status
+                .unwrap()
+                .status_version,
+            4
+        );
+    }
+
+    #[test]
+    fn root_observation_rejects_previous_attempt_and_drained_generation() {
+        let mut state = StatementObservers::default();
+        let session = statement(7, 9, 12).session();
+        state
+            .arm(arm_request("selected-root", 7, "SELECT 1"), session)
+            .unwrap();
+        let handle = state
+            .bind_statement(statement(7, 9, 12), "SELECT 1")
+            .unwrap();
+        let first = execution(-19, 41, 1);
+        state.bind_attempt(&handle, first);
+        let old = original_root_fact(first, true, 9);
+        state.publish_root_status(&handle, old);
+        let next = execution(-19, 41, 2);
+        state.bind_attempt(&handle, next);
+        assert!(
+            state
+                .response("selected-root")
+                .unwrap()
+                .root_status
+                .is_none()
+        );
+        state.publish_root_status(&handle, old);
+        assert!(
+            state
+                .response("selected-root")
+                .unwrap()
+                .root_status
+                .is_none()
+        );
+        assert!(state.root_observer_for_execution(first).is_none());
+        assert!(state.root_observer_for_execution(next).is_some());
+        state.drain("selected-root").unwrap();
+        state
+            .arm(arm_request("selected-root", 7, "SELECT 1"), session)
+            .unwrap();
+        let replacement = state
+            .bind_statement(statement(7, 9, 13), "SELECT 1")
+            .unwrap();
+        state.bind_attempt(&replacement, next);
+        let current = original_root_fact(next, true, 2);
+        state.publish_root_status(&handle, current);
+        assert!(
+            state
+                .response("selected-root")
+                .unwrap()
+                .root_status
+                .is_none()
+        );
+        state.publish_root_status(&replacement, current);
+        assert!(
+            state
+                .response("selected-root")
+                .unwrap()
+                .root_status
+                .unwrap()
+                .installed
+        );
+    }
+
+    #[test]
+    fn statement_observation_matches_exact_query_sql_and_statement_owner() {
         let mut state = StatementObservers::default();
         let session_key = (7_u64 << 32) | 9;
         state
@@ -907,7 +1117,9 @@ mod statement_observation_tests {
         let response = state.response("selected").unwrap();
         assert_eq!(
             response.work_id,
-            Some(format!("statement:7:{session_key}:12"))
+            Some(format!(
+                "client-query:20261029_120000_00007_abcde:{session_key}:12"
+            ))
         );
         assert_eq!(response.logical_execution_id.as_deref(), Some("-19:41"));
         assert_eq!(response.execution_id.as_deref(), Some("-19:41:1"));
@@ -966,48 +1178,6 @@ mod statement_observation_tests {
             response.query_local_sequence.unwrap()
         );
         assert_eq!(wire["query_attempt_id"], response.attempt_id.unwrap());
-    }
-
-    #[test]
-    fn session_capture_before_close_cannot_bind_the_replacement_after_arm() {
-        let control = Arc::new(
-            novarocks_query_application::query_control::QueryApplicationControl::default(),
-        );
-        let service =
-            novarocks_query_application::session_control::QueryControlService::new(control.clone());
-        let original = service
-            .register_session(
-                novarocks_query_application::session_control::SessionIdentity::new(
-                    novarocks_query_application::client_connection::ClientConnectionToken::new(
-                        7, 1,
-                    )
-                    .unwrap(),
-                    "capture-race",
-                ),
-            )
-            .unwrap();
-        let captured = control.current_session_for_test_controls(7).unwrap();
-        drop(original);
-        let replacement = service
-            .register_session(
-                novarocks_query_application::session_control::SessionIdentity::new(
-                    novarocks_query_application::client_connection::ClientConnectionToken::new(
-                        7, 2,
-                    )
-                    .unwrap(),
-                    "capture-race",
-                ),
-            )
-            .unwrap();
-        let mut state = StatementObservers::default();
-        state
-            .arm(arm_request("captured", 7, "SELECT 1"), captured)
-            .unwrap();
-        let mut actual = service.begin_statement(replacement.token()).unwrap();
-        assert!(state.bind_statement(actual.token(), "SELECT 1").is_none());
-        assert!(state.response("captured").unwrap().work_id.is_none());
-        actual.finish();
-        drop(replacement);
     }
 
     #[test]
@@ -1186,26 +1356,15 @@ mod session_owner_tests {
         );
         let service =
             novarocks_query_application::session_control::QueryControlService::new(control.clone());
-        let session = service
-            .register_session(
-                novarocks_query_application::session_control::SessionIdentity::new(
-                    novarocks_query_application::client_connection::ClientConnectionToken::new(
-                        7, 1,
-                    )
-                    .unwrap(),
-                    "observer-test",
-                ),
-            )
-            .unwrap();
-        owner
-            .install_session_resolver(Arc::new(move |connection| {
-                control
-                    .current_session_for_test_controls(connection)
-                    .map_err(|error| {
-                        format!("statement observation session lookup failed: {error:?}")
-                    })
+        let weak = Arc::downgrade(&owner);
+        control
+            .install_client_statement_observer(Arc::new(move |query, session| {
+                if let Some(owner) = weak.upgrade() {
+                    owner.on_client_statement_session_registered(query, session);
+                }
             }))
             .unwrap();
+        let query = service.mint_client_query_id();
         owner.install_input_freezer(Arc::new(|_| Ok(()))).unwrap();
         owner
             .install_nomination_freezer(Arc::new(|_, _| Ok(())))
@@ -1214,10 +1373,17 @@ mod session_owner_tests {
         owner
             .arm(StatementObservationArmRequest {
                 run_token: "one".into(),
-                connection_id: Some(7),
-                client_query_id: None,
+                client_query_id: Some(query.to_string()),
                 sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
             })
+            .unwrap();
+        let session = service
+            .register_session(
+                novarocks_query_application::session_control::SessionIdentity::client_statement(
+                    query,
+                    "observer-test",
+                ),
+            )
             .unwrap();
         let mut actual = service.begin_statement(session.token()).unwrap();
         let token = actual.token();
@@ -1302,13 +1468,6 @@ mod session_owner_tests {
                     }
                 }))
                 .unwrap();
-            owner
-                .install_session_resolver(Arc::new(move |connection| {
-                    control
-                        .current_session_for_test_controls(connection)
-                        .map_err(|error| format!("statement session lookup failed: {error:?}"))
-                }))
-                .unwrap();
             owner.install_input_freezer(freezer).unwrap();
             owner
                 .install_nomination_freezer(Arc::new(|_, _| Ok(())))
@@ -1323,28 +1482,25 @@ mod session_owner_tests {
         }
         fn session(
             &self,
-            connection: u32,
-            generation: u64,
+            query: &ClientQueryId,
         ) -> novarocks_query_application::session_control::QuerySessionLease {
             self.service
                 .register_session(
-                    novarocks_query_application::session_control::SessionIdentity::new(
-                        novarocks_query_application::client_connection::ClientConnectionToken::new(
-                            connection, generation,
-                        )
-                        .unwrap(),
+                    novarocks_query_application::session_control::SessionIdentity::client_statement(
+                        query.clone(),
                         "observer-only",
                     ),
                 )
                 .unwrap()
         }
-        fn arm(token: &str, connection_id: u32, sql: &str) -> StatementObservationArmRequest {
-            StatementObservationArmRequest {
-                run_token: token.into(),
-                connection_id: Some(connection_id),
-                client_query_id: None,
-                sql_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
-            }
+        fn arm_session(
+            &self,
+            token: &str,
+            sql: &str,
+        ) -> novarocks_query_application::session_control::QuerySessionLease {
+            let query = self.service.mint_client_query_id();
+            self.owner.arm(client_arm(token, &query, sql)).unwrap();
+            self.session(&query)
         }
     }
     impl Drop for ObserverFixture {
@@ -1358,7 +1514,6 @@ mod session_owner_tests {
     fn client_arm(token: &str, query: &ClientQueryId, sql: &str) -> StatementObservationArmRequest {
         StatementObservationArmRequest {
             run_token: token.into(),
-            connection_id: None,
             client_query_id: Some(query.to_string()),
             sql_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
         }
@@ -1502,9 +1657,7 @@ mod session_owner_tests {
         let sha = format!("{:x}", Sha256::digest(b"SELECT 1"));
         for value in [
             serde_json::json!({"run_token":"s","sql_sha256":sha}),
-            serde_json::json!({"run_token":"s","sql_sha256":sha,"connection_id":0}),
             serde_json::json!({"run_token":"s","sql_sha256":sha,"client_query_id":"wrong"}),
-            serde_json::json!({"run_token":"s","sql_sha256":sha,"connection_id":7,"client_query_id":"20261029_120000_00001_abcde"}),
         ] {
             let request: StatementObservationArmRequest = serde_json::from_value(value).unwrap();
             assert!(request.target().is_err());
@@ -1555,11 +1708,7 @@ mod session_owner_tests {
             }
         };
         let fixture = ObserverFixture::new();
-        let session = fixture.session(7, 1);
-        fixture
-            .owner
-            .arm(ObserverFixture::arm("cohorts", 7, "CALL rewrite()"))
-            .unwrap();
+        let session = fixture.arm_session("cohorts", "CALL rewrite()");
         let mut statement = fixture.service.begin_statement(session.token()).unwrap();
         let statement_token = statement.token();
         assert!(fixture.owner.bound_statement(statement_token).is_none());
@@ -1650,11 +1799,7 @@ mod session_owner_tests {
     #[test]
     fn nominated_observer_requires_the_same_complete_active_journal_entry() {
         let fixture = ObserverFixture::new();
-        let session = fixture.session(7, 1);
-        fixture
-            .owner
-            .arm(ObserverFixture::arm("stats", 7, "ANALYZE TABLE t"))
-            .unwrap();
+        let session = fixture.arm_session("stats", "ANALYZE TABLE t");
         let mut statement = fixture.service.begin_statement(session.token()).unwrap();
         assert!(
             fixture
@@ -1716,11 +1861,11 @@ mod session_owner_tests {
                 .is_none()
         );
         assert!(resolved.nomination().is_none());
-        fixture
-            .owner
-            .arm(ObserverFixture::arm("stats", 7, "ANALYZE TABLE t"))
+        let replacement_session = fixture.arm_session("stats", "ANALYZE TABLE t");
+        let mut replacement = fixture
+            .service
+            .begin_statement(replacement_session.token())
             .unwrap();
-        let mut replacement = fixture.service.begin_statement(session.token()).unwrap();
         let next = fixture
             .owner
             .bind_statement(replacement.token(), "ANALYZE TABLE t")
@@ -1800,11 +1945,7 @@ mod session_owner_tests {
         }
         for rearm_before_worker in [false, true] {
             let fixture = ObserverFixture::new();
-            let session = fixture.session(7, 1);
-            fixture
-                .owner
-                .arm(ObserverFixture::arm("stats-job", 7, "ANALYZE TABLE t"))
-                .unwrap();
+            let session = fixture.arm_session("stats-job", "ANALYZE TABLE t");
             let mut statement = fixture.service.begin_statement(session.token()).unwrap();
             let original = fixture
                 .owner
@@ -1862,15 +2003,12 @@ mod session_owner_tests {
             statement.finish();
             let replacement = if rearm_before_worker {
                 fixture.owner.drain("stats-job").unwrap();
-                fixture
-                    .owner
-                    .arm(ObserverFixture::arm(
-                        "stats-job",
-                        7,
-                        "ANALYZE TABLE replacement",
-                    ))
+                let replacement_session =
+                    fixture.arm_session("stats-job", "ANALYZE TABLE replacement");
+                let mut next = fixture
+                    .service
+                    .begin_statement(replacement_session.token())
                     .unwrap();
-                let mut next = fixture.service.begin_statement(session.token()).unwrap();
                 let replacement = fixture
                     .owner
                     .bind_statement(next.token(), "ANALYZE TABLE replacement")
@@ -1931,11 +2069,7 @@ mod session_owner_tests {
     #[test]
     fn observer_only_same_token_can_drain_and_reuse_with_actual_replacement_session() {
         let fixture = ObserverFixture::new();
-        let original = fixture.session(7, 1);
-        fixture
-            .owner
-            .arm(ObserverFixture::arm("reused", 7, "SELECT 1"))
-            .unwrap();
+        let original = fixture.arm_session("reused", "SELECT 1");
         assert!(
             !fixture
                 .role
@@ -1955,11 +2089,7 @@ mod session_owner_tests {
         fixture.owner.drain("reused").unwrap();
         assert!(old_handle.statement_target().is_none());
         drop(original);
-        let replacement = fixture.session(7, 2);
-        fixture
-            .owner
-            .arm(ObserverFixture::arm("reused", 7, "SELECT 2"))
-            .unwrap();
+        let replacement = fixture.arm_session("reused", "SELECT 2");
         let mut next = fixture
             .service
             .begin_statement(replacement.token())
@@ -1999,33 +2129,38 @@ mod session_owner_tests {
             Ok(())
         }));
         let mut sessions = Vec::new();
-        for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
-            sessions.push(fixture.session(connection, 1));
-        }
-        let mut invalid = ObserverFixture::arm("bad", 1, "SELECT 1");
+        let queries: Vec<_> = (0..MAX_STATEMENT_OBSERVERS)
+            .map(|_| fixture.service.mint_client_query_id())
+            .collect();
+        let mut invalid = client_arm("bad", &queries[0], "SELECT 1");
         invalid.sql_sha256 = "bad".into();
         assert!(fixture.owner.arm(invalid).is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
             fixture
                 .owner
-                .arm(ObserverFixture::arm(
+                .arm(client_arm(
                     &format!("token-{connection}"),
-                    connection,
+                    &queries[connection as usize - 1],
                     "SELECT 1",
                 ))
                 .unwrap();
+            sessions.push(fixture.session(&queries[connection as usize - 1]));
         }
         assert!(
             fixture
                 .owner
-                .arm(ObserverFixture::arm("token-1", 1, "SELECT 1"))
+                .arm(client_arm("token-1", &queries[0], "SELECT 1"))
                 .is_err()
         );
         assert!(
             fixture
                 .owner
-                .arm(ObserverFixture::arm("overflow", 100, "SELECT 1"))
+                .arm(client_arm(
+                    "overflow",
+                    &fixture.service.mint_client_query_id(),
+                    "SELECT 1"
+                ))
                 .is_err()
         );
         fixture.owner.drain("token-1").unwrap();
@@ -2033,7 +2168,7 @@ mod session_owner_tests {
         assert!(
             fixture
                 .owner
-                .arm(ObserverFixture::arm("exhausted", 1, "SELECT 1"))
+                .arm(client_arm("exhausted", &queries[0], "SELECT 1"))
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::Relaxed), MAX_STATEMENT_OBSERVERS);
@@ -2046,6 +2181,80 @@ mod session_owner_tests {
                 .any(|event| event.event == "hit")
         );
         drop(sessions);
+    }
+
+    #[test]
+    fn installed_root_observer_uses_only_the_original_finite_weak_generation() {
+        let fixture = ObserverFixture::new();
+        let session = fixture.arm_session("root-selected", "SELECT 1");
+        let mut statement = fixture.service.begin_statement(session.token()).unwrap();
+        let handle = fixture
+            .owner
+            .bind_statement(statement.token(), "SELECT 1")
+            .unwrap()
+            .unwrap();
+        let execution = QueryExecutionId::new(
+            QueryId::new(-19, 41),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let diagnostics =
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics::default();
+        assert!(diagnostics.root_observer_for_execution(execution).is_none());
+        diagnostics.activate(&fixture.owner).unwrap();
+        assert!(diagnostics.root_observer_for_execution(execution).is_none());
+        handle.bind_attempt(execution);
+        let original_strong_count = Arc::strong_count(&fixture.owner);
+        let observer = diagnostics.root_observer_for_execution(execution).unwrap();
+        assert_eq!(Arc::strong_count(&fixture.owner), original_strong_count);
+        let fact = StatementRootStatusObservation {
+            root: TaskIdentity::new(
+                execution,
+                novarocks_types::StageId::new(2).unwrap(),
+                novarocks_types::TaskId::new(3).unwrap(),
+                novarocks_types::BackendProcessId::new_v7(),
+            ),
+            installed: false,
+            status_version: TaskStatusVersion::FIRST,
+        };
+        observer.publish_root_status(fact);
+        assert!(
+            !fixture
+                .owner
+                .peek("root-selected")
+                .unwrap()
+                .root_status
+                .unwrap()
+                .installed
+        );
+        fixture.owner.drain("root-selected").unwrap();
+        statement.finish();
+        let replacement_session = fixture.arm_session("root-selected", "SELECT 1");
+        let mut statement = fixture
+            .service
+            .begin_statement(replacement_session.token())
+            .unwrap();
+        let rebound = fixture
+            .owner
+            .bind_statement(statement.token(), "SELECT 1")
+            .unwrap()
+            .unwrap();
+        rebound.bind_attempt(execution);
+        observer.publish_root_status(StatementRootStatusObservation {
+            installed: true,
+            ..fact
+        });
+        assert!(
+            fixture
+                .owner
+                .peek("root-selected")
+                .unwrap()
+                .root_status
+                .is_none()
+        );
+        fixture.owner.close_observation();
+        assert!(diagnostics.root_observer_for_execution(execution).is_none());
+        statement.finish();
     }
 
     #[test]

@@ -21,6 +21,7 @@ mod host;
 mod server;
 mod settings;
 mod update_type;
+pub use request::QueryTextLimit;
 pub use server::TrinoListener;
 pub use settings::TrinoListenerSettings;
 

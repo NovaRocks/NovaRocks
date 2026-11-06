@@ -26,7 +26,6 @@ pub struct FrontendWorkloadCapacityProfile {
     pub(super) workload: WorkloadConfig,
     pub(super) result: Option<novarocks_workload_control::ResultCapacityConfig>,
     pub(super) transport_budget: Option<novarocks_native_adapter::FrontendTaskTransportBudget>,
-    pub(super) statement_ingress: Option<super::composition::FrontendStatementIngress>,
 }
 impl FrontendWorkloadCapacityProfile {
     pub(super) fn from_configuration(
@@ -34,7 +33,6 @@ impl FrontendWorkloadCapacityProfile {
         workload: &WorkloadConfig,
         result: Option<novarocks_workload_control::ResultCapacityConfig>,
         transport_budget: Option<novarocks_native_adapter::FrontendTaskTransportBudget>,
-        statement_ingress: Option<super::composition::FrontendStatementIngress>,
     ) -> Result<Self, WorkError> {
         workload.validate()?;
         inputs.validate_pool_declarations(workload, inputs.query_blocking_capacity())?;
@@ -43,7 +41,6 @@ impl FrontendWorkloadCapacityProfile {
             workload: workload.clone(),
             result,
             transport_budget,
-            statement_ingress,
         })
     }
     pub const fn inputs(&self) -> &FrontendNativeCapacityInputs {
@@ -180,7 +177,6 @@ pub(crate) fn original_owner_test_profile(
     FrontendWorkloadCapacityProfile::from_configuration(
         FrontendNativeCapacityInputs::try_new(policy, blocking).unwrap(),
         &workload,
-        None,
         None,
         None,
     )

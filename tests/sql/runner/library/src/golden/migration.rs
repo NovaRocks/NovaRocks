@@ -103,7 +103,7 @@ pub fn convert_legacy_section_pair(
     }
     let actual_results = actual
         .iter()
-        .filter(|result| result.has_columns())
+        .filter(|result| result.is_result_set())
         .collect::<Vec<_>>();
     ensure!(
         original.blocks.len() == actual_results.len(),
@@ -176,7 +176,7 @@ fn convert_group(
     let mapping = old_equivalent(context, policy, &old_expanded, actual)?;
     let observed = actual
         .iter()
-        .filter(|result| result.has_columns())
+        .filter(|result| result.is_result_set())
         .collect::<Vec<_>>();
     ensure!(
         !observed.is_empty(),
@@ -330,6 +330,7 @@ mod tests {
             query_id: "query".into(),
             pages: 1,
             update_type: None,
+            update_count: None,
         }
     }
     fn context() -> OldRenderContext {
@@ -502,5 +503,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn legacy_conversion_ignores_counted_and_unknown_command_rows() {
+        let original = legacy(&["v"], &["2", "1"]);
+        let queries = vec![result("v", "bigint", vec![V::Integer(1), V::Integer(2)])];
+        let expected = convert_legacy_section(
+            &context(),
+            &OldComparePolicy::default(),
+            &original,
+            &queries,
+        )
+        .unwrap();
+        let mut counted = result("rows", "bigint", vec![V::Integer(0)]);
+        counted.update_type = Some("INSERT".into());
+        counted.update_count = Some(0);
+        let mut unknown = result("rows", "bigint", vec![V::Null]);
+        unknown.update_type = Some("REFRESH MATERIALIZED VIEW".into());
+        let actual = convert_legacy_section(
+            &context(),
+            &OldComparePolicy::default(),
+            &original,
+            &[counted, queries[0].clone(), unknown],
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 }

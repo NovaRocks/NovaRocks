@@ -24,10 +24,6 @@
 //! boundaries; the provider crate does not depend on aggregate Core, SQL, or
 //! execution modules.
 
-/// Stable provider identity used by server composition and SPI declarations.
-#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(novarocks_dev_controls)))]
-compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
-
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
     (
@@ -35,8 +31,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
         &[
             #[cfg(novarocks_dev_controls)]
             "test-controls",
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            "mem-1-m07-hms-listing-observe",
         ],
     )
 }
@@ -68,8 +62,7 @@ pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-pub mod hms_listing_probe;
+
 pub mod loaded_table;
 pub mod manifest;
 pub mod metadata;

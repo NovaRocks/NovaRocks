@@ -74,26 +74,91 @@ impl SelectedStatement {
         Ok(())
     }
 
-    pub fn arm(
+    /// The POST has returned its query id, but its first GET has not started.
+    pub fn arm_client_query(
         &self,
         context: &mut ScenarioContext,
-        connection: u32,
+        client_query_id: &str,
         sql: &str,
     ) -> Result<QueryLifecycleStatementObservation> {
-        self.verify_submission(sql, context.deadline())?;
+        let deadline = context.deadline();
+        self.arm_client_query_on(context.handle(), client_query_id, sql, deadline)
+    }
+
+    /// The explicit handle is the actual compatibility island, never a fallback.
+    pub fn arm_client_query_on(
+        &self,
+        handle: &mut dyn TestClusterOwner,
+        client_query_id: &str,
+        sql: &str,
+        original_deadline: Instant,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        self.verify_submission(sql, original_deadline)?;
         for &(index, kind) in &self.faults {
-            context
-                .handle()
-                .arm_selected_query_lifecycle_fault(index, kind, &self.token)?;
+            handle.arm_selected_query_lifecycle_fault(index, kind, &self.token)?;
         }
-        context.handle().arm_selected_statement_observation(
+        handle.arm_selected_statement_observation_for_client_query(
             &self.token,
-            connection,
+            client_query_id,
             &self.sql,
             self.deadline,
         )
     }
+
+    pub fn arm_pending(
+        &self,
+        context: &mut ScenarioContext,
+        pending: novarocks_test_trino_client::PendingStatement,
+        sql: &str,
+    ) -> Result<(
+        novarocks_test_trino_client::PendingStatement,
+        QueryLifecycleStatementObservation,
+    )> {
+        let deadline = context.deadline();
+        self.arm_pending_on(context.handle(), pending, sql, deadline)
+    }
+
+    /// Retain the original unstarted POST across exact arm/refusal on this peer.
+    pub fn arm_pending_on(
+        &self,
+        handle: &mut dyn TestClusterOwner,
+        pending: novarocks_test_trino_client::PendingStatement,
+        sql: &str,
+        original_deadline: Instant,
+    ) -> Result<(
+        novarocks_test_trino_client::PendingStatement,
+        QueryLifecycleStatementObservation,
+    )> {
+        let cancel = pending.cancel_handle();
+        match self.arm_client_query_on(handle, &pending.query_id, sql, original_deadline) {
+            Ok(observation) => Ok((pending, observation)),
+            Err(primary) => match cancel.delete(self.deadline) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(PendingArmCleanupFailure { primary, cleanup }.into()),
+            },
+        }
+    }
 }
+#[derive(Debug)]
+struct PendingArmCleanupFailure {
+    primary: anyhow::Error,
+    cleanup: novarocks_test_trino_client::StatementFailure,
+}
+impl std::fmt::Display for PendingArmCleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}; cancel original unstarted query after arm refusal: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+impl std::error::Error for PendingArmCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
 struct Launch {
     reference: RoleLaunchReference,
     grants: Vec<DomainGrant>,
@@ -119,6 +184,7 @@ pub(in crate::scenarios) struct SqlIntentOwner(Mutex<Option<Frozen>>);
 #[derive(Clone, Copy)]
 enum StatementRefinement {
     BeforeSchemaFailure,
+    RootObservation,
     RemoteWriterSender(usize),
     MarkJoinBuild(usize),
 }
@@ -132,6 +198,25 @@ impl SqlIntentOwner {
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
         self.freeze_internal(specs, replacements, cluster_size, binary, deadline, None)
+    }
+
+    /// Retain the original FE NativeTrust identity through its existing finite
+    /// role-session grant. This observation never authorizes a Root action.
+    pub fn freeze_root_observation(
+        &self,
+        specs: Vec<StatementSpec>,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        self.freeze_internal(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+            Some(StatementRefinement::RootObservation),
+        )
     }
 
     /// Coordinate the first declared Root failure with the original FE protocol handoff.
@@ -260,6 +345,13 @@ impl SqlIntentOwner {
             "statement-observation",
             json!({"action":"observe","bearer_secret":secret}),
         );
+        if matches!(refinement, Some(StatementRefinement::RootObservation)) {
+            add(
+                launches.get_mut(&RoleSlot::Frontend).unwrap(),
+                "root-observation",
+                json!({"action":"observe"}),
+            );
+        }
         let mut statements = vec![];
         for (statement_index, spec) in specs.into_iter().enumerate() {
             ensure!(

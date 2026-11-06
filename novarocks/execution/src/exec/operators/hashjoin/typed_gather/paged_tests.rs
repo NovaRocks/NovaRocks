@@ -560,3 +560,345 @@ fn paged_left_mark_gather_authors_nullable_boolean_and_preserves_duplicate_probe
             .is_err()
     );
 }
+
+fn fixed_struct_type(child_nullable: bool, width: i32) -> DataType {
+    DataType::Struct(
+        vec![Arc::new(Field::new(
+            "f",
+            DataType::FixedSizeBinary(width),
+            child_nullable,
+        ))]
+        .into(),
+    )
+}
+fn permissive_fixed_struct_schema(id: u32, owner: &dyn InputConstructionOwner) -> ChunkSchemaRef {
+    let ty = FunctionValueType::new(fixed_struct_type(false, 4), true);
+    let mut slots = funded_vec(owner, 1).unwrap();
+    slots.push(
+        ChunkSlotSchema::try_new_typed_observed::<ConstructionFailure, _>(
+            SlotId::new(id),
+            Arc::new(Field::new(
+                format!("c{id}"),
+                fixed_struct_type(true, 4),
+                true,
+            )),
+            ty.typed_binding().clone(),
+            None,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap(),
+    );
+    funded_shared(
+        owner,
+        ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
+            slots,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |units| {
+                owner.observe(
+                    0,
+                    &[],
+                    ArrayNormalizationStep::InspectConstructionWork { units },
+                )
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+fn permissive_fixed_struct(parent_valid: Vec<bool>) -> ArrayRef {
+    use arrow::{array::StructArray, buffer::NullBuffer};
+    let child = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some([1, 2, 3, 4]), None, Some([5, 6, 7, 8])].into_iter(),
+        4,
+    )
+    .unwrap();
+    let DataType::Struct(fields) = fixed_struct_type(true, 4) else {
+        unreachable!()
+    };
+    Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(child)],
+        Some(NullBuffer::from(parent_valid)),
+    ))
+}
+
+#[test]
+fn paged_gather_projects_required_fixed_child_before_null_extension_and_selection() {
+    use arrow::array::StructArray;
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let probe_schema = permissive_fixed_struct_schema(1, owner.as_ref());
+    let probe = chunk(
+        probe_schema.clone(),
+        permissive_fixed_struct(vec![true, false, true]),
+        owner.as_ref(),
+    );
+    let actual_schema = permissive_fixed_struct_schema(2, owner.as_ref());
+    let source = chunk(
+        actual_schema.clone(),
+        permissive_fixed_struct(vec![true, false, true]),
+        owner.as_ref(),
+    );
+    let rows = pages(&source, &work);
+    let ty = FunctionValueType::new(fixed_struct_type(false, 4), true);
+    let output_schema = schema(&[ty.clone(), ty], &[1, 2], owner.as_ref());
+    let gather = PagedJoinGather::new_canonical(
+        output_schema.clone(),
+        &probe_schema,
+        &actual_schema,
+        CanonicalJoinOutput::Pairs,
+        owner.as_ref(),
+    )
+    .unwrap();
+    for selected in [
+        vec![
+            JoinPairRow {
+                probe: Some(0),
+                build: Some(rows.row(2).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(1).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(2),
+                build: Some(rows.row(1).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(0),
+                build: Some(rows.row(0).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(2).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(0).unwrap()),
+            },
+        ],
+        vec![
+            JoinPairRow {
+                probe: Some(0),
+                build: Some(rows.row(2).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(1).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(2),
+                build: None,
+            },
+            JoinPairRow {
+                probe: Some(0),
+                build: Some(rows.row(0).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(2).unwrap()),
+            },
+            JoinPairRow {
+                probe: None,
+                build: Some(rows.row(0).unwrap()),
+            },
+        ],
+        vec![
+            JoinPairRow {
+                probe: Some(1),
+                build: Some(rows.row(1).unwrap()),
+            },
+            JoinPairRow {
+                probe: Some(1),
+                build: None,
+            },
+        ],
+    ] {
+        let output = gather
+            .gather(
+                Some(&probe),
+                &rows,
+                &selected,
+                owner.as_ref(),
+                &work.host,
+                &Control,
+            )
+            .unwrap()
+            .into_chunk(owner.as_ref())
+            .unwrap();
+        for (ordinal, array) in output.columns().iter().enumerate() {
+            assert_eq!(
+                array.data_type(),
+                output_schema.slots()[ordinal].data_type()
+            );
+            let structure = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let bytes = structure
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            assert_eq!(bytes.value_length(), 4);
+            if selected.len() == 2 {
+                assert!(structure.is_null(0));
+                assert!(structure.is_null(1));
+            } else if ordinal == 0 {
+                for row in [0, 2, 3] {
+                    assert!(structure.is_valid(row));
+                }
+                for row in [1, 4, 5] {
+                    assert!(structure.is_null(row));
+                }
+                assert_eq!(bytes.value(0), &[1, 2, 3, 4]);
+                assert_eq!(bytes.value(2), &[5, 6, 7, 8]);
+                assert_eq!(bytes.value(3), &[1, 2, 3, 4]);
+            } else {
+                for row in [0, 3, 4, 5] {
+                    assert!(structure.is_valid(row));
+                }
+                for row in [1, 2] {
+                    assert!(structure.is_null(row));
+                }
+                assert_eq!(bytes.value(0), &[5, 6, 7, 8]);
+                assert_eq!(bytes.value(3), &[1, 2, 3, 4]);
+                assert_eq!(bytes.value(4), &[5, 6, 7, 8]);
+                assert_eq!(bytes.value(5), &[1, 2, 3, 4]);
+            }
+        }
+    }
+}
+
+#[test]
+fn join_source_projection_preserves_active_required_null_and_width_rejections() {
+    use crate::runtime::task::ExecutionFailureCause;
+    use novarocks_value_arrays::{ValueError, ValueViolation};
+
+    let (owner, _tracker) = fixture();
+    let target = schema(
+        &[FunctionValueType::new(fixed_struct_type(false, 4), true)],
+        &[2],
+        owner.as_ref(),
+    );
+    let storage = owner.storage_lifetime();
+    let good = permissive_fixed_struct(vec![true, false, true]);
+    let projected = project_source(
+        &good,
+        &target.slots()[0],
+        &storage,
+        owner.as_ref(),
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(projected.data_type(), target.slots()[0].data_type());
+    let bad = permissive_fixed_struct(vec![true, true, true]);
+    let failure = project_source(&bad, &target.slots()[0], &storage, owner.as_ref(), &Control)
+        .unwrap_err()
+        .into_execution();
+    assert!(matches!(
+        failure.cause(),
+        ExecutionFailureCause::Domain(cause)
+            if matches!(cause.downcast_ref::<ValueError>(),
+                Some(ValueError::Invariant(ValueViolation::RequiredNull)))
+    ));
+    let wrong_width = schema(
+        &[FunctionValueType::new(fixed_struct_type(false, 3), true)],
+        &[2],
+        owner.as_ref(),
+    );
+    let width_failure = project_source(
+        &good,
+        &wrong_width.slots()[0],
+        &storage,
+        owner.as_ref(),
+        &Control,
+    )
+    .unwrap_err()
+    .into_execution();
+    assert!(matches!(
+        width_failure.cause(),
+        ExecutionFailureCause::Domain(cause)
+            if matches!(cause.downcast_ref::<ValueError>(),
+                Some(ValueError::Invariant(ValueViolation::Layout)))
+    ));
+    let fast = project_source(
+        &projected,
+        &target.slots()[0],
+        &storage,
+        owner.as_ref(),
+        &Control,
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&projected, &fast));
+}
+
+#[test]
+fn join_source_projection_preserves_original_cancellation_and_owner_refusal() {
+    use crate::exec::chunk::ArrayPathStep;
+    struct Cancelled;
+    impl KernelEvaluationControl for Cancelled {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Err(novarocks_functions::KernelFailure::Cancelled)
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("projection must not wait")
+        }
+    }
+    struct RefuseRequests<'a>(&'a dyn InputConstructionOwner);
+    impl InputConstructionOwner for RefuseRequests<'_> {
+        fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+            self.0.storage_lifetime()
+        }
+        fn request(&self, _: std::alloc::Layout) -> Result<(), ConstructionFailure> {
+            Err(ConstructionFailure::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            ))
+        }
+        fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+            self.0.observe_opaque_upper_bound(bytes)
+        }
+        fn observe(
+            &self,
+            ordinal: usize,
+            path: &[ArrayPathStep],
+            step: ArrayNormalizationStep<'_>,
+        ) -> Result<(), ConstructionFailure> {
+            self.0.observe(ordinal, path, step)
+        }
+    }
+    let (owner, _tracker) = fixture();
+    let target = schema(
+        &[FunctionValueType::new(fixed_struct_type(false, 4), true)],
+        &[2],
+        owner.as_ref(),
+    );
+    let source = permissive_fixed_struct(vec![true, false, true]);
+    let storage = owner.storage_lifetime();
+    let cancelled = project_source(
+        &source,
+        &target.slots()[0],
+        &storage,
+        owner.as_ref(),
+        &Cancelled,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cancelled,
+        JoinGatherError::Kernel(novarocks_functions::KernelFailure::Cancelled)
+    ));
+    let refused = project_source(
+        &source,
+        &target.slots()[0],
+        &storage,
+        &RefuseRequests(owner.as_ref()),
+        &Control,
+    )
+    .unwrap_err()
+    .into_execution();
+    assert_eq!(
+        refused,
+        ExecutionFailure::from(ConstructionFailure::Control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ))
+    );
+}

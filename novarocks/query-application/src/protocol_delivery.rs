@@ -30,13 +30,14 @@ use crate::session_control::{
 };
 use crate::session_error::QueryServiceError;
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
-use novarocks_workload_control::{ResultWindowClass, ResultWindowGrant, WorkError};
+use novarocks_workload_control::WorkError;
 
 /// Shared move-only owner for any governed query result presented to a client.
 #[must_use = "the governed protocol owner must be settled by its protocol adapter"]
 pub struct GovernedProtocolOwner {
     statement: Option<GovernedQueryStatementOwner>,
     settled: bool,
+    external_effect: Option<crate::api::StatementExternalEffectDisposition>,
 }
 
 impl GovernedProtocolOwner {
@@ -44,7 +45,16 @@ impl GovernedProtocolOwner {
         Self {
             statement: Some(statement),
             settled: false,
+            external_effect: None,
         }
+    }
+
+    /// The original Action's cumulative effect fact grants no publication,
+    /// visibility, control or resource authority.
+    pub fn external_effect_disposition(
+        &self,
+    ) -> Option<crate::api::StatementExternalEffectDisposition> {
+        self.external_effect
     }
 
     /// Project the original live statement identity without retaining its owner.
@@ -103,56 +113,6 @@ impl GovernedProtocolOwner {
             .accept_failed_delivery_cut()
     }
 
-    fn closing_capacity(
-        &self,
-        cut: novarocks_workload_control::ResultClosingCut,
-    ) -> Result<ResultWindowGrant, WorkError> {
-        let statement = self.statement.as_ref().ok_or(WorkError::Released)?;
-        statement
-            .scope()
-            .result_capacity()?
-            .try_acquire_closing(statement.scope(), cut)
-    }
-
-    pub fn try_closing_capacity(
-        &mut self,
-        cancelled: bool,
-    ) -> Result<ResultWindowGrant, WorkError> {
-        let cut = if cancelled {
-            self.accept_cancel_delivery_cut()?;
-            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
-        } else {
-            self.accept_failed_delivery_cut()?;
-            novarocks_workload_control::ResultClosingCut::OriginatingFailure
-        };
-        self.closing_capacity(cut)
-    }
-
-    /// A Local caller destroys its renderer/source and transfers only the
-    /// bounded writer tail. Any still-live ordinary backing keeps its alias.
-    pub fn into_closing_delivery<W>(
-        self,
-        writer: W,
-        capacity: ResultWindowGrant,
-        simultaneously_live_backing_bytes: u64,
-    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
-        match ClosingDelivery::try_new(writer, self, capacity, simultaneously_live_backing_bytes) {
-            Ok(mut closing) => {
-                std::sync::Arc::get_mut(closing.tail.as_mut().expect("new closing tail"))
-                    .expect("new closing has no aliases")
-                    .protocol
-                    .as_mut()
-                    .expect("closing protocol")
-                    .statement
-                    .as_mut()
-                    .expect("closing statement")
-                    .release_transferred_result_window();
-                Ok(closing)
-            }
-            Err((writer, protocol, capacity)) => Err((protocol, writer, capacity)),
-        }
-    }
-
     pub fn complete(&mut self) -> GovernedStatementFinishOutcome {
         self.settled = true;
         self.statement
@@ -201,136 +161,6 @@ impl Drop for GovernedProtocolOwner {
     }
 }
 
-/// Move-only protocol tail with its own complete capacity position. `W` owns
-/// the detached socket writer, frozen metadata, packet cursor and validated
-/// resident current-row tail; it has no root fetch/render capability. Any
-/// physical writer alias must retain `retained_guard()` through actual exit.
-#[must_use = "a closing delivery retains its statement generation and writer until actual exit"]
-pub struct ClosingDelivery<W> {
-    writer: Option<W>,
-    tail: Option<std::sync::Arc<ClosingTailOwner>>,
-    completion: Option<tokio::sync::oneshot::Receiver<GovernedStatementFinishOutcome>>,
-}
-struct ClosingTailOwner {
-    protocol: Option<GovernedProtocolOwner>,
-    capacity: ResultWindowGrant,
-    writer_exited: std::sync::atomic::AtomicBool,
-    completion: Option<tokio::sync::oneshot::Sender<GovernedStatementFinishOutcome>>,
-}
-impl Drop for ClosingTailOwner {
-    fn drop(&mut self) {
-        let mut protocol = self
-            .protocol
-            .take()
-            .expect("closing retains its protocol owner");
-        let outcome = if !self
-            .writer_exited
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            protocol.client_disconnected()
-        } else {
-            match self
-                .capacity
-                .closing_cut()
-                .expect("closing requires an accepted cut")
-            {
-                novarocks_workload_control::ResultClosingCut::AcceptedCancellation => {
-                    protocol.settle_cancellation()
-                }
-                novarocks_workload_control::ResultClosingCut::OriginatingFailure => protocol.fail(),
-            }
-        };
-        if let Some(completion) = self.completion.take() {
-            let _ = completion.send(outcome);
-        }
-    }
-}
-/// Every physical writer/backing alias retains BOTH the statement generation
-/// and the independent closing position. Its last drop is the actual exit cut.
-#[derive(Clone)]
-pub struct ClosingDeliveryAlias {
-    tail: std::sync::Arc<ClosingTailOwner>,
-}
-impl ClosingDeliveryAlias {
-    pub fn scope_id(&self) -> novarocks_workload_control::WorkId {
-        self.tail.capacity.scope_id()
-    }
-}
-impl<W> ClosingDelivery<W> {
-    /// The caller checks full simultaneous backing capacity before moving the
-    /// writer. A closing grant with preexisting raw aliases cannot transfer:
-    /// all subsequent physical aliases must retain the protocol owner as well.
-    /// Rejection returns every owner intact for immediate disconnect.
-    pub fn try_new(
-        writer: W,
-        protocol: GovernedProtocolOwner,
-        capacity: ResultWindowGrant,
-        simultaneously_live_backing_bytes: u64,
-    ) -> Result<Self, (W, GovernedProtocolOwner, ResultWindowGrant)> {
-        let valid_scope = protocol.statement.as_ref().is_some_and(|owner| {
-            capacity.is_for_scope(owner.scope())
-                && owner.accepted_delivery_cut().is_some()
-                && owner.accepted_delivery_cut() == capacity.closing_cut()
-        });
-        if capacity.class() != ResultWindowClass::Closing
-            || !valid_scope
-            || capacity.has_retained_aliases()
-            || capacity
-                .check_backing_total(simultaneously_live_backing_bytes)
-                .is_err()
-        {
-            return Err((writer, protocol, capacity));
-        }
-        let (completion, receiver) = tokio::sync::oneshot::channel();
-        Ok(Self {
-            writer: Some(writer),
-            tail: Some(std::sync::Arc::new(ClosingTailOwner {
-                protocol: Some(protocol),
-                capacity,
-                writer_exited: std::sync::atomic::AtomicBool::new(false),
-                completion: Some(completion),
-            })),
-            completion: Some(receiver),
-        })
-    }
-    pub fn writer_mut(&mut self) -> &mut W {
-        self.writer
-            .as_mut()
-            .expect("closing owns its detached writer")
-    }
-    pub fn retained_guard(&self) -> ClosingDeliveryAlias {
-        ClosingDeliveryAlias {
-            tail: std::sync::Arc::clone(
-                self.tail.as_ref().expect("closing retains its tail owner"),
-            ),
-        }
-    }
-    /// Invoke after ERR/flush completes or disconnect. Generation settlement
-    /// still waits for every physical alias. Cancelling this wait cannot settle
-    /// or release a still-live alias; its owner retains the protocol authority.
-    pub async fn settle_after_writer_exit(mut self) -> GovernedStatementFinishOutcome {
-        drop(self.writer.take());
-        self.tail
-            .as_ref()
-            .expect("closing owns tail")
-            .writer_exited
-            .store(true, std::sync::atomic::Ordering::Release);
-        let completion = self.completion.take().expect("closing owns completion");
-        drop(self.tail.take());
-        completion
-            .await
-            .expect("last closing holder publishes settlement")
-    }
-}
-impl<W> Drop for ClosingDelivery<W> {
-    fn drop(&mut self) {
-        // Writer destruction precedes its tail owner. Last-alias destruction
-        // settles cancellation/disconnect; dropping a waiter never proves exit.
-        drop(self.writer.take());
-        drop(self.tail.take());
-    }
-}
-
 /// Query-application output delivered to a client-session protocol adapter.
 ///
 /// The adapter owns wire framing, while these values retain every application
@@ -344,6 +174,37 @@ pub enum QuerySessionOutput {
     GovernedCompletion(GovernedCompletionStatementResult),
     GovernedError(GovernedErrorStatementResult),
     Ok,
+}
+
+impl QuerySessionOutput {
+    pub fn external_effect_disposition(
+        &self,
+    ) -> Option<crate::api::StatementExternalEffectDisposition> {
+        match self {
+            Self::GovernedQuery(result) => result.protocol.external_effect_disposition(),
+            Self::StreamingQuery(result) => result.protocol.external_effect_disposition(),
+            Self::GovernedCompletion(result) => result.protocol.external_effect_disposition(),
+            Self::GovernedError(result) => crate::api::StatementExternalEffectDisposition::combine(
+                result.protocol.external_effect_disposition(),
+                result.error.external_effect_disposition(),
+            ),
+            Self::Query(_) | Self::Ok => None,
+        }
+    }
+
+    pub(crate) fn retain_original_external_effect(
+        &mut self,
+        effect: Option<crate::api::StatementExternalEffectDisposition>,
+    ) {
+        let protocol = match self {
+            Self::GovernedQuery(result) => &mut result.protocol,
+            Self::StreamingQuery(result) => &mut result.protocol,
+            Self::GovernedCompletion(result) => &mut result.protocol,
+            Self::GovernedError(result) => &mut result.protocol,
+            Self::Query(_) | Self::Ok => return,
+        };
+        protocol.external_effect = effect;
+    }
 }
 
 impl std::fmt::Debug for QuerySessionOutput {
@@ -412,6 +273,7 @@ impl GovernedImmediateStatementResult {
 #[must_use = "the governed completion must be settled by its protocol owner"]
 pub struct GovernedCompletionStatementResult {
     completion: StatementCommandCompletion,
+    completion_rows: Option<OwnedLocalResult>,
     protocol: GovernedProtocolOwner,
     effects: crate::session_effects::SessionEffects,
 }
@@ -423,9 +285,34 @@ impl GovernedCompletionStatementResult {
     ) -> Self {
         Self {
             completion,
+            completion_rows: None,
             protocol: GovernedProtocolOwner::new(statement),
             effects: crate::session_effects::SessionEffects::default(),
         }
+    }
+    pub(crate) fn with_prepared_rows(
+        completion: StatementCommandCompletion,
+        completion_rows: Option<OwnedLocalResult>,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            completion,
+            completion_rows,
+            protocol: GovernedProtocolOwner::new(statement),
+            effects: crate::session_effects::SessionEffects::default(),
+        }
+    }
+    pub const fn completion(&self) -> StatementCommandCompletion {
+        self.completion
+    }
+    pub fn into_parts_with_rows(
+        self,
+    ) -> (
+        StatementCommandCompletion,
+        Option<OwnedLocalResult>,
+        GovernedProtocolOwner,
+    ) {
+        (self.completion, self.completion_rows, self.protocol)
     }
     pub fn with_session_effects(
         statement: GovernedQueryStatementOwner,
@@ -434,7 +321,8 @@ impl GovernedCompletionStatementResult {
         Self {
             // Session mutations are control statements with no affected rows.
             // DML completion carries its own explicit logical row count.
-            completion: StatementCommandCompletion::new(0),
+            completion: StatementCommandCompletion::empty(),
+            completion_rows: None,
             protocol: GovernedProtocolOwner::new(statement),
             effects,
         }
@@ -533,6 +421,12 @@ impl StreamingStatementResult {
         })
     }
 
+    pub fn external_effect_disposition(
+        &self,
+    ) -> Option<crate::api::StatementExternalEffectDisposition> {
+        self.protocol.external_effect_disposition()
+    }
+
     /// Project the protocol owner's exact identity; observation grants no control.
     pub fn statement_token(&self) -> Option<StatementToken> {
         self.protocol.statement_token()
@@ -567,68 +461,6 @@ impl StreamingStatementResult {
 
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         self.protocol.seal_success_visibility()
-    }
-
-    /// Fix the delivery verdict and return computation capacity before a
-    /// possibly slow protocol tail. Closing admission is a single try.
-    pub fn try_closing_capacity(
-        &mut self,
-        cancelled: bool,
-    ) -> Result<ResultWindowGrant, WorkError> {
-        let _ = self.execution.request_cancel();
-        let cut = if cancelled {
-            self.protocol.accept_cancel_delivery_cut()?;
-            novarocks_workload_control::ResultClosingCut::AcceptedCancellation
-        } else {
-            self.protocol.accept_failed_delivery_cut()?;
-            novarocks_workload_control::ResultClosingCut::OriginatingFailure
-        };
-        self.protocol.closing_capacity(cut)
-    }
-
-    /// Transfer only after the independent capacity proves the complete tail.
-    /// A rejected handoff returns every original owner intact.
-    pub fn into_closing_delivery<W>(
-        mut self,
-        writer: W,
-        capacity: ResultWindowGrant,
-        simultaneously_live_backing_bytes: u64,
-    ) -> Result<ClosingDelivery<W>, (Self, W, ResultWindowGrant)> {
-        let _ = self.execution.request_cancel();
-        self.settled = true;
-        let protocol = std::mem::replace(
-            &mut self.protocol,
-            GovernedProtocolOwner {
-                statement: None,
-                settled: true,
-            },
-        );
-        match ClosingDelivery::try_new(
-            writer,
-            protocol,
-            capacity,
-            simultaneously_live_backing_bytes,
-        ) {
-            Ok(mut closing) => {
-                let tail = std::sync::Arc::get_mut(
-                    closing.tail.as_mut().expect("new closing retains tail"),
-                )
-                .expect("new closing has no aliases");
-                tail.protocol
-                    .as_mut()
-                    .expect("new closing retains protocol")
-                    .statement
-                    .as_mut()
-                    .expect("closing protocol retains statement")
-                    .release_transferred_result_window();
-                Ok(closing)
-            }
-            Err((writer, protocol, capacity)) => {
-                self.protocol = protocol;
-                self.settled = false;
-                Err((self, writer, capacity))
-            }
-        }
     }
 
     pub fn result_window_alias(
@@ -681,7 +513,6 @@ impl Drop for StreamingStatementResult {
 #[cfg(test)]
 mod execution_handoff_tests {
     use super::*;
-    use crate::client_connection::ClientConnectionToken;
     use crate::query_control::QueryApplicationControl;
     use crate::session_control::{QueryControlService, SessionIdentity};
     use novarocks_workload_control::{
@@ -767,8 +598,8 @@ mod execution_handoff_tests {
             let application = Arc::new(QueryApplicationControl::default());
             let service = QueryControlService::new(application);
             let session = service
-                .register_session(SessionIdentity::new(
-                    ClientConnectionToken::new(7, 1).unwrap(),
+                .register_session(SessionIdentity::client_statement(
+                    service.mint_client_query_id(),
                     "root",
                 ))
                 .unwrap();

@@ -44,9 +44,8 @@ pub(crate) use application::{
     connector_request_context_for_execution_on_runtime,
     connector_request_context_for_query_on_runtime, connector_write_column,
     context_for_planning_pin, context_for_planning_pin_typed, metadata_binding_typed,
-    metadata_list_namespaces_with_planning_pin_async,
-    metadata_list_tables_with_planning_pin_async, metadata_namespace_exists_async,
-    metadata_read_reference_facts_with_planning_pin_async,
+    metadata_list_namespaces_with_planning_pin_async, metadata_list_tables_with_planning_pin_async,
+    metadata_namespace_exists_async, metadata_read_reference_facts_with_planning_pin_async,
     metadata_table_exists_with_planning_pin_async, query_connector_request_context_on_runtime,
     require_current_write_authority, sql_column_from_connector_binding,
 };

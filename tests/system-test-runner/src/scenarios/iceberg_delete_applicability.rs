@@ -22,10 +22,9 @@ use super::connector::{
     resource_baseline,
 };
 use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
 use novarocks_cluster_harness::{CrossProcessConfigOverlay, TestClusterOwner};
 use serde::Deserialize;
@@ -485,20 +484,17 @@ impl Scenario for IcebergDeleteApplicability {
                 .await?;
                 Ok::<_, anyhow::Error>((corpus, anomaly, scale))
             })?;
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect delete oracle session")?,
-        )?;
-        connection.query_drop(create_catalog_sql(fixture))?;
-        connection.query_drop("SET enable_scan_datacache = false")?;
+        context.remaining("connect delete oracle session")?;
+        let mut connection =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        connection.execute(create_catalog_sql(fixture))?;
+        connection.execute("SET enable_scan_datacache = false")?;
         let mut observations = Vec::new();
         for case in fixture.corpus["cases"].as_array().unwrap() {
             let table = table_name(case["table"].as_str().context("case table missing")?)?;
             let snapshot = case["snapshot"].as_i64().context("snapshot missing")?;
             let query = format!("SELECT id,p,value FROM {table} FOR VERSION AS OF {snapshot}");
-            let mut actual: Vec<(Option<i64>, Option<i64>, Option<String>)> =
-                connection.query(&query)?;
+            let mut actual = read_row_bag(&connection.execute(&query)?)?;
             let mut expected = row_bag(case)?;
             actual.sort();
             expected.sort();
@@ -524,33 +520,59 @@ impl Scenario for IcebergDeleteApplicability {
                 .context("scale snapshot missing")?;
             let query = scale_read_sql(case)?;
             let selected = self.intent.take(index)?;
-            let observation = selected.arm(context, connection.connection_id(), &query)?;
-            let mut hash = Sha256::new();
-            let mut count = 0_i64;
-            let mut sums = [0_i64; 4];
-            let mut last = None;
-            for row in connection.query_iter(&query)? {
-                let row: (i64, i64, i64, i64) =
-                    mysql::from_row_opt(row?).context("scale row is not four INT64 values")?;
-                ensure!(
-                    last.is_none_or(|old| old < row.0),
-                    "scale rows repeat or violate row_id order"
-                );
-                last = Some(row.0);
-                for (i, value) in [row.0, row.1, row.2, row.3].into_iter().enumerate() {
-                    hash.update(value.to_be_bytes());
-                    sums[i] = sums[i].checked_add(value).context("scale sum overflow")?;
+            let pending = connection.submit(&query)?;
+            let (pending, observation) = selected.arm_pending(context, pending, &query)?;
+            let cancel = pending.cancel_handle();
+            let mut terminal_sql = false;
+            let phase = (|| -> Result<Value> {
+                let executed = connection.run_pending(pending);
+                terminal_sql = matches!(&executed, Ok(_) | Err(StatementFailure::Trino(_)));
+                let result = executed?;
+                require_integer_columns(&result, 4)?;
+                let mut hash = Sha256::new();
+                let mut count = 0_i64;
+                let mut sums = [0_i64; 4];
+                let mut last = None;
+                for cells in result.rows {
+                    let [
+                        TrinoValue::Integer(row_id),
+                        TrinoValue::Integer(eq_key),
+                        TrinoValue::Integer(partition_key),
+                        TrinoValue::Integer(payload),
+                    ] = cells.as_slice()
+                    else {
+                        anyhow::bail!("scale row is not four non-null integer values: {cells:?}");
+                    };
+                    let row = (*row_id, *eq_key, *partition_key, *payload);
+                    ensure!(
+                        last.is_none_or(|old| old < row.0),
+                        "scale rows repeat or violate row_id order"
+                    );
+                    last = Some(row.0);
+                    for (i, value) in [row.0, row.1, row.2, row.3].into_iter().enumerate() {
+                        hash.update(value.to_be_bytes());
+                        sums[i] = sums[i].checked_add(value).context("scale sum overflow")?;
+                    }
+                    count += 1;
                 }
-                count += 1;
-            }
-            let observed = json!({"row_count":count,"sum_row_id":sums[0],"sum_eq_key":sums[1],"sum_partition_key":sums[2],"sum_payload":sums[3],"sorted_row_sha256":format!("{:x}",hash.finalize())});
-            ensure!(
-                observed == case["independent_oracle"],
-                "native exact scale bag differs for {name}: {observed}"
-            );
-            context
+                let observed = json!({"row_count":count,"sum_row_id":sums[0],"sum_eq_key":sums[1],"sum_partition_key":sums[2],"sum_payload":sums[3],"sorted_row_sha256":format!("{:x}",hash.finalize())});
+                ensure!(
+                    observed == case["independent_oracle"],
+                    "native exact scale bag differs for {name}: {observed}"
+                );
+                Ok(observed)
+            })();
+            let cancelled = if phase.is_err() && !terminal_sql {
+                cancel
+                    .delete(selected.deadline)
+                    .map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+            let drained = context
                 .handle()
-                .drain_query_lifecycle_statement_binding(&observation, selected.deadline)?;
+                .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+            let observed = with_cleanup(with_cleanup(phase, cancelled), drained)?;
             observations.push(json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"exact_bag":observed}));
         }
         await_resource_convergence(context, &baseline, "native delete applicability reads")?;
@@ -590,7 +612,7 @@ impl Scenario for IcebergDeleteApplicability {
                 &json!({"manifest_sha256":fixture.manifest_sha256,"corpus_sha256":fixture.manifest.corpus_sha256,"scale_sha256":fixture.manifest.scale_sha256,"scale_artifacts_sha256":fixture.manifest.scale_artifacts_sha256,"closure_oracle":closure_summary,"anomaly_closure_oracle":anomaly_closure_summary,"scale_closure_oracle":scale_closure_summary,"observations":observations,"placements":placements,"resource_converged":true,"object_reads":events}),
             )?,
         )?;
-        connection.query_drop(format!("DROP CATALOG {CATALOG}"))?;
+        connection.execute(format!("DROP CATALOG {CATALOG}"))?;
         context.action("verified 23 immutable delete row bags and selected scale bags on all three BEs, with object-range and resource-exit evidence");
         Ok(())
     }
@@ -601,5 +623,75 @@ impl Scenario for IcebergDeleteApplicability {
             .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?
             .take();
         Ok(())
+    }
+}
+
+// These local row shapes belong to the immutable delete oracle. They are not
+// a client-wide SQL conversion or a replacement for provider schema authority.
+fn require_integer_columns(result: &StatementResult, count: usize) -> Result<()> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == count,
+        "delete oracle expected {count} integer columns: {result:?}"
+    );
+    for column in &result.columns {
+        ensure!(
+            matches!(
+                column.type_signature.raw_type.as_str(),
+                "tinyint" | "smallint" | "integer" | "bigint"
+            ) && column.type_signature.arguments.is_empty(),
+            "delete oracle expected a declared integer column: {column:?}"
+        );
+    }
+    Ok(())
+}
+fn read_row_bag(result: &StatementResult) -> Result<Vec<ExpectedRow>> {
+    ensure!(
+        result.is_result_set() && result.columns.len() == 3,
+        "delete row bag expected its three columns: {result:?}"
+    );
+    for column in &result.columns[..2] {
+        ensure!(
+            matches!(
+                column.type_signature.raw_type.as_str(),
+                "tinyint" | "smallint" | "integer" | "bigint"
+            ) && column.type_signature.arguments.is_empty(),
+            "delete row bag expected a declared integer column: {column:?}"
+        );
+    }
+    ensure!(
+        result.columns[2].type_signature.raw_type == "varchar",
+        "delete row bag expected its text value column: {:?}",
+        result.columns[2]
+    );
+    fn integer(value: &TrinoValue) -> Result<Option<i64>> {
+        match value {
+            TrinoValue::Null => Ok(None),
+            TrinoValue::Integer(n) => Ok(Some(*n)),
+            value => anyhow::bail!("delete row bag has a non-integer cell: {value:?}"),
+        }
+    }
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let [id, partition, value] = row.as_slice() else {
+                anyhow::bail!("delete row bag has the wrong width: {row:?}");
+            };
+            let value = match value {
+                TrinoValue::Null => None,
+                TrinoValue::Text(s) => Some(s.clone()),
+                value => anyhow::bail!("delete row bag has a non-text value: {value:?}"),
+            };
+            Ok((integer(id)?, integer(partition)?, value))
+        })
+        .collect()
+}
+fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("delete oracle cleanup failed: {cleanup:#}")))
+        }
     }
 }

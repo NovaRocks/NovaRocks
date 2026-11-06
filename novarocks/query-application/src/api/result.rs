@@ -477,12 +477,6 @@ impl RootSegmentDelivery {
         (reply, signal, self.resident_window.take())
     }
 
-    /// Original fallback delivery identity; no reply/guard/body alias is returned.
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    pub fn data_scalars(&self) -> Option<super::RootDataScalars> {
-        self.reply().data_scalars()
-    }
-
     /// `reply` must hold Data. ClientRows carries its frozen profile and the
     /// row cursor before this body, against which the body already validated.
     pub(crate) fn try_new(

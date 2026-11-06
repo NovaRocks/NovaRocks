@@ -294,7 +294,10 @@ class RendererTests(RendererCase):
         def mysql_renderer(context, output):
             original_renderer(context, output)
             path = output / 'sql-test.toml'
-            ports = tomllib.loads((output / 'fe.toml').read_text())['standalone_server']
+            fe_path = output / 'fe.toml'
+            fe_text = fe_path.read_text().replace('[standalone_server]\n', '[standalone_server]\nmysql_port = 9030\n', 1)
+            fe_path.write_text(fe_text)
+            ports = tomllib.loads(fe_text)['standalone_server']
             text = path.read_text().replace(
                 'trino_port = ' + json.dumps(str(ports['trino_port'])),
                 'port = ' + json.dumps(str(ports['mysql_port'])), 1)
@@ -320,7 +323,9 @@ class RendererTests(RendererCase):
         self.assertEqual(set(cluster), {'host', 'trino_port', 'user'})
         fe = tomllib.loads((current_directory / 'fe.toml').read_text())
         self.assertEqual(cluster['trino_port'], str(fe['standalone_server']['trino_port']))
-        self.assertEqual(old_cluster['port'], str(fe['standalone_server']['mysql_port']))
+        self.assertNotIn('mysql_port', fe['standalone_server'])
+        old_fe = tomllib.loads((old_directory / 'fe.toml').read_text())
+        self.assertEqual(old_cluster['port'], str(old_fe['standalone_server']['mysql_port']))
         self.assertEqual(old_hashes, self.publication_hashes(old_directory))
         self.assertEqual(old_cluster, tomllib.loads((old_directory / 'sql-test.toml').read_text())['cluster'])
         self.assertEqual(runtime.digest(runtime.read_json(old_directory / 'entry.json')), old_directory.name)
@@ -383,7 +388,7 @@ class RendererTests(RendererCase):
 
     def test_renderer_and_interrupted_commit_preserve_previous_complete_publication(self):
         first = self.bind()
-        invalid = copy.deepcopy(self.config); del invalid['local_ports']['mysql']
+        invalid = copy.deepcopy(self.config); del invalid['local_ports']['trino']
         with self.assertRaises(KeyError):
             entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid)
         self.assertEqual(publication.read(self.entry), first)
@@ -896,6 +901,159 @@ class DownPurgeTests(RendererCase):
         self.assertTrue((Path(first['published_dir']) / 'env.sh').is_file())
 
 
+class PrivateCreationTests(RendererCase):
+    def create_private(self, states=None, wait_codes=None, missing=(), shared=False,
+                       http_states=None, work_seconds=300, http_seconds=0):
+        from scratch import ScratchIdentity, RunBudget
+        clock = [1000.0]
+        identity = ScratchIdentity.create('s3://novarocks/test-worktree')
+        self.private_budget = RunBudget.admit(self.snapshot, identity,
+            seconds=work_seconds + 300, monotonic=lambda: clock[0])
+        config = copy.deepcopy(self.config)
+        config.update(shared_docker=False, update_current=False)
+        if shared:
+            config['shared_minio'] = self.snapshot
+            config['warehouses'] = {name: identity.scope_root + '/' + name for name in config['warehouses']}
+            config['run_context'] = self.private_budget.as_dict()
+        states = copy.deepcopy(states or {})
+        wait_codes = wait_codes or {}
+        self.creation_events = []
+        http_states = copy.deepcopy(http_states or {})
+        self.creation_http_calls = []
+        self.private_backend = backend = mock.Mock()
+        backend.timeout = min(120, work_seconds)
+        backend.image_id.side_effect = lambda reference: reference
+        backend.inspect.side_effect = lambda kind, reference: {
+            'Id': reference, 'Config': {'Entrypoint': ['java'], 'Cmd': ['-jar', '/rest.jar']}}
+        backend.attach.return_value = 'original-minio'
+        backend.healthy.side_effect = AssertionError('no environment health probe')
+
+        def compose(record, args):
+            self.creation_record = record
+
+        def http_ready(url):
+            record = self.creation_record
+            service = next(service for service in runtime.rest_services(record)
+                if url == f"http://127.0.0.1:{record['ports'][service.replace('-', '_')]}/v1/config")
+            saved = json.loads((self.entry / 'manifest.json').read_text())
+            self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+            self.assertLessEqual(backend.operation_deadline, 1000 + min(120, work_seconds))
+            self.creation_events.append(('http', service))
+            self.creation_http_calls.append((service, backend.operation_deadline))
+            clock[0] += http_seconds
+            state = http_states.get(service, True)
+            return state.pop(0) if isinstance(state, list) else state
+
+        def container(record, service):
+            if service in missing:
+                return None
+            state = states.get(service, {'Status': 'exited', 'ExitCode': 0})
+            return {'Id': 'original-' + service, 'State': copy.deepcopy(state)}
+
+        def command(args):
+            self.assertEqual(args[0], 'wait')
+            service = args[1].removeprefix('original-')
+            self.assertIn(service, ('mc-init', 'mc'))
+            saved = json.loads((self.entry / 'manifest.json').read_text())
+            self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+            self.creation_events.append(('wait', args[1]))
+            code = wait_codes.get(service, 0)
+            states[service] = {'Status': 'exited', 'ExitCode': code}
+            return str(code)
+
+        def publish(context, directory):
+            self.creation_events.append(('publish', context['private_record']['creation_state']))
+            return render(context, directory)
+
+        backend.container.side_effect = container
+        backend.command.side_effect = command
+        backend.compose.side_effect = compose
+        backend.http_ready.side_effect = http_ready
+        render = entry.render_entry
+        with mock.patch.object(runtime, 'Docker', return_value=backend), \
+                mock.patch.object(entry, 'render_entry', side_effect=publish), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(entry.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            return entry.start_private_stack(config, 'nr-isolated-rest-test', self.entry,
+                'stock', None, bom(), budget=self.private_budget)
+
+    def test_bucket_initializer_and_mc_exit_before_ready(self):
+        result = self.create_private(states={name: {'Status': 'running'} for name in ('mc-init', 'mc')})
+        self.assertEqual(self.creation_events, [
+            ('publish', 'starting'), ('wait', 'original-mc-init'),
+            ('wait', 'original-mc'), ('http', 'rest'), ('http', 'rest-mv'), ('publish', 'ready')])
+        self.assertEqual(result['private_record']['creation_state'], 'ready')
+        self.assertEqual(self.private_backend.operation_deadline,
+                         self.private_budget.deadline - self.private_budget.cleanup_grace_seconds)
+
+    def test_failed_one_shot_never_publishes_ready(self):
+        for service in ('mc-init', 'mc'):
+            for status in ('running', 'exited'):
+                with self.subTest(service=service, status=status):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, 'did not exit successfully') as raised:
+                        self.create_private(states={service: {'Status': status, 'ExitCode': 17}},
+                                            wait_codes={service: 17})
+                    self.assertEqual(raised.exception.code, 'RuntimeCreationFailed')
+                    self.assertNotIn(('publish', 'ready'), self.creation_events)
+                    saved = json.loads((self.entry / 'manifest.json').read_text())
+                    self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+
+    def test_missing_required_or_mc_container_is_not_ready(self):
+        for service in ('mc-init', 'rest', 'mc'):
+            with self.subTest(service=service):
+                with self.assertRaises(runtime.RuntimeFailure) as raised:
+                    self.create_private(missing=(service,))
+                self.assertEqual(raised.exception.code, 'RuntimeStateUnreadable')
+                self.assertNotIn(('publish', 'ready'), self.creation_events)
+
+    def test_shared_minio_waits_only_for_its_original_mc(self):
+        result = self.create_private(states={'mc': {'Status': 'running'}}, shared=True)
+        self.assertEqual([event for event in self.creation_events if event[0] == 'wait'],
+                         [('wait', 'original-mc')])
+        self.assertNotIn('mc-init', result['private_record']['required_services'])
+        self.assertNotIn('mc-init', [call.args[1] for call in self.private_backend.container.call_args_list])
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+
+    def test_successful_exit_facts_do_not_start_another_wait(self):
+        self.create_private()
+        self.assertFalse(self.private_backend.command.called)
+        self.assertEqual([service for service, _ in self.creation_http_calls], ['rest', 'rest-mv'])
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+
+    def test_new_rest_services_handoff_only_after_both_serve(self):
+        self.create_private(http_states={'rest': [False, True], 'rest-mv': [False, True]}, shared=True)
+        self.assertEqual([service for service, _ in self.creation_http_calls],
+                         ['rest', 'rest', 'rest-mv', 'rest-mv'])
+        self.assertEqual(self.creation_events[-1], ('publish', 'ready'))
+        self.assertEqual(self.private_backend.operation_deadline, 1300)
+
+    def test_new_rest_timeout_keeps_partial_record_and_original_deadline(self):
+        for service, work_seconds in [('rest', 300), ('rest-mv', 5)]:
+            with self.subTest(service=service, work_seconds=work_seconds):
+                with self.assertRaises(runtime.RuntimeFailure) as raised:
+                    self.create_private(http_states={service: False}, work_seconds=work_seconds)
+                self.assertEqual(raised.exception.code,
+                                 'RunBudgetExpired' if work_seconds < 120 else 'ReadinessTimeout')
+                self.assertEqual(self.private_backend.operation_deadline, 1000 + work_seconds)
+                self.assertNotIn(('publish', 'ready'), self.creation_events)
+                saved = json.loads((self.entry / 'manifest.json').read_text())
+                self.assertEqual(saved['runtime']['catalog']['creation_state'], 'starting')
+
+    def test_late_http_success_cannot_extend_creation_window(self):
+        with self.assertRaises(runtime.RuntimeFailure) as raised:
+            self.create_private(http_seconds=121)
+        self.assertEqual(raised.exception.code, 'ReadinessTimeout')
+        self.assertEqual(self.private_backend.operation_deadline, 1300)
+        self.assertNotIn(('publish', 'ready'), self.creation_events)
+
+    def test_http_success_cannot_hide_original_work_budget_expiry(self):
+        with self.assertRaises(runtime.RuntimeFailure) as raised:
+            self.create_private(work_seconds=5, http_seconds=6)
+        self.assertEqual(raised.exception.code, 'RunBudgetExpired')
+        self.assertEqual(self.private_backend.operation_deadline, 1005)
+        self.assertNotIn(('publish', 'ready'), self.creation_events)
+
+
 class IsolatedEntryTests(RendererCase):
     def isolated(self, profile='stock'):
         config = copy.deepcopy(self.config)
@@ -908,7 +1066,9 @@ class IsolatedEntryTests(RendererCase):
         result = self.isolated()
         result['record'].update(creation_state='ready', containers={'rest': 'original-rest'})
         entry.render_entry(result['context'], self.entry)
-        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')):
+        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')), \
+                mock.patch.object(runtime.Docker, 'http_ready', side_effect=AssertionError('no existing target HTTP probe')), \
+                mock.patch.object(runtime.Docker, 'healthy', side_effect=AssertionError('no existing target health probe')):
             saved = entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
         self.assertEqual(saved['private_record']['containers'], {'rest': 'original-rest'})
 

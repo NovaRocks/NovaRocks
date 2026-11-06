@@ -118,6 +118,9 @@ impl ParticipationHostRecord {
         command: ParticipationCommand,
     ) -> Result<(), ParticipationRequestSubmitRefusal> {
         let (task, read) = match command {
+            ParticipationCommand::Cancel { task, reason } => {
+                (task, TaskReadCommand::Cancel { reason })
+            }
             ParticipationCommand::GetFinalInfo { task } => (task, TaskReadCommand::FinalInfo),
             ParticipationCommand::GetDynamicFilters { task, acknowledged } => {
                 (task, TaskReadCommand::DynamicFilters { acknowledged })

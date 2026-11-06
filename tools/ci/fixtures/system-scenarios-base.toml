@@ -50,7 +50,6 @@ path = "tmp/system-scenarios-state-store.sqlite"
 mode = "dynamic-state-store"
 
 [standalone_server]
-mysql_port = 9030
 user = "root"
 
 # A system scenario preserves the production FE/BE process boundary, but is

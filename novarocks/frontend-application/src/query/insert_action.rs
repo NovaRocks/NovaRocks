@@ -17,7 +17,7 @@
 
 //! INSERT retains its original statement preparation and compilation authors.
 
-use super::write_action::{self, WriteStatementFamily, WriteStatementStart};
+use super::write_action::{self, WriteCompletion, WriteStatementFamily, WriteStatementStart};
 use super::*;
 use crate::dml::attempt::DmlPublicationAttempt;
 use crate::query_execution::{
@@ -39,6 +39,10 @@ struct InsertFamily;
 impl WriteStatementFamily for InsertFamily {
     type Input = PreparationInput;
     type Prepared = PreparedIcebergWrite;
+
+    fn completion(_input: &PreparationInput) -> WriteCompletion {
+        WriteCompletion::Counted
+    }
 
     async fn prepare(
         input: Arc<PreparationInput>,

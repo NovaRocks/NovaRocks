@@ -36,6 +36,12 @@ pub(super) fn prepare(
         crate::preparation_diagnostics::StatementObservationHandle,
     >,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+    let family = context.session().presentation().copied().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorKind::Rejected,
+            "maintenance client result requires an explicit presentation",
+        )
+    })?;
     if let Some(action) = executor
         .prepare_optimize_action(
             command,
@@ -55,7 +61,7 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
-            *context.session().presentation(),
+            family,
             #[cfg(novarocks_dev_controls)]
             observation,
         )
@@ -70,7 +76,7 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
-            *context.session().presentation(),
+            family,
         )
         .map_err(maintenance_command_error)?
     {
@@ -104,7 +110,7 @@ pub(super) fn prepare(
         )
         .map_err(maintenance_command_error)?;
     Ok(Box::new(MetadataMaintenanceAction {
-        family: *context.session().presentation(),
+        family,
         call,
         origin,
         started: false,
@@ -184,7 +190,7 @@ impl MetadataMaintenanceAction {
         };
         Poll::Ready(match result {
             MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok(
-                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+                novarocks_query_application::session_control::StatementCommandCompletion::empty(),
             )),
             MaintenanceStatementResult::Query(result) => {
                 let window = match owner.result_window_alias() {

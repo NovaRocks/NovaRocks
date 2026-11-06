@@ -20,11 +20,11 @@ use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_result_contract::{
     ClientRenderSchema, ClientRowProfile, ClientRowStreamCursor, NamedRenderField,
-    NativeRenderType as N, OpaqueRenderType, RenderColumn, RenderField, RenderPresentation as P,
-    RenderTimeUnit as U, RootProfileV1 as V,
+    NativeRenderType as N, RenderColumn, RenderField, RenderPresentation as P, RenderTimeUnit as U,
+    RootProfileV1 as V,
 };
 use novarocks_result_render::{
-    ArrowMysqlTextEncoder, BoundedClientRowEncoder, RenderErrorKind as E, RenderTurnStatus,
+    ArrowTrinoJsonEncoder, BoundedClientRowEncoder, RenderErrorKind as E, RenderTurnStatus,
 };
 use std::sync::Arc;
 fn field(n: N, p: P, nullable: bool) -> RenderField {
@@ -42,7 +42,7 @@ fn input(arrays: Vec<ArrayRef>) -> RecordBatch {
         .collect::<Vec<_>>();
     RecordBatch::try_new(Arc::new(Schema::new(fs)), arrays).unwrap()
 }
-fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowMysqlTextEncoder {
+fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowTrinoJsonEncoder {
     let cols = fields
         .into_iter()
         .enumerate()
@@ -53,10 +53,16 @@ fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowMysqlTextEncode
             field,
         })
         .collect();
-    ArrowMysqlTextEncoder::try_new(
+    ArrowTrinoJsonEncoder::try_new(
         Arc::new(
             ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: false,
+                    },
+                ),
                 cols,
                 batch.num_columns(),
             )
@@ -66,13 +72,13 @@ fn encoder(batch: RecordBatch, fields: Vec<RenderField>) -> ArrowMysqlTextEncode
     )
     .unwrap()
 }
-fn string_encoder(values: Vec<&str>) -> ArrowMysqlTextEncoder {
+fn string_encoder(values: Vec<&str>) -> ArrowTrinoJsonEncoder {
     encoder(
         input(vec![Arc::new(StringArray::from(values))]),
-        vec![field(N::String, P::ScalarText, true)],
+        vec![field(N::String, P::TrinoValue, true)],
     )
 }
-fn encode(mut e: ArrowMysqlTextEncoder, size: usize) -> (Vec<u8>, Vec<usize>) {
+fn encode(mut e: ArrowTrinoJsonEncoder, size: usize) -> (Vec<u8>, Vec<usize>) {
     let mut out = vec![0; size];
     let mut all = Vec::new();
     let mut lengths = Vec::new();
@@ -104,111 +110,18 @@ fn row(payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-fn cell(value: &[u8]) -> Vec<u8> {
-    let mut out = if value.len() < 251 {
-        vec![value.len() as u8]
-    } else if value.len() <= 65535 {
-        vec![0xfc, value.len() as u8, (value.len() >> 8) as u8]
-    } else if value.len() <= 0xffffff {
-        vec![
-            0xfd,
-            value.len() as u8,
-            (value.len() >> 8) as u8,
-            (value.len() >> 16) as u8,
-        ]
-    } else {
-        let mut v = vec![0xfe];
-        v.extend_from_slice(&(value.len() as u64).to_le_bytes());
-        v
-    };
-    out.extend_from_slice(value);
-    out
-}
 #[test]
-fn scalar_exact_bytes() {
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(vec![i64::MIN])),
-        Arc::new(UInt64Array::from(vec![u64::MAX])),
-        Arc::new(BooleanArray::from(vec![true])),
-        Arc::new(Float32Array::from(vec![1.25])),
-        Arc::new(
-            Decimal128Array::from(vec![-12345])
-                .with_precision_and_scale(8, 3)
-                .unwrap(),
-        ),
-        Arc::new(Date32Array::from(vec![-719560])),
-        Arc::new(Time64MicrosecondArray::from(vec![93_784_000_005])),
-        Arc::new(TimestampNanosecondArray::from(vec![1_999])),
-    ];
-    let fields = vec![
-        field(N::SignedInteger(64), P::ScalarText, true),
-        field(N::UnsignedInteger(64), P::ScalarText, true),
-        field(N::Boolean, P::ScalarText, true),
-        field(N::Float32, P::ScalarText, true),
-        field(
-            N::Decimal {
-                bits: 128,
-                precision: 8,
-                scale: 3,
-            },
-            P::ScalarText,
-            true,
-        ),
-        field(N::Date, P::ScalarText, true),
-        field(
-            N::Time {
-                unit: U::Microsecond,
-            },
-            P::ScalarText,
-            true,
-        ),
-        field(
-            N::Timestamp {
-                unit: U::Nanosecond,
-                timezone: None,
-            },
-            P::TimestampUtcMicros,
-            true,
-        ),
-    ];
-    let mut payload = Vec::new();
-    for s in [
-        "-9223372036854775808",
-        "18446744073709551615",
-        "1",
-        "1.25",
-        "-12.345",
-        "0000-00-00",
-        "26:03:04.000005",
-        "1970-01-01 00:00:00.000001",
-    ] {
-        payload.extend(cell(s.as_bytes()));
-    }
-    assert_eq!(
-        encode(encoder(input(arrays), fields), 1 << 20).0,
-        row(&payload)
-    );
-}
-#[test]
-fn small_threshold_and_lenenc_boundaries() {
+fn small_threshold_keeps_exact_json_payload_boundaries() {
     for total in [
         V::SMALL_ROW_BYTES - 1,
         V::SMALL_ROW_BYTES,
         V::SMALL_ROW_BYTES + 1,
     ] {
-        let prefix = if total - 3 <= 65535 { 3 } else { 4 };
-        let value = "x".repeat(total - prefix);
-        let expected = row(&cell(value.as_bytes()));
+        let value = "x".repeat(total - 4);
+        let expected = row(format!("[\"{value}\"]").as_bytes());
         let (actual, lengths) = encode(string_encoder(vec![&value]), 1 << 20);
         assert_eq!(actual, expected);
         assert!(lengths.iter().all(|n| *n > 4));
-    }
-    for n in [0, 1, 250, 251, 65535, 65536, 0xffffff, 0x1000000] {
-        let value = "x".repeat(n);
-        assert_eq!(
-            encode(string_encoder(vec![&value]), 65536).0,
-            row(&cell(value.as_bytes()))
-        );
     }
 }
 #[test]
@@ -218,9 +131,9 @@ fn prefix_quantum_and_short_continuation() {
         assert_eq!(
             encode(string_encoder(vec![&value, "", &value]), size).0,
             [
-                row(&cell(value.as_bytes())),
-                row(&cell(b"")),
-                row(&cell(value.as_bytes()))
+                row(format!("[\"{value}\"]").as_bytes()),
+                row(b"[\"\"]"),
+                row(format!("[\"{value}\"]").as_bytes())
             ]
             .concat()
         );
@@ -237,6 +150,10 @@ fn prefix_quantum_and_short_continuation() {
         let t = e.step(&mut out).unwrap();
         if t.emitted_bytes != 0 {
             assert_eq!(t.emitted_bytes, 5);
+            assert_eq!(
+                &out,
+                &[((value.len() + 4) as u32).to_le_bytes().as_slice(), b"["].concat()
+            );
             break;
         }
     }
@@ -244,66 +161,7 @@ fn prefix_quantum_and_short_continuation() {
     assert_eq!(t.emitted_bytes, 1);
 }
 #[test]
-fn nested_struct_json_time_timestamp_binary() {
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(vec![r#"{"a":[1,{"b":null}]}"#])),
-        Arc::new(Time64MicrosecondArray::from(vec![-1])),
-        Arc::new(TimestampNanosecondArray::from(vec![1]).with_timezone("UTC")),
-        Arc::new(BinaryArray::from(vec![b"a\xff\"".as_slice()])),
-    ];
-    let names = ["j", "t", "ts", "b"];
-    let fs = arrays
-        .iter()
-        .zip(names)
-        .map(|(a, n)| Arc::new(Field::new(n, a.data_type().clone(), true)))
-        .collect::<Vec<_>>();
-    let array = StructArray::new(fs.into(), arrays, None);
-    let children = vec![
-        NamedRenderField {
-            name: "j".into(),
-            field: field(N::Json, P::JsonText, true),
-        },
-        NamedRenderField {
-            name: "t".into(),
-            field: field(
-                N::Time {
-                    unit: U::Microsecond,
-                },
-                P::ScalarText,
-                true,
-            ),
-        },
-        NamedRenderField {
-            name: "ts".into(),
-            field: field(
-                N::Timestamp {
-                    unit: U::Nanosecond,
-                    timezone: Some("UTC".into()),
-                },
-                P::TimestampContainerText,
-                true,
-            ),
-        },
-        NamedRenderField {
-            name: "b".into(),
-            field: field(N::Binary, P::ScalarText, true),
-        },
-    ];
-    let expected = "{\"j\":'{\"a\":[1,{\"b\":null}]}',\"t\":\"-00:00:00.000001\",\"ts\":\"1970-01-01 00:00:00.000000001 UTC\",\"b\":\"a�\\\"\"}";
-    assert_eq!(
-        encode(
-            encoder(
-                input(vec![Arc::new(array)]),
-                vec![field(N::Struct(children), P::MysqlContainer, true)]
-            ),
-            1 << 20
-        )
-        .0,
-        row(&cell(expected.as_bytes()))
-    );
-}
-#[test]
-fn map_insertion_order_and_empty_list_null() {
+fn map_insertion_order_empty_map_and_null_value() {
     let keys: ArrayRef = Arc::new(StringArray::from(vec!["z", "a"]));
     let vals: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
     let entries = StructArray::new(
@@ -325,22 +183,22 @@ fn map_insertion_order_and_empty_list_null() {
     );
     let f = field(
         N::Map {
-            key: Box::new(field(N::String, P::ScalarText, false)),
-            value: Box::new(field(N::SignedInteger(32), P::ScalarText, true)),
+            key: Box::new(field(N::String, P::TrinoValue, false)),
+            value: Box::new(field(N::SignedInteger(32), P::TrinoValue, true)),
         },
-        P::MysqlContainer,
+        P::TrinoValue,
         true,
     );
     assert_eq!(
         encode(encoder(input(vec![Arc::new(map)]), vec![f]), 65536).0,
-        [row(&cell(br#"{"z":1,"a":null}"#)), row(&cell(b"{}"))].concat()
+        [row(br#"[{"z":1,"a":null}]"#), row(b"[{}]")].concat()
     );
 }
 #[test]
 fn repeated_occurrences_and_dictionary() {
     let d = DictionaryArray::<Int32Type>::from_iter(vec![Some("alpha"), None, Some("alpha")]);
     let batch = input(vec![Arc::new(d)]);
-    let f = field(N::String, P::ScalarText, true);
+    let f = field(N::String, P::TrinoValue, true);
     let cols = vec![
         RenderColumn {
             source_ordinal: 0,
@@ -357,61 +215,26 @@ fn repeated_occurrences_and_dictionary() {
     ];
     let schema = Arc::new(
         ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: false,
+                },
+            ),
             cols,
             1,
         )
         .unwrap(),
     );
-    let e = ArrowMysqlTextEncoder::try_new(schema, batch).unwrap();
+    let e = ArrowTrinoJsonEncoder::try_new(schema, batch).unwrap();
     let expected = [
-        row(&[cell(b"alpha"), cell(b"alpha")].concat()),
-        row(&[0xfb, 0xfb]),
-        row(&[cell(b"alpha"), cell(b"alpha")].concat()),
+        row(br#"["alpha","alpha"]"#),
+        row(b"[null,null]"),
+        row(br#"["alpha","alpha"]"#),
     ]
     .concat();
     assert_eq!(encode(e, 65536).0, expected);
-}
-#[test]
-fn opaque_closed_and_binary_named_like_aggregate() {
-    let batch = input(vec![Arc::new(BinaryArray::from(vec![b"x".as_slice()]))]);
-    let f = field(N::Binary, P::ScalarText, true);
-    let schema = Arc::new(
-        ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
-            vec![RenderColumn {
-                source_ordinal: 0,
-                source_slot: None,
-                name: "bitmap_union".into(),
-                field: f,
-            }],
-            1,
-        )
-        .unwrap(),
-    );
-    assert_eq!(
-        encode(
-            ArrowMysqlTextEncoder::try_new(schema, batch.clone()).unwrap(),
-            65536
-        )
-        .0,
-        row(&cell(b"x"))
-    );
-    assert_eq!(
-        encode(
-            encoder(
-                batch,
-                vec![field(
-                    N::Opaque(OpaqueRenderType::Bitmap),
-                    P::OpaqueNull,
-                    true
-                )]
-            ),
-            65536
-        )
-        .0,
-        row(&[0xfb])
-    );
 }
 #[test]
 fn unsupported_and_cancel() {
@@ -421,7 +244,7 @@ fn unsupported_and_cancel() {
             N::Time {
                 unit: U::Microsecond,
             },
-            P::ScalarText,
+            P::TrinoValue,
             true,
         )],
     );
@@ -438,7 +261,7 @@ fn unsupported_and_cancel() {
     ] {
         let mut e = encoder(
             input(vec![Arc::new(StringArray::from(vec![json]))]),
-            vec![field(N::Json, P::JsonText, true)],
+            vec![field(N::Json, P::TrinoValue, true)],
         );
         let cause = e.step(&mut [0; 100]).unwrap_err();
         assert_eq!(cause.kind, E::InvalidJson, "{json}");
@@ -454,17 +277,11 @@ fn unsupported_and_cancel() {
     e.cancel();
     assert_eq!(e.step(&mut [0; 100]).unwrap_err().kind, E::Cancelled);
 }
-fn variant(data: Vec<u8>, offset: i32) -> ArrowMysqlTextEncoder {
+fn variant(data: Vec<u8>) -> ArrowTrinoJsonEncoder {
     let a = LargeBinaryArray::from(vec![data.as_slice()]);
     encoder(
         input(vec![Arc::new(a)]),
-        vec![field(
-            N::Variant,
-            P::VariantJson {
-                timezone_offset_seconds: offset,
-            },
-            true,
-        )],
+        vec![field(N::Variant, P::TrinoValue, true)],
     )
 }
 fn serialized(meta: &[u8], value: &[u8]) -> Vec<u8> {
@@ -474,80 +291,35 @@ fn serialized(meta: &[u8], value: &[u8]) -> Vec<u8> {
     b
 }
 #[test]
-fn variant_ascii_unicode_key_value_frozen_offset() {
-    let data = serialized(
-        &[1, 0, 0],
-        &[1 | (6 << 2), b'h', b'e', b'l', b'l', b'o', b'!'],
-    );
-    assert_eq!(
-        encode(variant(data, 3600), 65536).0,
-        row(&cell(b"\"hello!\""))
-    );
-    let mut v = vec![1 | (6 << 2)];
-    v.extend("中文".as_bytes());
-    let expected = "\"ä¸\u{ad}æ\u{96}\u{87}\"";
-    assert_eq!(
-        encode(variant(serialized(&[1, 0, 0], &v), 0), 65536).0,
-        row(&cell(expected.as_bytes()))
-    );
-    let mut tag12 = vec![12 << 2];
-    tag12.extend_from_slice(&1i64.to_le_bytes());
-    assert_eq!(
-        encode(variant(serialized(&[1, 0, 0], &tag12), 19800), 65536).0,
-        row(&cell(b"\"1970-01-01 05:30:00.000001+05:30\""))
-    );
-    let meta = [1, 1, 0, 6, 0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87];
-    let object = [2, 1, 0, 0, 1, 0];
-    let expected = "{\"ä¸\u{ad}æ\u{96}\u{87}\":null}";
-    assert_eq!(
-        encode(variant(serialized(&meta, &object), 0), 65536).0,
-        row(&cell(expected.as_bytes()))
-    );
-}
-#[test]
-fn variant_malformed_and_old_unsupported() {
+fn malformed_variant_payloads_keep_the_original_typed_data_cause() {
     for value in [
         vec![18 << 2],
         vec![19 << 2],
         vec![7 << 2, 0],
         vec![2, 1, 0, 2, 1, 0],
     ] {
-        let mut e = variant(serialized(&[1, 0, 0], &value), 0);
+        let mut e = variant(serialized(&[1, 0, 0], &value));
         let cause = e.step(&mut [0; 1000]).unwrap_err();
         assert_eq!(cause.kind, E::InvalidVariant);
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         assert_eq!(cause.failure_fact().class(), FailureClass::Data);
         assert_eq!(cause.failure_fact().reason().code(), 111);
     }
-    let data = serialized(&[1, 0, 0], &[0]);
-    assert_eq!(
-        encode(
-            encoder(
-                input(vec![Arc::new(LargeBinaryArray::from(vec![
-                    data.as_slice()
-                ]))]),
-                vec![field(N::Variant, P::VariantSerializedBytes, true)]
-            ),
-            65536
-        )
-        .0,
-        row(&cell(&data))
-    );
 }
 
 #[test]
-fn variant_date_does_not_use_date32_zero_sentinel() {
+fn variant_dates_keep_proleptic_calendar_values() {
     let mut v = vec![11 << 2];
     v.extend_from_slice(&(-719223i32).to_le_bytes());
     assert_eq!(
-        encode(variant(serialized(&[1, 0, 0], &v), 0), 65536).0,
-        row(&cell(b"\"0000-11-01\""))
+        encode(variant(serialized(&[1, 0, 0], &v)), 65536).0,
+        row(br#"["0000-11-01"]"#)
     );
     let mut v = vec![11 << 2];
     v.extend_from_slice(&(-719560i32).to_le_bytes());
     assert_eq!(
-        encode(variant(serialized(&[1, 0, 0], &v), 0), 65536).0,
-        row(&cell(b"\"-0001-11-30\""))
+        encode(variant(serialized(&[1, 0, 0], &v)), 65536).0,
+        row(br#"["-0001-11-30"]"#)
     );
 }
 #[test]
@@ -560,46 +332,12 @@ fn json_more_than_turn_cell_limit_keeps_exact_state() {
         encode(
             encoder(
                 input(vec![Arc::new(StringArray::from(vec![value.as_str()]))]),
-                vec![field(N::Json, P::JsonText, true)]
+                vec![field(N::Json, P::TrinoValue, true)]
             ),
             65536
         )
         .0,
-        row(&cell(value.as_bytes()))
-    );
-}
-#[test]
-fn float_display_extreme_literal_bytes() {
-    let values = [
-        f64::MAX,
-        f64::from_bits(1),
-        -0.0,
-        f64::NAN,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-    ];
-    let expected = [
-        format!("17976931348623157{}", "0".repeat(292)),
-        format!("0.{}5", "0".repeat(323)),
-        "-0".into(),
-        "NaN".into(),
-        "inf".into(),
-        "-inf".into(),
-    ];
-    let bytes = expected
-        .iter()
-        .flat_map(|s| row(&cell(s.as_bytes())))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        encode(
-            encoder(
-                input(vec![Arc::new(Float64Array::from(values.to_vec()))]),
-                vec![field(N::Float64, P::ScalarText, true)]
-            ),
-            65536
-        )
-        .0,
-        bytes
+        row(format!("[\"{}\"]", value.replace('\\', "\\\\").replace('"', "\\\"")).as_bytes())
     );
 }
 fn wrap_list(array: ArrayRef, render: RenderField) -> (ArrayRef, RenderField) {
@@ -616,7 +354,7 @@ fn wrap_list(array: ArrayRef, render: RenderField) -> (ArrayRef, RenderField) {
     );
     (
         Arc::new(out),
-        field(N::List(Box::new(render)), P::MysqlContainer, true),
+        field(N::List(Box::new(render)), P::TrinoValue, true),
     )
 }
 fn variant_arrays(mut inner: Vec<u8>, n: usize) -> Vec<u8> {
@@ -630,7 +368,7 @@ fn variant_arrays(mut inner: Vec<u8>, n: usize) -> Vec<u8> {
     }
     inner
 }
-fn run_error(e: &mut ArrowMysqlTextEncoder) -> E {
+fn run_error(e: &mut ArrowTrinoJsonEncoder) -> E {
     let mut output = vec![0; 65536];
     for _ in 0..200000 {
         match e.step(&mut output) {
@@ -647,7 +385,7 @@ fn run_error(e: &mut ArrowMysqlTextEncoder) -> E {
 #[test]
 fn native_and_dynamic_depth_boundaries() {
     let base = Arc::new(Int32Array::from(vec![0])) as ArrayRef;
-    let mut pair = (base, field(N::SignedInteger(32), P::ScalarText, true));
+    let mut pair = (base, field(N::SignedInteger(32), P::TrinoValue, true));
     for _ in 0..63 {
         pair = wrap_list(pair.0, pair.1);
     }
@@ -658,12 +396,18 @@ fn native_and_dynamic_depth_boundaries() {
             65536
         )
         .0,
-        row(&cell(expected.as_bytes()))
+        row(format!("[{expected}]").as_bytes())
     );
     let pair = wrap_list(pair.0, pair.1);
     assert!(
         ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true
+                }
+            ),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -676,7 +420,7 @@ fn native_and_dynamic_depth_boundaries() {
     );
     for (n, ok) in [(63, true), (64, false)] {
         let value = variant_arrays(vec![3, 0, 0], n);
-        let mut e = variant(serialized(&[1, 0, 0], &value), 0);
+        let mut e = variant(serialized(&[1, 0, 0], &value));
         if ok {
             encode(e, 65536);
         } else {
@@ -687,13 +431,7 @@ fn native_and_dynamic_depth_boundaries() {
         let value = serialized(&[1, 0, 0], &variant_arrays(vec![3, 0, 0], n));
         let pair = wrap_list(
             Arc::new(LargeBinaryArray::from(vec![value.as_slice()])),
-            field(
-                N::Variant,
-                P::VariantJson {
-                    timezone_offset_seconds: 0,
-                },
-                true,
-            ),
+            field(N::Variant, P::TrinoValue, true),
         );
         let mut e = encoder(input(vec![pair.0]), vec![pair.1]);
         if ok {
@@ -706,7 +444,7 @@ fn native_and_dynamic_depth_boundaries() {
         let text = format!("{}{}", "[".repeat(n), "]".repeat(n));
         let mut e = encoder(
             input(vec![Arc::new(StringArray::from(vec![text.as_str()]))]),
-            vec![field(N::Json, P::JsonText, true)],
+            vec![field(N::Json, P::TrinoValue, true)],
         );
         if ok {
             encode(e, 65536);
@@ -716,61 +454,9 @@ fn native_and_dynamic_depth_boundaries() {
     }
 }
 #[test]
-fn nested_decimal256_and_largeint_extremes() {
-    let values = Arc::new(
-        Decimal256Array::from_iter_values(
-            std::iter::once(
-                "9999999999999999999999999999999999999999999999999999999999999999999999999999",
-            )
-            .map(|s| s.parse().unwrap()),
-        )
-        .with_precision_and_scale(76, 2)
-        .unwrap(),
-    ) as ArrayRef;
-    let pair = wrap_list(
-        values,
-        field(
-            N::Decimal {
-                bits: 256,
-                precision: 76,
-                scale: 2,
-            },
-            P::ScalarText,
-            true,
-        ),
-    );
-    let expected = format!("[{}.99]", "9".repeat(74));
-    assert_eq!(
-        encode(encoder(input(vec![pair.0]), vec![pair.1]), 65536).0,
-        row(&cell(expected.as_bytes()))
-    );
-    let large = FixedSizeBinaryArray::try_from_iter(
-        [i128::MIN.to_be_bytes(), i128::MAX.to_be_bytes()].into_iter(),
-    )
-    .unwrap();
-    let expected = [
-        "-170141183460469231731687303715884105728",
-        "170141183460469231731687303715884105727",
-    ]
-    .iter()
-    .flat_map(|s| row(&cell(s.as_bytes())))
-    .collect::<Vec<_>>();
-    assert_eq!(
-        encode(
-            encoder(
-                input(vec![Arc::new(large)]),
-                vec![field(N::LargeInt, P::ScalarText, true)]
-            ),
-            65536
-        )
-        .0,
-        expected
-    );
-}
-#[test]
 fn row_limit_exact_and_plus_one() {
     for (extra, ok) in [(0, true), (1, false)] {
-        let text = "x".repeat(V::ROW_PAYLOAD_BYTES as usize - 9 + extra);
+        let text = "x".repeat(V::ROW_PAYLOAD_BYTES as usize - 4 + extra);
         let mut e = string_encoder(vec![&text]);
         if !ok {
             assert_eq!(run_error(&mut e), E::RowTooLarge);
@@ -808,7 +494,7 @@ fn elements_reset_between_passes_and_sum_occurrences() {
         (V::MAX_ELEMENTS_PER_ROW, false),
     ] {
         let array = Arc::new(Int8Array::from(vec![0; n])) as ArrayRef;
-        let pair = wrap_list(array, field(N::SignedInteger(8), P::ScalarText, true));
+        let pair = wrap_list(array, field(N::SignedInteger(8), P::TrinoValue, true));
         let mut e = encoder(input(vec![pair.0]), vec![pair.1]);
         if ok {
             let mut out = vec![0; 65536];
@@ -828,7 +514,7 @@ fn elements_reset_between_passes_and_sum_occurrences() {
         }
     }
     let array = Arc::new(Int8Array::from(vec![0; V::MAX_ELEMENTS_PER_ROW / 2])) as ArrayRef;
-    let pair = wrap_list(array, field(N::SignedInteger(8), P::ScalarText, true));
+    let pair = wrap_list(array, field(N::SignedInteger(8), P::TrinoValue, true));
     let batch = input(vec![pair.0]);
     let cols = (0..2)
         .map(|i| RenderColumn {
@@ -838,10 +524,16 @@ fn elements_reset_between_passes_and_sum_occurrences() {
             field: pair.1.clone(),
         })
         .collect();
-    let mut e = ArrowMysqlTextEncoder::try_new(
+    let mut e = ArrowTrinoJsonEncoder::try_new(
         Arc::new(
             ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: false,
+                    },
+                ),
                 cols,
                 1,
             )
@@ -861,13 +553,19 @@ fn wide_columns_and_many_small_rows() {
             source_ordinal: 0,
             source_slot: None,
             name: i.to_string(),
-            field: field(N::SignedInteger(8), P::ScalarText, true),
+            field: field(N::SignedInteger(8), P::TrinoValue, true),
         })
         .collect();
-    let e = ArrowMysqlTextEncoder::try_new(
+    let e = ArrowTrinoJsonEncoder::try_new(
         Arc::new(
             ClientRenderSchema::try_new(
-                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                    novarocks_result_contract::TrinoJsonFacts {
+                        parametric_datetime: true,
+                        variant: true,
+                        variant_binary: false,
+                    },
+                ),
                 cols,
                 1,
             )
@@ -876,11 +574,20 @@ fn wide_columns_and_many_small_rows() {
         batch,
     )
     .unwrap();
-    assert_eq!(encode(e, 65536).0, row(&[1, b'7'].repeat(count)));
+    assert_eq!(
+        encode(e, 65536).0,
+        row(format!("[{}]", vec!["7"; count].join(",")).as_bytes())
+    );
     let values = vec!["x"; 1000];
     let (actual, segments) = encode(string_encoder(values), 1 << 20);
-    assert_eq!(actual, row(&cell(b"x")).repeat(1000));
-    assert!(segments.len() < 10);
+    assert_eq!(actual, row(br#"["x"]"#).repeat(1000));
+    // The sole JSON protocol has its own quoting/traversal work. Preserve
+    // batching under the fixed per-turn quantum rather than the retired
+    // format's incidental number of segments.
+    assert!(
+        segments.len() < 1000,
+        "small rows must make batched progress"
+    );
 }
 #[test]
 fn timestamp_signed_units_and_gregorian_years() {
@@ -892,7 +599,7 @@ fn timestamp_signed_units_and_gregorian_years() {
                     unit: U::Millisecond,
                     timezone: None,
                 },
-                P::TimestampContainerText,
+                P::TrinoValue,
                 true,
             ),
             "[\"1969-12-31 23:59:59.999\"]",
@@ -904,14 +611,14 @@ fn timestamp_signed_units_and_gregorian_years() {
                     unit: U::Nanosecond,
                     timezone: None,
                 },
-                P::TimestampContainerText,
+                P::TrinoValue,
                 true,
             ),
             "[\"1969-12-31 23:59:59.999999999\"]",
         ),
         (
             Arc::new(Date32Array::from(vec![-719561])),
-            field(N::Date, P::ScalarText, true),
+            field(N::Date, P::TrinoValue, true),
             "[\"-0001-11-29\"]",
         ),
         (
@@ -921,7 +628,7 @@ fn timestamp_signed_units_and_gregorian_years() {
                     unit: U::Second,
                     timezone: None,
                 },
-                P::TimestampContainerText,
+                P::TrinoValue,
                 true,
             ),
             "[\"+10000-01-01 00:00:00\"]",
@@ -931,96 +638,23 @@ fn timestamp_signed_units_and_gregorian_years() {
         let pair = wrap_list(a, f);
         assert_eq!(
             encode(encoder(input(vec![pair.0]), vec![pair.1]), 65536).0,
-            row(&cell(expected.as_bytes()))
+            row(format!("[{expected}]").as_bytes())
         );
     }
     assert_eq!(
         encode(
             encoder(
                 input(vec![Arc::new(Date32Array::from(vec![-719223]))]),
-                vec![field(N::Date, P::ScalarText, true)]
+                vec![field(N::Date, P::TrinoValue, true)]
             ),
             65536
         )
         .0,
-        row(&cell(b"0000-11-01"))
+        row(br#"["0000-11-01"]"#)
     );
 }
 #[test]
-fn frozen_offset_second_rounding_matches_legacy() {
-    for (offset, expected) in [
-        (30, "\"1970-01-01 00:00:30+00:01\""),
-        (59, "\"1970-01-01 00:00:59+00:01\""),
-        (-30, "\"1969-12-31 23:59:30-00:01\""),
-        (-59, "\"1969-12-31 23:59:01-00:01\""),
-    ] {
-        let mut v = vec![12 << 2];
-        v.extend_from_slice(&0i64.to_le_bytes());
-        let actual = encode(variant(serialized(&[1, 0, 0], &v), offset), 65536).0;
-        assert_eq!(actual, row(&cell(expected.as_bytes())));
-        let dt = chrono::DateTime::from_timestamp(0, 0)
-            .unwrap()
-            .with_timezone(&chrono::FixedOffset::east_opt(offset).unwrap());
-        assert!(expected.ends_with(&format!("{}\"", dt.format("%:z"))));
-    }
-}
-
-// These byte oracles previously exercised the uncalled Arrow-field renderer.
-// They now use the installed typed client renderer without source annotations.
-#[test]
-fn format_timestamp_microsecond_omits_zero_fraction() {
-    let batch = input(vec![Arc::new(TimestampMicrosecondArray::from(vec![0]))]);
-    let fields = vec![field(
-        N::Timestamp {
-            unit: U::Microsecond,
-            timezone: None,
-        },
-        P::TimestampContainerText,
-        true,
-    )];
-    assert_eq!(
-        encode(encoder(batch, fields), 1024).0,
-        row(&cell(b"1970-01-01 00:00:00"))
-    );
-}
-
-#[test]
-fn format_timestamp_microsecond_keeps_non_zero_fraction() {
-    let batch = input(vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))]);
-    let fields = vec![field(
-        N::Timestamp {
-            unit: U::Microsecond,
-            timezone: None,
-        },
-        P::TimestampContainerText,
-        true,
-    )];
-    assert_eq!(
-        encode(encoder(batch, fields), 1024).0,
-        row(&cell(b"1970-01-01 00:00:00.000001"))
-    );
-}
-
-#[test]
-fn mysql_text_row_formats_time64_microsecond() {
-    let batch = input(vec![Arc::new(Time64MicrosecondArray::from(vec![
-        12_345_678,
-    ]))]);
-    let fields = vec![field(
-        N::Time {
-            unit: U::Microsecond,
-        },
-        P::ScalarText,
-        true,
-    )];
-    assert_eq!(
-        encode(encoder(batch, fields), 1024).0,
-        row(&cell(b"00:00:12.345678"))
-    );
-}
-
-#[test]
-fn mysql_text_row_uses_declared_struct_json_children() {
+fn trino_row_uses_declared_struct_json_children() {
     let array = StructArray::new(
         vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into(),
         vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
@@ -1029,13 +663,13 @@ fn mysql_text_row_uses_declared_struct_json_children() {
     let declared = field(
         N::Struct(vec![NamedRenderField {
             name: "payload".into(),
-            field: field(N::Json, P::JsonText, true),
+            field: field(N::Json, P::TrinoValue, true),
         }]),
-        P::MysqlContainer,
+        P::TrinoValue,
         true,
     );
     assert_eq!(
         encode(encoder(input(vec![Arc::new(array)]), vec![declared]), 1024).0,
-        row(&cell(br#"{"payload":'{"a":1}'}"#)),
+        row(br#"[["{\"a\":1}"]]"#),
     );
 }

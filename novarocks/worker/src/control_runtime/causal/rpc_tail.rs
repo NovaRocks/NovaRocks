@@ -136,7 +136,7 @@ impl CausalCutEnv<'_> {
                 continue;
             }
             if let Some(source) = original.source {
-                // ExitAuthority fills this original report only after its real
+                // ExitObligation fills this original report only after its real
                 // body/captures return. A saved Core receipt alone cannot fill it.
                 if original
                     .custody

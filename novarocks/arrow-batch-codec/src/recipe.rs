@@ -126,12 +126,12 @@ impl BatchRecipe {
                 &mut scratch,
                 |visit| {
                     observer.checkpoint().map_err(CodecError::Observer)?;
-                    if let ValueTypeVisit::Field(field) = visit {
-                        if !field.metadata().is_empty() {
-                            return Err(CodecError::Invalid(
-                                "runtime recipe fields must be metadata-free; exact semantic identity is supplied separately",
-                            ));
-                        }
+                    if let ValueTypeVisit::Field(field) = visit
+                        && !field.metadata().is_empty()
+                    {
+                        return Err(CodecError::Invalid(
+                            "runtime recipe fields must be metadata-free; exact semantic identity is supplied separately",
+                        ));
                     }
                     if let ValueTypeVisit::TypeNode(ty) = visit {
                         novarocks_type_contract::validate_arrow_carrier_parameters_observed(

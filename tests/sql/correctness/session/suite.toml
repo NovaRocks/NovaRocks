@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/mysql-adapter/**", "novarocks/query-application/src/**"]
+paths = ["novarocks/trino-adapter/**", "novarocks/query-application/src/**"]
 
 [reuse]
 scope = "suite"

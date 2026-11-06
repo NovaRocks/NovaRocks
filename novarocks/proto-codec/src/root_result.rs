@@ -140,9 +140,6 @@ pub fn encode_client_schema(schema: &ClientRenderSchema) -> wire::ClientRenderSc
         columns,
         field_nodes: nodes,
         family: Some(match schema.family() {
-            ClientPresentationFamily::MysqlText => {
-                wire::client_render_schema::Family::MysqlText(wire::MysqlTextFamily {})
-            }
             ClientPresentationFamily::TrinoJson(facts) => {
                 wire::client_render_schema::Family::TrinoJson(wire::TrinoJsonFamily {
                     parametric_datetime: facts.parametric_datetime,
@@ -157,18 +154,6 @@ fn encode_field(field: &RenderField, nodes: &mut Vec<wire::RenderField>) -> u32 
     let id = (nodes.len() + 1) as u32;
     nodes.push(wire::RenderField::default());
     let presentation = match field.presentation {
-        RenderPresentation::ScalarText => wire::RenderPresentation::ScalarText,
-        RenderPresentation::TimestampUtcMicros => wire::RenderPresentation::TimestampUtcMicros,
-        RenderPresentation::TimestampContainerText => {
-            wire::RenderPresentation::TimestampContainerText
-        }
-        RenderPresentation::JsonText => wire::RenderPresentation::JsonText,
-        RenderPresentation::VariantSerializedBytes => {
-            wire::RenderPresentation::VariantSerializedBytes
-        }
-        RenderPresentation::VariantJson { .. } => wire::RenderPresentation::VariantJson,
-        RenderPresentation::OpaqueNull => wire::RenderPresentation::OpaqueNull,
-        RenderPresentation::MysqlContainer => wire::RenderPresentation::MysqlContainer,
         RenderPresentation::TrinoValue => wire::RenderPresentation::TrinoValue,
     };
     let native_type = encode_type(&field.native_type, nodes);
@@ -176,12 +161,6 @@ fn encode_field(field: &RenderField, nodes: &mut Vec<wire::RenderField>) -> u32 
         nullable: field.nullable,
         native_type: Some(native_type),
         presentation: presentation as i32,
-        variant_json_timezone_offset_seconds: match field.presentation {
-            RenderPresentation::VariantJson {
-                timezone_offset_seconds,
-            } => Some(timezone_offset_seconds),
-            _ => None,
-        },
     };
     id
 }
@@ -298,9 +277,6 @@ pub fn decode_client_schema(
     path: FieldPath,
 ) -> Result<ClientRenderSchema, ProtocolError> {
     let family = match src.family.as_ref() {
-        Some(wire::client_render_schema::Family::MysqlText(_)) => {
-            ClientPresentationFamily::MysqlText
-        }
         Some(wire::client_render_schema::Family::TrinoJson(facts)) => {
             ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
                 parametric_datetime: facts.parametric_datetime,
@@ -473,36 +449,9 @@ fn decode_field(
     }
     let src = node_at(schema, id, path.clone())?;
     let presentation = match wire::RenderPresentation::try_from(src.presentation) {
-        Ok(wire::RenderPresentation::ScalarText) => RenderPresentation::ScalarText,
-        Ok(wire::RenderPresentation::TimestampUtcMicros) => RenderPresentation::TimestampUtcMicros,
-        Ok(wire::RenderPresentation::TimestampContainerText) => {
-            RenderPresentation::TimestampContainerText
-        }
-        Ok(wire::RenderPresentation::JsonText) => RenderPresentation::JsonText,
-        Ok(wire::RenderPresentation::VariantSerializedBytes) => {
-            RenderPresentation::VariantSerializedBytes
-        }
-        Ok(wire::RenderPresentation::VariantJson) => RenderPresentation::VariantJson {
-            timezone_offset_seconds: src.variant_json_timezone_offset_seconds.ok_or_else(|| {
-                invalid(
-                    path.clone(),
-                    "Variant JSON requires its frozen frontend timezone offset",
-                )
-            })?,
-        },
-        Ok(wire::RenderPresentation::OpaqueNull) => RenderPresentation::OpaqueNull,
-        Ok(wire::RenderPresentation::MysqlContainer) => RenderPresentation::MysqlContainer,
         Ok(wire::RenderPresentation::TrinoValue) => RenderPresentation::TrinoValue,
         _ => return Err(invalid(path, "render presentation is required and closed")),
     };
-    if !matches!(presentation, RenderPresentation::VariantJson { .. })
-        && src.variant_json_timezone_offset_seconds.is_some()
-    {
-        return Err(invalid(
-            path,
-            "timezone offset is exclusive to Variant JSON presentation",
-        ));
-    }
     let ty = src
         .native_type
         .as_ref()
@@ -630,7 +579,7 @@ mod schema_tests {
         }
     }
     #[test]
-    fn trino_facts_round_trip_and_family_is_required_without_cross_family_values() {
+    fn trino_facts_round_trip_and_missing_or_retired_wire_values_are_refused() {
         for mask in 0..8 {
             let facts = TrinoJsonFacts {
                 parametric_datetime: mask & 1 != 0,
@@ -656,20 +605,19 @@ mod schema_tests {
             let mut missing = encoded.clone();
             missing.family = None;
             assert!(decode_client_schema(&missing, 1, FieldPath::root("schema")).is_err());
-            let mut mixed = encoded.clone();
-            mixed.family = Some(wire::client_render_schema::Family::MysqlText(
-                wire::MysqlTextFamily {},
-            ));
-            assert!(decode_client_schema(&mixed, 1, FieldPath::root("schema")).is_err());
-            let mut mixed = encoded.clone();
-            mixed.field_nodes[0].presentation = wire::RenderPresentation::ScalarText as i32;
-            assert!(decode_client_schema(&mixed, 1, FieldPath::root("schema")).is_err());
-            let mut unknown = encoded.clone();
-            unknown.field_nodes[0].presentation = i32::MAX;
-            assert!(decode_client_schema(&unknown, 1, FieldPath::root("schema")).is_err());
-            let mut offset = encoded;
-            offset.field_nodes[0].variant_json_timezone_offset_seconds = Some(0);
-            assert!(decode_client_schema(&offset, 1, FieldPath::root("schema")).is_err());
+            let mut retired_family = encoded.clone();
+            retired_family.family = None;
+            let mut bytes = retired_family.encode_to_vec();
+            // The retired family occupied length-delimited field 3. It must
+            // remain absent after decoding, never selecting a default family.
+            bytes.extend_from_slice(&[0x1a, 0x00]);
+            let retired_family = wire::ClientRenderSchema::decode(bytes.as_slice()).unwrap();
+            assert!(decode_client_schema(&retired_family, 1, FieldPath::root("schema")).is_err());
+            for presentation in (0..=8).chain([i32::MAX]) {
+                let mut invalid = encoded.clone();
+                invalid.field_nodes[0].presentation = presentation;
+                assert!(decode_client_schema(&invalid, 1, FieldPath::root("schema")).is_err());
+            }
         }
     }
     #[test]
@@ -677,17 +625,17 @@ mod schema_tests {
         let columns = vec![
             col(
                 0,
-                NativeRenderType::LargeInt,
-                RenderPresentation::ScalarText,
+                NativeRenderType::SignedInteger(64),
+                RenderPresentation::TrinoValue,
             ),
             col(
                 1,
                 NativeRenderType::Decimal {
                     bits: 256,
-                    precision: 76,
+                    precision: 38,
                     scale: 9,
                 },
-                RenderPresentation::ScalarText,
+                RenderPresentation::TrinoValue,
             ),
             col(
                 2,
@@ -695,34 +643,30 @@ mod schema_tests {
                     unit: RenderTimeUnit::Nanosecond,
                     timezone: Some("UTC".into()),
                 },
-                RenderPresentation::TimestampUtcMicros,
+                RenderPresentation::TrinoValue,
             ),
-            col(
-                3,
-                NativeRenderType::Variant,
-                RenderPresentation::VariantSerializedBytes,
-            ),
-            col(
-                4,
-                NativeRenderType::Opaque(OpaqueRenderType::Bitmap),
-                RenderPresentation::OpaqueNull,
-            ),
+            col(3, NativeRenderType::Variant, RenderPresentation::TrinoValue),
+            col(4, NativeRenderType::Binary, RenderPresentation::TrinoValue),
         ];
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
             columns,
             5,
         )
         .unwrap();
         let encoded = encode_client_schema(&schema);
         assert_eq!(encoded.columns[0].source_slot, Some(10));
+        let decimal = encoded.field_nodes[encoded.columns[1].field_node_id as usize - 1]
+            .native_type
+            .as_ref()
+            .unwrap();
         assert_eq!(
-            encoded.field_nodes[encoded.columns[1].field_node_id as usize - 1]
-                .native_type
-                .as_ref()
-                .unwrap()
-                .precision,
-            76
+            (decimal.bits, decimal.precision, decimal.scale),
+            (256, 38, 9)
         );
         assert_eq!(
             decode_client_schema(&encoded, 5, FieldPath::root("schema")).unwrap(),
@@ -730,9 +674,13 @@ mod schema_tests {
         );
     }
     #[test]
-    fn nested_presentations_preserve_frozen_context_without_defaults() {
+    fn nested_trino_fields_preserve_native_timezone_and_capabilities() {
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            }),
             vec![col(
                 0,
                 NativeRenderType::Struct(vec![
@@ -741,9 +689,7 @@ mod schema_tests {
                         field: RenderField {
                             nullable: true,
                             native_type: NativeRenderType::Variant,
-                            presentation: RenderPresentation::VariantJson {
-                                timezone_offset_seconds: 28_800,
-                            },
+                            presentation: RenderPresentation::TrinoValue,
                         },
                     },
                     NamedRenderField {
@@ -754,11 +700,11 @@ mod schema_tests {
                                 unit: RenderTimeUnit::Nanosecond,
                                 timezone: Some("UTC".into()),
                             },
-                            presentation: RenderPresentation::TimestampContainerText,
+                            presentation: RenderPresentation::TrinoValue,
                         },
                     },
                 ]),
-                RenderPresentation::MysqlContainer,
+                RenderPresentation::TrinoValue,
             )],
             1,
         )
@@ -768,34 +714,24 @@ mod schema_tests {
             decode_client_schema(&encoded, 1, FieldPath::root("schema")).unwrap(),
             schema
         );
-        let index = encoded
-            .field_nodes
-            .iter()
-            .position(|field| field.presentation == wire::RenderPresentation::VariantJson as i32)
-            .unwrap();
-        for offset in [None, Some(-86_400), Some(86_400)] {
-            let mut invalid = encoded.clone();
-            invalid.field_nodes[index].variant_json_timezone_offset_seconds = offset;
-            assert!(decode_client_schema(&invalid, 1, FieldPath::root("schema")).is_err());
-        }
-        for offset in [-86_399, 0, 86_399] {
-            let mut valid = encoded.clone();
-            valid.field_nodes[index].variant_json_timezone_offset_seconds = Some(offset);
-            assert!(decode_client_schema(&valid, 1, FieldPath::root("schema")).is_ok());
-        }
-        let mut unexpected = encoded;
-        unexpected.field_nodes[0].variant_json_timezone_offset_seconds = Some(0);
-        assert!(decode_client_schema(&unexpected, 1, FieldPath::root("schema")).is_err());
+        assert_eq!(
+            schema.family(),
+            &ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true
+            })
+        );
     }
 
     #[test]
     fn missing_extra_or_conflicting_semantics_fail_before_binding() {
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
             vec![col(
                 0,
                 NativeRenderType::String,
-                RenderPresentation::ScalarText,
+                RenderPresentation::TrinoValue,
             )],
             1,
         )
@@ -822,17 +758,17 @@ mod schema_tests {
         let mut field = RenderField {
             nullable: true,
             native_type: NativeRenderType::String,
-            presentation: RenderPresentation::ScalarText,
+            presentation: RenderPresentation::TrinoValue,
         };
         for _ in 1..RootProfileV1::MAX_DEPTH {
             field = RenderField {
                 nullable: true,
                 native_type: NativeRenderType::List(Box::new(field)),
-                presentation: RenderPresentation::MysqlContainer,
+                presentation: RenderPresentation::TrinoValue,
             };
         }
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: Some(10),
@@ -859,8 +795,7 @@ mod schema_tests {
         let leaf = too_deep.field_nodes.len() - 2;
         too_deep.field_nodes[leaf] = wire::RenderField {
             nullable: true,
-            variant_json_timezone_offset_seconds: None,
-            presentation: wire::RenderPresentation::MysqlContainer as i32,
+            presentation: wire::RenderPresentation::TrinoValue as i32,
             native_type: Some(wire::NativeRenderType {
                 kind: wire::RenderTypeKind::List as i32,
                 children: vec![wire::NamedRenderField {
@@ -875,11 +810,11 @@ mod schema_tests {
     #[test]
     fn flat_schema_rejects_graph_expansion_cycles_and_unused_nodes() {
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
             vec![col(
                 0,
                 NativeRenderType::String,
-                RenderPresentation::ScalarText,
+                RenderPresentation::TrinoValue,
             )],
             1,
         )

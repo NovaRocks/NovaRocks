@@ -19,7 +19,7 @@ under the License.
 
 # 分布式部署
 
-分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 Trino HTTP 与 MySQL 客户端入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
+分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 Trino HTTP 客户端入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
 
 该模式不依赖 StarRocks FE。当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon；Iceberg 保留现有读写能力。Paimon 保留注册、catalog 配置与投影，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界，见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md)。StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
 
@@ -28,7 +28,7 @@ under the License.
 典型拓扑如下：
 
 ```text
-Trino / MySQL client
+Trino client
   |
   v
 NovaRocks role=fe
@@ -41,7 +41,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 | 角色 | 作用 | 对外端口 |
 | --- | --- | --- |
-| `fe` | 接收客户端语句，解析 SQL，优化计划，调度 fragment 到后端 | Trino HTTP：`[standalone_server].trino_port`；MySQL：`[standalone_server].mysql_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
+| `fe` | 接收客户端语句，解析 SQL，优化计划，调度 fragment 到后端 | Trino HTTP：`[standalone_server].trino_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
 | `be` | 执行 FE 下发的 fragment，处理 exchange、结果回传和 lifecycle control | Native Data gRPC：`[server].grpc_port`；Native Control gRPC：`[server].control_grpc_port`；BE management HTTP：`[server].http_port` |
 
 ## 前提条件
@@ -177,7 +177,7 @@ NOVAROCKS_READY role=be grpc_port=9080 control_grpc_port=9081 advertise_host=10.
 
 BE readiness marker 在两条 advertised endpoint 的启动就绪检查成功后发布；其中两个
 `*_grpc_port` 是本地 bind 端口，不能替代 NAT 后的 advertised port。`role=be` 不提供
-MySQL 端口，`--port` 参数对 BE 无效。
+客户端 SQL 端口。所有角色均拒绝 `--port`；端口由对应角色 TOML 配置。
 
 `[connector.object_store]` 是 native connector 当前读取 Iceberg/S3 数据时使用的
 role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
@@ -249,9 +249,9 @@ worker_threads = 8
 max_blocking_threads = 64
 
 [standalone_server]
-mysql_port = 9030
 trino_port = 8080
 trino_client_timeout_ms = 300000
+trino_query_max_length = 1000000
 user = "root"
 
 [connector.object_store]
@@ -290,13 +290,14 @@ NO_PROXY=127.0.0.1,localhost \
 启动成功后会输出：
 
 ```text
-NOVAROCKS_READY mysql_port=9030 pid=<pid> trino_port=8080
+NOVAROCKS_READY role=fe trino_port=8080 pid=<pid>
 ```
 
-FE 的 Trino 与 MySQL 客户端入口固定绑定 `127.0.0.1`，不读取 `[server].host` 扩展监听地址。
-Trino 的 `trino_port` 默认 `8080`，复用 `[standalone_server].user`（默认 `root`）；`trino_client_timeout_ms` 默认 `300000`，
+FE 的 Trino 客户端入口固定绑定 `127.0.0.1`，不读取 `[server].host` 扩展监听地址。
+Trino 的 `trino_port` 默认 `8080`，使用 `[standalone_server].user`（默认 `root`）；`trino_client_timeout_ms` 默认 `300000`，
 约束两次针对同一查询的客户端请求间隔，`HEAD nextUri` 也刷新它。单个 HTTP 响应另有 30 秒写出期限；期限到达只中止本次响应，原页可按同 token 重试。
-查询执行继续使用原查询期限与取消。Trino 端口应与 FE 的 MySQL、Native gRPC 和 management HTTP 端口分别配置。
+查询执行继续使用原查询期限与取消。Trino 端口应与 FE 的 Native gRPC 和 management HTTP 端口分别配置。
+`trino_query_max_length` 默认 `1000000`，接受 `0..=1000000000` UTF-16 code units；超限返回 `QUERY_TEXT_TOO_LARGE`。`trino_port = 0` 使用本次 ready marker 中 OS 分配的端口；旧 MySQL listener 配置明确拒绝。
 
 Trino 请求的 Host 必须是 `localhost`、`127.0.0.1` 或 `[::1]`（可带数字端口），否则返回 403；语句请求的 `X-Trino-User`
 必须等于配置用户，否则返回 401。生成 `nextUri` 时保留本机名称及显式端口，并将数字端口规范化。
@@ -457,7 +458,7 @@ secret 提交到 TOML、shell history 或日志。
 被动监听和主动中间人的内部网络。需要保密性、transport integrity 或 server endpoint
 cryptographic identity 时，所有 role 必须一起切换到 `automatic` 或 `pem` TLS 1.3。精确
 TLS profile、证书要求、DNS/IP identity、轮换和故障 runbook 见
-[Native trust、JWT 与可选 TLS](native-trust.md)。MySQL 与 management HTTP 不受
+[Native trust、JWT 与可选 TLS](native-trust.md)。Trino 客户端 HTTP 与 management HTTP 不受
 `[native_trust]` 保护。
 
 ## 验证集群
@@ -471,12 +472,6 @@ trino --server http://127.0.0.1:8080 --user root --execute 'SELECT 1'
 `--catalog lake --schema sales` 可把 catalog/schema 名称带入每条语句；服务端只在实际使用名称时解析存在性。
 CLI 按响应头应用 `USE` / `SET` 产生的会话变化。客户端必须沿 `nextUri` 消费至结束页：最后一个数据页仍带 `nextUri`，
 下一次请求才确认它；重试同一 token 得到相同响应，`DELETE nextUri` 请求取消查询。
-
-也可使用原 MySQL 入口：
-
-```bash
-mysql -h 127.0.0.1 -P 9030 -uroot
-```
 
 HTTP 入口观察可使用以下两项；它们不证明 BE 已经获得调度资格：
 
@@ -533,7 +528,7 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 推荐启动顺序：
 
 1. 启动对象存储、catalog、HDFS 等外部依赖。
-2. 启动 FE 节点，等待 `NOVAROCKS_READY mysql_port=...`。
+2. 启动 FE 节点，等待 `NOVAROCKS_READY role=fe trino_port=...`。
 3. 启动所有 BE 节点，等待 `NOVAROCKS_READY role=be` 及 `SHOW BACKENDS` 中 `Eligible=true`。
 4. 连接 FE 并执行 `SHOW BACKENDS`。
 5. 执行最小查询和一条真实数据查询。
@@ -562,7 +557,7 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 catalog source | StaticFile mode 必须提供可读、完整的 snapshot file；DynamicStateStore mode 必须配置 `[state_store]`。不要使用 core metadata 或内存 registry 作为 fallback。 |
 | BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint` 和非零独立 `[server].control_grpc_port`，且不能配置 FE heartbeat 或 lease 设置。 |
-| Native 或 management endpoint 冲突 | 让 FE Trino、FE MySQL、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
+| Native 或 management endpoint 冲突 | 让 FE Trino、FE Native gRPC、FE management HTTP、BE Data gRPC、BE Control gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
 | 启动拒绝 Native descriptor baseline | 检查 BE soft `RLIMIT_NOFILE` 至少 1024、FE 至少 2048；在启动环境设置，不依赖 Server 自动提高。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |
 

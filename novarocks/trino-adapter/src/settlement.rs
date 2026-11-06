@@ -42,6 +42,16 @@ pub(crate) struct Settlement {
         Option<std::sync::Arc<dyn novarocks_query_application::session::QuerySession>>,
 }
 impl SettlementOwner {
+    pub(crate) fn external_effect_disposition(
+        &self,
+    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
+        match self {
+            Self::Streaming(owner) => owner.external_effect_disposition(),
+            Self::Governed(owner) => owner.external_effect_disposition(),
+            Self::Ungoverned => None,
+        }
+    }
+
     fn cancellation_view(&self) -> Option<QueryCancellationView> {
         match self {
             Self::Streaming(owner) => Some(owner.cancellation()),

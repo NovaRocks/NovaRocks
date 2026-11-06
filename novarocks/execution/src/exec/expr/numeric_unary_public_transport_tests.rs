@@ -96,9 +96,13 @@ fn freeze_root_purpose(
     // handoff; neither the caller's possibly wrong output nor Arrow authors it.
     let render = novarocks_sql::compiler::client_render_schema_from_port(
         candidate.original_public_result_port(),
-        novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-            timezone_offset_seconds: 0,
-        },
+        novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+            &novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            },
+        ),
     )
     .expect("original public client-row declaration");
     candidate
@@ -216,16 +220,26 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         .unwrap();
         let render = novarocks_sql::compiler::client_render_schema_from_port(
             wrong_candidate.original_public_result_port(),
-            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-                timezone_offset_seconds: 0,
-            },
+            novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+                &novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .unwrap();
         let mut wrong_columns = render.columns().to_vec();
         wrong_columns[0].field.nullable = false;
         wrong_columns[2].field.nullable = false;
         let wrong_render = novarocks_result_contract::ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             wrong_columns,
             3,
         )

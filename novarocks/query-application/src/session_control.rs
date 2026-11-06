@@ -30,17 +30,16 @@ pub use statement_action::{
     BackgroundActionResultGuard, GovernedStatementAction, GovernedStatementResidual,
     StatementActionAttempt, StatementActionFailure, StatementActionReady, StatementActionReceipt,
     StatementActionValue, StatementActionWaitError, StatementActionWaiter,
-    StatementCommandCompletion, StatementProgressGeometry,
+    StatementCommandCompletion, StatementCommandRowCount, StatementCompletionProjection,
+    StatementProgressGeometry,
 };
 #[doc(hidden)]
 pub use statement_action::{StatementActionSource, StatementProgressSlot};
-use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
-use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     BusinessPermit, CancellationReason, CancellationView, QueryConcurrencyPermit, ResultClosingCut,
     ResultWindowAlias, ResultWindowClass, ResultWindowGrant, RootAdmissionHandle,
@@ -97,7 +96,6 @@ impl std::fmt::Display for ClientQueryId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionOrigin {
-    Connection(ClientConnectionToken),
     ClientStatement(ClientQueryId),
 }
 
@@ -108,12 +106,6 @@ pub struct SessionIdentity {
 }
 
 impl SessionIdentity {
-    pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
-        Self {
-            origin: SessionOrigin::Connection(connection),
-            principal: principal.into(),
-        }
-    }
     pub fn client_statement(query: ClientQueryId, principal: impl Into<Arc<str>>) -> Self {
         Self {
             origin: SessionOrigin::ClientStatement(query),
@@ -261,7 +253,6 @@ impl GovernedStatementRegistration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryControlError {
     SessionIdentityExhausted,
-    ConnectionIdInUse,
     ClientQueryIdInUse,
     UnknownSession,
     StaleSession,
@@ -275,13 +266,6 @@ pub enum QueryCancelOutcome {
     AlreadyRequested(QueryCancellationReason),
     Failed(WorkError),
     NoActiveStatement,
-    UnknownSession,
-    PermissionDenied,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectionKillAuthorization {
-    Authorized(ClientConnectionToken),
     UnknownSession,
     PermissionDenied,
 }
@@ -328,39 +312,6 @@ impl std::fmt::Display for GovernedQueryStatementBeginError {
 
 impl std::error::Error for GovernedQueryStatementBeginError {}
 
-// Design: ADR-0010 (docs/adr/ADR-0010-explicit-query-cancellation-surface.md)
-/// One session as `SHOW PROCESSLIST` sees it.
-///
-/// This is a read-only projection of the control registry, minted under its
-/// lock and handed out by value: a reader must never be able to reach live
-/// cancellation state through it.
-///
-/// Only what the registry actually owns appears here. A client's host address
-/// belongs to the MySQL listener and a session's current database is
-/// session-local SQL state; neither is registry state, so neither is
-/// reconstructed from a guess.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionProcess {
-    pub connection_id: u32,
-    pub principal: Arc<str>,
-    /// How long the session has been in its current command.
-    pub elapsed: Duration,
-    /// The statement text while one is running. `None` means the session is
-    /// idle, which is what makes this the `Command` column too.
-    pub statement: Option<Arc<str>>,
-}
-
-impl SessionProcess {
-    /// The MySQL `Command` column: a session either has a statement or does not.
-    pub const fn command(&self) -> &'static str {
-        if self.statement.is_some() {
-            "Query"
-        } else {
-            "Sleep"
-        }
-    }
-}
-
 pub trait QueryControlPort: Send + Sync + 'static {
     fn mint_client_query_id(&self) -> ClientQueryId;
     fn register_session(
@@ -385,8 +336,6 @@ pub trait QueryControlPort: Send + Sync + 'static {
         cancellation: GovernedStatementCancellation,
         statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError>;
-    /// Every registered session, ordered by connection id.
-    fn list_processes(&self) -> Vec<SessionProcess>;
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome;
     fn finish_governed_statement(
         &self,
@@ -413,12 +362,6 @@ pub trait QueryControlPort: Send + Sync + 'static {
         session: SessionToken,
         reason: QueryCancellationReason,
     ) -> QueryCancelOutcome;
-    fn kill_query(&self, requester: SessionToken, target_connection_id: u32) -> QueryCancelOutcome;
-    fn authorize_connection_kill(
-        &self,
-        requester: SessionToken,
-        target_connection_id: u32,
-    ) -> ConnectionKillAuthorization;
     fn cancel_all(&self, reason: QueryCancellationReason);
 
     /// Composition installs one original supervisor before publishing actions.
@@ -685,11 +628,6 @@ impl QueryControlService {
     /// Admit one protocol-visible statement under its actual workload class.
     /// The returned owner remains the sole holder of the statement generation,
     /// business permit, cancellation authority, and final protocol outcome.
-    /// Every registered session as `SHOW PROCESSLIST` sees it.
-    pub fn list_processes(&self) -> Vec<SessionProcess> {
-        self.port.list_processes()
-    }
-
     pub fn begin_governed_statement(
         &self,
         session: SessionToken,
@@ -808,23 +746,6 @@ impl QueryControlService {
         reason: QueryCancellationReason,
     ) -> QueryCancelOutcome {
         self.port.cancel_session_statement(session, reason)
-    }
-
-    pub fn kill_query(
-        &self,
-        requester: SessionToken,
-        target_connection_id: u32,
-    ) -> QueryCancelOutcome {
-        self.port.kill_query(requester, target_connection_id)
-    }
-
-    pub fn authorize_connection_kill(
-        &self,
-        requester: SessionToken,
-        target_connection_id: u32,
-    ) -> ConnectionKillAuthorization {
-        self.port
-            .authorize_connection_kill(requester, target_connection_id)
     }
 
     pub fn cancel_all(&self, reason: QueryCancellationReason) {
@@ -1186,12 +1107,6 @@ impl GovernedQueryStatementOwner {
             .map(StatementResultCapacity::retain_alias)
     }
 
-    pub(crate) fn release_transferred_result_window(&mut self) {
-        // Fetch and transport aliases retain their own short-tail position.
-        // The protocol has already moved its owned bytes into closing capacity.
-        self.result_window.take();
-    }
-
     pub(crate) fn execution_owner_matches_scope(&self) -> bool {
         // Both fields are minted together by the same statement constructor.
         // The WorkOwner is move-only; this read grants no capacity or locator.
@@ -1270,12 +1185,6 @@ impl GovernedQueryStatementOwner {
         self.accepted_delivery_cut = Some(ResultClosingCut::OriginatingFailure);
         Ok(self.query_concurrency.take().is_some())
     }
-    pub(crate) fn accepted_delivery_cut(&self) -> Option<ResultClosingCut> {
-        self.accepted_delivery_cut
-    }
-
-    /// Atomically wins the terminal success boundary against every later
-    /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
         StatementVisibilityLoan {
             service: &self.service,
@@ -1435,10 +1344,6 @@ impl QueryControlPort for TestQueryControlPort {
         Err(QueryControlError::UnknownSession)
     }
 
-    fn list_processes(&self) -> Vec<SessionProcess> {
-        Vec::new()
-    }
-
     fn finish_governed_statement(
         &self,
         _statement: StatementToken,
@@ -1482,22 +1387,6 @@ impl QueryControlPort for TestQueryControlPort {
         _reason: QueryCancellationReason,
     ) -> QueryCancelOutcome {
         QueryCancelOutcome::UnknownSession
-    }
-
-    fn kill_query(
-        &self,
-        _requester: SessionToken,
-        _target_connection_id: u32,
-    ) -> QueryCancelOutcome {
-        QueryCancelOutcome::UnknownSession
-    }
-
-    fn authorize_connection_kill(
-        &self,
-        _requester: SessionToken,
-        _target_connection_id: u32,
-    ) -> ConnectionKillAuthorization {
-        ConnectionKillAuthorization::UnknownSession
     }
 
     fn cancel_all(&self, _reason: QueryCancellationReason) {}

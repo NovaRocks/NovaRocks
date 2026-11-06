@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, Timelike};
 use novarocks_result_contract::{
-    ClientPresentationFamily, ClientRenderSchema, FrozenRootOutput, NativeRenderType as N,
-    RenderField, RenderPresentation as P, RenderTimeUnit, RootOutputContract, RootProfileV1 as V,
+    ClientRenderSchema, FrozenRootOutput, NativeRenderType as N, RenderField, RenderTimeUnit,
+    RootOutputContract, RootProfileV1 as V,
 };
 use std::mem::size_of;
 use std::ops::Range;
@@ -122,18 +122,11 @@ enum Source {
         row: usize,
         range: Option<Range<usize>>,
     },
-    Name {
-        parent: Path,
-        child: usize,
-    },
-    Timezone(Path),
 }
 impl Source {
     fn metadata_work(&self) -> usize {
         match self {
             Self::Array { .. } => 16,
-            Self::Name { parent, .. } => 16 + usize::from(parent.depth) * 2,
-            Self::Timezone(path) => 16 + usize::from(path.depth) * 2,
         }
     }
     fn array(array: ArrayRef, row: usize) -> Self {
@@ -143,7 +136,7 @@ impl Source {
             range: None,
         }
     }
-    fn data<'a>(&'a self, s: &'a ClientRenderSchema) -> Result<&'a [u8], RenderError> {
+    fn data(&self) -> Result<&[u8], RenderError> {
         match self {
             Self::Array { array, row, range } => {
                 let b = bytes(array, *row)?;
@@ -151,23 +144,6 @@ impl Source {
                     b.get(r.clone()).ok_or_else(invalid)
                 } else {
                     Ok(b)
-                }
-            }
-            Self::Name { parent, child } => {
-                if let N::Struct(fields) = &parent.field(s)?.native_type {
-                    Ok(fields.get(*child).ok_or_else(invalid)?.name.as_bytes())
-                } else {
-                    Err(invalid())
-                }
-            }
-            Self::Timezone(path) => {
-                if let N::Timestamp {
-                    timezone: Some(tz), ..
-                } = &path.field(s)?.native_type
-                {
-                    Ok(tz.as_bytes())
-                } else {
-                    Err(invalid())
                 }
             }
         }
@@ -189,12 +165,7 @@ impl Source {
 }
 #[derive(Clone, Copy)]
 enum Mode {
-    Raw,
-    Double,
-    Single,
-    LatinJson,
     Json,
-    Lossy,
     Base64,
 }
 struct Stream {
@@ -260,8 +231,11 @@ struct Variant {
     view: VariantView,
     range: Range<usize>,
     depth: usize,
-    offset: i32,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Inline formatting atoms share the fixed, accounted cursor stack and must not allocate per cell"
+)]
 enum EncodeStep {
     JsonEscape(bool),
     TrinoKey {
@@ -294,7 +268,6 @@ enum EncodeStep {
         row: usize,
         path: Path,
         next: usize,
-        phase: u8,
     },
     Stream(Stream),
     Atom(Atom),
@@ -365,42 +338,7 @@ fn stream_next(
                 stream.at += n;
                 b.scan(n);
             }
-            Mode::Lossy => {
-                let n = if c < 0x80 {
-                    1
-                } else if (0xc2..=0xdf).contains(&c) {
-                    2
-                } else if (0xe0..=0xef).contains(&c) {
-                    3
-                } else if (0xf0..=0xf4).contains(&c) {
-                    4
-                } else {
-                    1
-                };
-                let end = (stream.at + n).min(data.len());
-                let part = &data[stream.at..end];
-                let (text, consumed) = match std::str::from_utf8(part) {
-                    Ok(text) => (text.as_bytes(), part.len()),
-                    Err(e) => {
-                        if e.valid_up_to() > 0 {
-                            (&part[..e.valid_up_to()], e.valid_up_to())
-                        } else {
-                            ("\u{fffd}".as_bytes(), e.error_len().unwrap_or(part.len()))
-                        }
-                    }
-                };
-                if text.len() == 1 && matches!(text[0], b'"' | b'\\') {
-                    stream.pending[0] = b'\\';
-                    stream.pending[1] = text[0];
-                    stream.pending_len = 2;
-                } else {
-                    stream.pending[..text.len()].copy_from_slice(text);
-                    stream.pending_len = text.len();
-                }
-                stream.at += consumed;
-                b.scan(part.len());
-            }
-            mode => {
+            Mode::Json => {
                 b.scan(1);
                 stream.at += 1;
                 if let Some(j) = &mut stream.json
@@ -421,63 +359,10 @@ fn stream_next(
                 if let Some(u) = &mut stream.utf8 {
                     u.feed(c)?;
                 }
-                match mode {
-                    Mode::Double | Mode::Single
-                        if c == b'\\'
-                            || c == if matches!(mode, Mode::Double) {
-                                b'"'
-                            } else {
-                                b'\''
-                            } =>
-                    {
-                        stream.pending[..2].copy_from_slice(&[b'\\', c]);
-                        stream.pending_len = 2;
-                    }
-                    Mode::Json => {
-                        let mut escaped = [0; 6];
-                        let n = trino_json::escape_byte(c, &mut escaped);
-                        stream.pending[..n].copy_from_slice(&escaped[..n]);
-                        stream.pending_len = n;
-                    }
-                    Mode::LatinJson => {
-                        let escaped = match c {
-                            b'"' => Some(b"\\\"".as_slice()),
-                            b'\\' => Some(b"\\\\".as_slice()),
-                            b'\n' => Some(b"\\n".as_slice()),
-                            b'\r' => Some(b"\\r".as_slice()),
-                            b'\t' => Some(b"\\t".as_slice()),
-                            8 => Some(b"\\b".as_slice()),
-                            12 => Some(b"\\f".as_slice()),
-                            _ => None,
-                        };
-                        if let Some(e) = escaped {
-                            stream.pending[..e.len()].copy_from_slice(e);
-                            stream.pending_len = e.len();
-                        } else if c < 0x20 {
-                            const HEX: &[u8; 16] = b"0123456789abcdef";
-                            stream.pending[..6].copy_from_slice(&[
-                                b'\\',
-                                b'u',
-                                b'0',
-                                b'0',
-                                HEX[(c >> 4) as usize],
-                                HEX[(c & 15) as usize],
-                            ]);
-                            stream.pending_len = 6;
-                        } else if c < 0x80 || matches!(mode, Mode::Json) {
-                            stream.pending[0] = c;
-                            stream.pending_len = 1;
-                        } else {
-                            stream.pending[..2]
-                                .copy_from_slice(&[0xc0 | (c >> 6), 0x80 | (c & 63)]);
-                            stream.pending_len = 2;
-                        }
-                    }
-                    _ => {
-                        stream.pending[0] = c;
-                        stream.pending_len = 1;
-                    }
-                }
+                let mut escaped = [0; 6];
+                let count = trino_json::escape_byte(c, &mut escaped);
+                stream.pending[..count].copy_from_slice(&escaped[..count]);
+                stream.pending_len = count;
             }
         }
     }
@@ -581,7 +466,6 @@ impl CellCursor {
     }
     fn drain(
         &mut self,
-        s: &ClientRenderSchema,
         b: &mut Budget,
         mut output: Option<&mut [u8]>,
         limit: usize,
@@ -619,23 +503,7 @@ impl CellCursor {
                     return Ok(0);
                 }
                 b.scan(metadata);
-                let data = source.data(s)?;
-                if matches!(stream.mode, Mode::Raw)
-                    && stream.json.is_none()
-                    && stream.utf8.is_none()
-                    && stream.pending_at == stream.pending_len
-                {
-                    let n = (data.len() - stream.at)
-                        .min(limit)
-                        .min((V::EMIT_BYTES_PER_TURN - b.work) / 2);
-                    if let Some(out) = output {
-                        out[..n].copy_from_slice(&data[stream.at..stream.at + n]);
-                    }
-                    stream.at += n;
-                    b.scan(n);
-                    charge(b, n);
-                    return Ok(n);
-                }
+                let data = source.data()?;
                 let mut n = 0;
                 while n < limit && b.room(4096) {
                     match stream_next(stream, data, b, &mut self.elements)? {
@@ -695,7 +563,7 @@ impl CellCursor {
             if let Some(EncodeStep::Stream(stream)) = self.stack.last_mut() {
                 let source = stream.source.clone();
                 b.scan(source.metadata_work());
-                match stream_next(stream, source.data(s)?, b, &mut self.elements)? {
+                match stream_next(stream, source.data()?, b, &mut self.elements)? {
                     Poll::Done => {
                         self.stack.pop();
                         continue;
@@ -715,7 +583,7 @@ impl CellCursor {
                     self.stack.pop();
                     continue;
                 }
-                let data = source.data(s)?;
+                let data = source.data()?;
                 let range = view.key(data, *next)?;
                 b.scan(32);
                 let n = (range.len() - *at).min(V::EMIT_BYTES_PER_TURN - b.work - 1);
@@ -762,170 +630,16 @@ impl CellCursor {
                     if row >= array.len() {
                         return Err(error(E::SchemaMismatch));
                     }
-                    let f = path.field(s)?;
-                    let nested = path.depth != 0;
+                    let field = path.field(s)?;
                     let (array, row) = resolve_dictionary(array, row)?;
                     if array.is_null(row) {
-                        if !f.nullable && !matches!(f.native_type, N::Null | N::Opaque(_)) {
+                        if !field.nullable && !matches!(field.native_type, N::Null) {
                             return Err(error(E::SchemaMismatch));
                         }
-                        self.literal(
-                            if nested
-                                || matches!(s.family(), ClientPresentationFamily::TrinoJson(_))
-                            {
-                                b"null"
-                            } else {
-                                &[0xfb]
-                            },
-                        )?;
+                        self.literal(b"null")?;
                         continue;
                     }
-                    if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
-                        self.trino_value(array, row, path, s, false, b)?;
-                        continue;
-                    }
-                    match &f.native_type {
-                        N::List(_) => {
-                            let (values, start, end) = list_values(&array, row)?;
-                            self.literal(b"]")?;
-                            self.push(EncodeStep::List {
-                                array: values,
-                                next: start,
-                                end,
-                                path,
-                                first: true,
-                            })?;
-                            self.literal(b"[")?;
-                        }
-                        N::Map { .. } => {
-                            let m = down::<MapArray>(&array)?;
-                            let off = m.value_offsets();
-                            let start = usize::try_from(off[row]).map_err(|_| invalid())?;
-                            let end = usize::try_from(off[row + 1]).map_err(|_| invalid())?;
-                            if start > end || end > m.keys().len() || end > m.values().len() {
-                                return Err(invalid());
-                            }
-                            self.literal(b"}")?;
-                            self.push(EncodeStep::Map {
-                                array,
-                                next: start,
-                                end,
-                                path,
-                                phase: 0,
-                                first: true,
-                            })?;
-                            self.literal(b"{")?;
-                        }
-                        N::Struct(_) => {
-                            self.literal(b"}")?;
-                            self.push(EncodeStep::Struct {
-                                array,
-                                row,
-                                path,
-                                next: 0,
-                                phase: 0,
-                            })?;
-                            self.literal(b"{")?;
-                        }
-                        N::String | N::Binary | N::Json => {
-                            let source = Source::array(array, row);
-                            let mut stream = Stream::new(
-                                source,
-                                if nested {
-                                    if matches!(f.native_type, N::Json) {
-                                        Mode::Single
-                                    } else if matches!(f.native_type, N::Binary) {
-                                        Mode::Lossy
-                                    } else {
-                                        Mode::Double
-                                    }
-                                } else {
-                                    Mode::Raw
-                                },
-                            );
-                            if matches!(f.native_type, N::Json) {
-                                stream.json = Some(JsonCursor::new(path.depth as usize));
-                            }
-                            if nested {
-                                let q = if matches!(f.native_type, N::Json) {
-                                    b'\''
-                                } else {
-                                    b'"'
-                                };
-                                self.literal(&[q])?;
-                                self.push(EncodeStep::Stream(stream))?;
-                                self.literal(&[q])?;
-                            } else {
-                                self.push(EncodeStep::Stream(stream))?;
-                            }
-                        }
-                        N::Opaque(_) | N::Null => {
-                            self.literal(if nested { b"null" } else { &[0xfb] })?
-                        }
-                        N::Variant => match f.presentation {
-                            P::VariantSerializedBytes => self.push(EncodeStep::Stream(
-                                Stream::new(Source::array(array, row), Mode::Raw),
-                            ))?,
-                            P::VariantJson {
-                                timezone_offset_seconds,
-                            } => {
-                                let source = Source::array(array, row);
-                                let data = source.data(s)?;
-                                let view = VariantView::parse(data)?;
-                                let range = view.metadata_end..data.len();
-                                self.push(EncodeStep::Variant(Variant {
-                                    source: source.clone(),
-                                    view,
-                                    range,
-                                    depth: path.depth as usize,
-                                    offset: timezone_offset_seconds,
-                                }))?;
-                                self.push(EncodeStep::Metadata {
-                                    source,
-                                    view,
-                                    next: 0,
-                                    at: 0,
-                                    utf8: Utf8::default(),
-                                })?;
-                            }
-                            _ => return Err(invalid()),
-                        },
-                        _ => {
-                            let mut a = scalar_atom(&array, row, f, nested)?;
-                            b.scan(
-                                a.len * 2
-                                    + if matches!(f.native_type, N::Decimal { bits: 256, .. }) {
-                                        78 * 32
-                                    } else {
-                                        32
-                                    },
-                            );
-                            let quoted = nested
-                                && matches!(
-                                    f.native_type,
-                                    N::Date | N::Time { .. } | N::Timestamp { .. }
-                                );
-                            if quoted {
-                                self.literal(b"\"")?;
-                                if let N::Timestamp {
-                                    timezone: Some(_), ..
-                                } = &f.native_type
-                                    && matches!(f.presentation, P::TimestampContainerText)
-                                {
-                                    self.push(EncodeStep::Stream(Stream::new(
-                                        Source::Timezone(path),
-                                        Mode::Raw,
-                                    )))?;
-                                    self.literal(b" ")?;
-                                }
-                                self.push(EncodeStep::Atom(a))?;
-                                self.literal(b"\"")?;
-                            } else {
-                                a.at = 0;
-                                self.push(EncodeStep::Atom(a))?;
-                            }
-                        }
-                    }
+                    self.trino_value(array, row, path, s, false, b)?;
                 }
                 EncodeStep::List {
                     array,
@@ -977,23 +691,19 @@ impl CellCursor {
                             first: false,
                         })?;
                         let child = path.child(phase as usize)?;
-                        self.push(
-                            if phase == 0
-                                && matches!(s.family(), ClientPresentationFamily::TrinoJson(_))
-                            {
-                                EncodeStep::TrinoKey {
-                                    array: a,
-                                    row: next,
-                                    path: child,
-                                }
-                            } else {
-                                EncodeStep::Value {
-                                    array: a,
-                                    row: next,
-                                    path: child,
-                                }
-                            },
-                        )?;
+                        self.push(if phase == 0 {
+                            EncodeStep::TrinoKey {
+                                array: a,
+                                row: next,
+                                path: child,
+                            }
+                        } else {
+                            EncodeStep::Value {
+                                array: a,
+                                row: next,
+                                path: child,
+                            }
+                        })?;
                         if phase == 1 {
                             self.literal(b":")?;
                         } else if !first {
@@ -1006,7 +716,6 @@ impl CellCursor {
                     row,
                     path,
                     next,
-                    phase,
                 } => {
                     let fields = if let N::Struct(fields) = &path.field(s)?.native_type {
                         fields
@@ -1014,59 +723,20 @@ impl CellCursor {
                         return Err(invalid());
                     };
                     if next < fields.len() {
-                        if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
-                            let a = down::<StructArray>(&array)?.column(next).clone();
-                            self.push(EncodeStep::Struct {
-                                array,
-                                row,
-                                path,
-                                next: next + 1,
-                                phase: 0,
-                            })?;
-                            self.push(EncodeStep::Value {
-                                array: a,
-                                row,
-                                path: path.child(next)?,
-                            })?;
-                            if next != 0 {
-                                self.literal(b",")?;
-                            }
-                            continue;
-                        }
-                        if phase == 0 {
-                            self.push(EncodeStep::Struct {
-                                array,
-                                row,
-                                path,
-                                next,
-                                phase: 1,
-                            })?;
-                            self.quoted(
-                                Source::Name {
-                                    parent: path,
-                                    child: next,
-                                },
-                                Mode::Double,
-                                b'"',
-                            )?;
-                            if next != 0 {
-                                self.literal(b",")?;
-                            }
-                        } else {
-                            let a = down::<StructArray>(&array)?.column(next).clone();
-                            self.push(EncodeStep::Struct {
-                                array,
-                                row,
-                                path,
-                                next: next + 1,
-                                phase: 0,
-                            })?;
-                            self.push(EncodeStep::Value {
-                                array: a,
-                                row,
-                                path: path.child(next)?,
-                            })?;
-                            self.literal(b":")?;
+                        let child = down::<StructArray>(&array)?.column(next).clone();
+                        self.push(EncodeStep::Struct {
+                            array,
+                            row,
+                            path,
+                            next: next + 1,
+                        })?;
+                        self.push(EncodeStep::Value {
+                            array: child,
+                            row,
+                            path: path.child(next)?,
+                        })?;
+                        if next != 0 {
+                            self.literal(b",")?;
                         }
                     }
                 }
@@ -1081,7 +751,7 @@ impl CellCursor {
                     if value.depth > 64 {
                         return Err(error(E::DepthLimit));
                     }
-                    self.variant(value, s, b)?;
+                    self.variant(value, b)?;
                 }
                 EncodeStep::VariantCollection {
                     value,
@@ -1091,7 +761,7 @@ impl CellCursor {
                     object,
                 } => {
                     if next < info.count {
-                        let data = value.source.data(s)?;
+                        let data = value.source.data()?;
                         let range = info.child(data, next, value.range.end)?;
                         if object && phase == 0 {
                             let id = variant_cursor::read(
@@ -1108,14 +778,7 @@ impl CellCursor {
                                 phase: 1,
                                 object,
                             })?;
-                            let mut stream = Stream::new(
-                                source,
-                                if matches!(s.family(), ClientPresentationFamily::TrinoJson(_)) {
-                                    Mode::Json
-                                } else {
-                                    Mode::LatinJson
-                                },
-                            );
+                            let mut stream = Stream::new(source, Mode::Json);
                             stream.utf8 = Some(Utf8::default());
                             self.literal(b"\"")?;
                             self.push(EncodeStep::Stream(stream))?;
@@ -1146,14 +809,8 @@ impl CellCursor {
             }
         }
     }
-    fn variant(
-        &mut self,
-        v: Variant,
-        s: &ClientRenderSchema,
-        b: &mut Budget,
-    ) -> Result<(), RenderError> {
-        let trino = matches!(s.family(), ClientPresentationFamily::TrinoJson(_));
-        let data = v.source.data(s)?;
+    fn variant(&mut self, v: Variant, b: &mut Budget) -> Result<(), RenderError> {
+        let data = v.source.data()?;
         let bytes = data
             .get(v.range.clone())
             .ok_or_else(|| error(E::InvalidVariant))?;
@@ -1185,7 +842,7 @@ impl CellCursor {
                 }
                 self.quoted(
                     v.source.slice(v.range.start + 1..v.range.end)?,
-                    if trino { Mode::Json } else { Mode::LatinJson },
+                    Mode::Json,
                     b'"',
                 )?;
             }
@@ -1230,7 +887,7 @@ impl CellCursor {
                             payload.try_into().map_err(|_| error(E::InvalidVariant))?
                         )
                     )),
-                    7 | 14 if trino => Some(if tag == 7 {
+                    7 | 14 => Some(if tag == 7 {
                         trino_json::float64(
                             f64::from_le_bytes(
                                 payload.try_into().map_err(|_| error(E::InvalidVariant))?,
@@ -1245,30 +902,6 @@ impl CellCursor {
                             b,
                         )?
                     }),
-                    7 | 14 => {
-                        let n = if tag == 7 {
-                            f64::from_le_bytes(
-                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
-                            )
-                        } else {
-                            f64::from(f32::from_le_bytes(
-                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
-                            ))
-                        };
-                        let mut a = if n.is_finite() {
-                            atom!("{n}")
-                        } else {
-                            Atom::literal(b"null")
-                        };
-                        if n.is_finite()
-                            && !a.data[..a.len]
-                                .iter()
-                                .any(|b| matches!(b, b'.' | b'e' | b'E'))
-                        {
-                            a.write_str(".0").map_err(|_| invalid())?;
-                        }
-                        Some(a)
-                    }
                     8..=10 => {
                         let width = match tag {
                             8 => 4,
@@ -1286,25 +919,16 @@ impl CellCursor {
                         }
                         let mut a =
                             decimal128(i128::from_le_bytes(raw), payload[0] as usize, None)?;
-                        if trino {
-                            a = trino_json::variant_decimal(a, payload[0])?;
-                        } else if payload[0] != 0 {
-                            while a.len > 1
-                                && a.data[a.len - 1] == b'0'
-                                && a.data[a.len - 2] != b'.'
-                            {
-                                a.len -= 1;
-                            }
-                        }
+                        a = trino_json::variant_decimal(a, payload[0])?;
                         Some(a)
                     }
                     11 => {
                         let days = i32::from_le_bytes(
                             payload.try_into().map_err(|_| error(E::InvalidVariant))?,
                         );
-                        Some(atom!("\"{}\"", date_atom(days, true, false)?))
+                        Some(atom!("\"{}\"", date_atom(days)?))
                     }
-                    12 | 13 | 17 | 18 | 19 if trino => {
+                    12 | 13 | 17 | 18 | 19 => {
                         let raw = i64::from_le_bytes(
                             payload.try_into().map_err(|_| error(E::InvalidVariant))?,
                         );
@@ -1327,67 +951,6 @@ impl CellCursor {
                         }
                         Some(atom!("\"{}\"", text))
                     }
-                    12 | 13 => {
-                        let raw = i64::from_le_bytes(
-                            payload.try_into().map_err(|_| error(E::InvalidVariant))?,
-                        );
-                        let secs = raw.div_euclid(1_000_000);
-                        let micro = raw.rem_euclid(1_000_000) as u32;
-                        let dt =
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(secs, micro * 1000)
-                                .ok_or_else(|| error(E::InvalidVariant))?;
-                        let mut a = Atom::literal(b"\"");
-                        if tag == 12 {
-                            let offset = chrono::FixedOffset::east_opt(v.offset)
-                                .ok_or_else(|| error(E::InvalidVariant))?;
-                            let dt = dt.with_timezone(&offset);
-                            write!(
-                                &mut a,
-                                "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                year_atom(dt.year(), true)?,
-                                dt.month(),
-                                dt.day(),
-                                dt.hour(),
-                                dt.minute(),
-                                dt.second()
-                            )
-                            .map_err(|_| invalid())?;
-                            if micro != 0 {
-                                let f = atom!("{micro:06}");
-                                let mut n = f.len;
-                                while n > 0 && f.data[n - 1] == b'0' {
-                                    n -= 1;
-                                }
-                                a.write_str(".").map_err(|_| invalid())?;
-                                a.write_str(
-                                    std::str::from_utf8(&f.data[..n]).map_err(|_| invalid())?,
-                                )
-                                .map_err(|_| invalid())?;
-                            }
-                            write!(
-                                &mut a,
-                                "{}{:02}:{:02}",
-                                if v.offset < 0 { '-' } else { '+' },
-                                (v.offset.unsigned_abs() + 30) / 60 / 60,
-                                (v.offset.unsigned_abs() + 30) / 60 % 60
-                            )
-                            .map_err(|_| invalid())?;
-                        } else {
-                            write!(
-                                &mut a,
-                                "{}-{:02}-{:02} {:02}:{:02}:{:02}.{micro:06}",
-                                year_atom(dt.year(), true)?,
-                                dt.month(),
-                                dt.day(),
-                                dt.hour(),
-                                dt.minute(),
-                                dt.second()
-                            )
-                            .map_err(|_| invalid())?;
-                        }
-                        a.write_str("\"").map_err(|_| invalid())?;
-                        Some(a)
-                    }
                     15 | 16 => {
                         let len = variant_cursor::read(payload, 0, 4)? as usize;
                         if len.checked_add(4) != Some(payload.len()) {
@@ -1395,13 +958,7 @@ impl CellCursor {
                         }
                         self.quoted(
                             v.source.slice(v.range.start + 5..v.range.end)?,
-                            if tag == 15 {
-                                Mode::Base64
-                            } else if trino {
-                                Mode::Json
-                            } else {
-                                Mode::LatinJson
-                            },
+                            if tag == 15 { Mode::Base64 } else { Mode::Json },
                             b'"',
                         )?;
                         None
@@ -1473,8 +1030,8 @@ fn list_values(array: &ArrayRef, row: usize) -> Result<(ArrayRef, usize, usize),
     }
     Ok((a, start, end))
 }
-fn year_atom(year: i32, chrono_style: bool) -> Result<Atom, RenderError> {
-    Ok(if !chrono_style || (0..=9999).contains(&year) {
+fn year_atom(year: i32) -> Result<Atom, RenderError> {
+    Ok(if (0..=9999).contains(&year) {
         atom!("{year:04}")
     } else if year < 0 {
         atom!("-{:04}", year.unsigned_abs())
@@ -1482,7 +1039,7 @@ fn year_atom(year: i32, chrono_style: bool) -> Result<Atom, RenderError> {
         atom!("+{year}")
     })
 }
-fn date_atom(days: i32, chrono_style: bool, sentinel: bool) -> Result<Atom, RenderError> {
+fn date_atom(days: i32) -> Result<Atom, RenderError> {
     let ce = 719163i64
         .checked_add(i64::from(days))
         .ok_or_else(invalid_value)?;
@@ -1490,12 +1047,9 @@ fn date_atom(days: i32, chrono_style: bool, sentinel: bool) -> Result<Atom, Rend
         i32::try_from(ce).map_err(|_| invalid_value())?,
     )
     .ok_or_else(invalid_value)?;
-    if sentinel && date.year() == -1 && date.month() == 11 && date.day() == 30 {
-        return Ok(Atom::literal(b"0000-00-00"));
-    }
     Ok(atom!(
         "{}-{:02}-{:02}",
-        year_atom(date.year(), chrono_style)?,
+        year_atom(date.year())?,
         date.month(),
         date.day()
     ))
@@ -1573,141 +1127,12 @@ fn time_raw(array: &ArrayRef, row: usize) -> Result<i64, RenderError> {
         _ => Err(error(E::UnsupportedCarrier)),
     }
 }
-fn micros(raw: i64, unit: RenderTimeUnit) -> i128 {
-    match unit {
-        RenderTimeUnit::Second => i128::from(raw) * 1_000_000,
-        RenderTimeUnit::Millisecond => i128::from(raw) * 1000,
-        RenderTimeUnit::Microsecond => i128::from(raw),
-        RenderTimeUnit::Nanosecond => i128::from(raw) / 1000,
-    }
-}
-fn scalar_atom(
-    array: &ArrayRef,
-    row: usize,
-    f: &RenderField,
-    nested: bool,
-) -> Result<Atom, RenderError> {
-    macro_rules! value {
-        ($t:ty) => {
-            down::<$t>(array)?.value(row)
-        };
-    }
-    Ok(match f.native_type {
-        N::Boolean => Atom::literal(if value!(BooleanArray) { b"1" } else { b"0" }),
-        N::SignedInteger(8) => atom!("{}", value!(Int8Array)),
-        N::SignedInteger(16) => atom!("{}", value!(Int16Array)),
-        N::SignedInteger(32) => atom!("{}", value!(Int32Array)),
-        N::SignedInteger(64) => atom!("{}", value!(Int64Array)),
-        N::UnsignedInteger(8) => atom!("{}", value!(UInt8Array)),
-        N::UnsignedInteger(16) => atom!("{}", value!(UInt16Array)),
-        N::UnsignedInteger(32) => atom!("{}", value!(UInt32Array)),
-        N::UnsignedInteger(64) => atom!("{}", value!(UInt64Array)),
-        N::Float32 => {
-            #[cfg(test)]
-            FLOAT_FORMATS.with(|n| n.set(n.get() + 1));
-            atom!("{}", value!(Float32Array))
-        }
-        N::Float64 => {
-            #[cfg(test)]
-            FLOAT_FORMATS.with(|n| n.set(n.get() + 1));
-            atom!("{}", value!(Float64Array))
-        }
-        N::LargeInt => atom!(
-            "{}",
-            i128::from_be_bytes(bytes(array, row)?.try_into().map_err(|_| invalid_value())?)
-        ),
-        N::Decimal {
-            bits: 128,
-            precision,
-            scale,
-        } => decimal128(value!(Decimal128Array), scale as usize, Some(precision))?,
-        N::Decimal {
-            bits: 256,
-            precision,
-            scale,
-        } if nested => decimal256(
-            value!(Decimal256Array).to_le_bytes(),
-            scale as usize,
-            precision,
-        )?,
-        N::Date => date_atom(value!(Date32Array), nested, true)?,
-        N::Time { unit } => {
-            let n = micros(time_raw(array, row)?, unit);
-            if !nested && n < 0 {
-                return Err(invalid_value());
-            }
-            let abs = n.unsigned_abs();
-            let mut a = atom!(
-                "{}{:02}:{:02}:{:02}",
-                if n < 0 { "-" } else { "" },
-                abs / 3_600_000_000,
-                abs % 3_600_000_000 / 60_000_000,
-                abs % 60_000_000 / 1_000_000
-            );
-            let frac = abs % 1_000_000;
-            if frac != 0 {
-                write!(&mut a, ".{frac:06}").map_err(|_| invalid_value())?;
-            }
-            a
-        }
-        N::Timestamp { unit, .. } => {
-            let raw = time_raw(array, row)?;
-            let (secs, nanos, width, optional) =
-                if matches!(f.presentation, P::TimestampContainerText) {
-                    match unit {
-                        RenderTimeUnit::Second => (i128::from(raw), 0, 0, false),
-                        RenderTimeUnit::Millisecond => (
-                            i128::from(raw).div_euclid(1000),
-                            (raw.rem_euclid(1000) as u32) * 1_000_000,
-                            3,
-                            false,
-                        ),
-                        RenderTimeUnit::Microsecond => (
-                            i128::from(raw).div_euclid(1_000_000),
-                            (raw.rem_euclid(1_000_000) as u32) * 1000,
-                            6,
-                            true,
-                        ),
-                        RenderTimeUnit::Nanosecond => (
-                            i128::from(raw).div_euclid(1_000_000_000),
-                            raw.rem_euclid(1_000_000_000) as u32,
-                            9,
-                            false,
-                        ),
-                    }
-                } else {
-                    let n = micros(raw, unit);
-                    (
-                        n.div_euclid(1_000_000),
-                        (n.rem_euclid(1_000_000) as u32) * 1000,
-                        6,
-                        true,
-                    )
-                };
-            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                i64::try_from(secs).map_err(|_| invalid_value())?,
-                nanos,
-            )
-            .ok_or_else(invalid_value)?;
-            let mut a = atom!(
-                "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-                year_atom(
-                    dt.year(),
-                    matches!(f.presentation, P::TimestampContainerText)
-                )?,
-                dt.month(),
-                dt.day(),
-                dt.hour(),
-                dt.minute(),
-                dt.second()
-            );
-            if width != 0 && (!optional || nanos != 0) {
-                let frac = nanos / 10u32.pow(9 - width);
-                write!(&mut a, ".{frac:0width$}", width = width as usize)
-                    .map_err(|_| invalid_value())?;
-            }
-            a
-        }
+fn scalar_atom(array: &ArrayRef, row: usize, field: &RenderField) -> Result<Atom, RenderError> {
+    Ok(match field.native_type {
+        N::SignedInteger(8) => atom!("{}", down::<Int8Array>(array)?.value(row)),
+        N::SignedInteger(16) => atom!("{}", down::<Int16Array>(array)?.value(row)),
+        N::SignedInteger(32) => atom!("{}", down::<Int32Array>(array)?.value(row)),
+        N::SignedInteger(64) => atom!("{}", down::<Int64Array>(array)?.value(row)),
         _ => return Err(error(E::UnsupportedPresentation)),
     })
 }
@@ -1818,20 +1243,6 @@ fn validate_field(f: &RenderField, d: &DataType, nested: bool) -> Result<(), Ren
     }
     Ok(())
 }
-fn lenenc(n: usize) -> Atom {
-    if n < 251 {
-        Atom::literal(&[n as u8])
-    } else if n <= 0xffff {
-        Atom::literal(&[0xfc, n as u8, (n >> 8) as u8])
-    } else if n <= 0xff_ffff {
-        Atom::literal(&[0xfd, n as u8, (n >> 8) as u8, (n >> 16) as u8])
-    } else {
-        let mut a = Atom::literal(&[0xfe]);
-        a.data[1..9].copy_from_slice(&(n as u64).to_le_bytes());
-        a.len = 9;
-        a
-    }
-}
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Small,
@@ -1879,8 +1290,6 @@ struct ArrowClientRowEncoder {
     row: usize,
     column: usize,
     cell_started: bool,
-    cell_null: bool,
-    cell_prefix: usize,
     cell_length: usize,
     row_length: usize,
     elements: usize,
@@ -1888,8 +1297,6 @@ struct ArrowClientRowEncoder {
     stage_at: usize,
     prefix_at: usize,
     cell_atom: Atom,
-    moving: usize,
-    move_target: usize,
     // Every batch/cursor array owner is destroyed before its type creator
     // responsibility. Independent cursors retain this immutable owner.
     schema: SchemaOwner,
@@ -1969,9 +1376,7 @@ impl ArrowClientRowEncoder {
         Self::try_new_with_owner(SchemaOwner::TypedRoot(input), batch)
     }
     fn try_new_with_owner(schema: SchemaOwner, batch: RecordBatch) -> Result<Self, RenderError> {
-        if matches!(schema.family(), ClientPresentationFamily::TrinoJson(_)) {
-            trino_json::validate_schema(&schema)?;
-        }
+        trino_json::validate_schema(&schema)?;
         if schema.columns().is_empty() || schema.columns().len() > V::MAX_COLUMNS {
             return Err(error(E::SchemaMismatch));
         }
@@ -2015,8 +1420,6 @@ impl ArrowClientRowEncoder {
             row: 0,
             column: 0,
             cell_started: false,
-            cell_null: false,
-            cell_prefix: 0,
             cell_length: 0,
             row_length: 0,
             elements: 0,
@@ -2024,8 +1427,6 @@ impl ArrowClientRowEncoder {
             stage_at: 0,
             prefix_at: 0,
             cell_atom: Atom::new(),
-            moving: 0,
-            move_target: 0,
         })
     }
     fn reset_row(&mut self, phase: Phase) {
@@ -2038,65 +1439,39 @@ impl ArrowClientRowEncoder {
         self.stage_len = 0;
         self.stage_at = 0;
         self.prefix_at = 0;
-        self.moving = 0;
-        self.move_target = 0;
         self.cursor.stack.clear();
     }
-    fn start_cell(&mut self, b: &mut Budget) -> Result<bool, RenderError> {
-        let trino = matches!(self.schema.family(), ClientPresentationFamily::TrinoJson(_));
-        if !b.room(if trino { 4096 } else { 32 }) || !b.cell() {
+    fn start_cell(&mut self, budget: &mut Budget) -> Result<bool, RenderError> {
+        if !budget.room(4096) || !budget.cell() {
             return Ok(false);
         }
-        b.scan(16);
+        budget.scan(16);
         let column = &self.schema.columns()[self.column];
         let array = self.batch.column(column.source_ordinal as usize).clone();
-        let (resolved, row) = resolve_dictionary(array.clone(), self.row)?;
-        self.cell_null = !trino
-            && (resolved.is_null(row)
-                || matches!(column.field.native_type, N::Null | N::Opaque(_)));
         self.cell_started = true;
         self.cell_length = 0;
-        if self.cell_null {
-            if !column.field.nullable && !matches!(column.field.native_type, N::Null | N::Opaque(_))
-            {
-                return Err(error(E::SchemaMismatch));
-            }
-            self.elements += 1;
-            if self.elements > V::MAX_ELEMENTS_PER_ROW {
-                return Err(extent_error(E::ElementLimit, self.elements));
-            }
-            self.cell_atom = Atom::literal(&[0xfb]);
-        } else {
+        self.cursor
+            .reset(array, self.row, Path::root(self.column), self.elements);
+        if self.column + 1 == self.schema.columns().len() {
+            // The closing delimiter belongs to the last cell's measured payload.
             self.cursor
-                .reset(array, self.row, Path::root(self.column), self.elements);
-            if trino && self.column + 1 == self.schema.columns().len() {
-                // Closing delimiter is part of this last cell's measured payload.
-                self.cursor
-                    .stack
-                    .insert(0, EncodeStep::Atom(Atom::literal(b"]")));
-                b.scan(size_of::<EncodeStep>());
-            }
-            self.cell_atom = if self.phase == Phase::Emit && trino {
-                Atom::literal(if self.column == 0 { b"[" } else { b"," })
-            } else if self.phase == Phase::Emit {
-                lenenc(self.lengths[self.column] as usize)
-            } else {
-                Atom::new()
-            };
+                .stack
+                .insert(0, EncodeStep::Atom(Atom::literal(b"]")));
+            budget.scan(size_of::<EncodeStep>());
         }
-        if self.phase == Phase::Small && !self.cell_null {
+        self.cell_atom = if self.phase == Phase::Emit {
+            Atom::literal(if self.column == 0 { b"[" } else { b"," })
+        } else {
+            Atom::new()
+        };
+        if self.phase == Phase::Small {
             if self.stage_len == V::SMALL_ROW_BYTES {
                 self.reset_row(Phase::Count);
                 return Ok(true);
             }
-            self.cell_prefix = self.stage_len;
-            self.stage[self.stage_len] = if trino {
-                if self.column == 0 { b'[' } else { b',' }
-            } else {
-                0
-            };
+            self.stage[self.stage_len] = if self.column == 0 { b'[' } else { b',' };
             self.stage_len += 1;
-            b.scan(1);
+            budget.scan(1);
         }
         Ok(true)
     }
@@ -2110,68 +1485,16 @@ impl ArrowClientRowEncoder {
         }
         Ok(())
     }
-    fn complete_cell(&mut self, b: &mut Budget) -> Result<bool, RenderError> {
-        if !self.cell_null {
-            self.elements = self.cursor.elements;
-        }
+    fn complete_cell(&mut self) -> Result<(), RenderError> {
+        self.elements = self.cursor.elements;
         match self.phase {
-            Phase::Small => {
-                if !self.cell_null
-                    && matches!(self.schema.family(), ClientPresentationFamily::MysqlText)
-                {
-                    let prefix = lenenc(self.cell_length);
-                    let extra = prefix.len - 1;
-                    if self
-                        .stage_len
-                        .checked_add(extra)
-                        .ok_or_else(|| error(E::ArithmeticOverflow))?
-                        > V::SMALL_ROW_BYTES
-                    {
-                        self.reset_row(Phase::Count);
-                        return Ok(true);
-                    }
-                    if extra != 0 {
-                        if self.moving == 0 && self.move_target == 0 {
-                            self.moving = self.cell_length;
-                            self.move_target = extra;
-                        }
-                        // Each cell is moved once, backwards, in bounded pieces.
-                        let n = self
-                            .moving
-                            .min((V::EMIT_BYTES_PER_TURN - b.work).saturating_sub(prefix.len) / 2);
-                        if n == 0 {
-                            return Ok(false);
-                        }
-                        let start = self.cell_prefix + 1 + self.moving - n;
-                        self.stage.copy_within(start..start + n, start + extra);
-                        self.moving -= n;
-                        b.scan(n * 2);
-                        if self.moving != 0 {
-                            return Ok(false);
-                        }
-                        self.stage_len += extra;
-                        self.move_target = 0;
-                    }
-                    if !b.room(prefix.len) {
-                        return Ok(false);
-                    }
-                    self.stage[self.cell_prefix..self.cell_prefix + prefix.len]
-                        .copy_from_slice(&prefix.data[..prefix.len]);
-                    b.scan(prefix.len);
-                }
-            }
+            Phase::Small => {}
             Phase::Count => {
                 self.lengths[self.column] = self.cell_length as u32;
-                self.add_length(if self.cell_null {
-                    1
-                } else if matches!(self.schema.family(), ClientPresentationFamily::TrinoJson(_)) {
-                    1 + self.cell_length
-                } else {
-                    lenenc(self.cell_length).len + self.cell_length
-                })?;
+                self.add_length(1 + self.cell_length)?;
             }
             Phase::Emit => {
-                if !self.cell_null && self.cell_length != self.lengths[self.column] as usize {
+                if self.cell_length != self.lengths[self.column] as usize {
                     return Err(error(E::SchemaMismatch));
                 }
             }
@@ -2180,7 +1503,7 @@ impl ArrowClientRowEncoder {
         self.column += 1;
         self.cell_started = false;
         self.cell_length = 0;
-        Ok(true)
+        Ok(())
     }
     fn run(&mut self, out: &mut [u8]) -> Result<RenderTurn, RenderError> {
         let mut b = Budget::new();
@@ -2275,55 +1598,33 @@ impl ArrowClientRowEncoder {
                     continue;
                 }
             }
-            if self.phase == Phase::Emit || self.cell_null {
-                if self.cell_atom.at < self.cell_atom.len {
-                    if self.phase == Phase::Small && self.stage_len == V::SMALL_ROW_BYTES {
-                        self.reset_row(Phase::Count);
-                        continue;
-                    }
-                    let byte = self.cell_atom.data[self.cell_atom.at];
-                    self.cell_atom.at += 1;
-                    if self.phase == Phase::Emit {
-                        if self.prefix_at == 0 {
-                            if !b.room(5) {
-                                self.cell_atom.at -= 1;
-                                break;
-                            }
-                            out[b.emitted..b.emitted + 4]
-                                .copy_from_slice(&(self.row_length as u32).to_le_bytes());
-                            b.emit(4);
-                            self.prefix_at = 4;
-                        }
-                        if !b.room(1) {
-                            self.cell_atom.at -= 1;
-                            break;
-                        }
-                        out[b.emitted] = byte;
-                        b.emit(1);
-                    } else if self.phase == Phase::Small {
-                        self.stage[self.stage_len] = byte;
-                        self.stage_len += 1;
-                        b.scan(1);
-                    } else {
-                        b.scan(1);
-                    }
-                    continue;
-                }
-                if self.cell_null {
-                    if !self.complete_cell(&mut b)? {
+            if self.phase == Phase::Emit && self.cell_atom.at < self.cell_atom.len {
+                let byte = self.cell_atom.data[self.cell_atom.at];
+                self.cell_atom.at += 1;
+                if self.prefix_at == 0 {
+                    if !b.room(5) {
+                        self.cell_atom.at -= 1;
                         break;
                     }
-                    continue;
+                    out[b.emitted..b.emitted + 4]
+                        .copy_from_slice(&(self.row_length as u32).to_le_bytes());
+                    b.emit(4);
+                    self.prefix_at = 4;
                 }
+                if !b.room(1) {
+                    self.cell_atom.at -= 1;
+                    break;
+                }
+                out[b.emitted] = byte;
+                b.emit(1);
+                continue;
             }
             if self.phase == Phase::Small && self.stage_len == V::SMALL_ROW_BYTES {
-                // Completion may require only a prefix expansion, so ask the
-                // cursor before deciding that an exact-T row is large.
+                // Ask the cursor before classifying a row that ends exactly
+                // at the staging boundary as a larger counted row.
                 match self.cursor.next(&self.schema, &mut b)? {
                     Poll::Done => {
-                        if !self.complete_cell(&mut b)? {
-                            break;
-                        }
+                        self.complete_cell()?;
                     }
                     Poll::Yield => break,
                     Poll::Byte(_) => self.reset_row(Phase::Count),
@@ -2332,21 +1633,19 @@ impl ArrowClientRowEncoder {
             }
             let n = match self.phase {
                 Phase::Small => self.cursor.drain(
-                    &self.schema,
                     &mut b,
                     Some(&mut self.stage[self.stage_len..]),
                     V::SMALL_ROW_BYTES - self.stage_len,
                     false,
                 )?,
-                Phase::Count => {
-                    self.cursor
-                        .drain(&self.schema, &mut b, None, V::EMIT_BYTES_PER_TURN, false)?
-                }
+                Phase::Count => self
+                    .cursor
+                    .drain(&mut b, None, V::EMIT_BYTES_PER_TURN, false)?,
                 Phase::Emit => {
                     let at = b.emitted;
                     let capacity = out.len() - at;
                     self.cursor
-                        .drain(&self.schema, &mut b, Some(&mut out[at..]), capacity, true)?
+                        .drain(&mut b, Some(&mut out[at..]), capacity, true)?
                 }
                 _ => 0,
             };
@@ -2370,9 +1669,7 @@ impl ArrowClientRowEncoder {
             match self.cursor.next(&self.schema, &mut b)? {
                 Poll::Yield => break,
                 Poll::Done => {
-                    if !self.complete_cell(&mut b)? {
-                        break;
-                    }
+                    self.complete_cell()?;
                 }
                 Poll::Byte(byte) => {
                     self.cell_length = self
@@ -2442,63 +1739,7 @@ pub(super) const fn scratch_capacity_bound_bytes() -> usize {
         + CELL_TASK_CAPACITY * size_of::<EncodeStep>()
 }
 
-/// Existing MySQL text presentation over the shared bounded row machine.
-pub struct ArrowMysqlTextEncoder(ArrowClientRowEncoder);
-impl ArrowMysqlTextEncoder {
-    pub fn try_new(
-        schema: Arc<ClientRenderSchema>,
-        batch: RecordBatch,
-    ) -> Result<Self, RenderError> {
-        if !matches!(
-            schema.family(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText
-        ) {
-            return Err(error(E::UnsupportedPresentation));
-        }
-        ArrowClientRowEncoder::try_new(schema, batch).map(Self)
-    }
-    pub fn try_new_root(
-        contract: Arc<RootOutputContract>,
-        batch: RecordBatch,
-    ) -> Result<Self, RenderError> {
-        let FrozenRootOutput::ClientRows(schema) = contract.output() else {
-            return Err(error(E::SchemaMismatch));
-        };
-        if !matches!(
-            schema.family(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText
-        ) {
-            return Err(error(E::UnsupportedPresentation));
-        }
-        ArrowClientRowEncoder::try_new_root(contract, batch).map(Self)
-    }
-    pub fn try_new_typed_root(
-        input: ValidatedClientInput,
-        batch: RecordBatch,
-    ) -> Result<Self, RenderError> {
-        let FrozenRootOutput::ClientRows(schema) = input.contract().output() else {
-            return Err(error(E::SchemaMismatch));
-        };
-        if !matches!(
-            schema.family(),
-            novarocks_result_contract::ClientPresentationFamily::MysqlText
-        ) {
-            return Err(error(E::UnsupportedPresentation));
-        }
-        ArrowClientRowEncoder::try_new_typed_root(input, batch).map(Self)
-    }
-}
-impl BoundedClientRowEncoder for ArrowMysqlTextEncoder {
-    fn step(&mut self, out: &mut [u8]) -> Result<RenderTurn, RenderError> {
-        self.0.step(out)
-    }
-    fn cancel(&mut self) {
-        self.0.cancel();
-    }
-    fn scratch_capacity_bytes(&self) -> usize {
-        self.0.scratch_capacity_bytes()
-    }
-}
+/// Trino JSON presentation over the shared bounded row machine.
 #[path = "trino_json.rs"]
 mod trino_json;
 pub use trino_json::ArrowTrinoJsonEncoder;

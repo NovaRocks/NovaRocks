@@ -29,7 +29,6 @@ fn owners() -> Vec<(&'static str, &'static [&'static str])> {
         crate::compiled_test_capabilities(),
         novarocks_failpoint::compiled_test_capabilities(),
         novarocks_frontend_application::compiled_test_capabilities(),
-        novarocks_mysql_adapter::compiled_test_capabilities(),
         novarocks_query_application::compiled_test_capabilities(),
         novarocks_native_adapter::compiled_test_capabilities(),
         novarocks_worker::compiled_test_capabilities(),

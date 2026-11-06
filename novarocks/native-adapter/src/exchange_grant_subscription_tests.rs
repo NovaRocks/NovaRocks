@@ -1012,7 +1012,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         // Its blocking owner survives the caller's Unknown notification.
         let hold = Arc::new(DeliveryHold::default());
         *port.delivery_hold.lock().unwrap() = Some(hold.clone());
-        let transmitter = crate::exchange_transmitter::grpc_exchange_transmitter(runtime.clone(), Duration::from_millis(150), #[cfg(novarocks_dev_controls)] None);
+        let transmitter = crate::exchange_transmitter::grpc_exchange_transmitter(runtime.clone(), Duration::from_millis(150), novarocks_worker::TaskInboundCapabilities::new(), #[cfg(novarocks_dev_controls)] None);
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exit_flag = exited.clone();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();

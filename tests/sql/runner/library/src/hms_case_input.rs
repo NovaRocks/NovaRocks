@@ -174,7 +174,7 @@ impl Definition {
         );
         let case = crate::parser::load_sql_case_from_file(&self.path, meta, marker, &vars)?
             .context("bound HMS input has no executable case")?;
-        ensure!(case.steps.len() == 59, "bound HMS case changed step count");
+        ensure!(case.steps.len() == 61, "bound HMS case changed step count");
         // The existing loader above rewrites/parses the complete real SQL with
         // the sealed owned catalog. The declaration projection never reaches here.
         ensure!(
@@ -250,16 +250,18 @@ impl Definition {
         )?
         .context("HMS input definition has no steps")?;
         ensure!(
-            case.steps.len() == 59 && case.sequential,
-            "HMS recipe requires its original sequential 59 steps"
+            case.steps.len() == 61 && case.sequential,
+            "HMS recipe requires its sequential 61 steps"
         );
+        // Queries 1-57 retain their original ordinals. The listing and view
+        // checks precede the original two cleanup steps, now queries 60-61.
         ensure!(
             case.steps
                 .iter()
                 .filter(|s| s.meta.expect_error.is_some())
                 .count()
-                == 38,
-            "HMS recipe requires its original negative guards"
+                == 39,
+            "HMS recipe requires its original negative guards and view-listing refusal"
         );
         ensure!(
             case.steps
@@ -865,7 +867,7 @@ mod tests {
         (dir, result)
     }
     #[test]
-    fn hms_definition_keeps_original_59_steps_without_starting_a_producer() {
+    fn hms_definition_keeps_61_steps_without_starting_a_producer() {
         let (dir, result) = definition(TEMPLATE);
         assert_eq!(result.unwrap().case_id(), CASE);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -1160,13 +1162,13 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         let family = format!("iru7_{}", case.expected_variables["uuid0"]);
         assert_eq!(case.namespace_rewrites[&family], namespace);
         assert_eq!(case.namespace_rewrites[&format!("{family}_new")], sibling);
-        assert_eq!(case.steps.len(), 59);
+        assert_eq!(case.steps.len(), 61);
         assert_eq!(
             case.steps
                 .iter()
                 .filter(|step| step.meta.expect_error.is_some())
                 .count(),
-            38
+            39
         );
         assert_eq!(
             case.steps
@@ -1212,6 +1214,41 @@ print(json.dumps({'empty': {'remaining_objects':empty},
                 .sql
                 .contains(&format!("ALTER TABLE {catalog}.{namespace}.v2"))
         );
+        assert_eq!(
+            case.steps
+                .iter()
+                .map(|step| step.query_number)
+                .collect::<Vec<_>>(),
+            (1..=61).collect::<Vec<_>>()
+        );
+        assert!(
+            case.steps[57]
+                .sql
+                .contains(&format!("FROM {catalog}.information_schema.tables"))
+        );
+        assert!(!case.steps[57].meta.cleanup);
+        assert_eq!(case.steps[58].sql, "SHOW VIEWS;");
+        assert_eq!(
+            case.steps[58].meta.expect_sql_code.as_deref(),
+            Some("query.execution.unsupported")
+        );
+        assert_eq!(
+            case.steps[58].meta.expect_sql_phase,
+            Some(crate::sql_error_codes::SqlErrorPhase::Execution)
+        );
+        assert_eq!(
+            case.steps[58].meta.expect_error.as_deref(),
+            Some("TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }")
+        );
+        assert!(!case.steps[58].meta.cleanup);
+        assert!(case.steps[59].meta.cleanup);
+        assert!(
+            case.steps[59]
+                .sql
+                .contains(&format!(" cleanup {namespace}"))
+        );
+        assert!(case.steps[60].meta.cleanup);
+        assert_eq!(case.steps[60].sql, format!("DROP CATALOG {catalog};"));
         let attempt = read(&evidence.join("input.binding-attempt.json")).unwrap();
         assert_eq!(attempt["actual_uri"], expected_uri);
         assert_eq!(attempt["expected_uri"], expected_uri);
@@ -1698,7 +1735,7 @@ else:
                     let mut owner = model.register();
                     assert_eq!(model.actions("prepare"), 0);
                     let case = model.prepare(&mut owner).unwrap();
-                    assert_eq!(case.steps.len(), 59);
+                    assert_eq!(case.steps.len(), 61);
                     assert_eq!(
                         case.steps[10].meta.result_rows_where,
                         vec![("snapshot_id".into(), "731".into())]

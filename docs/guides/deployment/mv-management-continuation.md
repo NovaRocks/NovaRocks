@@ -107,7 +107,7 @@ systemctl set-environment NOVAROCKS_MV_LAUNCH_NONCE="$NONCE"
 systemctl start novarocks-fe
 
 # 3. 等 FE 可服务，然后问它自己的 incarnation 与上一个写者是谁。
-mysql -h 127.0.0.1 -P 9030 -u root -e \
+trino --server http://127.0.0.1:8080 --user root --execute \
   "CALL novarocks_mv_management_status('ice_rest', 'analytics', 'orders_mv')"
 
 # 4. 写声明。文件权限按配置文件同级保护。

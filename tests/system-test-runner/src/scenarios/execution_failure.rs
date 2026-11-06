@@ -17,9 +17,8 @@
 
 //! Real hard-limit refusal, policy, client continuity, and actual owner exit.
 
-use crate::actors::mysql_stream::{
-    AsyncMysqlStream, BoundedErrorPrefix, BoundedNegativeTextObservation, TextResultObservation,
-};
+use crate::actors::sql::{SqlSession, StatementResult, TrinoValue};
+use crate::actors::trino_protocol::TrinoClient;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::{
     native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec},
@@ -32,13 +31,9 @@ use novarocks_cluster_harness::{
 use novarocks_execution_contract::failure::{
     FailureClass, FailureEvidence, FailureFact, ResourceDimension, domain,
 };
+use novarocks_test_trino_client::{Column, TrinoError, TypeArgument};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path, time::Instant};
 
 const BACKENDS: usize = 3;
 // The finite UNION ALL uses real compiled Native preparation. The hint is
@@ -108,7 +103,12 @@ impl Scenario for ResourceRecoveryPolicy {
         )?))
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_rejection_policy(context, &self.intent, 1041, assert_resource_terminal)
+        run_rejection_policy(
+            context,
+            &self.intent,
+            FailureClass::Resource,
+            assert_resource_terminal,
+        )
     }
 }
 
@@ -118,7 +118,7 @@ impl Scenario for ResourceRecoveryPolicy {
 pub(super) fn run_rejection_policy(
     context: &mut ScenarioContext,
     intent: &SqlIntentOwner,
-    expected_errno: u16,
+    expected_class: FailureClass,
     terminal_oracle: fn(&QueryLifecycleStructuredSnapshot) -> Result<()>,
 ) -> Result<()> {
     ensure!(
@@ -134,19 +134,14 @@ pub(super) fn run_rejection_policy(
     let resource = intent.take(0)?;
     let next = intent.take(1)?;
     let independent = intent.take(2)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create the existing asynchronous MySQL client runtime")?;
     let mut observations = Vec::new();
     let result = run_rejection_body(
-        &runtime,
         context,
         &resource,
         &next,
         &independent,
         &mut observations,
-        expected_errno,
+        expected_class,
         terminal_oracle,
     );
     // All client futures have settled and their streams have been dropped
@@ -202,36 +197,58 @@ pub(super) fn run_rejection_policy(
 }
 
 fn run_rejection_body(
-    runtime: &tokio::runtime::Runtime,
     context: &mut ScenarioContext,
     resource: &SelectedStatement,
     next: &SelectedStatement,
     independent: &SelectedStatement,
     observations: &mut Vec<QueryLifecycleStatementObservation>,
-    expected_errno: u16,
+    expected_class: FailureClass,
     terminal_oracle: fn(&QueryLifecycleStructuredSnapshot) -> Result<()>,
 ) -> Result<()> {
     let deadline = context.deadline();
-    let mut stream = runtime.block_on(connect_until(context, deadline))?;
-    let original_connection = stream.connection_id()?;
-    let observation = resource.arm(context, original_connection, &resource.sql)?;
+    let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let pending = session.submit(&resource.sql)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = resource.arm_pending(context, pending, &resource.sql)?;
     observations.push(observation.clone());
-    let (ready, ready_receiver) = tokio::sync::oneshot::channel();
-    let error = runtime.block_on(stream.observe_bounded_execution_error(
-        &resource.sql,
-        BoundedErrorPrefix::BeforeRows,
-        ready,
+    let query_id = pending.query_id.clone();
+    let first_uri = pending
+        .initial_next_uri
+        .clone()
+        .context("rejection POST omitted its unstarted continuation")?;
+    let actor = TrinoClient::new(
+        context.trino_port(),
+        context.sql_user(),
         deadline,
-    ));
-    drop(ready_receiver);
-    // Retain the entire bounded original packet even when a later assertion
-    // fails. Parser diagnostics are not a source of failure classification.
-    write_artifact(
-        context,
-        "rejection-original-err.json",
-        &serde_json::to_value(&error)?,
+        &context.scenario_root().join("rejection-pages"),
     )?;
-    assert_rejection_packet(&error, expected_errno)?;
+    let observed = observe_zero_row_failure(&actor, &query_id, first_uri);
+    let observed = match observed {
+        Ok(value) => value,
+        Err(primary) => {
+            return match cancel.delete(deadline) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => {
+                    Err(primary.context(format!("cancel exact rejection continuation: {cleanup}")))
+                }
+            };
+        }
+    };
+    drop(pending);
+    write_artifact(context, "rejection-original-error.json", &observed)?;
+    let error: TrinoError = serde_json::from_value(observed["error"].clone())?;
+    let sql_code = match expected_class {
+        FailureClass::Resource => "query.execution.resource_exhausted",
+        FailureClass::Representation => "query.execution.representation",
+        _ => anyhow::bail!("unsupported original rejection class"),
+    };
+    ensure!(
+        error.error_code == 131072
+            && error.error_name == "GENERIC_INSUFFICIENT_RESOURCES"
+            && error.error_type == "INSUFFICIENT_RESOURCES"
+            && error.message.starts_with(&format!("[{sql_code}] ")),
+        "original rejection changed typed Trino identity: {error:?}"
+    );
     let terminal = context
         .handle()
         .await_query_lifecycle_statement_observation(&observation, false, deadline)?;
@@ -241,6 +258,12 @@ fn run_rejection_body(
         &terminal_json(&terminal),
     )?;
     terminal_oracle(&terminal)?;
+    ensure!(
+        terminal
+            .failure_fact
+            .is_some_and(|fact| fact.class() == expected_class),
+        "public rejection class differs from the authoritative original failure"
+    );
     let mut native_observations = Vec::new();
     let mut replacement_observed = false;
     for index in 0..BACKENDS {
@@ -259,18 +282,11 @@ fn run_rejection_body(
         replacement_observed |= replacement.is_some();
         let binding_json =
             |binding: novarocks_failpoint::target_binding::StatementExecutionBinding| {
-                json!({
-                    "backend_index": binding.backend_index,
-                    "backend_process_id": binding.backend_process_id,
-                    "query_id_hi": binding.query_id_hi, "query_id_lo": binding.query_id_lo,
-                    "attempt_id": binding.attempt_id,
-                })
+                json!({"backend_index":binding.backend_index,"backend_process_id":binding.backend_process_id,
+                "query_id_hi":binding.query_id_hi,"query_id_lo":binding.query_id_lo,"attempt_id":binding.attempt_id})
             };
-        native_observations.push(json!({
-            "backend_index": index,
-            "original_attempt": first.map(binding_json),
-            "replacement_attempt": replacement.map(binding_json),
-        }));
+        native_observations.push(json!({"backend_index":index,
+            "original_attempt":first.map(binding_json),"replacement_attempt":replacement.map(binding_json)}));
     }
     write_artifact(
         context,
@@ -281,158 +297,183 @@ fn run_rejection_body(
         !replacement_observed,
         "deterministic execution rejection created replacement-attempt work"
     );
-    context.action("observed the complete expected ERR, authoritative original failure facts, attempt 1, and actual Worker context convergence");
-
-    // Reuse this exact socket: the first ERR must not poison a healthy stream
-    // or leak SET_VAR(query_mem_limit=1) into the next statement.
-    // The original terminal snapshot has been retained above. A connection
-    // has one observer, so drain that exact completed binding before reuse.
+    context.action("observed zero public rows, exact typed rejection, authoritative original failure, attempt 1 and actual Worker convergence");
     context
         .handle()
         .drain_query_lifecycle_statement_binding(&observations[0], deadline)?;
     observations.remove(0);
-    let next_observation = next.arm(context, original_connection, &next.sql)?;
+    // The same explicit session is reused; socket identity is not a Trino contract.
+    let pending = session.submit(&next.sql)?;
+    let (pending, next_observation) = next.arm_pending(context, pending, &next.sql)?;
     observations.push(next_observation.clone());
-    let next_result = runtime.block_on(stream.observe_text_query_owned_until(
-        &next.sql,
-        Duration::ZERO,
-        None,
-        deadline,
-    ));
+    let next_result = run_original_pending(&mut session, pending, deadline)?;
+    assert_text_rows(&next_result, &["17", "19"])?;
     write_artifact(
         context,
-        "rejection-same-connection-next.json",
-        &serde_json::to_value(&next_result.observation)?,
+        "rejection-next-session-statement.json",
+        &json!({"query_id":next_result.query_id,"columns":next_result.columns,
+        "rows":next_result.rows.iter().map(|row| match row.as_slice() {
+            [TrinoValue::Text(value)] => Some(value.as_str()), _ => None,
+        }).collect::<Vec<_>>()}),
     )?;
-    if let Some(error) = next_result.actual_failure {
-        return Err(error.context("same-connection next query failed"));
-    }
-    assert_text_rows(&next_result.observation, &["17", "19"])?;
-    ensure!(
-        stream.connection_id()? == original_connection,
-        "next query replaced the original MySQL connection"
-    );
     let next_terminal = context
         .handle()
         .await_query_lifecycle_statement_observation(&next_observation, true, deadline)?;
+    assert_healthy_terminal(&next_terminal)?;
     write_artifact(
         context,
-        "rejection-same-connection-terminal.json",
+        "rejection-next-terminal.json",
         &terminal_json(&next_terminal),
     )?;
-    assert_healthy_terminal(&next_terminal)?;
-
-    // The failed connection remains open while an independent connection
-    // executes finite Native work against the same surviving three roles.
-    let mut other = runtime.block_on(connect_until(context, deadline))?;
-    let other_connection = other.connection_id()?;
-    ensure!(
-        other_connection != original_connection,
-        "independent query reused the original live connection identity"
-    );
-    let other_observation = independent.arm(context, other_connection, &independent.sql)?;
+    let mut other = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let pending = other.submit(&independent.sql)?;
+    let (pending, other_observation) =
+        independent.arm_pending(context, pending, &independent.sql)?;
     observations.push(other_observation.clone());
-    let other_result = runtime.block_on(other.observe_text_query_owned_until(
-        &independent.sql,
-        Duration::ZERO,
-        None,
-        deadline,
-    ));
-    write_artifact(
-        context,
-        "rejection-independent-query.json",
-        &serde_json::to_value(&other_result.observation)?,
-    )?;
-    if let Some(error) = other_result.actual_failure {
-        return Err(error.context("independent query failed"));
-    }
-    // Explicit Boolean-to-VARCHAR casting returns text, unlike the native BOOL wire value.
-    assert_text_rows(&other_result.observation, &["true", "true"])?;
+    let other_result = run_original_pending(&mut other, pending, deadline)?;
+    assert_text_rows(&other_result, &["true", "true"])?;
     let other_terminal = context
         .handle()
         .await_query_lifecycle_statement_observation(&other_observation, true, deadline)?;
+    assert_healthy_terminal(&other_terminal)?;
+    ensure!(
+        other_terminal.execution_id != next_terminal.execution_id
+            && next_terminal.execution_id != terminal.execution_id,
+        "continuity statements reused the failed or peer logical execution"
+    );
     write_artifact(
         context,
         "rejection-independent-terminal.json",
         &terminal_json(&other_terminal),
     )?;
-    assert_healthy_terminal(&other_terminal)?;
-    context.action("verified the original socket's next statement and an independent Native query returned exact rows after execution rejection");
+    context.action("verified explicit-session next statement and independent Native query returned exact typed rows after rejection");
     Ok(())
 }
 
-async fn connect_until(context: &ScenarioContext, deadline: Instant) -> Result<AsyncMysqlStream> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .context("original resource-scenario deadline expired before MySQL connect")?;
-    tokio::time::timeout_at(
-        deadline.into(),
-        AsyncMysqlStream::connect(context.mysql_user(), context.mysql_port(), remaining),
-    )
-    .await
-    .context("original resource-scenario deadline expired during MySQL connect")?
-}
-
-fn assert_rejection_packet(
-    observed: &BoundedNegativeTextObservation,
-    expected_errno: u16,
-) -> Result<()> {
-    ensure!(
-        observed.text.error.is_none(),
-        "did not receive a complete execution ERR: {:?}",
-        observed.text.error
-    );
-    ensure!(
-        observed.pending_packet.is_none() && observed.text.rows == 0,
-        "rejected query returned a partial packet or visible row"
-    );
-    let error = observed
-        .terminal
-        .as_ref()
-        .context("rejected query did not return ERR")?;
-    ensure!(
-        error.code == expected_errno && error.sqlstate == "HY000",
-        "execution rejection changed errno/SQLSTATE: {}/{}",
-        error.code,
-        error.sqlstate
-    );
-    ensure!(
-        error.payload_bytes >= 9
-            && error.payload_bytes <= 4096
-            && error.payload_hex.len() == 2 * error.payload_bytes
-            && error.payload_hex.starts_with(&format!(
-                "ff{:02x}{:02x}234859303030",
-                expected_errno.to_le_bytes()[0],
-                expected_errno.to_le_bytes()[1]
-            ))
-            && observed.terminal_payload_hex.as_deref() == Some(error.payload_hex.as_str()),
-        "original rejection ERR packet was truncated or differs from its parsed fixed header"
-    );
-    ensure!(
-        !error.message.is_empty(),
-        "execution ERR lost its producer-safe detail"
-    );
-    if observed.completed_metadata {
-        ensure!(
-            observed.text.columns == 1
-                && observed.text.schema.len() == 1
-                && observed.text.schema[0].name == "payload"
-                && observed.text.schema[0].mysql_type == 253,
-            "rejection metadata differs from the exact nullable VARCHAR result"
-        );
-        ensure!(
-            error.sequence == 4,
-            "post-metadata zero-row ERR sequence changed"
-        );
-    } else {
-        ensure!(
-            observed.text.columns == 0
-                && observed.metadata_payload_hex.is_empty()
-                && error.sequence == 1,
-            "pre-schema resource ERR contained an unexpected prefix"
-        );
+pub(super) fn run_original_pending(
+    session: &mut SqlSession,
+    pending: crate::actors::sql::PendingStatement,
+    deadline: Instant,
+) -> Result<StatementResult> {
+    let cancel = pending.cancel_handle();
+    match session.run_pending(pending) {
+        Ok(result) => Ok(result),
+        Err(primary @ crate::actors::sql::StatementFailure::Trino(_)) => Err(primary.into()),
+        Err(primary) => match cancel.delete(deadline) {
+            Ok(()) => Err(primary.into()),
+            Err(cleanup) => Err(anyhow::Error::new(primary)
+                .context(format!("cancel original continuity statement: {cleanup}"))),
+        },
     }
+}
+
+pub(super) fn check_payload_columns(columns: &[Column]) -> Result<()> {
+    ensure!(
+        columns.len() == 1
+            && columns[0].name == "payload"
+            && columns[0].type_name == "varchar"
+            && columns[0].type_signature.raw_type == "varchar"
+            && columns[0].type_signature.arguments == [TypeArgument::Long(2_147_483_647)],
+        "original payload declaration differs from nullable VARCHAR: {columns:?}"
+    );
     Ok(())
+}
+
+/// A finite failure page owns its actual response reader through EOF/Join.
+/// It also carries the visible-prefix scenario's one complete small row.
+pub(super) fn read_negative_page(
+    actor: &TrinoClient,
+    uri: &str,
+) -> Result<crate::actors::trino_protocol::RawResponse> {
+    let mut held = actor.open_get(uri)?;
+    let status = held.status();
+    let headers = held.headers().clone();
+    let read = (|| -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        loop {
+            let step = held.read_step(4096)?;
+            body.extend_from_slice(&step.bytes);
+            // These scenarios require zero rows or one small visible-prefix row;
+            // this finite diagnostic bound exceeds their full metadata/error.
+            ensure!(
+                body.len() <= 128 * 1024,
+                "finite failure page exceeded its bounded envelope"
+            );
+            if step.eof {
+                return Ok(body);
+            }
+        }
+    })();
+    let joined = if read.is_ok() {
+        held.settle()
+    } else {
+        held.interrupt()
+    };
+    let settled = joined.require_clean();
+    match (read, settled) {
+        (Ok(body), Ok(())) => Ok(crate::actors::trino_protocol::RawResponse {
+            status,
+            headers,
+            body,
+        }),
+        (Err(primary), Ok(())) | (Ok(_), Err(primary)) => Err(primary),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("original HTTP reader Join failed: {cleanup:#}")))
+        }
+    }
+}
+
+pub(super) fn observe_zero_row_failure(
+    actor: &TrinoClient,
+    query: &str,
+    mut uri: String,
+) -> Result<Value> {
+    let mut columns = None;
+    let mut pages = 0u64;
+    loop {
+        let raw = read_negative_page(actor, &uri)?;
+        ensure!(
+            raw.status == 200,
+            "execution rejection was not a typed HTTP200 SQL error"
+        );
+        let page = raw.json()?;
+        ensure!(
+            page["id"].as_str() == Some(query)
+                && page.get("updateType").is_none_or(Value::is_null)
+                && page.get("updateCount").is_none_or(Value::is_null),
+            "rejection page changed query identity or became a completion"
+        );
+        ensure!(
+            page.get("data")
+                .is_none_or(|data| data.is_null() || data.as_array().is_some_and(Vec::is_empty)),
+            "rejected query published a visible row"
+        );
+        if let Some(value) = page.get("columns").filter(|v| !v.is_null()) {
+            let actual: Vec<Column> = serde_json::from_value(value.clone())?;
+            check_payload_columns(&actual)?;
+            ensure!(
+                columns.as_ref().is_none_or(|old| old == &actual),
+                "rejection columns changed"
+            );
+            columns = Some(actual);
+        }
+        pages = pages
+            .checked_add(1)
+            .context("rejection page count overflow")?;
+        if let Some(error) = page.get("error").filter(|v| !v.is_null()) {
+            let error: TrinoError = serde_json::from_value(error.clone())?;
+            ensure!(
+                raw.next_uri()?.is_none() && page["stats"]["state"] == "FAILED",
+                "execution rejection was not the original terminal error page"
+            );
+            return Ok(
+                json!({"query_id":query,"pages":pages,"rows":0,"columns":columns,"error":error}),
+            );
+        }
+        uri = raw
+            .next_uri()?
+            .context("execution rejection unexpectedly completed successfully")?;
+    }
 }
 
 fn assert_resource_terminal(terminal: &QueryLifecycleStructuredSnapshot) -> Result<()> {
@@ -489,30 +530,18 @@ fn assert_healthy_terminal(terminal: &QueryLifecycleStructuredSnapshot) -> Resul
     Ok(())
 }
 
-fn assert_text_rows(observed: &TextResultObservation, expected: &[&str]) -> Result<()> {
+fn assert_text_rows(observed: &StatementResult, expected: &[&str]) -> Result<()> {
+    check_payload_columns(&observed.columns)?;
     ensure!(
-        observed.error.is_none()
-            && observed.rows == expected.len() as u64
-            && observed.columns == 1
-            && observed.schema.len() == 1
-            && observed.schema[0].name == "payload"
-            && observed.schema[0].mysql_type == 253,
-        "healthy query returned an unexpected result shape: {observed:?}"
+        observed.is_result_set() && observed.rows.len() == expected.len(),
+        "healthy query returned another complete result shape"
     );
-    let mut digest = Sha256::new();
-    for value in expected {
+    for (row, expected) in observed.rows.iter().zip(expected) {
         ensure!(
-            value.len() < 251,
-            "expected health row exceeds its short-cell fixture"
+            matches!(row.as_slice(),[TrinoValue::Text(value)] if value==expected),
+            "healthy query changed exact text value/NULL/type"
         );
-        digest.update([value.len() as u8]);
-        digest.update(value.as_bytes());
-        digest.update((value.len() as u64 + 1).to_le_bytes());
     }
-    ensure!(
-        observed.row_sha256 == format!("{:x}", digest.finalize()),
-        "healthy query returned incorrect complete rows"
-    );
     Ok(())
 }
 

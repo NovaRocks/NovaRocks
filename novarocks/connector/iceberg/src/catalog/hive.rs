@@ -173,25 +173,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 self.selected.clone(),
             ))
             .await?;
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        if let Some(observer) = self.delegate.listing.active_observer() {
-            let target = None;
-            return self
-                .delegate
-                .listing
-                .run_hms(
-                    context,
-                    observer,
-                    super::hms_listing_observer::HmsListingOperation::Namespaces,
-                    target,
-                    |invocation| async move {
-                        self.delegate
-                            .list_namespaces_observed(bound, &invocation)
-                            .await
-                    },
-                )
-                .await;
-        }
+
         {
             self.delegate
                 .listing
@@ -217,26 +199,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 self.selected.clone(),
             ))
             .await?;
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        if let Some(observer) = self.delegate.listing.active_observer() {
-            use sha2::Digest;
-            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
-            return self
-                .delegate
-                .listing
-                .run_hms(
-                    context,
-                    observer,
-                    super::hms_listing_observer::HmsListingOperation::Tables,
-                    target,
-                    |invocation| async move {
-                        self.delegate
-                            .list_tables_observed(&namespace, bound, &invocation)
-                            .await
-                    },
-                )
-                .await;
-        }
+
         {
             self.delegate
                 .listing

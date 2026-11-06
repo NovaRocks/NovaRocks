@@ -665,6 +665,15 @@ impl ParticipationHostRecord {
                 let Some(original) = original else {
                     break;
                 };
+                #[cfg(test)]
+                if self.normal_retire_handoff_held_for_test(&original) {
+                    // Delay only this actual ticket's handoff. Finalize's
+                    // physical host work and the remaining owner classes still
+                    // advance below; release wakes this same original owner.
+                    self.resources.pending_host_jobs.actor_effect = Some(original);
+                    self.resources.pending_host_jobs.effect_scan_remaining = 0;
+                    break;
+                }
                 self.handoff_actor_effect(original, tasks)?;
                 self.resources.pending_host_jobs.effect_scan_remaining =
                     self.dispatch.ready_positions();

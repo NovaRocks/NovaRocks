@@ -19,16 +19,6 @@ pub struct Cli {
     pub timeout_secs: u64,
     pub fixture_budget_secs: u64,
     pub launch_profile: LaunchProfile,
-    /// Exact private binding for the optional small HMS correctness preflight.
-    pub hms_classification_binding: Option<PathBuf>,
-    /// Already-prepared readonly stock HMS bulk input; no fixture preparation.
-    pub hms_bulk_readonly_binding: Option<PathBuf>,
-    /// Frozen provenance admission for the explicit original exact MySQL matrix.
-    pub exact_mysql_execution_binding: Option<PathBuf>,
-    /// Independent new frozen input and neutral-feature admission.
-    pub held_native_execution_binding: Option<PathBuf>,
-    /// Original stdin/stdout source fences for an independent live collector.
-    pub held_live_collector_fences: bool,
 }
 impl Cli {
     pub fn parse_env() -> Result<Self> {
@@ -52,11 +42,6 @@ impl Cli {
             timeout_secs: 300,
             fixture_budget_secs: 3600,
             launch_profile: LaunchProfile::FaultScenario,
-            hms_classification_binding: None,
-            hms_bulk_readonly_binding: None,
-            exact_mysql_execution_binding: None,
-            held_native_execution_binding: None,
-            held_live_collector_fences: false,
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -104,110 +89,9 @@ impl Cli {
                         .parse()
                         .map_err(anyhow::Error::msg)?;
                 }
-                "--exact-mysql-execution-binding" => {
-                    if cli.exact_mysql_execution_binding.is_some() {
-                        bail!("--exact-mysql-execution-binding must appear exactly once");
-                    }
-                    cli.exact_mysql_execution_binding =
-                        Some(PathBuf::from(value("--exact-mysql-execution-binding")?));
-                }
-                "--held-native-execution-binding" => {
-                    if cli.held_native_execution_binding.is_some() {
-                        bail!("--held-native-execution-binding must appear exactly once");
-                    }
-                    cli.held_native_execution_binding =
-                        Some(PathBuf::from(value("--held-native-execution-binding")?));
-                }
-                "--held-live-collector-fences-v1" => {
-                    if cli.held_live_collector_fences {
-                        bail!("--held-live-collector-fences-v1 must appear exactly once");
-                    }
-                    cli.held_live_collector_fences = true;
-                }
-                "--hms-bulk-readonly-binding" => {
-                    if cli.hms_bulk_readonly_binding.is_some() {
-                        bail!("--hms-bulk-readonly-binding must appear exactly once");
-                    }
-                    cli.hms_bulk_readonly_binding =
-                        Some(PathBuf::from(value("--hms-bulk-readonly-binding")?));
-                }
-                "--hms-classification-binding" => {
-                    if cli.hms_classification_binding.is_some() {
-                        bail!("--hms-classification-binding must appear exactly once");
-                    }
-                    cli.hms_classification_binding =
-                        Some(PathBuf::from(value("--hms-classification-binding")?));
-                }
                 "--help" | "-h" => bail!(Self::usage()),
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
-        }
-        if cli.hms_bulk_readonly_binding.is_some()
-            && (cli.list
-                || cli.list_default
-                || cli.list_compatibility
-                || cli.list_binary_requirements
-                || cli.list_declarations
-                || !cli.only.is_empty()
-                || cli.compatible_binary.is_some()
-                || cli.other_island_binary.is_some()
-                || cli.exact_mysql_execution_binding.is_some()
-                || cli.hms_classification_binding.is_some()
-                || cli.held_native_execution_binding.is_some()
-                || cli.held_live_collector_fences
-                || cli.cluster_size != 3
-                || cli.launch_profile != LaunchProfile::FaultScenario)
-        {
-            bail!("HMS readonly bulk binding is one exclusive fault-scenario 1FE+3BE run");
-        }
-        if cli.held_live_collector_fences && cli.held_native_execution_binding.is_none() {
-            bail!("held live source fences require explicit held Native admission");
-        }
-        if cli.held_native_execution_binding.is_some()
-            && (cli.list
-                || cli.list_default
-                || cli.list_compatibility
-                || cli.list_binary_requirements
-                || cli.list_declarations
-                || cli.compatible_binary.is_some()
-                || cli.other_island_binary.is_some()
-                || cli.exact_mysql_execution_binding.is_some()
-                || cli.hms_classification_binding.is_some()
-                || cli.launch_profile != LaunchProfile::FaultScenario
-                || cli.cluster_size != 3
-                || !(cli.only.is_empty()
-                    || (cli.only.len() == 1
-                        && cli.only[0] == "result-delivery/held-response-late-ack")))
-        {
-            bail!("held native admission is one exclusive fault-scenario 1FE+3BE case");
-        }
-        if cli.hms_classification_binding.is_some()
-            && (cli.list
-                || cli.list_default
-                || cli.list_compatibility
-                || cli.list_binary_requirements
-                || cli.list_declarations
-                || !cli.only.is_empty()
-                || cli.compatible_binary.is_some()
-                || cli.other_island_binary.is_some()
-                || cli.exact_mysql_execution_binding.is_some())
-        {
-            bail!("--hms-classification-binding is an exclusive preflight run mode");
-        }
-        if cli.exact_mysql_execution_binding.is_some()
-            && (cli.list
-                || cli.list_default
-                || cli.list_compatibility
-                || cli.list_binary_requirements
-                || cli.list_declarations
-                || cli.compatible_binary.is_some()
-                || cli.other_island_binary.is_some()
-                || cli.launch_profile != LaunchProfile::FaultScenario
-                || cli.cluster_size != 3)
-        {
-            bail!(
-                "--exact-mysql-execution-binding requires explicit fault-scenario 1FE+3BE without alternate modes"
-            );
         }
         if [
             cli.list,
@@ -238,8 +122,7 @@ impl Cli {
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] [--fixture-budget-secs <N>] ",
-            "[--launch-profile <fault-scenario|performance>] ",
-            "[--hms-classification-binding <path>] [--hms-bulk-readonly-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>] [--held-live-collector-fences-v1]"
+            "[--launch-profile <fault-scenario|performance>]"
         )
     }
 }
@@ -247,124 +130,6 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn readonly_bulk_binding_is_unique_and_exclusive_in_both_orders() {
-        let base = vec!["--hms-bulk-readonly-binding", "ready-bound.json"];
-        assert!(Cli::parse(base.iter().map(|s| (*s).into())).is_ok());
-        for extra in [
-            vec!["--hms-bulk-readonly-binding", "duplicate"],
-            vec!["--hms-classification-binding", "small"],
-            vec!["--held-native-execution-binding", "held"],
-            vec!["--exact-mysql-execution-binding", "exact"],
-            vec!["--only", "catalog/mem-1-m07-real-hms-readonly-bulk"],
-            vec!["--cluster-size", "1"],
-            vec!["--launch-profile", "performance"],
-            vec!["--list"],
-            vec!["--held-live-collector-fences-v1"],
-        ] {
-            let mut args = base.clone();
-            args.extend(extra.clone());
-            assert!(Cli::parse(args.into_iter().map(String::from)).is_err());
-            let mut args = extra;
-            args.extend(base.clone());
-            assert!(Cli::parse(args.into_iter().map(String::from)).is_err());
-        }
-    }
-
-    #[test]
-    fn live_fences_require_unique_exclusive_held_admission_in_both_orders() {
-        let fence = "--held-live-collector-fences-v1";
-        assert!(Cli::parse([fence.to_owned()]).is_err());
-        for args in [
-            vec![fence, "--held-native-execution-binding", "actual.json"],
-            vec!["--held-native-execution-binding", "actual.json", fence],
-        ] {
-            assert!(
-                Cli::parse(args.iter().map(|s| (*s).to_owned()))
-                    .unwrap()
-                    .held_live_collector_fences
-            );
-            for extra in [
-                vec![fence],
-                vec!["--exact-mysql-execution-binding", "old.json"],
-                vec!["--list"],
-                vec!["--cluster-size", "1"],
-            ] {
-                let mut changed = args.clone();
-                changed.extend(extra.clone());
-                assert!(Cli::parse(changed.iter().map(|s| (*s).to_owned())).is_err());
-                let mut changed = extra;
-                changed.extend(args.clone());
-                assert!(Cli::parse(changed.iter().map(|s| (*s).to_owned())).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn held_execution_binding_is_unique_exclusive_in_both_flag_orders() {
-        let base = vec![
-            "--held-native-execution-binding".to_owned(),
-            "held.json".to_owned(),
-        ];
-        assert!(Cli::parse(base.clone()).is_ok());
-        let mut selected = base.clone();
-        selected.extend([
-            "--only".into(),
-            "result-delivery/held-response-late-ack".into(),
-        ]);
-        assert!(Cli::parse(selected).is_ok());
-        for extra in [
-            vec!["--held-native-execution-binding", "duplicate"],
-            vec!["--exact-mysql-execution-binding", "old"],
-            vec!["--hms-classification-binding", "hms"],
-            vec!["--only", "other"],
-            vec!["--cluster-size", "1"],
-            vec!["--list"],
-            vec!["--launch-profile", "performance"],
-            vec![
-                "--only",
-                "result-delivery/held-response-late-ack",
-                "--only",
-                "result-delivery/held-response-late-ack",
-            ],
-        ] {
-            let extra: Vec<String> = extra.into_iter().map(str::to_owned).collect();
-            let mut args = base.clone();
-            args.extend(extra.clone());
-            assert!(Cli::parse(args).is_err());
-            let mut args = extra;
-            args.extend(base.clone());
-            assert!(Cli::parse(args).is_err());
-        }
-    }
-
-    #[test]
-    fn exact_execution_binding_is_explicit_unique_and_topology_fixed() {
-        let flag = "--exact-mysql-execution-binding".to_string();
-        let args = vec![
-            flag.clone(),
-            "frozen.json".to_string(),
-            "--only".into(),
-            "exact-native-resident-cut-1".into(),
-        ];
-        let cli = Cli::parse(args).unwrap();
-        assert_eq!(
-            cli.exact_mysql_execution_binding,
-            Some(PathBuf::from("frozen.json"))
-        );
-        for extra in [
-            vec![flag.clone(), "duplicate.json".into()],
-            vec!["--list".into()],
-            vec!["--cluster-size".into(), "1".into()],
-            vec!["--launch-profile".into(), "performance".into()],
-            vec!["--hms-classification-binding".into(), "hms.json".into()],
-        ] {
-            let mut args = vec![flag.clone(), "frozen.json".to_string()];
-            args.extend(extra);
-            assert!(Cli::parse(args).is_err());
-        }
-    }
 
     #[test]
     fn defaults_to_three_backends() {
@@ -387,7 +152,7 @@ mod tests {
     fn only_is_repeatable() {
         let cli = Cli::parse(vec![
             "--only".to_string(),
-            "query-lifecycle/mysql-disconnect".to_string(),
+            "query-lifecycle/client-abandonment".to_string(),
             "--only".to_string(),
             "connector/catalog-version-drain".to_string(),
         ])
@@ -432,48 +197,6 @@ mod tests {
         ])
         .expect_err("retired manifest option must be refused");
         assert!(error.to_string().contains("unknown option"));
-    }
-}
-
-#[cfg(test)]
-mod hms_preflight_cli_tests {
-    use super::*;
-
-    fn parse(values: &[&str]) -> Result<Cli> {
-        Cli::parse(values.iter().map(|value| (*value).to_string()))
-    }
-
-    #[test]
-    fn hms_binding_is_exclusive_and_cannot_be_repeated() {
-        assert!(parse(&["--hms-classification-binding", "/private/input.json"]).is_ok());
-        assert!(
-            parse(&[
-                "--hms-classification-binding",
-                "/private/input.json",
-                "--hms-classification-binding",
-                "/other.json"
-            ])
-            .is_err()
-        );
-        for option in ["--only", "--compatible-binary", "--other-island-binary"] {
-            assert!(
-                parse(&[
-                    "--hms-classification-binding",
-                    "/private/input.json",
-                    option,
-                    "value"
-                ])
-                .is_err()
-            );
-        }
-        assert!(
-            parse(&[
-                "--hms-classification-binding",
-                "/private/input.json",
-                "--list"
-            ])
-            .is_err()
-        );
     }
 }
 

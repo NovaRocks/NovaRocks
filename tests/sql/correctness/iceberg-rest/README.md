@@ -64,7 +64,7 @@ NO_PROXY=127.0.0.1,localhost "$NOVAROCKS_BIN" standalone --role all-in-one \
 server_pid=$!
 trap 'kill -TERM "$server_pid" 2>/dev/null || true; wait "$server_pid"' EXIT
 for _ in $(seq 1 60); do
-  if grep -q '^NOVAROCKS_READY mysql_port=.*trino_port=' "$server_log"; then break; fi
+  if grep -Eq '^NOVAROCKS_READY role=fe trino_port=[0-9]+ pid=[0-9]+$' "$server_log"; then break; fi
   if ! kill -0 "$server_pid" 2>/dev/null; then
     cat "$server_log" >&2
     wait "$server_pid"
@@ -72,7 +72,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-grep -q '^NOVAROCKS_READY mysql_port=.*trino_port=' "$server_log" || {
+grep -Eq '^NOVAROCKS_READY role=fe trino_port=[0-9]+ pid=[0-9]+$' "$server_log" || {
   echo "NovaRocks did not publish its readiness marker; log: $server_log" >&2
   exit 1
 }
@@ -100,4 +100,4 @@ not collide.
 
 普通 `--mode record` 从目标端录制；已有旧期望的协议迁移使用受等价约束的 `--convert-legacy`，不能靠直接重录覆盖 mismatch。格式与转换规则见 [SQL README](../../README.md#golden-格式)。
 
-SQL runner 配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。就绪标记仍保留 `mysql_port=` 前缀并追加本次实际 `trino_port=`；不能用端口探测代替本次进程的标记。
+SQL runner 配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。就绪标记为 `NOVAROCKS_READY role=fe trino_port=<实际端口> pid=<进程号>`；不能用端口探测代替本次进程的标记。

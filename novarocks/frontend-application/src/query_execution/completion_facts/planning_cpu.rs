@@ -69,12 +69,46 @@ pub(crate) enum ReadEncodingPurpose {
     Read(FrontendQueryPurpose),
     Profile(std::time::Instant),
 }
+fn root_output_for_read(
+    purpose: ReadEncodingPurpose,
+    family: Option<&novarocks_result_contract::ClientPresentationFamily>,
+    port: Option<&novarocks_physical_plan::ResultPort>,
+) -> Result<novarocks_result_contract::FrozenRootOutput, FrontendQueryCompilerError> {
+    Ok(match purpose {
+        ReadEncodingPurpose::Read(FrontendQueryPurpose::ClientRows) => {
+            let family = family.ok_or_else(|| {
+                client_render_schema_error(
+                    novarocks_sql::compiler::ClientRenderSchemaError::Invalid(
+                        "ClientRows requires an explicit client presentation".into(),
+                    ),
+                )
+            })?;
+            let novarocks_result_contract::ClientPresentationFamily::TrinoJson(facts) = family;
+            novarocks_result_contract::FrozenRootOutput::ClientRows(
+                novarocks_sql::compiler::client_render_schema_from_port(
+                    port,
+                    novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(facts),
+                )
+                .map_err(client_render_schema_error)?,
+            )
+        }
+        ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue) => {
+            crate::query::compiler::scalar_root_output_from_public_port(port)?
+        }
+        ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows) => {
+            return Err(FrontendQueryCompilerError::Engine(
+                "distributed read received a different application output purpose".into(),
+            ));
+        }
+        ReadEncodingPurpose::Profile(_) => novarocks_result_contract::FrozenRootOutput::CountOnly,
+    })
+}
+
 pub(crate) struct ReadEncodingInput {
     pub(crate) purpose: ReadEncodingPurpose,
     pub(crate) version: novarocks_physical_plan::PlanVersionId,
     pub(crate) options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
-    pub(crate) family: novarocks_result_contract::ClientPresentationFamily,
-    pub(crate) offset: i32,
+    pub(crate) family: Option<novarocks_result_contract::ClientPresentationFamily>,
     pub(crate) carrier: CompiledPackageCarrier,
     pub(crate) policy: novarocks_physical_plan::ConstantPolicy,
     pub(crate) control: SqlCompileControl,
@@ -279,39 +313,11 @@ impl PlanningCpuOriginal {
         input: ReadEncodingInput,
     ) -> Result<ReadEncodedParts, FrontendQueryCompilerError> {
         let candidate = body.candidate.take().expect("original read candidate");
-        let root_output = match input.purpose {
-            ReadEncodingPurpose::Read(FrontendQueryPurpose::ClientRows) => {
-                novarocks_result_contract::FrozenRootOutput::ClientRows(
-                    novarocks_sql::compiler::client_render_schema_from_port(
-                        candidate.original_public_result_port(),
-                        match &input.family {
-                            novarocks_result_contract::ClientPresentationFamily::MysqlText => {
-                                novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-                                    timezone_offset_seconds: input.offset,
-                                }
-                            }
-                            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
-                                facts,
-                            ) => novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(facts),
-                        },
-                    )
-                    .map_err(client_render_schema_error)?,
-                )
-            }
-            ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue) => {
-                crate::query::compiler::scalar_root_output_from_public_port(
-                    candidate.original_public_result_port(),
-                )?
-            }
-            ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows) => {
-                return Err(FrontendQueryCompilerError::Engine(
-                    "distributed read received a different application output purpose".into(),
-                ));
-            }
-            ReadEncodingPurpose::Profile(_) => {
-                novarocks_result_contract::FrozenRootOutput::CountOnly
-            }
-        };
+        let root_output = root_output_for_read(
+            input.purpose,
+            input.family.as_ref(),
+            candidate.original_public_result_port(),
+        )?;
         let candidate = candidate
             .freeze_root_output(root_output)
             .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
@@ -857,6 +863,109 @@ impl SqlCompletionCpuPort for FrontendPlanningCpuSource {
 #[cfg(test)]
 mod client_render_error_tests {
     use super::*;
+
+    fn result_port(ty: novarocks_physical_plan::ValueType) -> novarocks_physical_plan::ResultPort {
+        use novarocks_physical_plan::*;
+        ResultPort {
+            fragment: FragmentId::new(1),
+            output: OutputPort {
+                node: NodeId::new(1),
+                columns: vec![ValueId::new(1)].into(),
+            },
+            fields: vec![ResultField {
+                domain: ResultValueDomain::Plain,
+                name: "value".into(),
+                alias: None,
+                value: ValueId::new(1),
+                ty,
+            }]
+            .into(),
+            scalar_schema: None,
+        }
+    }
+
+    #[test]
+    fn client_rows_require_and_preserve_the_original_explicit_presentation() {
+        use novarocks_result_contract::{
+            ClientPresentationFamily, FrozenRootOutput, TrinoJsonFacts,
+        };
+        let port = result_port(novarocks_physical_plan::ValueType::new(
+            arrow::datatypes::DataType::Int64,
+            true,
+        ));
+        let purpose = ReadEncodingPurpose::Read(FrontendQueryPurpose::ClientRows);
+        let error = root_output_for_read(purpose, None, Some(&port)).unwrap_err();
+        assert!(matches!(error, FrontendQueryCompilerError::Engine(message)
+            if message == "ClientRows requires an explicit client presentation"));
+        let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+            parametric_datetime: false,
+            variant: true,
+            variant_binary: false,
+        });
+        let FrozenRootOutput::ClientRows(schema) =
+            root_output_for_read(purpose, Some(&family), Some(&port)).unwrap()
+        else {
+            panic!("client rows require the original client schema");
+        };
+        assert_eq!(schema.family(), &family);
+        let wide = result_port(
+            novarocks_physical_plan::ValueType::try_with_logical_type(
+                arrow::datatypes::DataType::FixedSizeBinary(16),
+                true,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        );
+        let error = root_output_for_read(purpose, Some(&family), Some(&wide)).unwrap_err();
+        let FrontendQueryCompilerError::Application(error) = error else {
+            panic!("unsupported client types must retain the typed application error");
+        };
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.client_type_unsupported"
+        );
+    }
+
+    #[test]
+    fn internal_outputs_keep_scalar_and_count_only_without_a_client_presentation() {
+        use novarocks_result_contract::{
+            FrozenRootOutput, ScalarField, ScalarSchema, ScalarValueType,
+        };
+        let mut port = result_port(novarocks_physical_plan::ValueType::new(
+            arrow::datatypes::DataType::Int64,
+            true,
+        ));
+        let scalar = ScalarSchema::try_new(ScalarField {
+            nullable: true,
+            value_type: ScalarValueType::SignedInteger(64),
+        })
+        .unwrap()
+        .bind_native_slots(&[1])
+        .unwrap();
+        port.scalar_schema = Some(scalar.clone());
+        assert_eq!(
+            root_output_for_read(
+                ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue),
+                None,
+                Some(&port)
+            )
+            .unwrap(),
+            FrozenRootOutput::ScalarValue(scalar)
+        );
+        assert_eq!(
+            root_output_for_read(
+                ReadEncodingPurpose::Profile(std::time::Instant::now()),
+                None,
+                None
+            )
+            .unwrap(),
+            FrozenRootOutput::CountOnly
+        );
+        assert!(
+            matches!(root_output_for_read(ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows), None, Some(&port)),
+            Err(FrontendQueryCompilerError::Engine(message)) if message == "distributed read received a different application output purpose")
+        );
+    }
 
     #[test]
     fn protocol_type_rejection_retains_typed_application_error() {

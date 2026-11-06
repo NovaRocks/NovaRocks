@@ -28,11 +28,15 @@ pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
         activity: super::exchange_unit::ExchangeCallActivity,
         done: super::exchange_unit::ExchangeDeliveryCallback,
     );
+    /// Move the same activity with the control request captures through their
+    /// real exit. Its callback is a result notification, not a Drop receipt;
+    /// control activity reserves no DATA permit or byte capacity.
     fn register_unit_demands(
         &self,
         destination: RuntimeEndpoint,
         entries: Vec<super::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: super::exchange_unit::ExchangeDemandCallback,
     );
     fn watch_unit_facts(
@@ -328,6 +332,7 @@ pub(crate) mod test_support {
             _destination: RuntimeEndpoint,
             entries: Vec<ExchangeDemandEntry>,
             _stop: tokio_util::sync::CancellationToken,
+            activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             done: ExchangeDemandCallback,
         ) {
             let results = entries
@@ -342,6 +347,7 @@ pub(crate) mod test_support {
                 })
                 .collect();
             done(ExchangeDemandCallOutcome::Observed(results));
+            drop(activity);
         }
         fn watch_unit_facts(
             &self,
@@ -397,6 +403,7 @@ pub(crate) mod test_support {
             _: RuntimeEndpoint,
             _: Vec<ExchangeDemandEntry>,
             _: tokio_util::sync::CancellationToken,
+            _: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             _: ExchangeDemandCallback,
         ) {
             panic!("result-only fixture attempted demand registration")

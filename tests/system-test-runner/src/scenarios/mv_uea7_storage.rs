@@ -20,9 +20,10 @@ use super::mv_uea7::{
     ManagedMvRestFixture, assert_rows, execute, property, require_property, require_three_backends,
     select_catalog_and_namespace, status, wait_for_status_phase,
 };
+use super::mv_uea7::{mv_properties, mv_public_error, mv_text_lines};
+use crate::actors::sql::SqlSession;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use serde_json::Value;
@@ -187,18 +188,20 @@ impl Scenario for MvStorageContract {
         select_catalog_and_namespace(context, &mut independent_reader, CATALOG)?;
         require_rewrite(context, &mut independent_reader)?;
         context.action("execute EXPLAIN ANALYZE through the final query plan");
-        let analyzed: Vec<(String,)> = independent_reader
-            .query("EXPLAIN ANALYZE SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
-            .context("execute final plan with MV rewrite candidate")?;
+        let analyzed: Vec<(String,)> = mv_text_lines(
+            &independent_reader
+                .execute("EXPLAIN ANALYZE SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
+                .context("execute final plan with MV rewrite candidate")?,
+        )?;
         ensure!(
             analyzed
                 .iter()
                 .any(|(line,)| line.contains("rewritten with mv: orders_mv")),
             "EXPLAIN ANALYZE final plan did not select the MV: {analyzed:?}"
         );
-        independent_reader.finish()?;
+        drop(independent_reader);
         require_actual_rewrite_barrier(context)?;
-        conn.finish()?;
+        drop(conn);
 
         context.action("restart FE while preserving the private REST catalog and its MV documents");
         let deadline = context.deadline();
@@ -230,16 +233,17 @@ impl Scenario for MvStorageContract {
         );
         select_catalog_and_namespace(context, &mut conn, CATALOG)?;
         context.action("verify refresh remains closed until an operator declaration");
-        let error = match conn.query_drop("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
+        let error = match conn.execute("REFRESH MATERIALIZED VIEW orders_mv WITH SYNC MODE") {
             Err(error) => error,
-            Ok(()) => bail!(
+            Ok(_) => bail!(
                 "restarted FE refreshed the MV before management readmission; {}",
                 context.diagnostics()
             ),
         };
+        let public_error = mv_public_error(&error)?;
         ensure!(
-            error
-                .to_string()
+            public_error
+                .message
                 .contains("MV target requires a successful fresh Current observation"),
             "closed MV refresh returned an unrelated error {error}; {}",
             context.diagnostics()
@@ -250,13 +254,13 @@ impl Scenario for MvStorageContract {
         let challenge = property(&closed, "Challenge")?;
         let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
         context.action("readmit management through the public operator procedure");
-        let resumed: Vec<(String, Option<String>)> = conn
-            .query(format!(
+        let resumed: Vec<(String, Option<String>)> = mv_properties(&conn
+            .execute(format!(
                 "CALL novarocks_mv_resume_management('{CATALOG}', '{NAMESPACE}', '{VIEW}', \
                  '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
                  'the system scenario replaced the declared frontend process before this statement')"
             ))
-            .context("resume managed MV after FE restart")?;
+            .context("resume managed MV after FE restart")?)?;
         require_property(&resumed, "SettledEffects", "1")?;
         execute(
             context,
@@ -374,12 +378,14 @@ fn require_actual_rewrite_barrier(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn require_rewrite(context: &mut ScenarioContext, conn: &mut mysql::Conn) -> Result<()> {
+fn require_rewrite(context: &mut ScenarioContext, conn: &mut SqlSession) -> Result<()> {
     context.remaining("explain base aggregate rewrite")?;
     context.action("verify the base aggregate rewrites onto the published MV");
-    let plan: Vec<(String,)> = conn
-        .query("EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
-        .context("explain aggregate over the MV source")?;
+    let plan: Vec<(String,)> = mv_text_lines(
+        &conn
+            .execute("EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
+            .context("explain aggregate over the MV source")?,
+    )?;
     ensure!(
         plan.iter()
             .any(|(line,)| line.contains("rewritten with mv: orders_mv")),
@@ -449,10 +455,7 @@ fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Res
     })
 }
 
-fn connect(context: &mut ScenarioContext) -> Result<crate::actors::mysql::DeadlineConnection> {
-    crate::actors::mysql::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )
+fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }

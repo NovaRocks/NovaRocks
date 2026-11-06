@@ -42,7 +42,7 @@ import oss_ops
 
 HERE = Path(__file__).resolve().parent
 FILES = runtime.ENTRY_FILES
-LOCAL_RANGES = {"trino": 8640, "mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
+LOCAL_RANGES = {"trino": 8640, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
 MANAGED = """NOVA_ENV_CONFIG_FILE NOVA_ENV_ID NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT
 NOVA_ENV_RUNTIME_DIR NOVA_ENV_CURRENT_DIR NOVA_ENV_REST_ENV_FILE NOVA_ENV_MANIFEST NOVA_ENV_README
 NOVA_ENV_COMPOSE_FILE NOVA_ENV_COMPOSE_ENV NOVA_ENV_MINIO_PORT NOVA_ENV_MINIO_CONSOLE_PORT
@@ -387,7 +387,6 @@ path = {json_string(stable / "frontend-state.sqlite")}
 cluster_id = {json_string(env_id)}
 
 [standalone_server]
-mysql_port = {ports["mysql"]}
 trino_port = {ports["trino"]}
 user = "root"
 mv_refresh_scheduler_enabled = true
@@ -596,7 +595,7 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     offset = int(hashlib.sha1(str(workspace).encode()).hexdigest()[:8], 16)
     starts = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_START', base)) for name, base in LOCAL_RANGES.items()}
     ranges = {name: int(settings.get('NOVA_ENV_' + name.upper() + '_PORT_RANGE', '199')) for name in LOCAL_RANGES}
-    ports = dict(old_config.get('local_ports') or {})
+    ports = {name: value for name, value in (old_config.get('local_ports') or {}).items() if name in LOCAL_RANGES}
     missing = {name: base for name, base in starts.items() if name not in ports}
     if missing:
         ports.update(choose_ports(missing, offset, ranges, reserved=set(ports.values())))
@@ -728,18 +727,53 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
         record["object_store_container"] = backend.attach(config["shared_minio"], record)
         render_entry(context, entry)
     backend.compose(record, ['up', '-d'])
-    record['containers'] = {name: backend.container(record, name)['Id'] for name in record['required_services']}
-    # Join the actual one-shot command, not a readiness probe of the whole stack.
-    mc = backend.container(record, 'mc')
-    if not mc:
-        raise runtime.RuntimeFailure('RuntimeStateUnreadable', 'private creation omitted its mc container')
-    if mc.get('State', {}).get('Status') != 'exited':
-        result = backend.command(['wait', mc['Id']]).strip()
-        if result != '0':
-            raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
-    elif mc.get('State', {}).get('ExitCode') != 0:
-        raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
-    record['containers']['mc'] = mc['Id']
+    previous_deadline = getattr(backend, 'operation_deadline', None)
+    deadline = time.monotonic() + min(120, backend.timeout)
+    if previous_deadline is not None:
+        deadline = min(deadline, previous_deadline)
+    backend.operation_deadline = deadline
+    try:
+        record['containers'] = {}
+        for service in record['required_services']:
+            container = backend.container(record, service)
+            if not container:
+                raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+            record['containers'][service] = container['Id']
+        # Bucket initialization belongs to this owner, alongside the mc one-shot.
+        # Shared MinIO has no private initializer in its required services.
+        for service in ('mc-init', 'mc'):
+            if service == 'mc-init' and service not in record['required_services']:
+                continue
+            container = backend.container(record, service)
+            if not container:
+                raise runtime.RuntimeFailure('RuntimeStateUnreadable', f'private creation omitted its {service} container')
+            if container.get('State', {}).get('Status') != 'exited':
+                result = backend.command(['wait', container['Id']]).strip()
+                if result != '0':
+                    raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
+            elif container.get('State', {}).get('ExitCode') != 0:
+                raise runtime.RuntimeFailure('RuntimeCreationFailed', f'private {service} command did not exit successfully')
+            record['containers'][service] = container['Id']
+        # Only newly created REST services need their first serving handoff.
+        # Existing fixtures do not pass through this creation owner.
+        for service in runtime.rest_services(record):
+            url = f'http://127.0.0.1:{record["ports"][service.replace("-", "_")]}/v1/config'
+            while True:
+                if budget:
+                    budget.check(work=True)
+                if time.monotonic() >= deadline:
+                    raise runtime.RuntimeFailure('ReadinessTimeout', project)
+                serving = backend.http_ready(url)
+                if budget:
+                    budget.check(work=True)
+                now = time.monotonic()
+                if now >= deadline:
+                    raise runtime.RuntimeFailure('ReadinessTimeout', project)
+                if serving:
+                    break
+                time.sleep(min(0.1, deadline - now))
+    finally:
+        backend.operation_deadline = previous_deadline
     record['creation_state'] = 'ready'
     render_entry(context, entry)
     return {'published_dir': str(entry), 'private_record': record, 'producer_receipt': context['producer_receipt']}

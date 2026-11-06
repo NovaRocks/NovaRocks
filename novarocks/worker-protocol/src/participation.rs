@@ -303,7 +303,13 @@ impl ParticipationCommand {
 #[derive(Clone, Copy, Debug)]
 pub enum TaskReadCommand {
     FinalInfo,
-    DynamicFilters { acknowledged: Option<DomainVersion> },
+    DynamicFilters {
+        acknowledged: Option<DomainVersion>,
+    },
+    /// Replay the original cancellation only after the actual Task read seal.
+    Cancel {
+        reason: CancelReason,
+    },
 }
 impl TaskReadCommand {
     pub fn into_command(self, task: TaskIdentity) -> ParticipationCommand {
@@ -312,6 +318,7 @@ impl TaskReadCommand {
             Self::DynamicFilters { acknowledged } => {
                 ParticipationCommand::GetDynamicFilters { task, acknowledged }
             }
+            Self::Cancel { reason } => ParticipationCommand::Cancel { task, reason },
         }
     }
 }

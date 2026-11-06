@@ -20,7 +20,7 @@
 use super::*;
 use novarocks_query_application::session_control::{
     GovernedQueryStatementOwner, GovernedStatementAction, StatementActionReady,
-    StatementActionReceipt, StatementActionWaitError,
+    StatementActionReceipt, StatementActionWaitError, StatementCompletionProjection,
 };
 
 /// Exactly one receiving field in the existing session. The tail cannot erase
@@ -70,6 +70,8 @@ impl StatementReadyReceiver {
                 };
                 *current = reconciled.expect("same observed business error");
             }
+            // The same Source already constructed the closed completion
+            // graph under its original Work. Protocol delivery only moves it.
             StatementActionReady::transfer_protocol_in(&mut ready, &mut output)
                 .map_err(internal_error)?;
         }
@@ -83,6 +85,30 @@ impl FrontendQuerySession {
         statement: GovernedQueryStatementOwner,
         action: Box<dyn GovernedStatementAction>,
     ) -> Result<StatementResult, QueryServiceError> {
+        // Freeze the original admitted shape and client presentation before
+        // Source publication, while its execution Work is still available.
+        // Neither missing metadata nor a poisoned session invents a schema.
+        let projection = (|| -> Result<StatementCompletionProjection, QueryServiceError> {
+            let shape = self
+                .output_shape
+                .lock()
+                .map_err(|_| internal_error("statement output shape lock poisoned"))?
+                .ok_or_else(|| internal_error("statement has no admitted static shape"))?;
+            let family = self
+                .state
+                .lock()
+                .map_err(poisoned_state)?
+                .presentation()
+                .copied()
+                .ok_or_else(|| {
+                    internal_error("client statement requires an explicit presentation")
+                })?;
+            Ok(StatementCompletionProjection::new(shape, family))
+        })();
+        let projection = match projection {
+            Ok(projection) => projection,
+            Err(error) => return Ok(self.governed_typed_error(error, statement)),
+        };
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -93,6 +119,7 @@ impl FrontendQuerySession {
         let tail = match self.service.query_control.publish_statement_action_in(
             &mut owner,
             &mut action,
+            projection,
             &mut waiter,
         ) {
             Ok(tail) => tail,

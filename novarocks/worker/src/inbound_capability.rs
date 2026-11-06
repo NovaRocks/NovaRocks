@@ -655,6 +655,18 @@ impl TaskInboundCapabilities {
             .insert(participation.query_execution_id());
     }
 
+    /// A positive fact from the original Participation abort owner. It fences every
+    /// inbound route of this exact execution, including late installation.
+    /// Absence, normal close and receiver destruction provide no such proof.
+    /// This is admission revocation, never a decoder or request exit receipt.
+    pub fn participation_admission_aborted(&self, execution: QueryExecutionId) -> bool {
+        self.state
+            .lock()
+            .expect(CAPABILITY_LOCK)
+            .aborted_executions
+            .contains(&execution)
+    }
+
     pub fn abort_participation(&self, participation: ParticipationRef) {
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         let execution = participation.query_execution_id();

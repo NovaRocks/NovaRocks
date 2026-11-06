@@ -364,6 +364,124 @@ impl TaskIoState {
     }
 }
 impl ParticipationHostRecord {
+    #[cfg(test)]
+    pub(crate) fn original_physical_pending_for_test(&self) -> usize {
+        self.task_io.physical_pending.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_normal_retire_handoff_for_test(&mut self, task: TaskIdentity) -> bool {
+        if task.verify_participation(self.identity).is_err()
+            || self.normal_retire_handoff_gate.is_some()
+        {
+            return false;
+        }
+        self.normal_retire_handoff_gate = Some(task);
+        true
+    }
+    #[cfg(test)]
+    pub(crate) fn release_normal_retire_handoff_for_test(&mut self, task: TaskIdentity) -> bool {
+        if self.normal_retire_handoff_gate != Some(task) {
+            return false;
+        }
+        self.normal_retire_handoff_gate = None;
+        self.ready_notice().notify();
+        true
+    }
+    #[cfg(test)]
+    pub(super) fn normal_retire_handoff_held_for_test(
+        &self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> bool {
+        ticket.actor == self.actor
+            && self.control_runtime.validate_effect_ticket(ticket).is_ok()
+            && matches!(&ticket.effect,
+                WorkerAction::Participation(ParticipationEffect::RetireTask {
+                    task, never_accepted: false, ..
+                }) if self.normal_retire_handoff_gate == Some(*task))
+    }
+    #[cfg(test)]
+    pub(crate) fn finalized_task_closing_for_test(
+        &mut self,
+        task: TaskIdentity,
+    ) -> Option<FinalizedTaskClosingForTest> {
+        let ticket = self.resources.pending_host_jobs.actor_effect.as_ref()?;
+        if !self.normal_retire_handoff_held_for_test(ticket) {
+            return None;
+        }
+        let WorkerAction::Participation(ParticipationEffect::RetireTask {
+            task: original_task,
+            payload,
+            close_epoch,
+            ..
+        }) = &ticket.effect
+        else {
+            return None;
+        };
+        if *original_task != task {
+            return None;
+        }
+        let (payload, close_epoch) = (*payload, *close_epoch);
+        let accepted_retirement = self
+            .task_io
+            .retirements
+            .get(&task)
+            .and_then(|original| original.disposal_authorization.as_ref())
+            .is_some_and(|authorization| {
+                matches!(
+                    authorization.origin(),
+                    super::super::task_disposal::TaskDisposalOrigin::AcceptedTerminal { .. }
+                )
+            });
+        let read_sealed = self.has_retired_task_read(task);
+        let owner = self.task(task)?;
+        Some(FinalizedTaskClosingForTest {
+            payload,
+            close_epoch,
+            original_payload: owner.original_payload_id(),
+            production_retired: owner.production_retired(),
+            finalize_projection_exited: owner.retirement_projection_exited(true).ok()?,
+            request_open: owner.request_admission_open(),
+            // This stricter original getter proves source_closed as well as
+            // the independently drained open summary; false proves neither.
+            source_closed_and_open_drained: owner.port().ingress().open_summary_drained(),
+            accepted_retirement,
+            read_sealed,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn closing_task_retirement_for_test(
+        &mut self,
+        task: TaskIdentity,
+    ) -> Option<(
+        novarocks_worker_protocol::creation::PayloadId,
+        novarocks_control_runtime_core::identity::Generation,
+        bool,
+        bool,
+        bool,
+        bool,
+    )> {
+        let retirement = self.task_io.retirements.get(&task)?;
+        let (payload, close_epoch) = retirement.retained_custody?;
+        let accepted = retirement
+            .disposal_authorization
+            .as_ref()
+            .is_some_and(|authorization| {
+                matches!(
+                    authorization.origin(),
+                    super::super::task_disposal::TaskDisposalOrigin::AcceptedTerminal { .. }
+                )
+            });
+        let committed = retirement.projection_committed;
+        let request_open = self.task(task)?.request_admission_open();
+        Some((
+            payload,
+            close_epoch,
+            accepted,
+            committed,
+            request_open,
+            self.has_retired_task_read(task),
+        ))
+    }
     pub(crate) fn trace_drain_inventory(&self, budget: usize) {
         // Bound diagnostics by the same caller budget; counts describe only
         // this prefix of the original inventory, never all queued captures.
@@ -1403,6 +1521,17 @@ impl ParticipationHostRecord {
                     .expect("finite Task retirement continuation")
                     .insert(task);
             }
+            // Installed and the original preparation return can arrive in
+            // either order. Revisit their single original activation from
+            // this Task's actual progress notice, independently of whether
+            // another status projection is published. The paid cleanup slot
+            // keeps activation out of the preparation body's own queue.
+            if let Some(job) = self
+                .task(task)
+                .and_then(|owner| owner.take_production_activation())
+            {
+                self.queue_task_cleanup(job, ports)?;
+            }
             if let Some(execution) = &ports.execution
                 && let Some(job) = self
                     .task(task)
@@ -1531,6 +1660,20 @@ impl ParticipationHostRecord {
         }
         Ok(false)
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FinalizedTaskClosingForTest {
+    pub payload: novarocks_worker_protocol::creation::PayloadId,
+    pub close_epoch: Generation,
+    pub original_payload: novarocks_worker_protocol::creation::PayloadId,
+    pub production_retired: bool,
+    pub finalize_projection_exited: bool,
+    pub request_open: bool,
+    pub source_closed_and_open_drained: bool,
+    pub accepted_retirement: bool,
+    pub read_sealed: bool,
 }
 
 impl ParticipationHostRecord {

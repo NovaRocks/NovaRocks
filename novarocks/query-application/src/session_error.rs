@@ -70,6 +70,9 @@ enum QueryServiceErrorBody {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DiagnosticFacts {
     publication_terminal: Option<LakePublicationTerminal>,
+    // Only Message/User need a base after their first effect attachment.
+    // Execution reconstructs from its original typed descriptor and terminal.
+    external_effect_message_base: Option<String>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     compile_provenance: Option<novarocks_type_contract::CompileControlProvenance>,
 }
@@ -98,6 +101,7 @@ impl QueryServiceError {
             facts.publication_terminal.is_none()
                 && facts.compile_control.is_none()
                 && facts.compile_provenance.is_none()
+                && facts.external_effect_message_base.is_none()
         }) {
             self.diagnostics = None;
         }
@@ -238,94 +242,74 @@ impl QueryServiceError {
     }
 
     fn render_execution_message(&mut self) {
+        if !matches!(&self.body, QueryServiceErrorBody::Execution { .. }) {
+            return;
+        }
+        let message = StatementExternalEffectDisposition::diagnostic(
+            &ExecutionPublicBase(self),
+            self.external_effect_disposition,
+        )
+        .to_string();
         if let QueryServiceErrorBody::Execution {
-            user_error,
-            message,
-            ..
+            message: target, ..
         } = &mut self.body
         {
-            // Both independent knowledge fields render from the same frozen
-            // descriptor. Neither attachment may erase the other one's guard.
-            *message = user_error.to_string();
-            if let Some(terminal) = self
-                .diagnostics
-                .as_deref()
-                .and_then(|facts| facts.publication_terminal.as_ref())
-            {
-                let disposition = match terminal.disposition() {
-                    LakePublicationDisposition::KnownUncommitted => "KnownUncommitted",
-                    LakePublicationDisposition::CommitUnknown => "CommitUnknown",
-                    LakePublicationDisposition::KnownCommitted => "KnownCommitted",
-                };
-                use std::fmt::Write;
-                let header = terminal.header();
-                write!(
-                    message,
-                    " (lake publication id={} family={} disposition={}",
-                    header.publication_id(),
-                    header.family().as_str(),
-                    disposition,
-                )
-                .expect("writing to a String cannot fail");
-                if terminal.do_not_retry() {
-                    message.push_str(" do_not_retry=true; do not retry statement");
-                }
-                message.push(')');
-            }
-            if let Some(disposition) = self.external_effect_disposition {
-                let label = match disposition {
-                    StatementExternalEffectDisposition::KnownUncommitted => "KnownUncommitted",
-                    StatementExternalEffectDisposition::CommitUnknown => "CommitUnknown",
-                    StatementExternalEffectDisposition::KnownCommitted => "KnownCommitted",
-                };
-                use std::fmt::Write;
-                write!(message, " (external effect disposition={label}")
-                    .expect("writing to a String cannot fail");
-                if disposition.do_not_retry() {
-                    message.push_str(" do_not_retry=true; do not retry statement");
-                }
-                message.push(')');
-            }
+            *target = message;
         }
     }
 
-    /// Forward only the original action owner's effect knowledge.
-    /// A disposition alone grants no domain identity, receipt, or exit proof.
-    /// The selected input, descriptor and phase are retained without rewriting.
+    /// Forward cumulative facts supplied by the original Action. Preserve the
+    /// source, code, location and independent publication terminal unchanged.
     pub fn attach_external_effect_disposition(
         mut self,
         disposition: StatementExternalEffectDisposition,
     ) -> Self {
-        // This is one original owner's frozen terminal verdict, not a new
-        // observation/update channel. Reapplying it cannot duplicate rendering.
-        if self.external_effect_disposition.is_some() {
+        let combined = StatementExternalEffectDisposition::combine(
+            self.external_effect_disposition,
+            Some(disposition),
+        );
+        if combined == self.external_effect_disposition {
             return self;
         }
-        self.external_effect_disposition = Some(disposition);
+        if !matches!(&self.body, QueryServiceErrorBody::Execution { .. })
+            && self.external_effect_disposition.is_none()
+        {
+            let base = self.message().to_owned();
+            self.diagnostic_facts_mut().external_effect_message_base = Some(base);
+        }
+        self.external_effect_disposition = combined;
         if matches!(&self.body, QueryServiceErrorBody::Execution { .. }) {
             self.render_execution_message();
-            return self;
+        } else {
+            let base = self
+                .diagnostics
+                .as_deref()
+                .and_then(|facts| facts.external_effect_message_base.as_deref())
+                .expect("original effect message base");
+            let message =
+                StatementExternalEffectDisposition::diagnostic(&base, combined).to_string();
+            match &mut self.body {
+                QueryServiceErrorBody::Message {
+                    message: target, ..
+                }
+                | QueryServiceErrorBody::User {
+                    message: target, ..
+                } => *target = message,
+                _ => unreachable!("handled Execution above"),
+            }
         }
-        // Preserve the original Message/User behavior. Their text has no
-        // frozen execution descriptor to render again.
-        let message = match &mut self.body {
-            QueryServiceErrorBody::Message { message, .. }
-            | QueryServiceErrorBody::User { message, .. } => message,
-            QueryServiceErrorBody::Execution { .. } => unreachable!("handled above"),
-        };
-        let label = match disposition {
-            StatementExternalEffectDisposition::KnownUncommitted => "KnownUncommitted",
-            StatementExternalEffectDisposition::CommitUnknown => "CommitUnknown",
-            StatementExternalEffectDisposition::KnownCommitted => "KnownCommitted",
-        };
-        use std::fmt::Write;
-        write!(message, " (external effect disposition={label}")
-            .expect("writing to a String cannot fail");
-        if disposition.do_not_retry() {
-            message.push_str(" do_not_retry=true; do not retry statement");
-        }
-        message.push(')');
         self
+    }
+    /// Pure borrowing projection for a protocol's bounded diagnostic. The
+    /// same cumulative author is used by owned attachments and projections.
+    pub fn diagnostic_with_external_effect(
+        &self,
+        companion: Option<StatementExternalEffectDisposition>,
+    ) -> impl fmt::Display + '_ {
+        ServiceExternalEffectDiagnostic {
+            error: self,
+            companion,
+        }
     }
 
     pub fn external_effect_disposition(&self) -> Option<StatementExternalEffectDisposition> {
@@ -459,6 +443,72 @@ impl std::error::Error for QueryServiceError {
                     .and_then(|facts| facts.compile_control.as_ref())
                     .map(|cause| cause as &dyn std::error::Error)
             })
+    }
+}
+
+struct ExecutionPublicBase<'a>(&'a QueryServiceError);
+impl fmt::Display for ExecutionPublicBase<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let QueryServiceErrorBody::Execution { user_error, .. } = &self.0.body else {
+            unreachable!("typed execution base")
+        };
+        fmt::Display::fmt(user_error, f)?;
+        if let Some(terminal) = self.0.publication_terminal() {
+            let disposition = match terminal.disposition() {
+                LakePublicationDisposition::KnownUncommitted => "KnownUncommitted",
+                LakePublicationDisposition::CommitUnknown => "CommitUnknown",
+                LakePublicationDisposition::KnownCommitted => "KnownCommitted",
+            };
+            let header = terminal.header();
+            write!(
+                f,
+                " (lake publication id={} family={} disposition={disposition}",
+                header.publication_id(),
+                header.family().as_str()
+            )?;
+            if terminal.do_not_retry() {
+                f.write_str(" do_not_retry=true; do not retry statement")?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+struct ServiceExternalEffectDiagnostic<'a> {
+    error: &'a QueryServiceError,
+    companion: Option<StatementExternalEffectDisposition>,
+}
+impl fmt::Display for ServiceExternalEffectDiagnostic<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let combined = StatementExternalEffectDisposition::combine(
+            self.error.external_effect_disposition,
+            self.companion,
+        );
+        if combined == self.error.external_effect_disposition {
+            return f.write_str(self.error.message());
+        }
+        match &self.error.body {
+            QueryServiceErrorBody::Execution { .. } => fmt::Display::fmt(
+                &StatementExternalEffectDisposition::diagnostic(
+                    &ExecutionPublicBase(self.error),
+                    combined,
+                ),
+                f,
+            ),
+            QueryServiceErrorBody::Message { message, .. }
+            | QueryServiceErrorBody::User { message, .. } => {
+                let base = self
+                    .error
+                    .diagnostics
+                    .as_deref()
+                    .and_then(|facts| facts.external_effect_message_base.as_deref())
+                    .unwrap_or(message);
+                fmt::Display::fmt(
+                    &StatementExternalEffectDisposition::diagnostic(&base, combined),
+                    f,
+                )
+            }
+        }
     }
 }
 
@@ -1230,6 +1280,57 @@ mod external_effect_companion_tests {
             );
             assert_eq!(message.external_effect_disposition(), Some(disposition));
             assert!(message.publication_terminal().is_none());
+        }
+    }
+    #[test]
+    fn cumulative_effect_projection_and_attachments_preserve_unmodified_base_and_cause() {
+        use StatementExternalEffectDisposition::{
+            CommitUnknown as X, KnownCommitted as C, KnownUncommitted as U,
+        };
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_workload_control::WorkError::Capacity("original result backing"),
+        );
+        for original in [
+            QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "original public diagnostic",
+            ),
+            QueryServiceError::from_failure_cause(source.clone()),
+        ] {
+            let base = original.message().to_owned();
+            let mut error = original.clone();
+            for effect in [U, X, C, U, X, C] {
+                let projected = error
+                    .diagnostic_with_external_effect(Some(effect))
+                    .to_string();
+                error = error.attach_external_effect_disposition(effect);
+                assert_eq!(error.message(), projected);
+                assert!(error.message().starts_with(&base));
+                assert_eq!(
+                    error
+                        .message()
+                        .matches(" (external effect disposition=")
+                        .count(),
+                    1
+                );
+                assert_eq!(error.failure_cause(), original.failure_cause());
+                assert_eq!(error.execution_failure(), original.execution_failure());
+                assert_eq!(error.user_error(), original.user_error());
+            }
+            assert_eq!(error.external_effect_disposition(), Some(C));
+            assert_eq!(original.message(), base);
+            // Removing an unrelated diagnostic must not discard the saved base.
+            error = error
+                .with_compile_control(None)
+                .attach_external_effect_disposition(U);
+            assert_eq!(error.external_effect_disposition(), Some(C));
+            assert_eq!(
+                error
+                    .message()
+                    .matches(" (external effect disposition=")
+                    .count(),
+                1
+            );
         }
     }
 }

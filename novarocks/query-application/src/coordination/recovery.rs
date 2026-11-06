@@ -165,6 +165,19 @@ mod tests {
     }
 
     #[test]
+    fn execution_failure_never_restarts_a_remote_attempt() {
+        // Representation is classified as ExecutionFailure by its typed-input
+        // boundary test; no output visibility or exhausted budget is needed.
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                failure: AttemptFailureClass::ExecutionFailure,
+                ..recoverable()
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
+        );
+    }
+
+    #[test]
     fn local_resource_governance_never_restarts_a_remote_attempt() {
         assert_eq!(
             evaluate_recovery(RecoveryInput {

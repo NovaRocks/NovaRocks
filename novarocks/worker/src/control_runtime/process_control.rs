@@ -1206,7 +1206,11 @@ mod tests {
         ActorId::new(1).unwrap()
     }
     fn core() -> ControlCore {
+        core_with_backend(novarocks_types::BackendProcessId::new_v7())
+    }
+    fn core_with_backend(backend: novarocks_types::BackendProcessId) -> ControlCore {
         ControlCore::new(
+            backend,
             ControlConfig {
                 max_pending_requests: 1,
                 step_budget: ControlCore::MAX_STEP_WORK,
@@ -1627,7 +1631,8 @@ mod tests {
             .unwrap();
         let ledger = RuntimeLedger::new(limits.quota);
         let runtime = ActorRuntime::new();
-        let core = core();
+        let backend = BackendProcessId::new_v7();
+        let core = core_with_backend(backend);
         let capability = core.admission().capability();
         let mut owner = ProcessControlOwner::bootstrap(&runtime, &ledger, core, binding()).unwrap();
         fn complete_marker(
@@ -1655,7 +1660,7 @@ mod tests {
         let participation = ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(7101, 7102), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
-            BackendProcessId::new_v7(),
+            backend,
         );
         let mut bytes = [17; 16];
         bytes[6] = 0x70;

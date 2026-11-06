@@ -1616,7 +1616,7 @@ fn join_kind_text(kind: novarocks_physical_plan::JoinKind) -> &'static str {
         JoinKind::RightSemi => "RIGHT SEMI",
         JoinKind::LeftAnti => "LEFT ANTI",
         JoinKind::RightAnti => "RIGHT ANTI",
-        JoinKind::LeftMark { .. } => "NULL AWARE LEFT MARK",
+        JoinKind::LeftMark => "NULL AWARE LEFT MARK",
         JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI",
         JoinKind::Cross => "CROSS",
     }

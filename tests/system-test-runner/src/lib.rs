@@ -19,12 +19,6 @@ pub mod actors;
 pub mod build_information;
 mod cli;
 mod config;
-#[cfg(unix)]
-mod exact_mysql_target_binding;
-#[cfg(unix)]
-mod exact_native_admission;
-#[cfg(unix)]
-mod held_live_source_fence;
 mod runner;
 pub mod scenario;
 mod scenario_settlement;
@@ -36,7 +30,7 @@ pub fn run(build: build_information::BuildInformation) {
         return;
     }
     if let Err(error) = cli::Cli::parse_env().and_then(|cli| runner::run(cli, build)) {
-        if let Some(verdict) = runner::exact_mysql_failure_presentation(&error) {
+        if let Some(verdict) = runner::observed_failure_presentation(&error) {
             eprintln!("system scenario runner failed: {verdict}");
         } else {
             eprintln!("system scenario runner failed: {error:#}");

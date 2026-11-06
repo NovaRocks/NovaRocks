@@ -5,6 +5,9 @@ domain: [distributed-query-lifecycle, frontend]
 status: active
 supersedes: [ADR-0010]
 superseded-by: null
+partially-superseded-by: [ADR-0217]
+partially-superseded-scope:
+  ADR-0217: "MySQL connection registry, connection-token control port and connection-addressed KILL are retired; application authorization, original cancellation identity, protocol/application ownership separation and actual-exit rules remain active."
 date: 2026-08-23
 provenance:
   - "discussion: 2026-08-22 MySQL KILL connection lifecycle semantics"

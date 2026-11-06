@@ -136,6 +136,7 @@ mod tests {
             query_id: "conversion-query".into(),
             pages: 1,
             update_type: None,
+            update_count: None,
         }
     }
     fn execution(results: Vec<StatementResult>) -> QueryExecution {
@@ -540,6 +541,7 @@ k1	v2
                 query_id: "retained-artifact-fixture-not-original-query-id".into(),
                 pages: 1,
                 update_type: None,
+                update_count: None,
             }])
         }
 

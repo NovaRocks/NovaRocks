@@ -46,11 +46,11 @@
 //! unchanged" is the process-boundary form of "the provider's commit was
 //! invoked exactly zero times".
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{
+    self, PendingStatement, SqlSession, StatementFailure, StatementResult, TrinoValue,
+};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, anyhow, bail};
-use mysql::prelude::Queryable;
-use mysql::{Row, Value};
 use novarocks_cluster_harness::{
     QueryLifecycleFailureSite, QueryLifecycleStructuredSnapshot, TestClusterOwner,
 };
@@ -75,7 +75,7 @@ mod small_slots;
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
-    mysql_endpoint, require_three_backends, resource_baseline,
+    require_three_backends, resource_baseline,
 };
 
 const WRITER_OPENS: &str = "novarocks_backend_connector_write_writer_opens_total";
@@ -547,18 +547,277 @@ fn require_multi_driver_host() -> Result<f64> {
     Ok(dop as f64)
 }
 
-fn snapshot_count(control: &mut mysql::Conn, table: &str) -> Result<i64> {
-    control
-        .query_first::<i64, _>(format!("SELECT count(*) FROM {table}$snapshots"))
-        .with_context(|| format!("read {table} snapshot count"))?
-        .with_context(|| format!("{table}$snapshots returned no row"))
+// These decoders belong only to the writer fixture's declared SQL shapes.
+// They never infer a transport, stringify values or convert an unknown type.
+fn writer_shape(result: &StatementResult, expected: &[&str]) -> Result<()> {
+    anyhow::ensure!(
+        result.is_result_set() && result.columns.len() == expected.len(),
+        "writer result has the wrong declared width: {result:?}"
+    );
+    for (column, raw_type) in result.columns.iter().zip(expected) {
+        anyhow::ensure!(
+            column.type_signature.raw_type == *raw_type,
+            "writer column does not match its declared type {raw_type}: {column:?}"
+        );
+        if *raw_type != "varchar" && *raw_type != "row" {
+            anyhow::ensure!(
+                column.type_signature.arguments.is_empty(),
+                "writer integer metadata has unexpected parameters: {column:?}"
+            );
+        }
+    }
+    Ok(())
+}
+fn writer_bigint(result: &StatementResult) -> Result<i64> {
+    writer_shape(result, &["bigint"])?;
+    sql::single_integer(result)
+}
+fn writer_optional_bigint(result: &StatementResult) -> Result<Option<i64>> {
+    writer_shape(result, &["bigint"])?;
+    anyhow::ensure!(
+        result.rows.len() == 1,
+        "writer SUM requires exactly one aggregate row"
+    );
+    match result.rows[0].as_slice() {
+        [TrinoValue::Integer(value)] => Ok(Some(*value)),
+        [TrinoValue::Null] => Ok(None),
+        row => bail!("writer SUM is not its declared nullable bigint: {row:?}"),
+    }
+}
+fn writer_bigint_pairs(result: &StatementResult) -> Result<Vec<(i64, i64)>> {
+    writer_shape(result, &["bigint", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(v0), TrinoValue::Integer(v1)] => Ok((*v0, *v1)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_partition_rows(result: &StatementResult) -> Result<Vec<(i64, i64, i64)>> {
+    writer_shape(result, &["bigint", "bigint", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(v0),
+                TrinoValue::Integer(v1),
+                TrinoValue::Integer(v2),
+            ] => Ok((*v0, *v1, *v2)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_row_ids(result: &StatementResult) -> Result<Vec<(i64, String, i64)>> {
+    writer_shape(result, &["bigint", "varchar", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(v0),
+                TrinoValue::Text(v1),
+                TrinoValue::Integer(v2),
+            ] => Ok((*v0, v1.clone(), *v2)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_file_partitions(result: &StatementResult) -> Result<Vec<(String, i32, i64)>> {
+    writer_shape(result, &["varchar", "integer", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Text(v0),
+                TrinoValue::Integer(v1),
+                TrinoValue::Integer(v2),
+            ] => Ok((v0.clone(), i32::try_from(*v1)?, *v2)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_file_specs(result: &StatementResult) -> Result<Vec<(String, i32)>> {
+    writer_shape(result, &["varchar", "integer"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(v0), TrinoValue::Integer(v1)] => {
+                Ok((v0.clone(), i32::try_from(*v1)?))
+            }
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_file_spec_counts(result: &StatementResult) -> Result<Vec<(i32, String, i32, i64)>> {
+    writer_shape(result, &["integer", "varchar", "integer", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(v0),
+                TrinoValue::Text(v1),
+                TrinoValue::Integer(v2),
+                TrinoValue::Integer(v3),
+            ] => Ok((i32::try_from(*v0)?, v1.clone(), i32::try_from(*v2)?, *v3)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_file_row_counts(result: &StatementResult) -> Result<Vec<(String, i64)>> {
+    writer_shape(result, &["varchar", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(v0), TrinoValue::Integer(v1)] => Ok((v0.clone(), *v1)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_live_files(result: &StatementResult) -> Result<Vec<(i32, String, String, i64)>> {
+    writer_shape(result, &["integer", "varchar", "varchar", "bigint"])?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Integer(v0),
+                TrinoValue::Text(v1),
+                TrinoValue::Text(v2),
+                TrinoValue::Integer(v3),
+            ] => Ok((i32::try_from(*v0)?, v1.clone(), v2.clone(), *v3)),
+            row => bail!("writer fixture row does not match its declared shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_boundary_summary(result: &StatementResult) -> Result<(i64, i64, i64, i64)> {
+    writer_shape(result, &["bigint", "bigint", "bigint", "bigint"])?;
+    anyhow::ensure!(
+        result.rows.len() == 1,
+        "same-file boundary aggregate requires exactly one row"
+    );
+    match result.rows[0].as_slice() {
+        [
+            TrinoValue::Integer(count),
+            TrinoValue::Integer(min),
+            TrinoValue::Integer(max),
+            TrinoValue::Integer(sum),
+        ] => Ok((*count, *min, *max, *sum)),
+        row => {
+            bail!("same-file boundary aggregate changed its four non-null bigint cells: {row:?}")
+        }
+    }
+}
+fn writer_statistics_rows(result: &StatementResult) -> Result<Vec<TableStatisticsRow>> {
+    writer_shape(
+        result,
+        &[
+            "varchar", "varchar", "varchar", "varchar", "varchar", "varchar", "varchar",
+        ],
+    )?;
+    result
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                TrinoValue::Text(metric),
+                scalar,
+                TrinoValue::Text(status),
+                TrinoValue::Text(basis),
+                TrinoValue::Text(source),
+                TrinoValue::Text(nature),
+                TrinoValue::Text(relation),
+            ] => {
+                let scalar = match scalar {
+                    TrinoValue::Null => None,
+                    TrinoValue::Text(value) => Some(value.clone()),
+                    value => bail!("provider statistic is not declared nullable text: {value:?}"),
+                };
+                Ok((
+                    metric.clone(),
+                    scalar,
+                    status.clone(),
+                    basis.clone(),
+                    source.clone(),
+                    nature.clone(),
+                    relation.clone(),
+                ))
+            }
+            row => bail!("provider statistics row changed its declared text shape: {row:?}"),
+        })
+        .collect()
+}
+fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serde_json::Value)>> {
+    use novarocks_test_trino_client::TypeArgument;
+    writer_shape(result, &["varchar", "row"])?;
+    let fields = &result.columns[1].type_signature.arguments;
+    anyhow::ensure!(
+        fields.len() == 2,
+        "evolved partition ROW requires its original p and p_bucket_8 fields"
+    );
+    let names = fields
+        .iter()
+        .map(|field| {
+            let TypeArgument::NamedType(field) = field else {
+                bail!("partition ROW omitted a named field")
+            };
+            let name = field
+                .field_name
+                .as_ref()
+                .context("partition ROW field has no exact name")?
+                .name
+                .as_str();
+            let expected = match name {
+                "p" => "bigint",
+                "p_bucket_8" => "integer",
+                _ => bail!("unexpected evolved partition field {name}"),
+            };
+            anyhow::ensure!(
+                field.type_signature.raw_type == expected
+                    && field.type_signature.arguments.is_empty(),
+                "evolved partition field {name} changed its signed type"
+            );
+            Ok(name)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        names.contains(&"p") && names.contains(&"p_bucket_8"),
+        "evolved partition ROW duplicated a field"
+    );
+    result.rows.iter().map(|row| match row.as_slice() {
+        [TrinoValue::Text(path), TrinoValue::Row(values)] if values.len() == names.len() => {
+            let mut partition = serde_json::Map::new();
+            for (name, value) in names.iter().zip(values) {
+                let value = match value {
+                    TrinoValue::Null => serde_json::Value::Null,
+                    TrinoValue::Integer(value) => serde_json::json!(value),
+                    value => bail!("partition field {name} changed its signed integer/NULL value: {value:?}"),
+                };
+                partition.insert((*name).to_owned(), value);
+            }
+            Ok((path.clone(), serde_json::Value::Object(partition)))
+        }
+        row => bail!("original file path/partition ROW changed its shape: {row:?}"),
+    }).collect()
 }
 
-fn row_count(control: &mut mysql::Conn, table: &str) -> Result<i64> {
-    control
-        .query_first::<i64, _>(format!("SELECT count(*) FROM {table}"))
-        .with_context(|| format!("count rows in {table}"))?
-        .with_context(|| format!("{table} row count returned no row"))
+fn snapshot_count(control: &mut SqlSession, table: &str) -> Result<i64> {
+    let result = control
+        .execute(format!("SELECT count(*) FROM {table}$snapshots"))
+        .with_context(|| format!("read {table} snapshot count"))?;
+    writer_bigint(&result)
+}
+fn row_count(control: &mut SqlSession, table: &str) -> Result<i64> {
+    let result = control
+        .execute(format!("SELECT count(*) FROM {table}"))
+        .with_context(|| format!("count rows in {table}"))?;
+    writer_bigint(&result)
 }
 
 /// Create the catalog and a source table with two committed data files per
@@ -573,7 +832,7 @@ fn row_count(control: &mut mysql::Conn, table: &str) -> Result<i64> {
 /// what these scenarios are about.
 fn seed_source_files(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     source: &str,
@@ -582,10 +841,10 @@ fn seed_source_files(
     let warehouse = create_warehouse(context, warehouse_name)?;
     create_catalog(control, catalog, &warehouse)?;
     control
-        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE DATABASE {catalog}.{database}"))
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE TABLE {catalog}.{database}.{source} (v BIGINT)"
         ))
         .with_context(|| format!("create {catalog}.{database}.{source}"))?;
@@ -593,7 +852,7 @@ fn seed_source_files(
         let low = file * SEED_ROWS_PER_FILE + 1;
         let high = (file + 1) * SEED_ROWS_PER_FILE;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {catalog}.{database}.{source} \
                  SELECT generate_series FROM TABLE(generate_series({low}, {high}))"
             ))
@@ -617,19 +876,19 @@ fn seed_source_files(
 /// therefore its own split: a single statement would leave one file, one
 /// split, and a write that reaches one backend.
 fn seed_delay_source_files(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     source: &str,
 ) -> Result<()> {
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE TABLE {catalog}.{database}.{source} (v BIGINT, delay_s BIGINT)"
         ))
         .with_context(|| format!("create {catalog}.{database}.{source}"))?;
     for row in 1..=ABORT_SOURCE_FILES {
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {catalog}.{database}.{source} VALUES ({row}, {ABORT_DELAY_S})"
             ))
             .with_context(|| format!("seed {catalog}.{database}.{source} row {row}"))?;
@@ -725,7 +984,7 @@ struct ConcurrentWriter {
     ordinal: usize,
     selected: SelectedStatement,
     actor: WriterActor,
-    early_outcome: Option<mysql::Result<()>>,
+    early_outcome: Option<std::result::Result<StatementResult, StatementFailure>>,
 }
 
 fn concurrent_target(ordinal: usize) -> String {
@@ -814,12 +1073,14 @@ fn require_concurrent_effective_config(context: &ScenarioContext) -> Result<usiz
 /// Read external data only before admission or after EVERY original writer
 /// actually exits. Readback can need the same warehouse query admission;
 /// adding it while the three writers are held would contaminate this proof.
-fn require_concurrent_source_data(control: &mut mysql::Conn) -> Result<()> {
+fn require_concurrent_source_data(control: &mut SqlSession) -> Result<()> {
     let source = format!("{CONCURRENT_CATALOG}.{CONCURRENT_DATABASE}.{CONCURRENT_SOURCE}");
     let rows = row_count(control, &source)?;
-    let total: Option<i64> = control
-        .query_first(format!("SELECT SUM(v) FROM {source}"))
-        .context("read concurrent writer source value sum")?;
+    let total = writer_optional_bigint(
+        &control
+            .execute(format!("SELECT SUM(v) FROM {source}"))
+            .context("read concurrent writer source value sum")?,
+    )?;
     anyhow::ensure!(
         rows == SEED_ROWS && total == Some(SEED_SUM),
         "concurrent source changed: rows={rows}, sum={total:?}; expected rows={SEED_ROWS}, sum={SEED_SUM}"
@@ -829,7 +1090,7 @@ fn require_concurrent_source_data(control: &mut mysql::Conn) -> Result<()> {
 }
 
 fn require_concurrent_targets_unpublished(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     snapshots_before: &[i64],
 ) -> Result<()> {
     for (ordinal, &before) in snapshots_before.iter().enumerate() {
@@ -930,8 +1191,9 @@ impl Scenario for DistributedWriterConcurrentProgress {
         require_three_backends(context)?;
         let concurrent_writers = require_concurrent_effective_config(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
         seed_source_files(
             context,
             &mut control,
@@ -941,7 +1203,7 @@ impl Scenario for DistributedWriterConcurrentProgress {
             "distributed-writer-concurrent-progress",
         )?;
         for ordinal in 0..concurrent_writers {
-            control.query_drop(format!(
+            control.execute(format!(
                 "CREATE TABLE {} (v BIGINT)",
                 concurrent_target(ordinal)
             ))?;
@@ -951,7 +1213,7 @@ impl Scenario for DistributedWriterConcurrentProgress {
             .map(|ordinal| snapshot_count(&mut control, &concurrent_target(ordinal)))
             .collect::<Result<Vec<_>>>()?;
         require_concurrent_targets_unpublished(&mut control, &snapshots_before)?;
-        control.finish()?;
+        drop(control);
         await_resource_convergence(context, &baseline, "concurrent writer fixture setup")?;
 
         // Reserve time from the original scenario deadline for cancellation,
@@ -999,12 +1261,9 @@ impl Scenario for DistributedWriterConcurrentProgress {
         let deadline = context.deadline();
         for writer in &writers {
             if writer.early_outcome.is_none() {
-                let cancelled = context
-                    .handle()
-                    .kill_query_until(writer.actor.connection_id, deadline)
-                    .with_context(|| {
-                        format!("cancel original concurrent writer {}", writer.ordinal)
-                    });
+                let cancelled = writer.actor.cancel(deadline).with_context(|| {
+                    format!("cancel original concurrent writer {}", writer.ordinal)
+                });
                 result = writer_statement_actor::combine(result, cancelled);
             }
         }
@@ -1023,8 +1282,8 @@ impl Scenario for DistributedWriterConcurrentProgress {
                 };
             let settled = writer.actor.settle(context, outcome).and_then(|outcome| {
                 match outcome {
-                    Err(mysql::Error::MySqlError(error))
-                        if error.code == 1317 && error.state == "70100" => Ok(()),
+                    Err(StatementFailure::Trino(error))
+                        if error.error_code == 3 && error.error_name == "USER_CANCELED" && error.error_type == "USER_ERROR" => Ok(()),
                     other => bail!(
                         "concurrent writer {ordinal} must return its public KILL cancellation: {other:?}"
                     ),
@@ -1041,13 +1300,11 @@ impl Scenario for DistributedWriterConcurrentProgress {
         // These are independent committed-data oracles, after real actor exit.
         // The BE resource oracle above covers contexts/fragments/catalog leases;
         // neither it nor empty tables proves unknown sealed objects disposed.
-        let external_effects = mysql_actor::connect_until(&user, port, context.deadline())
-            .and_then(|control| {
-                control.run(|control| {
-                    require_concurrent_targets_unpublished(control, &snapshots_before)?;
-                    require_concurrent_source_data(control)
-                })
-            });
+        let external_effects = (|| -> Result<()> {
+            let mut control = SqlSession::new(&user, port, context.deadline())?;
+            require_concurrent_targets_unpublished(&mut control, &snapshots_before)?;
+            require_concurrent_source_data(&mut control)
+        })();
         result = writer_statement_actor::combine(result, external_effects);
         let readback_cleanup =
             await_resource_convergence(context, &baseline, "concurrent writer external readbacks");
@@ -1127,12 +1384,10 @@ impl Scenario for DistributedWriterDataflow {
         require_three_backends(context)?;
         let expected_dop = require_multi_driver_host()?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect distributed writer control session")?,
-        )?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        context.remaining("connect distributed writer control session")?;
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
 
         const CATALOG: &str = "distributed_writer";
         const DATABASE: &str = "distributed_writer_db";
@@ -1150,7 +1405,7 @@ impl Scenario for DistributedWriterDataflow {
             "distributed-writer",
         )?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
             ))
             .context("create distributed writer table")?;
@@ -1166,7 +1421,7 @@ impl Scenario for DistributedWriterDataflow {
 
         context.action("append through the distributed write dataflow");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}"
             ))
             .context("distributed append through the write dataflow")?;
@@ -1248,9 +1503,11 @@ impl Scenario for DistributedWriterDataflow {
             );
         }
 
-        let total: Option<i64> = control
-            .query_first(format!("SELECT SUM(v) FROM {target}"))
-            .context("read back the distributed append")?;
+        let total = writer_optional_bigint(
+            &control
+                .execute(format!("SELECT SUM(v) FROM {target}"))
+                .context("read back the distributed append")?,
+        )?;
         if total != Some(SEED_SUM) {
             bail!("distributed append read back {total:?}; expected Some({SEED_SUM})");
         }
@@ -1310,12 +1567,10 @@ impl Scenario for DistributedStatisticsDataflow {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect native statistics control session")?,
-        )?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        context.remaining("connect native statistics control session")?;
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
 
         const CATALOG: &str = "native_statistics";
         const DATABASE: &str = "native_statistics_db";
@@ -1328,10 +1583,10 @@ impl Scenario for DistributedStatisticsDataflow {
         context.action("seed six source files for a three-backend statistics scan");
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
-            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
             .context("create native statistics database")?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {source} (v BIGINT) TBLPROPERTIES \
                  ('novarocks.statistics.collect-on-write' = 'false')"
             ))
@@ -1340,7 +1595,7 @@ impl Scenario for DistributedStatisticsDataflow {
             let low = file * SEED_ROWS_PER_FILE + 1;
             let high = (file + 1) * SEED_ROWS_PER_FILE;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {source} SELECT generate_series FROM \
                      TABLE(generate_series({low}, {high}))"
                 ))
@@ -1354,7 +1609,7 @@ impl Scenario for DistributedStatisticsDataflow {
 
         context.action("run binary ANALYZE across all three backend processes");
         control
-            .query_drop(format!("ANALYZE TABLE {source}"))
+            .execute(format!("ANALYZE TABLE {source}"))
             .context("run native distributed ANALYZE")?;
         wait_for_statistics_job_success(context, &mut control, CATALOG, DATABASE, SOURCE)?;
 
@@ -1394,7 +1649,7 @@ impl Scenario for DistributedStatisticsDataflow {
         )?;
 
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {target} (v BIGINT) TBLPROPERTIES \
                  ('novarocks.statistics.collect-on-write' = 'true')"
             ))
@@ -1409,7 +1664,7 @@ impl Scenario for DistributedStatisticsDataflow {
 
         context.action("collect statistics from the same pages written on all three backends");
         control
-            .query_drop(format!("INSERT INTO {target} SELECT v FROM {source}"))
+            .execute(format!("INSERT INTO {target} SELECT v FROM {source}"))
             .context("run native collect-on-write INSERT")?;
 
         let after = all_write_counters(context)?;
@@ -1504,7 +1759,7 @@ impl Scenario for DistributedStatisticsDataflow {
 
         context.action("seed a 1024-field source with twelve independently splittable files");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {wide_source} ({wide_schema}) TBLPROPERTIES \
                  ('novarocks.statistics.collect-on-write' = 'false')"
             ))
@@ -1513,14 +1768,14 @@ impl Scenario for DistributedStatisticsDataflow {
             let low = file * WIDE_ROWS_PER_FILE + 1;
             let high = (file + 1) * WIDE_ROWS_PER_FILE;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {wide_source} SELECT {wide_values} FROM \
                      TABLE(generate_series({low}, {high}))"
                 ))
                 .with_context(|| format!("seed wide native statistics rows {low}..{high}"))?;
         }
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {wide_target} ({wide_schema}) TBLPROPERTIES \
                  ('novarocks.statistics.collect-on-write' = 'true')"
             ))
@@ -1538,7 +1793,7 @@ impl Scenario for DistributedStatisticsDataflow {
             "collect 1024 writer aggregates through sparse multi-batch output on all backends",
         );
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {wide_target} SELECT {wide_column_names} FROM {wide_source}"
             ))
             .context("run wide native collect-on-write INSERT")?;
@@ -1636,21 +1891,21 @@ type TableStatisticsRow = (
 /// inspecting BE task admission and provider publication evidence.
 fn wait_for_statistics_job_success(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<()> {
     context.action("wait for the submitted ANALYZE job to reach SUCCEEDED");
     loop {
-        let rows: Vec<Row> = control
-            .query("SHOW ANALYZE JOBS")
+        let rows = control
+            .execute("SHOW ANALYZE JOBS")
             .context("observe submitted native distributed ANALYZE job")?;
         let mut matches = Vec::new();
-        for row in rows {
-            if analyze_job_field(&row, "catalog")?.as_deref() == Some(catalog)
-                && analyze_job_field(&row, "namespace")?.as_deref() == Some(namespace)
-                && analyze_job_field(&row, "table")?.as_deref() == Some(table)
+        for row in &rows.rows {
+            if analyze_job_field(&rows, row, "catalog")?.as_deref() == Some(catalog)
+                && analyze_job_field(&rows, row, "namespace")?.as_deref() == Some(namespace)
+                && analyze_job_field(&rows, row, "table")?.as_deref() == Some(table)
             {
                 matches.push(row);
             }
@@ -1665,10 +1920,10 @@ fn wait_for_statistics_job_success(
                 "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
             );
         }
-        let job_id = analyze_job_field(&job, "job_id")?
+        let job_id = analyze_job_field(&rows, job, "job_id")?
             .filter(|value| !value.is_empty())
             .context("ANALYZE job observation has no job_id")?;
-        let state = analyze_job_field(&job, "state")?
+        let state = analyze_job_field(&rows, job, "state")?
             .filter(|value| !value.is_empty())
             .context("ANALYZE job observation has no state")?;
         match state.as_str() {
@@ -1680,7 +1935,7 @@ fn wait_for_statistics_job_success(
                 thread::sleep(Duration::from_millis(20));
             }
             _ => {
-                let detail = analyze_job_field(&job, "error_message")?.unwrap_or_default();
+                let detail = analyze_job_field(&rows, job, "error_message")?.unwrap_or_default();
                 bail!(
                     "ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
                 );
@@ -1689,38 +1944,50 @@ fn wait_for_statistics_job_success(
     }
 }
 
-fn analyze_job_field(row: &Row, name: &str) -> Result<Option<String>> {
-    let index = row
-        .columns_ref()
+fn analyze_job_field(
+    result: &StatementResult,
+    row: &[TrinoValue],
+    name: &str,
+) -> Result<Option<String>> {
+    anyhow::ensure!(result.is_result_set(), "ANALYZE jobs must be a result set");
+    let indices = result
+        .columns
         .iter()
-        .position(|column| column.name_str().eq_ignore_ascii_case(name))
-        .with_context(|| format!("ANALYZE job observation omitted column {name}"))?;
+        .enumerate()
+        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        indices.len() == 1,
+        "ANALYZE job observation omitted or duplicated column {name}"
+    );
+    let index = indices[0];
+    anyhow::ensure!(
+        result.columns[index].type_signature.raw_type == "varchar",
+        "ANALYZE job column {name} is not its declared text"
+    );
     match row
-        .as_ref(index)
+        .get(index)
         .context("ANALYZE job observation value is missing")?
     {
-        Value::NULL => Ok(None),
-        Value::Bytes(bytes) => Ok(Some(
-            String::from_utf8(bytes.clone()).context("ANALYZE job observation is not UTF-8")?,
-        )),
-        Value::Int(value) => Ok(Some(value.to_string())),
-        Value::UInt(value) => Ok(Some(value.to_string())),
-        Value::Float(value) => Ok(Some(value.to_string())),
-        Value::Double(value) => Ok(Some(value.to_string())),
+        TrinoValue::Null => Ok(None),
+        TrinoValue::Text(value) => Ok(Some(value.clone())),
         _ => bail!("ANALYZE job observation column {name} has an unsupported value type"),
     }
 }
 
 fn assert_show_theta_statistics(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     table: &str,
     column: &str,
     expected_ndv: f64,
     label: &str,
 ) -> Result<()> {
-    let rows: Vec<TableStatisticsRow> = control
-        .query(format!("SHOW TABLE STATS {table}"))
-        .with_context(|| format!("read {label} statistics through the provider"))?;
+    let rows: Vec<TableStatisticsRow> = writer_statistics_rows(
+        &control
+            .execute(format!("SHOW TABLE STATS {table}"))
+            .with_context(|| format!("read {label} statistics through the provider"))?,
+    )?;
     let metric = format!("theta_ndv:{column}");
     let Some((_, value, status, basis_version, source, numeric_nature, basis_relation)) =
         rows.into_iter().find(|row| row.0 == metric)
@@ -1972,12 +2239,10 @@ impl Scenario for DistributedWriterOverwrite {
         require_three_backends(context)?;
         let expected_dop = require_multi_driver_host()?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect distributed overwrite control session")?,
-        )?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        context.remaining("connect distributed overwrite control session")?;
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
 
         const CATALOG: &str = "distributed_overwrite";
         const DATABASE: &str = "distributed_overwrite_db";
@@ -1995,14 +2260,14 @@ impl Scenario for DistributedWriterOverwrite {
             "distributed-writer-overwrite",
         )?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
             ))
             .context("create distributed overwrite table")?;
         // The stale content the overwrite must replace. It is written at one
         // driver so it, like the seeding writes, leaves a one-entry root peak.
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {target} SELECT generate_series FROM TABLE(generate_series(1, 7))"
             ))
             .context("seed the distributed overwrite target with stale rows")?;
@@ -2014,7 +2279,7 @@ impl Scenario for DistributedWriterOverwrite {
 
         context.action("replace the table through the distributed write dataflow");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT OVERWRITE {target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}"
             ))
             .context("distributed overwrite through the write dataflow")?;
@@ -2078,9 +2343,11 @@ impl Scenario for DistributedWriterOverwrite {
         if rows != SEED_ROWS {
             bail!("overwritten {target} has {rows} rows; expected {SEED_ROWS}");
         }
-        let total: Option<i64> = control
-            .query_first(format!("SELECT SUM(v) FROM {target}"))
-            .context("read back the distributed overwrite")?;
+        let total = writer_optional_bigint(
+            &control
+                .execute(format!("SELECT SUM(v) FROM {target}"))
+                .context("read back the distributed overwrite")?,
+        )?;
         if total != Some(SEED_SUM) {
             bail!("distributed overwrite read back {total:?}; expected Some({SEED_SUM})");
         }
@@ -2175,25 +2442,23 @@ impl Scenario for DistributedWriterRowLevel {
             small_slots::require_effective_config(context)?;
         }
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect row-level mutation control session")?,
-        )?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        context.remaining("connect row-level mutation control session")?;
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
 
         const CATALOG: &str = row_level_contract::CATALOG;
         const DATABASE: &str = row_level_contract::DATABASE;
         let warehouse = create_warehouse(context, "distributed-writer-row-level")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
-            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
             .context("create row-level mutation database")?;
 
         // A merge-on-read v3 table: DELETE writes deletion vectors.
         let dv = format!("{CATALOG}.{DATABASE}.row_level_dv");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {dv} (id BIGINT, v BIGINT) TBLPROPERTIES \
                  (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\", \
                  \"novarocks.update.mode\" = \"merge-on-read\")"
@@ -2202,7 +2467,7 @@ impl Scenario for DistributedWriterRowLevel {
         for file in 0..3 {
             let base = file * 4;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {dv} VALUES ({}, {}), ({}, {}), ({}, {}), ({}, {})",
                     base + 1,
                     base + 1,
@@ -2220,10 +2485,10 @@ impl Scenario for DistributedWriterRowLevel {
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let dv_snapshots_before = snapshot_count(&mut control, &dv)?;
-        control
-            .query_drop(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
+        let mutation_result = control
+            .execute(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
             .context("first deletion-vector DELETE")?;
-        row_level_contract::assert_affected(&control, 3, "first deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&mutation_result, 3, "first deletion-vector DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2245,19 +2510,21 @@ impl Scenario for DistributedWriterRowLevel {
                  {dv_snapshots_after} snapshots; expected exactly one"
             );
         }
-        let remaining: Vec<i64> = control
-            .query(format!("SELECT id FROM {dv} ORDER BY id"))
-            .context("read the table after the first deletion-vector DELETE")?;
+        let remaining: Vec<i64> = sql::integer_column(
+            &control
+                .execute(format!("SELECT id FROM {dv} ORDER BY id"))
+                .context("read the table after the first deletion-vector DELETE")?,
+        )?;
         if remaining != vec![2, 3, 4, 6, 7, 8, 10, 11, 12] {
             bail!("first deletion-vector DELETE left {remaining:?}");
         }
 
         context.action("merge a second delete into the existing deletion vectors");
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-        control
-            .query_drop(format!("DELETE FROM {dv} WHERE v > 10"))
+        let mutation_result = control
+            .execute(format!("DELETE FROM {dv} WHERE v > 10"))
             .context("second deletion-vector DELETE")?;
-        row_level_contract::assert_affected(&control, 2, "second deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&mutation_result, 2, "second deletion-vector DELETE")?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         assert_committed_once(
             before_terminals,
@@ -2267,9 +2534,11 @@ impl Scenario for DistributedWriterRowLevel {
         // If the backend had merged anything other than the exact references
         // the frontend froze, either the frontend would have refused this
         // commit or ids 1, 5 and 9 would be back.
-        let remaining: Vec<i64> = control
-            .query(format!("SELECT id FROM {dv} ORDER BY id"))
-            .context("read the table after the merged deletion-vector DELETE")?;
+        let remaining: Vec<i64> = sql::integer_column(
+            &control
+                .execute(format!("SELECT id FROM {dv} ORDER BY id"))
+                .context("read the table after the merged deletion-vector DELETE")?,
+        )?;
         if remaining != vec![2, 3, 4, 6, 7, 8, 10] {
             bail!(
                 "merged deletion-vector DELETE left {remaining:?}; the second delete must union \
@@ -2281,7 +2550,7 @@ impl Scenario for DistributedWriterRowLevel {
         // branch instead of the deletion-vector branch.
         let positional = format!("{CATALOG}.{DATABASE}.row_level_positional");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {positional} (id BIGINT, v BIGINT) TBLPROPERTIES \
                  (\"format-version\" = \"2\", \"novarocks.update.mode\" = \"merge-on-read\")"
             ))
@@ -2289,7 +2558,7 @@ impl Scenario for DistributedWriterRowLevel {
         for file in 0..3 {
             let base = file * 4;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {positional} VALUES ({}, {}), ({}, {}), ({}, {}), ({}, {})",
                     base + 1,
                     base + 1,
@@ -2306,10 +2575,10 @@ impl Scenario for DistributedWriterRowLevel {
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let positional_snapshots_before = snapshot_count(&mut control, &positional)?;
-        control
-            .query_drop(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
+        let mutation_result = control
+            .execute(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
             .context("position-delete DELETE")?;
-        row_level_contract::assert_affected(&control, 3, "position-delete DELETE")?;
+        row_level_contract::assert_affected(&mutation_result, 3, "position-delete DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2328,9 +2597,11 @@ impl Scenario for DistributedWriterRowLevel {
                  {positional_snapshots_after} snapshots; expected exactly one"
             );
         }
-        let remaining: Vec<i64> = control
-            .query(format!("SELECT id FROM {positional} ORDER BY id"))
-            .context("read the table after the position-delete DELETE")?;
+        let remaining: Vec<i64> = sql::integer_column(
+            &control
+                .execute(format!("SELECT id FROM {positional} ORDER BY id"))
+                .context("read the table after the position-delete DELETE")?,
+        )?;
         if remaining != vec![2, 3, 4, 6, 7, 8, 10, 11, 12] {
             bail!("position-delete DELETE left {remaining:?}");
         }
@@ -2339,7 +2610,7 @@ impl Scenario for DistributedWriterRowLevel {
         // rather than staging a delete artifact.
         let cow = format!("{CATALOG}.{DATABASE}.row_level_cow");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {cow} (id BIGINT, v BIGINT) TBLPROPERTIES \
                  (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\", \
                  \"novarocks.update.mode\" = \"copy-on-write\")"
@@ -2348,7 +2619,7 @@ impl Scenario for DistributedWriterRowLevel {
         for file in 0..3 {
             let base = file * 4;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {cow} VALUES ({}, {}), ({}, {}), ({}, {}), ({}, {})",
                     base + 1,
                     base + 1,
@@ -2365,12 +2636,12 @@ impl Scenario for DistributedWriterRowLevel {
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let cow_snapshots_before = snapshot_count(&mut control, &cow)?;
-        control
-            .query_drop(format!(
+        let mutation_result = control
+            .execute(format!(
                 "UPDATE {cow} SET v = v + 100 WHERE id IN (1, 5, 9)"
             ))
             .context("copy-on-write UPDATE")?;
-        row_level_contract::assert_affected(&control, 3, "copy-on-write UPDATE")?;
+        row_level_contract::assert_affected(&mutation_result, 3, "copy-on-write UPDATE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2388,9 +2659,11 @@ impl Scenario for DistributedWriterRowLevel {
                  {cow_snapshots_after} snapshots; expected exactly one"
             );
         }
-        let updated: Vec<i64> = control
-            .query(format!("SELECT v FROM {cow} ORDER BY id"))
-            .context("read the table after the copy-on-write UPDATE")?;
+        let updated: Vec<i64> = sql::integer_column(
+            &control
+                .execute(format!("SELECT v FROM {cow} ORDER BY id"))
+                .context("read the table after the copy-on-write UPDATE")?,
+        )?;
         if updated != vec![101, 2, 3, 4, 105, 6, 7, 8, 109, 10, 11, 12] {
             bail!("copy-on-write UPDATE left {updated:?}");
         }
@@ -2399,13 +2672,13 @@ impl Scenario for DistributedWriterRowLevel {
         // Both must publish under one snapshot or the statement was not atomic.
         let merge_source = format!("{CATALOG}.{DATABASE}.row_level_merge_source");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {merge_source} (id BIGINT, v BIGINT) TBLPROPERTIES \
                  (\"format-version\" = \"3\", \"write.row-lineage\" = \"true\")"
             ))
             .context("create merge source table")?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {merge_source} VALUES (2, 2000), (99, 9900)"
             ))
             .context("seed merge source rows")?;
@@ -2413,15 +2686,15 @@ impl Scenario for DistributedWriterRowLevel {
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let merge_snapshots_before = snapshot_count(&mut control, &dv)?;
-        control
-            .query_drop(format!(
+        let mutation_result = control
+            .execute(format!(
                 "MERGE INTO {dv} AS t USING {merge_source} AS s ON t.id = s.id \
                  WHEN MATCHED THEN UPDATE SET v = s.v \
                  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
             ))
             .context("MERGE across the delete and data branches")?;
         row_level_contract::assert_affected(
-            &control,
+            &mutation_result,
             2,
             "MERGE across the delete and data branches",
         )?;
@@ -2443,9 +2716,11 @@ impl Scenario for DistributedWriterRowLevel {
                  snapshots; a delete branch and a data branch must fold into exactly one"
             );
         }
-        let merged: Vec<(i64, i64)> = control
-            .query(format!("SELECT id, v FROM {dv} ORDER BY id"))
-            .context("read the table after the MERGE")?;
+        let merged: Vec<(i64, i64)> = writer_bigint_pairs(
+            &control
+                .execute(format!("SELECT id, v FROM {dv} ORDER BY id"))
+                .context("read the table after the MERGE")?,
+        )?;
         if merged
             != vec![
                 (2, 2000),
@@ -2867,8 +3142,9 @@ impl Scenario for DistributedWriterFaults {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
 
         const CATALOG: &str = "distributed_writer_faults";
         const DATABASE: &str = "distributed_writer_fault_db";
@@ -2888,7 +3164,7 @@ impl Scenario for DistributedWriterFaults {
         )?;
         seed_delay_source_files(&mut control, CATALOG, DATABASE, DELAY_SOURCE)?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT) \
                  TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
             ))
@@ -2923,7 +3199,7 @@ impl Scenario for DistributedWriterFaults {
                 // This owned table has exactly one future writer, the frozen
                 // original INSERT below. No old case can contribute a file.
                 control
-                    .query_drop(format!(
+                    .execute(format!(
                         "CREATE TABLE {case_target} (v BIGINT) \
                      TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
                     ))
@@ -3005,14 +3281,15 @@ impl Scenario for DistributedWriterFaults {
                 bail!("{case} did not fail the write");
             };
             if matches!(&fault, WriteFault::DeadlineAbort) {
-                let mysql::Error::MySqlError(error) = &error else {
+                let StatementFailure::Trino(error) = &error else {
                     bail!(
                         "{case} did not return its complete public SQL deadline error: {error:?}"
                     );
                 };
                 anyhow::ensure!(
-                    error.code == 1317
-                        && error.state == "70100"
+                    error.error_code == 131075
+                        && error.error_name == "EXCEEDED_TIME_LIMIT"
+                        && error.error_type == "INSUFFICIENT_RESOURCES"
                         && exact_uncommitted_write_publication_message(
                             &error.message,
                             "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
@@ -3087,7 +3364,7 @@ impl Scenario for DistributedWriterFaults {
         // rather than only about the catalog.
         context.action("write successfully after the fault matrix");
         control
-            .query_drop(&insert)
+            .execute(&insert)
             .context("write after the distributed writer fault matrix")?;
         let rows = row_count(&mut control, &target)?;
         if rows != SEED_ROWS {
@@ -3182,10 +3459,10 @@ fn capture_original_write_window(context: &mut ScenarioContext) -> Result<Origin
 fn settle_observed_writer(
     write: WriterActor,
     context: &mut ScenarioContext,
-    primary: Result<mysql::Result<()>>,
+    primary: Result<std::result::Result<StatementResult, StatementFailure>>,
     before_reentry: impl FnOnce(&mut ScenarioContext) -> Result<OriginalWriteWindow>,
 ) -> Result<(
-    mysql::Result<()>,
+    std::result::Result<StatementResult, StatementFailure>,
     Option<QueryLifecycleStructuredSnapshot>,
     OriginalWriteWindow,
 )> {
@@ -3217,7 +3494,7 @@ fn run_faulted_write(
     selected: SelectedStatement,
     before_reentry: impl FnOnce(&mut ScenarioContext) -> Result<OriginalWriteWindow>,
 ) -> Result<(
-    Result<(), mysql::Error>,
+    std::result::Result<StatementResult, StatementFailure>,
     Option<QueryLifecycleStructuredSnapshot>,
     OriginalWriteWindow,
 )> {
@@ -3358,9 +3635,8 @@ fn run_faulted_write(
                     "a task admitted for the write this case aborts",
                 )?;
                 let deadline = context.deadline();
-                context
-                    .handle()
-                    .kill_query_until(write.connection_id, deadline)
+                write
+                    .cancel(deadline)
                     .context("abort the in-flight distributed write")?;
                 write
                     .done
@@ -3395,21 +3671,30 @@ fn run_faulted_write(
         }
         _ => {
             let deadline = context.deadline();
-            let mut connection = mysql_actor::connect_until(user, port, deadline)?;
-            let observation = match selected.arm(context, connection.connection_id(), insert) {
-                Ok(observation) => observation,
-                Err(primary) => {
-                    return writer_statement_actor::combine(Err(primary), connection.finish());
-                }
+            let mut connection = SqlSession::new(user, port, deadline)?;
+            let pending = connection.submit(insert)?;
+            let cancel = pending.cancel_handle();
+            let (pending, observation) = selected.arm_pending(context, pending, insert)?;
+            let outcome = connection.run_pending(pending);
+            let client_cleanup = if matches!(&outcome, Err(error) if !matches!(error, StatementFailure::Trino(_)))
+            {
+                let cancelled = cancel.delete(deadline).map_err(anyhow::Error::from);
+                let shutdown = if cancelled.is_err() {
+                    context.shutdown()
+                } else {
+                    Ok(())
+                };
+                writer_statement_actor::combine(cancelled, shutdown)
+            } else {
+                Ok(())
             };
-            let outcome = connection.query_drop(insert);
             let mut accepted = None;
             let terminal = match &outcome {
-                Ok(()) => context
+                Ok(_) => context
                     .handle()
                     .await_query_lifecycle_statement_observation(&observation, true, deadline)
                     .map(|_| ()),
-                Err(mysql::Error::MySqlError(_)) => context
+                Err(StatementFailure::Trino(_)) => context
                     .handle()
                     .await_query_lifecycle_statement_observation(&observation, false, deadline)
                     .map(|snapshot| accepted = Some(snapshot)),
@@ -3418,41 +3703,36 @@ fn run_faulted_write(
             // Keep the original connection idle until its writer-only facts
             // are frozen. Do not subtract an assumed Root for later SELECT 1.
             let original_window = terminal.and_then(|_| before_reentry(context));
-            let reentry = if matches!(&outcome, Err(mysql::Error::MySqlError(_))) {
+            let reentry = if matches!(&outcome, Err(StatementFailure::Trino(_))) {
                 writer_statement_actor::require_public_error_reentry(&mut connection)
             } else {
                 Ok(())
             };
-            let drain = if outcome.is_ok() {
-                context
-                    .handle()
-                    .drain_query_lifecycle_statement_observation(&observation)
-            } else {
-                context
-                    .handle()
-                    .drain_query_lifecycle_statement_binding(&observation, deadline)
-            };
+            let drain = context
+                .handle()
+                .drain_query_lifecycle_statement_binding(&observation, deadline);
             let (original_window, observed) = match original_window {
                 Ok(window) => (Some(window), Ok(())),
                 Err(error) => (None, Err(error)),
             };
             let primary = match outcome {
-                Err(error) if !matches!(&error, mysql::Error::MySqlError(_)) => Err(error.into()),
+                Err(error) if !matches!(&error, StatementFailure::Trino(_)) => Err(error.into()),
                 outcome => Ok(outcome),
             };
             let cleanup = writer_statement_actor::combine(
                 observed,
-                writer_statement_actor::combine(reentry, drain),
+                writer_statement_actor::combine(
+                    client_cleanup,
+                    writer_statement_actor::combine(reentry, drain),
+                ),
             );
-            retain_write_result(retain_write_result(primary, cleanup), connection.finish()).map(
-                |outcome| {
-                    (
-                        outcome,
-                        accepted,
-                        original_window.expect("a successful observation precedes reentry"),
-                    )
-                },
-            )
+            retain_write_result(primary, cleanup).map(|outcome| {
+                (
+                    outcome,
+                    accepted,
+                    original_window.expect("a successful observation precedes reentry"),
+                )
+            })
         }
     }
 }
@@ -3462,7 +3742,7 @@ fn run_faulted_write(
 fn assert_sealed_root_read_failure(
     context: &mut ScenarioContext,
     fault: &WriteFault,
-    outcome: &mysql::Result<()>,
+    outcome: &std::result::Result<StatementResult, StatementFailure>,
     snapshot: Option<&QueryLifecycleStructuredSnapshot>,
     selected: &SelectedStatement,
 ) -> Result<()> {
@@ -3480,12 +3760,13 @@ fn assert_sealed_root_read_failure(
     // The native convergence snapshot observes only the Task protocol's
     // terminal, not the logical actor's independent Root read failure. Check
     // that failure at its actual public boundary before inspecting the snapshot.
-    let Err(mysql::Error::MySqlError(error)) = outcome else {
+    let Err(StatementFailure::Trino(error)) = outcome else {
         bail!("Root read action did not return its original SQL error: {outcome:?}");
     };
     anyhow::ensure!(
-        error.code == 1105
-            && error.state == "HY000"
+        error.error_code == 65536
+            && error.error_name == "GENERIC_INTERNAL_ERROR"
+            && error.error_type == "INTERNAL_ERROR"
             && exact_uncommitted_write_publication_message(
                 &error.message,
                 &format!("[query.execution.unexpected] {detail}")
@@ -3730,7 +4011,9 @@ fn exact_uncommitted_write_publication_message(message: &str, public_message: &s
     let prefix = format!("{public_message} (lake publication id=");
     let Some(publication) = message
         .strip_prefix(prefix.as_str())
-        .and_then(|rest| rest.strip_suffix(" family=write disposition=KnownUncommitted)"))
+        .and_then(|rest| {
+            rest.strip_suffix(" family=write disposition=KnownUncommitted) (external effect disposition=KnownUncommitted)")
+        })
         .and_then(|id| {
             id.parse::<novarocks_spi::connector::LakePublicationId>()
                 .ok()
@@ -3742,13 +4025,13 @@ fn exact_uncommitted_write_publication_message(message: &str, public_message: &s
     // fields, noncanonical IDs, changed descriptors and any trailing text.
     message
         == format!(
-            "{public_message} (lake publication id={publication} family=write disposition=KnownUncommitted)"
+            "{public_message} (lake publication id={publication} family=write disposition=KnownUncommitted) (external effect disposition=KnownUncommitted)"
         )
 }
 
 fn assert_connector_failure(
     context: &mut ScenarioContext,
-    outcome: &Result<(), mysql::Error>,
+    outcome: &std::result::Result<StatementResult, StatementFailure>,
     snapshot: Option<&QueryLifecycleStructuredSnapshot>,
     expected: FailureFact,
     case: &str,
@@ -3797,7 +4080,7 @@ fn assert_connector_failure(
         connector_neutral_detail(detail, expected),
         "{case}: accepted detail is not its exact neutral fact/location summary: {detail:?}"
     );
-    let Err(mysql::Error::MySqlError(error)) = outcome else {
+    let Err(StatementFailure::Trino(error)) = outcome else {
         bail!("{case}: expected the original complete public SQL execution error, got {outcome:?}");
     };
     let descriptor = match expected.class() {
@@ -3807,9 +4090,17 @@ fn assert_connector_failure(
     };
     let public_message = format!("[{descriptor}] {detail}");
     anyhow::ensure!(
-        error.code == 1105
-            && error.state == "HY000"
-            && exact_uncommitted_write_publication_message(&error.message, &public_message),
+        match expected.class() {
+            FailureClass::Unexpected =>
+                error.error_code == 65536
+                    && error.error_name == "GENERIC_INTERNAL_ERROR"
+                    && error.error_type == "INTERNAL_ERROR",
+            FailureClass::Data =>
+                error.error_code == 0
+                    && error.error_name == "GENERIC_USER_ERROR"
+                    && error.error_type == "USER_ERROR",
+            _ => false,
+        } && exact_uncommitted_write_publication_message(&error.message, &public_message),
         "{case}: SQL code/state/detail differs from the accepted Connector failure: {error:?}"
     );
     Ok(())
@@ -4042,7 +4333,7 @@ mod controlled_writer_tests {
             "[query.execution.deadline_exceeded] logical execution deadline expired before success EOF",
         ] {
             let complete = format!(
-                "{public} (lake publication id={id} family=write disposition=KnownUncommitted)"
+                "{public} (lake publication id={id} family=write disposition=KnownUncommitted) (external effect disposition=KnownUncommitted)"
             );
             assert!(exact_uncommitted_write_publication_message(
                 &complete, public
@@ -4052,6 +4343,16 @@ mod controlled_writer_tests {
                 complete.replace("family=write", "family=data_mutation"),
                 complete.replace("KnownUncommitted", "CommitUnknown"),
                 complete.replace("KnownUncommitted", "CommittedSucceeded"),
+                complete.replace(" (external effect disposition=KnownUncommitted)", ""),
+                complete.replace(
+                    "external effect disposition=KnownUncommitted",
+                    "external effect disposition=CommitUnknown",
+                ),
+                complete.replace(
+                    "external effect disposition=KnownUncommitted",
+                    "external effect disposition=CommittedSucceeded",
+                ),
+                format!("{complete} (external effect disposition=KnownUncommitted)"),
                 complete.replace(id, "not-a-publication-id"),
                 complete.replace(id, "018f1f07-1234-4000-8000-00000000000a"),
                 complete.replace(id, &id.to_uppercase()),

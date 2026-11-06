@@ -1240,7 +1240,7 @@ mod tests {
         let bound = crate::parser::load_sql_case_from_file(hms_source, &meta, &marker, &hms_vars)
             .unwrap()
             .unwrap();
-        assert_eq!(bound.steps.len(), 59);
+        assert_eq!(bound.steps.len(), 61);
         assert!(
             bound.steps[1]
                 .sql
@@ -1257,6 +1257,18 @@ mod tests {
                 .contains(" FOR VERSION AS OF 731 ORDER BY id;")
         );
         assert!(!bound.steps[11].sql.contains("${hms_first_snapshot_id}"));
+        assert_eq!(bound.steps[57].query_number, 58);
+        assert!(
+            bound.steps[57]
+                .sql
+                .contains(&format!("FROM {sealed_catalog}.information_schema.tables"))
+        );
+        assert_eq!(bound.steps[58].query_number, 59);
+        assert_eq!(bound.steps[58].sql, "SHOW VIEWS;");
+        assert_eq!(bound.steps[59].query_number, 60);
+        assert!(bound.steps[59].meta.cleanup);
+        assert_eq!(bound.steps[60].query_number, 61);
+        assert!(bound.steps[60].meta.cleanup);
         let expected_uri = format!("{syntax_warehouse}/iru7/{}/v1/data", namespaces[&base]);
         assert!(
             bound.steps[39]

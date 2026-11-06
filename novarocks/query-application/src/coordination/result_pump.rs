@@ -1870,8 +1870,10 @@ fn work_failure(error: WorkError) -> RootResultFetchFailure {
 fn cancellation_failure(reason: CancellationReason) -> RootResultFetchFailure {
     use crate::execution_error::QueryFailureReason;
     match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => query_failure(
+        CancellationReason::FrontendDrainDeadlineExceeded => RootResultFetchFailure::from_input(
+            crate::session_outcome::governed_cancellation_failure_input(reason),
+        ),
+        CancellationReason::DeadlineExceeded => query_failure(
             QueryFailureReason::DeadlineExceeded,
             "logical execution deadline expired while pumping results",
         ),
@@ -1909,6 +1911,21 @@ fn classify_root_termination(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn result_pump_keeps_the_original_frontend_drain_reason() {
+        let reason = CancellationReason::FrontendDrainDeadlineExceeded;
+        let failure = cancellation_failure(reason.clone());
+        assert_eq!(
+            failure.input(),
+            &crate::session_outcome::governed_cancellation_failure_input(reason)
+        );
+        let deadline = cancellation_failure(CancellationReason::DeadlineExceeded);
+        assert_eq!(
+            deadline.input().detail().as_str(),
+            "logical execution deadline expired while pumping results"
+        );
+    }
+
     #[test]
     fn actor_boundary_preserves_nested_fact_and_stopped_observation() {
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};

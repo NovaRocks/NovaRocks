@@ -71,7 +71,6 @@ pub enum OpaqueRenderType {
 /// A statement's immutable client encoding selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientPresentationFamily {
-    MysqlText,
     TrinoJson(TrinoJsonFacts),
 }
 /// Client capabilities which affect Trino type signatures and value encoding.
@@ -83,20 +82,6 @@ pub struct TrinoJsonFacts {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RenderPresentation {
-    ScalarText,
-    TimestampUtcMicros,
-    /// Existing MySQL container timestamp presentation preserves the frozen
-    /// native unit and timezone text, unlike top-level UTC microsecond cells.
-    TimestampContainerText,
-    JsonText,
-    VariantSerializedBytes,
-    /// The frontend freezes its presentation offset once. Pure encoders must
-    /// never read a backend's local timezone or clock.
-    VariantJson {
-        timezone_offset_seconds: i32,
-    },
-    OpaqueNull,
-    MysqlContainer,
     TrinoValue,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,51 +266,6 @@ impl SchemaBounds {
                     return Err(RootContractError::UnsupportedRenderType);
                 }
             }
-            ClientPresentationFamily::MysqlText => {
-                match (&field.native_type, &field.presentation) {
-                    (
-                        NativeRenderType::Timestamp { .. },
-                        RenderPresentation::TimestampUtcMicros
-                        | RenderPresentation::TimestampContainerText,
-                    )
-                    | (NativeRenderType::Json, RenderPresentation::JsonText)
-                    | (
-                        NativeRenderType::Variant,
-                        RenderPresentation::VariantSerializedBytes
-                        | RenderPresentation::VariantJson { .. },
-                    )
-                    | (NativeRenderType::Opaque(_), RenderPresentation::OpaqueNull)
-                    | (
-                        NativeRenderType::List(_)
-                        | NativeRenderType::Map { .. }
-                        | NativeRenderType::Struct(_),
-                        RenderPresentation::MysqlContainer,
-                    ) => {}
-                    (
-                        NativeRenderType::Null
-                        | NativeRenderType::Boolean
-                        | NativeRenderType::SignedInteger(_)
-                        | NativeRenderType::UnsignedInteger(_)
-                        | NativeRenderType::LargeInt
-                        | NativeRenderType::Float32
-                        | NativeRenderType::Float64
-                        | NativeRenderType::Decimal { .. }
-                        | NativeRenderType::String
-                        | NativeRenderType::Binary
-                        | NativeRenderType::Date
-                        | NativeRenderType::Time { .. },
-                        RenderPresentation::ScalarText,
-                    ) => {}
-                    _ => return Err(RootContractError::UnsupportedRenderType),
-                }
-            }
-        }
-        if let RenderPresentation::VariantJson {
-            timezone_offset_seconds,
-        } = field.presentation
-            && !(-86_399..=86_399).contains(&timezone_offset_seconds)
-        {
-            return Err(RootContractError::UnsupportedRenderType);
         }
         match &field.native_type {
             NativeRenderType::SignedInteger(bits) | NativeRenderType::UnsignedInteger(bits)
@@ -397,7 +337,7 @@ mod tests {
             source_slot: None,
             name: "same".into(),
             field: RenderField {
-                presentation: RenderPresentation::ScalarText,
+                presentation: RenderPresentation::TrinoValue,
                 nullable: true,
                 native_type,
             },
@@ -409,94 +349,7 @@ mod tests {
         out
     }
     #[test]
-    fn mysql_presentations_keep_their_existing_type_pairs() {
-        let scalar = column(0, NativeRenderType::String).field;
-        let pairs = vec![
-            (NativeRenderType::String, RenderPresentation::ScalarText),
-            (NativeRenderType::LargeInt, RenderPresentation::ScalarText),
-            (
-                NativeRenderType::UnsignedInteger(64),
-                RenderPresentation::ScalarText,
-            ),
-            (
-                NativeRenderType::Decimal {
-                    bits: 256,
-                    precision: 76,
-                    scale: 9,
-                },
-                RenderPresentation::ScalarText,
-            ),
-            (
-                NativeRenderType::Timestamp {
-                    unit: RenderTimeUnit::Microsecond,
-                    timezone: None,
-                },
-                RenderPresentation::TimestampUtcMicros,
-            ),
-            (
-                NativeRenderType::Timestamp {
-                    unit: RenderTimeUnit::Nanosecond,
-                    timezone: Some("UTC".into()),
-                },
-                RenderPresentation::TimestampContainerText,
-            ),
-            (NativeRenderType::Json, RenderPresentation::JsonText),
-            (
-                NativeRenderType::Variant,
-                RenderPresentation::VariantSerializedBytes,
-            ),
-            (
-                NativeRenderType::Variant,
-                RenderPresentation::VariantJson {
-                    timezone_offset_seconds: 28800,
-                },
-            ),
-            (
-                NativeRenderType::Opaque(OpaqueRenderType::Bitmap),
-                RenderPresentation::OpaqueNull,
-            ),
-            (
-                NativeRenderType::List(Box::new(scalar.clone())),
-                RenderPresentation::MysqlContainer,
-            ),
-            (
-                NativeRenderType::Map {
-                    key: Box::new(scalar.clone()),
-                    value: Box::new(scalar.clone()),
-                },
-                RenderPresentation::MysqlContainer,
-            ),
-            (
-                NativeRenderType::Struct(vec![NamedRenderField {
-                    name: "field".into(),
-                    field: scalar,
-                }]),
-                RenderPresentation::MysqlContainer,
-            ),
-        ];
-        for (native_type, presentation) in pairs {
-            let mut column = column(0, native_type);
-            column.field.presentation = presentation;
-            assert!(
-                ClientRenderSchema::try_new(
-                    ClientPresentationFamily::MysqlText,
-                    vec![column.clone()],
-                    1
-                )
-                .is_ok()
-            );
-            assert_eq!(
-                ClientRenderSchema::try_new(
-                    ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
-                    vec![column],
-                    1
-                ),
-                Err(RootContractError::UnsupportedRenderType)
-            );
-        }
-    }
-    #[test]
-    fn presentation_families_accept_their_own_type_vocabulary() {
+    fn trino_accepts_its_explicit_type_vocabulary() {
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
             parametric_datetime: true,
             variant: true,
@@ -561,18 +414,10 @@ mod tests {
                 ClientRenderSchema::try_new(family, vec![trino_column(ty.clone())], 1).unwrap();
             assert_eq!(schema.family(), &family);
             assert_eq!(schema.columns()[0].field.native_type, ty);
-            assert_eq!(
-                ClientRenderSchema::try_new(
-                    ClientPresentationFamily::MysqlText,
-                    vec![trino_column(ty)],
-                    1
-                ),
-                Err(RootContractError::UnsupportedRenderType)
-            );
         }
     }
     #[test]
-    fn trino_refuses_unmapped_types_and_mixed_nested_presentations() {
+    fn trino_refuses_unmapped_types_at_root_and_nested_occurrences() {
         let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default());
         let mut unsupported = vec![
             NativeRenderType::LargeInt,
@@ -594,20 +439,16 @@ mod tests {
             unsupported.push(NativeRenderType::Opaque(kind));
         }
         for ty in unsupported {
-            assert_eq!(
-                ClientRenderSchema::try_new(family, vec![trino_column(ty)], 1),
-                Err(RootContractError::UnsupportedRenderType)
-            );
+            for native_type in [
+                ty.clone(),
+                NativeRenderType::List(Box::new(trino_column(ty).field)),
+            ] {
+                assert_eq!(
+                    ClientRenderSchema::try_new(family, vec![trino_column(native_type)], 1),
+                    Err(RootContractError::UnsupportedRenderType)
+                );
+            }
         }
-        assert_eq!(
-            ClientRenderSchema::try_new(family, vec![column(0, NativeRenderType::String)], 1),
-            Err(RootContractError::UnsupportedRenderType)
-        );
-        let mixed = NativeRenderType::List(Box::new(column(0, NativeRenderType::String).field));
-        assert_eq!(
-            ClientRenderSchema::try_new(family, vec![trino_column(mixed)], 1),
-            Err(RootContractError::UnsupportedRenderType)
-        );
     }
     #[test]
     fn trino_decimal_precision_limit_applies_recursively_and_preserves_width() {
@@ -655,14 +496,18 @@ mod tests {
             column(1, NativeRenderType::String),
         ];
         assert_eq!(
-            ClientRenderSchema::try_new(ClientPresentationFamily::MysqlText, columns.clone(), 2)
-                .unwrap()
-                .columns(),
+            ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+                columns.clone(),
+                2
+            )
+            .unwrap()
+            .columns(),
             columns
         );
         assert_eq!(
             ClientRenderSchema::try_new(
-                ClientPresentationFamily::MysqlText,
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
                 vec![column(2, NativeRenderType::String)],
                 2
             ),
@@ -676,7 +521,7 @@ mod tests {
         let mut second = column(1, NativeRenderType::String);
         second.source_slot = Some(11);
         let schema = ClientRenderSchema::try_new(
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
             vec![first, second],
             2,
         )
@@ -691,7 +536,7 @@ mod tests {
             Err(RootContractError::InvalidSchema)
         );
         let local = ClientRenderSchema::try_new(
-            ClientPresentationFamily::MysqlText,
+            ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
             vec![column(0, NativeRenderType::String)],
             1,
         )
@@ -707,7 +552,11 @@ mod tests {
         col.name = String::with_capacity(RootProfileV1::SCHEMA_BACKING_BYTES + 1);
         col.name.push('x');
         assert_eq!(
-            ClientRenderSchema::try_new(ClientPresentationFamily::MysqlText, vec![col], 1),
+            ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+                vec![col],
+                1
+            ),
             Err(RootContractError::SchemaLimit)
         );
         for ty in [
@@ -725,7 +574,7 @@ mod tests {
         ] {
             assert_eq!(
                 ClientRenderSchema::try_new(
-                    ClientPresentationFamily::MysqlText,
+                    ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
                     vec![column(0, ty)],
                     1
                 ),
@@ -735,19 +584,19 @@ mod tests {
         let mut ty = NativeRenderType::String;
         for _ in 0..RootProfileV1::MAX_DEPTH {
             ty = NativeRenderType::List(Box::new(RenderField {
-                presentation: if matches!(ty, NativeRenderType::List(_)) {
-                    RenderPresentation::MysqlContainer
-                } else {
-                    RenderPresentation::ScalarText
-                },
+                presentation: RenderPresentation::TrinoValue,
                 nullable: true,
                 native_type: ty,
             }));
         }
         let mut col = column(0, ty);
-        col.field.presentation = RenderPresentation::MysqlContainer;
+        col.field.presentation = RenderPresentation::TrinoValue;
         assert_eq!(
-            ClientRenderSchema::try_new(ClientPresentationFamily::MysqlText, vec![col], 1),
+            ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+                vec![col],
+                1
+            ),
             Err(RootContractError::SchemaLimit)
         );
     }

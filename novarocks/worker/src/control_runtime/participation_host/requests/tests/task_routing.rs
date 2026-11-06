@@ -146,6 +146,22 @@ fn closed_task_admission_keeps_the_original_request_routable_until_unused_retire
 
 #[test]
 fn closed_task_read_keeps_one_original_r_and_expires_before_the_actual_read_seal() {
+    closed_task_command_expires_before_read_seal(|task| ParticipationCommand::GetFinalInfo {
+        task,
+    });
+}
+
+#[test]
+fn closed_task_cancel_keeps_one_original_r_and_expires_before_the_actual_read_seal() {
+    closed_task_command_expires_before_read_seal(|task| ParticipationCommand::Cancel {
+        task,
+        reason: novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+    });
+}
+
+fn closed_task_command_expires_before_read_seal(
+    command: impl FnOnce(TaskIdentity) -> ParticipationCommand,
+) {
     let (mut f, task, mut preparation) = accepted_task_fixture();
     let ready = ready(&f, 1);
     let operation = operation(123);
@@ -199,8 +215,7 @@ fn closed_task_read_keeps_one_original_r_and_expires_before_the_actual_read_seal
                 deadline,
             )
             .unwrap();
-        host.submit_deferred_task_read(work, ParticipationCommand::GetFinalInfo { task })
-            .unwrap();
+        host.submit_deferred_task_read(work, command(task)).unwrap();
         (work, handle)
     };
     let original = handle.request();
@@ -251,6 +266,100 @@ fn closed_task_read_keeps_one_original_r_and_expires_before_the_actual_read_seal
     assert!(host.task_read_waiters.is_empty_for_test());
     drop(host);
     finish_task_fixture(f, task);
+}
+
+#[test]
+fn refused_seal_continuation_keeps_owner_failure_and_original_r_until_delivery_exits() {
+    use novarocks_worker_protocol::participation::TaskReadCommand;
+
+    let mut f = original_participation(1);
+    let ready = ready(&f, 1);
+    let operation = operation(124);
+    let deadline = MonotonicInstant::from_origin(Duration::from_secs(5));
+    let address = f.service.participation(f.identity).unwrap();
+    let (work, mut handle) = address
+        .lock()
+        .unwrap()
+        .admit_request(
+            &ready,
+            ActorId::new(91).unwrap(),
+            InputClass::Control,
+            operation,
+            deadline,
+        )
+        .unwrap();
+    let original = handle.request();
+    let failure = failure_publications::actual_failure(&mut f);
+    let failure_input = failure.input;
+    {
+        let mut host = address.lock().unwrap();
+        // The original neutral input fails at the actual mailbox fill. No
+        // Task command or read-seal continuation reaches the failed Core.
+        let refused = host
+            .submit_request(
+                work,
+                ParticipationCommand::AwaitTaskReadSeal {
+                    task: task(f.identity, 1),
+                    command: TaskReadCommand::Cancel {
+                        reason: novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                    },
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            refused.error,
+            ParticipationRequestError::ActorTurn(ActorTurnError::ActorFailed)
+        ));
+        assert!(
+            f.runtime
+                .input_custody(participation_actor(), original.token)
+                .unwrap()
+                .is_some_and(
+                    |input| input.phase == novarocks_control_runtime::actor_turn::InputPhase::Bound
+                )
+        );
+        host.begin_failure_publications(failure).unwrap();
+    }
+    assert!(failure_publications::drain_one_unit_turns(&mut f, failure_input).0);
+    let delivery = handle
+        .try_take()
+        .expect("the original failed-owner outbox is committed");
+    assert_eq!(delivery.request(), original);
+    assert!(matches!(
+        delivery.body(),
+        ParticipationReplyBody::Verdict(RequestResult::Outcome(OperationOutcome::OwnerFailed))
+    ));
+    {
+        let mut host = address.lock().unwrap();
+        // Drive the same failed-input consumer as the physical handoff owner.
+        // Publication alone does not consume this refused original input.
+        let failure = host.resources.failure.take().unwrap();
+        let stage = failure.drained().unwrap();
+        assert!(
+            host.advance_refused_neutral_inputs(&stage, &mut None, 1)
+                .unwrap()
+        );
+        host.resources.failure = Some(failure);
+    }
+    assert!(
+        f.runtime
+            .input_custody(participation_actor(), original.token)
+            .unwrap()
+            .is_some_and(|input| input.phase
+                == novarocks_control_runtime::actor_turn::InputPhase::AbandonedByOwnerFailure)
+    );
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
+    assert!(
+        !advance(&mut f, work),
+        "the actual external delivery is still held"
+    );
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 1);
+    drop((delivery, handle));
+    assert!(advance(&mut f, work));
+    assert_eq!(f.ledger.used(Dimension::Requests.id()), 0);
+    assert_eq!(ready.registered(), 0);
+    assert!(address.lock().unwrap().resources.requests.is_empty());
+    failure_publications::finish_failed_fixture(f, failure_input);
 }
 
 #[test]

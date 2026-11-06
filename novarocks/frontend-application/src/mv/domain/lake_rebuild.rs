@@ -99,29 +99,12 @@ pub fn rebuild_imv_cache_from_catalogs(
     ctx: &LakeRebuildContext<'_>,
     instance_ids: &[ConnectorInstanceId],
 ) -> Result<(), String> {
-    rebuild_imv_cache_from_catalogs_inner(
-        ctx,
-        instance_ids,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        None,
-    )
-}
-
-#[cfg(feature = "mem-1-m07-hms-listing-observe")]
-pub(crate) fn rebuild_imv_cache_from_catalogs_observed(
-    ctx: &LakeRebuildContext<'_>,
-    instance_ids: &[ConnectorInstanceId],
-    sweep: Option<&crate::catalog_application::admission_completion::Sweep>,
-) -> Result<(), String> {
-    rebuild_imv_cache_from_catalogs_inner(ctx, instance_ids, sweep)
+    rebuild_imv_cache_from_catalogs_inner(ctx, instance_ids)
 }
 
 fn rebuild_imv_cache_from_catalogs_inner(
     ctx: &LakeRebuildContext<'_>,
     instance_ids: &[ConnectorInstanceId],
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")] sweep: Option<
-        &crate::catalog_application::admission_completion::Sweep,
-    >,
 ) -> Result<(), String> {
     let context = crate::connector::connector_request_context(
         None,
@@ -136,26 +119,17 @@ fn rebuild_imv_cache_from_catalogs_inner(
             ctx.connector_control,
             instance_id,
             context.clone(),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            sweep,
         ) {
             Ok(discovered) => discovered,
             Err(error) => {
                 quarantine_catalog_after_discovery_failure(ctx, instance_id, &error)?;
-                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                if let Some(sweep) = sweep {
-                    sweep.quarantined(error.kind());
-                }
+
                 continue;
             }
         };
         let targets = match discovered {
             ManagedMvDiscovery::Complete(targets) => targets,
             ManagedMvDiscovery::Incomplete(reason) => {
-                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                if let Some(sweep) = sweep {
-                    sweep.failed();
-                }
                 ctx.readiness
                     .quarantine_catalog(
                         instance_id.as_str(),
@@ -182,10 +156,6 @@ fn rebuild_imv_cache_from_catalogs_inner(
             // them missing, and nothing says which.
             if let Err(error) = rediscover_one_target(ctx, &source, &context, &discovered, &target)
             {
-                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                if let Some(sweep) = sweep {
-                    sweep.failed();
-                }
                 tracing::warn!(
                     catalog = instance_id.as_str(),
                     mv_target = target.name(),
@@ -444,18 +414,9 @@ fn discover_managed_mv_targets(
     controls: &dyn ConnectorControlResolver,
     instance_id: &ConnectorInstanceId,
     context: ConnectorRequestContext,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")] sweep: Option<
-        &crate::catalog_application::admission_completion::Sweep,
-    >,
 ) -> Result<ManagedMvDiscovery, ConnectorError> {
     let planning = controls.acquire_current(instance_id)?;
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    if let Some(sweep) = sweep {
-        match planning.binding().catalog_handle() {
-            Ok(handle) => sweep.bound(handle, planning.binding().incarnation()),
-            Err(_) => sweep.failed(),
-        }
-    }
+
     if planning.binding().descriptor().instance_id != *instance_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,

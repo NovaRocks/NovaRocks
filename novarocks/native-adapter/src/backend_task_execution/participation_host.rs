@@ -27,21 +27,15 @@
 //! *whether* a participation establishes, advances, or retires, and this host only
 //! carries out the decision it was handed.
 //!
-//! # Why every install is mirrored by per-participation state
+//! # Materialization, stop and release
 //!
-//! [`ParticipationHost::materialize`] runs outside the owner's lock, while the
-//! participation is `Establishing` and already racing its sequence-zero lease, and
-//! [`ParticipationHost::release`] can run *concurrently with it*: the owner's
-//! state machine admits `Establishing -> Aborting`, and a participation with no tasks
-//! completes that abort immediately. So a release is not a "later" event that
-//! can read whatever materialize finished — it is a peer that has to undo an
-//! install still in flight.
-//!
-//! That is what the per-participation record is for. Every installed fact is
-//! published into it as soon as it exists, `released` is the one flag both
-//! sides read, and each side only ever tears down what it took out of the
-//! record. Whoever loses the race unwinds; nothing is closed twice, and nothing
-//! is left behind.
+//! An instance's materialization borrows its original Participation Scope stop view.
+//! Abort closes that view before the original M call has exited. Cold provider
+//! binding checks it independently of physical release, which still waits for
+//! the same M and its captures to retire. The legacy host entrypoint retains its
+//! existing release-race rollback. Every installed fact is published into the
+//! per-participation record, so either rollback or release takes its actual custody
+//! exactly once. Observing stop does not attest release or resource exit.
 //!
 //! # Lock discipline
 //!
@@ -97,7 +91,7 @@ use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet, HostRejection, ParticipationCredentialSlot,
     ParticipationHost, ParticipationHostFactory, ParticipationHostInstance,
-    ReleasedParticipationEvidence, SharedFactsRequest,
+    ParticipationMaterializationControl, ReleasedParticipationEvidence, SharedFactsRequest,
 };
 
 type RuntimeFilterParticipantInstaller = dyn Fn(
@@ -601,7 +595,11 @@ impl NativeParticipationHost {
         options: QueryOptions,
         options_fingerprint: ContentFingerprint,
         material: &WireCredential,
+        stopped: &dyn Fn() -> bool,
     ) -> Result<(), HostRejection> {
+        if stopped() {
+            return Err(cancelled_establish());
+        }
         let execution_id = participation.query_execution_id();
 
         // Credentials first: a catalog runtime is the thing most likely to need
@@ -644,11 +642,14 @@ impl NativeParticipationHost {
             self.adopt_participant(participation, installed, participant)?;
         }
 
-        self.install_catalogs(execution_id, catalogs, installed)?;
+        self.install_catalogs(execution_id, catalogs, installed, stopped)?;
 
         // The last word. Every install above is published in the record by the
         // time this runs, so a release that arrives from here on finds all of
         // them, and one that already ran is seen here and unwound by the caller.
+        if stopped() {
+            return Err(cancelled_establish());
+        }
         self.still_establishing(installed)
     }
 
@@ -728,7 +729,11 @@ impl NativeParticipationHost {
         execution_id: QueryExecutionId,
         catalogs: Vec<CatalogProperties>,
         installed: &InstalledParticipation,
+        stopped: &dyn Fn() -> bool,
     ) -> Result<(), HostRejection> {
+        if stopped() {
+            return Err(cancelled_establish());
+        }
         if catalogs.is_empty() {
             return Ok(());
         }
@@ -780,7 +785,7 @@ impl NativeParticipationHost {
                 emit_catalog_install_started(observer.as_ref(), execution_id, catalogs.len());
             }
             controls
-                .catalog_hold(execution_id, || installed.is_released())
+                .catalog_hold(execution_id, || stopped() || installed.is_released())
                 .map_err(|error| {
                     catalog_rejection(
                         installed,
@@ -837,7 +842,7 @@ impl NativeParticipationHost {
                 .ensure_while(
                     execution_id,
                     properties,
-                    || !installed.is_released(),
+                    || !stopped() && !installed.is_released(),
                     move |properties| {
                         factories
                             .bind(
@@ -930,7 +935,11 @@ impl ParticipationHostInstance for NativeParticipationInstance {
         self.participation
     }
 
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        control: &dyn ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
         if request.participation() != self.participation {
             return Err(participation_facts_rejection(
                 ParticipationFactsFailure::WrongInstanceParticipation {
@@ -960,6 +969,7 @@ impl ParticipationHostInstance for NativeParticipationInstance {
                 options,
                 options_fingerprint,
                 material,
+                &|| control.is_stopped(),
             )
         })();
         if result.is_err() {
@@ -1117,6 +1127,7 @@ impl ParticipationHost for NativeParticipationHost {
             options,
             options_fingerprint,
             material,
+            &|| installed.is_released(),
         ) {
             Ok(()) => Ok(()),
             Err(rejection) => {
@@ -1956,6 +1967,7 @@ mod tests {
     use novarocks_worker::{CatalogManager, ConnectorExecutionRoleBindingFactorySet};
     use novarocks_worker::{
         HostRejection, ParticipationHost, ParticipationHostFactory, ParticipationHostInstance,
+        ParticipationMaterializationControl,
     };
     use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
@@ -2316,13 +2328,62 @@ mod tests {
         let catalog = catalog_payload(catalogs);
         let filter = filter_payload(no_contribution());
         let options = query_options_payload();
-        instance.materialize(SharedFactsRequest::new(
-            participation,
-            &catalog,
-            &filter,
-            &options,
-            credential,
-        ))
+        struct Active;
+        impl ParticipationMaterializationControl for Active {
+            fn is_stopped(&self) -> bool {
+                false
+            }
+        }
+        instance.materialize(
+            SharedFactsRequest::new(participation, &catalog, &filter, &options, credential),
+            &Active,
+        )
+    }
+
+    #[test]
+    fn original_scope_stop_prevents_a_cold_bind_before_physical_release() {
+        struct Stopped;
+        impl ParticipationMaterializationControl for Stopped {
+            fn is_stopped(&self) -> bool {
+                true
+            }
+        }
+        let fixture = Fixture::new();
+        let identity = participation(91_003);
+        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        assert!(
+            !fixture
+                .host
+                .participations
+                .lock()
+                .unwrap()
+                .get(identity)
+                .unwrap()
+                .is_released()
+        );
+        let catalogs = catalog_payload(vec![catalog_properties()]);
+        let filter = filter_payload(no_contribution());
+        let options = query_options_payload();
+        let credential = credential(1, ANNOUNCED_SCOPE, live_until());
+        let result = instance.materialize(
+            SharedFactsRequest::new(identity, &catalogs, &filter, &options, &credential),
+            &Stopped,
+        );
+        assert!(result.is_err());
+        assert_eq!(fixture.catalog_factory.binds.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.query_leases(), 0);
+        // The original capability still owns the actual release and disposal.
+        let _evidence = instance.release();
+        drop(instance);
+        assert!(
+            fixture
+                .host
+                .participations
+                .lock()
+                .unwrap()
+                .get(identity)
+                .is_none()
+        );
     }
 
     #[test]

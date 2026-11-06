@@ -104,7 +104,7 @@ async fn make_explain_preparation(
         } else {
             topology
         };
-        let presentation = *input.state.presentation();
+        let presentation = input.state.presentation().copied();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
@@ -567,6 +567,15 @@ impl FrontendQuerySession {
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> Result<StatementResult, QueryServiceError> {
+        let family = match state.presentation().copied() {
+            Some(family) => family,
+            None => {
+                return Ok(self.governed_typed_error(
+                    internal_error("EXPLAIN client result requires an explicit presentation"),
+                    statement,
+                ));
+            }
+        };
         let window = match statement.result_window_alias() {
             Some(window) => window,
             None => {
@@ -617,7 +626,6 @@ impl FrontendQuerySession {
         let provider_source =
             crate::query_execution::completion_facts::FrontendCompletionCustody::new();
         let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
-        let family = *state.presentation();
         let input = ExplainPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -699,8 +707,8 @@ fn explain_preparation_profile(
 mod tests {
     use super::*;
     use novarocks_query_application::{
-        api::ReservedExecutionIdentity, client_connection::ClientConnectionToken,
-        query_control::QueryApplicationControl, session_control::StatementActionReady,
+        api::ReservedExecutionIdentity, query_control::QueryApplicationControl,
+        session_control::StatementActionReady,
     };
     use novarocks_workload_control::{
         ResourceConfig, ResultCapacityConfig, ResultCapacityHandle, WorkloadConfig, WorkloadControl,
@@ -762,8 +770,8 @@ mod tests {
         let control = Arc::new(QueryApplicationControl::default());
         let service = QueryControlService::new(control);
         let session = service
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(7, 1).unwrap(),
+            .register_session(SessionIdentity::client_statement(
+                service.mint_client_query_id(),
                 "root",
             ))
             .unwrap();
@@ -795,7 +803,13 @@ mod tests {
     }
     fn action(preparation: PreparationFuture) -> ExplainStatementAction {
         ExplainStatementAction {
-            family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             provider_source:
                 crate::query_execution::completion_facts::FrontendCompletionCustody::new(),
             planning_cpu: FrontendPlanningCpuSource::new(
@@ -901,12 +915,12 @@ mod tests {
     async fn occupied_protocol_destination_preserves_original_ready_and_owner() {
         let (_workload, _capacity, owner, _session) = statement().await;
         let token = owner.token();
-        let mut source = Some(StatementActionReady {
-            result: Ok(StatementActionValue::Ok(
+        let mut source = Some(StatementActionReady::new(
+            Ok(StatementActionValue::Ok(
                 novarocks_query_application::session_control::StatementCommandCompletion::new(0),
             )),
             owner,
-        });
+        ));
         let mut target = Some(StatementResult::Ok);
         assert!(StatementActionReady::transfer_protocol_in(&mut source, &mut target).is_err());
         assert_eq!(source.as_ref().unwrap().owner.token(), token);
@@ -918,7 +932,7 @@ mod tests {
             panic!("same governed completion")
         };
         let (completion, mut protocol) = result.into_parts();
-        assert_eq!(completion.affected_rows(), 0);
+        assert_eq!(completion.count(), Some(0));
         assert_eq!(
             protocol.complete(),
             novarocks_query_application::session_control::GovernedStatementFinishOutcome::Completed

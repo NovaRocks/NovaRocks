@@ -3916,6 +3916,7 @@ pub(crate) mod tests {
         let completion_supervisor =
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
 
+        let inbound_capabilities = TaskInboundCapabilities::new();
         NativeTaskExecutionHost::new(
             Arc::new(compiled_package_host::interpreter()),
             NativeQueryContextRuntime::new_for_test(
@@ -3923,10 +3924,11 @@ pub(crate) mod tests {
                 Arc::clone(&facts.memory_authority),
             ),
             facts,
-            TaskInboundCapabilities::new(),
+            Arc::clone(&inbound_capabilities),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                 data_runtime,
                 Duration::from_millis(120_000),
+                inbound_capabilities,
                 #[cfg(novarocks_dev_controls)]
                 None,
             ),
@@ -4050,6 +4052,7 @@ pub(crate) mod tests {
             .expect("a legal install");
 
         capabilities.close_participation(participation);
+        assert!(!capabilities.participation_admission_aborted(participation.query_execution_id()));
         let route = || ExchangeRouteQuery {
             stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
                 ExchangeSource::new(producer, producer_key, 0),
@@ -4080,6 +4083,7 @@ pub(crate) mod tests {
             .expect_err("normal close fences new receiver installation");
         assert!(rejection.detail().as_str().contains("participation closed"));
         capabilities.abort_participation(participation);
+        assert!(capabilities.participation_admission_aborted(participation.query_execution_id()));
         let claim = claim_frame(&capabilities, route());
         let InboundFrameClaim::Refused(detail) = claim else {
             panic!("a true abort must refuse its still-installed destination");
@@ -4094,6 +4098,7 @@ pub(crate) mod tests {
         );
 
         capabilities.remove(&descriptor);
+        assert!(capabilities.participation_admission_aborted(participation.query_execution_id()));
         let rejection = capabilities
             .install(Arc::new(late_descriptor))
             .expect_err("a create already in flight cannot reopen a closed participation");
@@ -4978,7 +4983,7 @@ pub(crate) mod tests {
             let source = match writer.open(
                 ResultWriteSpec::new(
                     UniqueId::new(80_030 + index as i64, 1),
-                    ResultPresentation::MysqlText,
+                    ResultPresentation::ArrowIpc,
                     None,
                     true,
                 )
@@ -5805,7 +5810,7 @@ pub(crate) mod tests {
         original: &LocalTaskExecutionError,
     ) {
         let actual = crate::backend_test_support::find_source::<LocalTaskExecutionError>(origin)
-            .expect("actual FragmentExecutionError remains in the source chain");
+            .expect("actual ExecutionFailure remains in the source chain");
         assert_eq!(actual.kind(), original.kind());
         assert!(std::ptr::eq(
             actual.cause().cause(),
@@ -7897,8 +7902,8 @@ pub(crate) mod tests {
         let stop_observer = original_control
             .stop_observable()
             .subscribe(Arc::new(move || {
-                // The existing real cleanup gate fixes the observation window;
-                // no concurrent producer turn can hold either Root mutex here.
+                // The exact original pool cleanup callback holds its real
+                // phase after channel close and before input disposal.
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 while !actual_cleanup_entered.load(Ordering::Acquire) {
                     assert!(
@@ -7934,30 +7939,30 @@ pub(crate) mod tests {
             started: Mutex::new(None),
         });
         let cleanup_pause = CallbackPause(gate.clone());
-        let weak_channel = Arc::downgrade(&channel);
-        let once = std::sync::atomic::AtomicBool::new(true);
-        let observer = channel.writable_observable().subscribe(Arc::new(move || {
-            if weak_channel
+        let cleanup_session = session_at_cleanup
+            .upgrade()
+            .expect("the original adopted Session is still owned before opening its CPU gate");
+        cleanup_session.observe_cleanup_close_for_test(Box::new(move || {
+            // This callback belongs to the actual original pool cleanup phase1.
+            // Generic writable notifications neither nominate nor block it.
+            let session = session_at_cleanup
                 .upgrade()
-                .is_some_and(|channel| channel.is_closed())
-                && once.swap(false, Ordering::AcqRel)
-            {
-                // This is the real codec's cleanup callback, while its input,
-                // cursor and producer guard have not all left the pool turn.
-                let session = session_at_cleanup
-                    .upgrade()
-                    .expect("the original Session remains alive in its actual cleanup callback");
-                let transferred = session.assert_scalar_origin_handoff_at_cleanup();
-                cleanup_entered.store(true, Ordering::Release);
-                sender.send(transferred).unwrap();
-                let mut open = gate.open.lock().unwrap();
-                while !*open {
-                    open = gate.changed.wait(open).unwrap();
-                }
+                .expect("the original Session remains alive in its actual cleanup callback");
+            let transferred = session.assert_scalar_origin_handoff_at_cleanup();
+            cleanup_entered.store(true, Ordering::Release);
+            sender.send(transferred).unwrap();
+            let mut open = gate.open.lock().unwrap();
+            while !*open {
+                open = gate.changed.wait(open).unwrap();
             }
         }));
+        drop(cleanup_session);
         pause.open();
         let transferred_at_cleanup = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            channel.is_closed(),
+            "the original cleanup channel close really returned"
+        );
         let (accepted_at_stop, published_at_stop) = stopped_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the actual adopted runtime cut must notify its original Root observer");
@@ -7995,7 +8000,6 @@ pub(crate) mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        drop(observer);
         assert_eq!(
             terminal.state(),
             TaskState::Failed,
@@ -8443,7 +8447,13 @@ pub(crate) mod tests {
             RenderPresentation, RootOutputKind,
         };
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: Some(0),
@@ -8451,7 +8461,7 @@ pub(crate) mod tests {
                 field: RenderField {
                     nullable: false,
                     native_type: NativeRenderType::SignedInteger(64),
-                    presentation: RenderPresentation::ScalarText,
+                    presentation: RenderPresentation::TrinoValue,
                 },
             }],
             1,
@@ -8481,7 +8491,7 @@ pub(crate) mod tests {
         let RootReadOutcome::Data(data) = &delivery.reply().outcome else {
             panic!("root did not encode client bytes")
         };
-        assert_eq!(data.body().as_ref(), &[3, 0, 0, 0, 2, b'4', b'2']);
+        assert_eq!(data.body().as_ref(), b"\x04\0\0\0[42]");
         assert_single_row_end_without_ack(&fixture, root, data, &runtime);
         drop(delivery);
         fixture.abort();
@@ -10498,6 +10508,7 @@ pub(crate) mod tests {
             )
             .expect("finite test producer pool");
 
+            let inbound_capabilities = TaskInboundCapabilities::new();
             NativeTaskExecutionHost::new(
                 Arc::new(interpreter()),
                 NativeQueryContextRuntime::new_for_test(
@@ -10505,10 +10516,11 @@ pub(crate) mod tests {
                     Arc::clone(&facts.0.memory_authority),
                 ),
                 facts,
-                TaskInboundCapabilities::new(),
+                Arc::clone(&inbound_capabilities),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
+                    inbound_capabilities,
                     #[cfg(novarocks_dev_controls)]
                     None,
                 ),
@@ -11033,6 +11045,7 @@ pub(crate) mod tests {
             )
             .expect("finite test producer pool");
 
+            let inbound_capabilities = TaskInboundCapabilities::new();
             NativeTaskExecutionHost::new(
                 Arc::new(interpreter()),
                 NativeQueryContextRuntime::new_for_test(
@@ -11040,10 +11053,11 @@ pub(crate) mod tests {
                     Arc::clone(&facts.stub.memory_authority),
                 ),
                 facts,
-                TaskInboundCapabilities::new(),
+                Arc::clone(&inbound_capabilities),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
+                    inbound_capabilities,
                     #[cfg(novarocks_dev_controls)]
                     None,
                 ),

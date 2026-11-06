@@ -341,6 +341,8 @@ pub(crate) struct ParticipationHostRecord {
     retired_task_reads: BTreeMap<TaskIdentity, Arc<super::lifecycle_read::TaskReadSnapshot>>,
     task_read_waiters: requests::deferred_read::TaskReadWaiters,
     task_io: task_io::TaskIoState,
+    #[cfg(test)]
+    normal_retire_handoff_gate: Option<TaskIdentity>,
     root_issuance_sealed: bool,
     max_live_tasks: usize,
     max_routes: usize,
@@ -605,6 +607,8 @@ impl ParticipationHostRecord {
             retired_task_reads: BTreeMap::new(),
             task_read_waiters: Default::default(),
             task_io: task_io::TaskIoState::new(binding.max_live_tasks),
+            #[cfg(test)]
+            normal_retire_handoff_gate: None,
             root_issuance_sealed: false,
             max_live_tasks: binding.max_live_tasks,
             max_routes,
@@ -1428,6 +1432,7 @@ mod tests {
                 participation: participation_storage.resources().unwrap(),
             };
             let core = ControlCore::new(
+                identity.backend_process_id(),
                 ControlConfig {
                     max_pending_requests: requests + 4,
                     step_budget: ControlCore::MAX_STEP_WORK,
@@ -2248,10 +2253,14 @@ mod tests {
     fn foreign_root_remove_host_cannot_move_the_original_service_inventory() {
         use crate::control_runtime::service::ServiceHostError;
         let mut first = Harness::new(PARTICIPATION_BOOTSTRAP_STORAGE);
-        let mut second = Harness::new(PARTICIPATION_BOOTSTRAP_STORAGE);
         // Equal complete protocol coordinates in independent actual runtimes
         // still do not confer ownership of the other Service's original map.
-        second.identity = first.identity;
+        let mut second = Harness::new_with_participation_identity(
+            PARTICIPATION_BOOTSTRAP_STORAGE,
+            0,
+            0,
+            Some(first.identity),
+        );
         for fixture in [&mut first, &mut second] {
             let materialize = fixture.materialize();
             let binding = fixture.binding(participation_actor(), &materialize);

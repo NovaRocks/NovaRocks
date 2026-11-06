@@ -1,9 +1,7 @@
 use super::mv_uea7::ManagedMvRestFixture;
 use super::native_sql_controls::SelectedStatement;
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{SqlSession, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use ::mysql::prelude::{FromRow, Queryable};
-use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::{
     TestClusterOwner,
@@ -158,47 +156,59 @@ impl Scenario for OptimizeTargetReplacement {
             .map_err(|_| anyhow::anyhow!("maintenance intent lock poisoned"))?
             .clone()
             .context("maintenance finite intent is missing")?;
-        let conn = connect(context)?;
-        let phase = conn.run(|conn| {
-        setup_orders_fixture(context, conn, catalog, &create_catalog_sql)?;
+        let mut conn = connect(context)?;
+        let phase = (|| {
+            let conn = &mut conn;
+            setup_orders_fixture(context, conn, catalog, &create_catalog_sql)?;
 
-        submit_optimize(context, conn, &intent.statements[0], "submit optimize for the original table incarnation")?;
-        let first = wait_for_ready_marker(context, &intent, 0, None)?;
-        context.action("observed process-local optimize claim before its first rebind");
+            submit_optimize(
+                context,
+                conn,
+                &intent.statements[0],
+                "submit optimize for the original table incarnation",
+            )?;
+            let first = wait_for_ready_marker(context, &intent, 0, None)?;
+            context.action("observed process-local optimize claim before its first rebind");
 
-        execute(
-            context,
-            conn,
-            "drop original optimize target incarnation",
-            "DROP TABLE orders FORCE",
-        )?;
-        execute(
-            context,
-            conn,
-            "recreate optimize target under the same logical name",
-            "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
-        )?;
-        execute(
-            context,
-            conn,
-            "seed replacement optimize target table",
-            "INSERT INTO orders VALUES (9, 90)",
-        )?;
-        write_resume(&first)?;
-        context.action("released optimize rebind barrier after same-name replacement");
+            execute(
+                context,
+                conn,
+                "drop original optimize target incarnation",
+                "DROP TABLE orders FORCE",
+            )?;
+            execute(
+                context,
+                conn,
+                "recreate optimize target under the same logical name",
+                "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+            )?;
+            execute(
+                context,
+                conn,
+                "seed replacement optimize target table",
+                "INSERT INTO orders VALUES (9, 90)",
+            )?;
+            write_resume(&first)?;
+            context.action("released optimize rebind barrier after same-name replacement");
 
-        wait_for_job_state(context, conn, catalog, first.job_id, "TARGET_REPLACED")?;
-        assert_dispatch_count(context, &first, 0)?;
-        context.action("verified replacement became TARGET_REPLACED with zero provider dispatch");
+            wait_for_job_state(context, conn, catalog, first.job_id, "TARGET_REPLACED")?;
+            assert_dispatch_count(context, &first, 0)?;
+            context
+                .action("verified replacement became TARGET_REPLACED with zero provider dispatch");
 
-        submit_optimize(context, conn, &intent.statements[1], "submit a new optimize to prove the terminal job released its active fence")?;
-        let second = wait_for_ready_marker(context, &intent, 1, Some(first.job_id))?;
-        write_resume(&second)?;
-        context.action("a second process-local optimize claim acquired the same table fence");
-        wait_for_terminal_job(context, conn, catalog, second.job_id)?;
+            submit_optimize(
+                context,
+                conn,
+                &intent.statements[1],
+                "submit a new optimize to prove the terminal job released its active fence",
+            )?;
+            let second = wait_for_ready_marker(context, &intent, 1, Some(first.job_id))?;
+            write_resume(&second)?;
+            context.action("a second process-local optimize claim acquired the same table fence");
+            wait_for_terminal_job(context, conn, catalog, second.job_id)?;
 
-        Ok(first.job_id)
-        });
+            Ok(first.job_id)
+        })();
         let first_job_id = match phase {
             Ok(job_id) => job_id,
             Err(primary) => {
@@ -211,13 +221,14 @@ impl Scenario for OptimizeTargetReplacement {
             context,
             "restart FE after process-local TARGET_REPLACED transition",
         )?;
-        let conn = connect(context)?;
-        conn.run(|conn| {
+        let mut conn = connect(context)?;
+        (|| {
+            let conn = &mut conn;
             select_catalog_and_database(context, conn, catalog)?;
             assert_job_not_listed(context, conn, catalog, first_job_id)?;
             context.action("verified the restarted FE discards process-local optimize history in native 1FE+3BE");
             Ok(())
-        })
+        })()
     }
 
     fn teardown(&self) -> Result<()> {
@@ -246,35 +257,48 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn connect(context: &mut ScenarioContext) -> Result<mysql_actor::DeadlineConnection> {
-    context.action("connect through public MySQL protocol");
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
+    context.action("connect through public Trino protocol");
+    Ok(SqlSession::new(
+        context.sql_user(),
+        context.trino_port(),
         context.deadline(),
-    )
+    )?)
 }
 
 fn submit_optimize(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     selected: &SelectedStatement,
     action: &str,
 ) -> Result<()> {
     context.action(action);
-    let observation = selected.arm(context, conn.connection_id(), OPTIMIZE_SQL)?;
-    let result = conn.query_drop(OPTIMIZE_SQL).map_err(anyhow::Error::from);
+    let pending = conn.submit(OPTIMIZE_SQL)?;
+    let (pending, observation) = selected.arm_pending(context, pending, OPTIMIZE_SQL)?;
+    let cancel = pending.cancel_handle();
+    let result = conn
+        .run_pending(pending)
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
+    // Even a joined HTTP/transport failure may leave the original query live.
+    let cancelled = if result.is_err() {
+        cancel
+            .delete(selected.deadline)
+            .map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
     let drained = context
         .handle()
         .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
-    with_cleanup(result, drained)
+    with_cleanup(with_cleanup(result, cancelled), drained)
 }
 fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(primary), Err(cleanup)) => {
-            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
+            Err(primary.context(format!("cleanup failed: {cleanup:#}")))
         }
     }
 }
@@ -301,7 +325,7 @@ fn release_ready_barriers(intent: &MaintenanceIntent) -> Result<()> {
 
 fn setup_orders_fixture(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     create_catalog_sql: &str,
 ) -> Result<()> {
@@ -334,7 +358,7 @@ fn setup_orders_fixture(
 
 fn select_catalog_and_database(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
 ) -> Result<()> {
     execute(
@@ -346,22 +370,29 @@ fn select_catalog_and_database(
     execute(context, conn, "select maintenance namespace", "USE ns")
 }
 
-fn execute(context: &mut ScenarioContext, conn: &mut Conn, action: &str, sql: &str) -> Result<()> {
+fn execute(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    action: &str,
+    sql: &str,
+) -> Result<()> {
     context.remaining(action)?;
     context.action(action);
-    conn.query_drop(sql)
+    conn.execute(sql)
+        .map(|_| ())
         .with_context(|| format!("{action}: {sql}"))
 }
 
-fn query<T: FromRow>(
+fn query(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     sql: &str,
     action: &str,
-) -> Result<Vec<T>> {
+) -> Result<StatementResult> {
     context.remaining(action)?;
     context.action(action);
-    conn.query(sql).with_context(|| format!("{action}: {sql}"))
+    conn.execute(sql)
+        .with_context(|| format!("{action}: {sql}"))
 }
 
 #[derive(Debug)]
@@ -510,7 +541,7 @@ fn assert_dispatch_count(
 
 fn wait_for_job_state(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     job_id: i64,
     expected_state: &str,
@@ -542,7 +573,7 @@ fn wait_for_job_state(
 
 fn wait_for_terminal_job(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     job_id: i64,
 ) -> Result<()> {
@@ -573,7 +604,7 @@ fn wait_for_terminal_job(
 
 fn assert_job_not_listed(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     job_id: i64,
 ) -> Result<()> {
@@ -592,10 +623,10 @@ fn assert_job_not_listed(
 
 fn list_optimize_jobs(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
 ) -> Result<Vec<(i64, String)>> {
-    let rows: Vec<Row> = query(
+    let result = query(
         context,
         conn,
         &format!(
@@ -603,17 +634,31 @@ fn list_optimize_jobs(
         ),
         "read current-process optimize job state",
     )?;
-    rows.into_iter()
+    ensure!(
+        result.is_result_set() && result.columns.len() >= 3,
+        "SHOW ALTER TABLE OPTIMIZE did not return its job columns: {result:?}"
+    );
+    for (index, name) in [(0, "JobId"), (2, "State")] {
+        let column = &result.columns[index];
+        ensure!(
+            column.name == name && column.type_signature.raw_type == "varchar",
+            "SHOW ALTER TABLE OPTIMIZE {name} is not its declared text column: {column:?}"
+        );
+    }
+    result
+        .rows
+        .into_iter()
         .map(|row| {
-            let job_id = row
-                .get::<String, _>(0)
-                .context("SHOW ALTER TABLE OPTIMIZE JobId column")?
+            let Some(TrinoValue::Text(job_id)) = row.first() else {
+                bail!("SHOW ALTER TABLE OPTIMIZE JobId is not non-null text: {row:?}");
+            };
+            let job_id = job_id
                 .parse::<i64>()
                 .context("parse SHOW ALTER TABLE OPTIMIZE JobId")?;
-            let state = row
-                .get::<String, _>(2)
-                .context("SHOW ALTER TABLE OPTIMIZE State column")?;
-            Ok((job_id, state))
+            let Some(TrinoValue::Text(state)) = row.get(2) else {
+                bail!("SHOW ALTER TABLE OPTIMIZE State is not non-null text: {row:?}");
+            };
+            Ok((job_id, state.clone()))
         })
         .collect()
 }

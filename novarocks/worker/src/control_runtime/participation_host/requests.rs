@@ -1359,6 +1359,19 @@ impl ParticipationRequestCustody {
             WorkerMessage::Participation(ParticipationMessage::Command {
                 work,
                 request: Some(metadata),
+                command:
+                    ParticipationInput::Request(ParticipationCommand::AwaitTaskReadSeal {
+                        task,
+                        command,
+                    }),
+            }) => {
+                // This frozen continuation owns only neutral command values.
+                // Its actual R and any seal remain in the original custody.
+                let _original_fields = (work, metadata, task, command, refused.error);
+            }
+            WorkerMessage::Participation(ParticipationMessage::Command {
+                work,
+                request: Some(metadata),
                 command: ParticipationInput::RootEndAcknowledged { task },
             }) => {
                 // Every field of this exact variant is Copy neutral metadata;

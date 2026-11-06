@@ -125,6 +125,7 @@ struct Fixture {
 impl Fixture {
     fn new(max_pending: usize, original_deadline: u64) -> Self {
         let root = ControlCore::new(
+            participation(1).backend_process_id(),
             ControlConfig {
                 max_pending_requests: max_pending,
                 step_budget: ControlCore::MAX_STEP_WORK,
@@ -686,4 +687,178 @@ fn a_routed_domain_failure_keeps_its_exact_token_body_and_original_decision_time
         ParticipationState::Active,
     );
     f.assert_original_admissions();
+}
+
+#[test]
+fn foreign_process_rpc_requests_are_fenced_before_admission_or_context_lookup() {
+    let mut f = Fixture::new(2, 100);
+    let local = participation(1);
+    let foreign = ParticipationRef::new(
+        local.query_execution_id(),
+        local.frontend_process_id(),
+        BackendProcessId::try_from_bytes(bytes(3)).unwrap(),
+    );
+    let calls = f.capacity.calls.clone();
+    let grants = f.root.admission().logical_live_grants();
+    let acquire = AcquireParticipationAdmissionTicket::new(
+        operation(3),
+        foreign,
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        f.root.admission().capability(),
+    );
+    let acquire = f
+        .root
+        .handle_request(
+            at(2),
+            request(3, operation(3), 100),
+            ControlInput::Acquire {
+                request: acquire,
+                ticket: ticket(5),
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert_eq!(acquire.requests.len(), 1);
+    assert!(
+        acquire.requests[0]
+            .body
+            .matches(RequestResult::Outcome(OperationOutcome::IdentityMismatch))
+    );
+    assert!(acquire.effects.is_empty());
+    let establish = f
+        .root
+        .handle_request(
+            at(2),
+            request(4, operation(4), 100),
+            ControlInput::Establish {
+                request: operation(4),
+                participation: foreign,
+                ticket: f.ticket,
+                payload: PayloadId(4),
+                semantics: semantics(),
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert!(
+        establish.requests[0]
+            .body
+            .matches(RequestResult::Outcome(OperationOutcome::IdentityMismatch))
+    );
+    assert!(establish.effects.is_empty());
+    let task = novarocks_execution_contract::TaskIdentity::new(
+        foreign.query_execution_id(),
+        novarocks_types::StageId::new(1).unwrap(),
+        novarocks_types::TaskId::new(1).unwrap(),
+        foreign.backend_process_id(),
+    );
+    let create = f
+        .root
+        .handle_request(
+            at(2),
+            request(5, operation(5), 100),
+            ControlInput::CreateWithoutParticipationAddress {
+                participation: foreign,
+                task,
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert!(
+        create.requests[0]
+            .body
+            .matches(RequestResult::Outcome(OperationOutcome::IdentityMismatch))
+    );
+    assert!(create.effects.is_empty());
+    assert_eq!(f.capacity.calls, calls);
+    assert_eq!(f.root.admission().logical_live_grants(), grants);
+
+    // The actual receiver still owns ordinary absence. Do not turn a stale
+    // local ticket into process-loss evidence or broaden frontend retries.
+    let missing = f
+        .root
+        .handle_request(
+            at(2),
+            request(6, operation(6), 100),
+            ControlInput::Establish {
+                request: operation(6),
+                participation: participation(2),
+                ticket: ticket(99),
+                payload: PayloadId(6),
+                semantics: semantics(),
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert!(
+        missing.requests[0]
+            .body
+            .matches(RequestResult::Outcome(OperationOutcome::Gone))
+    );
+    assert_eq!(f.capacity.calls, calls);
+}
+
+#[test]
+fn administrative_control_inputs_keep_the_same_process_fence() {
+    let mut f = Fixture::new(2, 100);
+    let local = participation(1);
+    let foreign = ParticipationRef::new(
+        local.query_execution_id(),
+        local.frontend_process_id(),
+        BackendProcessId::try_from_bytes(bytes(3)).unwrap(),
+    );
+    let calls = f.capacity.calls.clone();
+    let grants = f.root.admission().logical_live_grants();
+    let acquire = AcquireParticipationAdmissionTicket::new(
+        operation(3),
+        foreign,
+        LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        NativeCompatibilityId::new([3; 32]),
+        f.root.admission().capability(),
+    );
+    let acquire = f
+        .root
+        .handle(
+            at(2),
+            ControlInput::Acquire {
+                request: acquire,
+                ticket: ticket(5),
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert!(acquire.effects.iter().any(|effect| matches!(
+        effect,
+        ControlEffect::AdmissionReply {
+            result: Err(OperationOutcome::IdentityMismatch),
+            ..
+        }
+    )));
+    let establish = f
+        .root
+        .handle(
+            at(2),
+            ControlInput::Establish {
+                request: operation(4),
+                participation: foreign,
+                ticket: f.ticket,
+                payload: PayloadId(4),
+                semantics: semantics(),
+                generation: Generation::new(1).unwrap(),
+            },
+            &mut f.capacity,
+        )
+        .unwrap();
+    assert!(establish.effects.iter().any(|effect| matches!(
+        effect,
+        ControlEffect::Reply {
+            outcome: OperationOutcome::IdentityMismatch,
+            ..
+        }
+    )));
+    assert_eq!(f.capacity.calls, calls);
+    assert_eq!(f.root.admission().logical_live_grants(), grants);
 }

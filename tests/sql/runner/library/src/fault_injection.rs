@@ -2407,7 +2407,7 @@ mod tests {
             ..QueryMeta::default()
         };
 
-        apply_pre_query(&meta, &mut server).expect("arm establish-context restart");
+        apply_pre_query(&meta, &mut server).expect("arm establish-participation restart");
 
         assert_eq!(
             server.events,

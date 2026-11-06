@@ -1181,8 +1181,12 @@ fn start_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
 /// Project only the actual workload cancellation verdict, without inventing a Task phase.
 fn cancellation_error(reason: CancellationReason, detail: &'static str) -> QueryExecutionError {
     let reason = match reason {
-        CancellationReason::DeadlineExceeded
-        | CancellationReason::FrontendDrainDeadlineExceeded => QueryFailureReason::DeadlineExceeded,
+        CancellationReason::FrontendDrainDeadlineExceeded => {
+            return QueryExecutionError::from_execution(
+                crate::session_outcome::governed_cancellation_failure_input(reason),
+            );
+        }
+        CancellationReason::DeadlineExceeded => QueryFailureReason::DeadlineExceeded,
         _ => QueryFailureReason::Cancelled,
     };
     QueryExecutionError::from_execution(ExecutionFailureInput::new(
@@ -4375,6 +4379,27 @@ mod tests {
     include!("supervisor_qualification_binding_tests.rs");
     include!("supervisor_client_computation_tests.rs");
     #[test]
+    fn startup_cancellation_keeps_the_original_frontend_drain_reason() {
+        let reason = CancellationReason::FrontendDrainDeadlineExceeded;
+        let expected = crate::session_outcome::governed_cancellation_failure_input(reason.clone());
+        for error in [
+            start_cancellation_error(reason.clone()),
+            pre_install_cancellation_error(reason),
+        ] {
+            assert_eq!(error.execution_failure(), Some(&expected));
+            assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        }
+        assert_eq!(
+            start_cancellation_error(CancellationReason::DeadlineExceeded).message(),
+            "logical execution start was cancelled before its start verdict"
+        );
+        assert_eq!(
+            pre_install_cancellation_error(CancellationReason::DeadlineExceeded).message(),
+            "logical execution cancelled before actor installation"
+        );
+    }
+
+    #[test]
     fn terminal_actor_disposition_does_not_hide_invalid_phase_or_service_invariants() {
         use super::super::{LogicalConclusion, LogicalExecutionActorError};
         assert!(
@@ -4822,9 +4847,13 @@ mod tests {
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
         let render = novarocks_sql::compiler::client_render_schema(
             plan.candidate().plan(),
-            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-                timezone_offset_seconds: 0,
-            },
+            novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+                &novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
         )
         .unwrap();
         let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(

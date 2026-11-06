@@ -17,7 +17,7 @@
 
 //! DELETE retains the original typed statement and signed Provider facts.
 
-use super::write_action::{self, WriteStatementFamily, WriteStatementStart};
+use super::write_action::{self, WriteCompletion, WriteStatementFamily, WriteStatementStart};
 use super::*;
 use crate::dml::attempt::DmlPublicationAttempt;
 use crate::query_execution::{
@@ -36,6 +36,10 @@ struct DeleteFamily;
 impl WriteStatementFamily for DeleteFamily {
     type Input = PreparationInput;
     type Prepared = PreparedDeleteWrite;
+
+    fn completion(input: &PreparationInput) -> WriteCompletion {
+        completion_for_statement(&input.statement)
+    }
 
     async fn prepare(
         input: Arc<PreparationInput>,
@@ -65,6 +69,13 @@ impl WriteStatementFamily for DeleteFamily {
     }
     fn finalize(prepared: &Self::Prepared) -> Result<(), String> {
         prepared.finalize()
+    }
+}
+
+fn completion_for_statement(statement: &OwnedDeleteStatement) -> WriteCompletion {
+    match statement {
+        OwnedDeleteStatement::Predicate(_) => WriteCompletion::Counted,
+        OwnedDeleteStatement::Equality(_) => WriteCompletion::Empty,
     }
 }
 
@@ -172,4 +183,32 @@ pub(crate) fn prepare(
         #[cfg(novarocks_dev_controls)]
         observation: input.observation,
     }))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn original_typed_delete_variant_selects_control_or_counted_completion() {
+        for (sql, expected) in [
+            ("DELETE FROM t WHERE id = 2", WriteCompletion::Counted),
+            (
+                "ALTER TABLE t ADD EQUALITY DELETE (id) VALUES (2)",
+                WriteCompletion::Empty,
+            ),
+        ] {
+            let mut parsed = novarocks_parser::parse(sql).unwrap();
+            assert_eq!(parsed.len(), 1);
+            let owned = match parsed.remove(0) {
+                novarocks_parser::ast::Statement::Dml(
+                    novarocks_parser::ast::DmlStatement::Delete(statement),
+                ) => OwnedDeleteStatement::Predicate(statement),
+                novarocks_parser::ast::Statement::Dml(
+                    novarocks_parser::ast::DmlStatement::AddEqualityDelete(statement),
+                ) => OwnedDeleteStatement::Equality(statement),
+                _ => panic!("expected the original typed DELETE variant"),
+            };
+            assert_eq!(completion_for_statement(&owned), expected);
+        }
+    }
 }

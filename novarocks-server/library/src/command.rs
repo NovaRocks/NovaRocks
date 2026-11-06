@@ -122,7 +122,6 @@ fn run_frontend(
         &role.config,
         build,
         &role.native_trust,
-        None,
         native_compatibility_id,
         static_plan,
         function_catalog,
@@ -241,7 +240,6 @@ async fn run_all_in_one(
         &fe.config,
         build,
         &fe.native_trust,
-        None,
         native_compatibility_id,
         static_plan,
         std::sync::Arc::clone(function_set.catalog()),
@@ -482,46 +480,7 @@ pub fn main(build: crate::build_information::BuildInformation) {
         }
         return;
     }
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
-        println!(
-            "{} commit={} build_identity={} hms_listing_observe=true",
-            novarocks_failpoint::observation_marker::MEM_1_M07_HMS_LISTING_BUILD,
-            build.source_commit,
-            build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
-        println!(
-            "{} commit={} build_identity={} closing_pressure=true",
-            novarocks_failpoint::observation_marker::MEM_1_M07_CLOSING_PRESSURE_BUILD,
-            build.source_commit,
-            build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    if args.as_slice() == ["--mem-1-m07-build-identity"] {
-        println!(
-            "{} commit={} build_identity={} exact_mysql_write=true",
-            novarocks_failpoint::observation_marker::MEM_1_M07_BUILD,
-            build.source_commit,
-            build.native_build_identity
-        );
-        return;
-    }
-    #[cfg(feature = "mem-1-m07-root-observation")]
-    if args.as_slice() == ["--mem-1-m07-root-observation-build-identity"] {
-        println!(
-            "{} commit={} build_identity={} root_observation=true",
-            novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_BUILD,
-            build.source_commit,
-            build.native_build_identity
-        );
-        return;
-    }
+
     if args
         .first()
         .is_none_or(|command| command == "--help" || command == "-h")

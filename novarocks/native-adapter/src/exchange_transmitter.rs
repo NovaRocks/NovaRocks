@@ -14,6 +14,7 @@ use crate::{BackendDataRuntime, NativeRpcClient};
 pub fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,
     send_timeout: Duration,
+    capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     #[cfg(novarocks_dev_controls)] observations: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
@@ -25,6 +26,7 @@ pub fn grpc_exchange_transmitter(
     Arc::new(GrpcExchangeFrameTransmitter {
         runtime,
         send_timeout,
+        capabilities,
         grants,
         #[cfg(novarocks_dev_controls)]
         observations,
@@ -36,6 +38,7 @@ struct GrpcExchangeFrameTransmitter {
     observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     runtime: BackendDataRuntime,
     send_timeout: Duration,
+    capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     grants: Arc<crate::exchange_grant_subscription::ExchangeGrantClients>,
 }
 
@@ -206,6 +209,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         destination: novarocks_execution::runtime::endpoint::RuntimeEndpoint,
         entries: Vec<novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: CancellationToken,
+        activity: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
         done: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         use novarocks_execution::runtime::task::io::exchange_unit::{
@@ -233,6 +237,8 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             )));
             return;
         }
+        let stopping_one =
+            entries.len() == 1 && entries[0].operation == ExchangeDemandOperation::StopSender;
         let entries = entries
             .into_iter()
             .map(|entry| codec::DecodedExchangeDemandEntry {
@@ -264,41 +270,67 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             done(ExchangeDemandCallOutcome::Refused(fact));
             return;
         }
+        // Encoding is complete before the asynchronous request takes over.
+        drop(entries);
+        // Read only the original destination Context's positive abort fact.
+        // Same-process routing still uses Native RPC for data and ordinary
+        // control. This fact discharges only an already-stopped stream's debt;
+        // it neither fabricates receiver facts nor releases request activity.
+        if stopping_one
+            && first.source().task().query_execution_id()
+                == first.destination().query_execution_id()
+            && local
+                == Some(novarocks_native_trust::NativeProcessIdentity::Backend(
+                    first.destination().backend_process_id(),
+                ))
+            && self
+                .capabilities
+                .participation_admission_aborted(first.destination().query_execution_id())
+        {
+            done(ExchangeDemandCallOutcome::RouteRetired(first));
+            return;
+        }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
         self.runtime.handle().spawn(async move {
-            let client = NativeRpcClient::new_backend_endpoint(
-                runtime,
-                destination.native_endpoint().clone(),
-                first.destination().backend_process_id(),
-            );
-            let outcome = match client
-                .register_exchange_demand_async(request, timeout, stop)
-                .await
-            {
-                Ok(response) => match codec::decode_demand_response(
-                    &response,
-                    &streams,
-                    FieldPath::root("exchange_demand_response"),
-                ) {
-                    Ok(results) => ExchangeDemandCallOutcome::Observed(
-                        results
-                            .into_iter()
-                            .map(|result| (result.stream, result.outcome))
-                            .collect(),
-                    ),
-                    Err(_) => ExchangeDemandCallOutcome::Unknown(
-                        "exchange demand response cannot be fully validated".into(),
-                    ),
-                },
-                Err(crate::native_client::ExchangeRpcFailure::NotProcessed(detail)) => {
-                    ExchangeDemandCallOutcome::NotProcessed(detail)
+            // The inner future owns all request/client captures. The original
+            // activity remains outside it and outside the outcome callback.
+            let outcome = async move {
+                let client = NativeRpcClient::new_backend_endpoint(
+                    runtime,
+                    destination.native_endpoint().clone(),
+                    first.destination().backend_process_id(),
+                );
+                match client
+                    .register_exchange_demand_async(request, timeout, stop)
+                    .await
+                {
+                    Ok(response) => match codec::decode_demand_response(
+                        &response,
+                        &streams,
+                        FieldPath::root("exchange_demand_response"),
+                    ) {
+                        Ok(results) => ExchangeDemandCallOutcome::Observed(
+                            results
+                                .into_iter()
+                                .map(|result| (result.stream, result.outcome))
+                                .collect(),
+                        ),
+                        Err(_) => ExchangeDemandCallOutcome::Unknown(
+                            "exchange demand response cannot be fully validated".into(),
+                        ),
+                    },
+                    Err(crate::native_client::ExchangeRpcFailure::NotProcessed(detail)) => {
+                        ExchangeDemandCallOutcome::NotProcessed(detail)
+                    }
+                    Err(crate::native_client::ExchangeRpcFailure::Unknown(detail)) => {
+                        ExchangeDemandCallOutcome::Unknown(detail)
+                    }
                 }
-                Err(crate::native_client::ExchangeRpcFailure::Unknown(detail)) => {
-                    ExchangeDemandCallOutcome::Unknown(detail)
-                }
-            };
+            }
+            .await;
             done(outcome);
+            drop(activity);
         });
     }
 
@@ -463,6 +495,7 @@ pub(crate) mod tests {
         let transmitter = grpc_exchange_transmitter(
             crate::backend_test_support::test_backend_data_runtime(),
             Duration::from_secs(1),
+            novarocks_worker::TaskInboundCapabilities::new(),
             #[cfg(novarocks_dev_controls)]
             None,
         );
@@ -487,6 +520,209 @@ pub(crate) mod tests {
             std::io::ErrorKind::WouldBlock
         );
     }
+    #[test]
+    fn stalled_control_cancellation_keeps_activity_until_callback_and_capture_exit() {
+        use novarocks_execution::runtime::task::io::exchange_unit::{
+            ExchangeDemandCallOutcome, ExchangeDemandEntry, ExchangeDemandOperation,
+        };
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::Instant;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let frame = unit_frame();
+        let stream = frame.receiver.stream;
+        let runtime = crate::backend_test_support::test_backend_data_runtime();
+        runtime
+            .native_trust()
+            .bind_process_identity(novarocks_native_trust::NativeProcessIdentity::Backend(
+                stream.source().task().backend_process_id(),
+            ))
+            .unwrap();
+        let transmitter = grpc_exchange_transmitter(
+            runtime,
+            Duration::from_secs(3),
+            novarocks_worker::TaskInboundCapabilities::new(),
+            #[cfg(novarocks_dev_controls)]
+            None,
+        );
+        let (outcome_tx, outcome_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let stop = CancellationToken::new();
+        transmitter.register_unit_demands(
+            novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                listener.local_addr().unwrap(),
+            ),
+            vec![ExchangeDemandEntry {
+                stream,
+                operation: ExchangeDemandOperation::StopSender,
+            }],
+            stop.clone(),
+            ExchangeCallActivity::new(move || {
+                exit_tx.send(()).unwrap();
+            }),
+            Box::new(move |outcome| {
+                outcome_tx.send(outcome).unwrap();
+                // Keep this actual callback/capture alive after reporting its
+                // outcome. The activity must still belong to this same call.
+                release_rx.recv().unwrap();
+            }),
+        );
+        let accept_deadline = Instant::now() + Duration::from_secs(1);
+        let mut accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < accept_deadline, "control did not connect");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("control blackhole accept failed: {error}"),
+            }
+        };
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut preface = [0; 24];
+        accepted.read_exact(&mut preface).unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        accepted.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).unwrap();
+        // Use the existing Native client's H2 request barrier: a connected
+        // socket alone would still permit pre-dispatch cancellation.
+        loop {
+            let mut header = [0; 9];
+            accepted.read_exact(&mut header).unwrap();
+            let length = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+            let mut payload = vec![0; length as usize];
+            accepted.read_exact(&mut payload).unwrap();
+            let stream_id = u32::from_be_bytes(header[5..9].try_into().unwrap()) & 0x7fff_ffff;
+            if header[3] == 1 && stream_id != 0 {
+                break;
+            }
+        }
+        stop.cancel();
+        let outcome = outcome_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            matches!(outcome, ExchangeDemandCallOutcome::Unknown(_)),
+            "{outcome:?}"
+        );
+        assert!(matches!(exit_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        exit_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(accepted);
+    }
+
+    #[test]
+    fn only_the_local_destination_abort_fence_retires_stop_without_dialing() {
+        use novarocks_execution::runtime::task::io::exchange_unit::{
+            ExchangeDemandCallOutcome, ExchangeDemandEntry, ExchangeDemandOperation,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut frame = unit_frame();
+        frame.destination =
+            novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
+                listener.local_addr().unwrap(),
+            );
+        let stream = frame.receiver.stream;
+        let runtime = crate::backend_test_support::test_backend_data_runtime();
+        runtime
+            .native_trust()
+            .bind_process_identity(novarocks_native_trust::NativeProcessIdentity::Backend(
+                stream.source().task().backend_process_id(),
+            ))
+            .unwrap();
+        let capabilities = novarocks_worker::TaskInboundCapabilities::new();
+        let transmitter = grpc_exchange_transmitter(
+            runtime,
+            Duration::from_secs(1),
+            capabilities.clone(),
+            #[cfg(novarocks_dev_controls)]
+            None,
+        );
+        let call = |stream, operation| {
+            let stop = CancellationToken::new();
+            stop.cancel();
+            let (tx, rx) = std::sync::mpsc::channel();
+            transmitter.register_unit_demands(
+                frame.destination.clone(),
+                vec![ExchangeDemandEntry { stream, operation }],
+                stop,
+                ExchangeCallActivity::new(|| {}),
+                Box::new(move |outcome| tx.send(outcome).unwrap()),
+            );
+            rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        };
+        let participation = novarocks_execution_contract::ParticipationRef::new(
+            stream.destination().query_execution_id(),
+            novarocks_types::identity::FrontendProcessId::new_v7(),
+            stream.destination().backend_process_id(),
+        );
+        // Missing metadata and normal quiesce provide no retirement proof.
+        assert!(matches!(
+            call(stream, ExchangeDemandOperation::StopSender),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        capabilities.close_participation(participation);
+        assert!(matches!(
+            call(stream, ExchangeDemandOperation::StopSender),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        let other_execution = QueryExecutionId::new(
+            participation.query_execution_id().query_id(),
+            AttemptId::new(2).unwrap(),
+        )
+        .unwrap();
+        capabilities.abort_participation(novarocks_execution_contract::ParticipationRef::new(
+            other_execution,
+            participation.frontend_process_id(),
+            participation.backend_process_id(),
+        ));
+        assert!(matches!(
+            call(stream, ExchangeDemandOperation::StopSender),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        // The original positive abort fences all routes and late installation
+        // even after their receiver descriptors have actually been removed.
+        capabilities.abort_participation(participation);
+        assert!(
+            matches!(call(stream, ExchangeDemandOperation::StopSender), ExchangeDemandCallOutcome::RouteRetired(actual) if actual == stream)
+        );
+        let remote = TaskIdentity::new(
+            stream.destination().query_execution_id(),
+            stream.destination().stage_id(),
+            stream.destination().task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let remote_stream = ExchangeStreamIdentity::try_new(
+            stream.source(),
+            remote,
+            stream.destination_task_key(),
+            stream.destination_node(),
+        )
+        .unwrap();
+        assert!(matches!(
+            call(remote_stream, ExchangeDemandOperation::StopSender),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        let demand = novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitDemand {
+            sequence: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence::try_new(1).unwrap(), wire_bytes: 1,
+        };
+        assert!(matches!(
+            call(stream, ExchangeDemandOperation::Register(demand)),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        capabilities.forget_participation(participation);
+        assert!(matches!(
+            call(stream, ExchangeDemandOperation::StopSender),
+            ExchangeDemandCallOutcome::NotProcessed(_)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     #[test]
     fn exact_normal_close_names_only_one_destination_stream() {
         let frame = unit_frame();

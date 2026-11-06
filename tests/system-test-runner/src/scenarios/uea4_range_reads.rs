@@ -19,11 +19,14 @@
 //! only; the functional stage checks multi-file rows and held-read cleanup.
 
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
-use super::provider_mysql_actors::{MysqlActor, record_cancelled_proxy_read, run_checks};
-use crate::actors::mysql as mysql_actor;
+use super::provider_mysql_actors::{
+    ActorStatements, ProviderActor, ProviderCheck, finish_provider_operation,
+    provider_failure_receipt, record_cancelled_proxy_read, run_checks, unsigned_pairs,
+    unsigned_rows,
+};
+use crate::actors::sql::{SqlSession, StatementFailure};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, LaunchProfile,
@@ -431,13 +434,11 @@ impl Scenario for RangeFunctional {
             fixture.checked.manifest_sha256
         ));
         let table = fixture.checked.table_name();
-        let mut connection = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect functional Iceberg session")?,
-        )?;
+        let mut connection =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         connection
-            .query_drop(fixture.checked.catalog_sql(fixture.proxy.endpoint()))
+            .execute(fixture.checked.catalog_sql(fixture.proxy.endpoint()))
+            .map(|_| ())
             .context("create functional Iceberg catalog")?;
         if self.short {
             drop(connection);
@@ -456,7 +457,8 @@ impl Scenario for RangeFunctional {
         );
         context.action("verified every ordered ID across the published multi-file Iceberg table");
         let first_five: Vec<u64> = connection
-            .query(format!("{scan} LIMIT 5"))
+            .execute(format!("{scan} LIMIT 5"))
+            .and_then(unsigned_rows)
             .context("read limited multi-file Iceberg result")?;
         ensure!(
             first_five == [0, 1, 2, 3, 4],
@@ -472,26 +474,29 @@ impl Scenario for RangeFunctional {
         let baseline = resource_baseline(context)?;
         let hold = fixture.proxy.hold_next_read_with_suffix(".parquet")?;
         let held_scan = scan.clone();
-        let mut actor = MysqlActor::spawn(context, "a4-held-read", move |connection| {
-            Ok(connection.query::<u64, _>(held_scan))
-        })?;
+        let mut actor =
+            ProviderActor::spawn(context, "a4-held-read", move |connection, statements| {
+                Ok(statements
+                    .run(connection, held_scan)?
+                    .and_then(unsigned_rows))
+            })?;
         let mut kill_actor = None;
         let mut entered = false;
         let operation = (|| -> Result<()> {
-            let connection_id =
-                actor.connection_id(context.remaining("receive held read connection ID")?)?;
+            actor.wait_started(context.remaining("receive held read connection ID")?)?;
             hold.wait_until_entered(
                 context
                     .remaining("observe held Parquet read")?
                     .min(Duration::from_secs(30)),
             )?;
             entered = true;
-            kill_actor = Some(MysqlActor::spawn(
+            let original_query = actor.current_query()?;
+            kill_actor = Some(ProviderActor::spawn(
                 context,
                 "a4-held-kill",
-                move |control| {
-                    control
-                        .query_drop(format!("KILL QUERY {connection_id}"))
+                move |_control, _statements| {
+                    original_query
+                        .cancel()
                         .context("cancel held multi-file Iceberg read")
                 },
             )?);
@@ -510,67 +515,73 @@ impl Scenario for RangeFunctional {
                     .min(Duration::from_secs(30)),
             )?;
             let result = actor.receive(context.remaining("await cancelled Iceberg read")?)?;
-            ensure!(
-                matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
-                "held Iceberg read did not report query cancellation: {result:?}"
-            );
+            let error = result
+                .err()
+                .context("held Iceberg read unexpectedly succeeded after cancellation")?;
+            if !matches!(&error, StatementFailure::Trino(error) if error.error_code == 3 && error.error_name == "USER_CANCELED" && error.error_type == "USER_ERROR")
+            {
+                return Err(anyhow::Error::new(error)
+                    .context("held Iceberg read did not report query cancellation"));
+            }
             Ok(())
         })();
         let mut cleanup = Vec::new();
         if operation.is_err() {
             if let Err(error) = actor.cancel(context) {
-                cleanup.push(format!("cancel read: {error:#}"));
+                cleanup.push(error.context("cancel read"));
             }
             if let Some(actor) = &mut kill_actor
                 && let Err(error) = actor.cancel(context)
             {
-                cleanup.push(format!("cancel control: {error:#}"));
+                cleanup.push(error.context("cancel control"));
             }
         }
         hold.release();
         if entered
             && let Err(error) = hold.wait_until_cancelled_read_exited(Duration::from_secs(30))
         {
-            cleanup.push(format!("held read terminal I/O: {error:#}"));
+            cleanup.push(error.context("held read terminal I/O"));
         }
-        if let Err(error) = actor.finish(context) {
-            cleanup.push(format!("read actual join: {error:#}"));
+        if let Err(error) = actor.finish_with(context, |result| {
+            result.map(|_| ()).map_err(anyhow::Error::from)
+        }) {
+            cleanup.push(error.context("read actual join and original result"));
         }
         if let Some(actor) = &mut kill_actor
-            && let Err(error) = actor.finish(context)
+            && let Err(error) = actor.finish_with(context, |()| Ok(()))
         {
-            cleanup.push(format!("control actual join: {error:#}"));
+            cleanup.push(error.context("control actual join"));
         }
         if let Err(error) =
             await_resource_convergence(context, &baseline, "held multi-file Iceberg cancellation")
         {
-            cleanup.push(format!("resource exit: {error:#}"));
+            cleanup.push(error.context("resource exit"));
         }
         if let Err(error) =
             record_cancelled_proxy_read(context, "a4-held-read", &fixture.proxy, &hold)
         {
-            cleanup.push(format!("proxy terminal evidence: {error:#}"));
+            cleanup.push(error.context("proxy terminal evidence"));
         }
-        let evidence = fs::write(
-            context.scenario_root().join("a4-held-read-exit.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "operation_error":operation.as_ref().err().map(|error| format!("{error:#}")),
-                "cleanup_errors":cleanup,"actual_actor_joins_completed":true,
-            }))?,
-        );
-        operation?;
-        ensure!(
-            cleanup.is_empty(),
-            "held multi-file cleanup failed: {cleanup:?}"
-        );
-        evidence?;
+        let evidence = (|| -> Result<()> {
+            fs::write(
+                context.scenario_root().join("a4-held-read-exit.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "operation_error":operation.as_ref().err().map(provider_failure_receipt),
+                    "cleanup_errors":cleanup.iter().map(provider_failure_receipt).collect::<Vec<_>>(),
+                    "actual_actor_joins_completed":true,
+                    "causal_priority":"original operation first; post-cancel/Join results remain actual secondary objects",
+                }))?,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = evidence {
+            cleanup.push(error.context("persist original range exit evidence"));
+        }
+        finish_provider_operation(operation, cleanup)?;
         context.action("cancelled a real held Parquet read and observed native resource drain");
 
-        let mut followup = mysql_actor::connect(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect post-cancellation Iceberg read")?,
-        )?;
+        let mut followup =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         verify_functional_rows(&mut followup, &scan)?;
         context.action("verified the full Iceberg oracle after cancellation");
         Ok(())
@@ -585,10 +596,14 @@ impl Scenario for RangeFunctional {
     }
 }
 
-fn verify_functional_rows(connection: &mut mysql::Conn, sql: &str) -> Result<()> {
+fn verify_functional_rows(connection: &mut SqlSession, sql: &str) -> Result<()> {
     let rows: Vec<u64> = connection
-        .query(sql)
+        .execute(sql)
+        .and_then(unsigned_rows)
         .context("read multi-file Iceberg rows")?;
+    verify_functional_result(rows)
+}
+fn verify_functional_result(rows: Vec<u64>) -> Result<()> {
     ensure!(
         rows.len() == 768 && rows.iter().copied().eq(0..768),
         "multi-file Iceberg rows differ from the published ordered ID oracle"
@@ -608,20 +623,24 @@ fn run_range_clients(context: &mut ScenarioContext, table: &str, short: bool) ->
     let checks = (0..4)
         .map(|index| {
             let sql = sql.clone();
-            Box::new(move |connection: &mut mysql::Conn| -> Result<()> {
-                if short {
-                    let actual: Vec<(u64, u64)> = connection.query(&sql)?;
-                    let expected = (1..=10).map(|id| (id, 3 * id)).collect::<Vec<_>>();
-                    ensure!(
-                        actual == expected,
-                        "short-range client {index} rows differ: {actual:?}"
-                    );
-                } else {
-                    verify_functional_rows(connection, &sql)
+            Box::new(
+                move |connection: &mut SqlSession, statements: &ActorStatements| -> Result<()> {
+                    if short {
+                        let actual = unsigned_pairs(statements.run(connection, &sql)??)?;
+                        let expected = (1..=10).map(|id| (id, 3 * id)).collect::<Vec<_>>();
+                        ensure!(
+                            actual == expected,
+                            "short-range client {index} rows differ: {actual:?}"
+                        );
+                    } else {
+                        verify_functional_result(unsigned_rows(
+                            statements.run(connection, &sql)??,
+                        )?)
                         .with_context(|| format!("multi-file range client {index}"))?;
-                }
-                Ok(())
-            }) as Box<dyn FnOnce(&mut mysql::Conn) -> Result<()> + Send>
+                    }
+                    Ok(())
+                },
+            ) as ProviderCheck
         })
         .collect();
     let execution = run_checks(

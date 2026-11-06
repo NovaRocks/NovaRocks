@@ -1615,6 +1615,7 @@ fn process_control_and_participation_share_one_scheduler_with_independent_origin
         roles.push((work, capacity));
     }
     let core = ControlCore::new(
+        f.identity.backend_process_id(),
         ControlConfig {
             max_pending_requests: 8,
             step_budget: ControlCore::MAX_STEP_WORK,

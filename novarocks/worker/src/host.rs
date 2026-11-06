@@ -735,6 +735,12 @@ pub trait ParticipationHostFactory: Send + Sync {
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection>;
 }
 
+/// Read-only stop observation borrowed from the original admitted Participation Scope.
+/// It grants no release, completion, or resource-retirement authority.
+pub trait ParticipationMaterializationControl: Sync {
+    fn is_stopped(&self) -> bool;
+}
+
 /// The host resources of one Participation incarnation. No operation resolves a
 /// Participation key again: a delayed job retains its original instance, never a
 /// later occupant of the directory. The owning scope must retain this
@@ -742,7 +748,13 @@ pub trait ParticipationHostFactory: Send + Sync {
 pub trait ParticipationHostInstance: Send + Sync {
     fn participation(&self) -> ParticipationRef;
 
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
+    /// Observe the same Scope's committed stop while installing shared facts.
+    /// Already started calls retain their original custody until actual exit.
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        control: &dyn ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection>;
 
     fn release(&self) -> ReleasedParticipationEvidence;
 

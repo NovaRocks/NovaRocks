@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 pub struct ProviderTestSlots {
     pub iceberg: IcebergObservationSlot,
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub hms: novarocks_connector_iceberg::hms_listing_probe::HmsListingObservationSlot,
+
     storage: Arc<Mutex<Vec<Arc<novarocks_fs::StorageAuthorityRegistry>>>>,
 }
 impl ProviderTestSlots {
@@ -45,8 +44,6 @@ impl ProviderTestSlots {
         let result = self.try_bind_frontend(scope);
         if result.is_err() {
             self.iceberg.close();
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            self.hms.close();
         }
         result
     }
@@ -58,19 +55,11 @@ impl ProviderTestSlots {
         self.iceberg
             .activate(scope.grants_for(IcebergObservationSlot::DOMAIN))
             .map_err(str::to_owned)?;
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let probe = self
-            .hms
-            .activate(scope.grants_for(
-                novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe::DOMAIN,
-            ))
-            .map_err(str::to_owned)?;
-        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+
         if !scope.grants_for("hms-listing-observation").is_empty() {
-            return Err("HMS listing observation requires its explicit build capability".into());
+            return Err("HMS listing observation is retired".into());
         }
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let close_probe = probe.clone();
+
         let input_writer = self.iceberg.clone();
         let writer = self.iceberg.clone();
         let close = self.iceberg.clone();
@@ -84,33 +73,9 @@ impl ProviderTestSlots {
                 })),
                 close: Some(Arc::new(move || {
                     close.close();
-                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                    if let Some(probe) = &close_probe {
-                        probe.close();
-                    }
+
                     Ok(())
                 })),
-                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                hms_listing_observation: probe.as_ref().map(|probe| {
-                    let handler = probe.clone();
-                    let selected = probe.clone();
-                    novarocks_frontend_application::HmsListingObservationSetup::new(
-                        Arc::new(move |body| handler.handle_json(body)),
-                        Arc::new(move |observation| {
-                            selected
-                                .captured_admission_owner(&observation.instance_id)
-                                .map(|owner| {
-                                    owner.map(|(handle, incarnation)| {
-                                        novarocks_frontend_application::HmsAdmissionInstalledOwner {
-                                            handle,
-                                            incarnation,
-                                        }
-                                    })
-                                })
-                        }),
-                        probe.cancellation(),
-                    )
-                }),
             },
         )
     }

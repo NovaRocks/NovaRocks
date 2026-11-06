@@ -93,35 +93,35 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     require_three_backends(context)?;
     let warehouse =
         crate::scenarios::connector::create_warehouse(context, "limit-zero-unknown-sender")?;
-    let mut control = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
+    let mut control = crate::actors::sql::SqlSession::new(
+        context.sql_user(),
+        context.trino_port(),
         context.deadline(),
     )?;
     crate::scenarios::connector::create_catalog(&mut control, "cbw_catalog", &warehouse)?;
-    control.query_drop("CREATE DATABASE cbw_catalog.cbw_db")?;
-    control.query_drop("CREATE TABLE cbw_catalog.cbw_db.cbw_data (v BIGINT) TBLPROPERTIES ('novarocks.statistics.collect-on-write'='false')")?;
+    control.execute("CREATE DATABASE cbw_catalog.cbw_db")?;
+    control.execute("CREATE TABLE cbw_catalog.cbw_db.cbw_data (v BIGINT) TBLPROPERTIES ('novarocks.statistics.collect-on-write'='false')")?;
     for value in [1, 2, 3] {
-        control.query_drop(format!(
+        control.execute(format!(
             "INSERT INTO cbw_catalog.cbw_db.cbw_data VALUES ({value})"
         ))?;
     }
-    control.finish()?;
+    drop(control);
     context.action("created three independent Iceberg scan files before arming exact Create holds");
     let baseline = resource_snapshot(context)?;
     let listener = HoldListener::bind(&selected.token, context.process_ids().backends.len())?;
-    let connection = mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )?;
-    let observation = selected.arm(context, connection.connection_id(), QUERY)?;
+    let deadline = context.deadline();
+    let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
+    let pending = session.submit(QUERY)?;
+    let cancel = pending.cancel_handle();
+    let (pending, observation) = selected.arm_pending(context, pending, QUERY)?;
     let (done_tx, done) = mpsc::sync_channel(1);
     let query = QueryRead(Some(thread::spawn(move || -> Result<()> {
-        connection.run(|connection| {
-            let rows = connection.query::<i64, _>(QUERY);
-            done_tx.send(rows).context("publish LIMIT 0 result")
-        })
+        match done_tx.send(session.run_pending(pending)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::SendError(Err(error))) => Err(error.into()),
+            Err(mpsc::SendError(Ok(_))) => bail!("LIMIT 0 result receiver closed"),
+        }
     })));
     let mut held = Vec::<HeldCreate>::new();
     let result = (|| -> Result<String> {
@@ -204,10 +204,10 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         }
         context.remaining("receive complete LIMIT 0 result with unknown sender")?;
         let deadline = context.deadline();
-        let rows = loop {
+        let response = loop {
             match done.try_recv() {
-                Ok(rows) => {
-                    break rows
+                Ok(response) => {
+                    break response
                         .context("LIMIT 0 must seal while its unneeded Create is unknown")?;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => bail!("LIMIT 0 client actor disconnected"),
@@ -228,8 +228,13 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
             thread::sleep(RESOURCE_POLL_INTERVAL);
         };
         ensure!(
-            rows.is_empty(),
-            "LIMIT 0 returned unexpected rows: {rows:?}"
+            response.is_result_set()
+                && response.columns.len() == 1
+                && response.columns[0].name == "v"
+                && response.columns[0].type_signature.raw_type == "bigint"
+                && response.columns[0].type_signature.arguments.is_empty()
+                && response.rows.is_empty(),
+            "LIMIT 0 returned an unexpected typed result: {response:?}"
         );
         ensure!(
             context.process_ids().backends[target] == process_pid
@@ -270,19 +275,29 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     // The grant is now retired. Listener drop releases pending connections and
     // unlinks the socket before joining the bounded client.
     drop(listener);
+    use super::super::paimon::scan_statement_actor::combine;
+    let cancelled = if result.is_err() {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
     let joined = query.join();
-    let cleanup =
-        crate::scenarios::paimon::scan_statement_actor::combine(released_and_cleared, joined);
-    let execution = crate::scenarios::paimon::scan_statement_actor::combine(result, cleanup)?;
-    // The public answer above is the seal witness. Full background cleanup
-    // evidence is read only after restoring transport and releasing every
-    // pre-Worker hold, including requests that arrived after the root EOS.
-    let terminal = context
+    let terminal = (|| -> Result<_> {
+        let execution = combine(
+            result,
+            combine(released_and_cleared, combine(cancelled, joined)),
+        )?;
+        // The public answer above is the seal witness. Full background cleanup
+        // evidence is read after restoring transport and releasing all holds.
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+        Ok((execution, terminal))
+    })();
+    let drained = context
         .handle()
-        .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)?;
-    context
-        .handle()
-        .drain_query_lifecycle_statement_observation(&observation)?;
+        .drain_query_lifecycle_statement_binding(&observation, deadline);
+    let (execution, terminal) = combine(terminal, drained)?;
     ensure!(
         terminal.execution_id.as_deref() == Some(execution.as_str()) && terminal.attempt_id == 1,
         "LIMIT 0 cleanup must belong to the same frozen attempt: {terminal:?}"

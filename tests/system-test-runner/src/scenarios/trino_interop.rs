@@ -89,7 +89,6 @@ impl Scenario for TrinoInterop {
                     "novarocks/result-contract/**",
                     "novarocks/query-application/**",
                     "novarocks/frontend-application/**",
-                    "novarocks/mysql-adapter/**",
                     "novarocks/sql/**",
                     "novarocks/native-adapter/**",
                     "novarocks/connector/iceberg/**",

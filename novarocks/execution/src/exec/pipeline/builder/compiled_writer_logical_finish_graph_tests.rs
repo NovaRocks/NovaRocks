@@ -228,10 +228,11 @@ mod logical_finish_graph {
             destination: RuntimeEndpoint,
             entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
             stop: tokio_util::sync::CancellationToken,
+            activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
         ) {
             self.loopback
-                .register_unit_demands(destination, entries, stop, done)
+                .register_unit_demands(destination, entries, stop, activity, done)
         }
         fn watch_unit_facts(
             &self,

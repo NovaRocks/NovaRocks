@@ -61,7 +61,6 @@ use novarocks_query_application::api::{
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use novarocks_query_application::client_connection::ClientConnectionControlPort;
 use novarocks_query_application::cpu::QueryBlockingExecutor;
 #[cfg(test)]
 use novarocks_query_application::cpu::QueryCpuRunError;
@@ -74,7 +73,7 @@ use novarocks_query_application::serving_admission::{
     FrontendAdmissionError, FrontendServingAdmission,
 };
 use novarocks_query_application::session::{
-    QuerySession, QuerySessionFactory, QuerySessionOpenRequest, StatementSessionRequest,
+    QuerySession, QuerySessionFactory, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
     GovernedQueryStatementBeginError, GovernedStatementAction, QueryControlService,
@@ -90,11 +89,9 @@ use novarocks_query_application::session_outcome::{
 use novarocks_query_application::session_value::StatementSessionError;
 use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
-    unnegotiated_query_statement,
 };
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
-use novarocks_query_application::sql::kill::execute_control_session_statement;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -299,45 +296,55 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
             self.executor.clone(),
             request_context,
             command_context,
-            move |context, command_context| match command {
-                novarocks_sql::semantic::CatalogSqlCommand::DropDatabase { name, .. }
-                    if context.session().current_catalog().is_none() && name.parts.len() == 1 =>
-                {
-                    view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
-                    Ok(StatementResult::Ok)
+            move |context, command_context| -> Result<StatementResult, CommandError> {
+                match command {
+                    novarocks_sql::semantic::CatalogSqlCommand::DropDatabase { name, .. }
+                        if context.session().current_catalog().is_none()
+                            && name.parts.len() == 1 =>
+                    {
+                        view.drop_database(DEFAULT_CATALOG, &name.parts[0])?;
+                        Ok(StatementResult::Ok)
+                    }
+                    novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) => catalog
+                        .execute_table_command(
+                            &command,
+                            context.session().current_catalog(),
+                            context.session().current_database(),
+                            command_context.connector_context(),
+                        ),
+                    novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command)
+                        if matches!(
+                            &command.action,
+                            novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
+                        ) =>
+                    {
+                        iceberg_ref
+                            .execute_command(
+                                &command,
+                                context.session().current_database(),
+                                command_context.connector_context(),
+                            )
+                            .map_err(Into::into)
+                    }
+                    novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command) => {
+                        catalog
+                            .execute_iceberg_command(
+                                &command,
+                                context.session().current_catalog(),
+                                context.session().current_database(),
+                                command_context.connector_context(),
+                            )
+                            .map_err(Into::into)
+                    }
+                    command => catalog
+                        .execute_command(
+                            &command,
+                            context.session().current_catalog(),
+                            context.session().current_database(),
+                            command_context.connector_context(),
+                        )
+                        .map_err(Into::into),
                 }
-                novarocks_sql::semantic::CatalogSqlCommand::CreateTable(command) => catalog
-                    .execute_table_command(
-                        &command,
-                        context.session().current_catalog(),
-                        context.session().current_database(),
-                        command_context.connector_context(),
-                    ),
-                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command)
-                    if matches!(
-                        &command.action,
-                        novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
-                    ) =>
-                {
-                    iceberg_ref.execute_command(
-                        &command,
-                        context.session().current_database(),
-                        command_context.connector_context(),
-                    )
-                }
-                novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command) => catalog
-                    .execute_iceberg_command(
-                        &command,
-                        context.session().current_catalog(),
-                        context.session().current_database(),
-                        command_context.connector_context(),
-                    ),
-                command => catalog.execute_command(
-                    &command,
-                    context.session().current_catalog(),
-                    context.session().current_database(),
-                    command_context.connector_context(),
-                ),
             },
         )
     }
@@ -365,7 +372,16 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
                 request_context.session().current_database(),
                 request_context.execution(),
                 command_context.connector_context(),
-                *request_context.session().presentation(),
+                request_context
+                    .session()
+                    .presentation()
+                    .copied()
+                    .ok_or_else(|| {
+                        CommandError::new(
+                            CommandErrorKind::Rejected,
+                            "statistics client result requires an explicit presentation",
+                        )
+                    })?,
             )
             .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))
     }
@@ -582,7 +598,6 @@ struct TypedCommandRoute {
     mv: Arc<dyn MaterializedViewCommandConsumer>,
     mv_call: MvCommandExecutor,
     executor: QueryBlockingExecutor,
-    sessions: QueryControlService,
 }
 
 impl TypedCommandRoute {
@@ -592,7 +607,6 @@ impl TypedCommandRoute {
         mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
         executor: QueryBlockingExecutor,
-        sessions: QueryControlService,
     ) -> Self {
         Self {
             backend,
@@ -600,190 +614,11 @@ impl TypedCommandRoute {
             mv,
             mv_call,
             executor,
-            sessions,
         }
     }
 }
 
-/// The MySQL `SHOW PROCESSLIST` column set, in MySQL's order.
-///
-/// `Host`, `db`, and `State` are always NULL: a client's host address belongs
-/// to the MySQL listener, the current database is session-local SQL state, and
-/// this engine has no per-statement state machine to name. None of the three
-/// is registry state, so none is invented here.
-fn process_list_columns() -> Vec<novarocks_query_application::api::ResultField> {
-    use arrow::datatypes::DataType;
-    use novarocks_query_application::api::ResultField;
-    use novarocks_type_contract::FunctionValueType;
-    [
-        ("Id", DataType::Int64, false),
-        ("User", DataType::Utf8, false),
-        ("Host", DataType::Utf8, true),
-        ("db", DataType::Utf8, true),
-        ("Command", DataType::Utf8, false),
-        ("Time", DataType::Int64, false),
-        ("State", DataType::Utf8, true),
-        ("Info", DataType::Utf8, true),
-    ]
-    .into_iter()
-    .map(|(name, carrier, nullable)| {
-        ResultField::new(name, FunctionValueType::new(carrier, nullable))
-    })
-    .collect()
-}
-
-/// MySQL truncates `Info` here unless the caller asked for `FULL`.
-const PROCESS_LIST_INFO_LIMIT: usize = 100;
-
-fn process_list_result(
-    processes: Vec<novarocks_query_application::session_control::SessionProcess>,
-    full: bool,
-) -> Result<QueryResult, String> {
-    use novarocks_query_application::api::LocalResultBound;
-
-    // The snapshot shares each statement text with its session. Count the
-    // whole result from it before building any array; FULL output can carry
-    // every running statement's complete text.
-    let info = processes
-        .iter()
-        .map(|process| {
-            process.statement.as_deref().map(|text| {
-                if full {
-                    std::borrow::Cow::Borrowed(text)
-                } else {
-                    std::borrow::Cow::Owned(truncate_process_list_info(text))
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    let bytes = processes
-        .iter()
-        .zip(&info)
-        .try_fold(0_usize, |total, (process, info)| {
-            [
-                size_of::<i64>(),
-                process.principal.len(),
-                0,
-                0,
-                process.command().len(),
-                size_of::<i64>(),
-                0,
-                info.as_deref().map_or(0, str::len),
-            ]
-            .into_iter()
-            .try_fold(total, |total, cell| {
-                total.checked_add(LocalResultBound::cell_bytes(cell))
-            })
-        })
-        .unwrap_or(usize::MAX);
-    LocalResultBound::V1.admit(processes.len(), bytes)?;
-
-    let columns = process_list_columns();
-    let schema = Arc::new(arrow::datatypes::Schema::new(
-        columns
-            .iter()
-            .map(|field| {
-                arrow::datatypes::Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.nullable(),
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let mut ids = arrow::array::Int64Builder::with_capacity(processes.len());
-    let mut times = arrow::array::Int64Builder::with_capacity(processes.len());
-    for process in &processes {
-        ids.append_value(i64::from(process.connection_id));
-        times.append_value(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX));
-    }
-    let ids = ids.finish();
-    let times = times.finish();
-    // All requested values/offset/validity storage is covered by the borrowed
-    // whole-table preflight above. Iterator constructors cannot infer string
-    // bytes and may geometrically replace a nearly full values buffer.
-    let users = process_list_text_column(
-        processes
-            .iter()
-            .map(|process| Some(process.principal.as_ref())),
-    )?;
-    let hosts = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
-    let databases = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
-    let commands =
-        process_list_text_column(processes.iter().map(|process| Some(process.command())))?;
-    let states = process_list_text_column(std::iter::repeat_n(None, processes.len()))?;
-    let info = process_list_text_column(info.iter().map(Option::as_deref))?;
-
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(ids),
-            Arc::new(users),
-            Arc::new(hosts),
-            Arc::new(databases),
-            Arc::new(commands),
-            Arc::new(times),
-            Arc::new(states),
-            Arc::new(info),
-        ],
-    )
-    .map_err(|error| format!("build SHOW PROCESSLIST result: {error}"))?;
-
-    Ok(QueryResult {
-        columns,
-        batches: vec![batch],
-    })
-}
-
-/// Only the closed SHOW PROCESSLIST source uses this constructor. Count
-/// borrowed cells first; no source alias is installed in the new Arrow graph.
-fn process_list_text_column<'a>(
-    values: impl ExactSizeIterator<Item = Option<&'a str>> + Clone,
-) -> Result<arrow::array::StringArray, String> {
-    let bytes = values.clone().flatten().try_fold(0usize, |sum, value| {
-        sum.checked_add(value.len())
-            .ok_or("SHOW PROCESSLIST text capacity overflows")
-    })?;
-    let mut builder = arrow::array::StringBuilder::with_capacity(values.len(), bytes);
-    for value in values {
-        builder.append_option(value);
-    }
-    Ok(builder.finish())
-}
-
-/// Truncates on a character boundary, so a multi-byte statement cannot be cut
-/// into invalid UTF-8.
-fn truncate_process_list_info(text: &str) -> String {
-    if text.chars().count() <= PROCESS_LIST_INFO_LIMIT {
-        return text.to_string();
-    }
-    text.chars().take(PROCESS_LIST_INFO_LIMIT).collect()
-}
-
 impl SpecializedStatementRoute for TypedCommandRoute {
-    fn execute_show_process_list(
-        &self,
-        full: bool,
-        _context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> CommandFuture {
-        // The registry snapshot is taken here, under its own lock, and the
-        // rest is pure projection, so this route needs no blocking executor.
-        let window = command_context.result_window_alias();
-        let processes = self.sessions.list_processes();
-        Box::pin(async move {
-            let _window = window;
-            process_list_result(processes, full)
-                .map(StatementResult::Query)
-                .map_err(|error| {
-                    novarocks_query_application::api::CommandError::new(
-                        novarocks_query_application::api::CommandErrorKind::Failed,
-                        error,
-                    )
-                })
-        })
-    }
-
     fn execute_show_backends(
         &self,
         context: &RequestContext,
@@ -1217,7 +1052,6 @@ pub struct FrontendQueryService {
     command_executor: Arc<dyn SpecializedStatementRoute>,
     product_command_router: ProductCommandRouter,
     query_control: QueryControlService,
-    client_connection_control: Arc<dyn ClientConnectionControlPort>,
     logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
     workload_root_admission: RootAdmissionHandle,
     role: ClusterRole,
@@ -1277,7 +1111,6 @@ impl FrontendQueryService {
         mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
         query_control: QueryControlService,
-        client_connection_control: Arc<dyn ClientConnectionControlPort>,
         logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
         workload_root_admission: RootAdmissionHandle,
         role: ClusterRole,
@@ -1308,11 +1141,9 @@ impl FrontendQueryService {
                 mv_command_consumer,
                 mv_command_executor,
                 query_blocking_executor.clone(),
-                query_control.clone(),
             )),
             product_command_router,
             query_control,
-            client_connection_control,
             logical_execution_launcher,
             workload_root_admission,
             role,
@@ -1338,6 +1169,7 @@ impl QuerySessionFactory for FrontendQueryService {
         &self,
         request: StatementSessionRequest,
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+        let admission = request.admission();
         let (query_id, principal, value) = request.into_parts();
         let state = SessionSqlState::from_session_value(value)?;
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
@@ -1359,35 +1191,8 @@ impl QuerySessionFactory for FrontendQueryService {
             state: Arc::new(Mutex::new(state)),
             statement_ready: statement_action::StatementReadyReceiver::default(),
             principal,
-        }))
-    }
-
-    fn open_session(
-        &self,
-        request: QuerySessionOpenRequest,
-    ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
-        let query_control = self.query_control.clone();
-        let identity =
-            SessionIdentity::new(request.connection_token(), request.principal().to_string());
-        let lease = self
-            .serving_admission
-            .register_session(|| query_control.register_session(identity))
-            .map_err(query_service_admission_error)?
-            .map_err(|error| {
-                QueryServiceError::new(
-                    QueryServiceErrorKind::Internal,
-                    format!("register frontend query session failed: {error:?}"),
-                )
-            })?;
-        Ok(Arc::new(FrontendQuerySession {
-            service: self.clone(),
-            origin: novarocks_query_application::session_control::SessionOrigin::Connection(
-                request.connection_token(),
-            ),
-            lease: Mutex::new(Some(lease)),
-            state: Arc::new(Mutex::new(SessionSqlState::default())),
-            statement_ready: statement_action::StatementReadyReceiver::default(),
-            principal: Arc::from(request.principal()),
+            admission,
+            output_shape: Mutex::new(None),
         }))
     }
 
@@ -1417,37 +1222,23 @@ struct FrontendQuerySession {
     /// Who the server authenticated on this connection. A command that records
     /// what someone did takes this, never an argument that claims an identity.
     principal: Arc<str>,
+    admission: novarocks_query_application::session::StatementAdmissionPublisher,
+    output_shape: Mutex<Option<novarocks_query_application::session::StatementOutputShape>>,
 }
 
-/// Statement-origin errors retain the original SQL prefix for exact locations.
-/// Connection-origin framing keeps its existing normalization policy.
-fn statement_execution_source<'a>(
-    origin: &novarocks_query_application::session_control::SessionOrigin,
-    original: &'a str,
-    legacy_normalized: &'a str,
-) -> &'a str {
-    match origin {
-        novarocks_query_application::session_control::SessionOrigin::ClientStatement(_) => {
-            original.trim_end().trim_end_matches(';').trim_end()
-        }
-        novarocks_query_application::session_control::SessionOrigin::Connection(_) => {
-            legacy_normalized
-        }
-    }
+/// Keep the original SQL prefix for exact error locations.
+fn statement_execution_source(original: &str) -> &str {
+    original.trim_end().trim_end_matches(';').trim_end()
 }
 
 impl FrontendQuerySession {
     fn statement_logical_execution_launcher(&self) -> Arc<dyn LogicalExecutionLauncher> {
-        let launcher = Arc::clone(&self.service.logical_execution_launcher);
-        match &self.origin {
-            novarocks_query_application::session_control::SessionOrigin::ClientStatement(id) => {
-                crate::query_execution::logical_execution::trace_client_statement(
-                    launcher,
-                    id.clone(),
-                )
-            }
-            novarocks_query_application::session_control::SessionOrigin::Connection(_) => launcher,
-        }
+        let novarocks_query_application::session_control::SessionOrigin::ClientStatement(id) =
+            &self.origin;
+        crate::query_execution::logical_execution::trace_client_statement(
+            Arc::clone(&self.service.logical_execution_launcher),
+            id.clone(),
+        )
     }
 
     fn governed_statement_begin_error(
@@ -1500,10 +1291,16 @@ impl FrontendQuerySession {
         if let Some(error) = admin_raise_engine_error(trimmed)? {
             return Err(error);
         }
-        let source = statement_execution_source(&self.origin, statement, trimmed);
+        let source = statement_execution_source(statement);
         let parsed_statement = parse_single_statement(source)
             .map_err(|error| query_service_parse_error(error, source))?;
-        let kind = StatementKind::from_statement(&parsed_statement);
+        novarocks_query_application::sql::admission::admit_statement_session(&parsed_statement)?;
+        let admitted = novarocks_query_application::session::StatementAdmission::from_statement(
+            &parsed_statement,
+        );
+        self.admission.publish(admitted);
+        *self.output_shape.lock().unwrap_or_else(|p| p.into_inner()) = Some(admitted.shape);
+        let kind = admitted.kind;
         let result = match parsed_statement {
             ParsedStatement::Session(ast::SessionStatement::Set(statement))
                 if statement
@@ -1543,15 +1340,6 @@ impl FrontendQuerySession {
         statement: &ast::SessionStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         let token = self.token()?;
-        if let Some(result) = execute_control_session_statement(
-            source,
-            statement,
-            token,
-            &self.service.query_control,
-            self.service.client_connection_control.as_ref(),
-        ) {
-            return result;
-        }
         let governed = self
             .service
             .query_control
@@ -1597,7 +1385,7 @@ impl FrontendQuerySession {
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Kill(_) => {
-                unreachable!("KILL enters the dedicated control route before ordinary admission")
+                unreachable!("connection management is refused before statement admission")
             },
             ast::SessionStatement::TransactionControl(statement) => Err(
                 QueryServiceError::from_user_error(
@@ -1640,8 +1428,14 @@ impl FrontendQuerySession {
         statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
         let family = match self.state.lock() {
-            Ok(state) => *state.presentation(),
+            Ok(state) => state.presentation().copied(),
             Err(error) => return self.governed_typed_error(poisoned_state(error), statement),
+        };
+        let Some(family) = family else {
+            return self.governed_typed_error(
+                internal_error("client result requires an explicit presentation"),
+                statement,
+            );
         };
         match GovernedImmediateStatementResult::try_new(result, statement, family) {
             Ok(result) => StatementResult::GovernedQuery(result),
@@ -1943,7 +1737,7 @@ impl FrontendQuerySession {
         } else {
             topology
         };
-        let presentation = *state.presentation();
+        let presentation = state.presentation().copied();
         let (
             current_catalog,
             current_database,
@@ -2492,13 +2286,6 @@ impl FrontendQuerySession {
                     }
                 }
             }),
-            ParsedStatement::ShowProcessList(statement) => Box::pin(async move {
-                let result = command_executor
-                    .execute_show_process_list(statement.full, &context, &command_context)
-                    .await
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
-                Ok((result, execution_owner))
-            }),
             ParsedStatement::ShowBackends(_) => Box::pin(async move {
                 let result = command_executor
                     .execute_show_backends(&context, &command_context)
@@ -2646,8 +2433,7 @@ impl FrontendQuerySession {
             Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
                 GovernedCompletionStatementResult::new(
-                    novarocks_query_application::session_control::StatementCommandCompletion::new(
-                        0,
+                    novarocks_query_application::session_control::StatementCommandCompletion::empty(
                     ),
                     statement,
                 ),
@@ -2704,85 +2490,6 @@ fn with_query_hints(
 
 #[async_trait]
 impl QuerySession for FrontendQuerySession {
-    #[cfg(novarocks_dev_controls)]
-    fn connection_session(
-        &self,
-        connection: novarocks_query_application::client_connection::ClientConnectionToken,
-    ) -> Option<SessionToken> {
-        match &self.origin {
-            novarocks_query_application::session_control::SessionOrigin::Connection(original)
-                if *original == connection =>
-            {
-                self.lease
-                    .lock()
-                    .ok()?
-                    .as_ref()
-                    .map(QuerySessionLease::token)
-            }
-            _ => None,
-        }
-    }
-
-    async fn init_database(
-        &self,
-        schema: &str,
-    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
-    {
-        let token = self.token()?;
-        let statement = self
-            .service
-            .query_control
-            .begin_governed_statement_with_result(
-                token,
-                &self.service.workload_root_admission,
-                WorkClass::Management,
-                None,
-                None,
-                None,
-                ResultWindowClass::Local,
-            )
-            .map_err(|error| self.governed_statement_begin_error(error))?;
-        let cancellation = QueryCancellationView::governed(
-            statement.cancellation().clone(),
-            statement.timeout_ms(),
-        );
-        match self
-            .init_database_with_cancellation(schema, cancellation, &statement)
-            .await
-        {
-            Ok(effects) => Ok(
-                novarocks_query_application::session::QuerySessionStatement::output_owned(
-                    StatementResult::GovernedCompletion(
-                        GovernedCompletionStatementResult::with_session_effects(statement, effects),
-                    ),
-                    StatementKind::Use,
-                ),
-            ),
-            Err(error) => Ok(
-                novarocks_query_application::session::QuerySessionStatement::output_owned(
-                    self.governed_typed_error(error, statement),
-                    StatementKind::Use,
-                ),
-            ),
-        }
-    }
-
-    async fn execute_batch(
-        &self,
-        sql: &str,
-    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
-    {
-        let Some(statement) = unnegotiated_query_statement(sql)? else {
-            return Ok(
-                novarocks_query_application::session::QuerySessionStatement::output_owned(
-                    StatementResult::Ok,
-                    StatementKind::Empty,
-                ),
-            );
-        };
-        self.execute_statement(statement).await
-    }
-
     async fn execute_statement(
         &self,
         statement: &str,
@@ -3115,21 +2822,12 @@ mod tests {
 
     #[test]
     fn statement_origin_parser_errors_keep_the_original_source_prefix() {
-        use novarocks_query_application::{
-            query_control::QueryApplicationControl,
-            session_control::{QueryControlService, SessionOrigin},
-        };
-        let control = QueryControlService::new(Arc::new(QueryApplicationControl::new(
-            novarocks_types::FrontendProcessId::new_v7(),
-        )));
-        let origin = SessionOrigin::ClientStatement(control.mint_client_query_id());
         for (sql, line, column) in [
             ("                    SELECT );;", 1, 28),
             ("-- 中文😀 comment\n  SELECT '中😀中', );;", 2, 24),
             ("\n\nSELECT\n '中😀',\n );;", 5, 2),
         ] {
-            let legacy = strip_leading_line_comments(sql.trim().trim_end_matches(';').trim());
-            let source = statement_execution_source(&origin, sql, legacy);
+            let source = statement_execution_source(sql);
             assert_eq!(
                 source.as_ptr(),
                 sql.as_ptr(),
@@ -3146,31 +2844,12 @@ mod tests {
             );
         }
         let sql = "  -- original prefix\n SELECT '中😀';;;  ";
-        let source = statement_execution_source(
-            &origin,
-            sql,
-            strip_leading_line_comments(sql.trim().trim_end_matches(';').trim()),
-        );
+        let source = statement_execution_source(sql);
         assert!(
             parse_single_statement(source).is_ok(),
             "trailing-semicolon tolerance stays intact"
         );
         assert_eq!(source.as_ptr(), sql.as_ptr());
-    }
-
-    #[test]
-    fn connection_origin_parser_framing_keeps_legacy_normalization() {
-        let origin = novarocks_query_application::session_control::SessionOrigin::Connection(
-            novarocks_query_application::client_connection::ClientConnectionToken::new(41, 1)
-                .unwrap(),
-        );
-        let sql = "  -- existing connection prefix\n   SELECT );; ";
-        let legacy = strip_leading_line_comments(sql.trim().trim_end_matches(';').trim());
-        let source = statement_execution_source(&origin, sql, legacy);
-        assert_eq!(source, "SELECT )");
-        let error = query_service_parse_error(parse_single_statement(source).unwrap_err(), source);
-        let location = error.user_error().unwrap().location().unwrap();
-        assert_eq!((location.line(), location.column()), (1, 8));
     }
 
     #[test]
@@ -3409,118 +3088,6 @@ mod tests {
         )
         .expect("open scalar result stream");
         (producer, execution, receipt)
-    }
-
-    #[test]
-    fn process_list_truncates_info_only_without_full() {
-        use novarocks_query_application::session_control::SessionProcess;
-        use std::time::Duration;
-
-        // A statement long enough to cross the limit, with a multi-byte
-        // character straddling it: truncating by bytes here would produce
-        // invalid UTF-8 rather than a shorter statement.
-        let text: String = "SELECT '".to_string() + &"字".repeat(120) + "'";
-        let processes = vec![
-            SessionProcess {
-                connection_id: 1,
-                principal: Arc::from("root"),
-                elapsed: Duration::from_secs(5),
-                statement: None,
-            },
-            SessionProcess {
-                connection_id: 2,
-                principal: Arc::from("root"),
-                elapsed: Duration::from_secs(0),
-                statement: Some(Arc::from(text.as_str())),
-            },
-        ];
-
-        let truncated = process_list_result(processes.clone(), false).expect("plain result");
-        let full = process_list_result(processes, true).expect("full result");
-        assert_eq!(truncated.columns.len(), 8);
-        assert_eq!(truncated.row_count(), 2);
-
-        fn info(result: &novarocks_query_application::api::QueryResult) -> (bool, String) {
-            use arrow::array::Array;
-
-            let column = result.batches[0]
-                .column(7)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("Info is a string column")
-                .clone();
-            (column.is_null(0), column.value(1).to_string())
-        }
-        let (idle_is_null, truncated_info) = info(&truncated);
-        let (_, full_info) = info(&full);
-        assert!(idle_is_null, "an idle session reports no statement");
-        assert_eq!(truncated_info.chars().count(), PROCESS_LIST_INFO_LIMIT);
-        assert!(full_info.chars().count() > PROCESS_LIST_INFO_LIMIT);
-        assert_eq!(full_info, text);
-    }
-
-    #[test]
-    fn full_process_list_preallocates_long_text_without_geometric_value_slack() {
-        use arrow::array::{StringArray, StringBuilder};
-        use novarocks_query_application::session_control::SessionProcess;
-
-        let text: Arc<str> = Arc::from("x".repeat(65_537));
-        let processes = (0..3)
-            .map(|connection_id| SessionProcess {
-                connection_id,
-                principal: Arc::from("root"),
-                elapsed: Duration::from_secs(1),
-                statement: Some(Arc::clone(&text)),
-            })
-            .collect();
-        let result = process_list_result(processes, true).unwrap();
-        let info = result.batches[0]
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let requested = 3 * text.len();
-        // The public preallocated builder is the capacity oracle; do not
-        // assume Arrow's alignment or allocator rounding in product code.
-        let reserved = StringBuilder::with_capacity(3, requested).finish();
-        assert_eq!(info.values().capacity(), reserved.values().capacity());
-        for row in 0..3 {
-            assert_eq!(info.value(row), text.as_ref());
-        }
-        assert_eq!(result.columns[0].data_type(), &DataType::Int64);
-        assert_eq!(result.columns[5].data_type(), &DataType::Int64);
-        // This workload exercises the old iterator's replacement buffer,
-        // rather than merely restating the current constructor.
-        let iterator_built: StringArray = std::iter::repeat_n(Some(text.as_ref()), 3).collect();
-        assert!(iterator_built.values().capacity() > info.values().capacity());
-    }
-
-    #[test]
-    fn full_process_list_beyond_the_local_bound_is_refused_before_building() {
-        use novarocks_query_application::api::LocalResultBound;
-        use novarocks_query_application::session_control::SessionProcess;
-        use std::time::Duration;
-
-        // Every session shares one large running statement; FULL output would
-        // carry all of them, the truncated output stays small.
-        let statement: Arc<str> = Arc::from("x".repeat(1024 * 1024).as_str());
-        let sessions = LocalResultBound::V1.bytes / (1024 * 1024) + 1;
-        let processes = (0..sessions)
-            .map(|index| SessionProcess {
-                connection_id: u32::try_from(index).expect("small id"),
-                principal: Arc::from("root"),
-                elapsed: Duration::from_secs(1),
-                statement: Some(Arc::clone(&statement)),
-            })
-            .collect::<Vec<_>>();
-        let error = process_list_result(processes.clone(), true).expect_err("FULL is too large");
-        assert!(error.contains("byte bound"), "{error}");
-        assert_eq!(
-            process_list_result(processes, false)
-                .expect("truncated output")
-                .row_count(),
-            sessions
-        );
     }
 
     fn scalar_field(nullable: bool) -> ResultField {

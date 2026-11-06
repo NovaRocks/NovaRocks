@@ -4,10 +4,9 @@ mod storage_control_plan;
 #[path = "connector_control_plan.rs"]
 mod connector_control_plan;
 
-use crate::actors::mysql as mysql_actor;
+use crate::actors::sql::{self, SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::isolated_iceberg_rest::{
     IsolatedIcebergRestFixture, IsolatedS3Identity,
 };
@@ -31,7 +30,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONNECTOR_READER_OPEN: &str =
     novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_OPEN;
@@ -218,9 +217,9 @@ impl Scenario for Uea5dMultiSplitDop {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "uea5d_dop_catalog";
             const DATABASE: &str = "uea5d_dop_db";
             const TABLE: &str = "uea5d_dop_data";
@@ -231,7 +230,8 @@ impl Scenario for Uea5dMultiSplitDop {
             let mut observations = Vec::new();
             for (index, dop) in [1, 4].into_iter().enumerate() {
                 control
-                    .query_drop(format!("SET pipeline_dop = {dop}"))
+                    .execute(format!("SET pipeline_dop = {dop}"))
+                    .map(|_| ())
                     .with_context(|| format!("select requested read DOP {dop}"))?;
                 let before = backend_log_snapshots(context)?;
                 context.action(format!(
@@ -243,6 +243,7 @@ impl Scenario for Uea5dMultiSplitDop {
                     &mut control,
                     &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
                 )
+                .and_then(|result| connector_integer_pairs(result).map_err(anyhow::Error::from))
                 .with_context(|| format!("read UEA-5D multi-split fixture at DOP {dop}"))?;
                 ensure!(
                     rows == [(300_000, 45_000_150_000)],
@@ -314,8 +315,7 @@ impl Scenario for Uea5dMultiSplitDop {
             .context("persist exact UEA-5D multi-split DOP observations")?;
             await_resource_convergence(context, &baseline, "UEA-5D multi-split DOP reads")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -376,17 +376,19 @@ impl Scenario for TypedReadData {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             // Cache service availability alone is intentionally inert: this
             // scenario explicitly opts its control session into both cache reads
             // and population before asserting the warm/cached profiles below.
             control
-                .query_drop("SET enable_scan_datacache = true")
+                .execute("SET enable_scan_datacache = true")
+                .map(|_| ())
                 .context("enable cache reads for typed connector data")?;
             control
-                .query_drop("SET enable_populate_datacache = true")
+                .execute("SET enable_populate_datacache = true")
+                .map(|_| ())
                 .context("enable cache population for typed connector data")?;
 
             const CATALOG: &str = "typed_read_catalog";
@@ -402,14 +404,16 @@ impl Scenario for TypedReadData {
             let counted_query = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}");
             context.action("warm the enabled role-local cache through a typed connector read");
             let warm_profile: Vec<String> = control
-                .query(format!("EXPLAIN ANALYZE {counted_query}"))
+                .execute(format!("EXPLAIN ANALYZE {counted_query}"))
+                .and_then(connector_text_rows)
                 .context("collect cache-warming typed connector EXPLAIN ANALYZE profile")?;
             let warm_profile = warm_profile.join("\n");
             assert_positive_profile_counter(&warm_profile, "ConnectorFileCacheMisses")?;
 
             context.action("repeat the same typed connector read from the role-local cache");
             let cached_profile: Vec<String> = control
-                .query(format!("EXPLAIN ANALYZE {counted_query}"))
+                .execute(format!("EXPLAIN ANALYZE {counted_query}"))
+                .and_then(connector_text_rows)
                 .context("collect cached typed connector EXPLAIN ANALYZE profile")?;
             let cached_profile = cached_profile.join("\n");
             assert_positive_profile_counter(&cached_profile, "ConnectorFileCacheHits")?;
@@ -421,6 +425,7 @@ impl Scenario for TypedReadData {
                 &mut control,
                 &counted_query,
             )
+            .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("count rows through the typed connector read")?;
             if counted != [300_000] {
                 bail!("typed connector read returned {counted:?} rows, expected [300000]");
@@ -428,7 +433,8 @@ impl Scenario for TypedReadData {
             // A count alone can be right while the values are not; the sum pins
             // which rows were read, not just how many.
             let summed: Vec<i64> = control
-                .query(format!("SELECT sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .execute(format!("SELECT sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .and_then(connector_bigint_rows)
                 .context("sum values through the typed connector read")?;
             if summed != [45_000_150_000] {
                 bail!("typed connector read summed {summed:?}, expected [45000150000]");
@@ -445,8 +451,7 @@ impl Scenario for TypedReadData {
 
             await_resource_convergence(context, &baseline, "typed connector read")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -542,9 +547,9 @@ impl Scenario for DistributedReaderCancel {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             let warehouse = create_warehouse(context, "distributed-reader-cancel")?;
             context.action("create Hadoop Iceberg catalog and three independent data files");
             create_catalog_table_and_data(
@@ -562,10 +567,14 @@ impl Scenario for DistributedReaderCancel {
                 connector_control_plan::Reader::start(context, &selected, &user, port, None)?;
             let target = &owned.read;
             let phase = (|| -> Result<()> {
-                let connection_id = target
+                let client_query_id = target
                     .ready
                     .recv_timeout(context.remaining("receive connector read connection id")?)
                     .context("connector read terminated before publishing its connection id")?;
+                ensure!(
+                    client_query_id == owned.client_query_id,
+                    "reader ready changed the original Pending query identity"
+                );
 
                 wait_for_new_reader_on_every_backend(
                     context,
@@ -582,10 +591,11 @@ impl Scenario for DistributedReaderCancel {
                 }
 
                 context.action(format!(
-                    "cancel connector read through KILL QUERY {connection_id}"
+                    "cancel connector read through its original DELETE handle {client_query_id}"
                 ));
-                control
-                    .query_drop(format!("KILL QUERY {connection_id}"))
+                owned
+                    .cancel
+                    .delete(context.deadline())
                     .context("issue public MySQL KILL QUERY for connector read")?;
                 assert_cancelled_query(
                     &target.done,
@@ -595,7 +605,7 @@ impl Scenario for DistributedReaderCancel {
                     target,
                     context.remaining("verify KILL QUERY target connection remains usable")?,
                 )?;
-                assert_idle_query(&mut control, connection_id)?;
+                assert_completed_query_cancellation(&owned.cancel, context.deadline())?;
                 release_connector_read(target)?;
                 Ok(())
             })();
@@ -611,14 +621,14 @@ impl Scenario for DistributedReaderCancel {
             context
                 .action("verify a subsequent distributed query succeeds after connector cleanup");
             let rows: Vec<i64> = control
-                .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .execute("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .and_then(connector_integer_rows)
                 .context("run post-cancellation distributed query")?;
             if rows != [1, 2] {
                 bail!("post-cancellation distributed query returned {rows:?}, expected [1, 2]");
             }
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -673,9 +683,9 @@ impl Scenario for DistributedReaderKillConnection {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             let warehouse = create_warehouse(context, "distributed-reader-kill-connection")?;
             context.action("create Hadoop Iceberg catalog and three independent data files");
             create_catalog_table_and_data(
@@ -693,12 +703,16 @@ impl Scenario for DistributedReaderKillConnection {
                 connector_control_plan::Reader::start(context, &selected, &user, port, None)?;
             let target = &owned.read;
             let phase = (|| -> Result<()> {
-                let connection_id = target
+                let client_query_id = target
                     .ready
                     .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
                     .context(
                         "KILL CONNECTION target terminated before publishing its connection id",
                     )?;
+                ensure!(
+                    client_query_id == owned.client_query_id,
+                    "reader ready changed the original Pending query identity"
+                );
                 wait_for_new_reader_on_every_backend(
                     context,
                     "connector_kill_connection_catalog",
@@ -708,23 +722,23 @@ impl Scenario for DistributedReaderKillConnection {
                 )?;
 
                 context.action(format!(
-            "terminate the active public-MySQL reader through KILL CONNECTION {connection_id}"
-        ));
-                control
-                    .query_drop(format!("KILL CONNECTION {connection_id}"))
+                    "cancel the original active connector reader through DELETE {client_query_id}"
+                ));
+                owned
+                    .cancel
+                    .delete(context.deadline())
                     .context("issue public MySQL KILL CONNECTION for connector read")?;
-                assert_connection_killed_query(
+                assert_cancelled_query(
                     &target.done,
                     context.remaining("await KILL CONNECTION target query termination")?,
                 )?;
-                assert_target_connection_is_closed(
-                    target,
-                    context.remaining("verify KILL CONNECTION closes the target socket")?,
-                )?;
-                release_connector_read(target)?;
+                // The old socket non-reentry property retires with MySQL in P08.
+                // DELETE proves cancellation; original Native reader exit and
+                // resource convergence below remain independent obligations.
+
                 Ok(())
             })();
-            owned.finish_after(context, &mut control, phase)?;
+            owned.finish_after_retiring_socket_probe(context, phase)?;
 
             let reader_logs = wait_for_balanced_reader_lifecycle(
                 context,
@@ -733,36 +747,19 @@ impl Scenario for DistributedReaderKillConnection {
             assert_no_reader_open_after_abort(&reader_logs)?;
             await_resource_convergence(context, &baseline, "KILL CONNECTION connector read")?;
 
-            context.action("verify bare KILL closes an idle public-MySQL target socket");
-            let idle_owned = connector_control_plan::Idle::start(context, &user, port)?;
-            let idle_target = &idle_owned.client;
-            let idle_phase = (|| -> Result<()> {
-                let idle_connection_id = idle_target
-                    .ready
-                    .recv_timeout(context.remaining("receive bare KILL target id")?)
-                    .context("bare KILL target terminated before publishing its connection id")?;
-                control
-                    .query_drop(format!("KILL {idle_connection_id}"))
-                    .context("issue bare public MySQL KILL for idle target")?;
-                assert_idle_target_connection_is_closed(
-                    idle_target,
-                    context.remaining("verify bare KILL closes the idle target socket")?,
-                )?;
-                Ok(())
-            })();
-            idle_owned.finish_after(&mut control, idle_phase)?;
-
+            // P08 retires bare KILL/idle MySQL registration. An idle typed
+            // HTTP session has no FE-owned connection to kill or assert closed.
             context
                 .action("verify the KILL requester remains usable after both target terminations");
             let rows: Vec<i64> = control
-                .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .execute("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .and_then(connector_integer_rows)
                 .context("run requester query after KILL CONNECTION and bare KILL")?;
             if rows != [1, 2] {
                 bail!("post-KILL requester query returned {rows:?}, expected [1, 2]");
             }
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -820,9 +817,9 @@ impl Scenario for CatalogReadyLifecycle {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "catalog_ready_lifecycle";
             const DATABASE: &str = "catalog_ready_db";
             const TABLE: &str = "catalog_ready_data";
@@ -837,7 +834,8 @@ impl Scenario for CatalogReadyLifecycle {
             // before or after it. The hold is what makes that instant long enough
             // to act on, and the marker is what proves this backend is inside it.
             control
-                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .execute(format!("DROP CATALOG {CATALOG}"))
+                .map(|_| ())
                 .context("replace warm catalog before held cancellation")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             let before_cancel = backend_log_snapshots(context)?;
@@ -857,10 +855,14 @@ impl Scenario for CatalogReadyLifecycle {
             )?;
             let cancelled = &cancelled_owner.read;
             let phase = (|| -> Result<()> {
-                let connection_id = cancelled
+                let client_query_id = cancelled
                     .ready
                     .recv_timeout(context.remaining("receive held catalog query connection id")?)
                     .context("held catalog query terminated before publishing connection id")?;
+                ensure!(
+                    client_query_id == cancelled_owner.client_query_id,
+                    "reader ready changed the original Pending query identity"
+                );
                 let installing = wait_for_cold_catalog_install(
                     context,
                     &before_cancel,
@@ -887,8 +889,9 @@ impl Scenario for CatalogReadyLifecycle {
                     CATALOG,
                     "while the cold catalog install is held",
                 )?;
-                control
-                    .query_drop(format!("KILL QUERY {connection_id}"))
+                cancelled_owner
+                    .cancel
+                    .delete(context.deadline())
                     .context("cancel query while catalog install is held")?;
                 let killed_at = std::time::Instant::now();
                 // Delivery of the abort is asserted before the client's error code,
@@ -911,14 +914,14 @@ impl Scenario for CatalogReadyLifecycle {
                     &installing,
                     "observe the abort reach every Backend holding a cold catalog install",
                 )?;
-                // `KILL QUERY` owes this client 1317, and owes it only once the
+                // Original query cancellation owes this client typed USER_CANCELED, and owes it only once the
                 // coordinator's worker has unwound: the frontend deliberately
                 // withholds the interrupt until the statement generation is released,
                 // so that the probe below can reuse this connection
                 // (`cancellation_requires_statement_fence` in
                 // `novarocks/frontend-application/src/query.rs`). By this line the abort has
                 // already reached every installing Backend, so anything other than a
-                // prompt 1317 is the frontend failing to report an interrupt it owes,
+                // prompt USER_CANCELED is the frontend failing to report an interrupt it owes,
                 // never the expectation being wrong.
                 assert_held_query_interrupted(
                     &cancelled.done,
@@ -955,14 +958,15 @@ impl Scenario for CatalogReadyLifecycle {
             // One backend's cold install fails, and the retry after the trigger is
             // cleared has to succeed on that same backend.
             control
-                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .execute(format!("DROP CATALOG {CATALOG}"))
+                .map(|_| ())
                 .context("replace cancelled catalog before injected install failure")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             let failure_selection = self.controls.take(1)?;
             let before_failure = backend_log_snapshots(context)?;
             failure_selection.trigger(connector_control_plan::FAILURE, "fail\n")?;
             context.action("fail the cold catalog install on one Backend and reject the query");
-            let failed = connector_control_plan::outcome::<i64>(
+            let failed = connector_control_plan::outcome(
                 context,
                 &failure_selection,
                 &mut control,
@@ -973,7 +977,7 @@ impl Scenario for CatalogReadyLifecycle {
                 failure_selection.release(connector_control_plan::FAILURE),
             )?;
             match failed_query {
-                Err(mysql::Error::MySqlError(_)) => {}
+                Err(StatementFailure::Trino(_)) => {}
                 Ok(rows) => bail!("catalog install failure query unexpectedly succeeded: {rows:?}"),
                 Err(error) => {
                     bail!("catalog install failure did not return a public SQL error: {error}")
@@ -1008,6 +1012,7 @@ impl Scenario for CatalogReadyLifecycle {
                 &mut control,
                 &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
+            .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("retry catalog query after clearing injected install failure")?;
             if rows != [300_000] {
                 bail!("catalog install retry returned {rows:?}, expected [300000]");
@@ -1028,7 +1033,8 @@ impl Scenario for CatalogReadyLifecycle {
             // has to exist on a backend before that backend admits any task of the
             // query that asked for it.
             control
-                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .execute(format!("DROP CATALOG {CATALOG}"))
+                .map(|_| ())
                 .context("replace retried catalog before cold ready path")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             let before_cold = backend_log_snapshots(context)?;
@@ -1043,10 +1049,14 @@ impl Scenario for CatalogReadyLifecycle {
             )?;
             let cold = &cold_owner.read;
             let phase = (|| -> Result<()> {
-                let cold_connection_id = cold
+                let cold_client_query_id = cold
                     .ready
                     .recv_timeout(context.remaining("receive cold catalog query connection id")?)
                     .context("cold catalog query terminated before publishing connection id")?;
+                ensure!(
+                    cold_client_query_id == cold_owner.client_query_id,
+                    "reader ready changed the original Pending query identity"
+                );
                 let installing = wait_for_cold_catalog_install(
                     context,
                     &before_cold,
@@ -1076,8 +1086,9 @@ impl Scenario for CatalogReadyLifecycle {
                     &installing,
                     CATALOG,
                 )?;
-                control
-                    .query_drop(format!("KILL QUERY {cold_connection_id}"))
+                cold_owner
+                    .cancel
+                    .delete(context.deadline())
                     .context("cancel cold catalog reader after its runtime exists")?;
                 assert_cancelled_query(
                     &cold.done,
@@ -1101,6 +1112,7 @@ impl Scenario for CatalogReadyLifecycle {
                 &mut control,
                 &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
+            .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("run warm catalog query")?;
             if rows != [300_000] {
                 bail!("warm catalog query returned {rows:?}, expected [300000]");
@@ -1126,7 +1138,8 @@ impl Scenario for CatalogReadyLifecycle {
             // where the task protocol carries a query's catalog bindings, so it is
             // the operation whose lost answer can make a backend install twice.
             control
-                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .execute(format!("DROP CATALOG {CATALOG}"))
+                .map(|_| ())
                 .context("replace warm catalog before establish-replay coverage")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             let before_replay = backend_log_snapshots(context)?;
@@ -1141,6 +1154,7 @@ impl Scenario for CatalogReadyLifecycle {
                 &mut control,
                 &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
+            .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("execute cold catalog query with a dropped establish acknowledgement")?;
             context
                 .handle()
@@ -1189,8 +1203,7 @@ impl Scenario for CatalogReadyLifecycle {
                 bail!("catalog ready lifecycle lost a native process: {final_resources:?}");
             }
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -1248,21 +1261,23 @@ impl Scenario for CatalogReadWriteRuntime {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "catalog_read_write_runtime";
             const DATABASE: &str = "catalog_read_write_db";
             const TABLE: &str = "catalog_read_write_data";
             let warehouse = create_warehouse(context, "catalog-read-write-runtime")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             control
-                .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+                .execute(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+                .map(|_| ())
                 .context("create catalog read-write database")?;
             control
-                .query_drop(format!(
+                .execute(format!(
                     "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
                 ))
+                .map(|_| ())
                 .context("create catalog read-write table")?;
 
             context.action("write and read through the catalog runtime on every Backend");
@@ -1279,7 +1294,8 @@ impl Scenario for CatalogReadWriteRuntime {
                 &self.controls.take(3)?,
                 &mut control,
                 &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
-            )?;
+            )
+            .and_then(|result| connector_integer_pairs(result).map_err(anyhow::Error::from))?;
             ensure!(
                 rows == [(3_000, 4_501_500)],
                 "catalog read-write summary returned {rows:?}, expected [(3000,4501500)]"
@@ -1319,7 +1335,8 @@ impl Scenario for CatalogReadWriteRuntime {
                 &self.controls.take(5)?,
                 &mut control,
                 &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
-            )?;
+            )
+            .and_then(|result| connector_integer_pairs(result).map_err(anyhow::Error::from))?;
             ensure!(
                 rows == [(3_001, 4_502_501)],
                 "catalog read-write summary returned {rows:?}, expected [(3001,4502501)]"
@@ -1343,8 +1360,7 @@ impl Scenario for CatalogReadWriteRuntime {
 
             await_resource_convergence(context, &baseline, "catalog read-write runtime")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -1487,28 +1503,28 @@ impl Scenario for VendedRestReadWritePem {
                 fixture.rest.endpoints().rest_warehouse.clone(),
             )
         };
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "vended_rest_catalog";
             const DATABASE: &str = "vended_rest_db";
             const TABLE: &str = "vended_rest_data";
             const CTAS: &str = "vended_rest_ctas";
             context.action("create REST catalog with an explicit vended data binding");
             control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
                 self.vended_minio_endpoint()?
-            ))
+            )).map(|_| ())
             .context("create vended REST catalog")?;
             context.action("write three vended REST data files through the native 1FE+3BE path");
             // Three committed files give the three-backend read enough independent
             // work to prove that every Backend uses the vended data-plane lease.
             for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
                 control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
-                ))
+                )).map(|_| ())
                 .with_context(|| format!("insert vended REST data range {range}"))?;
             }
             let rows: Vec<(i64, i64)> = connector_control_plan::query(
@@ -1517,6 +1533,7 @@ impl Scenario for VendedRestReadWritePem {
                 &mut control,
                 &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
+            .and_then(|result| connector_integer_pairs(result).map_err(anyhow::Error::from))
             .context("read vended REST data")?;
             if rows != [(3_000, 4_501_500)] {
                 bail!("vended REST read returned {rows:?}, expected [(3000, 4501500)]");
@@ -1528,9 +1545,9 @@ impl Scenario for VendedRestReadWritePem {
             )?;
             context.action("create a vended REST CTAS target through staged publication");
             control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{CTAS} AS SELECT v FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v <= 1000"
-            ))
+            )).map(|_| ())
             .with_context(|| {
                 self.vended_proxy_audit()
                     .map(|audit| format!("create vended REST CTAS target; proxy audit: {audit:?}"))
@@ -1539,9 +1556,10 @@ impl Scenario for VendedRestReadWritePem {
                     })
             })?;
             let ctas_rows: Vec<(i64, i64)> = control
-                .query(format!(
+                .execute(format!(
                     "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{CTAS}"
                 ))
+                .and_then(connector_integer_pairs)
                 .context("read vended REST CTAS target")?;
             if ctas_rows != [(1_000, 500_500)] {
                 bail!("vended REST CTAS returned {ctas_rows:?}, expected [(1000, 500500)]");
@@ -1573,8 +1591,7 @@ impl Scenario for VendedRestReadWritePem {
             );
             await_resource_convergence(context, &baseline, "vended REST read/write")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 
     fn teardown(&self) -> Result<()> {
@@ -1701,32 +1718,48 @@ impl Scenario for VendedRestWriteOutcomePem {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "vended_write_outcome_catalog";
             const DATABASE: &str = "vended_write_outcome_db";
             const TABLE: &str = "vended_write_outcome_data";
             control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
-            ))
+            )).map(|_| ())
             .context("create response-loss REST vended catalog")?;
 
             let (done_tx, done) = mpsc::sync_channel(1);
             let query_user = user.clone();
             let insert = format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT 1 AS v");
             let deadline = context.deadline();
-            let writer = thread::spawn(move || {
-                let mut connection = mysql_actor::connect_until(&query_user, port, deadline)
-                    .context("connect vended write-outcome writer")?;
-                let result = connection.query_drop(insert);
-                let published = done_tx
-                    .send(result.map_err(anyhow::Error::from))
-                    .context("publish vended write-outcome result");
-                connector_control_plan::with_cleanup(published, connection.finish())
-            });
-
+            let mut connection = SqlSession::new(&query_user, port, deadline)
+                .context("connect vended write-outcome writer")?;
+            let pending = connection.submit(insert)?;
+            let cancel = pending.cancel_handle();
+            let saved_outcome = std::sync::Arc::new(Mutex::new(None));
+            let actor_outcome = saved_outcome.clone();
+            let writer = thread::Builder::new()
+                .name("connector-vended-write-outcome".into())
+                .spawn(move || {
+                    let result = connection.run_pending(pending).map(|_| ());
+                    *actor_outcome
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(connector_sql_outcome(&result));
+                    publish_connector_result(&done_tx, result)
+                        .context("publish vended write-outcome result")
+                });
+            let writer = match writer {
+                Ok(writer) => writer,
+                Err(primary) => {
+                    return connector_control_plan::with_cleanup(
+                        Err(primary.into()),
+                        cancel.delete(deadline).map_err(anyhow::Error::from),
+                    );
+                }
+            };
             context.action("inject catalog response loss after one durable vended table commit");
             let received = (|| {
                 done.recv_timeout(
@@ -1734,15 +1767,51 @@ impl Scenario for VendedRestWriteOutcomePem {
                 )
                 .context("vended write-outcome writer did not finish")
             })();
+            let before = *saved_outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let attempted = received.is_err()
+                && !matches!(
+                    before,
+                    Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+                );
+            let mut cancelled = if attempted {
+                cancel.delete(deadline).map_err(anyhow::Error::from)
+            } else {
+                Ok(())
+            };
+            if cancelled.is_err() {
+                cancelled = connector_control_plan::with_cleanup(cancelled, context.shutdown());
+            }
             let joined = writer
                 .join()
                 .map_err(|_| anyhow::anyhow!("vended write-outcome writer panicked"))
                 .and_then(|result| result);
-            let outcome = connector_control_plan::with_cleanup(received, joined)?;
-            ensure!(
-                outcome.is_ok(),
-                "response-lost vended write must reconcile the already-committed outcome: {outcome:?}"
-            );
+            let after = *saved_outcome
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !attempted
+                && !matches!(
+                    after,
+                    Some(ConnectorSqlOutcome::Success | ConnectorSqlOutcome::PublicFailure)
+                )
+            {
+                let deleted = cancel.delete(deadline).map_err(anyhow::Error::from);
+                cancelled = connector_control_plan::with_cleanup(
+                    cancelled,
+                    if deleted.is_err() {
+                        connector_control_plan::with_cleanup(deleted, context.shutdown())
+                    } else {
+                        deleted
+                    },
+                );
+            }
+            let received = received.and_then(|result| result.map_err(anyhow::Error::from));
+            connector_control_plan::with_cleanup(
+                received,
+                connector_control_plan::with_cleanup(cancelled, joined),
+            )
+            .context("response-lost vended write must reconcile the already-committed outcome")?;
             let audit = self.vended_proxy_audit()?;
             ensure!(
                 audit.table_commits == 1,
@@ -1753,7 +1822,8 @@ impl Scenario for VendedRestWriteOutcomePem {
                 "response-loss write must not manufacture a refused refresh; audit={audit:?}"
             );
             let rows: Vec<i64> = control
-                .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .execute(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .and_then(connector_bigint_rows)
                 .context("read the already-applied vended write outcome")?;
             ensure!(
                 rows == vec![1],
@@ -1761,8 +1831,7 @@ impl Scenario for VendedRestWriteOutcomePem {
             );
             await_resource_convergence(context, &baseline, "vended write-outcome failure")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 
     fn teardown(&self) -> Result<()> {
@@ -1965,18 +2034,17 @@ impl Scenario for VendedRestPostPublishAnswerPem {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let endpoints = self.fixture_endpoints()?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect post-publish answer control session")?,
-        )?;
+        let (user, port) = sql_endpoint(context);
+        let mut control = {
+            context.remaining("connect post-publish answer control session")?;
+            SqlSession::new(&user, port, context.deadline())
+        }?;
         context.action("create a vended REST catalog behind the post-publish answer proxy");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE EXTERNAL CATALOG {POST_PUBLISH_CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
                 endpoints.proxy_uri, endpoints.warehouse, endpoints.minio_endpoint
-            ))
+            )).map(|_| ())
             .context("create post-publish answer REST vended catalog")?;
         match self.case {
             PostPublishAnswerCase::InsertNotFound | PostPublishAnswerCase::InsertBadRequest => {
@@ -2019,7 +2087,7 @@ impl VendedRestPostPublishAnswerPem {
     fn run_insert(
         &self,
         context: &mut ScenarioContext,
-        control: &mut mysql::Conn,
+        control: &mut SqlSession,
         user: &str,
         port: u16,
         rest_uri: &str,
@@ -2030,20 +2098,18 @@ impl VendedRestPostPublishAnswerPem {
         context.action(format!(
             "insert one row; the proxy answers the applied table commit with HTTP {status}"
         ));
-        let mut writer = mysql_actor::connect_with_io_timeout(
-            user,
-            port,
-            Duration::from_secs(10),
-            context.remaining("bound the post-publish answer INSERT")?,
-        )
+        let mut writer = {
+            context.remaining("bound the post-publish answer INSERT")?;
+            SqlSession::new(user, port, context.deadline())
+        }
         .context("connect post-publish answer writer")?;
-        let outcome = writer.query_drop(format!("INSERT INTO {qualified} SELECT 1 AS v"));
+        let outcome = writer
+            .execute(format!("INSERT INTO {qualified} SELECT 1 AS v"))
+            .map(|_| ());
         let audit = self.vended_proxy_audit()?;
-        ensure!(
-            outcome.is_ok(),
-            "an applied INSERT whose commit was answered with HTTP {status} must be verified as \
-             committed and succeed: {outcome:?}; audit={audit:?}"
-        );
+        outcome.map_err(anyhow::Error::from).with_context(|| format!(
+            "an applied INSERT whose commit was answered with HTTP {status} must be verified as committed and succeed; audit={audit:?}"
+        ))?;
         ensure!(
             audit.replacement_class_requests == 1
                 && audit.replaced_responses == 1
@@ -2101,7 +2167,8 @@ impl VendedRestPostPublishAnswerPem {
         // Reading the row opens the data file the applied snapshot references,
         // so a successful read also proves no cleanup deleted that file.
         let rows: Vec<(i64, i64)> = control
-            .query(format!("SELECT count(*), sum(v) FROM {qualified}"))
+            .execute(format!("SELECT count(*), sum(v) FROM {qualified}"))
+            .and_then(connector_integer_pairs)
             .context("read the applied post-publish answer INSERT")?;
         ensure!(
             rows == [(1, 1)],
@@ -2127,16 +2194,16 @@ impl VendedRestPostPublishAnswerPem {
             "create a database; the proxy answers the applied namespace creation with HTTP {}",
             self.case.status()
         ));
-        let mut writer = mysql_actor::connect_with_io_timeout(
-            user,
-            port,
-            Duration::from_secs(10),
-            context.remaining("bound the post-publish answer CREATE DATABASE")?,
-        )
+        let mut writer = {
+            context.remaining("bound the post-publish answer CREATE DATABASE")?;
+            SqlSession::new(user, port, context.deadline())
+        }
         .context("connect post-publish answer DDL session")?;
-        let outcome = writer.query_drop(format!(
-            "CREATE DATABASE {POST_PUBLISH_CATALOG}.{POST_PUBLISH_CREATED_DATABASE}"
-        ));
+        let outcome = writer
+            .execute(format!(
+                "CREATE DATABASE {POST_PUBLISH_CATALOG}.{POST_PUBLISH_CREATED_DATABASE}"
+            ))
+            .map(|_| ());
         let audit = self.vended_proxy_audit()?;
         let error = match outcome {
             Ok(()) => bail!(
@@ -2144,15 +2211,18 @@ impl VendedRestPostPublishAnswerPem {
                  unknown outcome, but it succeeded; audit={audit:?}",
                 self.case.status()
             ),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
-        let lowered = error.to_ascii_lowercase();
-        ensure!(
-            lowered.contains("unknown") || lowered.contains("cannot be attributed"),
-            "CREATE DATABASE answered with HTTP {} after it was applied must report an unknown \
-             outcome, got: {error}",
-            self.case.status()
-        );
+        let StatementFailure::Trino(server) = &error else {
+            return Err(anyhow::Error::new(error)
+                .context("post-publish CREATE DATABASE must return its actual SQL refusal"));
+        };
+        let lowered = server.message.to_ascii_lowercase();
+        if !(lowered.contains("unknown") || lowered.contains("cannot be attributed")) {
+            return Err(anyhow::Error::new(error).context(format!(
+                "CREATE DATABASE answered with HTTP {} after it was applied must report an unknown outcome", self.case.status()
+            )));
+        }
         ensure!(
             audit.replacement_class_requests == 1 && audit.replaced_responses == 1,
             "CREATE DATABASE must send exactly one namespace creation and never replay it; \
@@ -2396,28 +2466,27 @@ impl Scenario for VendedRestRefreshPem {
                 fixture.rest.endpoints().minio_endpoint.clone(),
             )
         };
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect vended credential refresh control session")?,
-        )?;
+        let (user, port) = sql_endpoint(context);
+        let mut control = {
+            context.remaining("connect vended credential refresh control session")?;
+            SqlSession::new(&user, port, context.deadline())
+        }?;
 
         const CATALOG: &str = "vended_refresh_catalog";
         const DATABASE: &str = "vended_refresh_db";
         const TABLE: &str = "vended_refresh_data";
         context.action("create short-TTL REST catalog with a vended data binding");
         control
-            .query_drop(format!(
+            .execute(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
-            ))
+            )).map(|_| ())
             .context("create short-TTL vended REST catalog")?;
         context.action("write three independent vended data files for the 1FE+3BE long read");
         for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
             control
-                .query_drop(format!(
+                .execute(format!(
                     "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
-                ))
+                )).map(|_| ())
                 .with_context(|| format!("insert vended refresh data range {range}"))?;
         }
         // Each setup write is itself a legitimate short-TTL attempt and can
@@ -2430,14 +2499,15 @@ impl Scenario for VendedRestRefreshPem {
         // arming the fixture, then make only that consumer request new material.
         const TARGET_TABLE: &str = "vended_refresh_target";
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
-            ))
+            )).map(|_| ())
             .context("write one targeted vended data file")?;
         let target_sql =
             format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TARGET_TABLE} WHERE v % 100 = 0");
         let primed: Vec<i64> = control
-            .query(&target_sql)
+            .execute(&target_sql)
+            .and_then(connector_bigint_rows)
             .context("prime one identified BE authority through a real data read")?;
         ensure!(
             primed == [10],
@@ -2583,10 +2653,14 @@ impl Scenario for VendedRestRefreshPem {
         )?;
         let target = &observed_read.read;
         let phase = (|| -> Result<()> {
-            let connection_id = target
+            let client_query_id = target
                 .ready
                 .recv_timeout(context.remaining("receive vended read connection id")?)
                 .context("vended read ended before publishing its connection id")?;
+            ensure!(
+                client_query_id == observed_read.client_query_id,
+                "reader ready changed the original Pending query identity"
+            );
             wait_for_new_reader_on_every_backend(
                 context,
                 CATALOG,
@@ -2605,10 +2679,11 @@ impl Scenario for VendedRestRefreshPem {
                 bail!("three-BE vended read terminated before cancellation: {result:?}");
             }
             context.action(format!(
-                "cancel the long vended read through KILL QUERY {connection_id}"
+                "cancel the long vended read through its original DELETE handle {client_query_id}"
             ));
-            control
-                .query_drop(format!("KILL QUERY {connection_id}"))
+            observed_read
+                .cancel
+                .delete(context.deadline())
                 .context("cancel three-BE vended reader")?;
             assert_cancelled_query(
                 &target.done,
@@ -2618,7 +2693,7 @@ impl Scenario for VendedRestRefreshPem {
                 target,
                 context.remaining("verify post-cancellation connection behavior")?,
             )?;
-            assert_idle_query(&mut control, connection_id)?;
+            assert_completed_query_cancellation(&observed_read.cancel, context.deadline())?;
             release_connector_read(target)?;
             Ok(())
         })();
@@ -2900,12 +2975,11 @@ impl Scenario for VendedCredentialFaultPem {
                 ),
             ))
         })?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect credential fault control session")?,
-        )?;
+        let (user, port) = sql_endpoint(context);
+        let mut control = {
+            context.remaining("connect credential fault control session")?;
+            SqlSession::new(&user, port, context.deadline())
+        }?;
         const CATALOG: &str = "cad2_vended_catalog";
         const DATABASE: &str = "cad2_vended_db";
         const TABLE: &str = "cad2_vended_data";
@@ -2920,12 +2994,13 @@ impl Scenario for VendedCredentialFaultPem {
             CATALOG
         };
         control
-            .query_drop(catalog_sql(setup_catalog))
+            .execute(catalog_sql(setup_catalog))
+            .map(|_| ())
             .context("create CAD-2 vended catalog")?;
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {setup_catalog}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
-            ))
+            )).map(|_| ())
             .context("write one CAD-2 vended data file")?;
         await_resource_convergence(context, &baseline, "credential fault setup write")?;
 
@@ -2949,13 +3024,14 @@ impl Scenario for VendedCredentialFaultPem {
                     .advertise_unreachable_refresh_endpoint(endpoint.clone())
             })?;
             control
-                .query_drop(catalog_sql(CATALOG))
+                .execute(catalog_sql(CATALOG))
+                .map(|_| ())
                 .context("create target catalog with unreachable acquisition endpoint")?;
             context.action(format!(
                 "target catalog announces an unavailable loopback endpoint {endpoint}"
             ));
             let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
-            let observed = storage_control_plan::observed_outcome::<i64>(
+            let observed = storage_control_plan::observed_outcome(
                 context,
                 &storage_inputs,
                 &mut control,
@@ -3135,7 +3211,7 @@ impl Scenario for VendedCredentialFaultPem {
                     storage_control_plan::assert_acquisition_failure(
                         context, &terminal, 2, &error,
                     )?;
-                    let subsequent = storage_control_plan::observed_outcome::<i64>(
+                    let subsequent = storage_control_plan::observed_outcome(
                         context,
                         &storage_inputs,
                         &mut control,
@@ -3301,9 +3377,9 @@ impl Scenario for CatalogFeRestartCache {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             const CATALOG: &str = "catalog_fe_restart_cache";
             const DATABASE: &str = "catalog_fe_restart_db";
             const TABLE: &str = "catalog_fe_restart_data";
@@ -3325,6 +3401,7 @@ impl Scenario for CatalogFeRestartCache {
                 &mut control,
                 &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
+            .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("warm catalog runtime before FE restart")?;
             if warm_rows != [300_000] {
                 bail!("warm catalog read returned {warm_rows:?}, expected [300000]");
@@ -3368,10 +3445,11 @@ impl Scenario for CatalogFeRestartCache {
                     &target.done,
                     context.remaining("await in-flight query failure after FE restart")?,
                 )?;
-                assert_target_connection_is_closed(
-                    target,
-                    context.remaining("verify FE restart closed in-flight client connection")?,
-                )?;
+                // P08 retires the old same-socket reentry assertion. A fresh
+                // HTTP POST can reach the restored FE and is not that socket.
+                // Original in-flight failure, real FE exit and all Native/data
+                // restoration oracles remain independently checked.
+
                 release_connector_read(target)?;
                 Ok(())
             })();
@@ -3382,14 +3460,15 @@ impl Scenario for CatalogFeRestartCache {
             }
 
             context.action("read through the restored Frontend catalog projection");
-            let mut restored = mysql_actor::connect_until(&user, port, context.deadline())?;
-            let restored_phase = (|| -> Result<()> {
+            let mut restored = SqlSession::new(&user, port, context.deadline())?;
+            (|| -> Result<()> {
                 let restored_rows: Vec<i64> = connector_control_plan::query(
                     context,
                     &self.controls.take(5)?,
                     &mut restored,
                     &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
                 )
+                .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
                 .context("read catalog after FE restart")?;
                 if restored_rows != [300_000] {
                     bail!("restored catalog read returned {restored_rows:?}, expected [300000]");
@@ -3420,10 +3499,8 @@ impl Scenario for CatalogFeRestartCache {
 
                 await_resource_convergence(context, &baseline, "FE restart catalog cache")?;
                 Ok(())
-            })();
-            connector_control_plan::with_cleanup(restored_phase, restored.finish())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+            })()
+        })()
     }
 }
 
@@ -3512,9 +3589,9 @@ impl Scenario for StaticCredentialGeneration {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             run_static_credential_generation(
                 context,
                 &mut control,
@@ -3523,8 +3600,7 @@ impl Scenario for StaticCredentialGeneration {
             )?;
             await_resource_convergence(context, &baseline, "static credential generation reads")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -3574,17 +3650,19 @@ impl Scenario for AccessDomainCacheIsolation {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             // Cache policy is a query-scoped FE-to-BE contract. The process-level
             // cache service configured by this scenario is intentionally inert
             // until the client opts this session into both reads and population.
             control
-                .query_drop("SET enable_scan_datacache = true")
+                .execute("SET enable_scan_datacache = true")
+                .map(|_| ())
                 .context("enable cache reads for access-domain isolation")?;
             control
-                .query_drop("SET enable_populate_datacache = true")
+                .execute("SET enable_populate_datacache = true")
+                .map(|_| ())
                 .context("enable cache population for access-domain isolation")?;
 
             run_access_domain_cache_isolation(
@@ -3595,8 +3673,7 @@ impl Scenario for AccessDomainCacheIsolation {
             )?;
             await_resource_convergence(context, &baseline, "access-domain cache isolation")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -3661,7 +3738,7 @@ fn collision_loopback_s3_config(access_key_id: &str) -> LoopbackS3Config {
 
 fn run_static_credential_generation(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     controls: &connector_control_plan::Owner,
     fixtures: &Mutex<Option<StaticCredentialFixtures>>,
 ) -> Result<()> {
@@ -3693,7 +3770,8 @@ fn run_static_credential_generation(
         &controls.take(0)?,
         control,
         &connector_control_plan::sum_sql(STATIC_BLUE_CATALOG, "static_blue_db", "static_blue_data"),
-    )?;
+    )
+    .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))?;
     ensure!(
         rows == [45_000_150_000],
         "static credential catalog sum returned {rows:?}, expected [45_000_150_000]"
@@ -3721,7 +3799,8 @@ fn run_static_credential_generation(
             "static_green_db",
             "static_green_data",
         ),
-    )?;
+    )
+    .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))?;
     ensure!(
         rows == [135_000_150_000],
         "static credential catalog sum returned {rows:?}, expected [135_000_150_000]"
@@ -3755,7 +3834,7 @@ fn run_static_credential_generation(
 
 fn run_access_domain_cache_isolation(
     context: &mut ScenarioContext,
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     controls: &connector_control_plan::Owner,
     fixtures: &Mutex<Option<StaticCredentialFixtures>>,
 ) -> Result<()> {
@@ -3800,7 +3879,8 @@ fn run_access_domain_cache_isolation(
             COLLISION_DATABASE,
             COLLISION_TABLE,
         ),
-    )?;
+    )
+    .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))?;
     ensure!(
         rows == [75_000_150_000],
         "static credential catalog sum returned {rows:?}, expected [75_000_150_000]"
@@ -3840,7 +3920,8 @@ fn run_access_domain_cache_isolation(
             COLLISION_DATABASE,
             COLLISION_TABLE,
         ),
-    )?;
+    )
+    .and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))?;
     ensure!(
         rows == [75_000_450_000],
         "static credential catalog sum returned {rows:?}, expected [75_000_450_000]"
@@ -4062,9 +4143,9 @@ impl Scenario for PredicatePageIndexPruning {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             let warehouse = create_warehouse(context, "predicate-page-index-pruning")?;
             const CATALOG: &str = "page_index_catalog";
             const DATABASE: &str = "page_index_db";
@@ -4084,18 +4165,22 @@ impl Scenario for PredicatePageIndexPruning {
                 format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE {PREDICATE}");
             context.action("run the static predicate with page-index reader disabled");
             control
-                .query_drop("SET enable_parquet_reader_page_index = false")
+                .execute("SET enable_parquet_reader_page_index = false")
+                .map(|_| ())
                 .context("disable predicate-driven page-index pruning")?;
             let disabled: Vec<i64> = control
-                .query(&select)
+                .execute(&select)
+                .and_then(connector_bigint_rows)
                 .context("query dense Iceberg files with page-index disabled")?;
 
             context.action("run the same static predicate with page-index reader enabled");
             control
-                .query_drop("SET enable_parquet_reader_page_index = true")
+                .execute("SET enable_parquet_reader_page_index = true")
+                .map(|_| ())
                 .context("enable predicate-driven page-index pruning")?;
             let enabled: Vec<i64> = control
-                .query(&select)
+                .execute(&select)
+                .and_then(connector_bigint_rows)
                 .context("query dense Iceberg files with page-index enabled")?;
             if enabled != disabled || enabled != [3_003] {
                 bail!(
@@ -4105,7 +4190,8 @@ impl Scenario for PredicatePageIndexPruning {
 
             context.action("assert EXPLAIN ANALYZE surfaces typed connector scan activity");
             let explain: Vec<String> = control
-                .query(format!("EXPLAIN ANALYZE {select}"))
+                .execute(format!("EXPLAIN ANALYZE {select}"))
+                .and_then(connector_text_rows)
                 .context("collect typed connector EXPLAIN ANALYZE profile")?;
             let explain = explain.join("\n");
             if !explain.contains("TypedConnectorMetrics:") {
@@ -4115,8 +4201,7 @@ impl Scenario for PredicatePageIndexPruning {
             }
             assert_positive_profile_counter(&explain, "TypedConnectorPageSourcesOpened")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
     }
 }
 
@@ -4180,11 +4265,12 @@ impl Scenario for CatalogVersionDrain {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
-        let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
-        let control_phase = (|| -> Result<()> {
+        let (user, port) = sql_endpoint(context);
+        let mut control = SqlSession::new(&user, port, context.deadline())?;
+        (|| -> Result<()> {
             control
-                .query_drop("SET pipeline_dop = 1")
+                .execute("SET pipeline_dop = 1")
+                .map(|_| ())
                 .context("bound catalog version drain control driver parallelism")?;
 
             let warehouse = create_warehouse(context, "catalog-version-drain")?;
@@ -4209,12 +4295,16 @@ impl Scenario for CatalogVersionDrain {
             )?;
             let target = &owned.read;
             let phase = (|| -> Result<Vec<String>> {
-                let connection_id = target
+                let client_query_id = target
                     .ready
                     .recv_timeout(context.remaining("receive old-version connection id")?)
                     .context(
                         "old-version connector read terminated before publishing its connection id",
                     )?;
+                ensure!(
+                    client_query_id == owned.client_query_id,
+                    "reader ready changed the original Pending query identity"
+                );
                 let old_logs = wait_for_new_reader_on_every_backend(
                     context,
                     "connector_generation_catalog",
@@ -4232,13 +4322,14 @@ impl Scenario for CatalogVersionDrain {
 
                 context.action("drop and recreate the catalog while old readers remain in flight");
                 control
-                    .query_drop("DROP CATALOG connector_generation_catalog")
+                    .execute("DROP CATALOG connector_generation_catalog")
+                    .map(|_| ())
                     .context("retire first catalog version")?;
                 create_catalog(&mut control, "connector_generation_catalog", &warehouse)?;
 
                 context
                     .action("read the replacement catalog version while the old version is leased");
-                let replacement_rows: Vec<i64> = connector_control_plan::query(context, &self.controls.take(1)?, &mut control, "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data")
+                let replacement_rows: Vec<i64> = connector_control_plan::query(context, &self.controls.take(1)?, &mut control, "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data").and_then(|result| connector_bigint_rows(result).map_err(anyhow::Error::from))
             .context("read table through replacement catalog version while old version is leased")?;
                 if replacement_rows != [300_000] {
                     bail!(
@@ -4257,10 +4348,11 @@ impl Scenario for CatalogVersionDrain {
                 }
 
                 context.action(format!(
-                    "cancel old-version reader through KILL QUERY {connection_id}"
+                    "cancel old-version reader through its original DELETE handle {client_query_id}"
                 ));
-                control
-                    .query_drop(format!("KILL QUERY {connection_id}"))
+                owned
+                    .cancel
+                    .delete(context.deadline())
                     .context("issue public MySQL KILL QUERY for old-generation reader")?;
                 assert_cancelled_query(
                     &target.done,
@@ -4270,7 +4362,7 @@ impl Scenario for CatalogVersionDrain {
                     target,
                     context.remaining("verify old-generation KILL QUERY target remains usable")?,
                 )?;
-                assert_idle_query(&mut control, connection_id)?;
+                assert_completed_query_cancellation(&owned.cancel, context.deadline())?;
                 release_connector_read(target)?;
                 Ok(old_versions)
             })();
@@ -4284,24 +4376,133 @@ impl Scenario for CatalogVersionDrain {
 
             await_resource_convergence(context, &baseline, "catalog version drain")?;
             Ok(())
-        })();
-        connector_control_plan::with_cleanup(control_phase, control.finish())
+        })()
+    }
+}
+
+fn connector_integer_rows(
+    result: StatementResult,
+) -> std::result::Result<Vec<i64>, StatementFailure> {
+    sql::integer_column(&result)
+        .map_err(|error| StatementFailure::Protocol(format!("connector integer result: {error:#}")))
+}
+fn connector_bigint_rows(
+    result: StatementResult,
+) -> std::result::Result<Vec<i64>, StatementFailure> {
+    if !result.is_result_set()
+        || result.columns.len() != 1
+        || result.columns[0].type_signature.raw_type != "bigint"
+        || !result.columns[0].type_signature.arguments.is_empty()
+    {
+        return Err(StatementFailure::Protocol(format!(
+            "connector expected one declared BIGINT column: {:?}",
+            result.columns
+        )));
+    }
+    connector_integer_rows(result)
+}
+fn connector_integer_pairs(
+    result: StatementResult,
+) -> std::result::Result<Vec<(i64, i64)>, StatementFailure> {
+    if !result.is_result_set()
+        || result.columns.len() != 2
+        || result.columns.iter().any(|column| {
+            column.type_signature.raw_type != "bigint"
+                || !column.type_signature.arguments.is_empty()
+        })
+    {
+        return Err(StatementFailure::Protocol(format!(
+            "connector expected two integer columns: {:?}",
+            result.columns
+        )));
+    }
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Integer(left), TrinoValue::Integer(right)] => Ok((*left, *right)),
+            _ => Err(StatementFailure::Protocol(format!(
+                "connector expected two non-null integer cells: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn connector_text_rows(
+    result: StatementResult,
+) -> std::result::Result<Vec<String>, StatementFailure> {
+    if !result.is_result_set()
+        || result.columns.len() != 1
+        || result.columns[0].type_signature.raw_type != "varchar"
+    {
+        return Err(StatementFailure::Protocol(format!(
+            "connector expected one declared text column: {:?}",
+            result.columns
+        )));
+    }
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [TrinoValue::Text(text)] => Ok(text.clone()),
+            _ => Err(StatementFailure::Protocol(format!(
+                "connector expected a non-null text cell: {row:?}"
+            ))),
+        })
+        .collect()
+}
+fn publish_connector_result<T>(
+    sender: &mpsc::SyncSender<std::result::Result<T, StatementFailure>>,
+    result: std::result::Result<T, StatementFailure>,
+) -> Result<()> {
+    match sender.send(result) {
+        Ok(()) => Ok(()),
+        Err(mpsc::SendError(Err(primary))) => {
+            Err(anyhow::Error::new(primary).context("original connector result receiver closed"))
+        }
+        Err(mpsc::SendError(Ok(_))) => bail!("original connector result receiver closed"),
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectorSqlOutcome {
+    Success,
+    PublicFailure,
+    NonTerminalFailure,
+}
+fn connector_sql_outcome<T>(
+    result: &std::result::Result<T, StatementFailure>,
+) -> ConnectorSqlOutcome {
+    match result {
+        Ok(_) => ConnectorSqlOutcome::Success,
+        Err(StatementFailure::Trino(_)) => ConnectorSqlOutcome::PublicFailure,
+        Err(_) => ConnectorSqlOutcome::NonTerminalFailure,
+    }
+}
+fn run_original_connector_pending(
+    session: &mut SqlSession,
+    pending: novarocks_test_trino_client::PendingStatement,
+    deadline: std::time::Instant,
+) -> Result<std::result::Result<StatementResult, StatementFailure>> {
+    let cancel = pending.cancel_handle();
+    let result = session.run_pending(pending);
+    let cleanup = if connector_sql_outcome(&result) == ConnectorSqlOutcome::NonTerminalFailure {
+        cancel.delete(deadline).map_err(anyhow::Error::from)
+    } else {
+        Ok(())
+    };
+    match (result, cleanup) {
+        (result, Ok(())) => Ok(result),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(anyhow::Error::new(primary)
+            .context(format!("original connector DELETE failed: {cleanup:#}"))),
     }
 }
 
 struct ConnectorRead {
-    ready: mpsc::Receiver<u32>,
-    done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    ready: mpsc::Receiver<String>,
+    done: mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
     probe: mpsc::SyncSender<()>,
-    probe_result: mpsc::Receiver<std::result::Result<Option<i64>, mysql::Error>>,
+    probe_result: mpsc::Receiver<std::result::Result<Option<i64>, StatementFailure>>,
     release: mpsc::Sender<()>,
-    thread: thread::JoinHandle<Result<()>>,
-}
-
-struct IdleMysqlConnection {
-    ready: mpsc::Receiver<u32>,
-    probe: mpsc::SyncSender<()>,
-    probe_result: mpsc::Receiver<std::result::Result<Option<i64>, mysql::Error>>,
     thread: thread::JoinHandle<Result<()>>,
 }
 
@@ -4564,8 +4765,8 @@ pub(super) fn require_three_backends(context: &mut ScenarioContext) -> Result<()
     Ok(())
 }
 
-pub(super) fn mysql_endpoint(context: &ScenarioContext) -> (String, u16) {
-    (context.mysql_user().to_string(), context.mysql_port())
+pub(super) fn sql_endpoint(context: &ScenarioContext) -> (String, u16) {
+    (context.sql_user().to_string(), context.trino_port())
 }
 
 pub(super) fn resource_baseline(
@@ -4603,7 +4804,7 @@ pub(super) fn create_warehouse(
 }
 
 fn create_catalog_table_and_data(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     table: &str,
@@ -4611,45 +4812,49 @@ fn create_catalog_table_and_data(
 ) -> Result<()> {
     create_catalog(control, catalog, warehouse)?;
     control
-        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
         ))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}.{table}"))?;
     for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
-            ))
+            )).map(|_| ())
             .with_context(|| format!("write data range {range} to {catalog}.{database}.{table}"))?;
     }
     Ok(())
 }
 
 fn create_static_catalog_table_and_data(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     table: &str,
     ranges: [&str; 3],
 ) -> Result<()> {
     control
-        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database} from StaticFile source"))?;
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
         ))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}.{table} from StaticFile source"))?;
     // One committed data file per range gives the distributed 1FE+3BE query
     // enough independent S3 work to prove every BE read the declared catalog.
     for range in ranges {
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
-            ))
+            )).map(|_| ())
             .with_context(|| {
                 format!("write static credential range {range} to {catalog}.{database}.{table}")
             })?;
@@ -4658,7 +4863,7 @@ fn create_static_catalog_table_and_data(
 }
 
 fn static_catalog_profile(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     table: &str,
@@ -4666,9 +4871,10 @@ fn static_catalog_profile(
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let rows: Vec<String> = control
-            .query(format!(
+            .execute(format!(
                 "EXPLAIN ANALYZE SELECT count(*) FROM {catalog}.{database}.{table}"
             ))
+            .and_then(connector_text_rows)
             .with_context(|| {
                 format!("profile {catalog}.{database}.{table} through typed connector")
             })?;
@@ -4719,7 +4925,7 @@ fn assert_fixture_used_only_expected_key(
 }
 
 fn create_catalog_table_and_dense_data(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     database: &str,
     table: &str,
@@ -4727,12 +4933,14 @@ fn create_catalog_table_and_dense_data(
 ) -> Result<()> {
     create_catalog(control, catalog, warehouse)?;
     control
-        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .execute(format!("CREATE DATABASE {catalog}.{database}"))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}"))?;
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
         ))
+        .map(|_| ())
         .with_context(|| format!("create {catalog}.{database}.{table}"))?;
     // Each transaction writes one file. The duplicated ordered range prevents
     // Iceberg file-metric pruning from eliminating an entire file, while its
@@ -4740,24 +4948,24 @@ fn create_catalog_table_and_dense_data(
     // path under test.
     for _ in 0..3 {
         control
-            .query_drop(format!(
+            .execute(format!(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series(1, 200000))"
-            ))
+            )).map(|_| ())
             .with_context(|| format!("write dense page-index data to {catalog}.{database}.{table}"))?;
     }
     Ok(())
 }
 
 pub(super) fn create_catalog(
-    control: &mut mysql::Conn,
+    control: &mut SqlSession,
     catalog: &str,
     warehouse: &std::path::Path,
 ) -> Result<()> {
     let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
     control
-        .query_drop(format!(
+        .execute(format!(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
-        ))
+        )).map(|_| ())
         .with_context(|| format!("create Hadoop Iceberg catalog {catalog}"))
 }
 
@@ -4782,10 +4990,13 @@ fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn assert_idle_query(control: &mut mysql::Conn, connection_id: u32) -> Result<()> {
-    control
-        .query_drop(format!("KILL QUERY {connection_id}"))
-        .context("idle KILL QUERY must succeed for a live target connection")
+fn assert_completed_query_cancellation(
+    cancel: &novarocks_test_trino_client::CancelHandle,
+    deadline: Instant,
+) -> Result<()> {
+    cancel
+        .delete(deadline)
+        .context("cancelling the same completed query remains idempotent")
 }
 
 fn assert_target_connection_remains_usable(
@@ -4804,39 +5015,6 @@ fn assert_target_connection_remains_usable(
         Ok(Some(1)) => Ok(()),
         Ok(result) => bail!("KILL QUERY target probe returned {result:?}, expected Some(1)"),
         Err(error) => bail!("KILL QUERY unexpectedly closed target connection: {error}"),
-    }
-}
-
-fn assert_target_connection_is_closed(target: &ConnectorRead, timeout: Duration) -> Result<()> {
-    target
-        .probe
-        .send(())
-        .context("request KILL CONNECTION target connection probe")?;
-    match target
-        .probe_result
-        .recv_timeout(timeout)
-        .context("KILL CONNECTION target did not answer the connection probe")?
-    {
-        Err(_) => Ok(()),
-        Ok(result) => bail!("KILL CONNECTION left the target connection usable: {result:?}"),
-    }
-}
-
-fn assert_idle_target_connection_is_closed(
-    target: &IdleMysqlConnection,
-    timeout: Duration,
-) -> Result<()> {
-    target
-        .probe
-        .send(())
-        .context("request bare KILL target connection probe")?;
-    match target
-        .probe_result
-        .recv_timeout(timeout)
-        .context("bare KILL target did not answer the connection probe")?
-    {
-        Err(_) => Ok(()),
-        Ok(result) => bail!("bare KILL left the idle target connection usable: {result:?}"),
     }
 }
 
@@ -4873,7 +5051,7 @@ const HELD_QUERY_INTERRUPT_BUDGET: Duration = Duration::from_secs(5);
 /// `killed_at` is the instant the `KILL QUERY` statement returned, so the
 /// elapsed time this reports is the latency the client actually experienced.
 fn assert_held_query_interrupted(
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
     killed_at: std::time::Instant,
     budget: Duration,
 ) -> Result<()> {
@@ -4896,7 +5074,11 @@ fn assert_held_query_interrupted(
         Err(error) => error,
     };
     match error {
-        mysql::Error::MySqlError(error) if error.code == 1317 => {
+        StatementFailure::Trino(error)
+            if error.error_code == 3
+                && error.error_name == "USER_CANCELED"
+                && error.error_type == "USER_ERROR" =>
+        {
             println!(
                 "held-install KILL QUERY interrupt delivered after {} ms",
                 elapsed.as_millis()
@@ -4904,14 +5086,14 @@ fn assert_held_query_interrupted(
             Ok(())
         }
         other => bail!(
-            "expected MySQL cancellation error 1317 after {} ms, received {other}",
+            "expected Trino cancellation 3 USER_CANCELED USER_ERROR after {} ms, received {other}",
             elapsed.as_millis()
         ),
     }
 }
 
 fn assert_cancelled_query(
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
     timeout: Duration,
 ) -> Result<()> {
     let result = done
@@ -4922,13 +5104,19 @@ fn assert_cancelled_query(
         Err(error) => error,
     };
     match error {
-        mysql::Error::MySqlError(error) if error.code == 1317 => Ok(()),
-        other => bail!("expected MySQL cancellation error 1317, received {other}"),
+        StatementFailure::Trino(error)
+            if error.error_code == 3
+                && error.error_name == "USER_CANCELED"
+                && error.error_type == "USER_ERROR" =>
+        {
+            Ok(())
+        }
+        other => bail!("expected Trino cancellation 3 USER_CANCELED USER_ERROR, received {other}"),
     }
 }
 
 fn assert_connection_killed_query(
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, StatementFailure>>,
     timeout: Duration,
 ) -> Result<()> {
     match done
@@ -5102,7 +5290,10 @@ impl AwaitedRead<'_> {
             Err(mpsc::TryRecvError::Disconnected) => {
                 bail!("{} ended without reporting a result", self.subject)
             }
-            Ok(result) => bail!("{} ended first: {result:?}", self.subject),
+            Ok(Err(primary)) => {
+                Err(anyhow::Error::new(primary).context(format!("{} ended first", self.subject)))
+            }
+            Ok(Ok(rows)) => bail!("{} ended first: {rows:?}", self.subject),
         }
     }
 }
@@ -5682,10 +5873,10 @@ mod tests {
     /// ends and decide when the read is over.
     struct ReadHarness {
         read: ConnectorRead,
-        done_tx: mpsc::SyncSender<std::result::Result<Vec<i64>, mysql::Error>>,
-        _ready_tx: mpsc::SyncSender<u32>,
+        done_tx: mpsc::SyncSender<std::result::Result<Vec<i64>, StatementFailure>>,
+        _ready_tx: mpsc::SyncSender<String>,
         _probe_rx: mpsc::Receiver<()>,
-        _probe_result_tx: mpsc::SyncSender<std::result::Result<Option<i64>, mysql::Error>>,
+        _probe_result_tx: mpsc::SyncSender<std::result::Result<Option<i64>, StatementFailure>>,
         _release_rx: mpsc::Receiver<()>,
     }
 
@@ -5777,19 +5968,19 @@ mod tests {
         let harness = read_harness();
         harness
             .done_tx
-            .send(Err(mysql::Error::MySqlError(mysql::MySqlError {
-                code: 1105,
-                state: "HY000".into(),
-                message: "original cold preparation failure".into(),
-            })))
+            .send(Err(StatementFailure::Trino(serde_json::from_value(serde_json::json!({
+                "errorCode": 65536, "errorName": "GENERIC_INTERNAL_ERROR", "errorType": "INTERNAL_ERROR",
+                "message": "original cold preparation failure",
+            })).unwrap())))
             .expect("publish original SQL failure");
         let error = AwaitedRead::new(&harness.read, "cold catalog install query")
             .still_running()
             .expect_err("the producer failure must end a cold-install wait");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("cold catalog install query ended first"));
-        assert!(rendered.contains("1105"));
-        assert!(rendered.contains("HY000"));
+        assert!(rendered.contains("65536"));
+        assert!(rendered.contains("GENERIC_INTERNAL_ERROR"));
+        assert!(rendered.contains("INTERNAL_ERROR"));
         assert!(rendered.contains("original cold preparation failure"));
     }
 

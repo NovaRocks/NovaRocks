@@ -319,7 +319,7 @@ impl FrontendQueryCompiler {
         let execution = context.execution();
         let current_catalog = context.session().current_catalog();
         let current_database = context.session().current_database();
-        let family = *context.session().presentation();
+        let family = context.session().presentation().copied();
         let ExplainPreparationPorts {
             provider: provider_source,
             cpu: planning_cpu,
@@ -403,7 +403,6 @@ impl FrontendQueryCompiler {
                     version,
                     options: query_options,
                     family,
-                    offset: 0,
                     carrier: self.query.static_plan_carrier().clone(),
                     policy: self.constant_policy(),
                     control: encoding_control,

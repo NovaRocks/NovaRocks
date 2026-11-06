@@ -95,7 +95,6 @@ impl RootProfileV1 {
     // wire allowance. Raw preflight uses the same derived expansion bound.
     pub const SCHEMA_TYPE_NODES: usize = Self::SCHEMA_WIRE_BYTES / 32;
     pub const SCHEMA_BACKING_BYTES: usize = 1024 * 1024;
-    pub const MYSQL_METADATA_BYTES: usize = 512 * 1024;
 }
 
 #[cfg(test)]

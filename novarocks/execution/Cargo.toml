@@ -44,7 +44,6 @@ serde_json.workspace = true
 sha2.workspace = true
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prometheus.workspace = true
-threadpool = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true

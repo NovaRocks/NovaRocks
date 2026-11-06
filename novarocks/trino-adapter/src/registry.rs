@@ -98,7 +98,13 @@ impl TrinoQueryRegistry {
                 columns: None,
                 outcome: None,
                 retained: false,
+                admission: None,
+                selected_count: None,
+                update_count: None,
             }),
+            external_effect: Mutex::new(None),
+            #[cfg(test)]
+            delivery_panic: Mutex::new(None),
             progress: Arc::new(Notify::new()),
             touched: Mutex::new(Instant::now()),
             created: Instant::now(),
@@ -121,7 +127,7 @@ impl TrinoQueryRegistry {
                 None,
             );
         }
-        let page = ordinary_page(&entry, Some(0), "QUEUED", None, None, None);
+        let page = ordinary_page(&entry, Some(0), "QUEUED", None, None, None, None, None);
         self.entries
             .lock()
             .expect("query registry")
@@ -290,6 +296,9 @@ impl TrinoQueryRegistry {
         }
         let mut production = entry.production.lock().expect("query pipeline");
         if let Some((rows, _count)) = production.pipeline.as_mut().and_then(|p| p.take_rows()) {
+            if let Some(count) = production.selected_count.take() {
+                production.update_count = Some(count);
+            }
             let next = token.checked_add(1).ok_or(StatusCode::NOT_FOUND)?;
             let window = production.pipeline.as_ref().map(|p| p.window.clone());
             let page = ordinary_page(
@@ -299,6 +308,8 @@ impl TrinoQueryRegistry {
                 production.columns.as_ref(),
                 Some(rows),
                 window,
+                production.admission.and_then(command_update_type),
+                production.update_count,
             );
             production.retained = true;
             state.next_token = next;
@@ -326,6 +337,8 @@ impl TrinoQueryRegistry {
             production.columns.as_ref(),
             None,
             window,
+            production.admission.and_then(command_update_type),
+            production.update_count,
         );
         production.retained = true;
         state.next_token = next;
@@ -374,28 +387,51 @@ impl TrinoQueryRegistry {
     }
 }
 fn settle_outcome(entry: &QueryEntry, columns: Option<Bytes>, mut outcome: Outcome) -> Arc<Page> {
-    let headers = if outcome.error.is_none() {
-        session_effect_headers(&outcome.effects).unwrap_or_else(|error| {
-            outcome.disposition = Disposition::Fail;
-            outcome.error = Some(crate::driver::internal(
-                entry.id.as_str(),
-                &format!("invalid application session effect header: {error}"),
+    let headers =
+        if outcome.error.is_none() {
+            session_effect_headers(&outcome.effects).unwrap_or_else(|error| {
+                outcome.disposition = Disposition::Fail;
+                let effect = outcome
+                    .settlement
+                    .as_ref()
+                    .and_then(|settlement| settlement.owner.external_effect_disposition());
+                outcome.error = Some(crate::error_mapping::query_error_for_query_with_effect(
+                entry.id.as_str(), TrinoErrorSource::Service {
+                    error: &novarocks_query_application::session_error::QueryServiceError::new(
+                        novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                        format!("invalid application session effect header: {error}")), sql: "",
+                }, effect,
             ));
+                HeaderMap::new()
+            })
+        } else {
             HeaderMap::new()
-        })
-    } else {
-        HeaderMap::new()
-    };
+        };
     if let Some(settlement) = outcome.settlement.take() {
         settlement.finish(outcome.disposition);
     }
     entry.observation.settle(true, outcome.disposition);
-    let update = if columns.is_none() && outcome.error.is_none() {
-        update_type(outcome.kind)
+    let production = entry.production.lock().expect("query pipeline");
+    let update = if outcome.error.is_none() {
+        production.admission.and_then(command_update_type)
     } else {
         None
     };
-    terminal_page(entry, columns.as_ref(), outcome.error, headers, update)
+    let count = if outcome.error.is_none() {
+        production.update_count
+    } else {
+        None
+    };
+    drop(production);
+    let empty = Bytes::from_static(b"[]");
+    let columns = if outcome.error.is_some() {
+        None
+    } else if columns.is_none() && update.is_some() {
+        Some(&empty)
+    } else {
+        columns.as_ref()
+    };
+    terminal_page_with_count(entry, columns, outcome.error, headers, update, count)
 }
 async fn cancel_locked(entry: &QueryEntry, state: &mut EntryState, requested: Disposition) {
     state.retained.take();
@@ -445,12 +481,14 @@ async fn cancel_locked(entry: &QueryEntry, state: &mut EntryState, requested: Di
                         settlement.finish(effective);
                     }
                 } else if let Some(settlement) = outcome.settlement.take() {
+                    let effect = settlement.owner.external_effect_disposition();
                     let (finish, reason) = settlement.finish(requested);
                     let (disposition, error) = crate::driver::command_receipt(
                         entry.id.as_str(),
                         requested,
                         finish,
                         reason,
+                        effect,
                     );
                     effective = disposition;
                     selected_error = Some(error);
@@ -511,13 +549,13 @@ fn ordinary_page(
     columns: Option<&Bytes>,
     rows: Option<Bytes>,
     window: Option<novarocks_workload_control::ResultWindowAlias>,
+    update: Option<&str>,
+    count: Option<u64>,
 ) -> Arc<Page> {
+    let mut envelope = timed_envelope(entry, next, state, None, update);
+    envelope.update_count = count;
     Arc::new(Page {
-        chunks: page_chunks(
-            timed_envelope(entry, next, state, None, None),
-            columns,
-            rows,
-        ),
+        chunks: page_chunks(envelope, columns, rows),
         headers: HeaderMap::new(),
         status: StatusCode::OK,
         _window: window,
@@ -530,19 +568,37 @@ fn terminal_page(
     headers: HeaderMap,
     update: Option<&str>,
 ) -> Arc<Page> {
+    terminal_page_with_count(entry, columns, error, headers, update, None)
+}
+fn terminal_page_with_count(
+    entry: &QueryEntry,
+    columns: Option<&Bytes>,
+    error: Option<crate::error_mapping::TrinoQueryError>,
+    headers: HeaderMap,
+    update: Option<&str>,
+    count: Option<u64>,
+) -> Arc<Page> {
     let state = if error.is_some() {
         "FAILED"
     } else {
         "FINISHED"
     };
+    let mut envelope = timed_envelope(entry, None, state, error.as_ref(), update);
+    envelope.update_count = count;
     Arc::new(Page {
-        chunks: page_chunks(
-            timed_envelope(entry, None, state, error.as_ref(), update),
-            columns,
-            None,
-        ),
+        chunks: page_chunks(envelope, columns, None),
         headers,
         status: StatusCode::OK,
         _window: None,
     })
+}
+
+fn command_update_type(
+    admission: novarocks_query_application::session::StatementAdmission,
+) -> Option<&'static str> {
+    use novarocks_query_application::session::StatementOutputShape;
+    match admission.shape {
+        StatementOutputShape::Rows | StatementOutputShape::Empty => update_type(admission.kind),
+        StatementOutputShape::ResultSet | StatementOutputShape::UndeterminedCall => None,
+    }
 }

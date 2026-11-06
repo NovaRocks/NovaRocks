@@ -48,11 +48,21 @@ use std::{
     task::{Context, Poll},
 };
 
+/// Protocol completion nature selected by the original typed statement family.
+/// It does not change the domain's received row count or publication outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WriteCompletion {
+    Counted,
+    Empty,
+}
+
 /// Internal statement-family authors provide preparation and compilation;
 /// the shared action retains the original governed execution policy.
 pub(crate) trait WriteStatementFamily: Send + Sync + 'static {
     type Input: Send + Sync + 'static;
     type Prepared: Send + Sync + 'static;
+
+    fn completion(input: &Self::Input) -> WriteCompletion;
 
     fn prepare(
         input: Arc<Self::Input>,
@@ -135,6 +145,7 @@ pub(crate) fn prepare<P: WriteStatementFamily>(
         #[cfg(novarocks_dev_controls)]
         observation,
     } = start;
+    let completion = P::completion(&input);
     let computation = StatementComputation::new(
         root.clone(),
         initial,
@@ -170,6 +181,7 @@ pub(crate) fn prepare<P: WriteStatementFamily>(
         query_options,
         selected: None,
         affected_rows: None,
+        completion,
         close_failure: None,
     })
 }
@@ -202,6 +214,7 @@ struct WriteStatementAction<P: WriteStatementFamily> {
     query_options: QueryOptions,
     selected: Option<Result<(), QueryServiceError>>,
     affected_rows: Option<u64>,
+    completion: WriteCompletion,
     close_failure: Option<StatementNativeHealthFailure>,
 }
 
@@ -466,9 +479,10 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
         if self.selected.is_none() {
             self.selected = Some(Ok(()));
         }
-        Poll::Ready(selected_command_completion(
+        Poll::Ready(selected_write_completion(
             self.selected.take().unwrap(),
             self.affected_rows,
+            self.completion,
         ))
     }
 }
@@ -479,12 +493,27 @@ pub(super) fn selected_command_completion(
     selected: Result<(), QueryServiceError>,
     affected_rows: Option<u64>,
 ) -> Result<StatementActionValue, QueryServiceError> {
+    selected_write_completion(selected, affected_rows, WriteCompletion::Counted)
+}
+
+fn selected_write_completion(
+    selected: Result<(), QueryServiceError>,
+    affected_rows: Option<u64>,
+    completion: WriteCompletion,
+) -> Result<StatementActionValue, QueryServiceError> {
     selected?;
+    // Control statements still keep and validate their actual domain count;
+    // only the original typed family's protocol completion nature differs.
     let rows = affected_rows
         .ok_or_else(|| internal_error("successful write has no original affected-row count"))?;
-    Ok(StatementActionValue::Ok(
-        novarocks_query_application::session_control::StatementCommandCompletion::new(rows),
-    ))
+    Ok(StatementActionValue::Ok(match completion {
+        WriteCompletion::Counted => {
+            novarocks_query_application::session_control::StatementCommandCompletion::new(rows)
+        }
+        WriteCompletion::Empty => {
+            novarocks_query_application::session_control::StatementCommandCompletion::empty()
+        }
+    }))
 }
 
 pub(super) fn disposition(outcome: &WriteOutcome) -> LakePublicationDisposition {
@@ -915,11 +944,51 @@ mod command_completion_tests {
         );
     }
     #[test]
+    fn control_completion_keeps_domain_count_validation_without_publishing_count_rows() {
+        use novarocks_query_application::session_control::StatementCommandCompletion;
+        assert!(selected_write_completion(Ok(()), None, WriteCompletion::Empty).is_err());
+        let StatementActionValue::Ok(empty) =
+            selected_write_completion(Ok(()), Some(17), WriteCompletion::Empty).unwrap()
+        else {
+            panic!("selected control success must retain its Empty nature");
+        };
+        assert_eq!(empty, StatementCommandCompletion::Empty);
+        let StatementActionValue::Ok(counted) =
+            selected_write_completion(Ok(()), Some(17), WriteCompletion::Counted).unwrap()
+        else {
+            panic!("selected row mutation must retain its actual count");
+        };
+        assert_eq!(counted.count(), Some(17));
+    }
+    #[test]
+    fn control_completion_preserves_original_failure_and_committed_effect() {
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_query_application::api::StatementExternalEffectDisposition;
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        let cause = SharedFailureCause::new(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            "original control finalization failure",
+        ));
+        let error = QueryServiceError::from_failure_cause(cause.clone())
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted);
+        let Err(selected) =
+            selected_write_completion(Err(error.clone()), Some(17), WriteCompletion::Empty)
+        else {
+            panic!("committed publication failure must not become control success");
+        };
+        assert_eq!(selected, error);
+        assert_eq!(selected.failure_cause(), Some(&cause));
+        assert_eq!(
+            selected.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+    }
+    #[test]
     fn successful_empty_write_preserves_its_explicit_zero() {
         let StatementActionValue::Ok(rows) = selected_command_completion(Ok(()), Some(0)).unwrap()
         else {
             panic!("successful empty write must carry its explicit count")
         };
-        assert_eq!(rows.affected_rows(), 0);
+        assert_eq!(rows.count(), Some(0));
     }
 }

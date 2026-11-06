@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
+from trino_query import run_text_column
+
 
 RF_PATTERNS = (
     "runtime filter",
@@ -77,7 +79,7 @@ def repo_root() -> Path:
 
 def case_to_sql_path(case_id: str) -> Path:
     suite, case_name = case_id.split("/", 1)
-    return repo_root() / "tests" / "sql" / "suites" / suite / "sql" / f"{case_name}.sql"
+    return repo_root() / "tests" / "sql" / "correctness" / suite / "sql" / f"{case_name}.sql"
 
 
 def case_default_database(case_id: str) -> str | None:
@@ -153,11 +155,18 @@ def safe_file_name(case_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "__", case_id)
 
 
+def run_novarocks(endpoint: Endpoint, raw_sql: str, timeout: float, database: str | None = None, *,
+                   artifact_receipt: str | None = None, nr_catalog: str | None = None) -> str:
+    return run_text_column(endpoint, explain_sql(raw_sql), timeout, database,
+                           receipt=artifact_receipt, catalog=nr_catalog)
+
+
 def collect_case(
     case_id: str,
     endpoints: Iterable[Endpoint],
     output_dir: Path,
     timeout: int,
+    *, artifact_receipt: str | None = None, nr_catalog: str | None = None,
 ) -> dict[str, object]:
     sql_path = case_to_sql_path(case_id)
     raw_sql = sql_path.read_text()
@@ -169,7 +178,9 @@ def collect_case(
         "database": database,
     }
     for endpoint in endpoints:
-        explain = run_mysql(endpoint, sql, timeout, database)
+        explain = (run_novarocks(endpoint, raw_sql, timeout, database,
+                                  artifact_receipt=artifact_receipt, nr_catalog=nr_catalog)
+                   if endpoint.name == "nr" else run_mysql(endpoint, sql, timeout, database))
         out_path = output_dir / endpoint.name / f"{safe_file_name(case_id)}.out"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(explain)
@@ -192,6 +203,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--case", action="append", dest="cases")
+    parser.add_argument("--artifact-receipt", default=None)
+    parser.add_argument("--nr-catalog", default=None)
     return parser.parse_args()
 
 
@@ -205,7 +218,8 @@ def main() -> int:
     )
     summary = []
     for case_id in cases:
-        summary.append(collect_case(case_id, endpoints, output_dir, args.timeout))
+        summary.append(collect_case(case_id, endpoints, output_dir, args.timeout,
+                                    artifact_receipt=args.artifact_receipt, nr_catalog=args.nr_catalog))
     status_dir = output_dir / "status"
     status_dir.mkdir(parents=True, exist_ok=True)
     (status_dir / "aggregate_summary.json").write_text(

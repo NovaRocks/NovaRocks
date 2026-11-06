@@ -37,7 +37,7 @@ use novarocks_execution_contract::{
     ParticipationState, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution_contract::{ContentFingerprint, CredentialDomainId, CredentialEpoch};
-use novarocks_types::identity::{FrontendProcessId, QueryExecutionId};
+use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -399,6 +399,9 @@ pub struct ControlRetentionInventory {
 }
 #[derive(Debug)]
 pub struct ControlCore {
+    // Bound once by this Worker process's original composition. A ticket from
+    // another process cannot turn an address mismatch into ordinary absence.
+    backend: BackendProcessId,
     config: ControlConfig,
     now: MonotonicInstant,
     admission: AdmissionCore,
@@ -432,6 +435,7 @@ impl ControlCore {
     }
 
     pub fn new(
+        backend: BackendProcessId,
         config: ControlConfig,
         admission: AdmissionTicketConfig,
         issuer: [u8; 8],
@@ -441,6 +445,7 @@ impl ControlCore {
             return Err(CoreError::InvalidConfiguration);
         }
         Ok(Self {
+            backend,
             config,
             now,
             admission: AdmissionCore::new(admission, issuer),
@@ -714,7 +719,9 @@ impl ControlCore {
             // Numeric absence grants neither Task ownership nor a permanent
             // failure. The Root's original identity/fence facts still win.
             let record = self.directory.get(participation);
-            let outcome = if self.fenced.contains(&participation.frontend_process_id()) {
+            let outcome = if participation.backend_process_id() != self.backend {
+                OperationOutcome::IdentityMismatch
+            } else if self.fenced.contains(&participation.frontend_process_id()) {
                 OperationOutcome::Gone
             } else if self
                 .owners
@@ -778,6 +785,20 @@ impl ControlCore {
                 ..ControlStep::default()
             });
         }
+        if let ControlInput::Acquire {
+            request: candidate, ..
+        } = &input
+            && candidate.participation().backend_process_id() != self.backend
+        {
+            return Ok(ControlStep {
+                records_visited: 1,
+                requests: vec![ControlRequestSettlement::verdict(
+                    request,
+                    RequestResult::Outcome(OperationOutcome::IdentityMismatch),
+                )],
+                ..ControlStep::default()
+            });
+        }
         if let ControlInput::Establish {
             participation,
             ticket,
@@ -786,7 +807,9 @@ impl ControlCore {
             ..
         } = &input
         {
-            let refusal = if self.fenced.contains(&participation.frontend_process_id()) {
+            let refusal = if participation.backend_process_id() != self.backend {
+                Some(OperationOutcome::IdentityMismatch)
+            } else if self.fenced.contains(&participation.frontend_process_id()) {
                 Some(OperationOutcome::Gone)
             } else if self
                 .owners
@@ -1076,7 +1099,11 @@ impl ControlCore {
             }
             ControlInput::Acquire { request, ticket } => {
                 let operation = request.envelope().operation_id();
-                let result = if self
+                let result = if request.participation().backend_process_id() != self.backend {
+                    Err(AdmissionRefusal::Verdict(
+                        OperationOutcome::IdentityMismatch,
+                    ))
+                } else if self
                     .fenced
                     .contains(&request.participation().frontend_process_id())
                 {
@@ -1130,7 +1157,12 @@ impl ControlCore {
                 semantics,
                 generation,
             } => {
-                if self.fenced.contains(&participation.frontend_process_id()) {
+                if participation.backend_process_id() != self.backend {
+                    step.effects.push(ControlEffect::Reply {
+                        request,
+                        outcome: OperationOutcome::IdentityMismatch,
+                    });
+                } else if self.fenced.contains(&participation.frontend_process_id()) {
                     step.effects.push(ControlEffect::Reply {
                         request,
                         outcome: OperationOutcome::Gone,

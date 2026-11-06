@@ -382,8 +382,34 @@ pub struct ExchangeStreamSenderSnapshot {
     pub pending_grant: Option<ExchangeUnitSequence>,
     pub granted_through: u64,
     pub active_calls: usize,
+    /// Original Stop/Demand request captures that have not actually exited.
+    pub active_control_calls: usize,
     pub watching: bool,
     pub stop_obligation: ExchangeSenderStopState,
+}
+
+/// A borrowed diagnostic sample of existing state, never an exit or capacity proof.
+#[derive(Clone, Copy)]
+pub(crate) struct ExchangeStreamSenderDiagnosticSnapshot {
+    pub(crate) sender: ExchangeStreamSenderSnapshot,
+    pub(crate) peer_contact_started: bool,
+    pub(crate) stop_active: bool,
+    pub(crate) stop_retry_waiting: bool,
+    pub(crate) demand_active: bool,
+    pub(crate) demand_retry_waiting: bool,
+}
+impl fmt::Debug for ExchangeStreamSenderDiagnosticSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExchangeStreamSenderDiagnosticSnapshot")
+            .field("sender", &self.sender)
+            .field("peer_contact_started", &self.peer_contact_started)
+            .field("stop_active", &self.stop_active)
+            .field("stop_retry_waiting", &self.stop_retry_waiting)
+            .field("demand_active", &self.demand_active)
+            .field("demand_retry_waiting", &self.demand_retry_waiting)
+            .finish()
+    }
 }
 
 struct RetainedPayload {
@@ -396,6 +422,7 @@ struct SenderState {
     granted: u64,
     status: ExchangeStreamSenderStatus,
     active: BTreeMap<u64, u64>, // sequence -> actual call identity
+    active_control_calls: usize,
     next_call_id: u64,
     replay_due: BTreeSet<u64>,
     retry_pending: BTreeSet<u64>,
@@ -475,6 +502,7 @@ impl ExchangeStreamSender {
                 granted: 0,
                 status: ExchangeStreamSenderStatus::Open,
                 active: BTreeMap::new(),
+                active_control_calls: 0,
                 next_call_id: 0,
                 replay_due: BTreeSet::new(),
                 retry_pending: BTreeSet::new(),
@@ -507,6 +535,7 @@ impl ExchangeStreamSender {
             }),
             granted_through: state.granted,
             active_calls: state.active.len(),
+            active_control_calls: state.active_control_calls,
             watching: state.watching,
             stop_obligation: state.stop_obligation,
         }
@@ -519,19 +548,26 @@ impl ExchangeStreamSender {
         }
     }
 
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) fn try_diagnostic_snapshot(&self) -> Option<ExchangeStreamSenderSnapshot> {
+    pub(crate) fn try_diagnostic_snapshot(&self) -> Option<ExchangeStreamSenderDiagnosticSnapshot> {
         let state = self.state.try_lock().ok()?;
-        Some(ExchangeStreamSenderSnapshot {
-            retention: state.kernel.snapshot(),
-            status: state.status,
-            pending_grant: state.pending.map(|sequence| {
-                ExchangeUnitSequence::try_new(sequence).expect("published sequence")
-            }),
-            granted_through: state.granted,
-            active_calls: state.active.len(),
-            watching: state.watching,
-            stop_obligation: state.stop_obligation,
+        Some(ExchangeStreamSenderDiagnosticSnapshot {
+            sender: ExchangeStreamSenderSnapshot {
+                retention: state.kernel.snapshot(),
+                status: state.status,
+                pending_grant: state.pending.map(|sequence| {
+                    ExchangeUnitSequence::try_new(sequence).expect("published sequence")
+                }),
+                granted_through: state.granted,
+                active_calls: state.active.len(),
+                active_control_calls: state.active_control_calls,
+                watching: state.watching,
+                stop_obligation: state.stop_obligation,
+            },
+            peer_contact_started: state.peer_contact_started,
+            stop_active: state.stop_active,
+            stop_retry_waiting: state.stop_retry_waiting,
+            demand_active: state.demand_active,
+            demand_retry_waiting: state.demand_retry_waiting,
         })
     }
 
@@ -665,6 +701,10 @@ impl ExchangeStreamSender {
                 return;
             }
             state.stop_active = true;
+            state.active_control_calls = state
+                .active_control_calls
+                .checked_add(1)
+                .expect("exchange control activity count exhausted");
         }
         let sender = Arc::clone(self);
         self.transmitter.register_unit_demands(
@@ -674,8 +714,25 @@ impl ExchangeStreamSender {
                 operation: ExchangeDemandOperation::StopSender,
             }],
             self.stop_cancellation.clone(),
+            self.control_activity(),
             Box::new(move |outcome| sender.stop_outcome(outcome)),
         );
+    }
+
+    // Dispatch reserves this lifetime fact under the same state lock as the
+    // callback flag. It grants no DATA position, byte permit or remote fact.
+    fn control_activity(self: &Arc<Self>) -> ExchangeCallActivity {
+        let sender = Arc::clone(self);
+        ExchangeCallActivity::new(move || {
+            {
+                let mut state = sender.state.lock().expect("exchange stream sender lock");
+                state.active_control_calls = state
+                    .active_control_calls
+                    .checked_sub(1)
+                    .expect("one original exchange control capture exit");
+            }
+            sender.notify();
+        })
     }
 
     fn stop_outcome(self: &Arc<Self>, outcome: ExchangeDemandCallOutcome) {
@@ -686,6 +743,15 @@ impl ExchangeStreamSender {
                 return;
             }
             match outcome {
+                ExchangeDemandCallOutcome::RouteRetired(stream) => {
+                    if stream != self.config.stream {
+                        Err(contract_failure())
+                    } else {
+                        drop(state);
+                        self.retire_after_route_retirement();
+                        return;
+                    }
+                }
                 ExchangeDemandCallOutcome::Observed(results) => {
                     let result = if results.len() == 1 && results[0].0 == self.config.stream {
                         results[0].1
@@ -902,6 +968,10 @@ impl ExchangeStreamSender {
                             };
                             state.demand_registered = Some(pending);
                             state.demand_active = true;
+                            state.active_control_calls = state
+                                .active_control_calls
+                                .checked_add(1)
+                                .expect("exchange control activity count exhausted");
                             demand
                         })
                 } else {
@@ -936,6 +1006,7 @@ impl ExchangeStreamSender {
                         operation: ExchangeDemandOperation::Register(demand),
                     }],
                     self.cancellation.clone(),
+                    self.control_activity(),
                     Box::new(move |outcome| sender.demand_outcome(outcome)),
                 );
             }
@@ -977,6 +1048,7 @@ impl ExchangeStreamSender {
                 .demand_active = false;
         }
         match outcome {
+            ExchangeDemandCallOutcome::RouteRetired(_) => self.fail(contract_failure()),
             ExchangeDemandCallOutcome::Observed(results) => {
                 if results.len() != 1 || results[0].0 != self.config.stream {
                     self.fail(contract_failure());

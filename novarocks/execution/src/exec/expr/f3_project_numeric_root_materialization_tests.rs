@@ -46,9 +46,13 @@ fn programs(
     // declaration before the compiler publishes aliases to the source plan.
     let render = novarocks_sql::compiler::client_render_schema_from_port(
         source.plan().result_port(),
-        novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
-            timezone_offset_seconds: 0,
-        },
+        novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(
+            &novarocks_result_contract::TrinoJsonFacts {
+                parametric_datetime: true,
+                variant: true,
+                variant_binary: true,
+            },
+        ),
     )
     .expect("the original SQL result declares its client render schema");
     let source = source

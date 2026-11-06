@@ -5,6 +5,9 @@ domain: [distributed-query-lifecycle, runtime-role, sql-language]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0217]
+partially-superseded-scope:
+  ADR-0217: "The dual MySQL/Trino transition and connection-index model are retired; command-result projection is completed by ADR-0217. Explicit Trino facts, root framing, replay/acknowledgement, settlement, session effects, security and actual-exit rules remain active."
 date: 2026-10-28
 implementation-status: implemented
 provenance:

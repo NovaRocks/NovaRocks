@@ -125,7 +125,12 @@ impl MvCommandExecutor {
                 services,
                 request,
                 context.execution().clone(),
-                *context.session().presentation(),
+                context.session().presentation().copied().ok_or_else(|| {
+                    novarocks_query_application::api::CommandError::new(
+                        novarocks_query_application::api::CommandErrorKind::Rejected,
+                        "MV client result requires an explicit presentation",
+                    )
+                })?,
             );
         }
         use crate::query::mv_action::{CreateRequest, MvCommandRequest, prepare};

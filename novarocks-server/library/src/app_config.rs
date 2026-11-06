@@ -51,6 +51,8 @@ pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 pub const DEFAULT_FRONTEND_DRAIN_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_FRONTEND_CLEANUP_TIMEOUT_MS: u64 = 30_000;
 const RETIRED_STARROCKS_CONFIG_ERROR: &str = "[connector.starrocks] is no longer supported; this binary's sealed providers are `iceberg` and `paimon`";
+const RETIRED_MYSQL_PORT_CONFIG_ERROR: &str =
+    "standalone_server.mysql_port is retired; use standalone_server.trino_port";
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -683,19 +685,24 @@ fn load_resolved_config_value(path: &Path) -> Result<toml::Value> {
         .with_context(|| format!("read config file: {}", path.display()))?;
     let mut value: toml::Value = toml::from_str(&source)
         .with_context(|| format!("parse config TOML: {}", path.display()))?;
-    reject_retired_connector_configuration(&value)
+    reject_retired_configuration(&value)
         .with_context(|| format!("validate retired configuration: {}", path.display()))?;
     resolve_env_references(&mut value)
         .with_context(|| format!("resolve config environment references: {}", path.display()))?;
     Ok(value)
 }
 
-fn reject_retired_connector_configuration(value: &toml::Value) -> Result<()> {
+fn reject_retired_configuration(value: &toml::Value) -> Result<()> {
     let has_starrocks = value
         .get("connector")
         .and_then(toml::Value::as_table)
         .is_some_and(|connector| connector.contains_key("starrocks"));
     anyhow::ensure!(!has_starrocks, RETIRED_STARROCKS_CONFIG_ERROR);
+    let has_mysql_port = value
+        .get("standalone_server")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|server| server.contains_key("mysql_port"));
+    anyhow::ensure!(!has_mysql_port, RETIRED_MYSQL_PORT_CONFIG_ERROR);
     Ok(())
 }
 
@@ -1064,13 +1071,14 @@ impl ConnectorConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StandaloneServerConfig {
-    #[serde(default = "default_standalone_server_mysql_port")]
-    pub mysql_port: u16,
     #[serde(default = "default_trino_port")]
     pub trino_port: u16,
     #[serde(default = "default_trino_client_timeout_ms")]
     pub trino_client_timeout_ms: u64,
+    #[serde(default)]
+    pub trino_query_max_length: novarocks_trino_adapter::QueryTextLimit,
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
     #[serde(default)]
@@ -1110,10 +1118,6 @@ fn default_trino_port() -> u16 {
 }
 fn default_trino_client_timeout_ms() -> u64 {
     300_000
-}
-
-fn default_standalone_server_mysql_port() -> u16 {
-    9030
 }
 
 fn default_standalone_server_user() -> String {
@@ -1179,9 +1183,9 @@ fn default_standalone_iceberg_maintenance_max_consecutive_failures() -> u32 {
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
-            mysql_port: default_standalone_server_mysql_port(),
             trino_port: default_trino_port(),
             trino_client_timeout_ms: default_trino_client_timeout_ms(),
+            trino_query_max_length: novarocks_trino_adapter::QueryTextLimit::default(),
             user: default_standalone_server_user(),
             mv_refresh_scheduler_enabled: false,
             mv_refresh_scheduler_interval_ms: default_standalone_mv_refresh_scheduler_interval_ms(),
@@ -3496,6 +3500,30 @@ password = "${ENV:RETIRED_STARROCKS_SECRET_MUST_NOT_BE_RESOLVED}"
     }
 
     #[test]
+    fn retired_client_port_is_rejected_before_environment_resolution_for_both_roles() {
+        for role in ["fe", "be"] {
+            let document = format!(
+                "[cluster]\nrole = \"{role}\"\n\n[standalone_server]\nmysql_port = 9030\nuser = \"${{ENV:RETIRED_CLIENT_PORT_SECRET_MUST_NOT_BE_RESOLVED}}\"\n"
+            );
+            let deployable = tempfile::NamedTempFile::new().expect("temporary config");
+            std::fs::write(deployable.path(), document).expect("write retired config");
+            let error = match NovaRocksConfig::load_from_file(deployable.path()) {
+                Ok(_) => panic!("retired client listener configuration must fail before startup"),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(super::RETIRED_MYSQL_PORT_CONFIG_ERROR),
+                "{message}"
+            );
+            assert!(
+                !message.contains("RETIRED_CLIENT_PORT_SECRET_MUST_NOT_BE_RESOLVED"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn connector_credentials_parse_node_local_role_sources_without_acquiring_material() {
         for (role, purpose, cluster_role) in [
             ("fe", "object-store-metadata", ClusterRole::Fe),
@@ -4426,6 +4454,33 @@ grpc_port = 19080
     }
 
     #[test]
+    fn trino_query_text_length_is_validated_during_config_deserialization() {
+        for units in [0, 1_000_000, 1_000_000_000] {
+            let config: NovaRocksConfig = toml::from_str(&format!(
+                "[standalone_server]\ntrino_query_max_length = {units}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                config
+                    .standalone_server
+                    .unwrap()
+                    .trino_query_max_length
+                    .units(),
+                units
+            );
+        }
+        for invalid in ["-1", "1000000001", "4294967296", "1.5", "\"1000\""] {
+            assert!(
+                toml::from_str::<NovaRocksConfig>(&format!(
+                    "[standalone_server]\ntrino_query_max_length = {invalid}\n"
+                ))
+                .is_err(),
+                "invalid limit {invalid} must fail before application startup"
+            );
+        }
+    }
+
+    #[test]
     fn test_standalone_server_defaults() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -4436,9 +4491,9 @@ grpc_port = 19080
         assert_eq!(
             cfg.standalone_server,
             Some(StandaloneServerConfig {
-                mysql_port: 9030,
                 trino_port: 8080,
                 trino_client_timeout_ms: 300_000,
+                trino_query_max_length: novarocks_trino_adapter::QueryTextLimit::default(),
                 user: "root".to_string(),
                 mv_refresh_scheduler_enabled: false,
                 mv_refresh_scheduler_interval_ms: 30_000,

@@ -190,11 +190,35 @@ impl NodeHostRefusal {
         }
     }
 }
+/// The original pre-R admission error after its rich input and Native
+/// responsibility have moved to the existing paid Root cleanup owner.
+/// This value contains no opaque capture, partial R or ingress responsibility.
+#[derive(Debug)]
+pub(crate) struct NeutralNodeRequestRefusal {
+    operation: &'static str,
+    _original_error: super::participation_host::requests::ParticipationRequestError,
+}
+impl NeutralNodeRequestRefusal {
+    pub(crate) fn stage(&self) -> &'static str {
+        self.operation
+    }
+    #[cfg(test)]
+    pub(crate) fn into_original_for_test(self) -> NodeHostRefusal {
+        NodeHostRefusal::new(
+            self.operation,
+            super::participation_host::requests::ParticipationRequestAdmissionRefusal {
+                error: self._original_error,
+                partial: None,
+            },
+        )
+    }
+}
 /// A supported control submission can be refused before it owns any R.
-/// Driver invariants retain their complete original custody separately.
+/// Actor turn invariants retain their complete original custody separately.
 #[derive(Debug)]
 pub(crate) enum NodeRequestRefusal {
     OwnerFailed,
+    Neutral(NeutralNodeRequestRefusal),
     Invariant(NodeHostRefusal),
 }
 impl From<NodeHostRefusal> for NodeRequestRefusal {
@@ -230,6 +254,247 @@ pub(crate) struct WorkerNodeHost {
     rows: Mutex<ParticipationRows>,
 }
 impl WorkerNodeHost {
+    #[cfg(test)]
+    pub(crate) fn hold_normal_retire_handoff_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> bool {
+        if task.verify_participation(participation).is_err() {
+            return false;
+        }
+        let Some(address) = self.directory.participation(participation) else {
+            return false;
+        };
+        let Some(mut host) = address.lock() else {
+            return false;
+        };
+        host.hold_normal_retire_handoff_for_test(task)
+    }
+    #[cfg(test)]
+    pub(crate) fn release_normal_retire_handoff_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> bool {
+        if task.verify_participation(participation).is_err() {
+            return false;
+        }
+        let Some(address) = self.directory.participation(participation) else {
+            return false;
+        };
+        let Some(mut host) = address.lock() else {
+            return false;
+        };
+        host.release_normal_retire_handoff_for_test(task)
+    }
+    #[cfg(test)]
+    pub(crate) fn finalized_task_closing_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<super::participation_host::task_io::FinalizedTaskClosingForTest> {
+        task.verify_participation(participation).ok()?;
+        let address = self.directory.participation(participation)?;
+        let mut host = address.lock()?;
+        host.finalized_task_closing_for_test(task)
+    }
+    #[cfg(test)]
+    pub(crate) fn closing_task_retirement_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<(
+        novarocks_worker_protocol::creation::PayloadId,
+        Generation,
+        bool,
+        bool,
+        bool,
+        bool,
+    )> {
+        task.verify_participation(participation).ok()?;
+        let address = self.directory.participation(participation)?;
+        let mut host = address.lock()?;
+        host.closing_task_retirement_for_test(task)
+    }
+    #[cfg(test)]
+    pub(crate) fn task_domain_refusal_is_closed_for_test(
+        &self,
+        task: novarocks_execution_contract::TaskIdentity,
+        refusal: &NodeHostRefusal,
+    ) -> bool {
+        use super::participation_host::requests::{
+            ParticipationRequestAdmissionRefusal, ParticipationRequestError,
+        };
+        let Some((admission, request, _)) = refusal.original.downcast_ref::<(
+            ParticipationRequestAdmissionRefusal,
+            novarocks_execution_contract::UpdateTask,
+            super::node_api::WorkerIngressResponsibility,
+        )>() else {
+            return false;
+        };
+        refusal.operation == "Task domain original R admission"
+            && request.identity() == task
+            && admission.partial.is_none()
+            && matches!(
+                admission.error,
+                ParticipationRequestError::Causal(
+                    super::causal::CausalError::RequestAdmissionClosed
+                )
+            )
+    }
+    #[cfg(test)]
+    pub(crate) fn retired_task_contract_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<(bool, bool)> {
+        let address = self.directory.participation(participation)?;
+        let mut host = address.lock()?;
+        Some((host.task(task).is_some(), host.has_retired_task_read(task)))
+    }
+    #[cfg(test)]
+    pub(crate) fn ordinary_participation_admission_closed_for_test(
+        &self,
+        participation: ParticipationRef,
+    ) -> bool {
+        let Some(address) = self.directory.participation(participation) else {
+            return false;
+        };
+        let Some(host) = address.lock() else {
+            return false;
+        };
+        self.runtime
+            .snapshot(host.actor())
+            .is_ok_and(|snapshot| !snapshot.failed && !snapshot.external_open)
+    }
+    #[cfg(test)]
+    pub(crate) fn closed_participation_domain_refusal_for_test(
+        &self,
+        participation: ParticipationRef,
+        operation: novarocks_execution_contract::TaskOperationId,
+        refusal: &NodeHostRefusal,
+    ) -> Option<bool> {
+        use super::participation_host::requests::{
+            ParticipationRequestAdmissionRefusal, ParticipationRequestError,
+        };
+        if refusal.operation != "Participation domain original R admission" {
+            return None;
+        }
+        let closed = |admission: &ParticipationRequestAdmissionRefusal| {
+            admission.partial.is_none()
+                && matches!(admission.error, ParticipationRequestError::AdmissionClosed)
+        };
+        if let Some((admission, request, _)) = refusal.original.downcast_ref::<(
+            ParticipationRequestAdmissionRefusal,
+            novarocks_execution_contract::AdvanceParticipationDomain,
+            super::node_api::WorkerIngressResponsibility,
+        )>() {
+            return (closed(admission)
+                && request.participation() == participation
+                && request.envelope().operation_id() == operation)
+                .then_some(true);
+        }
+        refusal
+            .original
+            .downcast_ref::<ParticipationRequestAdmissionRefusal>()
+            .filter(|admission| closed(admission))
+            .map(|_| false)
+    }
+    #[cfg(test)]
+    pub(crate) fn dispose_closed_participation_domain_refusal_for_test(
+        &self,
+        participation: ParticipationRef,
+        operation: novarocks_execution_contract::TaskOperationId,
+        refusal: NodeHostRefusal,
+    ) -> Result<(), NodeHostRefusal> {
+        use super::participation_host::requests::ParticipationRequestAdmissionRefusal;
+        use super::process_control::rejected_ingress::RejectedIngressPayload;
+        let Some(has_original) =
+            self.closed_participation_domain_refusal_for_test(participation, operation, &refusal)
+        else {
+            return Err(refusal);
+        };
+        let NodeHostRefusal {
+            operation: stage,
+            original,
+        } = refusal;
+        if !has_original {
+            let neutral = original
+                .downcast::<ParticipationRequestAdmissionRefusal>()
+                .unwrap_or_else(|_| unreachable!("the inspected original neutral refusal"));
+            drop(neutral);
+            return Ok(());
+        }
+        let (admission, request, ingress) = *original
+            .downcast::<(
+                ParticipationRequestAdmissionRefusal,
+                novarocks_execution_contract::AdvanceParticipationDomain,
+                super::node_api::WorkerIngressResponsibility,
+            )>()
+            .unwrap_or_else(|_| unreachable!("the inspected original rich refusal"));
+        match self.control.lock().adopt_rejected_ingress(
+            participation,
+            RejectedIngressPayload::ParticipationDomain(request),
+            ingress,
+        ) {
+            Ok(()) => Ok(()),
+            Err(original) => Err(NodeHostRefusal::new(stage, (admission, original))),
+        }
+    }
+    /// Return a pre-R fixture refusal to the existing original Root disposal
+    /// owner. The test must observe real cleanup before asserting its mismatch.
+    #[cfg(test)]
+    pub(crate) fn dispose_task_domain_refusal_for_test(
+        &self,
+        participation: ParticipationRef,
+        refusal: NodeHostRefusal,
+    ) -> Result<(), NodeHostRefusal> {
+        use super::node_api::WorkerIngressResponsibility;
+        use super::participation_host::requests::ParticipationRequestAdmissionRefusal;
+        use super::process_control::rejected_ingress::RejectedIngressPayload;
+        use novarocks_execution_contract::UpdateTask;
+        if refusal.operation != "Task domain original R admission" {
+            return Err(refusal);
+        }
+        let NodeHostRefusal {
+            operation,
+            original,
+        } = refusal;
+        let original = match original.downcast::<(
+            ParticipationRequestAdmissionRefusal,
+            UpdateTask,
+            WorkerIngressResponsibility,
+        )>() {
+            Ok(original) => *original,
+            Err(original) => {
+                return Err(NodeHostRefusal {
+                    operation,
+                    original,
+                });
+            }
+        };
+        let (admission, request, ingress) = original;
+        if admission.partial.is_some()
+            || request
+                .identity()
+                .verify_participation(participation)
+                .is_err()
+        {
+            return Err(NodeHostRefusal::new(
+                operation,
+                (admission, request, ingress),
+            ));
+        }
+        match self.control.lock().adopt_rejected_ingress(
+            participation,
+            RejectedIngressPayload::TaskDomain(request),
+            ingress,
+        ) {
+            Ok(()) => Ok(()),
+            Err(original) => Err(NodeHostRefusal::new(operation, (admission, original))),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn original_request_inventory_for_test(
         &self,
@@ -433,6 +698,36 @@ impl WorkerNodeHost {
             }
         }
     }
+    fn refuse_closed_ingress(
+        &self,
+        participation: ParticipationRef,
+        stage: &'static str,
+        admission: super::participation_host::requests::ParticipationRequestAdmissionRefusal,
+        payload: super::process_control::rejected_ingress::RejectedIngressPayload,
+        ingress: super::node_api::WorkerIngressResponsibility,
+    ) -> NodeRequestRefusal {
+        use super::participation_host::requests::ParticipationRequestError;
+        // No Participation R exists on this exact permission refusal. Do not revive
+        // admission or project OwnerFailed: only the paid process cleanup
+        // adopts the original rich input and Native arrival responsibility.
+        if admission.partial.is_some()
+            || !matches!(admission.error, ParticipationRequestError::AdmissionClosed)
+        {
+            return NodeHostRefusal::new(stage, (admission, payload, ingress)).into();
+        }
+        // Every caller has released its Participation guard before the Root handoff.
+        let handoff = self
+            .control
+            .lock()
+            .adopt_rejected_ingress(participation, payload, ingress);
+        match handoff {
+            Ok(()) => NodeRequestRefusal::Neutral(NeutralNodeRequestRefusal {
+                operation: stage,
+                _original_error: admission.error,
+            }),
+            Err(original) => NodeHostRefusal::new(stage, (admission, original)).into(),
+        }
+    }
     fn reject_failed_admission_partial(
         host: &mut super::participation_host::ParticipationHostRecord,
         admission: super::participation_host::requests::ParticipationRequestAdmissionRefusal,
@@ -570,6 +865,19 @@ impl WorkerNodeHost {
                         ingress,
                     ));
                 }
+                Err(error)
+                    if error.partial.is_none()
+                        && matches!(error.error, ParticipationRequestError::AdmissionClosed) =>
+                {
+                    drop(host);
+                    return Err(self.refuse_closed_ingress(
+                        participation,
+                        "Task domain original inspection R admission",
+                        error,
+                        RejectedIngressPayload::TaskDomain(original),
+                        ingress,
+                    ));
+                }
                 Err(error) => {
                     return Err(NodeHostRefusal::new(
                         "Task domain original inspection R admission",
@@ -617,6 +925,19 @@ impl WorkerNodeHost {
             Err(error) if error.partial.is_some() => {
                 return Err(Self::reject_failed_admission_partial(
                     &mut host,
+                    error,
+                    RejectedIngressPayload::TaskDomain(original),
+                    ingress,
+                ));
+            }
+            Err(error)
+                if error.partial.is_none()
+                    && matches!(error.error, ParticipationRequestError::AdmissionClosed) =>
+            {
+                drop(host);
+                return Err(self.refuse_closed_ingress(
+                    participation,
+                    "Task domain original R admission",
                     error,
                     RejectedIngressPayload::TaskDomain(original),
                     ingress,
@@ -724,6 +1045,19 @@ impl WorkerNodeHost {
                     ingress,
                 ));
             }
+            Err(error)
+                if error.partial.is_none()
+                    && matches!(error.error, ParticipationRequestError::AdmissionClosed) =>
+            {
+                drop(host);
+                return Err(self.refuse_closed_ingress(
+                    participation,
+                    "Participation domain original R admission",
+                    error,
+                    RejectedIngressPayload::ParticipationDomain(original),
+                    ingress,
+                ));
+            }
             Err(error) => {
                 return Err(NodeHostRefusal::new(
                     "Participation domain original R admission",
@@ -772,9 +1106,11 @@ impl WorkerNodeHost {
             task,
             reason: request.reason(),
         };
-        if host.has_retired_task_read(task) {
+        let awaiting_seal = host.task_read_awaits_seal(task);
+        if host.has_retired_task_read(task) || awaiting_seal {
             // The original physical retirement proof replaces the departed
-            // producer; the same Participation Core still owns its replay answer.
+            // producer. Until that actual transfer, the same paid R waits
+            // without borrowing the Task's closing causal sources.
             let (work, handle) = match host.admit_request(
                 &self.requests,
                 self.next_source(),
@@ -797,7 +1133,12 @@ impl WorkerNodeHost {
                     .into());
                 }
             };
-            return match host.submit_retired_task_command(work, command) {
+            let submission = if awaiting_seal {
+                host.submit_deferred_task_read(work, command)
+            } else {
+                host.submit_retired_task_command(work, command)
+            };
+            return match submission {
                 Ok(()) => Ok(NodeCancelHandle::Participation(handle)),
                 Err(original) => Err(NodeHostRefusal::new(
                     "Cancel retained Task original handoff",
@@ -2457,11 +2798,15 @@ pub(crate) struct PreparationFixtureInventory {
         novarocks_control_runtime_core::identity::WorkId,
     )>,
     pub body_exited: bool,
+    pub child_body_exited: bool,
     pub host_borrowers_exited: bool,
     pub body_report_retired: bool,
     pub whole_report_retired: bool,
     pub stopped: bool,
     pub stop_call_exited: bool,
+    pub activation: (bool, usize, usize, usize),
+    pub installed: bool,
+    pub physical_pending: usize,
     pub lifecycle_ids: Vec<(
         crate::control_runtime_policy::TaskLifecycleInputKind,
         novarocks_control_runtime_core::identity::ScopedWorkRef,
@@ -2485,6 +2830,7 @@ impl WorkerNodeHost {
             .runtime
             .standing_input_inventory(host.actor(), None, budget)
             .ok()?;
+        let physical_pending = host.original_physical_pending_for_test();
         let owner = host.task(task)?;
         let resources = owner.resources_for_retirement();
         let preparation = owner.preparation();
@@ -2493,6 +2839,9 @@ impl WorkerNodeHost {
             input_custodies,
             preparation_key: preparation.map(|p| p.key()),
             body_exited: preparation.is_some_and(|p| p.body_and_captures_exited()),
+            child_body_exited: preparation
+                .and_then(|p| p.host_children())
+                .is_some_and(|child| child.body_has_exited()),
             host_borrowers_exited: preparation.is_some_and(|p| p.host_borrowers_exited()),
             body_report_retired: preparation.is_some_and(|p| p.body_report_retired()),
             whole_report_retired: preparation.is_some_and(|p| p.exit_report_retired()),
@@ -2500,6 +2849,9 @@ impl WorkerNodeHost {
             stop_call_exited: owner
                 .host_call(crate::control_runtime::task_host_call::TaskHostCallKind::Stop)
                 .actual_call_exited(),
+            activation: owner.activation_fixture_state(),
+            installed: resources.port.current().installed(),
+            physical_pending,
             lifecycle_ids: resources
                 .lifecycle_inputs
                 .iter()
@@ -2510,6 +2862,44 @@ impl WorkerNodeHost {
                 .as_ref()
                 .map(|completion| completion.settlement_work()),
         })
+    }
+
+    /// This fixture holds the original Participation projection after the actual
+    /// opaque host has consumed its roles. No status/exit fact is injected.
+    pub(crate) fn with_original_task_projection_locked_for_test<T>(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+        observe: impl FnOnce(bool) -> T,
+    ) -> T {
+        let address = self.directory.participation(participation).unwrap();
+        let mut host = address.lock().unwrap();
+        let installed = host
+            .task(task)
+            .unwrap()
+            .resources_for_retirement()
+            .port
+            .current()
+            .installed();
+        observe(installed)
+    }
+
+    /// Rescue only this fixture's proven uninvoked original action. No new
+    /// role, identity, factory or Core fact is made; callbacks run unlocked.
+    pub(crate) fn resume_original_uninvoked_activation_for_test(
+        &self,
+        participation: ParticipationRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> bool {
+        let original = {
+            let address = self.directory.participation(participation).unwrap();
+            let mut host = address.lock().unwrap();
+            host.task(task)
+                .unwrap()
+                .original_uninvoked_activation_for_rescue()
+                .unwrap()
+        };
+        original.1.activate(&original.0)
     }
 }
 

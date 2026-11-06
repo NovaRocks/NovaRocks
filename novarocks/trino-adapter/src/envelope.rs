@@ -32,6 +32,8 @@ pub(crate) struct Envelope<'a> {
     error: Option<&'a TrinoQueryError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     update_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) update_count: Option<u64>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +95,7 @@ pub(crate) fn envelope<'a>(
         warnings: [],
         error,
         update_type,
+        update_count: None,
     }
 }
 /// Borrow typed error text directly; never create a second JSON value tree.
@@ -149,6 +152,7 @@ mod tests {
             Some(&error),
             Some("ALTER MATERIALIZED VIEW REFRESH"),
         );
+        value.update_count = Some(u64::MAX);
         value.stats.elapsed_time_millis = u64::MAX;
         value.stats.queued_time_millis = u64::MAX;
         let expected = serde_json::to_vec(&value).unwrap();

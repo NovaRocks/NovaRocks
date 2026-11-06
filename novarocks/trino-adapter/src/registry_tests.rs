@@ -32,7 +32,6 @@ use novarocks_execution_contract::failure::FailureProjection;
 use novarocks_query_application::{
     api::{StatementExternalEffectDisposition, build_string_query_result},
     cancellation::{QueryCancellationReason, QueryCancellationView},
-    client_connection::ClientConnectionToken,
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
     protocol_delivery::{
         GovernedCompletionStatementResult, GovernedErrorStatementResult,
@@ -40,12 +39,12 @@ use novarocks_query_application::{
     },
     query_control::QueryApplicationControl,
     session::{
-        QuerySession, QuerySessionFactory, QuerySessionOpenRequest, QuerySessionStatement,
-        SessionProtocolTerminal, StatementSessionRequest,
+        QuerySession, QuerySessionFactory, QuerySessionStatement, SessionProtocolTerminal,
+        StatementSessionRequest,
     },
     session_control::{QueryControlService, QuerySessionLease, SessionIdentity, SessionToken},
     session_effects::SessionEffects,
-    session_error::{QueryServiceError, QueryServiceErrorKind},
+    session_error::QueryServiceError,
     session_value::StatementSessionError,
     sql::session::SessionSqlState,
     statement_kind::StatementKind,
@@ -80,9 +79,14 @@ struct Captured {
 enum OutputMode {
     Rows,
     InternalRows,
+    CallRows,
+    CallEmpty,
     Completion,
+    Counted(u64),
+    NoCount,
     InvalidHeaders,
     Failure(QueryFailureReason),
+    FailureWithEffect(QueryFailureReason, StatementExternalEffectDisposition),
 }
 
 struct FixtureState {
@@ -216,9 +220,20 @@ impl Fixture {
     }
     fn assert_retained_original(&self) {
         let snapshot = self.state.host.observation().snapshot();
+        let queued_query = matches!(
+            self.state.mode,
+            OutputMode::InternalRows | OutputMode::Counted(_) | OutputMode::NoCount
+        );
         assert_eq!(snapshot.root_responsibilities, 1);
-        assert_eq!(snapshot.businesses, 1);
-        assert_eq!(self.state.capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        // Queued query admission retains its original query permit and Root
+        // budget. Management admission instead retains a business permit and
+        // Local position; these are different original custody paths.
+        assert_eq!(snapshot.businesses, usize::from(!queued_query));
+        assert_eq!(snapshot.admitted_queries, usize::from(queued_query));
+        assert_eq!(
+            self.state.capacity.snapshot().held_positions,
+            if queued_query { [0; 4] } else { [0, 1, 0, 0] }
+        );
         assert_eq!(self.state.completed.load(Ordering::Acquire), 0);
         assert_eq!(self.state.terminal_drops.load(Ordering::Acquire), 0);
     }
@@ -237,6 +252,7 @@ impl Fixture {
         .expect("original owner and window must actually exit");
         let snapshot = self.state.host.observation().snapshot();
         assert_eq!(snapshot.businesses, 0);
+        assert_eq!(snapshot.admitted_queries, 0);
         assert_eq!(self.state.completed.load(Ordering::Acquire), 1);
         assert_eq!(self.state.terminal_drops.load(Ordering::Acquire), 1);
         assert_eq!(self.captured().scope.check(), Err(WorkError::Released));
@@ -289,6 +305,7 @@ impl QuerySessionFactory for Factory {
         &self,
         request: StatementSessionRequest,
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+        let admission = request.admission();
         let (id, principal, value) = request.into_parts();
         let input = SessionSqlState::from_session_value(value)?;
         let lease = self
@@ -303,16 +320,8 @@ impl QuerySessionFactory for Factory {
             lease: Mutex::new(Some(lease)),
             token,
             input,
+            admission,
         }))
-    }
-    fn open_session(
-        &self,
-        _: QuerySessionOpenRequest,
-    ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
-        Err(QueryServiceError::new(
-            QueryServiceErrorKind::Internal,
-            "connection sessions are outside this fixture",
-        ))
     }
     fn cancel_all(&self, reason: QueryCancellationReason) {
         self.0.control.cancel_all(reason);
@@ -323,25 +332,38 @@ struct Session {
     lease: Mutex<Option<QuerySessionLease>>,
     token: SessionToken,
     input: SessionSqlState,
+    admission: novarocks_query_application::session::StatementAdmissionPublisher,
 }
 #[async_trait::async_trait]
 impl QuerySession for Session {
-    #[cfg(novarocks_dev_controls)]
-    fn connection_session(&self, _: ClientConnectionToken) -> Option<SessionToken> {
-        None
-    }
-    async fn init_database(&self, _: &str) -> Result<QuerySessionStatement, QueryServiceError> {
-        Err(QueryServiceError::new(
-            QueryServiceErrorKind::Internal,
-            "COM_INIT_DB is outside this fixture",
-        ))
-    }
     async fn execute_statement(&self, _: &str) -> Result<QuerySessionStatement, QueryServiceError> {
+        use novarocks_query_application::session::{StatementAdmission, StatementOutputShape};
+        let (kind, shape) = match self.state.mode {
+            OutputMode::Completion | OutputMode::InvalidHeaders => {
+                (StatementKind::Use, StatementOutputShape::Empty)
+            }
+            OutputMode::Counted(_)
+            | OutputMode::NoCount
+            | OutputMode::Failure(_)
+            | OutputMode::FailureWithEffect(_, _) => {
+                (StatementKind::Insert, StatementOutputShape::Rows)
+            }
+            OutputMode::Rows | OutputMode::InternalRows => {
+                (StatementKind::Query, StatementOutputShape::ResultSet)
+            }
+            OutputMode::CallRows | OutputMode::CallEmpty => {
+                (StatementKind::Call, StatementOutputShape::UndeterminedCall)
+            }
+        };
+        self.admission.publish(StatementAdmission { kind, shape });
         let deadline = self
             .state
             .deadline_ms
             .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
-        let statement = if matches!(self.state.mode, OutputMode::InternalRows) {
+        let statement = if matches!(
+            self.state.mode,
+            OutputMode::InternalRows | OutputMode::Counted(_) | OutputMode::NoCount
+        ) {
             self.state
                 .control
                 .begin_queued_governed_query_statement_with_result(
@@ -376,9 +398,16 @@ impl QuerySession for Session {
         // command. A held return models the original action still exiting.
         let selected_error = match self.state.mode {
             OutputMode::Failure(reason) => Some(originating_error(reason)),
+            OutputMode::FailureWithEffect(reason, effect) => {
+                Some(originating_error(reason).attach_external_effect_disposition(effect))
+            }
             OutputMode::Rows
             | OutputMode::InternalRows
+            | OutputMode::CallRows
+            | OutputMode::CallEmpty
             | OutputMode::Completion
+            | OutputMode::Counted(_)
+            | OutputMode::NoCount
             | OutputMode::InvalidHeaders => None,
         };
         self.state.captured.lock().unwrap().push(Captured {
@@ -412,7 +441,34 @@ impl QuerySession for Session {
             )
         } else if matches!(
             self.state.mode,
-            OutputMode::Completion | OutputMode::InvalidHeaders
+            OutputMode::Counted(_) | OutputMode::NoCount
+        ) && cancellation.reason().is_none()
+        {
+            use novarocks_query_application::session_control::{
+                StatementActionReady, StatementActionValue, StatementCommandCompletion,
+            };
+            let completion = match self.state.mode {
+                OutputMode::Counted(n) => StatementCommandCompletion::new(n),
+                OutputMode::NoCount => StatementCommandCompletion::no_count(),
+                _ => unreachable!(),
+            };
+            let mut ready = Some(StatementActionReady::new(
+                Ok(StatementActionValue::Ok(completion)),
+                statement,
+            ));
+            ready.as_mut().unwrap().prepare_completion(
+                StatementOutputShape::Rows,
+                *self
+                    .input
+                    .presentation()
+                    .expect("original Trino statement input"),
+            );
+            let mut output = None;
+            StatementActionReady::transfer_protocol_in(&mut ready, &mut output).unwrap();
+            (output.unwrap(), StatementKind::Insert)
+        } else if matches!(
+            self.state.mode,
+            OutputMode::Completion | OutputMode::InvalidHeaders | OutputMode::CallEmpty
         ) || cancellation.reason().is_some()
         {
             let effects = if matches!(
@@ -434,7 +490,11 @@ impl QuerySession for Session {
                 QuerySessionOutput::GovernedCompletion(
                     GovernedCompletionStatementResult::with_session_effects(statement, effects),
                 ),
-                StatementKind::Use,
+                if matches!(self.state.mode, OutputMode::CallEmpty) {
+                    StatementKind::Call
+                } else {
+                    StatementKind::Use
+                },
             )
         } else {
             let result =
@@ -443,12 +503,19 @@ impl QuerySession for Session {
             let result = GovernedImmediateStatementResult::try_new(
                 result,
                 statement,
-                *self.input.presentation(),
+                *self
+                    .input
+                    .presentation()
+                    .expect("original Trino statement input"),
             )
             .unwrap_or_else(|(error, _)| panic!("{error}"));
             (
                 QuerySessionOutput::GovernedQuery(result),
-                StatementKind::Query,
+                if matches!(self.state.mode, OutputMode::CallRows) {
+                    StatementKind::Call
+                } else {
+                    StatementKind::Query
+                },
             )
         };
         Ok(QuerySessionStatement::new(
@@ -456,9 +523,6 @@ impl QuerySession for Session {
             Box::new(Terminal(Arc::clone(&self.state))),
             kind,
         ))
-    }
-    async fn execute_batch(&self, sql: &str) -> Result<QuerySessionStatement, QueryServiceError> {
-        self.execute_statement(sql).await
     }
     fn cancel_current(&self, reason: QueryCancellationReason) {
         self.state
@@ -732,55 +796,175 @@ async fn abandonment_settles_unsealed_and_sealed_originals_and_terminal_tombston
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn terminal_ack_delete_and_finalize_race_settles_original_owner_only_once() {
-    let fixture = Fixture::standard();
-    let (entry, _) = fixture.register();
-    let page = get(&fixture.registry, &entry, 0).await;
-    fixture.outcome(&entry).await;
-    let token = next(&page);
-    drop(page);
-    let barrier = Arc::new(Barrier::new(3));
-    let ack = {
-        let registry = fixture.registry.clone();
-        let entry = entry.clone();
-        let barrier = barrier.clone();
-        tokio::spawn(async move {
-            barrier.wait().await;
-            registry.get(&entry, token).await.unwrap()
-        })
-    };
-    let cancel = {
-        let registry = fixture.registry.clone();
-        let entry = entry.clone();
-        let barrier = barrier.clone();
-        tokio::spawn(async move {
-            barrier.wait().await;
-            registry.cancel(&entry).await;
-        })
-    };
-    let finalize = {
-        let registry = fixture.registry.clone();
-        let barrier = barrier.clone();
-        tokio::spawn(async move {
-            barrier.wait().await;
-            registry.finalize().await;
-        })
-    };
-    let terminal = tokio::time::timeout(Duration::from_secs(5), ack)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), cancel)
-        .await
-        .unwrap()
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), finalize)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(json(&terminal).get("nextUri").is_none());
-    fixture.assert_released().await;
-    assert_eq!(fixture.protocol_metrics(), (0, 1));
-    assert_eq!(fixture.captured().cancellation.reason(), None);
+    // The two existing data owners have different funding: ordinary local
+    // result windows consume a position; counted completion rows retain their
+    // same Internal Root budget. Do not relabel the latter as a Client window.
+    for (mode, flush, class) in [
+        (OutputMode::Rows, false, ResultWindowClass::Local),
+        (OutputMode::Counted(0), true, ResultWindowClass::Internal),
+    ] {
+        let fixture = Fixture::configured(false, false, mode, Duration::from_secs(60), None);
+        let (entry, _) = fixture.register();
+        let page = get(&fixture.registry, &entry, 0).await;
+        fixture.outcome(&entry).await;
+        fixture.assert_live_original();
+        let wire = json(&page);
+        assert_eq!(
+            wire["data"],
+            if flush {
+                serde_json::json!([[0]])
+            } else {
+                serde_json::json!([["row-one"], ["row-two"]])
+            }
+        );
+        let original = fixture.captured();
+        let window = page
+            ._window
+            .as_ref()
+            .expect("real data retains its original window");
+        assert_eq!(window.class(), class);
+        assert!(window.is_for_scope(&original.scope));
+        let held_positions = fixture.state.capacity.snapshot().held_positions;
+        let expected_bytes = bytes(&page);
+        let weak_page = Arc::downgrade(&page);
+        let token = next(&page);
+        let deadlines = WriteDeadlines::new(Duration::from_secs(30));
+        let mut body = deadlines
+            .wrap(body::response(page.clone(), entry.progress.clone()))
+            .into_body();
+        let mut transported = Vec::new();
+        let mut frames = Vec::new();
+        while let Some(frame) = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+            let frame = frame.unwrap();
+            transported.extend_from_slice(frame.data_ref().expect("original HTTP data frame"));
+            // These are actual original transport Frames, including row
+            // backing. Retain them across logical ACK beside Page custody.
+            frames.push(frame);
+        }
+        assert_eq!(transported, expected_bytes);
+        drop(body);
+        drop(page);
+        assert!(deadlines.has_pending());
+        assert!(weak_page.upgrade().is_some());
+
+        let barrier = Arc::new(Barrier::new(3));
+        let ack = {
+            let registry = fixture.registry.clone();
+            let entry = entry.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.get(&entry, token).await.unwrap()
+            })
+        };
+        let cancel = {
+            let registry = fixture.registry.clone();
+            let entry = entry.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.cancel(&entry).await;
+            })
+        };
+        let finalize = {
+            let registry = fixture.registry.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                registry.finalize().await;
+            })
+        };
+        let terminal = tokio::time::timeout(Duration::from_secs(5), ack)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finalize)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(json(&terminal).get("nextUri").is_none());
+        assert!(terminal._window.is_none());
+        assert_eq!(fixture.state.completed.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.state.terminal_drops.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.protocol_metrics(), (0, 1));
+        assert_eq!(fixture.captured().cancellation.reason(), None);
+        // Logical ACK/DELETE/finalize have settled the original protocol once,
+        // but cannot refund the real backing still held by the old HTTP write.
+        assert!(weak_page.upgrade().is_some());
+        assert_eq!(
+            fixture
+                .state
+                .host
+                .observation()
+                .snapshot()
+                .root_responsibilities,
+            1
+        );
+        assert_eq!(
+            fixture.state.capacity.snapshot().held_positions,
+            held_positions
+        );
+        let repeated = get(&fixture.registry, &entry, token).await;
+        assert!(Arc::ptr_eq(&terminal, &repeated));
+        assert_eq!(bytes(&terminal), bytes(&repeated));
+        fixture.registry.cancel(&entry).await;
+        fixture.registry.finalize().await;
+        assert_eq!(fixture.state.completed.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.state.terminal_drops.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.protocol_metrics(), (0, 1));
+        assert!(weak_page.upgrade().is_some());
+        assert_eq!(
+            fixture
+                .state
+                .host
+                .observation()
+                .snapshot()
+                .root_responsibilities,
+            1
+        );
+        assert_eq!(
+            fixture.state.capacity.snapshot().held_positions,
+            held_positions
+        );
+        drop(repeated);
+        drop(terminal);
+
+        // Actual transport Frames exit before an actual successful flush or
+        // failed-connection custody Drop can refund their original backing.
+        drop(frames);
+        assert!(weak_page.upgrade().is_some());
+        assert_eq!(
+            fixture
+                .state
+                .host
+                .observation()
+                .snapshot()
+                .root_responsibilities,
+            1
+        );
+        assert_eq!(
+            fixture.state.capacity.snapshot().held_positions,
+            held_positions
+        );
+        if flush {
+            deadlines.flushed();
+            assert!(!deadlines.has_pending());
+        } else {
+            // The original failed/closed connection retires its actual write
+            // custody. Dropping the earlier body alone did not do that.
+            drop(deadlines);
+        }
+        assert!(weak_page.upgrade().is_none());
+        fixture.assert_released().await;
+        assert_eq!(fixture.protocol_metrics(), (0, 1));
+        fixture.registry.cancel(&entry).await;
+        fixture.registry.finalize().await;
+        fixture.assert_released().await;
+    }
 }
 
 #[tokio::test]
@@ -854,8 +1038,8 @@ async fn page_bounds_are_derived_from_the_original_window_and_refuse_oversized_r
     let lease = fixture
         .state
         .control
-        .register_session(SessionIdentity::new(
-            ClientConnectionToken::new(71, 1).unwrap(),
+        .register_session(SessionIdentity::client_statement(
+            fixture.state.control.mint_client_query_id(),
             "root",
         ))
         .unwrap();
@@ -1334,17 +1518,18 @@ async fn malformed_or_overflowing_tokens_are_not_found_without_starting_the_stat
                 "/v1/statement/executing/{}/{}/{}",
                 entry.id, entry.slug, token
             );
-            let response = crate::routes::routes(fixture.registry.clone())
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("host", "localhost")
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            let response =
+                crate::routes::routes(fixture.registry.clone(), crate::QueryTextLimit::default())
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("host", "localhost")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {token}");
         }
     }
@@ -1421,8 +1606,8 @@ async fn internal_root_page_backing_obeys_its_configured_budget_and_emits_rows()
         novarocks_types::FrontendProcessId::new_v7(),
     )));
     let lease = control
-        .register_session(SessionIdentity::new(
-            ClientConnectionToken::new(72, 1).unwrap(),
+        .register_session(SessionIdentity::client_statement(
+            control.mint_client_query_id(),
             "root",
         ))
         .unwrap();
@@ -1482,4 +1667,288 @@ async fn internal_root_page_backing_obeys_its_configured_budget_and_emits_rows()
     drop(lease);
     assert_eq!(host.observation().snapshot().root_responsibilities, 0);
     assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+}
+
+#[tokio::test]
+async fn admitted_count_rows_preserve_zero_unknown_data_ack_and_replay() {
+    for (mode, count, cell) in [
+        (OutputMode::Counted(0), Some(0), serde_json::json!(0)),
+        (OutputMode::Counted(3), Some(3), serde_json::json!(3)),
+        (OutputMode::NoCount, None, serde_json::Value::Null),
+    ] {
+        let fixture = Fixture::configured(true, false, mode, Duration::from_secs(60), None);
+        let (entry, _) = fixture.register();
+        let pending = get(&fixture.registry, &entry, 0).await;
+        let wire = json(&pending);
+        assert_eq!(wire["updateType"], "INSERT");
+        assert_eq!(wire["columns"][0]["name"], "rows");
+        assert_eq!(wire["columns"][0]["type"], "bigint");
+        assert!(wire.get("data").is_none());
+        assert!(wire.get("updateCount").is_none());
+        let pending_replay = get(&fixture.registry, &entry, 0).await;
+        assert_eq!(bytes(&pending_replay), bytes(&pending));
+        drop(pending_replay);
+        let token = next(&pending);
+        drop(pending);
+        fixture.state.held.store(false, Ordering::Release);
+        fixture.state.release.notify_waiters();
+        let data = get(&fixture.registry, &entry, token).await;
+        let wire = json(&data);
+        assert_eq!(wire["updateType"], "INSERT");
+        assert_eq!(wire["data"], serde_json::json!([[cell]]));
+        assert_eq!(wire.get("updateCount").and_then(Value::as_u64), count);
+        fixture.assert_live_original();
+        assert_eq!(
+            data._window.as_ref().unwrap().class(),
+            ResultWindowClass::Internal
+        );
+        let replay = get(&fixture.registry, &entry, token).await;
+        assert!(Arc::ptr_eq(&data, &replay));
+        assert_eq!(bytes(&data), bytes(&replay));
+        let final_token = next(&data);
+        drop(data);
+        drop(replay);
+        let terminal = get(&fixture.registry, &entry, final_token).await;
+        let wire = json(&terminal);
+        assert_eq!(wire["stats"]["state"], "FINISHED");
+        assert_eq!(wire["updateType"], "INSERT");
+        assert_eq!(wire.get("updateCount").and_then(Value::as_u64), count);
+        assert!(wire.get("data").is_none());
+        assert!(wire.get("nextUri").is_none());
+        let replay = get(&fixture.registry, &entry, final_token).await;
+        assert!(Arc::ptr_eq(&terminal, &replay));
+        assert_eq!(bytes(&terminal), bytes(&replay));
+        fixture.assert_released().await;
+        fixture.registry.finalize().await;
+    }
+}
+#[tokio::test]
+async fn admitted_empty_command_has_columns_on_running_and_terminal_pages() {
+    let fixture = Fixture::new(true, true, Duration::from_secs(60));
+    let (entry, _) = fixture.register();
+    let pending = get(&fixture.registry, &entry, 0).await;
+    assert_eq!(json(&pending)["columns"], serde_json::json!([]));
+    assert_eq!(json(&pending)["updateType"], "USE");
+    assert!(json(&pending).get("data").is_none());
+    let token = next(&pending);
+    drop(pending);
+    fixture.state.held.store(false, Ordering::Release);
+    fixture.state.release.notify_waiters();
+    let terminal = get(&fixture.registry, &entry, token).await;
+    assert_eq!(json(&terminal)["columns"], serde_json::json!([]));
+    assert_eq!(json(&terminal)["updateType"], "USE");
+    assert!(json(&terminal).get("updateCount").is_none());
+    fixture.assert_released().await;
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn call_output_refines_from_the_original_carrier_without_losing_result_rows() {
+    for mode in [OutputMode::CallRows, OutputMode::CallEmpty] {
+        let fixture = Fixture::configured(true, false, mode, Duration::from_secs(60), None);
+        let (entry, _) = fixture.register();
+        let pending = get(&fixture.registry, &entry, 0).await;
+        let wire = json(&pending);
+        assert!(wire.get("columns").is_none());
+        assert!(wire.get("updateType").is_none());
+        assert!(wire.get("updateCount").is_none());
+        assert!(wire.get("data").is_none());
+        let token = next(&pending);
+        drop(pending);
+        fixture.state.held.store(false, Ordering::Release);
+        fixture.state.release.notify_waiters();
+        let resolved = get(&fixture.registry, &entry, token).await;
+        let wire = json(&resolved);
+        assert!(wire.get("updateCount").is_none());
+        let terminal = if matches!(mode, OutputMode::CallRows) {
+            assert_eq!(wire["data"], serde_json::json!([["row-one"], ["row-two"]]));
+            assert_eq!(wire["columns"][0]["name"], "value");
+            assert!(wire.get("updateType").is_none());
+            fixture.assert_live_original();
+            let repeated = get(&fixture.registry, &entry, token).await;
+            assert!(Arc::ptr_eq(&resolved, &repeated));
+            assert_eq!(bytes(&resolved), bytes(&repeated));
+            let token = next(&resolved);
+            drop(resolved);
+            drop(repeated);
+            get(&fixture.registry, &entry, token).await
+        } else {
+            assert_eq!(wire["columns"], serde_json::json!([]));
+            assert_eq!(wire["updateType"], "CALL");
+            assert!(wire.get("data").is_none());
+            resolved
+        };
+        let wire = json(&terminal);
+        assert_eq!(wire["stats"]["state"], "FINISHED");
+        assert!(wire.get("nextUri").is_none());
+        assert!(wire.get("data").is_none());
+        assert!(wire.get("updateCount").is_none());
+        if matches!(mode, OutputMode::CallRows) {
+            assert!(wire.get("updateType").is_none());
+            assert_eq!(wire["columns"][0]["name"], "value");
+        } else {
+            assert_eq!(wire["updateType"], "CALL");
+            assert_eq!(wire["columns"], serde_json::json!([]));
+        }
+        let token = entry.state.lock().await;
+        let Phase::Settled {
+            token: terminal_token,
+            ..
+        } = &token.phase
+        else {
+            panic!("resolved CALL must settle on its original terminal request");
+        };
+        let terminal_token = *terminal_token;
+        drop(token);
+        let repeated = get(&fixture.registry, &entry, terminal_token).await;
+        assert!(Arc::ptr_eq(&terminal, &repeated));
+        assert_eq!(bytes(&terminal), bytes(&repeated));
+        fixture.assert_released().await;
+        fixture.registry.finalize().await;
+    }
+}
+
+#[test]
+fn cancel_and_abandon_receipts_keep_original_effect_without_count_or_cause_inference() {
+    use novarocks_query_application::session_control::GovernedStatementFinishOutcome as Finish;
+    use novarocks_workload_control::CancellationReason;
+    for (requested, reason, actual, expected) in [
+        (
+            Disposition::ClientCancel,
+            QueryCancellationReason::ClientCancelRequested,
+            CancellationReason::ClientCancelRequested,
+            (3, "USER_CANCELED"),
+        ),
+        (
+            Disposition::Abandon,
+            QueryCancellationReason::ClientDisconnected,
+            CancellationReason::ClientDisconnected,
+            (2, "ABANDONED_QUERY"),
+        ),
+    ] {
+        for effect in [
+            StatementExternalEffectDisposition::KnownCommitted,
+            StatementExternalEffectDisposition::CommitUnknown,
+        ] {
+            let (disposition, error) = crate::driver::command_receipt(
+                "original-query",
+                requested,
+                Finish::Cancelled(actual.clone()),
+                Some(reason.clone()),
+                Some(effect),
+            );
+            assert_eq!(disposition, requested);
+            assert_eq!((error.error_code, error.error_name), expected);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("external effect disposition={effect:?}"))
+            );
+            assert!(error.message.contains("do_not_retry=true"));
+            assert_eq!(
+                error
+                    .message
+                    .matches(" (external effect disposition=")
+                    .count(),
+                1
+            );
+            let (_, without) = crate::driver::command_receipt(
+                "original-query",
+                requested,
+                Finish::Cancelled(actual.clone()),
+                Some(reason.clone()),
+                None,
+            );
+            assert_eq!(
+                (
+                    without.error_code,
+                    without.error_name,
+                    without.error_location
+                ),
+                (error.error_code, error.error_name, error.error_location)
+            );
+            assert!(!without.message.contains("external effect disposition="));
+        }
+    }
+}
+
+#[tokio::test]
+async fn caught_post_handoff_panic_keeps_original_error_effect_and_actual_resource_exit() {
+    let fixture = Fixture::configured(
+        false,
+        false,
+        OutputMode::FailureWithEffect(
+            QueryFailureReason::ResultProtocol,
+            StatementExternalEffectDisposition::KnownCommitted,
+        ),
+        Duration::from_secs(60),
+        None,
+    );
+    let (entry, _) = fixture.register();
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    *entry.delivery_panic.lock().unwrap() = Some((entered.clone(), release.clone()));
+    let registry = fixture.registry.clone();
+    let original_entry = entry.clone();
+    let get_join = tokio::spawn(async move { get(&registry, &original_entry, 0).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .expect("original output reached post-handoff delivery gate");
+    fixture.assert_live_original();
+    let original = fixture.captured();
+    assert_eq!(
+        original
+            .selected_error
+            .as_ref()
+            .unwrap()
+            .external_effect_disposition(),
+        Some(StatementExternalEffectDisposition::KnownCommitted)
+    );
+    assert_eq!(
+        entry.external_effect_disposition(),
+        Some(StatementExternalEffectDisposition::KnownCommitted)
+    );
+    release.wait().await;
+    let terminal = tokio::time::timeout(Duration::from_secs(5), get_join)
+        .await
+        .unwrap()
+        .unwrap();
+    let wire = json(&terminal);
+    assert_eq!(wire["error"]["errorCode"], 65536);
+    assert_eq!(wire["error"]["errorName"], "GENERIC_INTERNAL_ERROR");
+    assert_eq!(wire["error"]["errorType"], "INTERNAL_ERROR");
+    let message = wire["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("Trino query driver panicked"));
+    assert!(message.contains("external effect disposition=KnownCommitted do_not_retry=true"));
+    assert_eq!(message.matches(" (external effect disposition=").count(), 1);
+    assert!(wire.get("updateType").is_none());
+    assert!(wire.get("updateCount").is_none());
+    assert!(wire.get("columns").is_none());
+    assert!(wire.get("data").is_none());
+    assert!(wire.get("nextUri").is_none());
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .state
+            .host
+            .observation()
+            .wait_until_no_root_responsibilities(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixture.state.capacity.snapshot().held_positions, [0; 4]);
+    assert_eq!(original.scope.check(), Err(WorkError::Released));
+    // The existing unwind path drops the terminal; it does not invent a
+    // successful completion or run another settlement owner.
+    assert_eq!(fixture.state.completed.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.state.terminal_drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        entry.external_effect_disposition(),
+        Some(StatementExternalEffectDisposition::KnownCommitted),
+        "diagnostic knowledge retains no capacity after actual exit"
+    );
+    let replay = get(&fixture.registry, &entry, 0).await;
+    assert!(Arc::ptr_eq(&terminal, &replay));
+    assert_eq!(bytes(&terminal), bytes(&replay));
+    fixture.registry.finalize().await;
 }

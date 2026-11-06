@@ -313,7 +313,7 @@ impl TrinoCaseSession {
                 Ok(result)
             })();
             match outcome {
-                Ok(result) if result.has_columns() => {
+                Ok(result) if result.is_result_set() => {
                     result_statements.push(statement.clone());
                     results.push(result);
                 }
@@ -398,6 +398,7 @@ fn emit_control_failure_trace(pending: &PendingStatement, error: &anyhow::Error)
         "initial_next_uri": trace.initial_next_uri,
         "pages": trace.pages,
         "update_type": trace.update_type,
+        "update_count": trace.update_count,
         "state": "runner_control_failed",
         "failure": {"RunnerControl": format!("{error:#}")},
     });

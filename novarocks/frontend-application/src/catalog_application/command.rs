@@ -40,7 +40,7 @@ use crate::catalog_application::statement::{
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
-use novarocks_query_application::api::build_utf8_query_result;
+use novarocks_query_application::api::{CommandError, build_utf8_query_result};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::semantic::command::{
@@ -198,7 +198,7 @@ impl CatalogCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, CommandError> {
         if let Some(source) = &command.like {
             return execute_create_table_like(
                 self,
@@ -599,7 +599,7 @@ fn execute_create_table_like(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let source_target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &source,

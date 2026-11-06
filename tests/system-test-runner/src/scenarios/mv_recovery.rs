@@ -4,10 +4,12 @@ pub(super) mod control_plan;
 use super::mv_uea7::{
     ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
 };
-use crate::actors::mysql as mysql_actor;
+use super::mv_uea7::{
+    mv_properties, mv_public_error, mv_response_needs_cancel, mv_response_with_cleanup, mv_rows,
+    mv_text_lines,
+};
+use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use ::mysql::prelude::{FromRow, Queryable};
-use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::TestClusterOwner;
@@ -15,8 +17,8 @@ use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,7 +126,7 @@ impl Scenario for MvStateStoreRestart {
             &[(1, 10), (2, 20)],
             "read first MV publication before FE restart",
         )?;
-        conn.finish()?;
+        drop(conn);
 
         restart_frontend(context, "restart FE with the persisted StateStore")?;
         let mut conn = connect(context)?;
@@ -148,13 +150,13 @@ impl Scenario for MvStateStoreRestart {
         let challenge = property(&closed, "Challenge")?;
         let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
         context.action("declare the old FE isolated and resume exact MV management");
-        let resumed: Vec<(String, Option<String>)> = conn
-            .query(format!(
+        let resumed: Vec<(String, Option<String>)> = mv_properties(&conn
+            .execute(format!(
                 "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
                  '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
                  'the system scenario replaced the declared frontend process before this statement')"
             ))
-            .context("resume managed MV after StateStore restart")?;
+            .context("resume managed MV after StateStore restart")?)?;
         if property(&resumed, "SettledEffects")? != "1" {
             bail!("StateStore restart readmission did not settle the old incarnation");
         }
@@ -165,19 +167,13 @@ impl Scenario for MvStateStoreRestart {
             "create a second MV after StateStore recovery",
             "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
-        let views: Vec<Row> = query(
+        let views = query(
             context,
             &mut conn,
             "SHOW MATERIALIZED VIEWS FROM ns",
             "list MV definitions after FE restart",
         )?;
-        let names = views
-            .iter()
-            .map(|row| {
-                row.get::<String, _>(0)
-                    .context("SHOW MATERIALIZED VIEWS name column")
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let names = mv_show_names(&views)?;
         if names != ["orders_mv", "orders_mv_2"] {
             bail!(
                 "MV definitions did not survive StateStore restart: names={names:?}; {}",
@@ -485,7 +481,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "inject one typed connector unavailability after FE restart\n",
         )?;
         context.action("armed one transient scheduler preparation fault for FE recovery");
-        conn.finish()?;
+        drop(conn);
         context.action("terminate held scheduler FE attempt for recovery");
         context
             .handle()
@@ -635,12 +631,12 @@ impl Scenario for MvRewriteBindingBarrier {
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
 
-        let rewritten: Vec<(String,)> = query(
+        let rewritten: Vec<(String,)> = mv_text_lines(&query(
             context,
             &mut conn,
             "EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1",
             "confirm the query selects the fresh MV target",
-        )?;
+        )?)?;
         if !rewritten
             .iter()
             .any(|(line,)| line.contains("rewritten with mv: orders_agg_mv"))
@@ -829,8 +825,8 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             "token=before-configuration-write\n",
         )?;
         let held_refresh = spawn_refresh(
-            context.mysql_user().to_string(),
-            context.mysql_port(),
+            context.sql_user().to_string(),
+            context.trino_port(),
             catalog,
             "orders_mv",
             context.deadline(),
@@ -857,20 +853,25 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
 
         let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_string();
-        let port = context.mysql_port();
+        let user = context.sql_user().to_string();
+        let port = context.trino_port();
         context.remaining("start concurrent MV configuration write")?;
         let deadline = context.deadline();
-        let result_rx = spawn_sql_actor(move || {
-            mysql_actor::connect_until(&user, port, deadline)?.run(|writer| {
-                writer.query_drop(format!("SET CATALOG {catalog}"))?;
-                writer.query_drop("USE ns")?;
-                started_tx
-                    .send(())
-                    .context("signal configuration writer readiness")?;
-                writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
-                Ok(())
-            })
+        let result_rx = spawn_cancellable_sql_actor(move |cancellation| {
+            let mut writer = SqlSession::new(&user, port, deadline)?;
+
+            writer.execute(format!("SET CATALOG {catalog}"))?;
+            writer.execute("USE ns")?;
+            started_tx
+                .send(())
+                .context("signal configuration writer readiness")?;
+            run_original_mv_statement(
+                &mut writer,
+                "ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH",
+                deadline,
+                &cancellation,
+            )?;
+            Ok(())
         });
         started_rx
             .recv_timeout(context.remaining("wait for configuration writer readiness")?)
@@ -939,18 +940,12 @@ impl Scenario for MvRefreshConfigurationInterleaving {
 
 fn require_refresh_paused(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     view: &str,
     expected: bool,
 ) -> Result<()> {
-    let rows: Vec<Row> = conn.query("SHOW MATERIALIZED VIEWS")?;
-    let row = rows
-        .iter()
-        .find(|row| row.get::<String, _>("Name").as_deref() == Some(view))
-        .with_context(|| format!("SHOW MATERIALIZED VIEWS omitted {view}"))?;
-    let actual = row
-        .get::<String, _>("RefreshPaused")
-        .context("SHOW MATERIALIZED VIEWS omitted RefreshPaused")?;
+    let rows = conn.execute("SHOW MATERIALIZED VIEWS")?;
+    let actual = mv_show_field(&rows, view, "RefreshPaused")?;
     if actual != expected.to_string() {
         bail!(
             "{view} RefreshPaused is {actual}, expected {expected}; {}",
@@ -993,7 +988,7 @@ fn require_rest_snapshot_count(
 // orders/D-drift test below remains unchanged and uses a separate source table.
 fn source_window_interleavings(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     rest: &str,
 ) -> Result<()> {
@@ -1187,7 +1182,7 @@ fn source_window_interleavings(
 }
 fn create_window_fixture(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     source: &str,
     mv: &str,
 ) -> Result<()> {
@@ -1228,21 +1223,21 @@ fn hold_source_refresh(
             .join(format!("mv-refresh-at-{phase}.trigger")),
         &format!("token=source-window-{mv}\n"),
     )?;
-    let user = context.mysql_user().to_string();
-    let port = context.mysql_port();
+    let user = context.sql_user().to_string();
+    let port = context.trino_port();
     let deadline = context.deadline();
     let catalog = catalog.to_string();
     let sql = format!(
         "REFRESH MATERIALIZED VIEW {mv}{} WITH SYNC MODE",
         if full { " FULL" } else { "" }
     );
-    let held = spawn_sql_actor(move || {
-        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
-            conn.query_drop(format!("SET CATALOG {catalog}"))?;
-            conn.query_drop("USE ns")?;
-            conn.query_drop(sql)?;
-            Ok(())
-        })
+    let held = spawn_cancellable_sql_actor(move |cancellation| {
+        let mut conn = SqlSession::new(&user, port, deadline)?;
+
+        conn.execute(format!("SET CATALOG {catalog}"))?;
+        conn.execute("USE ns")?;
+        run_original_mv_statement(&mut conn, &sql, deadline, &cancellation)?;
+        Ok(())
     });
     Ok((trigger, held))
 }
@@ -1418,14 +1413,13 @@ fn require_window_failure(outcome: Result<()>, reason: u16) -> Result<()> {
     };
     let original = failure
         .chain()
-        .find_map(|value| value.downcast_ref::<mysql::Error>())
-        .context("source drift did not retain an original MySQL server error")?;
-    let mysql::Error::MySqlError(server) = original else {
-        bail!("source drift returned transport/client failure: {failure:#}");
-    };
+        .find_map(|value| value.downcast_ref::<StatementFailure>())
+        .context("source drift did not retain an original typed SQL error")?;
+    let server = mv_public_error(original)?;
     ensure!(
-        server.code == 1105
-            && server.state == "HY000"
+        server.error_code == 65542
+            && server.error_name == "REMOTE_TASK_ERROR"
+            && server.error_type == "INTERNAL_ERROR"
             && server.message.starts_with("[query.execution.dependency]")
             && server.message.contains(&format!("(reason 4:{reason})")),
         "wrong original public Source failure: {server:?}; {failure:#}"
@@ -1608,8 +1602,8 @@ impl Scenario for MvCurrentDependencyRecheck {
             "token=before-current-dependency-recheck\n",
         )?;
         let held_refresh = spawn_refresh(
-            context.mysql_user().to_string(),
-            context.mysql_port(),
+            context.sql_user().to_string(),
+            context.trino_port(),
             catalog,
             "orders_mv",
             context.deadline(),
@@ -1732,7 +1726,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
         let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
         execute(context, &mut conn, "create an unpublished MV", create)?;
         externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
-        conn.finish()?;
+        drop(conn);
 
         restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
         let mut conn = connect(context)?;
@@ -1748,11 +1742,11 @@ impl Scenario for MvLegacyInterpretationRebuild {
         let challenge = property(&closed, "Challenge")?;
         let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
         context.action("settle the old FE before testing the old L binding");
-        let resumed: Vec<(String, Option<String>)> = conn.query(format!(
+        let resumed: Vec<(String, Option<String>)> = mv_properties(&conn.execute(format!(
             "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
              '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
              'the system scenario replaced the old FE before rebuilding an old-format MV')"
-        ))?;
+        ))?)?;
         if property(&resumed, "SettledEffects")? != "1" {
             bail!("old-format MV did not settle the old FE incarnation");
         }
@@ -1767,10 +1761,10 @@ impl Scenario for MvLegacyInterpretationRebuild {
             .as_i64()
             .context("empty management snapshot has no Current ID")?;
         context.action("old L must reject a refresh without a data publication");
-        let error = conn
-            .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
-            .expect_err("old nonzero big-endian L must fail closed")
-            .to_string();
+        let failure = conn
+            .execute("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("old nonzero big-endian L must fail closed");
+        let error = mv_public_error(&failure)?.message.clone();
         if !error
             .contains("MV runtime target schema version is not from the exact document generation")
         {
@@ -1931,8 +1925,8 @@ impl Scenario for MvStagedPublishedRecovery {
         )?;
         context.action("armed committed-before-record crash barrier");
         let staged_refresh = spawn_refresh(
-            context.mysql_user().to_string(),
-            context.mysql_port(),
+            context.sql_user().to_string(),
+            context.trino_port(),
             catalog,
             "orders_mv",
             context.deadline(),
@@ -1952,7 +1946,7 @@ impl Scenario for MvStagedPublishedRecovery {
             .kill_fe()
             .context("kill FE at staged recovery barrier")?;
         staged.remove()?;
-        expect_refresh_failure(
+        expect_refresh_failure_after_fe_exit(
             context,
             staged_refresh,
             "staged refresh client after FE termination",
@@ -1988,8 +1982,8 @@ impl Scenario for MvStagedPublishedRecovery {
         )?;
         context.action("armed publication-committed crash barrier");
         let published_refresh = spawn_refresh(
-            context.mysql_user().to_string(),
-            context.mysql_port(),
+            context.sql_user().to_string(),
+            context.trino_port(),
             catalog,
             "orders_mv",
             context.deadline(),
@@ -2009,7 +2003,7 @@ impl Scenario for MvStagedPublishedRecovery {
             .kill_fe()
             .context("kill FE at publication recovery barrier")?;
         published.remove()?;
-        expect_refresh_failure(
+        expect_refresh_failure_after_fe_exit(
             context,
             published_refresh,
             "publication refresh client after FE termination",
@@ -2146,12 +2140,24 @@ impl Scenario for MvFirstRefreshStaging {
         let deadline = context.deadline();
         // The actual connection is idle after catalog/database setup. Arm the
         // exact outer REFRESH bytes before its real statement admission.
-        let observation = context.handle().arm_selected_statement_observation(
-            control_plan::FIRST_REFRESH_TOKEN,
-            conn.connection_id(),
-            control_plan::FIRST_REFRESH_SQL,
-            deadline,
-        )?;
+        let pending = conn.submit(control_plan::FIRST_REFRESH_SQL)?;
+        let cancel = pending.cancel_handle();
+        let observation = match context
+            .handle()
+            .arm_selected_statement_observation_for_client_query(
+                control_plan::FIRST_REFRESH_TOKEN,
+                &pending.query_id,
+                control_plan::FIRST_REFRESH_SQL,
+                deadline,
+            ) {
+            Ok(observation) => observation,
+            Err(primary) => {
+                return control_plan::with_cleanup(
+                    Err(primary),
+                    cancel.delete(deadline).map_err(Into::into),
+                );
+            }
+        };
         let armed = context.handle().arm_selected_query_lifecycle_fault(
             0,
             TASK_EXECUTION_FAILURE,
@@ -2160,23 +2166,37 @@ impl Scenario for MvFirstRefreshStaging {
         if let Err(error) = armed {
             let drained = context
                 .handle()
-                .drain_query_lifecycle_statement_observation(&observation);
-            return control_plan::with_cleanup(Err(error), drained);
+                .drain_query_lifecycle_statement_binding(&observation, deadline);
+            return control_plan::with_cleanup(
+                Err(error),
+                control_plan::with_cleanup(drained, cancel.delete(deadline).map_err(Into::into)),
+            );
         }
         context.action("armed an injected task execution failure for MV first refresh");
-        let refresh_result = conn.query_drop(control_plan::FIRST_REFRESH_SQL);
+        let refresh_result = conn.run_pending(pending);
+        let cancelled = if mv_response_needs_cancel(&refresh_result) {
+            cancel.delete(deadline).map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
         let cleanup_result = context
             .handle()
             .clear_query_lifecycle_faults()
             .context("clear injected task execution failure");
-        // query_drop returned the actual response before its observation is drained.
+        // The original pending returned its actual response before observation drain.
         let drained = context
             .handle()
-            .drain_query_lifecycle_statement_observation(&observation);
-        control_plan::with_cleanup(cleanup_result, drained)
-            .with_context(|| format!("first-refresh actual response: {refresh_result:?}"))?;
+            .drain_query_lifecycle_statement_binding(&observation, deadline);
+        let refresh_result = mv_response_with_cleanup(
+            refresh_result,
+            control_plan::with_cleanup(
+                cancelled,
+                control_plan::with_cleanup(cleanup_result, drained),
+            ),
+        )?;
         let error = refresh_result
             .expect_err("an injected task execution failure must fail the MV first refresh");
+        mv_public_error(&error)?;
         if error.to_string().is_empty() {
             bail!("injected task execution failure returned an empty MV refresh error");
         }
@@ -2298,7 +2318,7 @@ impl Scenario for MvBaseIdentityReplacement {
             "read publication before replacing its base table",
         )?;
 
-        conn.finish()?;
+        drop(conn);
         externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
@@ -2314,7 +2334,7 @@ impl Scenario for MvBaseIdentityReplacement {
             "seed replacement base table incarnation",
             "INSERT INTO orders VALUES (9, 90)",
         )?;
-        conn.finish()?;
+        drop(conn);
 
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
@@ -2428,7 +2448,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
             &[(1, 10), (2, 20)],
             "read newly published lake-native MV before FE restart",
         )?;
-        let rows: Vec<Row> = query(
+        let rows = query(
             context,
             &mut conn,
             &format!(
@@ -2437,21 +2457,18 @@ impl Scenario for MvLakePublicationRestartRebuild {
             "confirm the published MV has exact lake documents",
         )?;
         let report = rows
+            .rows
             .first()
             .context("lake document observation returned no report row")?;
-        let level = report
-            .get::<String, _>(0)
-            .context("lake document observation AvailableLevel column")?;
-        let source = report
-            .get::<String, _>(4)
-            .context("lake document observation RebuildSource column")?;
+        let level = mv_report_text(&rows, report, 0)?;
+        let source = mv_report_text(&rows, report, 4)?;
         if level != "provenance" || source != "lake-documents" {
             bail!(
                 "unexpected lake document report level={level:?}, source={source:?}; {}",
                 context.diagnostics()
             );
         }
-        let wiped: Vec<Row> = query(
+        let wiped = query(
             context,
             &mut conn,
             &format!(
@@ -2460,14 +2477,15 @@ impl Scenario for MvLakePublicationRestartRebuild {
             "wipe only the MV Accelerator after proving lake documents",
         )?;
         let wipe_report = wiped
+            .rows
             .first()
             .context("MV Accelerator wipe returned no report row")?;
-        if wipe_report.get::<String, _>(0).as_deref() != Some("wipe")
-            || wipe_report.get::<String, _>(4).as_deref() != Some("accelerator-wiped")
+        if mv_report_text(&wiped, wipe_report, 0)? != "wipe"
+            || mv_report_text(&wiped, wipe_report, 4)? != "accelerator-wiped"
         {
             bail!("unexpected MV Accelerator wipe report: {wipe_report:?}");
         }
-        conn.finish()?;
+        drop(conn);
         restart_frontend(context, "restart FE after MV Accelerator wipe")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
@@ -2526,19 +2544,16 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn connect(context: &mut ScenarioContext) -> Result<mysql_actor::DeadlineConnection> {
-    context.remaining("connect MySQL client")?;
-    context.action("connect through public MySQL protocol");
-    mysql_actor::connect_until(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.deadline(),
-    )
+fn connect(context: &mut ScenarioContext) -> Result<SqlSession> {
+    context.remaining("connect MV SQL client")?;
+    context.action("connect through public Trino protocol");
+    SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())
+        .map_err(Into::into)
 }
 
 fn setup_orders_fixture_rest(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     create_catalog_sql: &str,
     seed_rows: bool,
@@ -2575,7 +2590,7 @@ fn setup_orders_fixture_rest(
 
 fn select_catalog_and_database(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
 ) -> Result<()> {
     execute(
@@ -2957,25 +2972,89 @@ fn assert_rest_snapshot_unchanged(
     Ok(())
 }
 
-fn execute(context: &mut ScenarioContext, conn: &mut Conn, action: &str, sql: &str) -> Result<()> {
+fn mv_report_text<'a>(
+    result: &StatementResult,
+    row: &'a [TrinoValue],
+    index: usize,
+) -> Result<&'a str> {
+    ensure!(
+        result.is_result_set()
+            && result
+                .columns
+                .get(index)
+                .is_some_and(|column| column.type_signature.raw_type == "varchar"),
+        "MV report omitted its declared text column {index}"
+    );
+    let Some(TrinoValue::Text(value)) = row.get(index) else {
+        bail!("MV report omitted its non-null text field {index}")
+    };
+    Ok(value)
+}
+fn mv_show_column(result: &StatementResult, name: &str) -> Result<usize> {
+    let columns = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.name == name)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    ensure!(
+        result.is_result_set()
+            && columns.len() == 1
+            && result.columns[columns[0]].type_signature.raw_type == "varchar",
+        "SHOW MATERIALIZED VIEWS omitted or duplicated declared text {name}"
+    );
+    Ok(columns[0])
+}
+fn mv_show_names(result: &StatementResult) -> Result<Vec<String>> {
+    let index = mv_show_column(result, "Name")?;
+    result
+        .rows
+        .iter()
+        .map(|row| mv_report_text(result, row, index).map(str::to_owned))
+        .collect()
+}
+fn mv_show_field(result: &StatementResult, view: &str, field: &str) -> Result<String> {
+    let name = mv_show_column(result, "Name")?;
+    let value = mv_show_column(result, field)?;
+    let targets = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.get(name), Some(TrinoValue::Text(name)) if name == view))
+        .collect::<Vec<_>>();
+    ensure!(
+        targets.len() == 1,
+        "SHOW MATERIALIZED VIEWS omitted or duplicated exact target {view}"
+    );
+    mv_report_text(result, targets[0], value).map(str::to_owned)
+}
+
+fn execute(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    action: &str,
+    sql: &str,
+) -> Result<()> {
     context.remaining(action)?;
     context.action(action);
-    conn.query_drop(sql)
+    conn.execute(sql)
+        .with_context(|| format!("{action}: {sql}"))
+        .map(|_| ())
+}
+
+fn query(
+    context: &mut ScenarioContext,
+    conn: &mut SqlSession,
+    sql: &str,
+    action: &str,
+) -> Result<StatementResult> {
+    context.remaining(action)?;
+    context.action(action);
+    conn.execute(sql)
         .with_context(|| format!("{action}: {sql}"))
 }
 
-fn query<T: FromRow>(
-    context: &mut ScenarioContext,
-    conn: &mut Conn,
-    sql: &str,
-    action: &str,
-) -> Result<Vec<T>> {
-    context.remaining(action)?;
-    context.action(action);
-    conn.query(sql).with_context(|| format!("{action}: {sql}"))
-}
-
-fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<()> {
+fn refresh(context: &mut ScenarioContext, conn: &mut SqlSession, mv: &str) -> Result<()> {
     execute(
         context,
         conn,
@@ -2986,20 +3065,16 @@ fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<(
 
 fn assert_mv_quarantined_after_base_replacement(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
     context.remaining("verify MV is quarantined after same-name base replacement")?;
     context.action("verify MV is quarantined after same-name base replacement");
-    let views: Vec<Row> = conn
-        .query("SHOW MATERIALIZED VIEWS FROM ns")
+    let views = conn
+        .execute("SHOW MATERIALIZED VIEWS FROM ns")
         .context("list MVs after same-name base replacement")?;
-    let manageability = views
-        .iter()
-        .find(|row| row.get::<String, _>("Name").as_deref() == Some(mv))
-        .and_then(|row| row.get::<String, _>("Manageability"))
-        .context("quarantined MV is missing from SHOW MATERIALIZED VIEWS")?;
+    let manageability = mv_show_field(&views, mv, "Manageability")?;
     if !manageability.starts_with("UNAVAILABLE:")
         || !manageability
             .contains("published MV base occurrence 0 no longer resolves to its frozen object")
@@ -3014,30 +3089,31 @@ fn assert_mv_quarantined_after_base_replacement(
     let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
     context.remaining("reject readmission onto a same-name replacement base")?;
     context.action("reject readmission onto a same-name replacement base");
-    let readmission_error = match conn.query_drop(format!(
+    let readmission_error = match conn.execute(format!(
         "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
          '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
          'the system scenario replaced the declared frontend process before this statement')"
     )) {
         Err(error) => error,
-        Ok(()) => bail!("a replacement base readmitted the old MV unexpectedly"),
+        Ok(_) => bail!("a replacement base readmitted the old MV unexpectedly"),
     };
-    if !readmission_error
-        .to_string()
+    let public = mv_public_error(&readmission_error)?;
+    if !public
+        .message
         .contains("same-name relation was rebuilt with a different object identity")
     {
         bail!("replacement-base readmission failed for another reason: {readmission_error}");
     }
-    let error = match conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}")) {
+    let error = match conn.execute(format!("REFRESH MATERIALIZED VIEW {mv}")) {
         Err(error) => error,
-        Ok(()) => {
+        Ok(_) => {
             bail!(
                 "a quarantined MV accepted refresh unexpectedly; {}",
                 context.diagnostics()
             )
         }
     };
-    let message = error.to_string();
+    let message = mv_public_error(&error)?.message.clone();
     if !message.contains("MV target requires a successful fresh Current observation") {
         bail!(
             "refresh after same-name base replacement returned unexpected error {message:?}; {}",
@@ -3049,12 +3125,12 @@ fn assert_mv_quarantined_after_base_replacement(
 
 fn assert_rows(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     sql: &str,
     expected: &[(i32, i64)],
     action: &str,
 ) -> Result<()> {
-    let actual: Vec<(i32, i64)> = query(context, conn, sql, action)?;
+    let actual: Vec<(i32, i64)> = mv_rows(&query(context, conn, sql, action)?)?;
     if actual != expected {
         bail!(
             "{action} returned {actual:?}, expected {expected:?}; {}",
@@ -3269,7 +3345,7 @@ struct SchedulerOutcomeTarget {
 
 fn wait_for_rows(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     sql: &str,
     expected: &[(i32, i64)],
     action: &str,
@@ -3285,14 +3361,20 @@ fn wait_for_rows(
             &outcome.directory,
         )?;
         check_scheduler_outcome(&outcome.directory, outcome.grant_id, outcome.mv, &scope)?;
-        let actual = conn.query::<(i32, i64), _>(sql);
+        let actual = conn
+            .execute(sql)
+            .map_err(anyhow::Error::from)
+            .and_then(|result| mv_rows(&result));
         if let Ok(rows) = actual
             && rows == expected
         {
             return Ok(());
         }
         if context.remaining(action).is_err() {
-            let observed = conn.query::<(i32, i64), _>(sql).ok();
+            let observed = conn
+                .execute(sql)
+                .map_err(anyhow::Error::from)
+                .and_then(|result| mv_rows(&result));
             // Keep the controlled fixture result in the structured evidence so
             // an asynchronous refresh timeout remains diagnosable after the
             // harness redacts its full process-log diagnostic.
@@ -3417,6 +3499,7 @@ fn wait_for_fe_marker(
 struct JoinedSqlResult {
     result: Receiver<Result<()>>,
     actor: Mutex<Option<thread::JoinHandle<Result<()>>>>,
+    cancellation: Arc<Mutex<MvActorCancellation>>,
 }
 impl JoinedSqlResult {
     // Every caller holds an explicit refresh trigger until this marker. A
@@ -3469,20 +3552,64 @@ impl JoinedSqlResult {
         }
     }
     fn recv_timeout(&self, timeout: Duration) -> Result<Result<()>> {
+        self.recv_timeout_inner(timeout, false)
+    }
+    // Only the two crash scenarios call this after kill_fe has actually waited
+    // for this original FE and its role session to exit, before any restart.
+    fn recv_timeout_after_original_frontend_exit(&self, timeout: Duration) -> Result<Result<()>> {
+        self.recv_timeout_inner(timeout, true)
+    }
+    fn recv_timeout_inner(&self, timeout: Duration, frontend_exited: bool) -> Result<Result<()>> {
         let result = self
             .result
             .recv_timeout(timeout)
             .context("receive original MV SQL result");
-        let cleanup = self.join();
+        let cleanup = if frontend_exited {
+            let joined = self.join_reader();
+            let retired = self
+                .cancellation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original MV cancellation owner poisoned"))
+                .map(|mut state| {
+                    state.active.take();
+                });
+            control_plan::with_cleanup(joined, retired)
+        } else {
+            let cancelled = if result.is_err() {
+                self.cancel_original()
+            } else {
+                Ok(())
+            };
+            control_plan::with_cleanup(cancelled, self.join())
+        };
         match (result, cleanup) {
             (Ok(result), Ok(())) => Ok(result),
             (Err(primary), Err(cleanup)) | (Ok(Err(primary)), Err(cleanup)) => {
-                Err(primary.context(format!("original MV actor cleanup: {cleanup:#}")))
+                control_plan::with_cleanup(Err(primary), Err(cleanup))
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
         }
     }
-    fn join(&self) -> Result<()> {
+    fn cancel_original(&self) -> Result<()> {
+        let active = {
+            let mut state = self
+                .cancellation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original MV cancellation owner poisoned"))?;
+            state.requested = true;
+            state.active.clone()
+        };
+        if let Some((cancel, deadline)) = active {
+            cancel.delete(deadline)?;
+            self.cancellation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original MV cancellation owner poisoned"))?
+                .active
+                .take();
+        }
+        Ok(())
+    }
+    fn join_reader(&self) -> Result<()> {
         if let Some(actor) = self
             .actor
             .lock()
@@ -3491,14 +3618,24 @@ impl JoinedSqlResult {
         {
             actor
                 .join()
-                .map_err(|_| anyhow::anyhow!("original MV SQL actor panicked"))??;
+                .map_err(|_| anyhow::anyhow!("original MV SQL actor panicked"))
+                .and_then(|result| result)
+        } else {
+            Ok(())
         }
-        Ok(())
+    }
+    fn join(&self) -> Result<()> {
+        let joined = self.join_reader();
+        // The original Join owner retains nonterminal cleanup until exact
+        // DELETE or confirmed exit of the same original FE, never reader EOF.
+        let cancelled = self.cancel_original();
+        control_plan::with_cleanup(joined, cancelled)
     }
 }
 impl Drop for JoinedSqlResult {
     fn drop(&mut self) {
-        if let Err(error) = self.join() {
+        let cancelled = self.cancel_original();
+        if let Err(error) = control_plan::with_cleanup(cancelled, self.join()) {
             eprintln!("Original MV SQL actor cleanup failed: {error:#}");
         }
     }
@@ -3513,53 +3650,119 @@ fn spawn_refresh(
 ) -> JoinedSqlResult {
     let catalog = catalog.to_string();
     let mv = mv.to_string();
-    spawn_sql_actor(move || {
-        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
-            conn.query_drop(format!("SET CATALOG {catalog}"))?;
-            conn.query_drop("USE ns")?;
-            conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}"))?;
-            Ok(())
-        })
+    spawn_cancellable_sql_actor(move |cancellation| {
+        let mut conn = SqlSession::new(&user, port, deadline)?;
+
+        conn.execute(format!("SET CATALOG {catalog}"))?;
+        conn.execute("USE ns")?;
+        run_original_mv_statement(
+            &mut conn,
+            &format!("REFRESH MATERIALIZED VIEW {mv}"),
+            deadline,
+            &cancellation,
+        )?;
+        Ok(())
     })
 }
 
+#[derive(Default)]
+struct MvActorCancellation {
+    requested: bool,
+    active: Option<(novarocks_test_trino_client::CancelHandle, Instant)>,
+}
+fn run_original_mv_statement(
+    session: &mut SqlSession,
+    sql: &str,
+    deadline: Instant,
+    cancellation: &Arc<Mutex<MvActorCancellation>>,
+) -> Result<()> {
+    let pending = session.submit(sql)?;
+    let cancel = pending.cancel_handle();
+    let requested = {
+        let mut state = cancellation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original MV cancellation owner poisoned"))?;
+        ensure!(
+            state.active.is_none(),
+            "one actual target per original MV SQL actor"
+        );
+        state.active = Some((cancel.clone(), deadline));
+        state.requested
+    };
+    // External cleanup before POST publication still addresses this SAME query
+    // before its first GET; it never cancels a previous completed statement.
+    if requested {
+        cancel.delete(deadline)?;
+    }
+    let outcome = session.run_pending(pending);
+    if !mv_response_needs_cancel(&outcome) {
+        cancellation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original MV cancellation owner poisoned"))?
+            .active
+            .take();
+    }
+    // Return the actual reader error with its original capability still held.
+    // The existing JoinedSqlResult owns the later physical cleanup decision.
+    outcome.map(|_| ()).map_err(Into::into)
+}
+#[cfg(test)]
 fn spawn_sql_actor(operation: impl FnOnce() -> Result<()> + Send + 'static) -> JoinedSqlResult {
+    spawn_cancellable_sql_actor(move |_| operation())
+}
+fn spawn_cancellable_sql_actor(
+    operation: impl FnOnce(Arc<Mutex<MvActorCancellation>>) -> Result<()> + Send + 'static,
+) -> JoinedSqlResult {
     let (sender, receiver) = mpsc::sync_channel(1);
+    let cancellation = Arc::new(Mutex::new(MvActorCancellation::default()));
+    let original = cancellation.clone();
     let actor = thread::spawn(move || -> Result<()> {
-        match sender.send(operation()) {
+        match sender.send(operation(original)) {
             Ok(()) => Ok(()),
             Err(mpsc::SendError(Err(primary))) => {
                 Err(primary.context("MV SQL result owner closed before delivery"))
             }
-            Err(mpsc::SendError(Ok(()))) => {
-                bail!("MV SQL result owner closed before delivery")
-            }
+            Err(mpsc::SendError(Ok(()))) => bail!("MV SQL result owner closed before delivery"),
         }
     });
     JoinedSqlResult {
         result: receiver,
         actor: Mutex::new(Some(actor)),
+        cancellation,
     }
 }
 
-fn expect_refresh_failure(
+fn expect_refresh_failure_after_fe_exit(
     context: &mut ScenarioContext,
     receiver: JoinedSqlResult,
     action: &str,
 ) -> Result<()> {
     context.action(action);
     let timeout = context.remaining(action)?;
-    match receiver.recv_timeout(timeout) {
-        Ok(Err(error)) if !error.to_string().is_empty() => Ok(()),
-        Ok(Err(_)) => bail!("{action} returned an empty error"),
-        Ok(Ok(())) => bail!("{action} unexpectedly succeeded"),
-        Err(error) => bail!("{action} did not finish before deadline: {error}"),
+    let original = receiver
+        .recv_timeout_after_original_frontend_exit(timeout)
+        .with_context(|| format!("receive and join original MV refresh after FE exit: {action}"))?;
+    match original {
+        Err(error)
+            if error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<StatementFailure>(),
+                    Some(StatementFailure::Transport(_))
+                )
+            }) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.context(format!(
+            "{action} did not retain its original transport failure"
+        ))),
+        Ok(()) => bail!("{action} unexpectedly succeeded"),
     }
 }
 
 fn resume_and_refresh_after_fe_restart(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
@@ -3569,7 +3772,7 @@ fn resume_and_refresh_after_fe_restart(
 
 fn resume_management_after_fe_restart(
     context: &mut ScenarioContext,
-    conn: &mut Conn,
+    conn: &mut SqlSession,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
@@ -3584,13 +3787,15 @@ fn resume_management_after_fe_restart(
     let challenge = property(&closed, "Challenge")?;
     let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
     context.action("declare the crashed FE isolated and resume exact MV management");
-    let resumed: Vec<(String, Option<String>)> = conn
-        .query(format!(
-            "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
+    let resumed: Vec<(String, Option<String>)> = mv_properties(
+        &conn
+            .execute(format!(
+                "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
              '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
              'the system scenario replaced the declared frontend process before this statement')"
-        ))
-        .context("resume managed MV after frontend replacement")?;
+            ))
+            .context("resume managed MV after frontend replacement")?,
+    )?;
     if property(&resumed, "SettledEffects")? != "1" {
         bail!("frontend replacement did not settle the old FE effect");
     }
@@ -4001,21 +4206,18 @@ mod refresh_marker_tests {
     use super::*;
 
     fn query_failure() -> anyhow::Error {
-        anyhow::Error::from(::mysql::Error::MySqlError(::mysql::MySqlError {
-            code: 1146,
-            state: "42S02".into(),
-            message: "original refresh SQL failed".into(),
-        }))
-        .context("execute original refresh")
+        let error = serde_json::from_value::<novarocks_test_trino_client::TrinoError>(serde_json::json!({
+            "errorCode":46,"errorName":"TABLE_NOT_FOUND","errorType":"USER_ERROR","message":"original refresh SQL failed"
+        })).unwrap();
+        anyhow::Error::from(StatementFailure::Trino(error)).context("execute original refresh")
     }
-
-    fn assert_original_mysql_error(error: &anyhow::Error) {
-        let Some(::mysql::Error::MySqlError(actual)) = error.downcast_ref::<::mysql::Error>()
-        else {
-            panic!("original typed MySQL error missing: {error:#}");
+    fn assert_original_sql_error(error: &anyhow::Error) {
+        let Some(StatementFailure::Trino(actual)) = error.downcast_ref::<StatementFailure>() else {
+            panic!("original typed SQL error missing: {error:#}");
         };
-        assert_eq!(actual.code, 1146);
-        assert_eq!(actual.state, "42S02");
+        assert_eq!(actual.error_code, 46);
+        assert_eq!(actual.error_name, "TABLE_NOT_FOUND");
+        assert_eq!(actual.error_type, "USER_ERROR");
         assert_eq!(actual.message, "original refresh SQL failed");
     }
 
@@ -4024,7 +4226,7 @@ mod refresh_marker_tests {
         let outcome =
             source_hold_outcomes(Some(Err(query_failure())), Ok(()), Ok(()), Ok(()), Ok(()))
                 .unwrap();
-        assert_original_mysql_error(&outcome.unwrap_err());
+        assert_original_sql_error(&outcome.unwrap_err());
     }
 
     #[test]
@@ -4037,7 +4239,7 @@ mod refresh_marker_tests {
             Err(anyhow::anyhow!("original trigger release failed")),
         )
         .unwrap_err();
-        assert_original_mysql_error(&error);
+        assert_original_sql_error(&error);
         assert!(format!("{error:#}").contains("original trigger release failed"));
     }
 
@@ -4051,7 +4253,7 @@ mod refresh_marker_tests {
             Ok(()),
         )
         .unwrap_err();
-        assert_original_mysql_error(&error);
+        assert_original_sql_error(&error);
         let detail = format!("{error:#}");
         assert!(detail.contains("original remaining deadline expired"));
         assert!(detail.contains("original actor join failed"));
@@ -4069,11 +4271,11 @@ mod refresh_marker_tests {
         );
     }
     #[test]
-    fn pre_marker_failure_preserves_original_mysql_code_and_state() {
+    fn pre_marker_failure_preserves_original_sql_code_name_and_type() {
         let producer = spawn_sql_actor(|| Err(query_failure()));
         producer.join().unwrap();
         let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
-        assert_original_mysql_error(&error);
+        assert_original_sql_error(&error);
     }
 
     #[test]
@@ -4114,7 +4316,7 @@ mod refresh_marker_tests {
         producer.join().unwrap();
         assert!(producer.observe_required_marker(|| Ok(true)).unwrap());
         let error = producer.recv_timeout(Duration::ZERO).unwrap().unwrap_err();
-        assert_original_mysql_error(&error);
+        assert_original_sql_error(&error);
     }
 
     #[test]
@@ -4149,7 +4351,7 @@ mod refresh_marker_tests {
     }
 
     #[test]
-    fn closed_receiver_keeps_original_mysql_error_in_producer_join() {
+    fn closed_receiver_keeps_original_sql_error_in_producer_join() {
         let (release, held) = mpsc::sync_channel(1);
         let mut producer = spawn_sql_actor(move || {
             held.recv().context("release original producer")?;
@@ -4163,7 +4365,7 @@ mod refresh_marker_tests {
         ));
         release.send(()).unwrap();
         let error = producer.join().unwrap_err();
-        assert_original_mysql_error(&error);
+        assert_original_sql_error(&error);
     }
 
     #[test]
@@ -4178,6 +4380,7 @@ mod refresh_marker_tests {
         let producer = JoinedSqlResult {
             result: receiver,
             actor: Mutex::new(Some(actor)),
+            cancellation: Arc::new(Mutex::new(MvActorCancellation::default())),
         };
         let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
         assert!(format!("{error:#}").contains("exited without publishing its result"));
@@ -4192,6 +4395,7 @@ mod refresh_marker_tests {
         let producer = JoinedSqlResult {
             result: receiver,
             actor: Mutex::new(None),
+            cancellation: Arc::new(Mutex::new(MvActorCancellation::default())),
         };
         assert!(producer.observe_required_marker(|| Ok(false)).is_err());
     }
@@ -4212,5 +4416,159 @@ mod refresh_marker_tests {
         }
         let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
         assert!(format!("{error:#}").contains("original MV SQL actor panicked"));
+    }
+}
+
+#[cfg(test)]
+mod original_refresh_cancellation_owner_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct OriginalHttpPeer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        deletes: Arc<AtomicUsize>,
+        worker: Option<thread::JoinHandle<Result<()>>>,
+    }
+    impl OriginalHttpPeer {
+        fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let deletes = Arc::new(AtomicUsize::new(0));
+            let stopped = stop.clone();
+            let observed = deletes.clone();
+            let worker = thread::spawn(move || -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !stopped.load(Ordering::SeqCst) {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "original HTTP peer deadline expired"
+                    );
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                    let method = read_original_request(&mut stream)?;
+                    match method.as_str() {
+                        "POST" => {
+                            let body = serde_json::to_vec(&serde_json::json!({
+                                "id":"original-refresh-owner",
+                                "nextUri":format!("http://127.0.0.1:{port}/v1/statement/original-refresh-owner/0")
+                            }))?;
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )?;
+                            stream.write_all(&body)?;
+                        }
+                        // The original GET really loses its connection. The
+                        // same peer remains available for its owner's DELETE.
+                        "GET" => {}
+                        "DELETE" => {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+                        }
+                        other => bail!("unexpected original HTTP request method {other}"),
+                    }
+                }
+                Ok(())
+            });
+            Self {
+                port,
+                stop,
+                deletes,
+                worker: Some(worker),
+            }
+        }
+        fn finish(mut self) -> usize {
+            self.stop.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap().unwrap();
+            self.deletes.load(Ordering::SeqCst)
+        }
+    }
+    impl Drop for OriginalHttpPeer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap().unwrap();
+            }
+        }
+    }
+    fn read_original_request(stream: &mut TcpStream) -> Result<String> {
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            ensure!(
+                bytes.len() < 4096,
+                "original HTTP request headers exceed fixture cap"
+            );
+            stream.read_exact(&mut byte)?;
+            bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(bytes)?;
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        ensure!(
+            length <= 4096,
+            "original HTTP request body exceeds fixture cap"
+        );
+        stream.read_exact(&mut vec![0; length])?;
+        Ok(headers
+            .split_whitespace()
+            .next()
+            .context("original HTTP method missing")?
+            .to_owned())
+    }
+    #[test]
+    fn interrupted_refresh_leaves_cancellation_with_its_original_join_owner() {
+        let peer = OriginalHttpPeer::start();
+        let port = peer.port;
+        let producer = spawn_cancellable_sql_actor(move |cancellation| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut session = SqlSession::new("root", port, deadline)?;
+            run_original_mv_statement(&mut session, "SELECT 1", deadline, &cancellation)
+        });
+        let original = producer
+            .result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let before_join = peer.deletes.load(Ordering::SeqCst);
+        let joined = producer.join();
+        drop(producer);
+        let after_join = peer.finish();
+        eprintln!(
+            "original MV SQL actor, HTTP GET/DELETE peer and cancellation owner actually exited before custody assertions"
+        );
+        assert!(joined.is_ok(), "original Join cleanup failed: {joined:?}");
+        let error = original.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<StatementFailure>(),
+            Some(StatementFailure::Transport(_))
+        )));
+        assert_eq!(
+            before_join, 0,
+            "the reader must return its original error before its Join owner chooses cleanup"
+        );
+        assert_eq!(
+            after_join, 1,
+            "a live original FE still requires its exact DELETE at Join"
+        );
     }
 }

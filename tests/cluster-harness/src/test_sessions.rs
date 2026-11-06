@@ -1957,10 +1957,7 @@ mod tests {
             validate_binary_info(
                 &info("test-controls", vec!["test-controls"]),
                 true,
-                &[(
-                    "novarocks-mysql-adapter".into(),
-                    "mem-1-m07-exact-mysql-write".into()
-                )]
+                &[("unavailable-owner".into(), "unavailable-capability".into())]
             )
             .is_err()
         );

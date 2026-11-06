@@ -489,7 +489,7 @@ mod tests {
             bytes[4..36].copy_from_slice(recipe.value.digest());
             let result = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref());
             if active {
-                let error = result.err().expect("active required NULL is refused");
+                let error = result.expect_err("active required NULL is refused");
                 let expected = ValueError::Invariant(ValueViolation::RequiredNull);
                 assert_eq!(error.failure_fact(), expected.failure_fact());
                 let mut source: &dyn std::error::Error = &error;

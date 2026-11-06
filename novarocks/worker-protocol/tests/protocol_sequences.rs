@@ -1119,6 +1119,51 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         resumed.requests[0].result,
         RequestResult::Outcome(OperationOutcome::Idempotent)
     );
+    let cancel_token = InputId::new(9_000_012).unwrap();
+    let cancel_request = RequestReplyTag {
+        author: model_request_author(cancel_token),
+        token: cancel_token,
+        operation: operation(196),
+        deadline: at(3),
+    };
+    let admissions = port.calls.len();
+    let waiting = core
+        .handle_request(
+            at(1),
+            cancel_request,
+            ParticipationCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command: novarocks_worker_protocol::participation::TaskReadCommand::Cancel {
+                    reason: CancelReason::UpstreamNoLongerNeeded,
+                },
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
+    let resumed = core
+        .handle(
+            at(1),
+            ParticipationInput::ResumeTaskRead {
+                request: cancel_token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(resumed.requests.len(), 1);
+    assert_eq!(resumed.requests[0].request, cancel_request);
+    assert!(matches!(
+        resumed.requests[0].body.as_ref(),
+        ParticipationReplyBody::Task { outcome: OperationOutcome::Accepted, status }
+            if status.as_ref() == &original_status
+    ));
+    assert!(resumed.effects.is_empty());
+    assert_eq!(port.calls.len(), admissions);
+    assert_eq!(
+        core.decided_task(task(1)).unwrap().status(),
+        &original_status
+    );
     assert_eq!(
         core.next_deadline(),
         Some(at(2)),
@@ -2393,6 +2438,7 @@ fn control_with_pending_limit(
 ) -> novarocks_worker_protocol::control::ControlCore {
     use novarocks_worker_protocol::control::{ControlConfig, ControlCore};
     ControlCore::new(
+        participation().backend_process_id(),
         ControlConfig {
             max_pending_requests,
             step_budget: ControlCore::MAX_STEP_WORK,
@@ -5358,6 +5404,7 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         },
     ] {
         let mut control = ControlCore::new(
+            participation().backend_process_id(),
             ControlConfig {
                 max_pending_requests: 16,
                 step_budget: ControlCore::MAX_STEP_WORK,
@@ -6021,6 +6068,150 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
     assert_eq!(record.state, TaskState::Canceled);
     assert!(!record.output.responsibility_complete());
     assert!(!record.completion_success_pending);
+}
+
+#[test]
+fn a_cancel_seal_wait_replays_only_after_resume_and_keeps_the_original_terminal_status() {
+    use novarocks_worker_protocol::participation::TaskReadCommand;
+    let (mut core, mut port) = completion_fixture();
+    let command = TaskReadCommand::Cancel {
+        reason: CancelReason::UpstreamNoLongerNeeded,
+    };
+    assert!(matches!(
+        command.into_command(task(1)),
+        ParticipationCommand::Cancel { task: identity, reason: CancelReason::UpstreamNoLongerNeeded }
+            if identity == task(1)
+    ));
+    let token = InputId::new(9_000_020).unwrap();
+    let original = RequestReplyTag {
+        author: model_request_author(token),
+        token,
+        operation: operation(197),
+        deadline: at(2),
+    };
+    let admissions = port.calls.len();
+    let running = core.status(task(1)).unwrap().clone();
+    let waiting = core
+        .handle_request(
+            at(0),
+            original,
+            ParticipationCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
+    assert_eq!(core.status(task(1)).unwrap(), &running);
+    assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
+    assert_eq!(port.calls.len(), admissions);
+    let wrong = core
+        .handle(
+            at(0),
+            ParticipationInput::ResumeTaskRead {
+                request: token,
+                task: task(2),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(wrong.requests.is_empty() && wrong.effects.is_empty());
+    assert_eq!(core.status(task(1)).unwrap(), &running);
+
+    // Independent original completion wins while Cancel still awaits its seal.
+    completion_step(
+        &mut core,
+        &mut port,
+        ParticipationInput::CompletionIntent {
+            task: task(1),
+            completed_output: Some(TaskOutputFacts::new(true)),
+        },
+    );
+    completion_step(
+        &mut core,
+        &mut port,
+        ParticipationInput::CompletionExited { task: task(1) },
+    );
+    let terminal = core.status(task(1)).unwrap().clone();
+    assert_eq!(terminal.state(), TaskState::Finished);
+    let resumed = core
+        .handle(
+            at(1),
+            ParticipationInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(resumed.requests.len(), 1);
+    assert_eq!(resumed.requests[0].request, original);
+    assert!(matches!(
+        resumed.requests[0].body.as_ref(),
+        ParticipationReplyBody::Task { outcome: OperationOutcome::Accepted, status }
+            if status.as_ref() == &terminal
+    ));
+    assert!(resumed.effects.is_empty());
+    assert_eq!(core.status(task(1)).unwrap(), &terminal);
+    assert_eq!(
+        core.task(task(1)).unwrap().conclusion.accepted,
+        Some(TaskConclusion::Succeeded)
+    );
+    assert_eq!(port.calls.len(), admissions);
+    let repeated = core
+        .handle(
+            at(1),
+            ParticipationInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(repeated.requests.is_empty() && repeated.effects.is_empty());
+
+    let expiring_token = InputId::new(9_000_021).unwrap();
+    let expiring = RequestReplyTag {
+        author: model_request_author(expiring_token),
+        token: expiring_token,
+        operation: operation(198),
+        deadline: at(2),
+    };
+    let waiting = core
+        .handle_request(
+            at(1),
+            expiring,
+            ParticipationCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
+    let expired = core
+        .handle(at(2), ParticipationInput::Tick, &mut port)
+        .unwrap();
+    assert_eq!(expired.requests.len(), 1);
+    assert_eq!(expired.requests[0].request, expiring);
+    assert_eq!(
+        expired.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    let late = core
+        .handle(
+            at(3),
+            ParticipationInput::ResumeTaskRead {
+                request: expiring_token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(late.requests.is_empty() && late.effects.is_empty());
+    assert_eq!(core.status(task(1)).unwrap(), &terminal);
+    assert_eq!(port.calls.len(), admissions);
 }
 
 #[test]
@@ -7362,6 +7553,7 @@ fn next_internal_empty_frontend_fences_each_take_one_step_without_a_global_fence
         ControlConfig, ControlCore, ControlEffect, ControlInput,
     };
     let mut control = ControlCore::new(
+        participation().backend_process_id(),
         ControlConfig {
             max_pending_requests: 2,
             step_budget: ControlCore::MAX_STEP_WORK,

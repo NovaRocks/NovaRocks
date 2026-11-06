@@ -25,7 +25,12 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
-use novarocks_query_application::engine_error::EngineError;
+use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCause};
+use novarocks_query_application::{
+    api::{CommandError, StatementExternalEffectDisposition},
+    engine_error::EngineError,
+};
+use std::fmt;
 
 #[derive(Clone, Debug)]
 pub struct CompletedCatalogMutation {
@@ -94,6 +99,112 @@ pub fn execute_catalog_mutation(
         operation,
         context,
     ))
+}
+
+/// CREATE's command boundary retains the original Provider fact and the
+/// independent publication verdict. Legacy String callers keep their existing
+/// presentation entry below; they cannot recover a typed fact from that text.
+pub(crate) fn execute_catalog_mutation_for_command(
+    resolver: &dyn ConnectorCatalogMutationResolver,
+    instance_id: &ConnectorInstanceId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+) -> Result<CompletedCatalogMutation, CommandError> {
+    present_catalog_mutation_command_result(resolve_catalog_mutation(
+        resolver,
+        instance_id,
+        operation,
+        context,
+    ))
+}
+
+#[derive(Debug)]
+enum CatalogMutationCommandFailure {
+    KnownUncommitted {
+        failure: ConnectorMutationFailure,
+        cleanup: ExternalMutationFinalization,
+    },
+    CommitUnknown(ConnectorMutationFailure),
+    CommittedFinalization(ConnectorMutationFailure),
+    Contract(ConnectorError),
+}
+impl FailureProjection for CatalogMutationCommandFailure {
+    fn failure_fact(&self) -> FailureFact {
+        match self {
+            Self::KnownUncommitted { failure, .. }
+            | Self::CommitUnknown(failure)
+            | Self::CommittedFinalization(failure) => failure.failure_fact(),
+            Self::Contract(error) => error.failure_fact(),
+        }
+    }
+}
+impl fmt::Display for CatalogMutationCommandFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KnownUncommitted { failure, cleanup } => write!(
+                formatter,
+                "{}",
+                EngineError::commit_known_uncommitted(known_uncommitted_message(failure, cleanup))
+            ),
+            Self::CommitUnknown(failure) => formatter.write_str(
+                &EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message(),
+            ),
+            Self::CommittedFinalization(failure) => write!(
+                formatter,
+                "{}",
+                EngineError::commit_known_committed_finalize_failed(failure.to_string())
+            ),
+            Self::Contract(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+impl std::error::Error for CatalogMutationCommandFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::KnownUncommitted { failure, .. }
+            | Self::CommitUnknown(failure)
+            | Self::CommittedFinalization(failure) => Some(failure),
+            Self::Contract(error) => Some(error),
+        }
+    }
+}
+fn present_catalog_mutation_command_result(
+    result: ResolvedCatalogMutation,
+) -> Result<CompletedCatalogMutation, CommandError> {
+    use StatementExternalEffectDisposition::{CommitUnknown, KnownCommitted, KnownUncommitted};
+    let (cause, disposition) = match result {
+        ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(error) = &completed.cleanup {
+                tracing::warn!(%error, "committed catalog mutation retains incomplete cleanup");
+            }
+            match completed.finalization {
+                ExternalMutationFinalization::Complete => return Ok(completed),
+                ExternalMutationFinalization::Failed(failure) => (
+                    CatalogMutationCommandFailure::CommittedFinalization(failure),
+                    KnownCommitted,
+                ),
+            }
+        }
+        ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => (
+            CatalogMutationCommandFailure::KnownUncommitted { failure, cleanup },
+            KnownUncommitted,
+        ),
+        ResolvedCatalogMutation::CommitUnknown { failure, .. } => (
+            CatalogMutationCommandFailure::CommitUnknown(failure),
+            CommitUnknown,
+        ),
+        ResolvedCatalogMutation::ContractFailure { error, dispatch } => (
+            CatalogMutationCommandFailure::Contract(error),
+            match dispatch {
+                MutationDispatchState::ConfirmedNotDispatched => KnownUncommitted,
+                MutationDispatchState::PossiblyDispatched => CommitUnknown,
+            },
+        ),
+    };
+    Err(
+        CommandError::from_failure_cause(SharedFailureCause::new(cause))
+            .with_external_effect_disposition(Some(disposition)),
+    )
 }
 
 /// Executes and presents a mutation through the exact lease retained during
@@ -556,6 +667,163 @@ mod tests {
                 .unwrap_err(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn command_presentation_retains_original_already_exists_and_cleanup_without_parsing() {
+        let original = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::AlreadyExists,
+            "opaque provider detail",
+        );
+        let cleanup = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            "original cleanup failure",
+        ));
+        let command =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure: original.clone(),
+                cleanup: cleanup.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            command.execution_failure().unwrap().fact(),
+            original.failure_fact()
+        );
+        assert_eq!(
+            command.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
+        let cause = command.failure_cause().unwrap().clone();
+        let CatalogMutationCommandFailure::KnownUncommitted {
+            failure,
+            cleanup: retained,
+        } = cause
+            .downcast_ref::<CatalogMutationCommandFailure>()
+            .unwrap()
+        else {
+            panic!("original noncommit source and cleanup must remain together");
+        };
+        assert_eq!(failure, &original);
+        assert_eq!(retained, &cleanup);
+        assert!(
+            command
+                .to_string()
+                .contains("artifact cleanup failed: Internal: original cleanup failure")
+        );
+        let service = crate::query::product_command_service_error(command);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            original.failure_fact()
+        );
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownUncommitted)
+        );
+        assert!(!service.message().contains("do_not_retry=true"));
+    }
+
+    #[test]
+    fn command_presentation_keeps_unknown_committed_and_dispatch_effects_independent() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("catalog").unwrap(),
+        };
+        let operation = create_namespace_operation(descriptor.instance_id.clone());
+        let evidence = ExternalMutationEvidence::try_new(
+            1,
+            descriptor,
+            ProviderBindingEpoch::from_bytes([1; 16]),
+            ConnectorMutationOperationId::new(),
+            operation.kind(),
+            Bytes::from_static(b"original evidence"),
+        )
+        .unwrap();
+        let original = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::AlreadyExists,
+            "opaque unknown source",
+        );
+        let unknown =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::CommitUnknown {
+                failure: original.clone(),
+                evidence,
+            })
+            .unwrap_err();
+        assert_eq!(
+            unknown.execution_failure().unwrap().fact(),
+            original.failure_fact()
+        );
+        assert_eq!(
+            unknown.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::CommitUnknown)
+        );
+        let service = crate::query::product_command_service_error(unknown);
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::CommitUnknown)
+        );
+        assert!(service.message().contains("[CommitUnknown]"));
+        assert!(
+            service
+                .message()
+                .contains("CommitUnknown do_not_retry=true")
+        );
+
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Internal,
+            "original finalize failure",
+        );
+        let committed = present_catalog_mutation_command_result(
+            ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+                cleanup: ExternalMutationFinalization::Complete,
+                finalization: ExternalMutationFinalization::Failed(failure.clone()),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            committed.execution_failure().unwrap().fact(),
+            failure.failure_fact()
+        );
+        assert_eq!(
+            committed.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        let service = crate::query::product_command_service_error(committed);
+        assert_eq!(
+            service.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        assert!(
+            service
+                .message()
+                .contains("KnownCommitted do_not_retry=true")
+        );
+        for (dispatch, expected) in [
+            (
+                MutationDispatchState::ConfirmedNotDispatched,
+                StatementExternalEffectDisposition::KnownUncommitted,
+            ),
+            (
+                MutationDispatchState::PossiblyDispatched,
+                StatementExternalEffectDisposition::CommitUnknown,
+            ),
+        ] {
+            let source = ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                "AlreadyExists: misleading text",
+            );
+            let command =
+                present_catalog_mutation_command_result(ResolvedCatalogMutation::ContractFailure {
+                    error: source.clone(),
+                    dispatch,
+                })
+                .unwrap_err();
+            assert_eq!(
+                command.execution_failure().unwrap().fact(),
+                source.failure_fact()
+            );
+            assert_eq!(command.external_effect_disposition(), Some(expected));
         }
     }
 

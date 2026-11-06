@@ -166,17 +166,13 @@ run_spark() {
 spark_sql() { run_spark spark-sql.sh "$1"; }
 spark_shell() { run_spark spark-shell.sh "$1"; }
 
-mysql_exec() {
-    local sql=$1
-    python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- "$mysql_bin" \
-        --protocol=TCP \
-        --host=127.0.0.1 \
-        --port="$NOVA_ENV_MYSQL_PORT" \
-        --user=root \
-        --batch \
-        --raw \
-        --skip-column-names \
-        --execute "$sql"
+trino_exec() {
+    local mode=$1 sql=$2 timeout query_bin
+    timeout=$(python3 "$fixture_dir/fixture_run.py" remaining --env-file "$publication/env.sh") || return $?
+    query_bin=$(python3 "$repo_root/tools/ci/cargo-artifacts.py" verify "$receipt" novarocks-trino-query) || return $?
+    python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- "$query_bin" \
+        --host 127.0.0.1 --port "$NOVA_ENV_TRINO_PORT" --user root \
+        --time-zone UTC --timeout-secs "$timeout" --mode "$mode" --sql "$sql"
 }
 
 cat > "$tmp_dir/spark-hadoop-defaults.conf" <<EOF
@@ -212,9 +208,6 @@ log "spark_created_uuid=$spark_uuid"
 log "spark_created_location=$spark_location"
 log "spark_created_v1_sha256=$spark_digest"
 
-mysql_bin=$(command -v mysql || true)
-[[ -n "$mysql_bin" ]] || fail "mysql client is required for NovaRocks protocol verification"
-
 log "phase=novarocks-start"
 cd "$repo_root"
 receipt="${NOVA_CI_ARTIFACT_RECEIPT:-$tmp_dir/artifacts.json}"
@@ -227,6 +220,7 @@ if [[ -z "${NOVA_CI_ARTIFACT_RECEIPT:-}" ]]; then
 fi
 NOVAROCKS_BIN="$(python3 "$repo_root/tools/ci/cargo-artifacts.py" verify "$receipt" novarocks)"
 export NOVAROCKS_BIN
+python3 "$repo_root/tools/ci/cargo-artifacts.py" verify "$receipt" novarocks-trino-query > "$tmp_dir/trino-query.path"
 printf '%s\n' "$receipt" > "$tmp_dir/artifact-receipt.path"
 cp "$receipt" "$tmp_dir/artifacts-used.json"
 python3 "$fixture_dir/fixture_run.py" command --env-file "$publication/env.sh" -- \
@@ -236,8 +230,10 @@ NO_PROXY=127.0.0.1,localhost python3 "$process_owner" run --kind server \
     "$NOVAROCKS_BIN" standalone --role all-in-one \
     --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" > "$server_log" 2>&1 &
 server_owner_pid=$!
+# A BE ready line does not prove that the FE HTTP listener is serving.
+fe_ready_marker="^NOVAROCKS_READY role=fe trino_port=${NOVA_ENV_TRINO_PORT} pid=[0-9]+$"
 for _ in $(seq 1 60); do
-    if grep -q '^NOVAROCKS_READY ' "$server_log"; then
+    if grep -Eq "$fe_ready_marker" "$server_log"; then
         break
     fi
     if ! kill -0 "$server_owner_pid" >/dev/null 2>&1; then
@@ -247,11 +243,11 @@ for _ in $(seq 1 60); do
     python3 "$fixture_dir/fixture_run.py" remaining --env-file "$publication/env.sh" >/dev/null
     sleep 1
 done
-grep -q '^NOVAROCKS_READY ' "$server_log" || fail "timed out waiting for NovaRocks readiness"
-grep '^NOVAROCKS_READY ' "$server_log" | tee -a "$artifact"
+grep -Eq "$fe_ready_marker" "$server_log" || fail "timed out waiting for NovaRocks readiness"
+grep -E "$fe_ready_marker" "$server_log" | tee -a "$artifact"
 
 log "phase=novarocks-load-spark-table"
-mysql_exec "CREATE EXTERNAL CATALOG $catalog PROPERTIES(\
+trino_exec no-rows "CREATE EXTERNAL CATALOG $catalog PROPERTIES(\
 \"type\"=\"iceberg\",\
 \"iceberg.catalog.type\"=\"hadoop\",\
 \"iceberg.catalog.warehouse\"=\"$warehouse\",\
@@ -270,18 +266,18 @@ mysql_exec "CREATE EXTERNAL CATALOG $catalog PROPERTIES(\
 # Iceberg's HadoopCatalog has no durable namespace object. NovaRocks uses its
 # own namespace marker for SQL admission, so install that marker before testing
 # table-protocol interoperability over Spark's already-created table.
-mysql_exec "CREATE DATABASE IF NOT EXISTS $catalog.$namespace;"
-spark_rows=$(mysql_exec "SELECT COUNT(*) FROM $catalog.$namespace.$spark_table;")
+trino_exec no-rows "CREATE DATABASE IF NOT EXISTS $catalog.$namespace;"
+spark_rows=$(trino_exec scalar-integer "SELECT COUNT(*) FROM $catalog.$namespace.$spark_table;")
 [[ "$spark_rows" == "0" ]] || fail "NovaRocks returned unexpected Spark table row count: $spark_rows"
-mysql_exec "CREATE TABLE IF NOT EXISTS $catalog.$namespace.$spark_table (id BIGINT, payload STRING);"
+trino_exec no-rows "CREATE TABLE IF NOT EXISTS $catalog.$namespace.$spark_table (id BIGINT, payload STRING);"
 
-if mysql_exec "CREATE TABLE $catalog.$namespace.$spark_table (id BIGINT, payload STRING);" \
-    >"$tmp_dir/novarocks-strict.out" 2>&1; then
+if trino_exec no-rows "CREATE TABLE $catalog.$namespace.$spark_table (id BIGINT, payload STRING);" \
+    >"$tmp_dir/novarocks-strict.out" 2>"$tmp_dir/novarocks-strict.error.json"; then
     fail "NovaRocks strict CREATE unexpectedly replaced the Spark table"
 fi
-grep -q 'AlreadyExists' "$tmp_dir/novarocks-strict.out" || {
-    cat "$tmp_dir/novarocks-strict.out" | tee -a "$artifact"
-    fail "NovaRocks strict CREATE did not return the typed AlreadyExists error"
+python3 "$script_dir/hadoop-catalog-trino-query.py" already-exists "$tmp_dir/novarocks-strict.error.json" || {
+    cat "$tmp_dir/novarocks-strict.error.json" | tee -a "$artifact"
+    fail "NovaRocks strict CREATE did not return typed ALREADY_EXISTS/12/USER_ERROR with joined cleanup"
 }
 
 spark_metadata_after_novarocks=$(mc_cat "$spark_v1_object")
@@ -293,7 +289,7 @@ log "novarocks_strict_outcome=AlreadyExists"
 log "novarocks_noop_outcome=success"
 
 log "phase=novarocks-create"
-mysql_exec "CREATE TABLE $catalog.$namespace.$novarocks_table (id BIGINT, payload STRING);"
+trino_exec no-rows "CREATE TABLE $catalog.$namespace.$novarocks_table (id BIGINT, payload STRING);"
 novarocks_metadata=$(mc_cat "$novarocks_v1_object")
 novarocks_uuid=$(printf '%s' "$novarocks_metadata" | metadata_field table-uuid)
 novarocks_location=$(printf '%s' "$novarocks_metadata" | metadata_field location)

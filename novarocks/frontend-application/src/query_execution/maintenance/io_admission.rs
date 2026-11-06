@@ -218,13 +218,14 @@ fn loan<T>(source: &Mutex<Option<T>>) -> Option<Loan<'_, T>> {
     })
 }
 fn error(error: &WorkError) -> ConnectorError {
-    ConnectorError::new(
+    ConnectorError::from_domain_static(
         match error {
             WorkError::Cancelled(_) => ConnectorErrorKind::Cancelled,
             WorkError::Capacity(_) => ConnectorErrorKind::ResourceExhausted,
             _ => ConnectorErrorKind::Internal,
         },
-        format!("original metadata I/O admission refused: {error:?}"),
+        error.clone(),
+        "original metadata I/O admission refused",
     )
 }
 fn busy() -> ConnectorError {

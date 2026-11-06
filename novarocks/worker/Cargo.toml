@@ -31,7 +31,6 @@ novarocks-types.workspace = true
 novarocks-type-contract.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-uuid = { workspace = true, features = ["v4"] }
 tracing.workspace = true
 
 [dev-dependencies]

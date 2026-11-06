@@ -107,8 +107,8 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
     )
 }
 
-pub fn observe_stream_logical_size_construction<'a, H>(
-    batch: &'a RecordBatch,
+pub fn observe_stream_logical_size_construction<H>(
+    batch: &RecordBatch,
     facts: &IpcStreamBatchFacts<'_>,
     creation: &mut ValueSchemaCreation<'_, H>,
     control: &dyn KernelEvaluationControl,

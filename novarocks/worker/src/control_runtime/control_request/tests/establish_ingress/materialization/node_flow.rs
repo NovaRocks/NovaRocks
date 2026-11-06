@@ -48,11 +48,16 @@ pub(super) type HeldTaskDelivery = (
 );
 use std::{mem::ManuallyDrop, num::NonZeroU64, sync::atomic::AtomicU64, time::Duration};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ScenarioClock(AtomicU64);
 impl Clock for ScenarioClock {
     fn now(&self) -> Tick {
         Tick(self.0.load(Ordering::SeqCst))
+    }
+}
+impl crate::WorkerMonotonicClock for ScenarioClock {
+    fn now(&self) -> MonotonicInstant {
+        MonotonicInstant::from_origin(Duration::from_nanos(Clock::now(self).0))
     }
 }
 #[derive(Default)]
@@ -97,7 +102,11 @@ impl ParticipationHostInstance for Instance {
     fn participation(&self) -> ParticipationRef {
         self.participation
     }
-    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        _control: &dyn crate::ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
         if request.participation() != self.participation {
             panic!("the real Node must transfer its original Participation source");
         }
@@ -138,6 +147,13 @@ pub(super) struct Scenario<T = ()> {
         Mutex<Option<(ParticipationRef, novarocks_execution_contract::TaskIdentity)>>,
 }
 impl<T: Send + 'static> Scenario<T> {
+    pub(super) fn task_control(&self, participation: ParticipationRef) -> crate::WorkerTaskControl {
+        crate::WorkerTaskControl::from_node(
+            self.node.clone(),
+            self.clock.clone(),
+            participation.backend_process_id(),
+        )
+    }
     fn fail<O: Send + 'static>(self, stage: &str, original: O) -> ! {
         let task = *self.diagnostic_task.lock().unwrap();
         if let Some((participation, task)) = task {

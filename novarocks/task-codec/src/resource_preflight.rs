@@ -1349,12 +1349,18 @@ mod root_preflight_tests {
                 field: RenderField {
                     nullable: true,
                     native_type: NativeRenderType::String,
-                    presentation: RenderPresentation::ScalarText,
+                    presentation: RenderPresentation::TrinoValue,
                 },
             })
             .collect();
         let schema = ClientRenderSchema::try_new(
-            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
             columns,
             RootProfileV1::MAX_COLUMNS,
         )

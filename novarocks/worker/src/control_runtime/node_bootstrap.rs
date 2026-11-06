@@ -421,6 +421,7 @@ impl OwnedNodeRuntime {
         };
         let now = MonotonicInstant::from_origin(Duration::from_nanos(state.config.clock.now().0));
         let core = match ControlCore::new(
+            state.config.backend,
             state.config.control,
             state.config.tickets,
             state.config.admission_epoch.issuer(),

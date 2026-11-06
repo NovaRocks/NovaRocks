@@ -26,7 +26,6 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
 use http::{Request, header};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_native_trust::NativeEndpointConnector;
 use novarocks_proto_models::novarocks as proto;
@@ -45,7 +44,7 @@ use std::{
 };
 
 use crate::{
-    actors::mysql as mysql_actor,
+    actors::sql,
     scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig},
 };
 use novarocks_cluster_harness::LaunchProfile;
@@ -929,8 +928,9 @@ impl Scenario for AsyncSchedulingPressure {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let (_connector, control_connector, authorization, backend, _) = probe(context)?;
         let before = total_shuffle_bytes(context)?;
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
+        let statement_deadline = context.deadline();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let mut workers = Vec::new();
@@ -940,12 +940,11 @@ impl Scenario for AsyncSchedulingPressure {
             let done_tx = done_tx.clone();
             workers.push(thread::spawn(move || {
                 let result = (|| -> Result<()> {
-                    let mut connection =
-                        mysql_actor::connect(&user, port, Duration::from_secs(60))?;
+                    let mut connection = sql::SqlSession::new(&user, port, statement_deadline)?;
                     started_tx
                         .send(())
                         .context("publish Exchange query start")?;
-                    connection.query_drop(
+                    connection.execute(
                         "SELECT sleep(2), COUNT(*) FROM (\
                            SELECT generate_series AS x FROM TABLE(generate_series(1, 100000)) \
                            UNION ALL \

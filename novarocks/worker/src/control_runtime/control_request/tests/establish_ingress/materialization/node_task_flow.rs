@@ -18,7 +18,9 @@
 //! One real compiled CountOnly Root Task on the same original Node lifecycle. The host
 //! replaces only codec/connector I/O; Execution owns its real kernel lifecycle.
 
+mod activation_contract;
 mod completion_contracts;
+mod late_update_contract;
 
 use super::node_flow::{
     HeldTaskDelivery, NodeClose, Scenario, operation_number, retain_failure,
@@ -497,6 +499,7 @@ impl ExchangeFrameTransmitter for Ports {
         _: novarocks_execution_contract::RuntimeEndpoint,
         _: Vec<novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         _: tokio_util::sync::CancellationToken,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
         _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         panic!("CountOnly Root fixture attempted demand registration")
@@ -598,7 +601,7 @@ impl std::fmt::Debug for Runnable {
 }
 // This gate holds a real physical callback/job. Releasing it supplies no exit
 // fact: the original body/child still has to return through its normal owner.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PreparationGate {
     entered: std::sync::atomic::AtomicBool,
     released: std::sync::atomic::AtomicBool,
@@ -639,6 +642,7 @@ struct BundleFixture {
     whole_refusals: AtomicUsize,
     transfers: AtomicUsize,
     second_take_refusals: AtomicUsize,
+    activation_window: Mutex<Option<Arc<activation_contract::InstalledBeforeBody>>>,
 }
 impl BundleFixture {
     fn new(stopped_before_host: bool) -> Self {
@@ -651,6 +655,7 @@ impl BundleFixture {
             whole_refusals: AtomicUsize::new(0),
             transfers: AtomicUsize::new(0),
             second_take_refusals: AtomicUsize::new(0),
+            activation_window: Mutex::new(None),
         }
     }
     fn inventory(
@@ -680,6 +685,10 @@ impl BundleFixture {
         );
         let identity = preparation.view().identity();
         let children = preparation.original_children_for_test().clone();
+        let activation_window = self.activation_window.lock().unwrap().clone();
+        if let Some(window) = activation_window {
+            window.arm(preparation);
+        }
         let (owner, cadence) = preparation.view().control();
         let owner = owner.expect("same original execution port");
         let waker = preparation.readiness_waker();
@@ -869,6 +878,12 @@ impl TaskExecutionHost for CompiledTaskHost {
             }
             None => preparation.take_capture().unwrap(),
         };
+        if let Some(bundle) = &self.bundle {
+            let activation_window = bundle.activation_window.lock().unwrap().clone();
+            if let Some(window) = activation_window {
+                window.after_original_roles();
+            }
+        }
         let (fragment, assignment) = input.into_parts();
         assert_eq!(fragment.bytes().as_ref(), b"root");
         assert!(assignment.into_stored().downcast::<Assignment>().is_ok());
@@ -925,7 +940,7 @@ impl TaskExecutionHost for CompiledTaskHost {
         root.bind_preparation_exit_waker(preparation.readiness_waker())
             .unwrap_or_else(|_| panic!("the original preparation wake binds this Root once"));
         let session = CountSession::open(root.clone(), health, self.observed.clone());
-        let context = LocalTaskPrepareContext::new(
+        let participation = LocalTaskPrepareContext::new(
             None,
             None,
             None,
@@ -939,7 +954,7 @@ impl TaskExecutionHost for CompiledTaskHost {
         .with_result_identity(descriptor.identity())
         .with_task_control(control)
         .with_completion_work(completion_work);
-        let dormant = prepare_compiled_task(submission, context).unwrap();
+        let dormant = prepare_compiled_task(submission, participation).unwrap();
         let runnable = Arc::new(Runnable {
             identity: descriptor.identity(),
             state: Mutex::new(RunnableState {
@@ -1089,7 +1104,7 @@ pub(super) struct TaskResources {
     host: Arc<CompiledTaskHost>,
     loading: HostExecutor<LoadingHostJob, fn(LoadingHostJob)>,
     preparation: HostExecutor<TaskIoHostJob, PreparationRunner>,
-    lifecycle: HostExecutor<TaskIoHostJob, fn(TaskIoHostJob)>,
+    lifecycle: HostExecutor<TaskIoHostJob, PreparationRunner>,
     _async_runtime: tokio::runtime::Runtime,
 }
 fn observation_projection() -> crate::ObservationProjection {
@@ -1139,6 +1154,13 @@ fn start_tasks_with_bundle(
     root: &mut ProcessControlOwner,
     mode: Option<bool>,
 ) -> Result<(TaskIoPorts, TaskResources), Failure> {
+    start_tasks_with_lifecycle_gate(root, mode, None)
+}
+fn start_tasks_with_lifecycle_gate(
+    root: &mut ProcessControlOwner,
+    mode: Option<bool>,
+    disposal_gate: Option<Arc<PreparationGate>>,
+) -> Result<(TaskIoPorts, TaskResources), Failure> {
     let bundle = mode.map(|stopped| Arc::new(BundleFixture::new(stopped)));
     let capacity = root
         .task_capacity_signal()
@@ -1172,11 +1194,21 @@ fn start_tasks_with_bundle(
     // Cleanup execution is independent of preparation, whose body can wait
     // for its own real cancellation/settlement. More preparation threads do
     // not provide that progress guarantee.
-    let lifecycle =
-        match HostExecutor::start_with_waker(limits, preparation_body as fn(_), capacity.waker()) {
-            Ok(owner) => owner,
-            Err(original) => return Err(Box::new((loading, preparation, original))),
-        };
+    let lifecycle_body: PreparationRunner = Box::new(move |job| {
+        if matches!(&job, TaskIoHostJob::DisposeRejectedDomain(_))
+            && let Some(gate) = &disposal_gate
+            && !gate.entered()
+        {
+            // Hold this original paid R's physical disposal before raw Drop.
+            // Metadata inspection has already started the same authority.
+            gate.wait();
+        }
+        preparation_body(job);
+    });
+    let lifecycle = match HostExecutor::start_with_waker(limits, lifecycle_body, capacity.waker()) {
+        Ok(owner) => owner,
+        Err(original) => return Err(Box::new((loading, preparation, original))),
+    };
     let async_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -1277,6 +1309,25 @@ fn exercise_root(
     resources: &mut TaskResources,
     read_root: bool,
 ) -> Result<Option<HeldTaskDelivery>, Failure> {
+    exercise_root_with_preparing_read_hook(scene, participation, resources, read_root, None)
+}
+type PreparingReadHeldHook = Box<
+    dyn FnOnce(
+        &Scenario<TaskResources>,
+        ParticipationRef,
+        &mut TaskResources,
+        TaskIdentity,
+        novarocks_worker_protocol::creation::RequestReplyTag,
+    ) -> Result<(), Failure>,
+>;
+fn exercise_root_with_preparing_read_hook(
+    scene: &Scenario<TaskResources>,
+    participation: ParticipationRef,
+    resources: &mut TaskResources,
+    read_root: bool,
+    on_preparing_read_held: Option<PreparingReadHeldHook>,
+) -> Result<Option<HeldTaskDelivery>, Failure> {
+    let mut preparing_read: Option<HeldTaskDelivery> = None;
     let task = TaskIdentity::new(
         participation.query_execution_id(),
         StageId::new(1).unwrap(),
@@ -1293,6 +1344,12 @@ fn exercise_root(
         .bundle
         .as_ref()
         .map(|bundle| ReleasePreparationGate(bundle.adoption.clone()));
+    let _activation_body_release = resources
+        .host
+        .bundle
+        .as_ref()
+        .and_then(|bundle| bundle.activation_window.lock().unwrap().clone())
+        .map(|window| ReleasePreparationGate(window.body_gate()));
     if let Some(bundle) = &resources.host.bundle {
         *bundle.original.lock().unwrap() = Some((Arc::downgrade(&scene.node), participation));
     }
@@ -1385,6 +1442,94 @@ fn exercise_root(
         assert!(!before.whole_report_retired);
         assert_eq!(scene.ledger.used(Dimension::PreparingTasks.id()), 1);
         assert!(held_bytes > 0);
+        if on_preparing_read_held.is_some() {
+            if bundle.stopped_before_host {
+                return Err(Box::new(
+                    "the preparing read hook requires the original normal bundle",
+                ));
+            }
+            let operation = operation_number(54);
+            let deadline = MonotonicInstant::from_origin(Duration::from_secs(100));
+            let mut read = scene
+                .node
+                .submit_task_command(
+                    participation,
+                    operation,
+                    deadline,
+                    ParticipationCommand::GetDynamicFilters {
+                        task,
+                        acknowledged: None,
+                    },
+                )
+                .map_err(|original| Box::new(original) as Failure)?;
+            let Some((actual_actor, work)) = read.endpoint.external.slot().participation_author()
+            else {
+                return Err(Box::new((
+                    "the original preparing read has no actual R address",
+                    read,
+                )));
+            };
+            let metadata = read.request();
+            let Some(delivery) = wait_delivery(&mut read) else {
+                return Err(Box::new((
+                    "the original preparing GetDynamicFilters did not answer",
+                    read,
+                )));
+            };
+            // The original accepted but still-preparing CountOnly Task has no
+            // dynamic-filter publication. Pure Core authors Idempotent here;
+            // no payload is borrowed and no final-info tail can detach.
+            if actual_actor != participation_actor()
+                || delivery.request() != metadata
+                || metadata.operation != operation
+                || metadata.deadline != deadline
+                || !matches!(
+                    delivery.body(),
+                    ParticipationReplyBody::Verdict(
+                        novarocks_worker_protocol::participation::RequestResult::Outcome(
+                            OperationOutcome::Idempotent
+                        )
+                    )
+                )
+            {
+                return Err(Box::new((
+                    "the original preparing read metadata/verdict changed",
+                    delivery,
+                    read,
+                )));
+            }
+            let Some(saved) = scene
+                .node
+                .original_task_request_for_test(participation, work)
+            else {
+                return Err(Box::new((
+                    "the same original preparing Task R was not retained",
+                    delivery,
+                    read,
+                )));
+            };
+            if saved.0.author != work
+                || saved.0.operation != operation
+                || saved.0.deadline != deadline
+                || saved.1 != task
+                || !saved.2
+            {
+                return Err(Box::new((
+                    "the original preparing read lost its attached Task route",
+                    saved,
+                    delivery,
+                    read,
+                )));
+            }
+            drop(read);
+            if scene.ledger.used(Dimension::Requests.id()) != 1 {
+                return Err(Box::new((
+                    "the original preparing read did not retain one real R",
+                    delivery,
+                )));
+            }
+            preparing_read = Some((delivery, saved.0));
+        }
         if bundle.stopped_before_host {
             trace_original_preparation_stage(
                 scene,
@@ -1598,6 +1743,10 @@ fn exercise_root(
             return Ok(Some((final_delivery, original_request.0)));
         }
         bundle.prepare.release();
+        let activation_window = bundle.activation_window.lock().unwrap().clone();
+        if let Some(window) = activation_window {
+            window.before_adoption(scene, participation, task, resources, bundle)?;
+        }
         if !wait_until(|| bundle.adoption.entered()) {
             return Err(Box::new(
                 "the actual provider adoption callback did not start",
@@ -1623,6 +1772,10 @@ fn exercise_root(
         assert_eq!(bundle.transfers.load(Ordering::SeqCst), 1);
         assert_eq!(bundle.second_take_refusals.load(Ordering::SeqCst), 1);
         bundle.adoption.release();
+        let activation_window = bundle.activation_window.lock().unwrap().clone();
+        if let Some(window) = activation_window {
+            window.after_adoption()?;
+        }
     }
     let completion_contract = resources.host.completion_contract.lock().unwrap().clone();
     if let Some(contract) = &completion_contract {
@@ -1695,6 +1848,34 @@ fn exercise_root(
         return Err(Box::new(
             "real execution / installed / preparation whole-exit timeout",
         ));
+    }
+    if let Some((old_delivery, old_request)) = preparing_read.take() {
+        let attached = scene
+            .node
+            .original_task_request_for_test(participation, old_request.author);
+        if attached.is_none_or(|facts| facts.0 != old_request || facts.1 != task || !facts.2) {
+            return Err(Box::new((
+                "the original non-final-info Task R detached before its held hook",
+                attached,
+                old_delivery,
+            )));
+        }
+        let hook = on_preparing_read_held.expect("the same original preparing read has its hook");
+        if let Err(original) = hook(scene, participation, resources, task, old_request) {
+            return Err(Box::new((original, old_delivery)));
+        }
+        if scene.ledger.used(Dimension::Requests.id()) != 1 {
+            return Err(Box::new((
+                "the same original preparing R must remain after its held hook",
+                old_delivery,
+            )));
+        }
+        drop(old_delivery);
+        if !wait_until(|| scene.ledger.used(Dimension::Requests.id()) == 0) {
+            return Err(Box::new(
+                "the original preparing Task R did not really retire before Root reading",
+            ));
+        }
     }
     if !read_root {
         // The compiled producer and original Completion really finished, but

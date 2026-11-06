@@ -2382,6 +2382,20 @@ impl FrontendTaskProtocolActiveBehavior {
             handoff,
             profile_observer,
         } = attempt;
+        #[cfg(novarocks_dev_controls)]
+        let round = {
+            let mut round = round;
+            let execution = round
+                .round
+                .execution()
+                .graph()
+                .root_identity()
+                .query_execution_id();
+            if let Some(observer) = lifecycle_diagnostics.root_observer_for_execution(execution) {
+                round.round.install_root_observer(observer);
+            }
+            round
+        };
         Self {
             attempt: round,
             completion,

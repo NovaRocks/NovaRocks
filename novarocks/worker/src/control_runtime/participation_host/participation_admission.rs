@@ -112,6 +112,9 @@ impl ParticipationAdmissionCloseJob {
             state.started = true;
             ManuallyDrop::into_inner(state.host.take().expect("same original execution host"))
         };
+        tracing::debug!(participation = %self.0.participation, key = ?self.0.key,
+            reason = ?self.0.reason, phase = "host_call_started",
+            "Original Participation admission close progress");
         let returned = catch_unwind(AssertUnwindSafe(|| match self.0.reason {
             None => host.close_participation_admission(self.0.participation),
             Some(_) => host.abort_participation_admission(self.0.participation),
@@ -128,6 +131,9 @@ impl ParticipationAdmissionCloseJob {
             self.fail();
             return;
         }
+        tracing::debug!(participation = %self.0.participation, key = ?self.0.key,
+            phase = "host_call_returned",
+            "Original Participation admission close progress");
         // Actual capture destruction is also part of this original effect.
         // The poller never drops the captured Host or an original panic carrier.
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(host))) {
@@ -139,6 +145,9 @@ impl ParticipationAdmissionCloseJob {
             self.fail();
             return;
         }
+        tracing::debug!(participation = %self.0.participation, key = ?self.0.key,
+            phase = "host_capture_disposed",
+            "Original Participation admission close progress");
         let ticket = ManuallyDrop::into_inner(
             self.0
                 .state
@@ -160,6 +169,10 @@ impl ParticipationAdmissionCloseJob {
         if let Some(gate) = &self.0.gate {
             gate.complete();
         }
+        tracing::debug!(participation = %self.0.participation, key = ?self.0.key,
+            reason = ?self.0.reason, phase = "effect_completion_recorded",
+            gate_completed = ?self.0.gate.as_ref().map(|gate| gate.is_completed()),
+            "Original Participation admission close progress");
         self.notify();
         let retained = self
             .0

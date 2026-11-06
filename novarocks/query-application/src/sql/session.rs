@@ -51,7 +51,7 @@ pub struct SessionSqlState {
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     user_variables: BTreeMap<String, String>,
-    presentation: ClientPresentationFamily,
+    presentation: Option<ClientPresentationFamily>,
     time_zone: Option<SessionTimeZone>,
 }
 
@@ -64,7 +64,7 @@ impl Default for SessionSqlState {
             optimizer_settings: SessionOptimizerSettings::default(),
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             user_variables: BTreeMap::new(),
-            presentation: ClientPresentationFamily::MysqlText,
+            presentation: None,
             time_zone: None,
         }
     }
@@ -87,8 +87,8 @@ impl SessionSqlState {
         &self.execution_settings
     }
 
-    pub fn presentation(&self) -> &ClientPresentationFamily {
-        &self.presentation
+    pub fn presentation(&self) -> Option<&ClientPresentationFamily> {
+        self.presentation.as_ref()
     }
     pub fn time_zone(&self) -> Option<&SessionTimeZone> {
         self.time_zone.as_ref()
@@ -96,7 +96,7 @@ impl SessionSqlState {
 
     pub fn from_session_value(value: SessionValue) -> Result<Self, StatementSessionError> {
         let mut state = Self {
-            presentation: value.presentation,
+            presentation: Some(value.presentation),
             time_zone: value.time_zone,
             ..Self::default()
         };
@@ -753,6 +753,7 @@ mod tests {
         let state = SessionSqlState::default();
         assert_eq!(state.current_catalog(), None);
         assert_eq!(state.current_database(), DEFAULT_DATABASE);
+        assert_eq!(state.presentation(), None);
         assert!(state.user_variables.is_empty());
         assert_eq!(
             state.execution_settings(),

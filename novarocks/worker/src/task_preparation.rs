@@ -124,6 +124,8 @@ pub(crate) struct TaskPreparationScope {
     identity: TaskIdentity,
     health: Arc<ExecutionHealth>,
     state: Mutex<State>,
+    #[cfg(test)]
+    before_body_exit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Positive evidence from the same original scope: its physical preparation
@@ -163,6 +165,8 @@ impl TaskPreparationScope {
         Self {
             identity,
             health,
+            #[cfg(test)]
+            before_body_exit: Mutex::new(None),
             state: Mutex::new(State {
                 mode: Mode::Preparing,
                 body_exited: false,
@@ -285,10 +289,37 @@ impl TaskPreparationScope {
             .body_exited
     }
     pub(crate) fn body_exited(&self) {
+        #[cfg(test)]
+        {
+            // The original physical setter invokes this outside its lock.
+            // Releasing a test gate does not supply the body-exit fact.
+            let hook = self.before_body_exit.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.state
             .lock()
             .expect("preparation child scope lock")
             .body_exited = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn before_original_body_exit_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        let mut slot = self.before_body_exit.lock().unwrap();
+        assert!(slot.replace(hook).is_none());
+    }
+    /// Read this scope's original return author. This neither adopts its
+    /// runtime nor proves whole preparation exit or returns P/byte capacity.
+    pub(crate) fn body_has_exited(&self) -> bool {
+        self.state
+            .lock()
+            .expect("preparation child scope lock")
+            .body_exited
+    }
+    #[cfg(test)]
+    pub(crate) fn original_adoption_unstarted_for_test(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.mode == Mode::Preparing && state.phases[Step::Adopt as usize] == Phase::NotStarted
     }
     /// Read only the original provider-child cleanup observations. Adoption
     /// transfers runtime ownership elsewhere; this proves only that these

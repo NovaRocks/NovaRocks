@@ -188,6 +188,6 @@ secret/certificate hot reload、old/new secret overlap、rolling upgrade 或 per
 | 启动拒绝 Native descriptor baseline | 在启动环境配置 BE soft FD limit ≥1024、FE ≥2048；查询不会提高或预留限制。 |
 | 想立即拒绝已移除/泄露的节点 | Backend drain/终止只改变 future admission。轮换 deployment secret 并 homogeneous restart 才是当前完整 transport-trust revoke。 |
 
-NWT-3 只保护 Native gRPC surface。MySQL SQL entrypoint、management HTTP、metrics 和现有 debug route
+NWT-3 只保护 Native gRPC surface。Trino HTTP SQL entrypoint、management HTTP、metrics 和现有 debug route
 不读取这个 JWT/TLS config；它们需要各自的网络隔离、proxy 或后续安全设计。不要把 Native JWT 的存在解释为
 全产品 HTTPS、端到端 authorization 或 protocol slimming；后续 NWT-4 仍是独立工作。

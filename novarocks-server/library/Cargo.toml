@@ -21,7 +21,6 @@ novarocks-functions.workspace = true
 novarocks-fs.workspace = true
 novarocks-memory.workspace = true
 novarocks-mv-application.workspace = true
-novarocks-mysql-adapter.workspace = true
 novarocks-trino-adapter.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-native-adapter.workspace = true
@@ -62,10 +61,6 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
-mem-1-m07-hms-listing-observe = ["novarocks-connector-iceberg/mem-1-m07-hms-listing-observe", "novarocks-frontend-application/mem-1-m07-hms-listing-observe"]
-mem-1-m07-closing-pressure = ["novarocks-frontend-application/mem-1-m07-closing-pressure"]
-mem-1-m07-root-observation = ["novarocks-frontend-application/mem-1-m07-root-observation"]
-mem-1-m07-exact-mysql-write = ["novarocks-frontend-application/mem-1-m07-exact-mysql-write"]
 default = ["jemalloc"]
 # jemalloc is the only supported production allocator. Building without this
 # feature keeps the system allocator for same-revision baselines and for tools

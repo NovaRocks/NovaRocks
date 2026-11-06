@@ -17,26 +17,27 @@
 
 //! SQL actor with an exact statement nomination gate and joined failure cleanup.
 use super::native_sql_controls::SelectedStatement;
-use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
+use crate::{
+    actors::sql::{self, PendingStatement, SqlSession, StatementFailure, StatementResult},
+    scenario::ScenarioContext,
+};
 use anyhow::{Context, Result};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
+use novarocks_test_trino_client::CancelHandle;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 pub(super) struct WriterActor {
-    pub connection_id: u32,
-    pub done: mpsc::Receiver<mysql::Result<()>>,
+    pub client_query_id: String,
+    pub done: mpsc::Receiver<std::result::Result<StatementResult, StatementFailure>>,
     actor: Option<JoinHandle<Result<()>>>,
-    user: String,
-    port: u16,
+    cancel: CancelHandle,
     deadline: Instant,
     observation: QueryLifecycleStatementObservation,
     sql_outcome: Arc<Mutex<Option<SqlOutcome>>>,
     reentry_release: Option<mpsc::SyncSender<()>>,
 }
-
 #[derive(Clone, Copy)]
 enum SqlOutcome {
     Success,
@@ -49,24 +50,22 @@ pub(super) struct ReadSessionSettings {
     pub pipeline_dop: u32,
 }
 impl ReadSessionSettings {
-    pub fn apply(self, connection: &mut mysql::Conn) -> Result<()> {
+    pub fn apply(self, connection: &mut SqlSession) -> Result<()> {
         anyhow::ensure!(self.pipeline_dop > 0, "read control DOP must be positive");
         // Only this original session property is supported. Memory is frozen
         // by each statement's admitted hint; batch size remains its default.
         // The scenario checks the actual build participant count separately.
-        connection.query_drop(format!("SET pipeline_dop={}", self.pipeline_dop))?;
+        connection.execute(format!("SET pipeline_dop={}", self.pipeline_dop))?;
         Ok(())
     }
 }
 
-pub(super) fn require_public_error_reentry(connection: &mut mysql::Conn) -> Result<()> {
-    let rows: Vec<i64> = connection
-        .query("SELECT 1")
-        .context("reenter the original writer connection after its public SQL error")?;
-    anyhow::ensure!(
-        rows == vec![1],
-        "writer connection reentry returned {rows:?}"
-    );
+pub(super) fn require_public_error_reentry(connection: &mut SqlSession) -> Result<()> {
+    let result = connection
+        .execute("SELECT 1")
+        .context("reenter the original writer session after its public SQL error")?;
+    let rows = sql::integer_column(&result)?;
+    anyhow::ensure!(rows == vec![1], "writer session reentry returned {rows:?}");
     Ok(())
 }
 impl WriterActor {
@@ -86,103 +85,118 @@ impl WriterActor {
         context: &mut ScenarioContext,
         sql: &str,
         selected: SelectedStatement,
-        rows: Arc<Mutex<Option<Vec<mysql::Row>>>>,
+        result: Arc<Mutex<Option<StatementResult>>>,
         settings: Option<ReadSessionSettings>,
     ) -> Result<Self> {
-        Self::start_internal(context, sql, selected, None, Some(rows), settings)
+        Self::start_internal(context, sql, selected, None, Some(result), settings)
     }
     fn start_internal(
         context: &mut ScenarioContext,
         sql: &str,
         selected: SelectedStatement,
         query_timeout_secs: Option<u64>,
-        rows: Option<Arc<Mutex<Option<Vec<mysql::Row>>>>>,
+        read_result: Option<Arc<Mutex<Option<StatementResult>>>>,
         read_settings: Option<ReadSessionSettings>,
     ) -> Result<Self> {
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (submit_tx, submit_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<PendingStatement>(1);
+        let (submit_tx, submit_rx) = mpsc::sync_channel::<PendingStatement>(1);
         let (done_tx, done) = mpsc::sync_channel(1);
         let (reentry_release, reentry_wait) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
+        let user = context.sql_user().to_owned();
+        let port = context.trino_port();
         context.remaining("connect original writer actor")?;
         let deadline = context.deadline();
-        let actor_user = user.clone();
         let actor_sql = sql.to_owned();
         let sql_outcome = Arc::new(Mutex::new(None));
         let actor_outcome = Arc::clone(&sql_outcome);
         let actor = thread::Builder::new()
             .name("selected-distributed-writer-sql".into())
             .spawn(move || -> Result<()> {
-                let connection =
-                    mysql_actor::connect_for_cancellation_until(&actor_user, port, deadline)?;
-                connection.run(|connection| {
-                    if let Some(settings) = read_settings {
-                        settings.apply(connection)?;
+                let mut connection = SqlSession::new(&user, port, deadline)?;
+                if let Some(settings) = read_settings {
+                    settings.apply(&mut connection)?;
+                }
+                if let Some(seconds) = query_timeout_secs {
+                    connection
+                        .execute(format!("SET query_timeout = {seconds}"))
+                        .context("set the deadline write session query_timeout")?;
+                }
+                let pending = connection.submit(&actor_sql)?;
+                let cancel = pending.cancel_handle();
+                if ready_tx.send(pending).is_err() {
+                    return combine(
+                        Err(anyhow::anyhow!("original writer ready owner closed")),
+                        cancel.delete(deadline).map_err(Into::into),
+                    );
+                }
+                let pending = match submit_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(pending) => pending,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return cancel.delete(deadline).map_err(Into::into);
                     }
-                    if let Some(seconds) = query_timeout_secs {
-                        connection
-                            .query_drop(format!("SET query_timeout = {seconds}"))
-                            .context("set the deadline write session query_timeout")?;
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return combine(
+                            Err(anyhow::anyhow!(
+                                "original SQL submission gate deadline expired"
+                            )),
+                            cancel.delete(deadline).map_err(Into::into),
+                        );
                     }
-                    // The real connection is idle after its original SET prelude.
-                    ready_tx.send(connection.connection_id())?;
-                    match submit_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(()) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            anyhow::bail!("original SQL submission gate deadline expired")
-                        }
-                    }
-                    let outcome = match rows {
-                        None => connection.query_drop(actor_sql),
-                        Some(rows) => connection.query::<mysql::Row, _>(actor_sql).map(|actual| {
-                            *rows.lock().expect("original read result owner") = Some(actual);
-                        }),
-                    };
-                    let classification = match &outcome {
-                        Ok(()) => SqlOutcome::Success,
-                        Err(mysql::Error::MySqlError(_)) => SqlOutcome::PublicError,
-                        Err(_) => SqlOutcome::TransportError,
-                    };
-                    let recorded = actor_outcome
+                };
+                let outcome = connection.run_pending(pending);
+                let classification = match &outcome {
+                    Ok(_) => SqlOutcome::Success,
+                    Err(StatementFailure::Trino(_)) => SqlOutcome::PublicError,
+                    Err(_) => SqlOutcome::TransportError,
+                };
+                // Capture the same completed response, including its original
+                // types, query id and page count, without a second SQL reader.
+                let captured = match (&outcome, read_result) {
+                    (Ok(actual), Some(result)) => result
                         .lock()
-                        .map(|mut saved| *saved = Some(classification))
-                        .map_err(|_| anyhow::anyhow!("original writer SQL outcome owner poisoned"));
-                    let delivery = match done_tx.send(outcome) {
-                        Ok(()) => Ok(()),
-                        Err(mpsc::SendError(Err(actual))) => Err(anyhow::Error::from(actual)
-                            .context("original writer query failed after its result owner closed")),
-                        Err(mpsc::SendError(Ok(_))) => Err(anyhow::anyhow!(
-                            "original writer result owner closed before delivery"
-                        )),
-                    };
-                    // Preserve this exact idle connection while the scenario
-                    // observes only the original writer's counter window.
-                    // A disconnected gate is failure cleanup, never reentry.
-                    let reentry = match reentry_wait
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(()) if matches!(classification, SqlOutcome::PublicError) => {
-                            require_public_error_reentry(connection)
-                        }
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
-                        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-                            "original writer reentry gate deadline expired"
-                        )),
-                    };
-                    combine(combine(delivery, reentry), recorded)
-                })
+                        .map(|mut saved| *saved = Some(actual.clone()))
+                        .map_err(|_| anyhow::anyhow!("original read result owner poisoned")),
+                    _ => Ok(()),
+                };
+                let recorded = actor_outcome
+                    .lock()
+                    .map(|mut saved| *saved = Some(classification))
+                    .map_err(|_| anyhow::anyhow!("original writer SQL outcome owner poisoned"));
+                let delivery = match done_tx.send(outcome) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::SendError(Err(actual))) => Err(anyhow::Error::from(actual)
+                        .context("original writer query failed after its result owner closed")),
+                    Err(mpsc::SendError(Ok(_))) => Err(anyhow::anyhow!(
+                        "original writer result owner closed before delivery"
+                    )),
+                };
+                // Keep successful effects and public-error reentry on this same
+                // actor session, after the original writer-only counter window.
+                let reentry = match reentry_wait
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(()) if matches!(classification, SqlOutcome::PublicError) => {
+                        require_public_error_reentry(&mut connection)
+                    }
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                        "original writer reentry gate deadline expired"
+                    )),
+                };
+                combine(combine(combine(delivery, reentry), recorded), captured)
             })?;
-        let ready = (|| -> Result<(u32, QueryLifecycleStatementObservation)> {
-            let cid = ready_rx
-                .recv_timeout(context.remaining("receive idle writer connection")?)
-                .context("original writer actor did not publish its actual connection")?;
-            let observation = selected.arm(context, cid, sql)?;
-            Ok((cid, observation))
+        let ready = (|| -> Result<_> {
+            let pending = ready_rx
+                .recv_timeout(context.remaining("receive idle writer session")?)
+                .context("original writer actor did not publish its actual POST")?;
+            let cancel = pending.cancel_handle();
+            let client_query_id = pending.query_id.clone();
+            let (pending, observation) = selected.arm_pending(context, pending, sql)?;
+            Ok((client_query_id, cancel, pending, observation))
         })();
-        let (cid, observation) = match ready {
+        let (client_query_id, cancel, pending, observation) = match ready {
             Ok(ready) => ready,
             Err(primary) => {
                 drop(submit_tx);
@@ -190,36 +204,48 @@ impl WriterActor {
                 return combine::<Self>(Err(primary), join(actor));
             }
         };
-        if let Err(primary) = submit_tx.send(()) {
+        if let Err(primary) = submit_tx.send(pending) {
             drop(reentry_release);
             let cleanup = combine(
-                join(actor),
-                context
-                    .handle()
-                    .drain_query_lifecycle_statement_observation(&observation),
+                cancel.delete(deadline).map_err(Into::into),
+                combine(
+                    join(actor),
+                    context
+                        .handle()
+                        .drain_query_lifecycle_statement_binding(&observation, deadline),
+                ),
             );
-            return combine::<Self>(Err(primary.into()), cleanup);
+            return combine::<Self>(
+                Err(anyhow::anyhow!(
+                    "original writer submission owner closed: {primary}"
+                )),
+                cleanup,
+            );
         }
         Ok(Self {
-            connection_id: cid,
+            client_query_id,
             done,
             actor: Some(actor),
-            user,
-            port,
+            cancel,
             deadline,
             observation,
             sql_outcome,
             reentry_release: Some(reentry_release),
         })
     }
+    pub fn cancel(&self, deadline: Instant) -> Result<()> {
+        self.cancel
+            .delete(deadline)
+            .with_context(|| format!("cancel original writer query {}", self.client_query_id))
+    }
 
     /// Every known success/failure path settles the same original actor. Public
-    /// KILL and cluster shutdown are failure-only cleanup, never new admission.
+    /// cancellation and cluster shutdown are failure-only cleanup, never new admission.
     pub fn settle(
         mut self,
         context: &mut ScenarioContext,
-        primary: Result<mysql::Result<()>>,
-    ) -> Result<mysql::Result<()>> {
+        primary: Result<std::result::Result<StatementResult, StatementFailure>>,
+    ) -> Result<std::result::Result<StatementResult, StatementFailure>> {
         let mut cleanup = Ok(());
         if primary.is_err()
             && self
@@ -232,12 +258,15 @@ impl WriterActor {
                 .as_ref()
                 .is_some_and(|actor| !actor.is_finished())
         {
-            cleanup = cancel(&self.user, self.port, self.connection_id, self.deadline);
+            cleanup = self
+                .cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from);
             if cleanup.is_err() {
                 cleanup = combine(cleanup, context.shutdown());
             }
         }
-        // KILL above cannot strike SELECT 1: reentry is still gated until the
+        // Cancellation above cannot strike SELECT 1: reentry is still gated until the
         // original SQL is known complete or its cancellation has returned.
         if let Some(release) = self.reentry_release.take() {
             let released = release.send(()).map_err(|_| {
@@ -256,6 +285,27 @@ impl WriterActor {
             .lock()
             .map(|saved| *saved)
             .map_err(|_| anyhow::anyhow!("original writer SQL outcome owner poisoned"));
+        // A joined HTTP/client reader is not a server terminal receipt. The
+        // same registered query still needs DELETE on every non-Trino verdict.
+        let actual_terminal = matches!(
+            &classification,
+            Ok(Some(SqlOutcome::Success | SqlOutcome::PublicError))
+        );
+        let nonterminal_client_failure = !actual_terminal
+            && (matches!(&classification, Ok(Some(SqlOutcome::TransportError)))
+                || matches!(&primary, Ok(Err(error)) if !matches!(error, StatementFailure::Trino(_))));
+        if nonterminal_client_failure {
+            let cancelled = self
+                .cancel
+                .delete(self.deadline)
+                .map_err(anyhow::Error::from);
+            let shutdown = if cancelled.is_err() {
+                context.shutdown()
+            } else {
+                Ok(())
+            };
+            cleanup = combine(cleanup, combine(cancelled, shutdown));
+        }
         match classification {
             Ok(Some(SqlOutcome::Success)) => {
                 cleanup = combine(
@@ -273,7 +323,7 @@ impl WriterActor {
                     cleanup,
                     context
                         .handle()
-                        .drain_query_lifecycle_statement_observation(&self.observation),
+                        .drain_query_lifecycle_statement_binding(&self.observation, self.deadline),
                 );
             }
             classification => {
@@ -291,7 +341,7 @@ impl WriterActor {
             }
         }
         let primary = match primary {
-            Ok(Err(error)) if !matches!(&error, mysql::Error::MySqlError(_)) => Err(error.into()),
+            Ok(Err(error)) if !matches!(&error, StatementFailure::Trino(_)) => Err(error.into()),
             primary => primary,
         };
         retain_write_result(primary, cleanup)
@@ -305,23 +355,22 @@ impl Drop for WriterActor {
         // this thread, and an in-flight SQL must never start reentry on Drop.
         drop(self.reentry_release.take());
         if let Some(actor) = self.actor.take() {
-            let sql_running = self
-                .sql_outcome
-                .lock()
+            let disposition = self.sql_outcome.lock().map(|saved| *saved);
+            let sql_running = disposition
+                .as_ref()
                 .map(|saved| saved.is_none())
                 .unwrap_or(true);
-            if sql_running && !actor.is_finished() {
-                let _ = cancel(&self.user, self.port, self.connection_id, self.deadline);
+            let nonterminal_client_failure =
+                matches!(disposition, Ok(Some(SqlOutcome::TransportError)));
+            if (sql_running && !actor.is_finished()) || nonterminal_client_failure {
+                let _ = self
+                    .cancel
+                    .delete(self.deadline)
+                    .map_err(anyhow::Error::from);
             }
             let _ = join(actor);
         }
     }
-}
-fn cancel(user: &str, port: u16, cid: u32, deadline: Instant) -> Result<()> {
-    mysql_actor::connect_until(user, port, deadline)?.run(|control| {
-        control.query_drop(format!("KILL QUERY {cid}"))?;
-        Ok(())
-    })
 }
 fn join(actor: JoinHandle<Result<()>>) -> Result<()> {
     actor
@@ -336,9 +385,9 @@ pub(super) fn combine<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 pub(super) fn retain_write_result(
-    primary: Result<mysql::Result<()>>,
+    primary: Result<std::result::Result<StatementResult, StatementFailure>>,
     cleanup: Result<()>,
-) -> Result<mysql::Result<()>> {
+) -> Result<std::result::Result<StatementResult, StatementFailure>> {
     match (primary, cleanup) {
         (Ok(Err(actual)), Err(cleanup)) => combine(Err(actual.into()), Err(cleanup)),
         (primary, cleanup) => combine(primary, cleanup),

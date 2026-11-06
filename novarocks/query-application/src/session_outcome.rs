@@ -135,10 +135,25 @@ pub fn governed_query_execution_error(error: QueryExecutionError) -> QueryServic
 pub fn governed_statement_begin_error(
     error: crate::session_control::GovernedQueryStatementBeginError,
 ) -> QueryServiceError {
-    QueryServiceError::new(
-        QueryServiceErrorKind::Unavailable,
-        format!("begin governed query statement failed: {error}"),
-    )
+    use crate::session_control::GovernedQueryStatementBeginError;
+    use novarocks_workload_control::WorkError;
+
+    match error {
+        GovernedQueryStatementBeginError::Admission(WorkError::Cancelled(reason)) => {
+            governed_cancellation_error(reason)
+        }
+        GovernedQueryStatementBeginError::Admission(
+            error @ (WorkError::Capacity(_)
+            | WorkError::CapacityWaitTimeout
+            | WorkError::ArithmeticOverflow),
+        ) => QueryServiceError::from_failure_cause(
+            novarocks_failure_contract::SharedFailureCause::new(error),
+        ),
+        error => QueryServiceError::new(
+            QueryServiceErrorKind::Unavailable,
+            format!("begin governed query statement failed: {error}"),
+        ),
+    }
 }
 
 pub fn scalar_query_error(message: impl Into<String>) -> QueryServiceError {
@@ -537,6 +552,49 @@ mod tests {
                 assert_eq!(service.user_error(), Some(&input.user_error()));
                 assert!(!service.message().contains("private"));
             }
+        }
+    }
+
+    #[test]
+    fn admission_deadline_keeps_the_original_typed_cause() {
+        use crate::session_control::GovernedQueryStatementBeginError;
+        use novarocks_workload_control::WorkError;
+
+        let error = governed_statement_begin_error(GovernedQueryStatementBeginError::Admission(
+            WorkError::Cancelled(WorkCancellationReason::DeadlineExceeded),
+        ));
+        assert_eq!(
+            error,
+            governed_cancellation_error(WorkCancellationReason::DeadlineExceeded)
+        );
+        assert!(error.execution_failure().is_some());
+    }
+
+    #[test]
+    fn admission_capacity_refusals_keep_the_original_resource_fact_and_source() {
+        use crate::session_control::GovernedQueryStatementBeginError;
+        use novarocks_workload_control::WorkError;
+
+        for original in [
+            WorkError::Capacity("complete result window"),
+            WorkError::CapacityWaitTimeout,
+            WorkError::ArithmeticOverflow,
+        ] {
+            let error = governed_statement_begin_error(
+                GovernedQueryStatementBeginError::Admission(original.clone()),
+            );
+            let input = error
+                .execution_failure()
+                .expect("original resource refusal");
+            assert_eq!(input.fact(), original.failure_fact());
+            assert_eq!(
+                input.fact().class(),
+                novarocks_execution_contract::failure::FailureClass::Resource
+            );
+            assert_eq!(
+                error.failure_cause().unwrap().downcast_ref::<WorkError>(),
+                Some(&original)
+            );
         }
     }
 

@@ -37,7 +37,7 @@ use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendNativeCapacityInputs,
     FrontendQueryControlTimeouts, FrontendResultCapacityProfile, FrontendServingConfig,
-    FrontendStatementIngress, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
+    FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -555,7 +555,6 @@ pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,
     build: &crate::build_information::BuildInformation,
     native_trust: &NativeTrustSnapshot,
-    port_override: Option<u16>,
     native_compatibility_id: NativeCompatibilityId,
     static_plan: &ServerStaticPlan,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -591,13 +590,11 @@ pub fn compose_frontend_role_config(
     let (logical_supervisor, workload, abort_capacity, result_profile, capacity_inputs) =
         compose_frontend_workload_runtime(runtime_config)?;
     // Runtime settings come from the same original ingress and Native owners.
-    let ingress = compose_frontend_statement_ingress()?;
     let capacity_profile = FrontendWorkloadCapacityProfile::try_for_native(
         capacity_inputs,
         &workload,
         result_profile,
         task_execution_budgets.transport,
-        ingress,
     )
     .context("compose frontend original-source workload capacity profile")?;
     // The fifth input and the actual pool consume one frozen configuration.
@@ -714,18 +711,6 @@ pub fn compose_frontend_role_config(
         Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks_mysql_adapter::resolve_mysql_listener_settings(
-        config
-            .standalone_server
-            .as_ref()
-            .map(|server| server.mysql_port),
-        config
-            .standalone_server
-            .as_ref()
-            .map(|server| server.user.as_str()),
-        port_override,
-    )
-    .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let trino_settings = config
         .standalone_server
         .as_ref()
@@ -735,6 +720,7 @@ pub fn compose_frontend_role_config(
         port: trino_settings.trino_port,
         user: trino_settings.user,
         client_timeout: Duration::from_millis(trino_settings.trino_client_timeout_ms),
+        query_max_length: trino_settings.trino_query_max_length,
     };
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
@@ -771,8 +757,6 @@ pub fn compose_frontend_role_config(
             native_compatibility_id,
             memory_authority: std::sync::Arc::clone(&memory_authority),
             process_memory: Some(frontend_process_memory_observation()),
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_listing_observation: None,
         },
         serving: FrontendServingConfig {
             server_version: build.short_version.to_owned(),
@@ -782,7 +766,6 @@ pub fn compose_frontend_role_config(
             frontend_cleanup_timeout: Duration::from_millis(
                 config.server.frontend_cleanup_timeout_ms,
             ),
-            mysql_listener,
             trino_listener,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
@@ -878,21 +861,6 @@ pub(crate) fn validate_frontend_joint_startup(
         anyhow::bail!("frontend query concurrency exceeds its actual Client result positions");
     }
     Ok(())
-}
-
-fn compose_frontend_statement_ingress() -> anyhow::Result<FrontendStatementIngress> {
-    let mysql = novarocks_mysql_adapter::frozen_mysql_startup_parameters()
-        .context("read original frontend MySQL ingress bounds")?;
-    Ok(FrontendStatementIngress {
-        ordinary_connections: NonZeroUsize::new(mysql.ordinary_positions)
-            .ok_or_else(|| anyhow!("ordinary MySQL positions must be nonzero"))?,
-        control_connections: NonZeroUsize::new(mysql.control_positions)
-            .ok_or_else(|| anyhow!("control MySQL positions must be nonzero"))?,
-        ordinary_command_bytes: NonZeroUsize::new(mysql.ordinary.limits.command_bytes)
-            .ok_or_else(|| anyhow!("ordinary MySQL command bound must be nonzero"))?,
-        control_command_bytes: NonZeroUsize::new(mysql.control.limits.command_bytes)
-            .ok_or_else(|| anyhow!("control MySQL command bound must be nonzero"))?,
-    })
 }
 
 fn compose_frontend_workload_runtime(
@@ -1201,8 +1169,8 @@ pub fn state_store_provider_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrontendWorkloadCapacityProfile, compose_frontend_statement_ingress,
-        compose_frontend_workload_runtime, compose_task_execution_budgets,
+        FrontendWorkloadCapacityProfile, compose_frontend_workload_runtime,
+        compose_task_execution_budgets,
     };
 
     use novarocks_execution_contract::{MaxWait, OperationKind};
@@ -1399,14 +1367,9 @@ mod tests {
         let (_, workload, _, result, inputs) =
             compose_frontend_workload_runtime(&config.runtime).unwrap();
         let transport = compose_task_execution_budgets(&config).unwrap().transport;
-        let profile = FrontendWorkloadCapacityProfile::try_for_native(
-            inputs,
-            &workload,
-            result,
-            transport,
-            compose_frontend_statement_ingress().unwrap(),
-        )
-        .unwrap();
+        let profile =
+            FrontendWorkloadCapacityProfile::try_for_native(inputs, &workload, result, transport)
+                .unwrap();
         assert_eq!(
             profile
                 .inputs()
@@ -1417,10 +1380,6 @@ mod tests {
         );
         assert_eq!(profile.policy().scope_limit(), 8192);
         assert_eq!(transport.max_backend_queued_bytes(), 512 * 1024 * 1024);
-        assert_eq!(
-            profile.statement_ingress(),
-            Some(compose_frontend_statement_ingress().unwrap())
-        );
     }
 
     #[test]

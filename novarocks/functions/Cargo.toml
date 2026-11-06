@@ -52,7 +52,6 @@ arrow-buffer.workspace = true
 arrow-cast.workspace = true
 arrow-data.workspace = true
 arrow-ipc.workspace = true
-flatbuffers.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 chrono.workspace = true

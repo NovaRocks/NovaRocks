@@ -61,7 +61,6 @@ struct RowFieldName {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ColumnsError {
-    WrongPresentationFamily,
     UnsupportedFrozenType,
     BackingSizeOverflow,
     BackingLimitExceeded,
@@ -70,9 +69,6 @@ pub(crate) enum ColumnsError {
 impl std::fmt::Display for ColumnsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::WrongPresentationFamily => {
-                "Trino metadata requires the frozen Trino presentation family"
-            }
             Self::UnsupportedFrozenType => "Unsupported type in frozen Trino metadata",
             Self::BackingSizeOverflow => "Trino column metadata backing size overflows",
             Self::BackingLimitExceeded => {
@@ -146,7 +142,7 @@ fn signature_backing(
 pub(crate) fn columns_construction_backing_bound(
     schema: &ClientRenderSchema,
 ) -> Result<usize, ColumnsError> {
-    let facts = trino_facts(schema)?;
+    let facts = trino_facts(schema);
     let mut bytes = schema
         .columns()
         .len()
@@ -178,7 +174,7 @@ pub(crate) fn columns_with_backing_limit(
     if bound > limit {
         return Err(ColumnsError::BackingLimitExceeded);
     }
-    let facts = trino_facts(schema)?;
+    let facts = trino_facts(schema);
     let mut projected = exact_vec(schema.columns().len())?;
     for column in schema.columns() {
         projected.push(TrinoColumn {
@@ -192,11 +188,9 @@ pub(crate) fn columns_with_backing_limit(
     }
     Ok(projected)
 }
-fn trino_facts(schema: &ClientRenderSchema) -> Result<TrinoJsonFacts, ColumnsError> {
-    match schema.family() {
-        ClientPresentationFamily::TrinoJson(facts) => Ok(*facts),
-        ClientPresentationFamily::MysqlText => Err(ColumnsError::WrongPresentationFamily),
-    }
+fn trino_facts(schema: &ClientRenderSchema) -> TrinoJsonFacts {
+    let ClientPresentationFamily::TrinoJson(facts) = schema.family();
+    *facts
 }
 fn exact_vec<T>(length: usize) -> Result<Vec<T>, ColumnsError> {
     let mut value = Vec::new();
@@ -861,26 +855,6 @@ mod tests {
         }
     }
     #[test]
-    fn mysql_family_is_an_internal_contract_error() {
-        let schema = ClientRenderSchema::try_new(
-            ClientPresentationFamily::MysqlText,
-            vec![RenderColumn {
-                source_ordinal: 0,
-                source_slot: None,
-                name: "c".into(),
-                field: RenderField {
-                    native_type: NativeRenderType::String,
-                    nullable: false,
-                    presentation: RenderPresentation::ScalarText,
-                },
-            }],
-            1,
-        )
-        .unwrap();
-        assert_eq!(columns(&schema), Err(ColumnsError::WrongPresentationFamily));
-    }
-
-    #[test]
     fn backing_observation_counts_spare_capacity_and_nested_heap_once() {
         let mut field_name = String::with_capacity(73);
         field_name.push_str("field");
@@ -1096,11 +1070,6 @@ mod tests {
         ] {
             assert!(error.is_backing_failure());
         }
-        for error in [
-            ColumnsError::WrongPresentationFamily,
-            ColumnsError::UnsupportedFrozenType,
-        ] {
-            assert!(!error.is_backing_failure());
-        }
+        assert!(!ColumnsError::UnsupportedFrozenType.is_backing_failure());
     }
 }

@@ -713,7 +713,7 @@ fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing(
         super::PreparedNativeInListRecipe::try_new(false, &json, &[&json], &boolean, &Compile)
             .unwrap();
     assert_eq!(recipe.source_type(), &json);
-    assert_eq!(recipe.candidate_types(), &[json.clone()]);
+    assert_eq!(recipe.candidate_types(), std::slice::from_ref(&json));
     assert!(
         super::PreparedNativeInListRecipe::try_new(false, &json, &[&plain], &boolean, &Compile)
             .is_err()

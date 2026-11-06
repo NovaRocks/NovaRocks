@@ -581,6 +581,8 @@ struct RootSessionState {
     before_finish_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_pool_turn: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_cleanup_close: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     _metadata: Arc<RootMetadataReservation>,
 }
 pub struct NativeRootResultSession {
@@ -824,6 +826,8 @@ impl NativeRootResultSession {
             before_finish_wake: Mutex::new(None),
             #[cfg(test)]
             before_pool_turn: Mutex::new(None),
+            #[cfg(test)]
+            after_cleanup_close: Mutex::new(None),
             _metadata: metadata,
         });
         let bridge = WakeBridge {
@@ -881,6 +885,14 @@ impl NativeRootResultSession {
         };
         join_root_exit_progress(pool, self.shared.authority.input_exit_progress())
     }
+    /// Register only the exact original pool cleanup phase, not a generic
+    /// writable notification which may have another physical drainer.
+    #[cfg(test)]
+    pub(crate) fn observe_cleanup_close_for_test(&self, observer: Box<dyn FnOnce() + Send>) {
+        let mut original = self.shared.after_cleanup_close.lock().unwrap();
+        assert!(original.is_none(), "one exact cleanup-close observer");
+        *original = Some(observer);
+    }
     #[cfg(test)]
     pub(crate) fn assert_scalar_origin_handoff_at_cleanup(
         &self,
@@ -889,8 +901,8 @@ impl NativeRootResultSession {
         let state = self
             .shared
             .state
-            .try_lock()
-            .expect("the actual producer releases its state before cleanup callbacks");
+            .lock()
+            .expect("the actual cleanup callback reenters the producer mutex");
         assert!(
             state.cleanup_started,
             "the original pool cleanup has started"
@@ -938,19 +950,20 @@ impl NativeRootResultSession {
             original_scalar,
             "the actual original scalar codec source reaches the Task"
         );
-        assert!(
-            self.shared.state.try_lock().is_ok(),
-            "producer mutex is released before Task callbacks"
-        );
-        assert!(
-            self.shared.failure_reporter.try_lock().is_ok(),
-            "reporter mutex is released before Task callbacks"
+        // These actual callbacks must reenter both mutexes. A different
+        // legitimate reader is not evidence that this callback owns a lock.
+        // The original receiver/Node deadlines still bound a reentry failure.
+        drop(
+            self.shared
+                .failure_reporter
+                .lock()
+                .expect("the actual Task callback reenters the reporter mutex"),
         );
         let state = self
             .shared
             .state
-            .try_lock()
-            .expect("the actual Root cleanup gate keeps producer state available");
+            .lock()
+            .expect("the actual Task callback reenters the producer mutex");
         let failed = state
             .failed
             .as_ref()
@@ -1785,6 +1798,16 @@ impl RootSessionState {
             1 => {
                 if !self.state().completed {
                     self.channel.close(RootRetentionClose::ParticipationAborted);
+                    #[cfg(test)]
+                    {
+                        let observer = self.after_cleanup_close.lock().unwrap().take();
+                        if let Some(observer) = observer {
+                            // The actual channel close returned; this worker
+                            // holds neither Root mutex, and the original CPU
+                            // cleanup phase has not advanced to input disposal.
+                            observer();
+                        }
+                    }
                 }
             }
             2..=5 => return self.exit_input_phase(InputExitPhase::ALL[(phase - 2) as usize]),
@@ -3603,24 +3626,17 @@ pub(crate) mod terminal_observation_tests {
     }
 
     #[tokio::test]
-    async fn native_client_root_dispatches_from_frozen_family() {
+    async fn native_client_root_preserves_the_explicit_frozen_trino_presentation() {
         use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
         use novarocks_result_contract::{
             ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderColumn,
             RenderField, RenderPresentation,
         };
-        for (family, presentation, expected) in [
-            (
-                ClientPresentationFamily::MysqlText,
-                RenderPresentation::ScalarText,
-                b"\x03\0\0\0\x0242".as_slice(),
-            ),
-            (
-                ClientPresentationFamily::TrinoJson(Default::default()),
-                RenderPresentation::TrinoValue,
-                b"\x04\0\0\0[42]".as_slice(),
-            ),
-        ] {
+        for (family, presentation, expected) in [(
+            ClientPresentationFamily::TrinoJson(Default::default()),
+            RenderPresentation::TrinoValue,
+            b"\x04\0\0\0[42]".as_slice(),
+        )] {
             let output = FrozenRootOutput::ClientRows(
                 ClientRenderSchema::try_new(
                     family,
@@ -3693,14 +3709,20 @@ pub(crate) mod terminal_observation_tests {
             let output = if client {
                 FrozenRootOutput::ClientRows(
                     ClientRenderSchema::try_new(
-                        novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                        novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                            novarocks_result_contract::TrinoJsonFacts {
+                                parametric_datetime: true,
+                                variant: true,
+                                variant_binary: true,
+                            },
+                        ),
                         vec![RenderColumn {
                             source_ordinal: 0,
                             source_slot: Some(1),
                             name: "value".into(),
                             field: RenderField {
                                 native_type: NativeRenderType::SignedInteger(64),
-                                presentation: RenderPresentation::ScalarText,
+                                presentation: RenderPresentation::TrinoValue,
                                 nullable: false,
                             },
                         }],

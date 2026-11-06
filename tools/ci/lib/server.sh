@@ -53,7 +53,7 @@ ci_start_all_in_one_server() {
 
   i=0
   while [ "$i" -lt "$timeout_seconds" ]; do
-    if grep -q '^NOVAROCKS_READY mysql_port=' "$log_path" 2>/dev/null; then
+    if grep -Eq '^NOVAROCKS_READY role=fe trino_port=[0-9]+ pid=[0-9]+$' "$log_path" 2>/dev/null; then
       return 0
     fi
 
