@@ -59,3 +59,6 @@ pub use render_schema::{
 
 mod write_counts;
 pub use write_counts::*;
+
+mod summary;
+pub use summary::*;
