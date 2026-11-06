@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0218 (docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)
 //! Exit wrappers keep one original obligation with the actual future or job.
 //! The wrapper destroys the work and its captures before publishing exit. This
 //! covers this work item, not detached work started internally by dependencies.

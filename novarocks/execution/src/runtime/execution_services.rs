@@ -282,6 +282,10 @@ impl IoExecutor {
         &self.metrics
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Process sink-IO dispatch requires the original task control entry; see ADR-0218."
+    )]
     fn spawn_on<F>(&self, fut: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,

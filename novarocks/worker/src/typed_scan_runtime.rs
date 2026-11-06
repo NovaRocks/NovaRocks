@@ -307,8 +307,9 @@ pub struct TypedScanRuntime {
 /// What hosts the typed scan streams of one BE application: the bounds of
 /// each stream's speculative successor window, the one timer that supervises
 /// paused windows, and the scan I/O runtime a stream is entered into whenever
-/// it is polled or closed, so page streams may use its timers and spawn onto
-/// it.
+/// it is polled or closed. That context supplies timers and I/O drivers;
+/// entering it grants no spawn authority. Concurrent query work goes through
+/// the admitted connector operation and I/O entries.
 #[derive(Clone)]
 pub struct ScanStreamHost {
     preparation: ScanPreparationConfig,
@@ -335,8 +336,12 @@ impl ScanStreamHost {
         &self.timer
     }
 
-    pub fn runtime(&self) -> &tokio::runtime::Handle {
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
         &self.runtime
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn runtime_for_test(&self) -> &tokio::runtime::Handle {
+        self.runtime()
     }
 }
 

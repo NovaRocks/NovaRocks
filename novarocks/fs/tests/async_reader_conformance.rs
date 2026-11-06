@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! The awaited Parquet reader against the blocking one: the same rows,
 //! positions and storage reads, with a decoder request's independent ranges
 //! fetched concurrently through the source's range service.

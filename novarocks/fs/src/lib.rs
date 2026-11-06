@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; see ADR-0218."
+    )
+)]
+
 //! Connector-neutral file access and columnar physical decoding.
 //!
 //! This crate deliberately has no connector identity and owns no table-format

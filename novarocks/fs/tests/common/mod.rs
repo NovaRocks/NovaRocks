@@ -75,6 +75,10 @@ impl FileIoRuntime for TestIo {
 }
 
 impl FileIoSpawner for TestIo {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Integration-test I/O carrier owns its original FileIoJob; see ADR-0218."
+    )]
     fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         Ok(FileIoJob::new(self.runtime.spawn(task)))
     }

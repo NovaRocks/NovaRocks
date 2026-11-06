@@ -704,6 +704,10 @@ impl RootProducerLimits {
     }
 }
 impl RootProducerPool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The original Root producer pool owns and joins its workers; see ADR-0218."
+    )]
     pub fn try_new(
         threads: NonZeroUsize,
         positions: NonZeroUsize,

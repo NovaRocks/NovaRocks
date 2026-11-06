@@ -312,6 +312,10 @@ impl TokioFileIoSpawner {
 }
 
 impl FileIoSpawner for TokioFileIoSpawner {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Dispatches the original FileIoJob with its caller-owned drain obligation; see ADR-0218."
+    )]
     fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         Ok(FileIoJob::new(self.handle.spawn(task)))
     }

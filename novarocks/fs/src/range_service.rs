@@ -1345,6 +1345,10 @@ impl FileRangeService {
         None
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The segment supervisor owns the original FileIoJob drain and preserves unresolved loss; see ADR-0218."
+    )]
     fn spawn_segment(self: &Arc<Self>, work: Dispatch) {
         let Dispatch {
             id,

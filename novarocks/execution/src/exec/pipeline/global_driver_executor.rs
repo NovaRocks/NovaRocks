@@ -437,7 +437,7 @@ impl Drop for LiveDriverGuard {
 }
 
 impl DriverRunner {
-    pub fn new(
+    pub(crate) fn new(
         driver: PipelineDriver,
         completion: Arc<DriverGroupCompletion>,
         task_ctx: Arc<TaskContext>,
@@ -703,6 +703,10 @@ impl DriverExecutorExitProbes {
 }
 
 impl GlobalDriverExecutor {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Process driver-pool construction and owned worker lifecycle; see ADR-0218."
+    )]
     pub fn new(num_threads: usize) -> Self {
         let num_threads = num_threads.max(1);
         // The existing bounded cleanup owner exists before any prepared Task
@@ -744,7 +748,8 @@ impl GlobalDriverExecutor {
     /// Returns `false` after shutdown has closed admission. Rejected drivers
     /// receive cooperative cancellation, but a driver with live asynchronous
     /// finish work does not publish a forged stopped fact.
-    pub fn submit(&self, tasks: Vec<DriverRunner>) -> bool {
+    #[cfg(test)]
+    pub(crate) fn submit(&self, tasks: Vec<DriverRunner>) -> bool {
         let batch = DriverBatch::new(tasks);
         self.submit_owned(&batch)
     }
@@ -869,6 +874,10 @@ impl GlobalDriverExecutor {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The driver service retains and joins the original worker handles; see ADR-0218."
+    )]
     fn start_shutdown_reaper(&self) {
         self.begin_shutdown();
         let workers = {
@@ -974,6 +983,10 @@ impl RejectedDriverReaper {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The driver service retains rejected drivers through actual asynchronous finish; see ADR-0218."
+)]
 fn rejected_driver_reaper() -> &'static Arc<RejectedDriverReaper> {
     static REAPER: OnceLock<Arc<RejectedDriverReaper>> = OnceLock::new();
     REAPER.get_or_init(|| {

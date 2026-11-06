@@ -92,6 +92,10 @@ impl NativeDnsResolver {
 
     /// `lookup` is the blocking resolver call; production passes the
     /// standard library resolver. It runs only for DNS reference hosts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The DNS service retains its blocking permit through actual resolver work; see ADR-0218."
+    )]
     pub(crate) async fn resolve_with<F>(
         &self,
         endpoint: &NativeEndpoint,

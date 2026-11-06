@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! Original complete JSON invocation under the sole shipping GLOBAL.
 //! Safe record identities observe each backing, never hidden Buffer tails.
 #[path = "support/shift_runtime_funding.rs"]

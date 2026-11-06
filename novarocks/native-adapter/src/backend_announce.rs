@@ -45,6 +45,10 @@ pub struct BackendAnnounceSupervisor {
 }
 
 impl BackendAnnounceSupervisor {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The backend announce service owns its original worker; see ADR-0218."
+    )]
     pub fn start(
         data_runtime: BackendDataRuntime,
         frontend_endpoint: NativeEndpoint,

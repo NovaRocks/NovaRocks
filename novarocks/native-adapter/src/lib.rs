@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Server-resolved Native transport capabilities and protocol adapters.
 
 /// Capabilities compiled by this owner; activation still requires a role session.
@@ -351,6 +359,10 @@ impl BackendDataRuntime {
         self.transport_admission.as_ref()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Runs the original sender ExitObligation and wakes its Worker owner after actual drop; see ADR-0218."
+    )]
     pub(crate) fn spawn_with_obligation<F>(
         &self,
         work: novarocks_worker::RuntimeFilterSenderWork,
@@ -370,7 +382,7 @@ impl BackendDataRuntime {
         })
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
+    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send,
         F::Output: Send,
@@ -381,7 +393,7 @@ impl BackendDataRuntime {
             self.handle.block_on(future)
         }
     }
-    pub fn handle(&self) -> &Handle {
+    pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
     pub fn native_trust(&self) -> &Arc<NativeTrust> {

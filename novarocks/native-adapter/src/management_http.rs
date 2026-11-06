@@ -57,6 +57,10 @@ pub struct MetricsHttpServer {
 }
 
 impl MetricsHttpServer {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The management listener owns its service worker; see ADR-0218."
+    )]
     pub fn start(
         host: &str,
         port: u16,

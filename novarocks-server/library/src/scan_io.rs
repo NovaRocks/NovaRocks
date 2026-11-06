@@ -88,6 +88,10 @@ struct TrackedFileIoRuntime {
 }
 
 impl FileIoRuntime for TrackedFileIoRuntime {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Dispatches synchronous storage I/O on the process scan-I/O carrier; see ADR-0218."
+    )]
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<bytes::Bytes> {
         ensure_blocking_bridge_available()?;
         let flight = self.flight.enter()?;
@@ -103,6 +107,10 @@ impl FileIoRuntime for TrackedFileIoRuntime {
             .block_on_bytes(Box::pin(async move { map_scan_join(task.await) }))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Dispatches synchronous storage I/O on the process scan-I/O carrier; see ADR-0218."
+    )]
     fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
         ensure_blocking_bridge_available()?;
         let flight = self.flight.enter()?;
@@ -264,6 +272,10 @@ impl ScanIoRuntime {
     /// Call after backend driver shutdown has stopped every admitted scan.
     /// A runtime drop is performed only after all composed filesystem work
     /// has returned or observed its cancellation.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The scan-I/O service retains actual runtime drop and join ownership; see ADR-0218."
+    )]
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.services.range_service.close_admission();
         self.flight.close();

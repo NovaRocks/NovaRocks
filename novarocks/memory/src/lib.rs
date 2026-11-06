@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Carrier-neutral hierarchical memory accounting. Funded boundaries are
 //! local; independent funding domains retain independent redemption rights.
 //! Allocation facts may exceed backing and remain charged after teardown.

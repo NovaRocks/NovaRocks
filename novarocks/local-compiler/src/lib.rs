@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Pure fragment preparation. Provider validation is a distinct intermediate
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 

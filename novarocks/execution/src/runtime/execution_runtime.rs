@@ -277,7 +277,7 @@ impl ExecutionRuntime {
         Arc::clone(&self.exchange_registry)
     }
 
-    pub fn driver_executor(&self) -> Arc<GlobalDriverExecutor> {
+    pub(crate) fn driver_executor(&self) -> Arc<GlobalDriverExecutor> {
         Arc::clone(&self.driver_executor)
     }
 

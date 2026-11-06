@@ -115,6 +115,10 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
         Some(self.activity.clone())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "FE catalog-control work uses this shared provider service carrier; see ADR-0218."
+    )]
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,

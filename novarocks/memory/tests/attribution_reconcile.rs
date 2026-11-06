@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 #[cfg(not(loom))]
 #[test]
 fn attribution_reconcile() {

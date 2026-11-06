@@ -1249,7 +1249,7 @@ impl NativeTaskExecutionHost {
             && let Some(cause) = preparation_child
                 .inject_prepared_exit_failure(
                     controls,
-                    self.scan_stream_host.runtime(),
+                    self.scan_stream_host.runtime_for_test(),
                     prepared_exit_readiness,
                 )
                 .map_err(|detail| {
@@ -2056,7 +2056,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             super::task_update_replay_gate::ReplayReservation::new(
                 gate,
                 Arc::clone(controls),
-                self.scan_stream_host.runtime().clone(),
+                self.scan_stream_host.runtime_for_test().clone(),
             ),
         ))
     }
@@ -7841,8 +7841,7 @@ pub(crate) mod tests {
                         .expect("the actual prepared kernel exists before driver shutdown");
                     callback_host
                         .execution_runtime
-                        .driver_executor()
-                        .shutdown()
+                        .shutdown_driver_execution()
                         .unwrap();
                     prepared.send(()).unwrap();
                 },

@@ -85,6 +85,10 @@ impl<F> Drop for ExchangeCallFuture<F> {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The original ExchangeCallActivity covers the transmitted future and its captures; see ADR-0218."
+)]
 fn spawn_exchange_call(
     runtime: &BackendDataRuntime,
     activity: ExchangeCallActivity,

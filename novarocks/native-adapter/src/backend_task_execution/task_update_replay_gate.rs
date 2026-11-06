@@ -226,6 +226,10 @@ impl TaskUpdateReplayGate {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The authorized development replay gate owns its watcher; see ADR-0218."
+    )]
     fn watch(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
         let weak = Arc::downgrade(self);
         let control = self.control.clone();

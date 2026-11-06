@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! Real Worker participation/admission tests for the transport-independent reader.
 //! These tests install no RPC and make no HTTP/H2 ownership claim.
 

@@ -33,8 +33,9 @@
 //!
 //! No runtime type crosses this interface. The host does poll a stream, and
 //! call its methods, inside a Tokio runtime context, so a stream may create
-//! Tokio timers and spawn onto that runtime; it must never block the thread
-//! that polls it.
+//! timers and use its I/O drivers. Entering that context grants no work or
+//! spawn authority: concurrent operations use the connector's admitted
+//! operation and I/O entries. A stream never blocks the thread that polls it.
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
