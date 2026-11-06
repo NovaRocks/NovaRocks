@@ -63,7 +63,7 @@ Trino 的 MERGE 规划对 `(unique_id, case_number)` 做 MarkDistinct：已匹�
 6. **规划声明规则。** failure-contract 定义 SQL 域违约原因；FE 规划在准确断言上声明，依次经物理计划、package 与 LocalCompiler 传到 BE。键控断言失败沿 Data 类返回所声明原因；没有声明的断言仍返回原中立原因 7:317。执行侧不解释 SQL 语句种类，不解析消息以决定原因。
 7. **协议投影规则。** Trino 边界只按声明原因投影 `MERGE_TARGET_ROW_MULTIPLE_MATCHES`、119 与 USER_ERROR。MERGE 文本为 `One MERGE target table row matched more than one source row`；UPDATE FROM 使用 UPDATE 替换 MERGE。文本不加内部 code 前缀或发布终态后缀，诊断继续保留原失败位置和发布事实。其他失败映射不变。
 8. **精确版本规则。** package 新增声明身份是计划合同变化，随 plan contract revision 与原生 exact-island 身份更新。无旧格式透明读取、跨版本降级或 statement-text fallback。断言成功、写入提交与实际退出仍分别取证。
-9. **阶段范围。** 用户在RWM-5执行中明确选择：本次119、多键与NoAction对齐限定MOR。COW UPDATE/UPDATE FROM及matched-UPDATE MERGE保留独立selection/consumer，普通重复拒绝尚无计划119身份，未命中WHEN的已匹配行仍先过滤。insert-only、可DELETE的MERGE由Provider路由MOR，属于本次合同。RWM-7切换UPDATE到MOR、RWM-8删除COW后完成全路径收敛；不为过渡COW另做一套机制，也不事后统一映射Connector错误。
+9. **阶段范围。** 用户在RWM-5执行中明确选择：本次119、多键与NoAction对齐限定MOR。仍可达的COW UPDATE/UPDATE FROM保留独立consumer，普通重复拒绝尚无计划119身份。完整FE effects把matched UPDATE的MERGE也计入Delete，当前所有SQL MERGE均由Provider路由MOR，属于本次合同；保留COW MERGE helper的旧NoAction过滤不可误报为现产品缺口。RWM-7切换UPDATE、RWM-8删除遗留COW后收敛，不另造临时COW机制或事后统一映射Connector错误；共享metadata声明仍须逐列准确。
 
 本条仅替代 ADR-0055 中依赖 `write.row-lineage` 的历史准入描述与其妥协 1 的 v2 加属性不可写限制；Provider 策略唯一、DELETE 按格式版本、SQL 谓词合法性与其余有效裁决保留。
 
