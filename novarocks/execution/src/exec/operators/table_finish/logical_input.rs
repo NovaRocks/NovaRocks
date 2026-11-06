@@ -115,6 +115,7 @@ impl FinishSummaryInput {
         !self.end && (self.wait.as_ref().is_none_or(WaitFact::is_ready) || self.input.ready())
     }
 }
+// Design: ADR-0218 (docs/adr/ADR-0218-typed-task-summaries-and-per-kind-completion.md)
 struct LogicalFinish {
     core: TableFinishOperator,
     core_next: NextStep,

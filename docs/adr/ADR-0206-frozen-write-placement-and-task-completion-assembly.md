@@ -6,11 +6,13 @@ status: active
 supersedes: []
 superseded-by: null
 date: 2026-10-28
+related:
+  - "ADR-0218-typed-task-summaries-and-per-kind-completion.md"
 provenance:
   - "discussion: 2026-10-23 accepted independent write placement, logical summary and strict delivery contracts"
   - "implementation: frozen write placement and exact Task completion assembly"
 code-anchors:
-  - "novarocks/physical-plan/src/write_execution.rs (StagePlacementPolicy, WriteRouteRequirements, LogicalSummaryColumns)"
+  - "novarocks/physical-plan/src/write_execution.rs (StagePlacementPolicy, WriteRouteRequirements, SummaryColumns)"
   - "novarocks/query-application/src/coordination/schedule.rs (build_attempt_schedule)"
   - "novarocks/frontend-application/src/query_execution/artifact/task_manifest_binding.rs (TaskManifestBinding::summary_sources, TaskManifestBinding::writer_cohorts)"
   - "novarocks/frontend-application/src/task_execution/manifest_round.rs (ManifestAssembledRound::run)"
@@ -19,7 +21,7 @@ code-anchors:
   - "novarocks/native-adapter/src/compiled_writer_binding.rs (bind_compiled_writers)"
   - "novarocks/native-adapter/src/backend_task_execution/execution_host.rs (validate_native_strict_inputs, NativeTaskExecutionHost::retire_receiver_normally)"
   - "novarocks/execution/src/exec/pipeline/executor.rs (prepare_compiled_program_with_sink_materializer)"
-  - "novarocks/execution/src/runtime/fragment/sink.rs (materialize_compiled_sink_for_pipeline)"
+  - "novarocks/execution/src/runtime/task/sink.rs (materialize_compiled_sink_for_pipeline)"
   - "novarocks/execution/src/exec/pipeline/builder/compiled_writer.rs (build_logical_finish)"
   - "novarocks/frontend-application/src/query/statement_publication.rs (StatementPublication)"
   - "novarocks/frontend-application/src/query/write_action.rs (selected_command_completion)"

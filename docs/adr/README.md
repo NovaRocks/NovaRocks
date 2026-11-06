@@ -125,6 +125,7 @@ code-anchors:
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
+- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0214](ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md) — 在线数据为何在准备期冻结完整布局、只传独立标准批次，并分开物理NULL、逻辑requiredness、原预算与真实线程退出（active；补充ADR-0209，普通root IPC保持）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
@@ -242,6 +243,7 @@ code-anchors:
 
 资源沿用原 executor、Transport 和结果预算；普通 Full 是可取消背压。完整依赖事实约束来源与责任，不构成另一套工作类别或依赖域配额。计算位置、仍活数据和残留责任分别退出，超时不证明实际退出。公平推进以资源可用、依赖能够返回为条件；共享 worker 全部永久阻塞时，健康请求与结算也可能不可用，不据此承诺故障隔离或新增 worker 最低数。
 
+- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）
@@ -435,6 +437,7 @@ StateStore 的全局单值限制保持公共契约，record owner 负责自己�
 Iceberg；Paimon 仅支持已声明的只读快照，StarRocks 已废弃且不能恢复内部表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
+- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）

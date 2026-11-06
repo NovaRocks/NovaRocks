@@ -359,12 +359,16 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   不能重建已删除的 construction plan bridge。
 
 - `novarocks/execution/src/runtime/task/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
-  Router 按原 static branch 绑定 provider route 与独立 summary，表达式 root 保留原 branch 身份。
+  Router 按原 static branch 绑定 provider route；fragment 级 summary 声明独立保留种类、作者与分支。
+  全局分支顺序为原 sink 分支后接声明的 summary；表达式 root 保留原 branch 身份。
+  作者在 driver 创建前冻结贡献单位，末尾 Source 创建核对全部单位已领取；各 summary pipeline
+  加入同一 DriverBatch，当前生产作者只有 Router 的 WriteCounts，所有节点作者明确拒绝。
   writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
-  WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
-  合流和准确 source-bound summary，不再为 summary 构建竞争同一 receiver 的第二个 Source。
+  WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results、
+  各种类准确 source-bound summary 和原核心续体，不为同一 summary receiver 构建第二个 Source。
   核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
-  冻结放置、Task 绑定与完成装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)。
+  冻结放置与装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)，
+  类型化种类、作者单位与逐种类完成见 [ADR-0218](docs/adr/ADR-0218-typed-task-summaries-and-per-kind-completion.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -546,7 +550,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    splits, never of the cluster size.
    `coordination/schedule.rs` 消费显式 Singleton/ScanWork/Spread/FollowSources policy，
    独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
-   冻结的域。manifest 从同一准确 placement 分别冻结 writer 与 summary-source Task 集合。
+   冻结的域。manifest 从同一准确 placement 分别冻结 writer 与按种类的 summary-source Task 集合；
+   各集合均属于原 Task graph，同一 Task 可承担多个种类，完成义务不能互相替代或跨 attempt 拼接。
 2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
    Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
    稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；

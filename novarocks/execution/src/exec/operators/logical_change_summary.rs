@@ -121,6 +121,7 @@ struct SummaryAuthorEntry {
     claimed: bool,
     state: Option<TaskSummaryState>,
 }
+// Design: ADR-0218 (docs/adr/ADR-0218-typed-task-summaries-and-per-kind-completion.md)
 /// Task-local preparation obligation. It is checked by `seal`, with no Drop
 /// panic or replacement of an earlier construction failure. Its frozen author
 /// facts grant no memory capacity; the actual author supplies the Task tracker.
