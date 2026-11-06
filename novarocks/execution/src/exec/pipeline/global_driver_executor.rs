@@ -69,7 +69,7 @@ impl ParkingPhase {
 }
 use driver_batch::{Poll as ReaperPoll, ReaperEntry};
 
-const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Drivers synchronously encode online units and destroy their source arrays.
 // Runtime ownership fixes this stack independently of test thread settings.
 const DRIVER_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;

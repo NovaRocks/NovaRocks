@@ -4882,10 +4882,14 @@ pub(crate) mod tests {
         let actor = runtime_state
             .sink_io_executor()
             .expect("sink-I/O executor")
-            .spawn(async move {
-                let permit = actor_gate.acquire().await.expect("actor exit gate");
-                permit.forget();
-            });
+            .spawn(
+                &crate::runtime::execution_services::test_io_control(),
+                async move {
+                    let permit = actor_gate.acquire().await.expect("actor exit gate");
+                    permit.forget();
+                },
+            )
+            .expect("admit the original test actor");
         writer
             .kernel_for_test_mut()
             .writer

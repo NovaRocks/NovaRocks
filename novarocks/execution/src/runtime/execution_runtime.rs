@@ -288,6 +288,15 @@ impl ExecutionRuntime {
         self.driver_executor.shutdown()
     }
 
+    /// Seal sink actor admission before waiting for actual future/capture exit.
+    /// A deadline only stops this wait; live actors retain their own responsibility.
+    pub fn shutdown_sink_io(&self) -> crate::runtime::task::ExecutionResult<()> {
+        let io = self.services.sink_io();
+        io.close_admission();
+        io.wait_live_exit(crate::exec::pipeline::global_driver_executor::DEFAULT_SHUTDOWN_TIMEOUT)
+            .map_err(Into::into)
+    }
+
     pub fn exchange_unit_scheduler(&self) -> Arc<ExchangeUnitSendScheduler> {
         Arc::clone(&self.exchange_unit_scheduler)
     }
