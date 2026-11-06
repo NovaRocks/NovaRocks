@@ -421,3 +421,38 @@ fn input_destructor_panic_retains_unknown_work_and_payload_while_other_context_p
     assert!(!bad.0.state.lock().unwrap().captures_exited);
     assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn never_invoked_host_body_needs_no_late_cleanup_derivation_or_provider_hook() {
+    let mut fixture = Fixture::new();
+    let scope = fixture.scope();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (owner, job) = fixture.admitted(&scope, 1, input(drops.clone()));
+    let children = Arc::new(crate::task_preparation::TaskPreparationScope::new(
+        owner.0.task,
+        owner.0.health.clone(),
+    ));
+    owner.bind_host_children(children.clone());
+    scope.request_stop().unwrap();
+    let outcome = job.run(|_, _| panic!("stopped original host body must not run"));
+    assert!(matches!(
+        outcome,
+        PreparationOutcome::TaskStopped | PreparationOutcome::StartRefused(_)
+    ));
+    children.body_exited();
+    assert!(owner.rollback_host_runtime(
+        || panic!("an uninvoked host installed no inbound capability"),
+        || panic!("an uninvoked host installed no receiver"),
+    ));
+    let proof = children
+        .never_adopted_rollback_exit()
+        .expect("positive original uninvoked-body proof");
+    assert_eq!(
+        proof.output_exit(),
+        crate::TaskPreparationOutputExit::NoOutputCreated
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(fixture.ledger.unresolved_work().is_empty());
+    fixture.release(&owner);
+    fixture.finish();
+}

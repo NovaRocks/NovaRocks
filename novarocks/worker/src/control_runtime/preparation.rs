@@ -73,7 +73,7 @@ struct Custody {
     stop: TaskStopSignal,
     parent: PreparationParent,
     input: Mutex<Option<ManuallyDrop<TaskCreationInput>>>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     body_report: ReportSlot,
     exit_report: ReportSlot,
     preparing: ResourceVector,
@@ -93,13 +93,15 @@ pub(crate) struct PreparationParent {
     scope: ScopeHandle,
     work: WorkId,
     authority: Result<novarocks_control_runtime::obligation::WorkChildAuthority, RuntimeError>,
+    funding: Arc<Mutex<State>>,
 }
 impl PreparationParent {
-    pub(crate) fn from_admitted(work: &WorkObligation) -> Self {
+    fn from_admitted(work: &WorkObligation, funding: Arc<Mutex<State>>) -> Self {
         Self {
             scope: work.scope().clone(),
             work: work.id(),
             authority: work.child_authority(),
+            funding,
         }
     }
     pub(crate) fn admission_proof(
@@ -109,6 +111,38 @@ impl PreparationParent {
             .as_ref()
             .map_err(|error| *error)?
             .verify_live()
+    }
+    /// Transfer the same preparation's unused positions into its actual child.
+    /// This private loan never keeps a Custody/host-children cycle alive.
+    pub(crate) fn reserve_host_work(
+        &self,
+        kind: WorkKind,
+        resources: ReservationResources,
+    ) -> Result<novarocks_control_runtime::reported_work::ReportedWork, RuntimeError> {
+        let mut funding = self
+            .funding
+            .lock()
+            .expect("original preparation child funding");
+        let State { work, capacity, .. } = &mut *funding;
+        let parent = work.as_ref().ok_or(RuntimeError::Scope(
+            novarocks_control_runtime_core::scope::ScopeError::InvalidTransition,
+        ))?;
+        let payer = capacity.as_mut().ok_or(RuntimeError::Scope(
+            novarocks_control_runtime_core::scope::ScopeError::InvalidTransition,
+        ))?;
+        self.scope.reserve_child_from(
+            payer,
+            parent,
+            novarocks_control_runtime::transaction::DeclaredInput {
+                generation: self.scope.gates()?.generation,
+                kind,
+                resources,
+                consumers: vec![(PREPARATION_OBSERVER_CONSUMER, ConsumerKind::Observer)],
+            },
+        )
+    }
+    pub(crate) fn scope(&self) -> &ScopeHandle {
+        &self.scope
     }
     #[cfg(test)]
     pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepRegistration, RuntimeError> {
@@ -220,8 +254,8 @@ impl std::error::Error for PreparationStorageSplitError {
     }
 }
 /// The original Accepted preparation body is independent of its future Task
-/// lifecycle authors. Its same guard owns one Work, two exit reports, and the
-/// one actual input capture; it has no causal input, cut, reply, or RPC role.
+/// lifecycle authors. Its same guard prepays that body, its reports/input and
+/// the bounded host subtree below; it has no causal input, cut, reply, or RPC role.
 pub(crate) const PREPARATION_STORAGE: crate::control_runtime_policy::StorageNeed =
     crate::control_runtime_policy::StorageNeed {
         requests: 0,
@@ -230,9 +264,11 @@ pub(crate) const PREPARATION_STORAGE: crate::control_runtime_policy::StorageNeed
         effects: 0,
         cuts: 0,
         replies: 0,
-        completions: 2,
-        captures: 1,
-        work: 1,
+        // The body has two reports and its input capture. Five fixed host
+        // callbacks and one registered child each own one Work/report/capture.
+        completions: 8,
+        captures: 7,
+        work: 7,
     };
 
 pub(crate) const PREPARATION_CORE_CONSUMER: ConsumerId = ConsumerId::new(1).unwrap();
@@ -353,26 +389,33 @@ impl PreparationCustody {
             ),
         ])
         .expect("fixed preparation release dimensions");
-        let parent = PreparationParent::from_admitted(&work);
+        let state = Arc::new(Mutex::new(State {
+            work: Some(work),
+            capacity: Some(capacity),
+            body_exited: false,
+            captures_exited: false,
+            exit_published: false,
+            body_report_retired: false,
+            exit_report_retired: false,
+            transferred: false,
+            task_source_storage_transferred: false,
+            unresolved: false,
+            panics: [None, None],
+        }));
+        let parent = {
+            let original = state.lock().expect("original preparation funding");
+            PreparationParent::from_admitted(
+                original.work.as_ref().expect("admitted preparation"),
+                state.clone(),
+            )
+        };
         let [body_report, exit_report] = reports;
         let custody = Arc::new(Custody {
             task: binding.stop.identity(),
             stop: binding.stop,
             parent,
             input: Mutex::new(Some(ManuallyDrop::new(input))),
-            state: Mutex::new(State {
-                work: Some(work),
-                capacity: Some(capacity),
-                body_exited: false,
-                captures_exited: false,
-                exit_published: false,
-                body_report_retired: false,
-                exit_report_retired: false,
-                transferred: false,
-                task_source_storage_transferred: false,
-                unresolved: false,
-                panics: [None, None],
-            }),
+            state,
             body_report,
             exit_report,
             preparing,
@@ -584,25 +627,21 @@ impl PreparationCustody {
     /// exit report. Source aliases and report consumption retain their own
     /// independent whole-preparation/capacity retirement obligations.
     pub(crate) fn host_borrowers_exited(&self) -> bool {
-        let exited = {
-            let state = self.0.state.lock().expect("preparation borrower exit");
-            !state.unresolved && state.body_exited && state.captures_exited
-        };
-        exited
-            && self
-                .host_children()
-                .is_none_or(|child| child.host_captures_exited())
+        // Sources and independent report consumers retain their own whole-exit
+        // obligations; this loan observes only the actual host subtree.
+        let children_exited = self.host_children().is_none_or(|children| {
+            children
+                .retire_ready()
+                .expect("preparation host child retirement")
+        });
+        let state = self.0.state.lock().expect("preparation borrower exit");
+        !state.unresolved && state.body_exited && state.captures_exited && children_exited
     }
     /// The physical worker can already be reused. Children, input unwind and
     /// independent report consumers can still prevent whole exit/charge reuse.
     pub(crate) fn publish_whole_exit(&self) -> Result<bool, RuntimeError> {
-        // The foreign provider was already driven by the host, outside these
-        // locks. Body return alone cannot retire a registered dormant kernel.
-        if self
-            .host_children()
-            .is_some_and(|child| !child.host_captures_exited())
-        {
-            return Ok(false);
+        if let Some(children) = self.host_children() {
+            children.retire_ready()?;
         }
         let mut state = self.0.state.lock().expect("preparation custody lock");
         if state.exit_published {
@@ -688,12 +727,24 @@ impl PreparationJob {
                 .expect("preparation work")
                 .start();
             match start {
-                Ok(()) if !self.custody.0.stop.is_set() => PreparationOutcome::Returned(host(
-                    self.custody
-                        .take_input()
-                        .expect("one actual preparation input"),
-                    self.custody.0.parent.clone(),
-                )),
+                Ok(()) if !self.custody.0.stop.is_set() => {
+                    if let Some(children) = self.custody.host_children()
+                        && let Err(error) = children.bind_runtime(
+                            self.custody.0.parent.clone(),
+                            self.custody.0.pending.clone(),
+                        )
+                    {
+                        drop(host);
+                        drop(self.custody.take_input());
+                        return PreparationOutcome::StartRefused(error);
+                    }
+                    PreparationOutcome::Returned(host(
+                        self.custody
+                            .take_input()
+                            .expect("one actual preparation input"),
+                        self.custody.0.parent.clone(),
+                    ))
+                }
                 Ok(()) => {
                     drop(host);
                     drop(self.custody.take_input());
@@ -708,6 +759,13 @@ impl PreparationJob {
         }));
         let outcome = match result {
             Ok(outcome) => {
+                if matches!(
+                    outcome,
+                    PreparationOutcome::TaskStopped | PreparationOutcome::StartRefused(_)
+                ) && let Some(children) = self.custody.host_children()
+                {
+                    children.body_never_invoked();
+                }
                 self.custody.observe_body(true);
                 outcome
             }
@@ -725,6 +783,26 @@ impl PreparationJob {
         };
         self.active = false;
         outcome
+    }
+    #[cfg(test)]
+    pub(crate) fn start_for_test(&mut self) -> PreparationParent {
+        self.custody
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap()
+            .start()
+            .unwrap();
+        self.custody.0.parent.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn finish_body_for_test(mut self) {
+        drop(self.custody.take_input());
+        self.custody.observe_body(true);
+        self.active = false;
     }
     /// Cancellation removes a queued job; this host-side disposal is the
     /// positive exit observation. Queue removal/Drop alone proves no exit.

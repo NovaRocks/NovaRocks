@@ -485,11 +485,14 @@ impl TaskPreparationJob {
         let binding = self.host.take();
         let children = binding.as_ref().map(|binding| binding.children.clone());
         let captures = binding;
-        let _outcome = self.run(move |_request, input, _parent| {
+        let outcome = self.run(move |_request, input, _parent| {
             drop(input);
             drop(captures);
         });
         if let Some(children) = children {
+            if !matches!(outcome, PreparationOutcome::Unresolved) {
+                children.body_never_invoked();
+            }
             children.body_exited();
         }
     }

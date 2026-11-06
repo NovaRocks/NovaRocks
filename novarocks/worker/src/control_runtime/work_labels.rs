@@ -20,4 +20,20 @@
 pub(crate) const PARTICIPATION_INSTANCE: &str = "participation-instance";
 pub(crate) const RUNTIME_FILTER_SENDER: &str = "runtime-filter-sender";
 
-pub const WORK_DIAGNOSTIC_LABELS: &[&str] = &[PARTICIPATION_INSTANCE, RUNTIME_FILTER_SENDER];
+pub(crate) const PREPARATION_CANCEL: &str = "preparation.cancel";
+pub(crate) const PREPARATION_INBOUND: &str = "preparation.inbound";
+pub(crate) const PREPARATION_RECEIVER: &str = "preparation.receiver";
+pub(crate) const PREPARATION_CHILD: &str = "preparation.child";
+pub(crate) const PREPARATION_ADOPT: &str = "preparation.adopt";
+pub(crate) const PREPARATION_PUBLICATION: &str = "preparation.publication";
+
+pub const WORK_DIAGNOSTIC_LABELS: &[&str] = &[
+    PARTICIPATION_INSTANCE,
+    RUNTIME_FILTER_SENDER,
+    PREPARATION_CANCEL,
+    PREPARATION_INBOUND,
+    PREPARATION_RECEIVER,
+    PREPARATION_CHILD,
+    PREPARATION_ADOPT,
+    PREPARATION_PUBLICATION,
+];
