@@ -18,7 +18,6 @@
 //! The Native preparation's two original, named physical obligations.
 //! Worker still registers one child; no producer work runs on its polling owner.
 
-use crate::native_query_context::NativeTaskRegistration;
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
     task::{
@@ -54,8 +53,8 @@ pub(crate) enum Phase {
     LocalTaskStart,
     LocalTaskPoll,
     LocalTaskHolder,
-    Registration,
-    Control,
+    // 9657 is retired with NativeTaskRegistration.
+    Control = 8,
     LocalTaskObserve,
     RootOutput,
 }
@@ -153,7 +152,6 @@ struct State {
     dormant: Option<ManuallyDrop<PreparedTaskExecution>>,
     running: Option<ManuallyDrop<RunningTaskExecution>>,
     publisher: Option<ManuallyDrop<LocalTaskTerminalPublisher>>,
-    registration: Option<ManuallyDrop<NativeTaskRegistration>>,
     // Only real prepared kernel work keeps this capability, never Root metadata.
     control: Option<Arc<TaskExecutionControl>>,
     phases: [Action; PHASES],
@@ -207,7 +205,6 @@ impl NativePreparationChild {
                 dormant: None,
                 running: None,
                 publisher: None,
-                registration: None,
                 control: None,
                 phases: [Action::NotStarted; PHASES],
                 primary: std::array::from_fn(|_| None),
@@ -404,7 +401,6 @@ impl NativePreparationChild {
                 Phase::LocalTaskStart
                     | Phase::LocalTaskPoll
                     | Phase::LocalTaskHolder
-                    | Phase::Registration
                     | Phase::Control
                     | Phase::LocalTaskObserve
             ) {
@@ -644,9 +640,9 @@ impl NativePreparationChild {
                 Err(payload) => self.fault(Phase::LocalTaskHolder, Some(payload), None),
             }
         }
-        self.finish_registration();
+        self.finish_control();
         let mut state = self.state.lock().unwrap();
-        let exited = [Phase::LocalTaskHolder, Phase::Registration, Phase::Control]
+        let exited = [Phase::LocalTaskHolder, Phase::Control]
             .iter()
             .all(|phase| state.phases[*phase as usize] == Action::Exited);
         if exited {
@@ -655,7 +651,7 @@ impl NativePreparationChild {
                 output: TaskPreparationOutputExit::Unknown,
             };
         }
-        if [Phase::LocalTaskHolder, Phase::Registration, Phase::Control]
+        if [Phase::LocalTaskHolder, Phase::Control]
             .iter()
             .any(|phase| state.phases[*phase as usize] == Action::Unresolved)
         {
@@ -664,26 +660,7 @@ impl NativePreparationChild {
             TaskPreparationChildExit::Pending
         }
     }
-    fn finish_registration(&self) {
-        // Core's actual terminal publication owns this independent native
-        // settlement even if a sibling Root fault stops Worker child polling.
-        if self.claim(Phase::Registration) {
-            let mut registration = self.state.lock().unwrap().registration.take();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(registration) = registration.as_mut() {
-                    unsafe {
-                        ManuallyDrop::drop(registration);
-                    }
-                }
-            }));
-            unsafe {
-                std::ptr::write(&mut registration, None);
-            }
-            match result {
-                Ok(()) => self.exited(Phase::Registration),
-                Err(payload) => self.fault(Phase::Registration, Some(payload), None),
-            }
-        }
+    fn finish_control(&self) {
         if self.claim(Phase::Control) {
             let control = self.state.lock().unwrap().control.take();
             match catch_unwind(AssertUnwindSafe(|| drop(control))) {
@@ -704,9 +681,9 @@ impl NativePreparationChild {
                     .task_stopped
                     .store(true, std::sync::atomic::Ordering::Release);
                 if rollback {
-                    owner.finish_registration();
+                    owner.finish_control();
                     // Kernel exit can follow the original owner's Pending
-                    // observation. Wake it after registration cleanup so that
+                    // observation. Wake it after control cleanup so that
                     // the same Task can finish its retained rollback.
                     owner.readiness_waker.wake_by_ref();
                 }
@@ -891,17 +868,6 @@ impl NativePreparationChild {
             return Err(NativePreparedOwnerFailure::StartWithoutAdoption.into());
         }
         self.bind_publisher(Some(completion))?;
-        // The original lease's into_running is pure: its Drop sees active=false
-        // and cannot publish a pre-ready rollback snapshot.
-        let registration = self
-            .state
-            .lock()
-            .unwrap()
-            .registration
-            .take()
-            .expect("one original registration transfer");
-        ManuallyDrop::into_inner(registration).into_running();
-        self.exited(Phase::Registration);
         // The exact NativeRunnable was attached before this handoff. Releasing
         // this handle therefore cannot be the last foreign Running holder.
         if self.claim(Phase::LocalTaskHolder) {
@@ -941,7 +907,6 @@ impl Drop for NativePreparationChild {
             state.root.is_some()
                 || state.dormant.is_some()
                 || state.running.is_some()
-                || state.registration.is_some()
                 || state.publisher.is_some()
                 || state.control.is_some()
         };
@@ -1023,12 +988,10 @@ impl PreparedLocalTaskConstruction {
     pub(crate) fn install(
         mut self,
         dormant: PreparedTaskExecution,
-        registration: NativeTaskRegistration,
         control: Arc<TaskExecutionControl>,
     ) {
         let mut state = self.owner.state.lock().unwrap();
         state.dormant = Some(ManuallyDrop::new(dormant));
-        state.registration = Some(ManuallyDrop::new(registration));
         state.control = Some(control);
         if state.local_task != LocalTaskPhase::Unresolved {
             state.local_task = LocalTaskPhase::Prepared;
@@ -1086,10 +1049,9 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             let owner = self.owner.lock().unwrap().upgrade().unwrap();
             // Reentry also verifies that notification runs outside the finite
-            // owner's state lock, after its independent registration cleanup.
+            // owner's state lock, after its independent control cleanup.
             let state = owner.state.lock().unwrap();
             assert!(owner.task_stopped.load(Ordering::Acquire));
-            assert_eq!(state.phases[Phase::Registration as usize], Action::Exited);
             assert_eq!(state.phases[Phase::Control as usize], Action::Exited);
             drop(state);
             self.notifications.fetch_add(1, Ordering::AcqRel);

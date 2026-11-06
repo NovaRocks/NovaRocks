@@ -57,7 +57,6 @@ mod ingress;
 mod lease;
 mod lifecycle;
 mod operation;
-pub mod query_context;
 pub mod read_attempt;
 mod receipt;
 mod reliable_transport;
@@ -134,6 +133,7 @@ pub use control_runtime::node_bootstrap::{
     WorkerNodeRuntime, WorkerNodeShutdownError, WorkerNodeStartRefusal,
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
+pub use control_runtime::node_metrics::WorkerDetachmentBlockers;
 pub use control_runtime::node_metrics::{
     WorkerAdmissionSnapshot, WorkerCapacityRefusalKind, WorkerControlPlanePhase,
     WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot, WorkerControlPlaneWorkerSnapshot,
@@ -149,6 +149,14 @@ pub use control_runtime::operator_statistics::{
 pub use control_runtime::participation_host::observation::{
     ObservationProjection, ObservationProjectionError,
 };
+#[cfg(any(test, novarocks_dev_controls))]
+pub use control_runtime::participation_host::work_issuer::ParticipationWorkTestOwner;
+pub use control_runtime::participation_host::work_issuer::{
+    InstanceWorkIssuer, ParticipationInstanceGrant, ParticipationWorkError, ParticipationWorkWake,
+    RuntimeFilterSenderWork,
+};
+/// Fixed Work labels used only for low-cardinality diagnostics.
+pub use control_runtime::work_labels::WORK_DIAGNOSTIC_LABELS;
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };

@@ -2044,9 +2044,8 @@ const TASK_EXECUTION_TASKS_CREATED_METRIC: &str =
 const SCAN_STREAM_PENDING_METRIC: &str = "novarocks_scan_stream_pending_total";
 const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_terminal_total";
 
-const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 4] = [
+const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 3] = [
     "native_query_contexts_active",
-    "native_query_contexts_second_chance",
     "native_query_active_tasks",
     "catalog_query_pins",
 ];

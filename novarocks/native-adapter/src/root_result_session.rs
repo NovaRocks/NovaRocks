@@ -2003,7 +2003,7 @@ pub(crate) mod terminal_observation_tests {
     struct RootCallbackHost(Mutex<Option<RootPreparationCallback>>);
     impl TaskExecutionHost for RootCallbackHost {
         fn close_participation_admission(&self, _: ParticipationRef) {}
-        fn retire_participation_execution(&self, _: ParticipationRef) {}
+
         fn forget_participation_admission(&self, _: ParticipationRef) {}
         fn install_receiver(
             &self,

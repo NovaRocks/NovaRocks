@@ -855,6 +855,7 @@ pub trait ParticipationHostFactory: Send + Sync {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: crate::ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection>;
 }
 
@@ -942,9 +943,6 @@ pub trait TaskExecutionHost: Send + Sync {
     fn abort_participation_admission(&self, participation: ParticipationRef) {
         self.close_participation_admission(participation);
     }
-    /// Releases an idle execution context after every task has physically
-    /// converged and no new task can be admitted for this exact attempt.
-    fn retire_participation_execution(&self, participation: ParticipationRef);
 
     /// Reclaims the compact participation fence after the registry has forgotten
     /// the participation itself. No task capability for the execution may remain.

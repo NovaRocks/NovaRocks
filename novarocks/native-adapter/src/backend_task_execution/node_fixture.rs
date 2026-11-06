@@ -433,11 +433,14 @@ pub fn factory_from_host(
         fn create_instance(
             self: Arc<Self>,
             participation: ParticipationRef,
+            grant: novarocks_worker::ParticipationInstanceGrant,
         ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
-            Ok(Arc::new(Instance {
-                participation,
-                original: self.0.clone(),
-            }))
+            Ok(grant
+                .bind_test_instance(Arc::new(Instance {
+                    participation,
+                    original: self.0.clone(),
+                }))
+                .expect("fixture binds its exact original instance"))
         }
     }
     impl ParticipationHostInstance for Instance {
@@ -472,8 +475,11 @@ impl ParticipationHostFactory for MetadataFactory {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: novarocks_worker::ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
-        Ok(Arc::new(MetadataParticipationHost(participation)))
+        Ok(grant
+            .bind_test_instance(Arc::new(MetadataParticipationHost(participation)))
+            .expect("fixture binds its exact original metadata instance"))
     }
 }
 impl ParticipationHostInstance for MetadataParticipationHost {
@@ -530,7 +536,7 @@ struct PreparationGate {
 struct MetadataExecution(BTreeMap<TaskIdentity, Arc<PreparationGate>>);
 impl TaskExecutionHost for MetadataExecution {
     fn close_participation_admission(&self, _: ParticipationRef) {}
-    fn retire_participation_execution(&self, _: ParticipationRef) {}
+
     fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,
@@ -920,9 +926,7 @@ impl TaskExecutionHost for InspectInstall {
     fn abort_participation_admission(&self, participation: ParticipationRef) {
         self.original.abort_participation_admission(participation)
     }
-    fn retire_participation_execution(&self, participation: ParticipationRef) {
-        self.original.retire_participation_execution(participation)
-    }
+
     fn forget_participation_admission(&self, participation: ParticipationRef) {
         self.original.forget_participation_admission(participation)
     }

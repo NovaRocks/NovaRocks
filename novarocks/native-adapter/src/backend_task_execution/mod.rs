@@ -52,7 +52,7 @@ pub use compiled_package::{
     CompiledTaskProgram, CompiledTypeScope, CompiledTypeScopes, NativeTypeConstructionError,
 };
 pub use execution_host::{NativeTaskExecutionHost, TaskParticipationFacts};
-pub use participation_host::NativeParticipationHost;
+pub use participation_host::{NativeParticipationHost, NativeQueryExecutionResourceSnapshot};
 
 #[cfg(any(test, novarocks_dev_controls))]
 #[doc(hidden)]

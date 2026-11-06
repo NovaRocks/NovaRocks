@@ -500,6 +500,7 @@ impl ParticipationHostRecord {
         tracing::debug!(pid = std::process::id(), participation = ?self.identity,
             actor = ?self.control_runtime.snapshot(self.actor),
             scope = ?self.resources.scope.as_ref().map(|scope| scope.snapshot()),
+            work_blockers = ?self.detachment_blockers(),
             release_pending = self.resources.host_jobs.as_ref().map(|jobs| jobs.release_pending()),
             release_evidence_ready = self.resources.host_jobs.as_ref().map(|jobs| jobs.released_observation().is_some()),
             roots_sealed = self.task_io_roots_sealed(),

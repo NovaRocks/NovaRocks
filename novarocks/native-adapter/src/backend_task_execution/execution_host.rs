@@ -129,6 +129,23 @@ use novarocks_worker::{
 pub use crate::established_query_options::EstablishedQueryOptions;
 
 pub trait TaskParticipationFacts: Send + Sync {
+    #[cfg(test)]
+    fn install_query_context_for_test(
+        &self,
+        _context: Arc<novarocks_execution::runtime::query_context::QueryContext>,
+    ) {
+        panic!("this test host does not install fixture resources")
+    }
+    #[cfg(test)]
+    fn release_query_context_for_test(&self, _execution: QueryExecutionId) {
+        panic!("this test host does not release fixture resources")
+    }
+    /// The exact resource owner of this installed Participation.
+    fn query_context(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<Arc<novarocks_execution::runtime::query_context::QueryContext>, HostRejection>;
+
     /// The immutable execution options installed by this participation.
     fn query_options(
         &self,
@@ -814,8 +831,8 @@ impl NativeTaskExecutionHost {
 
     /// Receives, provider-validates and compiles the task's package into a
     /// LocalProgram, then prepares its dormant handle and task runtime.
-    /// The registration lease protects early query funding and
-    /// rolls back on every refusal before installation.
+    /// The original Participation supplies query resources. The Task guard
+    /// follows local/kernel resources through rollback and actual completion.
     fn install_compiled_receiver(
         &self,
         descriptor: &TaskDescriptor,
@@ -842,27 +859,11 @@ impl NativeTaskExecutionHost {
         })?;
 
         let established_query_options = self.participation_facts.query_options(execution)?;
-        let (delivery_expire, query_expire) =
-            novarocks_execution::runtime::query_options::query_expire_durations(Some(
-                established_query_options.runtime().as_ref(),
-            ));
-        // The original fragment lease protects the early SAME query account.
-        // A refused decoder drops only this fragment's registration.
-        let registration = self
-            .queries
-            .register_task_execution(
-                execution,
-                descriptor_task_key,
-                delivery_expire,
-                query_expire,
-            )
-            .map_err(host_failure)?;
+        let query_context = self.participation_facts.query_context(execution)?;
         let memory = self
             .queries
             .prepare_query_memory_typed(
-                execution,
-                delivery_expire,
-                query_expire,
+                &query_context,
                 established_query_options.runtime().exec_mem_limit(),
             )
             .map_err(|error| memory_admission_failure_to_host(identity, error))?;
@@ -898,7 +899,7 @@ impl NativeTaskExecutionHost {
         let type_tracker = self
             .queries
             .type_construction_tracker(
-                execution,
+                &query_context,
                 established_query_options.runtime().exec_mem_limit(),
             )
             .map_err(|error| memory_admission_failure_to_host(identity, error))?;
@@ -1242,7 +1243,7 @@ impl NativeTaskExecutionHost {
                 Some(closes.into_boxed_slice());
             Ok(())
         });
-        kernel_construction.install(dormant, registration, kernel_control);
+        kernel_construction.install(dormant, kernel_control);
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_deref()
             && let Some(cause) = preparation_child
@@ -1648,11 +1649,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.abort_participation(participation);
     }
 
-    fn retire_participation_execution(&self, participation: ParticipationRef) {
-        self.queries
-            .retire_idle_execution(participation.query_execution_id());
-    }
-
     fn forget_participation_admission(&self, participation: ParticipationRef) {
         self.capabilities.forget_participation(participation);
     }
@@ -1877,7 +1873,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             reporter.clone(),
         ));
         let completion_worker = Arc::downgrade(&task);
-        let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
@@ -1990,8 +1985,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     });
                     completion_worker.finish();
                     split_queues.close_attempt(attempt);
-                    queries.unregister_task_execution(execution, task_key);
-                    queries.finish_task(execution);
                 }),
             ))
             .map_err(|(error, action)| {
@@ -3189,6 +3182,7 @@ pub(crate) mod tests {
         ExecutionRuntime, ExecutionRuntimeConfig,
     };
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
+    use novarocks_execution::runtime::query_context::QueryContext;
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime::task::io::{
         ExchangeDestinationKey, NoopTaskEventSink, TaskEvent, TaskEventSink, TaskProgress,
@@ -3234,7 +3228,6 @@ pub(crate) mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-    use novarocks_worker::query_context::QueryExecutionKey;
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
     use prost::Message;
 
@@ -3562,20 +3555,13 @@ pub(crate) mod tests {
         execution: QueryExecutionId,
     ) -> Result<(), HostRejection> {
         let options = facts.query_options(execution)?;
-        let (delivery, query) = novarocks_execution::runtime::query_options::query_expire_durations(
-            Some(options.runtime()),
-        );
-        queries
-            .establish_query_resources(
-                execution,
-                delivery,
-                query,
-                options.runtime().exec_mem_limit(),
-            )
-            .map(|_| ())
+        let context = queries
+            .establish_query_resources(execution, options.runtime().exec_mem_limit())
             .map_err(|error| {
                 HostRejection::from_domain(TaskFailureCategory::ResourceExhausted, error)
-            })
+            })?;
+        facts.install_query_context_for_test(context);
+        Ok(())
     }
 
     fn inspect_native_receiver(
@@ -3662,11 +3648,39 @@ pub(crate) mod tests {
         BodySink::Stream(partition)
     }
 
+    /// Explicit fixture Participation resources installed by M and taken by R.
+    #[derive(Default)]
+    struct TestParticipationResources(Mutex<BTreeMap<QueryExecutionId, Arc<QueryContext>>>);
+    impl TestParticipationResources {
+        fn native_execution_resource_snapshot(
+            &self,
+        ) -> super::super::NativeQueryExecutionResourceSnapshot {
+            let contexts = self.0.lock().unwrap();
+            super::super::NativeQueryExecutionResourceSnapshot {
+                active_contexts: contexts.len(),
+                active_fragments: contexts
+                    .values()
+                    .map(|context| context.active_tasks())
+                    .sum(),
+            }
+        }
+        fn query_mem_tracker_execution(
+            &self,
+            execution: QueryExecutionId,
+        ) -> Option<Arc<novarocks_execution::runtime::mem_tracker::MemTracker>> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&execution)
+                .map(|context| context.tracker())
+        }
+    }
+
     /// A participation host that answers every query-scoped question with the
     /// smallest legal value, and counts what it was asked.
     struct StubParticipationFacts {
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
-        query_manager: Arc<novarocks_worker::query_context::QueryContextManager>,
+        query_manager: Arc<TestParticipationResources>,
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
@@ -3691,7 +3705,7 @@ pub(crate) mod tests {
             Self {
                 memory_authority:
                     novarocks_native_adapter::backend_test_support::test_memory_authority(),
-                query_manager: novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                query_manager: Arc::new(TestParticipationResources::default()),
                 query_options: Mutex::new(QueryOptions {
                     pipeline_dop: Some(1),
                     ..QueryOptions::default()
@@ -3726,6 +3740,35 @@ pub(crate) mod tests {
     }
 
     impl TaskParticipationFacts for StubParticipationFacts {
+        fn query_context(
+            &self,
+            execution: QueryExecutionId,
+        ) -> Result<Arc<QueryContext>, HostRejection> {
+            Ok(self
+                .query_manager
+                .0
+                .lock()
+                .unwrap()
+                .get(&execution)
+                .expect("fixture M installed the same resource owner")
+                .clone())
+        }
+        fn install_query_context_for_test(&self, context: Arc<QueryContext>) {
+            assert!(
+                self.query_manager
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert(context.execution(), context)
+                    .is_none()
+            );
+        }
+        fn release_query_context_for_test(&self, execution: QueryExecutionId) {
+            let context = self.query_manager.0.lock().unwrap().remove(&execution);
+            if let Some(context) = context {
+                assert_eq!(context.active_tasks(), 0);
+            }
+        }
         fn query_options(
             &self,
             _execution: QueryExecutionId,
@@ -3919,10 +3962,7 @@ pub(crate) mod tests {
         let inbound_capabilities = TaskInboundCapabilities::new();
         NativeTaskExecutionHost::new(
             Arc::new(compiled_package_host::interpreter()),
-            NativeQueryContextRuntime::new_for_test(
-                Arc::clone(&facts.query_manager),
-                Arc::clone(&facts.memory_authority),
-            ),
+            NativeQueryContextRuntime::new(Arc::clone(&facts.memory_authority)),
             facts,
             Arc::clone(&inbound_capabilities),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -7051,10 +7091,6 @@ pub(crate) mod tests {
             self.inner.close_participation_admission(participation);
         }
 
-        fn retire_participation_execution(&self, participation: ParticipationRef) {
-            self.inner.retire_participation_execution(participation);
-        }
-
         fn forget_participation_admission(&self, participation: ParticipationRef) {
             self.inner.forget_participation_admission(participation);
         }
@@ -7145,8 +7181,8 @@ pub(crate) mod tests {
             )
         }
         fn release(&self, participation: ParticipationRef) -> ReleasedParticipationEvidence {
-            self.queries
-                .retire_idle_execution(participation.query_execution_id());
+            self.facts
+                .release_query_context_for_test(participation.query_execution_id());
             ReleasedParticipationEvidence::none()
         }
         fn advance_shared_domain(
@@ -7233,7 +7269,7 @@ pub(crate) mod tests {
         node: super::super::tests::node_fixture::NativeNodeFixture,
         host: Arc<CountingHost>,
         participation: ParticipationRef,
-        manager: Arc<novarocks_worker::query_context::QueryContextManager>,
+        manager: Arc<TestParticipationResources>,
         facts: Arc<StubParticipationFacts>,
     }
 
@@ -7455,26 +7491,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn terminal_task_participation_retires_prepared_unregistered_query_context() {
+    fn release_retires_the_materialized_zero_task_participation_context() {
         let fixture = OwnerFixture::new(60_901);
         let execution = fixture.participation.query_execution_id();
-        let query = QueryExecutionKey::native_attempt(
-            QueryId::new(execution.query_id().high(), execution.query_id().low()),
-            NonZeroU64::new(execution.attempt_id().get()).unwrap(),
-        );
-        fixture
-            .host
-            .inner
-            .queries
-            .prepare_admission_execution(
-                execution,
-                UniqueId::new(60_903, 1),
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-                None,
-                None,
-            )
-            .expect("preparation creates the zero-fragment query context");
+        let original = fixture.facts.query_context(execution).unwrap();
+        let query = execution;
+        assert_eq!(original.active_tasks(), 0);
+        drop(original);
         assert!(fixture.manager.query_mem_tracker_execution(query).is_some());
 
         fixture.quiesce();
@@ -10390,6 +10413,18 @@ pub(crate) mod tests {
         );
 
         impl TaskParticipationFacts for ScanParticipationFacts {
+            fn query_context(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<Arc<QueryContext>, HostRejection> {
+                self.0.query_context(execution)
+            }
+            fn install_query_context_for_test(&self, context: Arc<QueryContext>) {
+                self.0.install_query_context_for_test(context)
+            }
+            fn release_query_context_for_test(&self, execution: QueryExecutionId) {
+                self.0.release_query_context_for_test(execution)
+            }
             fn query_options(
                 &self,
                 execution: QueryExecutionId,
@@ -10511,10 +10546,7 @@ pub(crate) mod tests {
             let inbound_capabilities = TaskInboundCapabilities::new();
             NativeTaskExecutionHost::new(
                 Arc::new(interpreter()),
-                NativeQueryContextRuntime::new_for_test(
-                    Arc::clone(&facts.0.query_manager),
-                    Arc::clone(&facts.0.memory_authority),
-                ),
+                NativeQueryContextRuntime::new(Arc::clone(&facts.0.memory_authority)),
                 facts,
                 Arc::clone(&inbound_capabilities),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -10929,6 +10961,18 @@ pub(crate) mod tests {
         }
 
         impl TaskParticipationFacts for WriteParticipationFacts {
+            fn query_context(
+                &self,
+                execution: QueryExecutionId,
+            ) -> Result<Arc<QueryContext>, HostRejection> {
+                self.stub.query_context(execution)
+            }
+            fn install_query_context_for_test(&self, context: Arc<QueryContext>) {
+                self.stub.install_query_context_for_test(context)
+            }
+            fn release_query_context_for_test(&self, execution: QueryExecutionId) {
+                self.stub.release_query_context_for_test(execution)
+            }
             fn query_options(
                 &self,
                 execution: QueryExecutionId,
@@ -11048,10 +11092,7 @@ pub(crate) mod tests {
             let inbound_capabilities = TaskInboundCapabilities::new();
             NativeTaskExecutionHost::new(
                 Arc::new(interpreter()),
-                NativeQueryContextRuntime::new_for_test(
-                    Arc::clone(&facts.stub.query_manager),
-                    Arc::clone(&facts.stub.memory_authority),
-                ),
+                NativeQueryContextRuntime::new(Arc::clone(&facts.stub.memory_authority)),
                 facts,
                 Arc::clone(&inbound_capabilities),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(

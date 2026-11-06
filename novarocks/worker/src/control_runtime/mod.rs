@@ -57,6 +57,7 @@ pub(crate) mod preparation_refusal;
 pub(crate) mod task;
 pub(crate) mod task_capacity;
 pub(crate) mod task_publication;
+pub(crate) mod work_labels;
 
 pub(crate) mod causal;
 pub(crate) mod causal_input;

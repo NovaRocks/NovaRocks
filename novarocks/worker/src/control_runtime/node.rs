@@ -2202,6 +2202,12 @@ impl WorkerNodeHost {
                     &ticket,
                     ParticipationHostBinding {
                         actor: self.actor_ids.next(),
+                        health: self
+                            .tasks
+                            .protocol_events
+                            .as_ref()
+                            .expect("original role execution ports validated at startup")
+                            .execution_health(),
                         core,
                         policy: self.config.policy,
                         storage: self.config.storage.clone(),
@@ -2651,6 +2657,30 @@ impl WorkerNodeHost {
 }
 
 impl WorkerNodeHost {
+    #[cfg(test)]
+    pub(crate) fn original_participation_scope_for_test(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<novarocks_control_runtime::transaction::ScopeHandle> {
+        let address = self.directory.participation(participation)?;
+        let host = address.lock()?;
+        Some(host.scope().clone())
+    }
+    pub(crate) fn participation_detachment_blockers(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<
+        Option<super::node_metrics::WorkerDetachmentBlockers>,
+        novarocks_control_runtime::transaction::RuntimeError,
+    > {
+        let Some(address) = self.directory.participation(participation) else {
+            return Ok(None);
+        };
+        let Some(host) = address.try_lock() else {
+            return Ok(None);
+        };
+        host.detachment_blockers()
+    }
     pub(crate) fn trace_drain_inventory(&self) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;

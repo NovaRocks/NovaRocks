@@ -11,6 +11,7 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-control-runtime.workspace = true
 novarocks-value-arrays.workspace = true
 novarocks-arrow-batch-codec.workspace = true
 novarocks-resource-contract.workspace = true

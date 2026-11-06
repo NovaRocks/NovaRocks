@@ -141,8 +141,11 @@ impl ParticipationHostFactory for FixtureParticipationFactory {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: novarocks_worker::ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
-        Ok(Arc::new(FixtureParticipationHost(participation)))
+        Ok(grant
+            .bind_test_instance(Arc::new(FixtureParticipationHost(participation)))
+            .expect("fixture instance uses its original grant"))
     }
 }
 struct FixtureParticipationFactory;
@@ -428,7 +431,6 @@ struct Host {
 }
 impl TaskExecutionHost for Host {
     fn close_participation_admission(&self, _: ParticipationRef) {}
-    fn retire_participation_execution(&self, _: ParticipationRef) {}
     fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,

@@ -37,7 +37,7 @@ use novarocks_control_runtime_core::{
     scope::{ScopeError, WorkAdmission, WorkKind},
 };
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Waker,
 };
 
@@ -288,22 +288,52 @@ fn future_panic_keeps_original_payload_in_custody_and_continues_unwinding() {
 }
 #[test]
 fn explicit_future_capture_destructor_panic_never_becomes_positive_exit() {
-    let mut f = fixture();
-    let (capture, destroyed) = capture(&f, true);
-    let future = run_future(
-        f.take(),
-        WorkFuture {
-            _capture: capture,
-            pending: true,
-            panic: false,
-        },
-        PanicSink::new(),
-    );
-    assert!(catch_unwind(AssertUnwindSafe(|| drop(future))).is_err());
-    assert!(destroyed.load(Ordering::SeqCst));
-    assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
-    assert_eq!(f.scope.snapshot().unwrap().unresolved, 1);
-    assert!(!f.custody.try_retire().unwrap());
+    // Explicit destruction happens after Ready, on cancellation of a pending
+    // future, before the first poll, and after a refused start gate.
+    for (started, ready, stopped) in [
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (false, false, true),
+    ] {
+        let mut f = fixture();
+        if stopped {
+            f.scope.request_stop().unwrap();
+        }
+        let (capture, destroyed) = capture(&f, true);
+        let sink = PanicSink::new();
+        let mut future = run_future(
+            f.take(),
+            WorkFuture {
+                _capture: capture,
+                pending: !ready,
+                panic: false,
+            },
+            sink.clone(),
+        );
+        let panic = if ready || stopped {
+            let panic = catch_unwind(AssertUnwindSafe(|| poll(&mut future))).unwrap_err();
+            drop(future);
+            panic
+        } else {
+            if started {
+                assert!(poll(&mut future).is_pending());
+            }
+            catch_unwind(AssertUnwindSafe(|| drop(future))).unwrap_err()
+        };
+        assert!(panic.is::<ForwardedWorkPanic>());
+        assert!(sink.has_panic());
+        assert_eq!(
+            sink.take().unwrap().downcast_ref::<&str>(),
+            Some(&"capture destructor panic")
+        );
+        assert!(!sink.has_panic());
+        assert!(sink.take_cleanup().is_none());
+        assert!(destroyed.load(Ordering::SeqCst));
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
+        assert_eq!(f.scope.snapshot().unwrap().unresolved, 1);
+        assert!(!f.custody.try_retire().unwrap());
+    }
 }
 #[test]
 fn blocking_job_never_started_and_completed_job_destroy_captures_before_exit() {
@@ -331,11 +361,132 @@ fn blocking_job_never_started_and_completed_job_destroy_captures_before_exit() {
 #[test]
 fn explicit_blocking_capture_destructor_panic_remains_unresolved() {
     let mut f = fixture();
-    let (capture, _) = capture(&f, true);
-    let job = run_blocking(f.take(), move || drop(capture), PanicSink::new());
-    assert!(catch_unwind(AssertUnwindSafe(|| drop(job))).is_err());
+    let (capture, destroyed) = capture(&f, true);
+    let sink = PanicSink::new();
+    let job = run_blocking(f.take(), move || drop(capture), sink.clone());
+    let panic = catch_unwind(AssertUnwindSafe(|| drop(job))).unwrap_err();
+    assert!(panic.is::<ForwardedWorkPanic>());
+    assert!(sink.has_panic());
+    assert_eq!(
+        sink.take().unwrap().downcast_ref::<&str>(),
+        Some(&"capture destructor panic")
+    );
+    assert!(!sink.has_panic());
+    assert!(destroyed.load(Ordering::SeqCst));
     assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
     assert_eq!(f.scope.snapshot().unwrap().unresolved, 1);
+    assert!(!f.custody.try_retire().unwrap());
+}
+
+struct PayloadDropProbe {
+    stage: &'static str,
+    dropped: std::sync::Arc<AtomicUsize>,
+}
+impl Drop for PayloadDropProbe {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+struct DoublePanicFuture {
+    body_dropped: std::sync::Arc<AtomicUsize>,
+    cleanup_dropped: std::sync::Arc<AtomicUsize>,
+}
+impl Future for DoublePanicFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        std::panic::panic_any(PayloadDropProbe {
+            stage: "body",
+            dropped: self.body_dropped.clone(),
+        });
+    }
+}
+impl Drop for DoublePanicFuture {
+    fn drop(&mut self) {
+        std::panic::panic_any(PayloadDropProbe {
+            stage: "cleanup",
+            dropped: self.cleanup_dropped.clone(),
+        });
+    }
+}
+#[test]
+fn poll_then_explicit_drop_panics_keep_both_original_boxes_and_unresolved_custody() {
+    for take_cleanup_first in [false, true] {
+        let mut f = fixture();
+        let body_dropped = std::sync::Arc::new(AtomicUsize::new(0));
+        let cleanup_dropped = std::sync::Arc::new(AtomicUsize::new(0));
+        let sink = PanicSink::new();
+        let mut future = run_future(
+            f.take(),
+            DoublePanicFuture {
+                body_dropped: body_dropped.clone(),
+                cleanup_dropped: cleanup_dropped.clone(),
+            },
+            sink.clone(),
+        );
+        let panic = catch_unwind(AssertUnwindSafe(|| poll(&mut future))).unwrap_err();
+        assert!(panic.is::<ForwardedWorkPanic>());
+        drop(future);
+        assert_eq!(body_dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanup_dropped.load(Ordering::SeqCst), 0);
+        assert!(sink.has_panic());
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
+        assert_eq!(f.scope.snapshot().unwrap().unresolved, 1);
+        assert!(!f.custody.try_retire().unwrap());
+        assert!(!f.history.drain(256).entries.iter().any(|entry| matches!(
+            entry.fact,
+            HistoryFact::BodyExited { .. } | HistoryFact::CapturesExited { .. }
+        )));
+        let first = if take_cleanup_first {
+            sink.take_cleanup().unwrap()
+        } else {
+            sink.take().unwrap()
+        };
+        assert!(sink.has_panic());
+        let second = sink.take().unwrap();
+        assert_eq!(
+            first.downcast_ref::<PayloadDropProbe>().unwrap().stage,
+            if take_cleanup_first {
+                "cleanup"
+            } else {
+                "body"
+            }
+        );
+        assert_eq!(
+            second.downcast_ref::<PayloadDropProbe>().unwrap().stage,
+            if take_cleanup_first {
+                "body"
+            } else {
+                "cleanup"
+            }
+        );
+        assert!(!sink.has_panic());
+        assert!(sink.take().is_none());
+        assert!(sink.take_cleanup().is_none());
+        assert_eq!(body_dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(cleanup_dropped.load(Ordering::SeqCst), 0);
+        drop((first, second));
+        assert_eq!(body_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup_dropped.load(Ordering::SeqCst), 1);
+    }
+}
+#[test]
+fn abandoned_panic_sink_never_runs_foreign_payload_destructors() {
+    let dropped = std::sync::Arc::new(AtomicUsize::new(0));
+    let sink = PanicSink::new();
+    sink.store_panics(
+        Box::new(PayloadDropProbe {
+            stage: "body",
+            dropped: dropped.clone(),
+        }),
+        Some(Box::new(PayloadDropProbe {
+            stage: "cleanup",
+            dropped: dropped.clone(),
+        })),
+    );
+    // An owner that abandons custody deliberately retains both foreign boxes;
+    // their destructors must not run as a side effect in a control poller.
+    drop(sink);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
 }
 #[test]
 fn live_proof_rejects_exited_and_unresolved_original_parent() {

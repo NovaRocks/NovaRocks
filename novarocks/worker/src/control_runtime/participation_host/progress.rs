@@ -97,6 +97,7 @@ impl std::error::Error for ParticipationHostProgressError {
             Self::Capacity(TaskCapacityError::ActorTurn(error)) => Some(error),
             Self::Cancel(ParticipationCancelError::Runtime(error)) => Some(error),
             Self::Fault(ParticipationHostReturned::StartRefused(error)) => Some(error),
+            Self::Fault(ParticipationHostReturned::WorkRefused(error)) => Some(error),
             Self::Submit(
                 ParticipationSubmitError::WrongOwner
                 | ParticipationSubmitError::StopRequired
@@ -324,6 +325,15 @@ impl ParticipationHostRecord {
             progress.returned = returns.observed;
         } else {
             progress.returned = jobs.poll_returns()?;
+        }
+        if let Some(registry) = &self.resources.work_registry
+            && let Err(error) = registry.retire_ready(budget)
+        {
+            let fault = match error {
+                crate::ParticipationWorkError::Panicked => ParticipationHostReturned::Panicked,
+                error => ParticipationHostReturned::WorkRefused(error),
+            };
+            return Err(ParticipationHostProgressError::Fault(fault));
         }
         if let Some(fault) = jobs.fault() {
             return Err(ParticipationHostProgressError::Fault(fault));

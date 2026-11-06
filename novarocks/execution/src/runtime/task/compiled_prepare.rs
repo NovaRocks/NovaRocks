@@ -429,6 +429,7 @@ fn prepare_compiled_task_in(
         Arc::clone(&context.exchange_receiver_port),
         context.cleanup_faults(),
     );
+    resources.hold_query_task(context.query_task.take());
     let prepare_result = (|| {
         resources.acquire_sink_commit(instance_task_key)?;
         context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;

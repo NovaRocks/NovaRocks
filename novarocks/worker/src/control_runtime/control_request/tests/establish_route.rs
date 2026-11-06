@@ -336,6 +336,9 @@ impl RouteFixture {
         };
         let binding = ParticipationHostBinding {
             actor: participation_actor(),
+            health: Arc::new(
+                novarocks_execution::runtime::execution_health::ExecutionHealth::new(),
+            ),
             core: ParticipationCore::new(
                 this.f.participation,
                 generation(),

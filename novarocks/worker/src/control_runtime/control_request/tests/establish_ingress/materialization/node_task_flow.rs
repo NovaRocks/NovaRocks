@@ -881,7 +881,7 @@ struct CompiledTaskHost {
 }
 impl TaskExecutionHost for CompiledTaskHost {
     fn close_participation_admission(&self, _: ParticipationRef) {}
-    fn retire_participation_execution(&self, _: ParticipationRef) {}
+
     fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,

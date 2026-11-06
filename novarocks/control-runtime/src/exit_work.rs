@@ -26,6 +26,7 @@ use crate::{
 use std::{
     any::Any,
     future::Future,
+    mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     task::{Context, Poll},
@@ -33,27 +34,61 @@ use std::{
 
 pub type PanicPayload = Box<dyn Any + Send + 'static>;
 
-/// One work item's original panic payload, retained for its supervising owner.
-/// Clones share that same slot; taking it never manufactures successful exit.
+#[derive(Default)]
+struct PanicSlots {
+    primary: Option<ManuallyDrop<PanicPayload>>,
+    cleanup: Option<ManuallyDrop<PanicPayload>>,
+}
+
+/// One work item's original panic and, if explicit teardown also panics, its
+/// cleanup panic. Clones share custody. Payload destructors run only after an
+/// owner takes them; abandoning a sink deliberately retains foreign payloads.
+/// Taking a payload never manufactures successful exit.
 #[derive(Clone, Default)]
-pub struct PanicSink(Arc<Mutex<Option<PanicPayload>>>);
+pub struct PanicSink(Arc<Mutex<PanicSlots>>);
 impl PanicSink {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Takes the original panic first, then any still-retained cleanup panic.
     pub fn take(&self) -> Option<PanicPayload> {
-        self.0.lock().expect("work panic custody lock").take()
+        let mut slots = self.0.lock().expect("work panic custody lock");
+        slots
+            .primary
+            .take()
+            .or_else(|| slots.cleanup.take())
+            .map(ManuallyDrop::into_inner)
+    }
+    /// Takes only the second panic from explicit capture destruction.
+    pub fn take_cleanup(&self) -> Option<PanicPayload> {
+        self.0
+            .lock()
+            .expect("work panic custody lock")
+            .cleanup
+            .take()
+            .map(ManuallyDrop::into_inner)
     }
     pub fn has_panic(&self) -> bool {
-        self.0.lock().expect("work panic custody lock").is_some()
+        let slots = self.0.lock().expect("work panic custody lock");
+        slots.primary.is_some() || slots.cleanup.is_some()
     }
     fn store(&self, payload: PanicPayload) {
-        let mut slot = self.0.lock().expect("work panic custody lock");
+        self.store_panics(payload, None);
+    }
+    fn store_panics(&self, payload: PanicPayload, cleanup: Option<PanicPayload>) {
+        let payload = ManuallyDrop::new(payload);
+        let cleanup = cleanup.map(ManuallyDrop::new);
+        let mut slots = self.0.lock().expect("work panic custody lock");
         // Each sink belongs to one invocation. Reusing an occupied sink would
         // discard an original panic, so this is an invariant failure.
-        assert!(slot.is_none(), "work panic sink already holds a payload");
-        *slot = Some(payload);
-        drop(slot);
+        assert!(
+            slots.primary.is_none() && slots.cleanup.is_none(),
+            "work panic sink already holds a payload"
+        );
+        slots.primary = Some(payload);
+        // Publish both stages under one lock: an owner may take the primary
+        // as soon as it observes a panic, even before this work reports exit.
+        slots.cleanup = cleanup;
     }
 }
 /// The actual panic remains in the work's PanicSink. This marker continues
@@ -109,6 +144,38 @@ impl ExitState {
     }
 }
 
+fn destroy_inner<T>(
+    inner: &mut Option<T>,
+    state: &mut ExitState,
+    panic: &PanicSink,
+    body_panic: Option<PanicPayload>,
+) {
+    state.destroying = true;
+    // Catch explicit teardown separately from the body. In particular, keep a
+    // body panic in custody while teardown runs, rather than dropping its Box
+    // during a second unwind. Neither panic proves that captures exited.
+    let destroyed = catch_unwind(AssertUnwindSafe(|| drop(inner.take())));
+    match destroyed {
+        Ok(()) => {
+            state.destroying = false;
+            if let Some(payload) = body_panic {
+                panic.store(payload);
+            }
+        }
+        Err(cleanup) => {
+            if let Some(payload) = body_panic {
+                panic.store_panics(payload, Some(cleanup));
+            } else {
+                panic.store(cleanup);
+            }
+            // Publish Unknown through the original obligation before the
+            // carrier can observe the forwarded failure. Never publish exit.
+            drop(state.obligation.take());
+            resume_forwarded_panic()
+        }
+    }
+}
+
 #[must_use = "The future owns an admitted work obligation until actual destruction"]
 pub struct ObligatedFuture<F> {
     inner: Option<Pin<Box<F>>>,
@@ -127,10 +194,8 @@ pub fn run_future<F: Future>(
     }
 }
 impl<F> ObligatedFuture<F> {
-    fn destroy_inner(&mut self) {
-        self.state.destroying = true;
-        drop(self.inner.take());
-        self.state.destroying = false;
+    fn destroy_inner(&mut self, body_panic: Option<PanicPayload>) {
+        destroy_inner(&mut self.inner, &mut self.state, &self.panic, body_panic);
     }
 }
 impl<F: Future> Future for ObligatedFuture<F> {
@@ -148,7 +213,7 @@ impl<F: Future> Future for ObligatedFuture<F> {
         if !this.state.started
             && let Err(error) = this.state.start()
         {
-            this.destroy_inner();
+            this.destroy_inner(None);
             return Poll::Ready(match this.state.exit() {
                 Ok(()) => Err(ExitWorkError::NotStarted(error)),
                 Err(error) => Err(ExitWorkError::Exit(error)),
@@ -159,7 +224,7 @@ impl<F: Future> Future for ObligatedFuture<F> {
         })) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => {
-                this.destroy_inner();
+                this.destroy_inner(None);
                 Poll::Ready(
                     this.state
                         .exit()
@@ -168,10 +233,9 @@ impl<F: Future> Future for ObligatedFuture<F> {
                 )
             }
             Err(payload) => {
-                this.destroy_inner();
+                this.destroy_inner(Some(payload));
                 // An exit error remains unresolved in the original custody.
                 // Preserve and propagate the original business panic regardless.
-                this.panic.store(payload);
                 let _ = this.state.exit();
                 resume_forwarded_panic()
             }
@@ -181,11 +245,11 @@ impl<F: Future> Future for ObligatedFuture<F> {
 impl<F> Drop for ObligatedFuture<F> {
     fn drop(&mut self) {
         if self.state.obligation.is_some() && !self.state.destroying {
-            self.destroy_inner();
+            self.destroy_inner(None);
             let _ = self.state.exit();
         }
-        // If inner destruction panicked, the obligation's ordinary Drop is
-        // intentionally left to record unresolved exit, never a positive exit.
+        // Failed explicit destruction already dropped the original obligation
+        // to record unresolved exit, never a positive exit.
     }
 }
 
@@ -208,9 +272,7 @@ pub fn run_blocking<F>(
 }
 impl<F> ObligatedBlocking<F> {
     fn destroy_inner(&mut self) {
-        self.state.destroying = true;
-        drop(self.inner.take());
-        self.state.destroying = false;
+        destroy_inner(&mut self.inner, &mut self.state, &self.panic, None);
     }
     /// Once invoked, a blocking closure runs until it returns or unwinds.
     /// Panic inside FnOnce::call_once (including its internal RAII teardown)

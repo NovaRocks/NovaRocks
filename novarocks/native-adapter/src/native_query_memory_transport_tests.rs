@@ -16,8 +16,7 @@
 // under the License.
 use super::*;
 use novarocks_memory::{AuthorityConfig, CapacityError};
-use novarocks_types::identity::AttemptId;
-use novarocks_worker::query_context::QueryMemoryAccountError;
+use novarocks_types::{QueryId, identity::AttemptId};
 
 fn authority(max_accounts: u32) -> Arc<MemoryAuthority> {
     let mut cfg = AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29);
@@ -31,25 +30,23 @@ fn execution(attempt: u64) -> QueryExecutionId {
 }
 fn admission(
     runtime: &NativeQueryContextRuntime,
-    id: QueryExecutionId,
+    context: &Arc<QueryContext>,
     limit: Option<i64>,
 ) -> Result<NativeTaskAdmissionResources, String> {
-    runtime.prepare_admission_execution(
-        id,
-        UniqueId::new(97203, 97204),
-        Duration::from_secs(30),
-        Duration::from_secs(30),
-        limit,
-        None,
-    )
+    let memory = runtime
+        .prepare_query_memory_typed(context, limit)
+        .map_err(|error| error.to_string())?;
+    Ok(runtime.prepare_admission_with_memory(UniqueId::new(97203, 97204), memory, None))
 }
 #[test]
 fn mem_a1_v2_none_creates_real_account_without_local_policy_or_grant() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
     let before = authority.root().committed_bytes();
-    let resources = admission(&runtime, execution(1), None).unwrap();
+    let context = runtime
+        .establish_query_resources(execution(1), None)
+        .unwrap();
+    let resources = admission(&runtime, &context, None).unwrap();
     let memory = resources
         .query_memory()
         .expect("native admission always binds query ownership");
@@ -65,18 +62,10 @@ fn mem_a1_v2_none_creates_real_account_without_local_policy_or_grant() {
 #[test]
 fn mem_a1_v2_none_real_metadata_refusal_keeps_typed_cause_and_full_legacy_text() {
     let authority = authority(1);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
     let before = authority.root().committed_bytes();
     let error = runtime
-        .prepare_admission_execution_typed(
-            execution(1),
-            UniqueId::new(97203, 97204),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            None,
-            None,
-        )
+        .establish_query_resources(execution(1), None)
         .err()
         .expect("root occupies the real account registry");
     assert!(matches!(
@@ -89,21 +78,30 @@ fn mem_a1_v2_none_real_metadata_refusal_keeps_typed_cause_and_full_legacy_text()
     assert!(
         full.starts_with("create query memory account: memory request refused: MetadataExhausted")
     );
-    assert_eq!(admission(&runtime, execution(1), None).err().unwrap(), full);
+    assert_eq!(
+        runtime
+            .establish_query_resources(execution(1), None)
+            .err()
+            .unwrap()
+            .to_string(),
+        full
+    );
     assert_eq!(authority.root().committed_bytes(), before);
     assert_eq!(authority.live_accounts(), 1);
 }
 #[test]
 fn mem_a1_installed_account_is_carried_without_erasing_policy_or_granting_work() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
-    let first = admission(&runtime, execution(1), Some(8192)).unwrap();
+    let runtime = NativeQueryContextRuntime::new(authority);
+    let context = runtime
+        .establish_query_resources(execution(1), Some(8192))
+        .unwrap();
+    let first = admission(&runtime, &context, Some(8192)).unwrap();
     let memory = first.query_memory().unwrap();
     let account = memory.account().id();
     assert_eq!(memory.account().snapshot().policy_limit_bytes, Some(8192));
     assert_eq!(memory.account().snapshot().granted_bytes, 0);
-    let none = admission(&runtime, execution(1), None).unwrap();
+    let none = admission(&runtime, &context, None).unwrap();
     assert_eq!(none.query_memory().unwrap().account().id(), account);
     assert_eq!(
         none.query_memory()
@@ -113,51 +111,53 @@ fn mem_a1_installed_account_is_carried_without_erasing_policy_or_granting_work()
             .policy_limit_bytes,
         Some(8192)
     );
-    let other = admission(&runtime, execution(2), None).unwrap();
+    let other_context = runtime
+        .establish_query_resources(execution(2), None)
+        .unwrap();
+    let other = admission(&runtime, &other_context, None).unwrap();
     let other = other.query_memory().unwrap();
     assert_ne!(other.account().id(), account);
     assert_eq!(other.account().snapshot().policy_limit_bytes, None);
     assert_eq!(other.account().snapshot().granted_bytes, 0);
 }
 #[test]
-fn mem_a1_worker_creation_keeps_actual_typed_metadata_cause_and_legacy_text() {
+fn mem_a1_owner_creation_keeps_actual_typed_metadata_cause_and_legacy_text() {
     let authority = authority(1);
-    let manager = QueryContextManager::new_for_test();
-    manager
-        .ensure_native_context_execution(
-            execution_key(execution(1)),
-            false,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        )
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
+    let error = runtime
+        .establish_query_resources(execution(1), None)
+        .err()
         .unwrap();
-    let error = manager
-        .ensure_query_memory_account(execution_key(execution(1)), &authority)
-        .unwrap_err();
+    let NativeTaskAdmissionError::MemoryAccount(original) = &error else {
+        panic!("the real account owner must preserve its typed refusal")
+    };
     assert!(matches!(
-        error,
+        original,
         QueryMemoryAccountError::Capacity(CapacityError::MetadataExhausted { .. })
     ));
-    assert_eq!(
-        manager
-            .ensure_query_account(execution_key(execution(1)), &authority)
-            .unwrap_err(),
-        error.to_string()
+    assert_eq!(error.to_string(), original.to_string());
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<QueryMemoryAccountError>()
     );
-    assert!(matches!(
-        manager.ensure_query_memory_account(execution_key(execution(2)), &authority),
-        Err(QueryMemoryAccountError::MissingContext)
-    ));
+    assert_eq!(
+        authority.live_accounts(),
+        1,
+        "refused ownership leaves no replacement context or account"
+    );
 }
 #[test]
-fn mem_a1_native_binder_checks_actual_worker_owner_attempt_and_authority() {
+fn mem_a1_native_binder_checks_actual_owner_attempt_and_authority() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager.clone(), authority.clone());
-    admission(&runtime, execution(1), Some(8192)).unwrap();
-    let owner = manager
-        .query_memory_account_execution(execution_key(execution(1)))
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
+    let context = runtime
+        .establish_query_resources(execution(1), Some(8192))
         .unwrap();
+    let owner = QueryMemoryAccount::new(
+        context.execution(),
+        context.memory_binding().account().clone(),
+    );
     assert!(matches!(
         bind_query_memory(execution(2), authority.clone(), owner.clone()),
         Err(QueryMemoryBindingError::OwnerAttemptMismatch)
@@ -175,15 +175,15 @@ fn mem_a1_native_binder_checks_actual_worker_owner_attempt_and_authority() {
         execution(1)
     );
 }
-
 #[test]
 fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() {
-    let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority);
-    let first = admission(&runtime, execution(1), None).unwrap();
+    let runtime = NativeQueryContextRuntime::new(authority(32));
+    let context = runtime
+        .establish_query_resources(execution(1), None)
+        .unwrap();
+    let first = admission(&runtime, &context, None).unwrap();
     let id = first.query_memory().unwrap().account().id();
-    let limited = admission(&runtime, execution(1), Some(8192)).unwrap();
+    let limited = admission(&runtime, &context, Some(8192)).unwrap();
     assert_eq!(limited.query_memory().unwrap().account().id(), id);
     assert_eq!(
         limited
@@ -194,7 +194,7 @@ fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() 
             .policy_limit_bytes,
         Some(8192)
     );
-    let again = admission(&runtime, execution(1), None).unwrap();
+    let again = admission(&runtime, &context, None).unwrap();
     assert_eq!(again.query_memory().unwrap().account().id(), id);
     assert_eq!(
         again
@@ -216,15 +216,27 @@ fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() 
     );
 }
 #[test]
-fn mem_a1_v2_context_removal_releases_only_after_the_last_actual_binding_drop() {
+fn mem_a1_v2_owner_release_waits_for_actual_task_and_last_binding_drop() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
     let before = authority.root().committed_bytes();
-    let resources = admission(&runtime, execution(1), None).unwrap();
+    let context = runtime
+        .establish_query_resources(execution(1), None)
+        .unwrap();
+    let weak = Arc::downgrade(&context);
+    let resources = admission(&runtime, &context, None).unwrap();
     let held = resources.query_memory().unwrap().clone();
+    drop(context);
+    assert_eq!(
+        weak.upgrade().unwrap().active_tasks(),
+        1,
+        "the actual Task guard keeps its context"
+    );
     drop(resources);
-    assert!(runtime.retire_idle_execution(execution(1)));
+    assert!(
+        weak.upgrade().is_none(),
+        "the Task exit releases its original guard"
+    );
     assert_eq!(authority.live_accounts(), 2);
     assert_eq!(held.account().snapshot().granted_bytes, 0);
     assert!(!held.account().is_retired());
@@ -233,11 +245,13 @@ fn mem_a1_v2_context_removal_releases_only_after_the_last_actual_binding_drop() 
     assert_eq!(authority.root().committed_bytes(), before);
 }
 #[test]
-fn mem_a1_v2_context_removal_is_not_funded_domain_teardown_evidence() {
+fn mem_a1_v2_owner_release_is_not_funded_domain_teardown_evidence() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
-    let resources = admission(&runtime, execution(1), None).unwrap();
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
+    let context = runtime
+        .establish_query_resources(execution(1), None)
+        .unwrap();
+    let resources = admission(&runtime, &context, None).unwrap();
     let domain = resources
         .query_memory()
         .unwrap()
@@ -245,82 +259,42 @@ fn mem_a1_v2_context_removal_is_not_funded_domain_teardown_evidence() {
         .create_domain(1024)
         .unwrap();
     drop(resources);
-    assert!(runtime.retire_idle_execution(execution(1)));
+    drop(context);
     assert!(!domain.lane().affiliation().is_retired());
     assert_eq!(domain.snapshot().authorized, 1024);
-    // This is an inactive no-payload domain; ending it is genuine local exit.
-    // It does not fabricate Work tasks/operators/I/O teardown evidence.
+    // Only this inactive no-payload domain's actual local exit is observed.
     domain.stop_producing().unwrap();
     drop(domain);
     assert!(authority.maintain(64).complete);
     assert_eq!(authority.live_accounts(), 1);
 }
-
 #[test]
 fn native_fragment_query_early_type_binding_and_later_admission_consume_same_account() {
     let authority = authority(32);
-    let manager = QueryContextManager::new_for_test();
-    let runtime =
-        NativeQueryContextRuntime::new_for_test(Arc::clone(&manager), Arc::clone(&authority));
-    let execution = execution(37);
-    let first = UniqueId::new(37, 1);
-    let second = UniqueId::new(37, 2);
-    let lease = runtime
-        .register_task_execution(
-            execution,
-            first,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        )
+    let runtime = NativeQueryContextRuntime::new(authority.clone());
+    let context = runtime
+        .establish_query_resources(execution(37), None)
+        .unwrap();
+    let tracker = runtime
+        .type_construction_tracker(&context, Some(1 << 20))
         .unwrap();
     let early = runtime
-        .prepare_query_memory_typed(
-            execution,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            Some(1 << 20),
-        )
+        .prepare_query_memory_typed(&context, Some(1 << 20))
         .unwrap();
     let account = early.binding().account().id();
-    let other_lease = runtime
-        .register_task_execution(
-            execution,
-            second,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        )
-        .unwrap();
-    let other = runtime
-        .prepare_query_memory_typed(
-            execution,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            None,
-        )
-        .unwrap();
+    let other = runtime.prepare_query_memory_typed(&context, None).unwrap();
     assert_eq!(other.binding().account().id(), account);
     assert_eq!(
         other.binding().account().snapshot().policy_limit_bytes,
         Some(1 << 20)
     );
     assert!(Arc::ptr_eq(other.binding().authority(), &authority));
+    assert!(Arc::ptr_eq(&tracker, &context.tracker()));
+    assert_eq!(context.active_tasks(), 2);
     drop(other);
-    drop(other_lease);
-    assert_eq!(
-        manager
-            .native_execution_resource_snapshot()
-            .active_fragments,
-        1
-    );
-    assert_eq!(
-        manager
-            .query_memory_account_execution(execution_key(execution))
-            .unwrap()
-            .account()
-            .id(),
-        account
-    );
-    let admission = runtime.prepare_admission_with_memory(first, early, None);
+    assert_eq!(context.active_tasks(), 1);
+    assert_eq!(context.memory_binding().account().id(), account);
+    let admission = runtime.prepare_admission_with_memory(UniqueId::new(37, 1), early, None);
     assert_eq!(admission.query_memory().unwrap().account().id(), account);
     assert_eq!(
         admission
@@ -331,43 +305,32 @@ fn native_fragment_query_early_type_binding_and_later_admission_consume_same_acc
             .granted_bytes,
         0
     );
+    assert!(Arc::ptr_eq(&admission.query_mem_tracker(), &tracker));
     drop(admission);
-    drop(lease);
-    assert_eq!(
-        manager
-            .native_execution_resource_snapshot()
-            .active_fragments,
-        0
-    );
+    assert_eq!(context.active_tasks(), 0);
 }
-
 #[test]
-fn native_fragment_query_refused_early_type_memory_rolls_back_only_its_original_lease() {
-    let authority = authority(1);
-    let manager = QueryContextManager::new_for_test();
-    let runtime = NativeQueryContextRuntime::new_for_test(Arc::clone(&manager), authority);
-    let execution = execution(38);
-    let lease = runtime
-        .register_task_execution(
-            execution,
-            UniqueId::new(38, 1),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        )
+fn native_fragment_query_refused_early_type_memory_does_not_create_a_task_guard() {
+    let runtime = NativeQueryContextRuntime::new(authority(32));
+    let context = runtime
+        .establish_query_resources(execution(38), Some(1024))
         .unwrap();
     assert!(matches!(
-        runtime.prepare_query_memory_typed(
-            execution,
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            None
-        ),
-        Err(NativeTaskAdmissionError::MemoryAccount(
-            QueryMemoryAccountError::Capacity(CapacityError::MetadataExhausted { .. })
-        ))
+        runtime.prepare_query_memory_typed(&context, Some(2048)),
+        Err(NativeTaskAdmissionError::Limit(_))
     ));
-    drop(lease);
-    let state = manager.native_execution_resource_snapshot();
-    assert_eq!(state.active_fragments, 0);
-    assert_eq!(state.active_contexts, 0);
+    assert_eq!(context.active_tasks(), 0);
+    assert_eq!(context.tracker().limit(), 1024);
+    assert_eq!(
+        context
+            .memory_binding()
+            .account()
+            .snapshot()
+            .policy_limit_bytes,
+        Some(1024)
+    );
+    let original = runtime.prepare_query_memory_typed(&context, None).unwrap();
+    assert_eq!(context.active_tasks(), 1);
+    drop(original);
+    assert_eq!(context.active_tasks(), 0);
 }

@@ -65,6 +65,7 @@ pub struct LocalTaskPrepareContext {
     root_sink_dop: Option<i32>,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
+    query_task: Option<crate::runtime::query_context::QueryTaskGuard>,
     commit_port: Arc<dyn TaskCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     receiver_construction_lifetime: ReceiverConstructionLifetime,
@@ -1942,9 +1943,87 @@ mod owner_tests {
         }
     }
 
+    fn original_query_resources(
+        execution: novarocks_types::QueryExecutionId,
+    ) -> Arc<crate::runtime::query_context::QueryContext> {
+        let authority = crate::runtime::execution_runtime::test_memory_authority();
+        let query = execution.query_id();
+        let account = authority
+            .create_account(
+                novarocks_memory::AccountKind::Work,
+                novarocks_memory::ExternalRef::new(query.high() as u64, query.low() as u64),
+            )
+            .unwrap();
+        let binding = crate::runtime::query_memory::QueryMemoryBinding::try_new(
+            execution, authority, account,
+        )
+        .unwrap();
+        Arc::new(
+            crate::runtime::query_context::QueryContext::try_new(
+                execution,
+                crate::runtime::mem_tracker::MemTracker::new_root(
+                    "actual Task resource guard fixture",
+                ),
+                binding,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn query_task_guard_exits_with_resources_before_publication_even_with_running_handle_aliases() {
+        let root = BoundedRootSession::new();
+        let query = original_query_resources(root.spec.task.query_execution_id());
+        let weak = Arc::downgrade(&query);
+        let running = prepare_compiled_task(
+            root.submission(),
+            root.context().with_query_task_guard(query.task_guard()),
+        )
+        .unwrap()
+        .start();
+        let alias = running.clone();
+        wait_for_task_probe(|| root.finishing.load(Ordering::Acquire));
+        assert_eq!(
+            query.active_tasks(),
+            1,
+            "a physically held result resource keeps its original Task guard"
+        );
+        assert!(running.stopped_fact().is_none());
+        let observed = Arc::new(AtomicBool::new(false));
+        let seen = observed.clone();
+        let original = Arc::downgrade(&query);
+        running.bind_test_publisher(move |_| {
+            assert_eq!(original.upgrade().unwrap().active_tasks(), 0, "the resources release their original guard before terminal publication and finisher CompletionExited");
+            seen.store(true, Ordering::Release);
+        });
+        root.actual_exit();
+        assert!(matches!(
+            running.join().outcome(),
+            LocalTaskOutcome::Succeeded
+        ));
+        wait_for_task_probe(|| observed.load(Ordering::Acquire));
+        assert_eq!(query.active_tasks(), 0);
+        assert!(alias.stopped_fact().is_some());
+        // The extra Running handle retains neither an active Task guard nor
+        // this QueryContext owner after actual resource retirement.
+        drop(query);
+        assert!(weak.upgrade().is_none());
+        assert!(matches!(
+            alias.join().outcome(),
+            LocalTaskOutcome::Succeeded
+        ));
+    }
+
     #[test]
     fn unknown_result_holder_does_not_block_healthy_commit_holder_or_revoke_body_fact() {
         let id = UniqueId::new(98_602, 1);
+        let query = original_query_resources(
+            novarocks_types::QueryExecutionId::new(
+                QueryId::new(id.high() - 2, id.low() - 2),
+                novarocks_types::AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+        );
         let gate = Arc::new(CommitHolderGate {
             registered: AtomicBool::new(false),
             rollback_count: AtomicUsize::new(0),
@@ -1965,7 +2044,8 @@ mod owner_tests {
                 tracker: healthy_tracker.clone(),
             }),
             ..LocalTaskPrepareContext::default()
-        };
+        }
+        .with_query_task_guard(query.task_guard());
         let mut dormant = prepare_compiled_task(empty_result_submission(id), context).unwrap();
         let writer: Arc<dyn TaskResultWriter> = Arc::new(SingleResultHolderWriter(Mutex::new(
             Some(Arc::new(UnknownResultHolder {
@@ -2008,6 +2088,7 @@ mod owner_tests {
         let stopped_body = running.inner.pipeline.stopped_fact();
         let terminal_while_held = running.stopped_fact();
         let charged_while_held = healthy_tracker.current();
+        let tasks_while_held = query.active_tasks();
         *gate.released.lock().unwrap() = true;
         gate.cv.notify_all();
         running
@@ -2037,6 +2118,15 @@ mod owner_tests {
             !advancing,
             "the actual finisher callback must return after gate release"
         );
+        assert_eq!(
+            tasks_while_held, 1,
+            "the healthy holder has not physically exited yet"
+        );
+        assert_eq!(
+            query.active_tasks(),
+            1,
+            "the unknown sibling retains the original Task guard after healthy commit exit"
+        );
         assert_eq!(healthy_tracker.current(), 0);
         assert_eq!(unknown_tracker.current(), 512);
         assert!(!gate.registered.load(Ordering::Acquire));
@@ -2055,6 +2145,11 @@ mod owner_tests {
             super::super::ExecutionReason::FragmentResourceHolderDropPanicked.reason()
         );
         running.inner.lifecycle.advance();
+        assert_eq!(
+            query.active_tasks(),
+            1,
+            "re-observation cannot manufacture unknown holder exit"
+        );
         assert_eq!(gate.rollback_count.load(Ordering::SeqCst), 1);
         assert_eq!(gate.drops.load(Ordering::SeqCst), 1);
         assert_eq!(result_drops.load(Ordering::SeqCst), 1);
@@ -2346,6 +2441,7 @@ impl Default for LocalTaskPrepareContext {
             root_sink_dop: None,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             query_memory: None,
+            query_task: None,
             commit_port: Arc::new(TestTaskCommitPort),
             exchange_receiver_port:
                 crate::runtime::task::io::exchange::in_process_test_exchange_receiver_port(),
@@ -2398,6 +2494,7 @@ impl LocalTaskPrepareContext {
             root_sink_dop: None,
             execution_runtime: None,
             query_memory: None,
+            query_task: None,
             commit_port: Arc::new(UnavailableTaskCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
@@ -2408,6 +2505,20 @@ impl LocalTaskPrepareContext {
             #[cfg(test)]
             start_failure: None,
         }
+    }
+
+    /// Transfer the original Participation reference into this Task's actual
+    /// resource retirement path, before CompletionExited can be published.
+    pub fn with_query_task_guard(
+        mut self,
+        guard: crate::runtime::query_context::QueryTaskGuard,
+    ) -> Self {
+        assert!(
+            self.query_task.is_none(),
+            "one original query Task resource guard"
+        );
+        self.query_task = Some(guard);
+        self
     }
 
     pub fn with_query_memory(

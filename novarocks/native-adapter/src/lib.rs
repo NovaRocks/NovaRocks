@@ -351,6 +351,25 @@ impl BackendDataRuntime {
         self.transport_admission.as_ref()
     }
 
+    pub(crate) fn spawn_with_obligation<F>(
+        &self,
+        work: novarocks_worker::RuntimeFilterSenderWork,
+        future: F,
+    ) -> tokio::task::JoinHandle<
+        Result<F::Output, novarocks_control_runtime::exit_work::ExitWorkError>,
+    >
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (obligation, panic, wake) = work.into_parts();
+        let future = novarocks_control_runtime::exit_work::run_future(obligation, future, panic);
+        self.handle.spawn(ParticipationExitWakeFuture {
+            future: Box::pin(future),
+            _wake: ParticipationExitWake(wake),
+        })
+    }
+
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send,
@@ -373,6 +392,28 @@ impl BackendDataRuntime {
     }
     pub(crate) fn channels(&self) -> &native_channel_cache::NativeChannelCache {
         &self.channels
+    }
+}
+
+struct ParticipationExitWake(novarocks_worker::ParticipationWorkWake);
+impl Drop for ParticipationExitWake {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
+struct ParticipationExitWakeFuture<F> {
+    // Rust destroys the actual obligated future before the wake, even when
+    // that destruction unwinds and records a real Unresolved work.
+    future: std::pin::Pin<Box<F>>,
+    _wake: ParticipationExitWake,
+}
+impl<F: Future> Future for ParticipationExitWakeFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
     }
 }
 

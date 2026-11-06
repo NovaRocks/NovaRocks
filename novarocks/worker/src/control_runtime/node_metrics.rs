@@ -23,6 +23,7 @@ pub use novarocks_control_runtime::observation::{
     LedgerInventoryObservation as WorkerRuntimeInventory,
     LedgerInventoryPage as WorkerRuntimeInventoryPage,
     RuntimeObservationSnapshot as WorkerRuntimeObservationSnapshot,
+    ScopeWorkInventory as WorkerDetachmentBlockers,
 };
 pub use novarocks_control_runtime::transaction::CapacityObservationError as WorkerRuntimeObservationError;
 use novarocks_control_runtime::transaction::RuntimeLedger;
