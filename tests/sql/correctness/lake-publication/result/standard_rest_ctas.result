@@ -6,9 +6,9 @@ id	value
 3	gamma
 
 -- query 8
--- types	bigint
-n
-3
+-- types	bigint	bigint	bigint
+n	assigned_ids	assigned_sequences
+3	3	3
 
 -- query 11
 -- types	bigint	bigint

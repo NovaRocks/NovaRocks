@@ -44,6 +44,8 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata, ConnectorWrite, ConnectorWriteOperationId, ConnectorWriteTargetRef,
 };
 
+use crate::dml::error::DmlExecutionError;
+
 /// One write target, resolved once against a single provider generation.
 ///
 /// Cloning is cheap: the metadata's schema is an `Arc` and the lease is a
@@ -153,12 +155,12 @@ impl ConnectorWriteTargetBinding {
         operation_id: ConnectorWriteOperationId,
         intent: ConnectorRowMutationIntent,
         context: ConnectorRequestContext,
-    ) -> Result<(ConnectorWrite, ConnectorRowMutationPreparation), String> {
+    ) -> Result<(ConnectorWrite, ConnectorRowMutationPreparation), DmlExecutionError> {
         let connector_write = self
             .derive_write_lease()
             .map_err(|error| format!("derive connector row-mutation write lease: {error}"))?;
-        let preparation = match connector_write
-            .prepare_row_mutation(ConnectorRowMutationPreparationRequest {
+        let preparation = row_mutation_preparation(connector_write.prepare_row_mutation(
+            ConnectorRowMutationPreparationRequest {
                 operation_id,
                 table: self.handle().clone(),
                 target_ref: ConnectorWriteTargetRef::parse(target_ref).map_err(|error| {
@@ -166,15 +168,29 @@ impl ConnectorWriteTargetBinding {
                 })?,
                 intent,
                 context,
-            })
-            .map_err(|error| format!("prepare connector row mutation: {error}"))?
-        {
-            ConnectorRowMutationPreparationOutcome::Prepared(preparation) => preparation,
-            ConnectorRowMutationPreparationOutcome::Denied(error) => {
-                return Err(format!("connector row-mutation admission denied: {error}"));
-            }
-        };
+            },
+        ))?;
         Ok((connector_write, preparation))
+    }
+}
+
+/// Provider refusals and failed calls retain their original fact through DML.
+fn row_mutation_preparation(
+    outcome: Result<
+        ConnectorRowMutationPreparationOutcome,
+        novarocks_spi::connector::ConnectorError,
+    >,
+) -> Result<ConnectorRowMutationPreparation, DmlExecutionError> {
+    let provider_failure = |error| {
+        DmlExecutionError::Application(
+            novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ),
+        )
+    };
+    match outcome.map_err(provider_failure)? {
+        ConnectorRowMutationPreparationOutcome::Prepared(preparation) => Ok(preparation),
+        ConnectorRowMutationPreparationOutcome::Denied(error) => Err(provider_failure(error)),
     }
 }
 
@@ -252,4 +268,74 @@ pub(crate) fn write_input_request_for_shape(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod row_mutation_preparation_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+    #[test]
+    fn provider_row_mutation_refusal_keeps_its_original_fact_through_dml() {
+        for denied in [false, true] {
+            for kind in [
+                ConnectorErrorKind::InvalidRequest,
+                ConnectorErrorKind::Internal,
+                ConnectorErrorKind::Cancelled,
+                ConnectorErrorKind::DeadlineExceeded,
+                ConnectorErrorKind::ResourceExhausted,
+                ConnectorErrorKind::Unavailable,
+            ] {
+                // Identical diagnostic text cannot give a system or control
+                // failure the InvalidRequest author's user-error identity.
+                let original =
+                    ConnectorError::new(kind, "UPDATE and MERGE require an Iceberg v3 table");
+                let fact = original.failure_fact();
+                let outcome = if denied {
+                    Ok(ConnectorRowMutationPreparationOutcome::Denied(original))
+                } else {
+                    Err(original)
+                };
+                let failure = match row_mutation_preparation(outcome) {
+                    Ok(_) => panic!("scripted provider refusal cannot prepare a mutation"),
+                    Err(failure) => failure.into_dml_error(None),
+                };
+                let application = failure
+                    .application_error()
+                    .expect("typed application error");
+                let source = application
+                    .failure_cause()
+                    .expect("original provider cause");
+                let provider = source
+                    .downcast_ref::<ConnectorError>()
+                    .expect("original ConnectorError remains available");
+                assert_eq!(provider.kind(), kind);
+                assert_eq!(source.failure_fact(), fact);
+                assert_eq!(failure.execution_failure().unwrap().fact(), fact);
+                let expected_class = match kind {
+                    ConnectorErrorKind::InvalidRequest => FailureClass::Data,
+                    ConnectorErrorKind::Internal => FailureClass::Unexpected,
+                    ConnectorErrorKind::Cancelled | ConnectorErrorKind::DeadlineExceeded => {
+                        FailureClass::Control
+                    }
+                    ConnectorErrorKind::ResourceExhausted => FailureClass::Resource,
+                    ConnectorErrorKind::Unavailable => FailureClass::Dependency,
+                    _ => unreachable!(),
+                };
+                assert_eq!(fact.class(), expected_class);
+            }
+        }
+    }
+
+    #[test]
+    fn nonprovider_row_mutation_diagnostics_keep_the_existing_engine_route() {
+        let failure = DmlExecutionError::from(
+            "InvalidRequest: UPDATE and MERGE require an Iceberg v3 table".to_owned(),
+        )
+        .into_dml_error(None);
+        assert!(failure.application_error().is_none());
+        assert!(failure.execution_failure().is_none());
+        assert!(failure.to_string().starts_with("Executor:"));
+    }
 }

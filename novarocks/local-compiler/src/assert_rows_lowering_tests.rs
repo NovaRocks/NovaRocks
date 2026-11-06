@@ -315,6 +315,7 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
                 labels.pop();
             }
             RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation: None,
                 applicability: match shape {
                     Shape::Conditional | Shape::WrongMaskType => {
                         novarocks_physical_plan::AssertionApplicability::WhenTrue(child[3])
@@ -511,6 +512,7 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
         input,
         mode:
             AssertRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 applicability: novarocks_local_program::ProgramAssertionApplicability::AllRows,
                 key_slots,
                 key_labels,

@@ -457,8 +457,11 @@ mod tests {
 
         let keyed = LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
             "DML change-stream matched row uniqueness",
-            vec![crate::column_id::ColumnId::new_for_test(7)],
-            vec!["_row_id".to_string()],
+            vec![
+                crate::column_id::ColumnId::new_for_test(7),
+                crate::column_id::ColumnId::new_for_test(8),
+            ],
+            vec!["_file".to_string(), "_pos".to_string()],
             "MOR UPDATE matched target row",
             None,
         ));
@@ -469,7 +472,7 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded()
             )
             .unwrap(),
-            Some("ASSERT NUM ROWS (PER KEY <= 1 BY [_row_id])".to_string())
+            Some("ASSERT NUM ROWS (PER KEY <= 1 BY [_file, _pos])".to_string())
         );
     }
 

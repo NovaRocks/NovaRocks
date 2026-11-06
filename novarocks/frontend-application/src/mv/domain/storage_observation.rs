@@ -103,7 +103,8 @@ pub(crate) struct MvSourceSchemaObservation {
     schema_version: bytes::Bytes,
     fields: Vec<novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts>,
     format_v3: bool,
-    stored_row_lineage_enabled: bool,
+    selected_snapshot_id: Option<i64>,
+    selected_snapshot_has_row_range: bool,
 }
 impl MvSourceSchemaObservation {
     pub(crate) fn table(&self) -> &ConnectorTableIdentity {
@@ -123,8 +124,11 @@ impl MvSourceSchemaObservation {
     pub(crate) fn is_format_v3(&self) -> bool {
         self.format_v3
     }
-    pub(crate) fn stored_row_lineage_enabled(&self) -> bool {
-        self.stored_row_lineage_enabled
+    pub(crate) fn selected_snapshot_id(&self) -> Option<i64> {
+        self.selected_snapshot_id
+    }
+    pub(crate) fn selected_snapshot_has_row_range(&self) -> bool {
+        self.selected_snapshot_has_row_range
     }
 }
 
@@ -176,7 +180,8 @@ pub(crate) fn source_schema_from_spi(
         schema_version: observation.schema_version().clone(),
         fields,
         format_v3: observation.is_format_v3(),
-        stored_row_lineage_enabled: observation.stored_row_lineage_enabled(),
+        selected_snapshot_id: observation.selected_snapshot_id(),
+        selected_snapshot_has_row_range: observation.selected_snapshot_has_row_range(),
     })
 }
 
@@ -186,7 +191,6 @@ pub(crate) struct MvSchemaValidationObservation {
     table: ConnectorTableIdentity,
     exact_schema: novarocks_mv_application::persistence::runtime_bindings::MvExactTargetSchemaFacts,
     format_v3: bool,
-    stored_row_lineage_enabled: bool,
 }
 
 impl MvSchemaValidationObservation {
@@ -206,10 +210,6 @@ impl MvSchemaValidationObservation {
 
     pub const fn is_format_v3(&self) -> bool {
         self.format_v3
-    }
-
-    pub const fn stored_row_lineage_enabled(&self) -> bool {
-        self.stored_row_lineage_enabled
     }
 }
 
@@ -713,7 +713,6 @@ pub(crate) fn schema_validation_from_spi(
             partition_fields,
         },
         format_v3: observation.is_format_v3(),
-        stored_row_lineage_enabled: observation.stored_row_lineage_enabled(),
     })
 }
 
@@ -1018,6 +1017,36 @@ mod tests {
     }
 
     #[test]
+    fn source_projection_preserves_the_selected_snapshot_and_its_row_range_fact() {
+        for has_row_range in [false, true] {
+            let context = context(4096);
+            let field = novarocks_spi::connector::MvObservedSourceField::try_new(
+                Bytes::from_static(b"field-id"),
+                "value".into(),
+                "bigint".into(),
+                true,
+            )
+            .unwrap();
+            let source = novarocks_spi::connector::MvSourceSchemaObservation::try_new(
+                table(),
+                object_id(b"source-object"),
+                Bytes::from_static(b"source-schema"),
+                true,
+                Some(42),
+                has_row_range,
+                vec![field],
+                &context,
+            )
+            .unwrap();
+            let projected = super::source_schema_from_spi(source, &context).unwrap();
+            assert_eq!(projected.selected_snapshot_id(), Some(42));
+            assert_eq!(projected.selected_snapshot_has_row_range(), has_row_range);
+            assert!(projected.is_format_v3());
+            assert_eq!(projected.fields()[0].name, "value");
+        }
+    }
+
+    #[test]
     fn target_observation_rejects_duplicate_schema_fields_and_invalid_partition_reference() {
         let mut duplicated = target_fields();
         duplicated.push(MvObservedTargetField {
@@ -1086,7 +1115,6 @@ mod tests {
                 Bytes::from_static(&[0xff, 8]),
                 Bytes::from_static(&[0xff, 9]),
                 true,
-                true,
                 fields,
                 vec![],
                 context,
@@ -1114,7 +1142,6 @@ mod tests {
         assert_eq!(observed.exact_schema().fields[0].ordinal, 3);
         assert_eq!(observed.exact_schema().fields[0].name, "physical_name");
         assert!(observed.is_format_v3());
-        assert!(observed.stored_row_lineage_enabled());
         assert_eq!(
             build(vec![(3, field.clone())], &context(1))
                 .unwrap_err()

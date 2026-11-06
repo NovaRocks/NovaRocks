@@ -1808,7 +1808,16 @@ pub(crate) fn validate_node_semantics(
                     labels,
                     message,
                     applicability,
+                    declared_violation,
                 } => {
+                    if declared_violation.is_some_and(|reason| {
+                        !novarocks_failure_contract::sql_reason::is_row_match_violation(reason)
+                    }) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "keyed assertion declared violation is not registered",
+                        ));
+                    }
                     if keys.is_empty() || keys.len() != labels.len() {
                         errors.push(ValidationError::new(
                             path,

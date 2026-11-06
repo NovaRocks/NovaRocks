@@ -400,6 +400,7 @@ mod tests {
                 ConnectorTableObjectId::try_new(Bytes::from_static(object)).unwrap(),
                 Bytes::from_static(&[1]),
                 true,
+                Some(1),
                 true,
                 vec![
                     MvObservedSourceField::try_new(

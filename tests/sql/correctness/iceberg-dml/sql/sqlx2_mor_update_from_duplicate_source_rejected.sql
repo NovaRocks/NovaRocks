@@ -17,7 +17,7 @@
 
 -- @order_sensitive=true
 -- SQLX-2 owner coverage: a MOR UPDATE ... FROM rejects duplicate source
--- matches with the keyed row-lineage assertion before staging a write.
+-- matches with the keyed physical-position assertion before staging a write.
 
 -- query 1
 -- @skip_result_check=true
@@ -42,7 +42,8 @@ INSERT INTO ${case_db}.sqlx2_mor_update_target VALUES (1, 'a');
 INSERT INTO ${case_db}.sqlx2_mor_update_source VALUES (1, 'x'), (1, 'y');
 
 -- query 2
--- @expect_error=[query.execution.invalid_data] Data failure (reason 7:317)
+-- @expect_error_tier=drift
+-- @expect_error=TrinoError { name=MERGE_TARGET_ROW_MULTIPLE_MATCHES type=USER_ERROR code=119 }: One UPDATE target table row matched more than one source row
 UPDATE ${case_db}.sqlx2_mor_update_target AS t
 SET v = s.new_v
 FROM ${case_db}.sqlx2_mor_update_source AS s

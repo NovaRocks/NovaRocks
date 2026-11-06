@@ -88,6 +88,9 @@ impl StaticPlanInterpreter {
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
+/// Planner-declared row assertion violations change the package descriptor and
+/// plan contract revision, so those exact inputs separate their compatibility
+/// islands without an additional execution-only epoch change.
 ///
 /// Epoch 14 replaces Schema-bearing Exchange payloads with preparation-bound
 /// Arrow units and freezes root COW recipes independently of their records.

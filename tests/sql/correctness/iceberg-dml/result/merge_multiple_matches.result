@@ -1,0 +1,19 @@
+-- query 3
+-- types	bigint	varchar
+id	v
+1	a
+
+-- query 5
+-- types	bigint	varchar
+id	v
+1	first
+
+-- query 10
+-- types	bigint	varchar
+id	v
+1	first
+2	x
+2	y
+-- types	bigint	bigint
+total_rows	unique_ids
+3	3

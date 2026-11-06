@@ -2122,13 +2122,7 @@ pub(crate) fn projected_schema_with_metadata(
     // admitted projection is compared against this schema field for field.
     let storage = annotate_hidden_fields(storage, &table.hidden_columns);
     let mut fields = storage.fields().to_vec();
-    let mut metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
-    if table.row_mutation_frozen_source {
-        metadata_fields = metadata_fields
-            .into_iter()
-            .map(|field| Arc::new(field.as_ref().clone().with_nullable(false)))
-            .collect();
-    }
+    let metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
     fields.extend(metadata_fields);
     let indexes = if projection.is_empty() {
         (0..fields.len()).collect::<Vec<_>>()
@@ -3103,7 +3097,7 @@ mod plan_splits_pruning_tests {
             PartitionSpec::unpartition_spec().into_unbound(),
             SortOrder::unsorted_order(),
             "file:///to-metadata".to_string(),
-            FormatVersion::V3,
+            FormatVersion::V2,
             HashMap::from([
                 ("write.row-lineage".to_string(), "false".to_string()),
                 ("unique_constraints".to_string(), "id".to_string()),
@@ -3120,7 +3114,7 @@ mod plan_splits_pruning_tests {
         let old_schema_id = base.current_schema_id();
         let snapshot_base_ms = base.last_updated_ms();
         let snapshot = |id, parent, schema_id| {
-            Snapshot::builder()
+            let builder = Snapshot::builder()
                 .with_snapshot_id(id)
                 .with_parent_snapshot_id(parent)
                 .with_sequence_number(id)
@@ -3130,9 +3124,12 @@ mod plan_splits_pruning_tests {
                     operation: Operation::Append,
                     additional_properties: HashMap::new(),
                 })
-                .with_schema_id(schema_id)
-                .with_row_range(0, 0)
-                .build()
+                .with_schema_id(schema_id);
+            if parent.is_some() {
+                builder.with_row_range(0, 0).build()
+            } else {
+                builder.build()
+            }
         };
         let base = base
             .into_builder(None)
@@ -3174,6 +3171,8 @@ mod plan_splits_pruning_tests {
             .unwrap();
         let evolved = base
             .into_builder(None)
+            .upgrade_format_version(FormatVersion::V3)
+            .unwrap()
             .add_current_schema(current_schema)
             .unwrap()
             .add_partition_spec(future_spec.into_unbound())
@@ -3286,7 +3285,10 @@ mod plan_splits_pruning_tests {
             current.version.clone().unwrap()
         );
         assert!(selected_source.format_v3);
-        assert!(!selected_source.stored_row_lineage_enabled);
+        assert_eq!(selected_source.selected_snapshot_id, Some(101));
+        assert!(!selected_source.selected_snapshot_has_row_range);
+        assert_eq!(current_source.selected_snapshot_id, Some(102));
+        assert!(current_source.selected_snapshot_has_row_range);
         assert_eq!(selected_source.object_id, current_source.object_id);
         // The default Current spec uses future field 3, absent from To. Source
         // inspection must not call the target partition-author under To schema.

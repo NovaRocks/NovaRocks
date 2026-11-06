@@ -139,9 +139,9 @@ pub(crate) struct DistributedChangeEventOutputExpr {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreExpandKeyedAssertSpec {
+    pub(crate) declared_violation: Option<novarocks_failure_contract::FailureReason>,
     pub(crate) applicability_output_ordinal: Option<usize>,
-    pub(crate) key_column_name: String,
-    pub(crate) key_label: String,
+    pub(crate) key_columns: Vec<(String, String)>,
     pub(crate) message_prefix: String,
 }
 

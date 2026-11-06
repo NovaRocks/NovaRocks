@@ -765,8 +765,8 @@ fn reserved_name_error(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     if lower == "_row_id" || lower == "_last_updated_sequence_number" {
         Some(format!(
-            "column \"{}\" is only available on Iceberg V3 row-lineage tables \
-             (table is not Iceberg V3 with write.row-lineage=true)",
+            "column \"{}\" is only available on Iceberg v3 tables \
+             (table is not Iceberg v3)",
             lower
         ))
     } else {

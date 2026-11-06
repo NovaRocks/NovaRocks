@@ -76,28 +76,10 @@ fn iceberg_type_children(ty: &Type) -> Vec<IcebergSchemaFieldDef> {
     }
 }
 
-/// Returns whether V3 row-lineage columns are available under the Iceberg
-/// default: V3 enables row lineage unless a table explicitly disables it.
+/// Iceberg V3 always exposes row-lineage columns, independently of properties.
+// Design: ADR-0219 (docs/adr/ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md)
 pub fn row_lineage_enabled(metadata: &TableMetadata) -> bool {
-    if !matches!(metadata.format_version(), FormatVersion::V3) {
-        return false;
-    }
-    match metadata.properties().get("write.row-lineage") {
-        Some(value) => !value.eq_ignore_ascii_case("false"),
-        None => true,
-    }
-}
-
-/// Returns whether a table's stored data files may be assumed to carry V3
-/// row-lineage values. Unlike [`row_lineage_enabled`], this requires an
-/// explicit `write.row-lineage=true` declaration because older writers can
-/// produce V3 metadata without materializing `first_row_id` in every file.
-pub fn stored_row_lineage_enabled(metadata: &TableMetadata) -> bool {
     matches!(metadata.format_version(), FormatVersion::V3)
-        && metadata
-            .properties()
-            .get("write.row-lineage")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -135,12 +117,12 @@ mod tests {
     }
 
     #[test]
-    fn row_lineage_follows_the_iceberg_v3_default() {
+    fn row_lineage_depends_only_on_format_version() {
         assert!(row_lineage_enabled(&metadata(
             FormatVersion::V3,
             HashMap::new()
         )));
-        assert!(!row_lineage_enabled(&metadata(
+        assert!(row_lineage_enabled(&metadata(
             FormatVersion::V3,
             HashMap::from([("write.row-lineage".to_string(), "false".to_string())]),
         )));
@@ -148,16 +130,8 @@ mod tests {
             FormatVersion::V2,
             HashMap::new()
         )));
-    }
-
-    #[test]
-    fn stored_row_lineage_requires_an_explicit_v3_declaration() {
-        assert!(!stored_row_lineage_enabled(&metadata(
-            FormatVersion::V3,
-            HashMap::new(),
-        )));
-        assert!(stored_row_lineage_enabled(&metadata(
-            FormatVersion::V3,
+        assert!(!row_lineage_enabled(&metadata(
+            FormatVersion::V2,
             HashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
         )));
     }

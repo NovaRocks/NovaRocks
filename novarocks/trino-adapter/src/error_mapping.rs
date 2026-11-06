@@ -104,6 +104,7 @@ enum Code {
     InvalidLiteral,
     InvalidArguments,
     DuplicateWindowName,
+    MergeTargetRowMultipleMatches,
     GenericInternal,
     PageTransportError,
     PageTransportTimeout,
@@ -140,6 +141,9 @@ impl Code {
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
             InvalidArguments => (76, "INVALID_ARGUMENTS", "USER_ERROR"),
             DuplicateWindowName => (92, "DUPLICATE_WINDOW_NAME", "USER_ERROR"),
+            MergeTargetRowMultipleMatches => {
+                (119, "MERGE_TARGET_ROW_MULTIPLE_MATCHES", "USER_ERROR")
+            }
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
             PageTransportTimeout => (65540, "PAGE_TRANSPORT_TIMEOUT", "INTERNAL_ERROR"),
@@ -193,6 +197,12 @@ impl fmt::Display for PublicMessage<'_> {
             // ExecutionFailureInput::user_error has no location and renders
             // exactly this descriptor prefix plus the original safe detail.
             // Borrow both facts instead of cloning the detail into a UserError.
+            Self::Execution(input) if input.row_match_violation_message().is_some() => formatter
+                .write_str(
+                    input
+                        .row_match_violation_message()
+                        .expect("declared SQL message"),
+                ),
             Self::Execution(input) => write!(
                 formatter,
                 "[{}] {}",
@@ -275,6 +285,9 @@ fn project_message(
     location: Option<TrinoErrorLocation>,
     effect: Option<StatementExternalEffectDisposition>,
 ) -> TrinoQueryError {
+    if code == Code::MergeTargetRowMultipleMatches {
+        return project(code, diagnostics::bound_display(&message), location);
+    }
     let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
     let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
@@ -330,6 +343,18 @@ fn service_error(
             QueryServiceErrorKind::Internal => Code::GenericInternal,
         }
     };
+    if code == Code::MergeTargetRowMultipleMatches {
+        let message = error
+            .execution_failure()
+            .and_then(|input| input.row_match_violation_message())
+            .or_else(|| {
+                error
+                    .user_error()
+                    .and_then(|user| row_match_message_for_code(user.code().as_str()))
+            })
+            .expect("declared row match SQL identity has a standard message");
+        return project(code, diagnostics::bound_display(message), None);
+    }
     let public = error.diagnostic_with_external_effect(effect);
     let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
@@ -361,7 +386,25 @@ fn cancellation_code(reason: &QueryCancellationReason) -> Code {
     }
 }
 
+fn row_match_message_for_code(code: &str) -> Option<&'static str> {
+    use novarocks_query_application::execution_error::{
+        MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE, UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE,
+    };
+    match code {
+        "query.execution.merge_target_row_multiple_matches" => {
+            Some(MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE)
+        }
+        "query.execution.update_target_row_multiple_matches" => {
+            Some(UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE)
+        }
+        _ => None,
+    }
+}
+
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if input.row_match_violation_message().is_some() {
+        return Code::MergeTargetRowMultipleMatches;
+    }
     let descriptor = input.descriptor().descriptor;
     let code = user_code(descriptor.code.as_str()).unwrap_or(Code::GenericInternal);
     // ConnectorMutationFailureKind::AlreadyExists owns the Data/CONNECTOR/6002
@@ -412,6 +455,8 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
 fn user_code(code: &str) -> Option<Code> {
     use Code::*;
     Some(match code {
+        "query.execution.merge_target_row_multiple_matches"
+        | "query.execution.update_target_row_multiple_matches" => MergeTargetRowMultipleMatches,
         "sql.lex.unexpected_character"
         | "sql.lex.unterminated_string"
         | "sql.lex.unterminated_quoted_identifier"

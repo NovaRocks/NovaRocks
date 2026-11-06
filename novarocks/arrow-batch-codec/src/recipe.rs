@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0214 (docs/adr/ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md)
+// Design: ADR-0218 (docs/adr/ADR-0218-schema-free-online-units-and-prepared-layout-recipes.md)
 use std::{alloc::Layout, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, UnionFields};

@@ -1628,6 +1628,7 @@ mod original_stage_tests {
                 object_id,
                 Bytes::from_static(b"schema-1"),
                 true,
+                Some(1),
                 true,
                 vec![
                     MvObservedSourceField::try_new(

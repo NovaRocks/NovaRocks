@@ -1109,8 +1109,7 @@ impl<'a> super::AnalyzerContext<'a> {
             return Err(AnalyzeError::invalid_argument(
                 format!(
                     "__nr_ivm_delta requires base table '{three_part}' to expose Iceberg v3 \
-                     row-lineage metadata columns; rebuild the table with \
-                     `write.row-lineage = true` (Iceberg v3)"
+                     row-lineage metadata columns; the table is not Iceberg v3"
                 ),
                 function.arguments[0].span(),
             ));

@@ -29,6 +29,7 @@ use crate::mv::domain::storage_observation::{
 };
 use novarocks_mv_application::persistence::codec::RelationOccurrence;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
+use novarocks_sql::compiler::SqlCompileError;
 
 /// Validate one D source occurrence and the exact target generation.
 pub(crate) fn validate_schema_contract(
@@ -36,20 +37,12 @@ pub(crate) fn validate_schema_contract(
     occurrence: &RelationOccurrence,
     current_base: &MvSourceSchemaObservation,
     current_target: &MvSchemaValidationObservation,
-) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
+) -> Result<Vec<MvOccurrenceFieldRebind>, SqlCompileError> {
     require_projection_occurrence(projection, occurrence)?;
-    require_row_lineage(
-        "base",
-        current_base.is_format_v3(),
-        current_base.stored_row_lineage_enabled(),
-    )?;
-    require_row_lineage(
-        "target",
-        current_target.is_format_v3(),
-        current_target.stored_row_lineage_enabled(),
-    )?;
+    require_source_row_lineage(current_base)?;
+    require_target_v3(current_target)?;
     validate_projection_target(projection, current_target)?;
-    validate_relation_occurrence_schema(occurrence, current_base)
+    validate_relation_occurrence_schema(occurrence, current_base).map_err(Into::into)
 }
 
 /// Validate every ordered D occurrence used by a join or UNION definition.
@@ -58,20 +51,17 @@ pub(crate) fn validate_join_schema_contract(
     projection: &StoredKeyedMvProjection,
     bases: &[(&RelationOccurrence, &MvSourceSchemaObservation)],
     current_target: &MvSchemaValidationObservation,
-) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
+) -> Result<Vec<MvOccurrenceFieldRebind>, SqlCompileError> {
     let occurrences = &projection.facts.definition().relation_occurrences;
     if occurrences.len() != bases.len() {
         return Err(format!(
             "MV source observation count {} does not match D occurrence count {}",
             bases.len(),
             occurrences.len()
-        ));
+        )
+        .into());
     }
-    require_row_lineage(
-        "target",
-        current_target.is_format_v3(),
-        current_target.stored_row_lineage_enabled(),
-    )?;
+    require_target_v3(current_target)?;
     validate_projection_target(projection, current_target)?;
 
     let mut renames = Vec::new();
@@ -80,13 +70,10 @@ pub(crate) fn validate_join_schema_contract(
             return Err(format!(
                 "MV source observations are not in D occurrence order at occurrence {}",
                 expected.occurrence_id
-            ));
+            )
+            .into());
         }
-        require_row_lineage(
-            "base",
-            observation.is_format_v3(),
-            observation.stored_row_lineage_enabled(),
-        )?;
+        require_source_row_lineage(observation)?;
         renames.extend(validate_relation_occurrence_schema(
             occurrence,
             observation,
@@ -106,11 +93,7 @@ pub(crate) fn validate_branch_id_field(
     if projection.facts.interpretation().branches.is_empty() {
         return Err("MV definition has no branch interpretation".to_string());
     }
-    require_row_lineage(
-        "target",
-        current_target.is_format_v3(),
-        current_target.stored_row_lineage_enabled(),
-    )?;
+    require_target_v3(current_target)?;
     let bindings = validate_projection_target(projection, current_target)?;
     if bindings.branches.len() != projection.facts.interpretation().branches.len() {
         return Err("MV target schema does not retain every branch binding".to_string());
@@ -138,18 +121,19 @@ fn require_projection_occurrence(
     }
 }
 
-fn require_row_lineage(
-    role: &str,
-    format_v3: bool,
-    stored_row_lineage_enabled: bool,
-) -> Result<(), String> {
-    if !format_v3 {
-        return Err(format!("MV {role} table is not Iceberg format v3"));
-    }
-    if !stored_row_lineage_enabled {
-        return Err(format!(
-            "MV {role} table does not retain stored row lineage"
-        ));
+fn require_source_row_lineage(
+    observation: &MvSourceSchemaObservation,
+) -> Result<(), SqlCompileError> {
+    let table = observation.table();
+    crate::mv::domain::refresh::target_apply::ensure_base_row_lineage_contract(
+        observation,
+        &format!("{}.{}", table.namespace, table.table),
+    )
+}
+
+fn require_target_v3(observation: &MvSchemaValidationObservation) -> Result<(), String> {
+    if !observation.is_format_v3() {
+        return Err("MV target table is not Iceberg format v3".to_owned());
     }
     Ok(())
 }
@@ -207,7 +191,7 @@ mod tests {
         occurrence: &RelationOccurrence,
         rename_amount: bool,
         format_v3: bool,
-        stored_row_lineage: bool,
+        selected_snapshot_has_row_range: bool,
     ) -> MvSourceSchemaObservation {
         let context = context();
         let fields = occurrence
@@ -241,7 +225,8 @@ mod tests {
                 .unwrap(),
                 Bytes::copy_from_slice(occurrence.schema_version.as_bytes()),
                 format_v3,
-                stored_row_lineage,
+                Some(1),
+                selected_snapshot_has_row_range,
                 fields,
                 &context,
             )
@@ -298,7 +283,6 @@ mod tests {
                         .as_bytes(),
                 ),
                 true,
-                true,
                 fields,
                 vec![],
                 &context,
@@ -343,21 +327,48 @@ mod tests {
             &target,
         )
         .unwrap_err();
-        assert!(error.contains("exact document generation"), "{error}");
+        assert!(
+            error.to_string().contains("exact document generation"),
+            "{error}"
+        );
     }
     #[test]
-    fn source_projection_keeps_both_original_row_lineage_refusals() {
+    fn source_projection_requires_v3_and_selected_snapshot_row_range() {
         let projection = projection();
         let occurrence = &projection.facts.definition().relation_occurrences[0];
         let target = target_observation(&projection);
         for (format, lineage, expected) in [
-            (false, false, "not Iceberg format v3"),
-            (true, false, "does not retain stored row lineage"),
+            (false, false, "Iceberg format-version=3"),
+            (true, false, "selected snapshot 1 has no row lineage"),
         ] {
             let source = source_observation_with_lineage(occurrence, false, format, lineage);
             let error =
                 validate_schema_contract(&projection, occurrence, &source, &target).unwrap_err();
-            assert!(error.contains(expected), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+            let SqlCompileError::CompilationSource(source) = &error else {
+                panic!("lineage admission must preserve its typed MV refusal");
+            };
+            use novarocks_failure_contract::FailureProjection;
+            assert_eq!(
+                source.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Data
+            );
+            assert_eq!(
+                source.failure_fact().reason().domain(),
+                novarocks_failure_contract::domain::METADATA.get()
+            );
+            assert_eq!(source.failure_fact().reason().code(), 920);
+            let retained =
+                crate::mv::domain::application::MvApplicationError::from_compile(error.clone());
+            assert_eq!(
+                retained.original_failure().unwrap().failure_fact(),
+                source.failure_fact()
+            );
+
+            if format {
+                assert!(error.to_string().contains("perform a v3 commit"), "{error}");
+                assert!(error.to_string().contains("OPTIMIZE"), "{error}");
+            }
         }
     }
 }

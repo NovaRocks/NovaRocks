@@ -9,11 +9,13 @@ query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
 query.execution.invalid_data	Execution
 query.execution.invariant	Execution
+query.execution.merge_target_row_multiple_matches	Execution
 query.execution.numeric_out_of_range	Execution
 query.execution.representation	Execution
 query.execution.resource_exhausted	Execution
 query.execution.unexpected	Execution
 query.execution.unsupported	Execution
+query.execution.update_target_row_multiple_matches	Execution
 sql.admit.client_type_unsupported	Admit
 sql.admit.create_table_unsupported_form	Admit
 sql.admit.delete_requires_where	Admit

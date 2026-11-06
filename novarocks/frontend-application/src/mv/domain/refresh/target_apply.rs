@@ -50,12 +50,33 @@ fn internal_target_column(kind: SqlMvInternalTargetColumn) -> TableColumnDef {
 pub(crate) fn ensure_base_row_lineage_contract(
     observation: &crate::mv::domain::storage_observation::MvSourceSchemaObservation,
     base_fqn: &str,
-) -> Result<(), String> {
-    if !observation.is_format_v3() || !observation.stored_row_lineage_enabled() {
-        return Err(format!(
-            "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3 with write.row-lineage=true; \
-             upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
-        ));
+) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+    // The MV owner authors a data refusal before compilation/publication; keep
+    // this original fact through the existing compile-source bridge.
+    let refusal = |message| {
+        novarocks_sql::compiler::SqlCompileError::CompilationSource(
+            novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_mv_application::product::MvProductError::new(
+                    novarocks_mv_application::product::MvProductErrorKind::InvalidRequest,
+                    message,
+                ),
+            ),
+        )
+    };
+    if !observation.is_format_v3() {
+        return Err(refusal(format!(
+            "iceberg-backed materialized views require base table {base_fqn} to be Iceberg format-version=3"
+        )));
+    }
+    if !observation.selected_snapshot_has_row_range() {
+        let snapshot = observation
+            .selected_snapshot_id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
+        return Err(refusal(format!(
+            "base table {base_fqn} selected snapshot {snapshot} has no row lineage (no row range); \
+             perform a v3 commit, for example OPTIMIZE, then retry"
+        )));
     }
     Ok(())
 }

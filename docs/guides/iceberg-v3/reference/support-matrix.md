@@ -231,7 +231,7 @@ under the License.
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
 | INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | 见 [DML](../dml.md) |
 | CTAS（写 Iceberg） | ✅ | 标准 REST staged-create + 显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
-| CTAS 默认 V3 row-lineage | ❌ | 默认格式 v2，v3 需显式声明 |
+| CTAS 默认 V3 row-lineage | ✅ | 只创建 v3，不注入 lineage 属性；用户显式属性保留 |
 | 提交依赖验证、`commit.retry.*` 与有界 owned-object 清理 | ✅ | 见 [lake-publication](../lake-publication.md)；读依赖操作当前要求目标 ref 未变 |
 | Lake publication unknown 人工核对 | ✅ | 见 [lake-publication](../lake-publication.md)：marker、target UUID、ancestry 三项同时为正才是 Published |
 | TRUNCATE TABLE | ✅ | 仅清空目标 ref，保留 schema 和历史 snapshot |

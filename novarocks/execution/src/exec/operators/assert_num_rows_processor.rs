@@ -39,7 +39,10 @@ enum AssertRowsFailure {
     Mismatch {
         detail: BoundedDetail,
     },
-    DuplicateKey(BoundedDetail),
+    DuplicateKey {
+        detail: BoundedDetail,
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
+    },
     CounterOverflow {
         current: u64,
         incoming: u64,
@@ -50,7 +53,18 @@ enum AssertRowsFailure {
 impl std::fmt::Display for AssertRowsFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Contract(detail) | Self::DuplicateKey(detail) | Self::Mismatch { detail, .. } => {
+            Self::Contract(detail) | Self::Mismatch { detail, .. } => detail.fmt(f),
+            Self::DuplicateKey {
+                detail,
+                declared_violation,
+            } => {
+                if declared_violation.is_some() {
+                    write!(
+                        f,
+                        "keyed assertion (reason {}): ",
+                        novarocks_failure_contract::execution_reason::ASSERT_ROWS_DUPLICATE_KEY
+                    )?;
+                }
                 detail.fmt(f)
             }
             Self::CounterOverflow { current, incoming } => {
@@ -77,7 +91,16 @@ impl FailureProjection for AssertRowsFailure {
         let (class, reason) = match self {
             Self::Contract(_) => (FailureClass::Invariant, ExecutionReason::AssertRowsContract),
             Self::Mismatch { .. } => (FailureClass::Data, ExecutionReason::AssertRowsMismatch),
-            Self::DuplicateKey(_) => (FailureClass::Data, ExecutionReason::AssertRowsDuplicateKey),
+            Self::DuplicateKey {
+                declared_violation, ..
+            } => {
+                return FailureFact::new(
+                    FailureClass::Data,
+                    declared_violation.unwrap_or(
+                        novarocks_failure_contract::execution_reason::ASSERT_ROWS_DUPLICATE_KEY,
+                    ),
+                );
+            }
             Self::CounterOverflow { current, incoming } => {
                 return FailureFact::new(
                     FailureClass::Resource,
@@ -265,6 +288,7 @@ enum RuntimeAssertNumRowsMode {
         done: bool,
     },
     PerKeyAtMostOne {
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
         key_slots: Vec<SlotId>,
         key_labels: Vec<String>,
         message_prefix: String,
@@ -289,10 +313,12 @@ impl RuntimeAssertNumRowsMode {
                 done: false,
             },
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation,
                 key_slots,
                 key_labels,
                 message_prefix,
             } => Self::PerKeyAtMostOne {
+                declared_violation: *declared_violation,
                 key_slots: key_slots.clone(),
                 key_labels: key_labels.clone(),
                 message_prefix: message_prefix.clone(),
@@ -564,6 +590,7 @@ impl AssertNumRowsProcessorKernel {
     }
     fn observe_keyed(&mut self, chunk: &Chunk, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         let RuntimeAssertNumRowsMode::PerKeyAtMostOne {
+            declared_violation,
             key_slots,
             key_labels,
             message_prefix,
@@ -768,15 +795,16 @@ impl AssertNumRowsProcessorKernel {
                 )
                 .ok();
                 return Err(ExecutionFailure::from_domain(
-                    AssertRowsFailure::DuplicateKey(BoundedDetail::truncating_display(
-                        DuplicateKeyDisplay {
+                    AssertRowsFailure::DuplicateKey {
+                        declared_violation: *declared_violation,
+                        detail: BoundedDetail::truncating_display(DuplicateKeyDisplay {
                             prefix: message_prefix,
                             labels: key_labels,
                             columns: &columns,
                             tuples: tuples.as_ref(),
                             row,
-                        },
-                    )),
+                        }),
+                    },
                 ));
             }
             Ok(())
@@ -1013,6 +1041,7 @@ mod tests {
         let err = match AssertNumRowsProcessorFactory::new(
             11,
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 key_slots: vec![],
                 key_labels: vec![],
                 message_prefix: "assert_num_rows failed".to_string(),
@@ -1032,6 +1061,7 @@ mod tests {
         let err = match AssertNumRowsProcessorFactory::new(
             11,
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 key_slots: vec![SlotId::new(7)],
                 key_labels: vec![],
                 message_prefix: "assert_num_rows failed".to_string(),
@@ -1052,6 +1082,7 @@ mod tests {
         let mut op = AssertNumRowsProcessorFactory::new(
             11,
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 key_slots: vec![SlotId::new(7)],
                 key_labels: vec!["_row_id".to_string()],
                 message_prefix: "assert_num_rows failed".to_string(),
@@ -1082,6 +1113,7 @@ mod tests {
         let mut op = AssertNumRowsProcessorFactory::new(
             11,
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 key_slots: vec![SlotId::new(7)],
                 key_labels: vec!["_row_id".to_string()],
                 message_prefix: "assert_num_rows failed".to_string(),
@@ -1117,6 +1149,7 @@ mod tests {
         let mut op = AssertNumRowsProcessorFactory::new(
             11,
             AssertNumRowsMode::PerKeyAtMostOne {
+                declared_violation: None,
                 key_slots: vec![SlotId::new(7)],
                 key_labels: vec!["_row_id".to_string()],
                 message_prefix: "assert_num_rows failed".to_string(),
@@ -1271,7 +1304,17 @@ mod typed_state_tests {
         conditional: bool,
         key_type: FunctionValueType,
     ) -> Box<dyn Operator> {
+        operator_typed_declared(rt, tracker, conditional, key_type, None)
+    }
+    fn operator_typed_declared(
+        rt: &RuntimeState,
+        tracker: Arc<MemTracker>,
+        conditional: bool,
+        key_type: FunctionValueType,
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
+    ) -> Box<dyn Operator> {
         let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            declared_violation,
             key_slots: vec![SlotId::new(1)],
             key_labels: vec!["target".into()],
             message_prefix: "duplicate target".into(),
@@ -1331,8 +1374,38 @@ mod typed_state_tests {
         assert_eq!(error.failure_fact().class(), FailureClass::Data);
         assert_eq!(
             error.failure_fact().reason(),
-            ExecutionReason::AssertRowsDuplicateKey.reason()
+            novarocks_failure_contract::execution_reason::ASSERT_ROWS_DUPLICATE_KEY
         );
+    }
+
+    #[test]
+    fn duplicate_key_returns_the_planner_declared_reason_and_preserves_neutral_diagnostic() {
+        use novarocks_failure_contract::sql_reason;
+        for reason in [
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+        ] {
+            let rt = RuntimeState::default();
+            let tracker = MemTracker::new_root("declared row match");
+            let mut op = operator_typed_declared(
+                &rt,
+                tracker,
+                true,
+                FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
+                Some(reason),
+            );
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            let error = calls
+                .input_and_collect(conditional(
+                    vec![Some(9), Some(9)],
+                    vec![Some(true), Some(true)],
+                ))
+                .unwrap_err();
+            assert_eq!(error.failure_fact().class(), FailureClass::Data);
+            assert_eq!(error.failure_fact().reason(), reason);
+            assert!(error.detail().contains("reason 7:317"));
+            assert!(error.detail().contains("duplicate target"));
+        }
     }
     #[test]
     fn applicable_null_is_contract_failure_and_bypassed_null_allocates_no_state() {
@@ -1482,12 +1555,13 @@ mod typed_state_tests {
         let error = calls.input_and_collect(next).unwrap_err();
         assert_eq!(
             error.failure_fact().reason(),
-            ExecutionReason::AssertRowsDuplicateKey.reason()
+            novarocks_failure_contract::execution_reason::ASSERT_ROWS_DUPLICATE_KEY
         );
     }
     #[test]
     fn keyed_mode_refuses_missing_or_wrong_arity_frozen_declaration() {
         let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            declared_violation: None,
             key_slots: vec![SlotId::new(1)],
             key_labels: vec!["target".into()],
             message_prefix: "duplicate".into(),
@@ -1536,7 +1610,7 @@ mod typed_state_tests {
                 .unwrap_err();
             assert_eq!(
                 error.failure_fact().reason(),
-                ExecutionReason::AssertRowsDuplicateKey.reason()
+                novarocks_failure_contract::execution_reason::ASSERT_ROWS_DUPLICATE_KEY
             );
             assert!(
                 error
@@ -1779,6 +1853,7 @@ mod applicability_long_key_tests {
         let rt = RuntimeState::default();
         let tracker = MemTracker::new_root("long bypass K state");
         let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            declared_violation: None,
             key_slots: vec![SlotId::new(1)],
             key_labels: vec!["target".into()],
             message_prefix: "duplicate target".into(),

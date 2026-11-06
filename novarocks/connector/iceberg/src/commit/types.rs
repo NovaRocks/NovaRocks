@@ -34,12 +34,6 @@ pub enum CommitOpKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcebergWriteMode {
-    LegacyPositionDeletes,
-    RowLineageV3,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergUpdateMode {
     CopyOnWrite,
     MergeOnRead,

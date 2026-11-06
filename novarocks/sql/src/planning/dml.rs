@@ -1164,12 +1164,13 @@ pub enum DmlChangeStreamKind {
 /// connector fencing remain application-owned.
 #[derive(Clone, Debug)]
 pub struct DmlPreExpandKeyedAssert {
+    pub declared_violation: Option<novarocks_failure_contract::FailureReason>,
     /// Exact output occurrence in the native ChangeEventExpand child.
     /// None explicitly preserves the existing all-row assertion.
     /// Some names an already materialized Boolean; SQL never reevaluates it.
     pub applicability_output_ordinal: Option<usize>,
-    pub key_column_name: String,
-    pub key_label: String,
+    /// Ordered pairs of exact child output name and diagnostic key label.
+    pub key_columns: Vec<(String, String)>,
     pub message_prefix: String,
 }
 
@@ -1350,8 +1351,8 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
             &mut physical,
             &crate::planner::physical::PreExpandKeyedAssertSpec {
                 applicability_output_ordinal: assertion.applicability_output_ordinal,
-                key_column_name: assertion.key_column_name,
-                key_label: assertion.key_label,
+                declared_violation: assertion.declared_violation,
+                key_columns: assertion.key_columns,
                 message_prefix: assertion.message_prefix,
             },
         )?;
@@ -1612,8 +1613,8 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
             applicability_output_ordinal: assertion.applicability_output_ordinal,
-            key_column_name: assertion.key_column_name,
-            key_label: assertion.key_label,
+            declared_violation: assertion.declared_violation,
+            key_columns: assertion.key_columns,
             message_prefix: assertion.message_prefix,
         }
     });
@@ -1823,8 +1824,8 @@ fn build_update_change_event_expand(
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
     let child_outputs = optimized_tree.output_columns.clone();
-    let row_id = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
-    let distributed = distribute_producer(optimized_tree, row_id.column_id);
+    let file = output_column_by_name(&child_outputs, "__nr_file", "UPDATE old file")?;
+    let distributed = distribute_producer(optimized_tree, file.column_id);
     let (file, pos, targets, row_id, last_sequence, effect) =
         allocate_change_outputs(&distributed, target_columns, control)?;
     let mut assignments = vec![
@@ -2033,33 +2034,16 @@ fn build_merge_change_event_expand(
     Ok((expanded, applicability_ordinal))
 }
 
-/// Append the Boolean assertion scope after action selection, preserving the
-/// exact output occurrence for the assertion handoff.
+/// Append the matched-target scope after action selection, preserving the
+/// exact file occurrence independently of whether a WHEN clause selected an action.
 fn project_merge_assertion_applicability(
     child: crate::optimizer::OptimizedOperatorNode,
     arena: &mut crate::optimizer::scalar::ScalarArena,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(crate::optimizer::OptimizedOperatorNode, usize), crate::compiler::SqlCompileError> {
     use crate::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
-    let no_action = merge_action_predicate(arena, &child.output_columns, 0, control)?;
-    let selected = arena.intern_observed(
-        crate::optimizer::scalar::ScalarNode::UnaryOp {
-            op: crate::common::UnOp::Not,
-            child: no_action,
-        },
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Boolean, false),
-        control,
-    )?;
-    let child = crate::optimizer::OptimizedOperatorNode {
-        op: Operator::PhysicalFilter(crate::optimizer::operator::FilterOp {
-            predicate: selected,
-        }),
-        stats: child.stats.clone(),
-        output_columns: child.output_columns.clone(),
-        children: vec![child],
-        explain_stats: Default::default(),
-        execution_props: Default::default(),
-    };
+    // NoAction rows must reach the keyed assertion. The existing action-specific
+    // ChangeEventExpand predicates discard them only after that assertion.
     let mut output_columns = child.output_columns.clone();
     let ordinal = output_columns.len();
     let next_column = max_physical_column_id(&child)
@@ -2085,14 +2069,17 @@ fn project_merge_assertion_applicability(
             })
         })
         .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
-    let update = merge_action_predicate(arena, &output_columns, 1, control)?;
-    let delete = merge_action_predicate(arena, &output_columns, 2, control)?;
+    let file = child_expr(
+        arena,
+        &output_columns,
+        "__nr_file",
+        "MERGE old file",
+        control,
+    )?;
     let expr = arena.intern_observed(
-        crate::optimizer::scalar::ScalarNode::BinaryOp {
-            op: crate::common::BinOp::Or,
-            left: update,
-            right: delete,
-            decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        crate::optimizer::scalar::ScalarNode::IsNull {
+            child: file,
+            negated: true,
         },
         mask.value_type.clone(),
         control,
@@ -3180,7 +3167,7 @@ mod tests {
             panic!("expected selected-action applicability projection")
         };
         let selected_action = crate::column_id::ColumnId(4);
-        let expected = std::collections::HashSet::from([selected_action]);
+        let expected = std::collections::HashSet::from([crate::column_id::ColumnId(1)]);
         assert_eq!(
             crate::optimizer::scalar_expr::collect_column_ids_strict(
                 arena,
@@ -3188,7 +3175,7 @@ mod tests {
             )
             .unwrap(),
             expected,
-            "assertion scope reads the already selected action, not WHEN or target nullability"
+            "all matched targets participate regardless of selected action or row lineage"
         );
         for event in &expand.events {
             assert_eq!(
@@ -3199,8 +3186,166 @@ mod tests {
                         .expect("each MERGE effect reads selected action"),
                 )
                 .unwrap(),
-                expected,
+                std::collections::HashSet::from([selected_action]),
             );
+        }
+    }
+
+    #[test]
+    fn mor_update_assertion_uses_physical_position_and_file_colocation() {
+        use crate::planner::physical::{
+            PhysicalPlanKind, PreExpandKeyedAssertSpec, RedistributeMode,
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let columns = [column("id")];
+        for renamed_child_outputs in [false, true] {
+            let producer =
+                super::build_update_change_event_expand(mor_match_producer(), &columns, &control)
+                    .unwrap();
+            let mut physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&producer).unwrap();
+            if renamed_child_outputs {
+                // The optimizer may rename an output while preserving the
+                // exact assignment identity used by ChangeEventExpand.
+                for column in &mut physical.children[0].output_columns {
+                    column.name = format!("carrier_{}", column.column_id.0);
+                }
+            }
+            crate::planner::pipeline::insert_pre_expand_keyed_assert(
+                &mut physical,
+                &PreExpandKeyedAssertSpec {
+                    declared_violation: None,
+                    applicability_output_ordinal: None,
+                    key_columns: vec![
+                        ("__nr_file".into(), "_file".into()),
+                        ("__nr_pos".into(), "_pos".into()),
+                    ],
+                    message_prefix: "duplicate UPDATE target".into(),
+                },
+            )
+            .unwrap();
+            let assertion_node = &physical.children[0];
+            let PhysicalPlanKind::AssertOneRow(assertion) = &assertion_node.kind else {
+                panic!("position assertion precedes event expansion")
+            };
+            assert_eq!(
+                assertion.group_key_column_ids,
+                [crate::column_id::ColumnId(1), crate::column_id::ColumnId(2)]
+            );
+            assert!(assertion.applicability_column_id.is_none());
+            let PhysicalPlanKind::Redistribute(distribution) = &assertion_node.children[0].kind
+            else {
+                panic!("UPDATE input is colocated by its old file")
+            };
+            assert!(matches!(
+                &distribution.mode,
+                RedistributeMode::Hash { cols, .. } if cols == &[crate::column_id::ColumnId(1)]
+            ));
+        }
+    }
+
+    #[test]
+    fn mor_merge_assertion_checks_no_action_rows_before_event_selection() {
+        use crate::optimizer::{operator::Operator, scalar::ScalarNode};
+        use crate::planner::physical::{PhysicalPlanKind, PreExpandKeyedAssertSpec};
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for (matched_update, matched_delete, expected_actions) in [
+            (true, false, vec![1, 3]),
+            (false, true, vec![2, 3]),
+            (false, false, vec![3]),
+        ] {
+            let (producer, applicability_ordinal) = super::build_merge_change_event_expand(
+                mor_match_producer(),
+                &[column("id")],
+                matched_update,
+                matched_delete,
+                true,
+                &control,
+            )
+            .unwrap();
+            let Operator::PhysicalProject(project) = &producer.children[0].op else {
+                panic!("matched-target scope is materialized before the assertion")
+            };
+            assert!(
+                matches!(
+                    producer.children[0].children[0].op,
+                    Operator::PhysicalValues(_)
+                ),
+                "no action filter may remove matched rows before their assertion"
+            );
+            let arena = producer.execution_props.scalar_arena.as_deref().unwrap();
+            let ScalarNode::IsNull {
+                child,
+                negated: true,
+            } = arena.node(project.items[applicability_ordinal].expr)
+            else {
+                panic!("only NULL target files bypass duplicate checking")
+            };
+            assert!(matches!(
+                arena.node(*child),
+                ScalarNode::ColumnRef(crate::column_id::ColumnId(1))
+            ));
+            let Operator::PhysicalChangeEventExpand(expand) = &producer.op else {
+                unreachable!()
+            };
+            let actual_actions = expand
+                .events
+                .iter()
+                .map(|event| {
+                    let ScalarNode::BinaryOp {
+                        op: crate::common::BinOp::Eq,
+                        left,
+                        right,
+                        ..
+                    } = arena.node(event.predicate.unwrap())
+                    else {
+                        panic!("each event consumes the original selected action")
+                    };
+                    assert!(matches!(
+                        arena.node(*left),
+                        ScalarNode::ColumnRef(crate::column_id::ColumnId(4))
+                    ));
+                    let ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
+                        crate::analysis::LiteralValue::Int(action),
+                    )) = arena.node(*right)
+                    else {
+                        panic!("each event has its exact selected action")
+                    };
+                    *action
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_actions, expected_actions,
+                "NoAction is filtered by event selection after duplicate checking"
+            );
+
+            let mut physical =
+                crate::planner::optimizer_bridge::to_physical_plan(&producer).unwrap();
+            crate::planner::pipeline::insert_pre_expand_keyed_assert(
+                &mut physical,
+                &PreExpandKeyedAssertSpec {
+                    declared_violation: None,
+                    applicability_output_ordinal: Some(applicability_ordinal),
+                    key_columns: vec![
+                        ("__nr_file".into(), "_file".into()),
+                        ("__nr_pos".into(), "_pos".into()),
+                        ("__nr_merge_action".into(), "__nr_merge_action".into()),
+                    ],
+                    message_prefix: "duplicate MERGE target".into(),
+                },
+            )
+            .unwrap();
+            let PhysicalPlanKind::AssertOneRow(assertion) = &physical.children[0].kind else {
+                panic!("all MERGE clause combinations install the target assertion")
+            };
+            assert_eq!(
+                assertion.group_key_column_ids,
+                [1, 2, 4].map(crate::column_id::ColumnId)
+            );
+            assert!(assertion.applicability_column_id.is_some());
+            // Same file/position with different selected clauses is distinct;
+            // two NoAction rows share the zero group. NULL files bypass both,
+            // retaining independent unmatched INSERT source rows.
         }
     }
 

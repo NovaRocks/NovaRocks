@@ -1,0 +1,17 @@
+-- query 2
+-- types	bigint	boolean	boolean
+id	missing_row_id	missing_sequence
+1	true	true
+2	true	true
+
+-- query 6
+-- types	bigint	integer	boolean	boolean
+id	v	assigned_row_id	assigned_sequence
+1	11	true	true
+2	20	true	true
+
+-- query 9
+-- types	bigint	integer
+id	v
+1	11
+2	20

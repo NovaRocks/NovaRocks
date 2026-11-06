@@ -75,12 +75,11 @@ CREATE TABLE orders (
   ts      TIMESTAMP
 )
 TBLPROPERTIES (
-  "format-version"   = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 ```
 
-> v3 + row-lineage 是后面 branch DML / MERGE INTO 的前置条件。
+> 后面的 branch DML / MERGE INTO 要求 v3；无需声明 `write.row-lineage`。
 
 ## 4. 写入与查询
 

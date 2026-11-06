@@ -238,3 +238,76 @@ fn original_sender_refusal_precedes_late_footer_control() {
         assert!(std::error::Error::source(&refused).is_some());
     }
 }
+
+#[test]
+fn whole_package_preserves_declared_keyed_assertion_violation() {
+    use crate::physical_package_v2::{decode_fragment_package, test_support};
+    use novarocks_failure_contract::sql_reason;
+    let control = Control::default();
+    let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
+    for reason in [
+        sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+        sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+    ] {
+        let mut wire = encode_fragment_package(&cv_package(), &encode_limits(), &control).unwrap();
+        let fragment = wire.fragment.as_mut().unwrap();
+        let source = fragment.root_node_id.unwrap();
+        let mut assertion = fragment
+            .nodes
+            .iter()
+            .find(|node| node.id == source)
+            .unwrap()
+            .clone();
+        let id = u32::MAX - 1;
+        assertion.id = id;
+        assertion.input_node_ids = vec![source];
+        assertion.required_inputs = vec![assertion.output_properties.clone().unwrap()];
+        assertion.output.as_mut().unwrap().node_id = Some(id);
+        assertion.kind = Some(wire::physical_node::Kind::AssertOneRow(
+            wire::RowCountAssertionNode {
+                kind: Some(wire::row_count_assertion_node::Kind::PerKeyAtMostOne(
+                    wire::PerKeyRowCountAssertion {
+                        key_value_ids: assertion.output.as_ref().unwrap().value_ids.clone(),
+                        labels: vec!["file".into(), "position".into()],
+                        message: "declared target uniqueness".into(),
+                        applicability: Some(wire::AssertionApplicability {
+                            kind: Some(wire::assertion_applicability::Kind::AllRows(
+                                novarocks_proto_models::physical_control_v2::Empty {},
+                            )),
+                        }),
+                        declared_sql_violation: Some(u32::from(reason.code())),
+                    },
+                )),
+            },
+        ));
+        fragment.nodes.push(assertion);
+        fragment.root_node_id = Some(id);
+        wire.result
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap()
+            .node_id = Some(id);
+        let decoded = decode_fragment_package(
+            &wire.encode_to_vec(),
+            &model,
+            &test_support::decode_limits(),
+            &control,
+        )
+        .unwrap();
+        let node = &decoded.fragment().nodes()[&p::NodeId::new(id)];
+        assert!(
+            matches!(&node.kind, p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne { declared_violation: Some(actual), .. }) if *actual == reason)
+        );
+        let encoded = encode_fragment_package(&decoded, &encode_limits(), &control).unwrap();
+        let roundtrip = decode_fragment_package(
+            &encoded.encode_to_vec(),
+            &model,
+            &test_support::decode_limits(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(roundtrip.fragment().nodes()[&p::NodeId::new(id)], *node);
+    }
+}

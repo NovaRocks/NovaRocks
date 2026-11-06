@@ -782,6 +782,7 @@ pub enum RowCountAssertionSpec {
     },
     PerKeyAtMostOne {
         applicability: crate::AssertionApplicability,
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
         keys: Box<[ValueId]>,
         labels: Box<[Box<str>]>,
         message: Box<str>,

@@ -20,9 +20,9 @@
 -- @tags=mv,iceberg,ivm,negative,v3_required
 -- Test Objective:
 -- 1. CREATE MATERIALIZED VIEW over a non-v3 (default v2) Iceberg base must
---    fail fast with a clear error pointing at format-version and row-lineage.
+--    fail fast with a clear error pointing at format-version.
 -- 2. CREATE MATERIALIZED VIEW over a v3 base without write.row-lineage=true
---    must also fail fast with the same error class.
+--    succeeds once its selected v3 snapshot has a row range.
 -- IVM is Iceberg-v3-only by design; this case locks in that contract.
 
 -- query 1
@@ -52,7 +52,7 @@ CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 (
   amount BIGINT
 );
 INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 VALUES (1, 10);
--- Explicit v3 base but row-lineage disabled.
+-- Explicit v3 base without any lineage property.
 CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage (
   order_id INT,
   amount BIGINT
@@ -64,14 +64,14 @@ SET CATALOG ice_ivm_reject_v2_${uuid0};
 USE ns_${uuid0};
 
 -- query 2
--- @expect_error=Iceberg format-version=3 with write.row-lineage=true
+-- @expect_error=Iceberg format-version=3
 CREATE MATERIALIZED VIEW mv_over_v2
 DISTRIBUTED BY HASH(order_id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT order_id, amount FROM orders_v2;
 
 -- query 3
--- @expect_error=Iceberg format-version=3 with write.row-lineage=true
+-- @skip_result_check=true
 CREATE MATERIALIZED VIEW mv_over_v3_no_lineage
 DISTRIBUTED BY HASH(order_id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -80,6 +80,7 @@ AS SELECT order_id, amount FROM orders_v3_no_lineage;
 -- query 4
 -- @cleanup=true
 -- @skip_result_check=true
+DROP MATERIALIZED VIEW IF EXISTS mv_over_v3_no_lineage;
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 FORCE;
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage FORCE;
 DROP DATABASE ice_ivm_reject_v2_${uuid0}.ns_${uuid0};
