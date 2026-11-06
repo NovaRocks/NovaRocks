@@ -47,6 +47,25 @@ pub(crate) enum NullPolicy {
     /// NULL is one equality class (GROUP BY or null-safe equality).
     Equal,
 }
+/// Equality is selected for each signed column before entering its row loop.
+/// Content identity always includes the root NULL class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyEquality {
+    SqlGrouping(NullPolicy),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "RWM-10 first constructs result-content indexes.")
+    )]
+    ResultContent,
+}
+impl KeyEquality {
+    fn null_policy(self) -> NullPolicy {
+        match self {
+            Self::SqlGrouping(nulls) => nulls,
+            Self::ResultContent => NullPolicy::Equal,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IndexPurpose {
     KeyIds,
@@ -70,6 +89,7 @@ pub(crate) enum KeyStrategy {
 struct SpecData {
     types: Vec<FunctionValueType>,
     nulls: Vec<NullPolicy>,
+    equalities: Vec<KeyEquality>,
     #[cfg_attr(
         not(test),
         expect(
@@ -89,17 +109,56 @@ impl KeySpec {
         owner: &dyn InputConstructionOwner,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<Self> {
+        Self::build(
+            types,
+            nulls.len(),
+            |i| KeyEquality::SqlGrouping(nulls[i]),
+            owner,
+            checkpoint,
+        )
+    }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "RWM-10 consumes the frozen result-content key policy."
+        )
+    )]
+    pub(crate) fn with_equalities(
+        types: &[FunctionValueType],
+        equalities: &[KeyEquality],
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
+        Self::build(
+            types,
+            equalities.len(),
+            |i| equalities[i],
+            owner,
+            checkpoint,
+        )
+    }
+    fn build(
+        types: &[FunctionValueType],
+        count: usize,
+        equality: impl Fn(usize) -> KeyEquality,
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<Self> {
         checkpoint()?;
-        if types.is_empty() || types.len() != nulls.len() {
+        if types.is_empty() || types.len() != count {
             return Err(invariant(ValueViolation::Layout));
         }
         let mut copied_types = vector(owner, types.len())?;
-        let mut copied_nulls = vector(owner, nulls.len())?;
+        let mut copied_nulls = vector(owner, count)?;
+        let mut equalities = vector(owner, count)?;
         let mut canonical = false;
-        for (i, (ty, policy)) in types.iter().zip(nulls).enumerate() {
+        for (i, ty) in types.iter().enumerate() {
             checkpoint_at(i, checkpoint)?;
             copied_types.push(ty.clone_observed(checkpoint)?);
-            copied_nulls.push(*policy);
+            let policy = equality(i);
+            copied_nulls.push(policy.null_policy());
+            equalities.push(policy);
             canonical |=
                 !is_fixed(ty.data_type()) && ByteLayout::from_data_type(ty.data_type()).is_none();
         }
@@ -117,10 +176,14 @@ impl KeySpec {
             SpecData {
                 types: copied_types,
                 nulls: copied_nulls,
+                equalities,
                 strategy,
                 _storage: owner.storage_lifetime(),
             },
         )?))
+    }
+    pub(crate) fn equalities(&self) -> &[KeyEquality] {
+        &self.0.equalities
     }
     pub(crate) fn types(&self) -> &[FunctionValueType] {
         &self.0.types
@@ -716,11 +779,43 @@ impl<'a> PreparedKeyBatch<'a> {
             allocator,
         })
     }
+    pub(super) fn decoded_byte_component(
+        &self,
+        column: usize,
+    ) -> Option<&novarocks_value_arrays::decode::DecodedBytes> {
+        self.input.0.tuples.decoded_component(column)
+    }
     pub(super) fn tuples(&self) -> CanonicalTupleView<'_> {
         self.preparation
             .projected()
             .map_or(&self.input.0.tuples, |(storage, _)| storage)
             .view(self.input.arrays())
+    }
+    /// Reuse the prepared tuple's actual normalized component and coordinates.
+    /// SQL callers retain their exact original encoder. Content callers select
+    /// identity or representative bits before entering their column row loop.
+    pub(super) fn encode_component_row<const CONTENT: bool, const REPRESENTATIVE: bool>(
+        &self,
+        column: usize,
+        row: usize,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<crate::exec::hash_table::allocation::AggregateVec<u8>> {
+        if !CONTENT {
+            return self.tuples().encode_component_row(
+                column,
+                row,
+                self.allocator.clone(),
+                checkpoint,
+            );
+        }
+        let (array, mapping) = self.tuples().physical_component(column)?;
+        let physical = super::pairs::physical_row(mapping, row)?;
+        let mut out =
+            crate::exec::hash_table::allocation::AggregateVec::new_in(self.allocator.clone());
+        crate::exec::hash_table::key_builder::append_content_nullable_tracked_observed::<
+            REPRESENTATIVE,
+        >(array, physical, &mut out, checkpoint)?;
+        Ok(out)
     }
     pub(super) fn component_binding(&self, column: usize) -> ExecutionResult<&FunctionValueType> {
         let bindings = self

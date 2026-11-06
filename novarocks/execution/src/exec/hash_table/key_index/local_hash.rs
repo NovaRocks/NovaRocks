@@ -16,12 +16,14 @@
 // under the License.
 
 use super::{
-    KeyInput, KeySpec, NullPolicy, PreparedKeyBatch, checkpoint_at, invariant, original, shared,
-    vector,
+    KeyEquality, KeyInput, KeySpec, NullPolicy, PreparedKeyBatch, checkpoint_at, invariant,
+    original, shared, vector,
 };
 use crate::{
     exec::{
-        hash_table::hash::{canonical_f32_bits, canonical_f64_bits},
+        hash_table::hash::{
+            canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits,
+        },
         pipeline::operator::InputConstructionOwner,
     },
     runtime::task::{ExecutionFailure, ExecutionResult},
@@ -215,14 +217,24 @@ pub(crate) fn hash_batch(
                 checkpoint,
             )?;
         } else {
-            complex_hashes(
-                prepared,
-                column,
-                policy.seed(),
-                &mut component,
-                &mut valid,
-                checkpoint,
-            )?;
+            match prepared.spec.equalities()[column] {
+                KeyEquality::SqlGrouping(_) => complex_hashes::<false>(
+                    prepared,
+                    column,
+                    policy.seed(),
+                    &mut component,
+                    &mut valid,
+                    checkpoint,
+                )?,
+                KeyEquality::ResultContent => complex_hashes::<true>(
+                    prepared,
+                    column,
+                    policy.seed(),
+                    &mut component,
+                    &mut valid,
+                    checkpoint,
+                )?,
+            }
         }
 
         for (i, (&part, value)) in component.iter().zip(&mut combined).enumerate() {
@@ -281,7 +293,7 @@ fn physical_row(mapping: Option<&[usize]>, row: usize) -> ExecutionResult<usize>
         None => Ok(row),
     }
 }
-fn complex_hashes(
+fn complex_hashes<const CONTENT: bool>(
     prepared: &PreparedKeyBatch<'_>,
     column: usize,
     seed: u64,
@@ -298,12 +310,7 @@ fn complex_hashes(
                 valid[ordinal] = 0;
             }
         } else {
-            let bytes = prepared.tuples().encode_component_row(
-                column,
-                row,
-                prepared.allocator.clone(),
-                checkpoint,
-            )?;
+            let bytes = prepared.encode_component_row::<CONTENT, false>(column, row, checkpoint)?;
             output[ordinal] = digest_bytes(seed, &bytes, checkpoint)?;
         }
     }
@@ -365,8 +372,14 @@ fn fixed_hashes(
         DataType::UInt16 => primitive!(UInt16Array, |v: u16| v),
         DataType::UInt32 => primitive!(UInt32Array, |v: u32| v),
         DataType::UInt64 => primitive!(UInt64Array, |v: u64| v),
-        DataType::Float32 => primitive!(Float32Array, canonical_f32_bits),
-        DataType::Float64 => primitive!(Float64Array, canonical_f64_bits),
+        DataType::Float32 => match prepared.spec.equalities()[column] {
+            KeyEquality::SqlGrouping(_) => primitive!(Float32Array, canonical_f32_bits),
+            KeyEquality::ResultContent => primitive!(Float32Array, content_f32_bits),
+        },
+        DataType::Float64 => match prepared.spec.equalities()[column] {
+            KeyEquality::SqlGrouping(_) => primitive!(Float64Array, canonical_f64_bits),
+            KeyEquality::ResultContent => primitive!(Float64Array, content_f64_bits),
+        },
         DataType::Decimal128(..) => primitive!(Decimal128Array, |v: i128| v),
         DataType::Decimal256(..) => primitive!(Decimal256Array, |v: arrow_buffer::i256| v),
         DataType::Date32 => primitive!(Date32Array, |v: i32| v),

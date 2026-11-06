@@ -20,12 +20,13 @@
 //! for the separately retained complete List/Struct/Map declaration.
 
 use super::{
-    KeySpec, NullPolicy, PreparedKeyBatch, checkpoint_at, invariant, original, reserve_push, vector,
+    KeyEquality, KeySpec, NullPolicy, PreparedKeyBatch, checkpoint_at, invariant, original,
+    reserve_push, vector,
 };
 use crate::{
     exec::{
         hash_table::key_builder::{
-            canonical_component_payload, canonical_nullable_equals_observed,
+            canonical_component_payload, canonical_nullable_equals_with_policy_observed,
         },
         pipeline::operator::InputConstructionOwner,
     },
@@ -196,6 +197,25 @@ impl OwnedCanonicalColumn {
         control: &dyn KernelEvaluationControl,
         target: usize,
     ) -> ExecutionResult<Self> {
+        match input.spec.equalities()[column] {
+            KeyEquality::SqlGrouping(_) => {
+                Self::copy_with_policy::<false>(input, column, rows, owner, host, control, target)
+            }
+            KeyEquality::ResultContent => {
+                Self::copy_with_policy::<true>(input, column, rows, owner, host, control, target)
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn copy_with_policy<const CONTENT: bool>(
+        input: &PreparedKeyBatch<'_>,
+        column: usize,
+        rows: &[usize],
+        owner: &dyn InputConstructionOwner,
+        host: Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+        target: usize,
+    ) -> ExecutionResult<Self> {
         let checkpoint = || control.checkpoint(0).map_err(ExecutionFailure::from);
         checkpoint()?;
         let signed = input
@@ -224,12 +244,7 @@ impl OwnedCanonicalColumn {
             let physical = super::pairs::physical_row(mapping, row)?;
             // This is the original cooperative serializer, not a new key codec.
             // Its temporary is released after copying this representative.
-            let bytes = input.tuples().encode_component_row(
-                column,
-                row,
-                input.allocator.clone(),
-                &checkpoint,
-            )?;
+            let bytes = input.encode_component_row::<CONTENT, true>(column, row, &checkpoint)?;
             if !builder.is_empty() && bytes_in_page >= target {
                 publish(
                     builder,
@@ -359,6 +374,24 @@ impl OwnedCanonicalColumn {
         {
             return Err(invariant(ValueViolation::Layout));
         }
+        match self.spec.equalities()[column] {
+            KeyEquality::SqlGrouping(_) => self.compare_with_policy::<false>(
+                input, column, input_rows, owned_rows, output, checkpoint,
+            ),
+            KeyEquality::ResultContent => self.compare_with_policy::<true>(
+                input, column, input_rows, owned_rows, output, checkpoint,
+            ),
+        }
+    }
+    fn compare_with_policy<const CONTENT: bool>(
+        &self,
+        input: &PreparedKeyBatch<'_>,
+        column: usize,
+        input_rows: &[usize],
+        owned_rows: &[usize],
+        output: &mut [u8],
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
         let (source, mapping) = input.tuples().physical_component(column)?;
         let nulls_equal = self.spec.nulls()[column] == NullPolicy::Equal;
         let mut cached: Option<(usize, &BinaryViewArray)> = None;
@@ -395,7 +428,7 @@ impl OwnedCanonicalColumn {
                 if stored.row >= encoded.len() {
                     return Err(invariant(ValueViolation::Bounds));
                 }
-                u8::from(canonical_nullable_equals_observed(
+                u8::from(canonical_nullable_equals_with_policy_observed::<CONTENT>(
                     source,
                     physical,
                     encoded.value(stored.row),

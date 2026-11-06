@@ -41,7 +41,7 @@ use crate::exec::hash_table::allocation::AggregateAllocator;
 use crate::exec::hash_table::allocation::AggregateVec;
 use novarocks_types::largeint;
 
-use super::hash::{canonical_f32_bits, canonical_f64_bits};
+use super::hash::{canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits};
 
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +347,12 @@ pub(crate) fn append_canonical_nullable_tracked(
 trait KeyByteSink {
     fn push_byte(&mut self, value: u8) -> ExecutionResult<()>;
     fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()>;
+    fn float32(&mut self, bits: u32) -> ExecutionResult<()> {
+        self.extend_bytes(&bits.to_le_bytes())
+    }
+    fn float64(&mut self, bits: u64) -> ExecutionResult<()> {
+        self.extend_bytes(&bits.to_le_bytes())
+    }
 }
 
 impl KeyByteSink for Vec<u8> {
@@ -383,17 +389,45 @@ impl KeyByteSink for AggregateVec<u8> {
     }
 }
 
-struct ComparingKeyByteSink<'a> {
+struct ComparingKeyByteSink<'a, const CONTENT: bool> {
     expected: &'a [u8],
     offset: usize,
     equal: bool,
 }
 
-impl KeyByteSink for ComparingKeyByteSink<'_> {
+impl<const CONTENT: bool> KeyByteSink for ComparingKeyByteSink<'_, CONTENT> {
     fn push_byte(&mut self, value: u8) -> ExecutionResult<()> {
         self.extend_bytes(&[value])
     }
 
+    fn float32(&mut self, bits: u32) -> ExecutionResult<()> {
+        if CONTENT {
+            let end = self.offset.saturating_add(4);
+            self.equal &= self.expected.get(self.offset..end).is_some_and(|bytes| {
+                content_f32_bits(f32::from_le_bytes(
+                    bytes.try_into().expect("fixed float width"),
+                )) == content_f32_bits(f32::from_bits(bits))
+            });
+            self.offset = end;
+            Ok(())
+        } else {
+            self.extend_bytes(&bits.to_le_bytes())
+        }
+    }
+    fn float64(&mut self, bits: u64) -> ExecutionResult<()> {
+        if CONTENT {
+            let end = self.offset.saturating_add(8);
+            self.equal &= self.expected.get(self.offset..end).is_some_and(|bytes| {
+                content_f64_bits(f64::from_le_bytes(
+                    bytes.try_into().expect("fixed float width"),
+                )) == content_f64_bits(f64::from_bits(bits))
+            });
+            self.offset = end;
+            Ok(())
+        } else {
+            self.extend_bytes(&bits.to_le_bytes())
+        }
+    }
     fn extend_bytes(&mut self, values: &[u8]) -> ExecutionResult<()> {
         let end = self.offset.saturating_add(values.len());
         if self.equal && self.expected.get(self.offset..end) != Some(values) {
@@ -413,7 +447,7 @@ pub(crate) fn canonical_group_key_equals(
     if array.is_null(row) {
         return Ok(false);
     }
-    let mut sink = ComparingKeyByteSink {
+    let mut sink = ComparingKeyByteSink::<false> {
         expected,
         offset: 0,
         equal: true,
@@ -425,20 +459,36 @@ pub(crate) fn canonical_group_key_equals(
 /// Compare one normalized complex component using the original nullable
 /// framing and cooperative canonical walker. Ordinary STRING/BINARY keys use
 /// value-arrays batch equality instead of this nested-value author.
+#[cfg(test)]
 pub(crate) fn canonical_nullable_equals_observed(
     array: &ArrayRef,
     row: usize,
     expected: &[u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<bool> {
+    canonical_nullable_equals_with_policy_observed::<false>(array, row, expected, checkpoint)
+}
+
+pub(crate) fn canonical_nullable_equals_with_policy_observed<const CONTENT: bool>(
+    array: &ArrayRef,
+    row: usize,
+    expected: &[u8],
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<bool> {
     checkpoint()?;
-    let mut sink = ComparingKeyByteSink {
+    let mut sink = ComparingKeyByteSink::<CONTENT> {
         expected,
         offset: 0,
         equal: true,
     };
     let mut work = ObservedCanonicalKeyWork::new(checkpoint);
-    encode_nullable_nested_with(array, row, &mut sink, "tuple component", &mut work)?;
+    encode_nullable_nested_with_policy::<CONTENT, false, false, _, _>(
+        array,
+        row,
+        &mut sink,
+        "tuple component",
+        &mut work,
+    )?;
     checkpoint()?;
     Ok(sink.equal && sink.offset == expected.len())
 }
@@ -549,6 +599,14 @@ trait CanonicalKeyWork {
         out.push_byte(byte)
     }
     fn extend<S: KeyByteSink>(&mut self, out: &mut S, bytes: &[u8]) -> ExecutionResult<()>;
+    fn float32<S: KeyByteSink>(&mut self, out: &mut S, bits: u32) -> ExecutionResult<()> {
+        self.step()?;
+        out.float32(bits)
+    }
+    fn float64<S: KeyByteSink>(&mut self, out: &mut S, bits: u64) -> ExecutionResult<()> {
+        self.step()?;
+        out.float64(bits)
+    }
 }
 struct UnobservedCanonicalKeyWork;
 impl CanonicalKeyWork for UnobservedCanonicalKeyWork {
@@ -686,6 +744,47 @@ pub(crate) fn append_canonical_nullable_tracked_observed(
     checkpoint()
 }
 
+/// Content identity and stored representatives share the original canonical
+/// framing and walker. Only floating bits differ; representatives retain the
+/// first value's unobservable NaN payload for exact typed export.
+pub(crate) fn append_content_nullable_tracked_observed<
+    const REPRESENTATIVE: bool,
+    const NEUTRAL_BYTES: bool,
+>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut AggregateVec<u8>,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<()> {
+    checkpoint()?;
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    let count = if array.is_null(row) {
+        1
+    } else {
+        5usize
+            .checked_add(if NEUTRAL_BYTES {
+                fingerprint_fixed_len(array.data_type())
+                    .map(Ok)
+                    .unwrap_or_else(|| encoded_group_key_non_null_len_with(array, row, &mut work))?
+            } else {
+                encoded_group_key_non_null_len_with(array, row, &mut work)?
+            })
+            .ok_or_else(group_key_request_arithmetic)?
+    };
+    out.try_reserve_exact(count).map_err(|source| {
+        out.allocator()
+            .allocation_error("reserve content tuple component", source)
+    })?;
+    encode_nullable_nested_with_policy::<true, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+        array,
+        row,
+        out,
+        "tuple component",
+        &mut work,
+    )?;
+    checkpoint()
+}
+
 /// Borrow the original byte leaf value and its existing canonical frame.
 /// Physical UTF8 offsets/view layouts share marker8; BinaryView shares the
 /// original Binary marker20. LargeBinary deliberately keeps marker21.
@@ -728,7 +827,95 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
     out: &mut S,
     work: &mut W,
 ) -> ExecutionResult<()> {
+    encode_group_key_non_null_value_with_policy::<false, false, false, _, _>(array, row, out, work)
+}
+// Extra fixed K carriers need fingerprint bytes but do not alter the old
+// grouping codec or the encoded complex storage representation.
+fn fingerprint_fixed_len(ty: &DataType) -> Option<usize> {
+    Some(match ty {
+        DataType::UInt8 => 2,
+        DataType::UInt16 => 3,
+        DataType::UInt32 => 5,
+        DataType::UInt64 => 9,
+        DataType::Date64 | DataType::Time64(_) | DataType::Duration(_) => 9,
+        DataType::Time32(_) => 5,
+        DataType::FixedSizeBinary(width) if *width != 16 => {
+            5usize.checked_add(usize::try_from(*width).ok()?)?
+        }
+        _ => return None,
+    })
+}
+fn encode_fingerprint_fixed<S: KeyByteSink, W: CanonicalKeyWork>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    work: &mut W,
+) -> ExecutionResult<bool> {
+    macro_rules! scalar {
+        ($ty:ty, $marker:expr) => {{
+            let values = array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                group_key_encoding_contract("fingerprint scalar carrier mismatch")
+            })?;
+            work.push(out, $marker)?;
+            work.extend(out, &values.value(row).to_le_bytes())?;
+        }};
+    }
+    match array.data_type() {
+        DataType::UInt8 => scalar!(arrow::array::UInt8Array, 22),
+        DataType::UInt16 => scalar!(arrow::array::UInt16Array, 23),
+        DataType::UInt32 => scalar!(arrow::array::UInt32Array, 24),
+        DataType::UInt64 => scalar!(arrow::array::UInt64Array, 25),
+        DataType::Date64 => scalar!(arrow::array::Date64Array, 26),
+        DataType::Time32(TimeUnit::Second) => scalar!(arrow::array::Time32SecondArray, 27),
+        DataType::Time32(TimeUnit::Millisecond) => {
+            scalar!(arrow::array::Time32MillisecondArray, 28)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            scalar!(arrow::array::Time64MicrosecondArray, 29)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => scalar!(arrow::array::Time64NanosecondArray, 30),
+        DataType::Duration(TimeUnit::Second) => scalar!(arrow::array::DurationSecondArray, 31),
+        DataType::Duration(TimeUnit::Millisecond) => {
+            scalar!(arrow::array::DurationMillisecondArray, 32)
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            scalar!(arrow::array::DurationMicrosecondArray, 33)
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            scalar!(arrow::array::DurationNanosecondArray, 34)
+        }
+        DataType::FixedSizeBinary(width) if *width != 16 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| {
+                    group_key_encoding_contract("fingerprint fixed binary carrier mismatch")
+                })?;
+            work.push(out, 35)?;
+            work.extend(out, &width.to_le_bytes())?;
+            work.extend(out, values.value(row))?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn encode_group_key_non_null_value_with_policy<
+    const CONTENT: bool,
+    const REPRESENTATIVE: bool,
+    const NEUTRAL_BYTES: bool,
+    S: KeyByteSink,
+    W: CanonicalKeyWork,
+>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    work: &mut W,
+) -> ExecutionResult<()> {
     work.step()?;
+    if NEUTRAL_BYTES && encode_fingerprint_fixed(array, row, out, work)? {
+        return Ok(());
+    }
     match array.data_type() {
         DataType::Boolean => {
             let arr = array
@@ -805,7 +992,18 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
                     )
                 })?;
             work.push(out, 6)?;
-            work.extend(out, &canonical_f32_bits(arr.value(row)).to_le_bytes())?;
+            work.float32(
+                out,
+                if CONTENT {
+                    if REPRESENTATIVE {
+                        arr.value(row).to_bits()
+                    } else {
+                        content_f32_bits(arr.value(row))
+                    }
+                } else {
+                    canonical_f32_bits(arr.value(row))
+                },
+            )?;
             Ok(())
         }
         DataType::Float64 => {
@@ -818,7 +1016,18 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
                     )
                 })?;
             work.push(out, 7)?;
-            work.extend(out, &canonical_f64_bits(arr.value(row)).to_le_bytes())?;
+            work.float64(
+                out,
+                if CONTENT {
+                    if REPRESENTATIVE {
+                        arr.value(row).to_bits()
+                    } else {
+                        content_f64_bits(arr.value(row))
+                    }
+                } else {
+                    canonical_f64_bits(arr.value(row))
+                },
+            )?;
             Ok(())
         }
         DataType::Utf8
@@ -829,7 +1038,14 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
         | DataType::LargeBinary => {
             let (value, marker, component) = canonical_byte_value(array, row)?;
             let len = group_key_component_len(value.len(), component)?;
-            work.push(out, marker)?;
+            work.push(
+                out,
+                if NEUTRAL_BYTES && marker == 21 {
+                    20
+                } else {
+                    marker
+                },
+            )?;
             work.extend(out, &len.to_le_bytes())?;
             work.extend(out, value)?;
             Ok(())
@@ -959,7 +1175,13 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
             let len = group_key_component_len(end.saturating_sub(start), "List")?;
             work.extend(out, &len.to_le_bytes())?;
             for idx in start..end {
-                encode_nullable_nested_with(values, idx, out, "group key list item", work)?;
+                encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+                    values,
+                    idx,
+                    out,
+                    "group key list item",
+                    work,
+                )?;
             }
             Ok(())
         }
@@ -976,7 +1198,13 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
             let field_count = group_key_component_len(struct_arr.num_columns(), "Struct")?;
             work.extend(out, &field_count.to_le_bytes())?;
             for column in struct_arr.columns() {
-                encode_nullable_nested_with(column, row, out, "group key struct field", work)?;
+                encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+                    column,
+                    row,
+                    out,
+                    "group key struct field",
+                    work,
+                )?;
             }
             Ok(())
         }
@@ -994,8 +1222,20 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
             let len = group_key_component_len(end.saturating_sub(start), "Map")?;
             work.extend(out, &len.to_le_bytes())?;
             for idx in start..end {
-                encode_nullable_nested_with(&keys, idx, out, "group key map key", work)?;
-                encode_nullable_nested_with(&values, idx, out, "group key map value", work)?;
+                encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+                    &keys,
+                    idx,
+                    out,
+                    "group key map key",
+                    work,
+                )?;
+                encode_nullable_nested_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+                    &values,
+                    idx,
+                    out,
+                    "group key map value",
+                    work,
+                )?;
             }
             Ok(())
         }
@@ -1013,16 +1253,39 @@ fn encode_nullable_nested_with<S: KeyByteSink, W: CanonicalKeyWork>(
     context: &'static str,
     work: &mut W,
 ) -> ExecutionResult<()> {
+    encode_nullable_nested_with_policy::<false, false, false, _, _>(array, row, out, context, work)
+}
+fn encode_nullable_nested_with_policy<
+    const CONTENT: bool,
+    const REPRESENTATIVE: bool,
+    const NEUTRAL_BYTES: bool,
+    S: KeyByteSink,
+    W: CanonicalKeyWork,
+>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    context: &'static str,
+    work: &mut W,
+) -> ExecutionResult<()> {
     work.step()?;
     if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         work.push(out, 0)?;
         return Ok(());
     }
     work.push(out, 1)?;
-    let len = encoded_group_key_non_null_len_with(array, row, work)?;
+    let len = if NEUTRAL_BYTES {
+        fingerprint_fixed_len(array.data_type())
+            .map(Ok)
+            .unwrap_or_else(|| encoded_group_key_non_null_len_with(array, row, work))?
+    } else {
+        encoded_group_key_non_null_len_with(array, row, work)?
+    };
     let len = group_key_component_len(len, context)?;
     work.extend(out, &len.to_le_bytes())?;
-    encode_group_key_non_null_value_with(array, row, out, work)
+    encode_group_key_non_null_value_with_policy::<CONTENT, REPRESENTATIVE, NEUTRAL_BYTES, _, _>(
+        array, row, out, work,
+    )
 }
 
 fn encoded_group_key_non_null_len_with<W: CanonicalKeyWork>(

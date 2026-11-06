@@ -41,3 +41,22 @@ pub fn canonical_f32_bits(value: f32) -> u32 {
         value.to_bits()
     }
 }
+
+/// Result-content identity keeps the observable sign of zero while treating
+/// every NaN as the same SQL-visible value.
+pub(crate) fn content_f64_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}
+
+/// See [`content_f64_bits`].
+pub(crate) fn content_f32_bits(value: f32) -> u32 {
+    if value.is_nan() {
+        f32::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
+}

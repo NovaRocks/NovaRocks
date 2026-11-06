@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+#[path = "content_tests.rs"]
+mod content_tests;
 
 #[path = "bulk_tests.rs"]
 mod bulk_tests;

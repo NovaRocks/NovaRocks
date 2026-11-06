@@ -19,12 +19,14 @@
 //! occurrence ordinals or dictionary codes. The caller discards every output
 //! slot if an operation fails; no comparison runs inside a table bool closure.
 
-use super::{NullPolicy, PreparedKeyBatch, checkpoint_at, invariant, original, vector};
+use super::{
+    KeyEquality, NullPolicy, PreparedKeyBatch, checkpoint_at, invariant, original, vector,
+};
 use crate::{
     exec::{
         hash_table::{
-            hash::{canonical_f32_bits, canonical_f64_bits},
-            key_builder::canonical_nullable_equals_observed,
+            hash::{canonical_f32_bits, canonical_f64_bits, content_f32_bits, content_f64_bits},
+            key_builder::canonical_nullable_equals_with_policy_observed,
         },
         pipeline::operator::InputConstructionOwner,
     },
@@ -99,34 +101,52 @@ pub(super) fn compare_prepared_pairs(
                 let (b, bm) = right.tuples().physical_component(column)?;
                 if super::prepared::is_fixed(left.spec.types()[column].data_type()) {
                     compare_fixed_pairs(
-                        a, am, left_rows, b, bm, right_rows, nulls, output, checkpoint,
+                        a,
+                        am,
+                        left_rows,
+                        b,
+                        bm,
+                        right_rows,
+                        nulls,
+                        left.spec.equalities()[column],
+                        output,
+                        checkpoint,
                     )?;
                 } else {
-                    for (i, ((&ar, &br), result)) in left_rows
-                        .iter()
-                        .zip(right_rows)
-                        .zip(output.iter_mut())
-                        .enumerate()
-                    {
-                        checkpoint_at(i, checkpoint)?;
-                        if *result == 0 {
-                            continue;
-                        }
-                        let ap = physical_row(am, ar)?;
-                        let bp = physical_row(bm, br)?;
-                        if let Some(equal) = null_equal(a.is_null(ap), b.is_null(bp), nulls) {
-                            *result = u8::from(equal);
-                        } else {
-                            let expected = left.tuples().encode_component_row(
-                                column,
-                                ar,
-                                left.allocator.clone(),
-                                checkpoint,
-                            )?;
-                            *result = u8::from(canonical_nullable_equals_observed(
-                                b, bp, &expected, checkpoint,
-                            )?);
-                        }
+                    macro_rules! complex {
+                        ($content:literal) => {{
+                            for (i, ((&ar, &br), result)) in left_rows
+                                .iter()
+                                .zip(right_rows)
+                                .zip(output.iter_mut())
+                                .enumerate()
+                            {
+                                checkpoint_at(i, checkpoint)?;
+                                if *result == 0 {
+                                    continue;
+                                }
+                                let ap = physical_row(am, ar)?;
+                                let bp = physical_row(bm, br)?;
+                                if let Some(equal) = null_equal(a.is_null(ap), b.is_null(bp), nulls)
+                                {
+                                    *result = u8::from(equal);
+                                } else {
+                                    let expected = left.encode_component_row::<$content, false>(
+                                        column, ar, checkpoint,
+                                    )?;
+                                    *result =
+                                        u8::from(canonical_nullable_equals_with_policy_observed::<
+                                            $content,
+                                        >(
+                                            b, bp, &expected, checkpoint
+                                        )?);
+                                }
+                            }
+                        }};
+                    }
+                    match left.spec.equalities()[column] {
+                        KeyEquality::SqlGrouping(_) => complex!(false),
+                        KeyEquality::ResultContent => complex!(true),
                     }
                 }
             }
@@ -220,6 +240,7 @@ pub(super) fn compare_value_pairs(
                         bm,
                         right_rows,
                         NullPolicy::Equal,
+                        left.spec.equalities()[column],
                         &mut fixed,
                         checkpoint,
                     )?;
@@ -241,36 +262,43 @@ pub(super) fn compare_value_pairs(
                         };
                     }
                 } else {
-                    for (i, ((&ar, &br), result)) in left_rows
-                        .iter()
-                        .zip(right_rows)
-                        .zip(values.iter_mut())
-                        .enumerate()
-                    {
-                        checkpoint_at(i, checkpoint)?;
-                        if output[i] == Some(false) {
-                            *result = Some(false);
-                            continue;
-                        }
-                        let ap = physical_row(am, ar)?;
-                        let bp = physical_row(bm, br)?;
-                        *result = if a.is_null(ap) || b.is_null(bp) {
-                            if nulls == NullPolicy::Equal {
-                                Some(a.is_null(ap) && b.is_null(bp))
-                            } else {
-                                None
+                    macro_rules! complex {
+                        ($content:literal) => {{
+                            for (i, ((&ar, &br), result)) in left_rows
+                                .iter()
+                                .zip(right_rows)
+                                .zip(values.iter_mut())
+                                .enumerate()
+                            {
+                                checkpoint_at(i, checkpoint)?;
+                                if output[i] == Some(false) {
+                                    *result = Some(false);
+                                    continue;
+                                }
+                                let ap = physical_row(am, ar)?;
+                                let bp = physical_row(bm, br)?;
+                                *result = if a.is_null(ap) || b.is_null(bp) {
+                                    if nulls == NullPolicy::Equal {
+                                        Some(a.is_null(ap) && b.is_null(bp))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    let expected = left.encode_component_row::<$content, false>(
+                                        column, ar, checkpoint,
+                                    )?;
+                                    Some(
+                                        canonical_nullable_equals_with_policy_observed::<$content>(
+                                            b, bp, &expected, checkpoint,
+                                        )?,
+                                    )
+                                };
                             }
-                        } else {
-                            let expected = left.tuples().encode_component_row(
-                                column,
-                                ar,
-                                left.allocator.clone(),
-                                checkpoint,
-                            )?;
-                            Some(canonical_nullable_equals_observed(
-                                b, bp, &expected, checkpoint,
-                            )?)
-                        };
+                        }};
+                    }
+                    match left.spec.equalities()[column] {
+                        KeyEquality::SqlGrouping(_) => complex!(false),
+                        KeyEquality::ResultContent => complex!(true),
                     }
                 }
             }
@@ -311,6 +339,7 @@ pub(super) fn compare_fixed_pairs(
     bm: Option<&[usize]>,
     right_rows: &[usize],
     nulls: NullPolicy,
+    equality: KeyEquality,
     output: &mut [u8],
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
 ) -> ExecutionResult<()> {
@@ -364,8 +393,14 @@ pub(super) fn compare_fixed_pairs(
         DataType::UInt16 => primitive!(UInt16Array, |v: u16| v),
         DataType::UInt32 => primitive!(UInt32Array, |v: u32| v),
         DataType::UInt64 => primitive!(UInt64Array, |v: u64| v),
-        DataType::Float32 => primitive!(Float32Array, canonical_f32_bits),
-        DataType::Float64 => primitive!(Float64Array, canonical_f64_bits),
+        DataType::Float32 => match equality {
+            KeyEquality::SqlGrouping(_) => primitive!(Float32Array, canonical_f32_bits),
+            KeyEquality::ResultContent => primitive!(Float32Array, content_f32_bits),
+        },
+        DataType::Float64 => match equality {
+            KeyEquality::SqlGrouping(_) => primitive!(Float64Array, canonical_f64_bits),
+            KeyEquality::ResultContent => primitive!(Float64Array, content_f64_bits),
+        },
         DataType::Decimal128(..) => primitive!(Decimal128Array, |v: i128| v),
         DataType::Decimal256(..) => primitive!(Decimal256Array, |v: arrow_buffer::i256| v),
         DataType::Date32 => primitive!(Date32Array, |v: i32| v),
