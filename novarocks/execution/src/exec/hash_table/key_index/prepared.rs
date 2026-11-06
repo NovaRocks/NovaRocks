@@ -814,6 +814,7 @@ impl<'a> PreparedKeyBatch<'a> {
             crate::exec::hash_table::allocation::AggregateVec::new_in(self.allocator.clone());
         crate::exec::hash_table::key_builder::append_content_nullable_tracked_observed::<
             REPRESENTATIVE,
+            false,
         >(array, physical, &mut out, checkpoint)?;
         Ok(out)
     }
