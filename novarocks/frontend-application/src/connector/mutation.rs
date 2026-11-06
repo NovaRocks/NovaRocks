@@ -25,11 +25,8 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
-use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCause};
-use novarocks_query_application::{
-    api::{CommandError, StatementExternalEffectDisposition},
-    engine_error::EngineError,
-};
+use novarocks_failure_contract::{FailureFact, FailureProjection};
+use novarocks_query_application::{api::CommandError, engine_error::EngineError};
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -445,6 +442,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use novarocks_query_application::api::StatementExternalEffectDisposition;
     use novarocks_spi::connector::{
         ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
         ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,

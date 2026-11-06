@@ -669,7 +669,6 @@ async fn build_frontend_role_products(
 fn build_frontend_query_session_factory_from_role_products(
     host: &FrontendApplicationHost,
     products: &FrontendRoleProducts,
-    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
 ) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
     let catalog_service = Arc::clone(&products.catalog_service);
     let unified_statistics = Arc::clone(&products.unified_statistics);
@@ -859,16 +858,11 @@ async fn build_frontend_query_session_factory(
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
-    let products = build_frontend_role_products(
-        host,
-        exchange_port,
-        mv_storage_observation,
-        system_catalog.clone(),
-    )
-    .await?;
+    let products =
+        build_frontend_role_products(host, exchange_port, mv_storage_observation, system_catalog)
+            .await?;
     products.start_background_workers()?;
-    let session_factory =
-        build_frontend_query_session_factory_from_role_products(host, &products, system_catalog)?;
+    let session_factory = build_frontend_query_session_factory_from_role_products(host, &products)?;
     Ok((session_factory, products))
 }
 
@@ -1079,7 +1073,7 @@ where
         host,
         exchange_port,
         mv_storage_observation,
-        system_catalog.clone(),
+        system_catalog,
     )
     .await
     {
@@ -1105,27 +1099,24 @@ where
             stop_result,
         );
     }
-    let session_factory = match build_frontend_query_session_factory_from_role_products(
-        host,
-        &products,
-        system_catalog,
-    ) {
-        Ok(factory) => factory,
-        Err(error) => {
-            let product_shutdown = shutdown_frontend_role_products_to_convergence(
-                &mut products,
-                config.frontend_cleanup_timeout,
-            )
-            .await;
-            let stop_result = report_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(
-                combine_server_and_shutdown(Err(error), product_shutdown),
-                stop_result,
-            );
-        }
-    };
+    let session_factory =
+        match build_frontend_query_session_factory_from_role_products(host, &products) {
+            Ok(factory) => factory,
+            Err(error) => {
+                let product_shutdown = shutdown_frontend_role_products_to_convergence(
+                    &mut products,
+                    config.frontend_cleanup_timeout,
+                )
+                .await;
+                let stop_result = report_server
+                    .stop()
+                    .map_err(FrontendApplicationError::server);
+                return combine_server_and_shutdown(
+                    combine_server_and_shutdown(Err(error), product_shutdown),
+                    stop_result,
+                );
+            }
+        };
     let server_result = run_client_listeners_with_supervision(
         #[cfg(novarocks_dev_controls)]
         Arc::clone(&config.native_trust),

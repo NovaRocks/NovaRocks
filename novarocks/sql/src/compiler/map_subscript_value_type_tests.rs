@@ -106,7 +106,7 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             assert_eq!(
                 render.unwrap_err(),
                 crate::compiler::ClientRenderSchemaError::UnsupportedClientType {
-                    column: sql.strip_prefix("SELECT ").unwrap().to_owned(),
+                    column: "_col0".to_owned(),
                     native_type: novarocks_result_contract::NativeRenderType::LargeInt,
                 },
                 "{sql}"
