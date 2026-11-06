@@ -432,7 +432,7 @@ struct BufferedFragment {
 /// of the complete prepared write set. The summary is its own first batch;
 /// prepared fragments then move through bounded, byte-aware batches.
 struct PrefixOutputCursor {
-    summary_rows: Option<i64>,
+    row_count_rows: Option<i64>,
     fragments: VecDeque<BufferedFragment>,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<Arc<MemTracker>>,
@@ -445,17 +445,17 @@ impl PrefixOutputCursor {
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
     ) -> ExecutionResult<Self> {
-        let summary_rows = row_count_to_wire(rows).map_err(finish_connector)?;
+        let row_count_rows = row_count_to_wire(rows).map_err(finish_connector)?;
         validate_root_write_result_row(
-            RootRowKind::Summary,
+            RootRowKind::RowCount,
             RootWriteResultRowShape {
-                row_count: Some(summary_rows),
+                row_count: Some(row_count_rows),
                 ..RootWriteResultRowShape::default()
             },
         )
         .map_err(finish_connector)?;
         Ok(Self {
-            summary_rows: Some(summary_rows),
+            row_count_rows: Some(row_count_rows),
             fragments: fragments.into(),
             root_schema,
             tracker,
@@ -463,7 +463,7 @@ impl PrefixOutputCursor {
     }
 
     fn has_output(&self) -> bool {
-        self.summary_rows.is_some() || !self.fragments.is_empty()
+        self.row_count_rows.is_some() || !self.fragments.is_empty()
     }
 
     fn is_finished(&self) -> bool {
@@ -471,22 +471,26 @@ impl PrefixOutputCursor {
     }
 
     fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
-        if let Some(summary_rows) = self.summary_rows.take() {
+        if let Some(row_count_rows) = self.row_count_rows.take() {
             let root_arrow = self.root_schema.arrow_schema_ref();
             let batch = RecordBatch::try_new(
                 root_arrow,
                 vec![
-                    Arc::new(Int8Array::from(vec![RootRowKind::Summary.to_wire()])) as ArrayRef,
+                    Arc::new(Int8Array::from(vec![RootRowKind::RowCount.to_wire()])) as ArrayRef,
                     new_null_array(self.root_schema.arrow_schema_ref().field(1).data_type(), 1),
-                    Arc::new(Int64Array::from(vec![Some(summary_rows)])),
+                    Arc::new(Int64Array::from(vec![Some(row_count_rows)])),
                     new_null_array(self.root_schema.arrow_schema_ref().field(3).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(4).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(5).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(6).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(7).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(8).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(9).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(10).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(11).data_type(), 1),
                 ],
             )
-            .map_err(|error| finish_arrow(FinishArrowOperation::Summary, error))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::RowCount, error))?;
             return self.track_batch(batch).map(Some);
         }
         if self.fragments.is_empty() {
@@ -593,6 +597,22 @@ impl PrefixOutputCursor {
                 ),
                 new_null_array(
                     self.root_schema.arrow_schema_ref().field(7).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(8).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(9).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(10).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(11).data_type(),
                     rows,
                 ),
             ],
@@ -1202,7 +1222,10 @@ pub(crate) fn root_artifact_chunk_with_construction(
                         .map_err(|_| KernelFailure::ResourceExhausted)?,
                 )?,
                 RootArtifactStep::Columns => owner.request(
-                    Layout::array::<ArrayRef>(8).map_err(|_| KernelFailure::ResourceExhausted)?,
+                    Layout::array::<ArrayRef>(
+                        novarocks_spi::connector::write_stack::ROOT_WRITE_RESULT_COLUMN_COUNT,
+                    )
+                    .map_err(|_| KernelFailure::ResourceExhausted)?,
                 )?,
                 RootArtifactStep::KindWrapper => {
                     super::compiled_writer_statistics::grouped_primitive_adoption(
@@ -1426,6 +1449,10 @@ fn root_artifact_chunk_core(
         blob_type,
         body,
         properties,
+        null_array(8, rows)?,
+        null_array(9, rows)?,
+        null_array(10, rows)?,
+        null_array(11, rows)?,
     ];
     construct(artifact, columns, rows)
 }
@@ -2152,6 +2179,10 @@ mod tests {
                 None,
                 false,
             )),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::FixedSizeBinary(16), 1),
         ];
         let upstream_schema =
             ChunkSchema::try_ref_from_schema_and_slot_ids(&upstream, root_schema.slot_ids())
@@ -2947,7 +2978,10 @@ mod tests {
             let (kinds, ordinals, row_counts, fragments) = finish_columns(output);
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("root row kind") {
-                    RootRowKind::Summary => {
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => {
                         summaries += 1;
                         assert!(ordinals.is_null(row));
                         assert_eq!(row_counts.value(row), 12);
@@ -2984,7 +3018,7 @@ mod tests {
         let output = &outputs[0];
         assert_eq!(output.len(), 1);
         let (kinds, _, row_counts, _) = finish_columns(output);
-        assert_eq!(kinds.value(0), RootRowKind::Summary.to_wire());
+        assert_eq!(kinds.value(0), RootRowKind::RowCount.to_wire());
         assert_eq!(row_counts.value(0), 0);
     }
 
@@ -3297,7 +3331,7 @@ mod tests {
                     .downcast_ref::<Int8Array>()
                     .expect("kind"))
                 .flat_map(|kinds| (0..kinds.len()).map(|row| kinds.value(row)))
-                .filter(|kind| *kind == RootRowKind::Summary.to_wire())
+                .filter(|kind| *kind == RootRowKind::RowCount.to_wire())
                 .count(),
             1
         );
@@ -3405,7 +3439,7 @@ mod tests {
                 .downcast_ref::<Int8Array>()
                 .unwrap()
                 .value(0),
-            RootRowKind::Summary.to_wire()
+            RootRowKind::RowCount.to_wire()
         );
         assert_eq!(
             summary.columns()[2]
@@ -3687,7 +3721,10 @@ mod tests {
                 .expect("kind");
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("root kind") {
-                    RootRowKind::Summary => {
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => {
                         summaries += 1;
                         let counts = output.columns()[2]
                             .as_any()
@@ -3831,7 +3868,10 @@ mod tests {
                 .expect("body");
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("kind") {
-                    RootRowKind::Summary => summaries += 1,
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => summaries += 1,
                     RootRowKind::PreparedFragment => panic!("unexpected fragment"),
                     RootRowKind::ArtifactDraft => {
                         assert!(
@@ -6375,7 +6415,7 @@ mod tests {
         for chunk in &chunks {
             let (kinds, _, counts, _) = finish_columns(chunk);
             for row in 0..chunk.len() {
-                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                     summaries += 1;
                     assert_eq!(counts.value(row), 9);
                 } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
@@ -6540,7 +6580,7 @@ mod tests {
         for chunk in &chunks {
             let (kinds, _, counts, _) = finish_columns(chunk);
             for row in 0..chunk.len() {
-                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                     summaries += 1;
                     assert_eq!(counts.value(row), 9);
                 } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
@@ -6657,7 +6697,7 @@ mod tests {
             for chunk in &chunks {
                 let (kinds, _, counts, _) = finish_columns(chunk);
                 for row in 0..chunk.len() {
-                    if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                    if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                         summaries += 1;
                         assert_eq!(counts.value(row), 9);
                     } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {

@@ -2965,7 +2965,7 @@ fn grouped_writer_fragment_with_sources(
     const ROOT_WRITE_RESULT_BODY_INDEX: usize = 6;
     const ROOT_WRITE_RESULT_PROPERTIES_INDEX: usize = 7;
     const WRITER_MULTIPLEX_SCHEMA_REVISION: u32 = 1;
-    const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
+    const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 2;
 
     let control = GroupedConstantControl;
     let pools = grouped_collection_pools(fixture, &control);
@@ -3039,6 +3039,14 @@ fn grouped_writer_fragment_with_sources(
         ("blob_type", DataType::Utf8, true),
         ("body", DataType::Binary, true),
         ("properties", DataType::Map(property_entries, false), true),
+        ("requested", DataType::Int64, true),
+        ("matched", DataType::Int64, true),
+        ("insufficient_keys", DataType::Int64, true),
+        (
+            "insufficient_fingerprint",
+            DataType::FixedSizeBinary(16),
+            true,
+        ),
     ];
     let output_fields = root_fields
         .into_iter()

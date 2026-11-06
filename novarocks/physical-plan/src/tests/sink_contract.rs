@@ -889,6 +889,34 @@ fn finish_router_writer_fixture(
             WriterRelationFieldRole::Auxiliary,
             WriterDerivedKind::RelationAuxiliary,
         ),
+        (
+            "requested",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "matched",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "insufficient_keys",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "insufficient_fingerprint",
+            DataType::FixedSizeBinary(16),
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
     ];
     let root_fields = root_specs
         .into_iter()

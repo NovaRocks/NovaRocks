@@ -47,8 +47,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 use arrow::array::{
-    Array, BinaryArray, Int8Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
-    StructArray,
+    Array, BinaryArray, FixedSizeBinaryArray, Int8Array, Int32Array, Int64Array, ListArray,
+    MapArray, StringArray, StructArray,
 };
 #[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
@@ -62,7 +62,9 @@ use novarocks_spi::connector::write_stack::{
 use novarocks_spi::connector::write_stack::{
     ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
     ROOT_WRITE_RESULT_FRAGMENT_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
-    ROOT_WRITE_RESULT_KIND_INDEX, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
+    ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_INDEX, ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_INDEX,
+    ROOT_WRITE_RESULT_KIND_INDEX, ROOT_WRITE_RESULT_MATCHED_INDEX,
+    ROOT_WRITE_RESULT_PROPERTIES_INDEX, ROOT_WRITE_RESULT_REQUESTED_INDEX,
     ROOT_WRITE_RESULT_ROW_COUNT_INDEX, ROOT_WRITE_RESULT_TARGET_INDEX, RootWriteResultSchema,
 };
 use novarocks_spi::connector::{
@@ -383,6 +385,8 @@ struct RootWriteRow<'a> {
     blob_type: Option<&'a str>,
     body: Option<&'a [u8]>,
     pairs: Option<Vec<(Option<&'a str>, Option<&'a str>)>>,
+    verification: [Option<i64>; 3],
+    fingerprint: Option<[u8; 16]>,
 }
 
 pub(crate) struct RootWriteResultDecoder {
@@ -488,6 +492,17 @@ impl RootWriteResultDecoder {
         let bodies = downcast::<BinaryArray>(&columns[ROOT_WRITE_RESULT_BODY_INDEX], "body")?;
         let properties =
             downcast::<MapArray>(&columns[ROOT_WRITE_RESULT_PROPERTIES_INDEX], "properties")?;
+        let requested =
+            downcast::<Int64Array>(&columns[ROOT_WRITE_RESULT_REQUESTED_INDEX], "requested")?;
+        let matched = downcast::<Int64Array>(&columns[ROOT_WRITE_RESULT_MATCHED_INDEX], "matched")?;
+        let insufficient = downcast::<Int64Array>(
+            &columns[ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_INDEX],
+            "insufficient keys",
+        )?;
+        let fingerprint = downcast::<FixedSizeBinaryArray>(
+            &columns[ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_INDEX],
+            "insufficient fingerprint",
+        )?;
 
         for row in 0..chunk.len() {
             if kinds.is_null(row) {
@@ -556,6 +571,14 @@ impl RootWriteResultDecoder {
                 blob_type: (!blob_types.is_null(row)).then(|| blob_types.value(row)),
                 body: (!bodies.is_null(row)).then(|| bodies.value(row)),
                 pairs,
+                verification: [requested, matched, insufficient]
+                    .map(|values| (!values.is_null(row)).then(|| values.value(row))),
+                fingerprint: (!fingerprint.is_null(row)).then(|| {
+                    fingerprint
+                        .value(row)
+                        .try_into()
+                        .expect("validated fingerprint width")
+                }),
             })?;
         }
         Ok(())
@@ -635,10 +658,15 @@ impl RootWriteResultDecoder {
         let header = view.header();
         let kind = header.kind();
         let artifact = kind == RootRowKind::ArtifactDraft;
+        let verification = view.delete_verification().map(|value| value.into_wire());
         self.apply_row(RootWriteRow {
             kind,
-            target: (kind != RootRowKind::Summary).then(|| header.target()),
-            count: (kind == RootRowKind::Summary)
+            target: matches!(
+                kind,
+                RootRowKind::PreparedFragment | RootRowKind::ArtifactDraft
+            )
+            .then(|| header.target()),
+            count: (kind == RootRowKind::RowCount)
                 .then(|| i64::try_from(header.row_count()))
                 .transpose()
                 .map_err(|_| "write Root record row count exceeds i64".to_string())?,
@@ -651,6 +679,8 @@ impl RootWriteResultDecoder {
                     .map(|(key, value)| (Some(key), Some(value)))
                     .collect()
             }),
+            verification: verification.map_or([None; 3], |(counts, _)| counts.map(Some)),
+            fingerprint: verification.map(|(_, fingerprint)| fingerprint),
         })
     }
 
@@ -664,6 +694,8 @@ impl RootWriteResultDecoder {
             blob_type,
             body,
             pairs,
+            verification,
+            fingerprint,
         } = row;
         self.membership
             .observe(
@@ -676,6 +708,10 @@ impl RootWriteResultDecoder {
                     blob_type_len: blob_type.map(str::len),
                     body_len: body.map(<[u8]>::len),
                     properties_len: pairs.as_ref().map(Vec::len),
+                    requested: verification[0],
+                    matched: verification[1],
+                    insufficient_keys: verification[2],
+                    insufficient_fingerprint_len: fingerprint.as_ref().map(|bytes| bytes.len()),
                 },
             )
             .map_err(|error| {
@@ -683,7 +719,12 @@ impl RootWriteResultDecoder {
             })?;
 
         match kind {
-            RootRowKind::Summary => {
+            RootRowKind::DeleteVerification => {
+                return Err(
+                    "write Root contains undeclared summary kind DeleteVerification".into(),
+                );
+            }
+            RootRowKind::RowCount => {
                 let count = count.expect("validated above");
                 let count = row_count_from_wire(count).map_err(|error| {
                     RootWriteDecodeFailure::source(error).context("write Root row count")
@@ -938,7 +979,7 @@ pub(crate) mod tests {
 
     fn summary(row_count: i64) -> Row {
         Row {
-            kind: RootRowKind::SUMMARY,
+            kind: RootRowKind::ROW_COUNT,
             target: None,
             row_count: Some(row_count),
             fragment: None,
@@ -1058,6 +1099,13 @@ pub(crate) mod tests {
                 blob_types,
                 bodies,
                 Arc::new(properties.finish()),
+                arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, rows.len()),
+                arrow::array::new_null_array(
+                    &arrow::datatypes::DataType::FixedSizeBinary(16),
+                    rows.len(),
+                ),
             ],
         )
         .expect("root relation chunk")
@@ -1497,7 +1545,7 @@ pub(crate) mod tests {
         let mut decoder = exact_decoder();
         let unexpected = records(vec![artifact(0, 12, "theta-v1", b"x")]);
         assert!(decoder.apply_record(&unexpected[0]).is_err());
-        // A missing SUMMARY fails at finish; records after EOF are refused.
+        // A missing ROW_COUNT fails at finish; records after EOF are refused.
         let mut decoder = new_decoder(1);
         let only_fragment = records(vec![fragment(0, 1)]);
         decoder.apply_record(&only_fragment[0]).unwrap();
@@ -1546,7 +1594,7 @@ pub(crate) mod tests {
             .expect("batch");
         let error = finish(decoder).expect_err("no summary");
         assert!(
-            error.contains("missing its SUMMARY row"),
+            error.contains("missing its ROW_COUNT row"),
             "unexpected error: {error}"
         );
     }
@@ -1558,7 +1606,7 @@ pub(crate) mod tests {
             .apply_chunk(&chunk(vec![summary(1), summary(2)]))
             .expect_err("two summaries");
         assert!(
-            error.contains("more than one SUMMARY"),
+            error.contains("more than one ROW_COUNT"),
             "unexpected error: {error}"
         );
     }
@@ -1570,7 +1618,7 @@ pub(crate) mod tests {
         assert!(
             decoder
                 .apply_chunk(&chunk(vec![Row {
-                    kind: RootRowKind::SUMMARY,
+                    kind: RootRowKind::ROW_COUNT,
                     target: Some(0),
                     row_count: Some(1),
                     fragment: None,
@@ -1760,5 +1808,48 @@ pub(crate) mod tests {
             ]))
             .expect_err("EOF closes the Root stream");
         assert!(error.to_string().contains("trailing batch after EOF"));
+    }
+
+    #[test]
+    fn undeclared_deletion_verification_is_refused_in_arrow_and_record_forms() {
+        use novarocks_native_adapter::root_write_commit_codec::{
+            WriteCommitEncoder, WriteCommitTotals,
+        };
+        let template = chunk(vec![summary(0)]);
+        let mut columns = template.columns().to_vec();
+        columns[0] = Arc::new(Int8Array::from(vec![RootRowKind::DELETE_VERIFICATION]));
+        columns[2] = arrow::array::new_null_array(&arrow::datatypes::DataType::Int64, 1);
+        for (index, value) in [(8, 7), (9, 5), (10, 1)] {
+            columns[index] = Arc::new(Int64Array::from(vec![Some(value)]));
+        }
+        let mut fingerprint = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
+        fingerprint.append_value([3; 16]).unwrap();
+        columns[11] = Arc::new(fingerprint.finish());
+        let verification =
+            Chunk::try_new_with_columns(template.chunk_schema_ref(), columns).unwrap();
+        let mut decoder = exact_decoder();
+        assert!(
+            decoder
+                .apply_chunk(&verification)
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared summary kind DeleteVerification")
+        );
+        let mut encoder = WriteCommitEncoder::try_new(
+            verification.record_batch().clone(),
+            WriteCommitTotals::default(),
+        )
+        .unwrap();
+        let mut bytes = [0; 128];
+        let turn = encoder.step(&mut bytes).unwrap();
+        assert_eq!(turn.emitted_bytes, 88);
+        let mut decoder = exact_decoder();
+        assert!(
+            decoder
+                .apply_record(&bytes[..turn.emitted_bytes])
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared summary kind DeleteVerification")
+        );
     }
 }

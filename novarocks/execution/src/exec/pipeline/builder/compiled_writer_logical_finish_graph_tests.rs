@@ -545,7 +545,7 @@ mod logical_finish_graph {
                 .downcast_ref::<Int64Array>()
                 .unwrap();
             for row in 0..chunk.len() {
-                if kind.value(row) == RootRowKind::Summary.to_wire() {
+                if kind.value(row) == RootRowKind::RowCount.to_wire() {
                     counts.push(count.value(row));
                 }
                 if kind.value(row) == RootRowKind::PreparedFragment.to_wire() {

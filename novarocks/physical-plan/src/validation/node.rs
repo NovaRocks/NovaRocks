@@ -2196,7 +2196,7 @@ pub(crate) fn validate_writer_schema(
     };
     let valid_width = match contract {
         WriterRelationContract::Multiplex => schema.fields.len() >= 4,
-        WriterRelationContract::RootResult => schema.fields.len() == 8,
+        WriterRelationContract::RootResult => schema.fields.len() == 12,
     };
     if schema.revision != expected_revision || !valid_width {
         errors.push(ValidationError::new(
@@ -2291,6 +2291,10 @@ pub(crate) fn writer_relation_field_matches(
                 "blob_type" => 5,
                 "body" => 6,
                 "properties" => 7,
+                "requested" => 8,
+                "matched" => 9,
+                "insufficient_keys" => 10,
+                "insufficient_fingerprint" => 11,
                 _ => return false,
             },
         },
@@ -2339,6 +2343,12 @@ pub(crate) fn writer_relation_field_matches(
         }
         (WriterRelationContract::RootResult, 6) => {
             super::value_binding_is_primitive(&field.ty, &DataType::Binary, true)
+        }
+        (WriterRelationContract::RootResult, 8..=10) => {
+            super::value_binding_is_primitive(&field.ty, &DataType::Int64, true)
+        }
+        (WriterRelationContract::RootResult, 11) => {
+            super::value_binding_is_primitive(&field.ty, &DataType::FixedSizeBinary(16), true)
         }
         (WriterRelationContract::RootResult, 7) => {
             matches!(
@@ -2796,9 +2806,13 @@ pub(crate) fn validate_writer_grouped_unpivot(
     let unpivot_auxiliary_outputs = std::iter::once(spec.value_output)
         .chain(spec.literal_outputs.iter().copied())
         .collect::<BTreeSet<_>>();
+    // Grouped Unpivot authors only the four ArtifactDraft payload fields.
+    // The verification tail is owned by a separate Root record.
     let schema_auxiliary_outputs = finish
         .output_schema
         .fields
+        .get(4..8)
+        .unwrap_or_default()
         .iter()
         .filter_map(|field| {
             (field.role == crate::WriterRelationFieldRole::Auxiliary).then_some(field.value)

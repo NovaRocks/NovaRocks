@@ -223,6 +223,34 @@ fn relation_fields(
                 R::Auxiliary,
                 K::RelationAuxiliary,
             ),
+            (
+                "requested",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "matched",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "insufficient_keys",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "insufficient_fingerprint",
+                DataType::FixedSizeBinary(16),
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
         ]);
     }
     specs
@@ -914,7 +942,11 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
             "input_fields",
             "blob_type",
             "body",
-            "properties"
+            "properties",
+            "requested",
+            "matched",
+            "insufficient_keys",
+            "insufficient_fingerprint"
         ]
     );
     let properties = root_result_layout.schema().field(7);

@@ -42,7 +42,7 @@ pub enum WriterDerivedKind {
 }
 
 pub const WRITER_MULTIPLEX_SCHEMA_REVISION: u32 = 1;
-pub const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
+pub const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueOrigin {

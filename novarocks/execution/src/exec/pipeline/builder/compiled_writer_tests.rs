@@ -2510,7 +2510,7 @@ mod statistics {
         let sketches = expected_theta(rows);
         vec![
             expected_root_batch(&[(
-                RootRowKind::Summary.to_wire(),
+                RootRowKind::RowCount.to_wire(),
                 None,
                 Some(i64::try_from(rows.len()).unwrap()),
                 None,

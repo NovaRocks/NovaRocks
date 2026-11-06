@@ -14539,7 +14539,7 @@ mod tests {
             finish_modes,
             vec![novarocks_physical_plan::FinishCountMode::WriterReported]
         );
-        assert_eq!(plan.result_port().unwrap().fields.len(), 8);
+        assert_eq!(plan.result_port().unwrap().fields.len(), 12);
     }
 
     #[test]
@@ -14595,7 +14595,7 @@ mod tests {
             finish.input_schema.fields.len(),
             novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
         );
-        assert_eq!(finish.output_schema.fields.len(), 8);
+        assert_eq!(finish.output_schema.fields.len(), 12);
     }
 
     #[test]

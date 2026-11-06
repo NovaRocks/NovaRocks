@@ -19,17 +19,20 @@
 //!
 //! One record per fixed Root write result row. Each record starts with a
 //! 48-byte header: ASCII `PWC1`, then u32LE complete record bytes (INCLUDING
-//! this header), u8 kind (1 SUMMARY, 2 PREPARED_FRAGMENT, 3 ARTIFACT_DRAFT),
-//! three zero bytes, i32LE target ordinal (0 for SUMMARY), u64LE row count
-//! (SUMMARY only), then u32LE fragment bytes, field count, blob-type bytes,
+//! this header), u8 kind (1 ROW_COUNT, 2 PREPARED_FRAGMENT, 3 ARTIFACT_DRAFT, 4 DELETE_VERIFICATION),
+//! three zero bytes, i32LE target ordinal (0 for ROW_COUNT), u64LE row count
+//! (ROW_COUNT only), then u32LE fragment bytes, field count, blob-type bytes,
 //! body bytes, property count and property key+value bytes. The payload is
 //! the fragment bytes, or for an artifact draft: i32LE field IDs, UTF-8 blob
 //! type, opaque body, then each property as u32LE key length, key, u32LE value
 //! length, value. Records may cross segments; there is no padding.
 //!
+//! DELETE_VERIFICATION has zero header payload declarations and exactly 40 payload
+//! bytes: three i64LE counts and a 16-byte little-endian fingerprint.
+//!
 //! Every single-value, count and cumulative limit the frontend applies is
 //! checked from the row's lengths BEFORE its header is written, so a refused
-//! row emits no byte. Exactly one SUMMARY is required: a second one is refused
+//! row emits no byte. Exactly one ROW_COUNT is required: a second one is refused
 //! before emission, and its absence is refused by [`WriteCommitTotals::finish`]
 //! at the sealed End. Field-ID/property-key uniqueness, the frozen target and
 //! artifact sets, and commit authority stay with the frontend decoder, which
@@ -40,8 +43,8 @@
 //! RecordBatch columns Vec clone, and retains the original input owner.
 
 use arrow::array::{
-    Array, BinaryArray, Int8Array, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
-    StringArray,
+    Array, BinaryArray, FixedSizeBinaryArray, Int8Array, Int32Array, Int64Array, ListArray,
+    MapArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field};
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
@@ -50,8 +53,10 @@ use novarocks_spi::connector::write_stack::{
     MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, MAX_CONNECTOR_WRITE_TARGETS,
     ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN, ROOT_WRITE_RESULT_BODY_COLUMN,
     ROOT_WRITE_RESULT_COLUMN_COUNT, ROOT_WRITE_RESULT_FRAGMENT_COLUMN,
-    ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN, ROOT_WRITE_RESULT_KIND_COLUMN,
-    ROOT_WRITE_RESULT_PROPERTIES_COLUMN, ROOT_WRITE_RESULT_ROW_COUNT_COLUMN,
+    ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN, ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_COLUMN,
+    ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_COLUMN, ROOT_WRITE_RESULT_KIND_COLUMN,
+    ROOT_WRITE_RESULT_MATCHED_COLUMN, ROOT_WRITE_RESULT_PROPERTIES_COLUMN,
+    ROOT_WRITE_RESULT_REQUESTED_COLUMN, ROOT_WRITE_RESULT_ROW_COUNT_COLUMN,
     ROOT_WRITE_RESULT_TARGET_COLUMN, RootRowKind,
 };
 use novarocks_spi::connector::{
@@ -61,13 +66,16 @@ use novarocks_spi::connector::{
 };
 
 pub const WRITE_COMMIT_HEADER_BYTES: usize = 48;
+pub const DELETE_VERIFICATION_PAYLOAD_BYTES: usize = 40;
+use novarocks_result_contract::DeleteVerificationCounts;
 // The spi checks below would allocate a ConnectorError on refusal; the cursor
 // applies the same rules directly so that no step ever allocates.
 fn kind_from_wire(kind: i8) -> Result<RootRowKind, WriteCommitCodecError> {
     match kind {
-        RootRowKind::SUMMARY => Ok(RootRowKind::Summary),
+        RootRowKind::ROW_COUNT => Ok(RootRowKind::RowCount),
         RootRowKind::PREPARED_FRAGMENT => Ok(RootRowKind::PreparedFragment),
         RootRowKind::ARTIFACT_DRAFT => Ok(RootRowKind::ArtifactDraft),
+        RootRowKind::DELETE_VERIFICATION => Ok(RootRowKind::DeleteVerification),
         _ => Err(WriteCommitCodecError::Kind),
     }
 }
@@ -90,8 +98,10 @@ pub enum WriteCommitCodecError {
     Shape,
     Target,
     RowCount,
-    DuplicateSummary,
-    MissingSummary,
+    DuplicateRowCount,
+    DuplicateDeleteVerification,
+    DeleteVerificationCount,
+    MissingRowCount,
     FragmentLimit,
     ArtifactLimit,
     FieldIds,
@@ -115,8 +125,12 @@ impl std::fmt::Display for WriteCommitCodecError {
             Self::Shape => "write commit row payload does not match its kind",
             Self::Target => "write commit target ordinal is invalid",
             Self::RowCount => "write commit row count is negative",
-            Self::DuplicateSummary => "write commit stream contains more than one SUMMARY",
-            Self::MissingSummary => "write commit stream ended without its SUMMARY",
+            Self::DuplicateRowCount => "write commit stream contains more than one ROW_COUNT",
+            Self::MissingRowCount => "write commit stream ended without its ROW_COUNT",
+            Self::DeleteVerificationCount => "delete verification count must be nonnegative",
+            Self::DuplicateDeleteVerification => {
+                "write commit stream contains more than one DELETE_VERIFICATION"
+            }
             Self::FragmentLimit => "prepared write set exceeds its frozen fragment budget",
             Self::ArtifactLimit => "write commit artifact count exceeds its bounded profile",
             Self::FieldIds => "write commit artifact field IDs must be positive and bounded",
@@ -153,9 +167,9 @@ pub struct WriteCommitRecordHeader {
     record_bytes: u32,
 }
 impl WriteCommitRecordHeader {
-    fn summary(row_count: i64) -> Result<Self, WriteCommitCodecError> {
+    fn row_count_record(row_count: i64) -> Result<Self, WriteCommitCodecError> {
         let row_count = u64::try_from(row_count).map_err(|_| WriteCommitCodecError::RowCount)?;
-        Self::try_new(RootRowKind::Summary, 0, row_count, 0, [0; 5])
+        Self::try_new(RootRowKind::RowCount, 0, row_count, 0, [0; 5])
     }
     fn fragment(target: i32, bytes: usize) -> Result<Self, WriteCommitCodecError> {
         let bytes = u32::try_from(bytes).map_err(|_| WriteCommitCodecError::FragmentLimit)?;
@@ -203,7 +217,12 @@ impl WriteCommitRecordHeader {
             && property_count == 0
             && property_bytes == 0;
         match kind {
-            RootRowKind::Summary => {
+            RootRowKind::DeleteVerification => {
+                if target != 0 || row_count != 0 || fragment_bytes != 0 || !artifact_empty {
+                    return Err(WriteCommitCodecError::Shape);
+                }
+            }
+            RootRowKind::RowCount => {
                 if target != 0 || fragment_bytes != 0 || !artifact_empty {
                     return Err(WriteCommitCodecError::Shape);
                 }
@@ -246,6 +265,11 @@ impl WriteCommitRecordHeader {
             }
         }
         let record = [
+            if kind == RootRowKind::DeleteVerification {
+                DELETE_VERIFICATION_PAYLOAD_BYTES
+            } else {
+                0
+            },
             fragment_bytes as usize,
             field_count as usize * 4,
             blob_type_bytes as usize,
@@ -387,7 +411,35 @@ impl<'a> WriteCommitRecordView<'a> {
                 return Err(WriteCommitCodecError::RecordLength);
             }
         }
+        if header.kind() == RootRowKind::DeleteVerification {
+            view.read_delete_verification()?;
+        }
         Ok(view)
+    }
+
+    fn read_delete_verification(&self) -> Result<DeleteVerificationCounts, WriteCommitCodecError> {
+        let count = |at| {
+            i64::from_le_bytes(
+                self.payload[at..at + 8]
+                    .try_into()
+                    .expect("fixed record payload"),
+            )
+        };
+        DeleteVerificationCounts::try_from_wire(
+            count(0),
+            count(8),
+            count(16),
+            self.payload[24..40]
+                .try_into()
+                .expect("fixed fingerprint width"),
+        )
+        .map_err(|_| WriteCommitCodecError::DeleteVerificationCount)
+    }
+    pub fn delete_verification(&self) -> Option<DeleteVerificationCounts> {
+        (self.header.kind() == RootRowKind::DeleteVerification).then(|| {
+            self.read_delete_verification()
+                .expect("record payload validated at parse")
+        })
     }
 
     pub const fn header(&self) -> WriteCommitRecordHeader {
@@ -451,7 +503,8 @@ impl<'a> WriteCommitRecordView<'a> {
 /// carry them across input batches; they are not commit evidence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteCommitTotals {
-    summary_seen: bool,
+    row_count_seen: bool,
+    delete_verification_seen: bool,
     /// `PreparedWriteSetLedger` semantics: reaching a bound is legal.
     fragments: usize,
     fragment_bytes: usize,
@@ -467,11 +520,17 @@ impl WriteCommitTotals {
     ) -> Result<Self, WriteCommitCodecError> {
         let mut next = self;
         match header.kind {
-            RootRowKind::Summary => {
-                if next.summary_seen {
-                    return Err(WriteCommitCodecError::DuplicateSummary);
+            RootRowKind::DeleteVerification => {
+                if next.delete_verification_seen {
+                    return Err(WriteCommitCodecError::DuplicateDeleteVerification);
                 }
-                next.summary_seen = true;
+                next.delete_verification_seen = true;
+            }
+            RootRowKind::RowCount => {
+                if next.row_count_seen {
+                    return Err(WriteCommitCodecError::DuplicateRowCount);
+                }
+                next.row_count_seen = true;
             }
             RootRowKind::PreparedFragment => {
                 next.fragments = next
@@ -505,16 +564,16 @@ impl WriteCommitTotals {
         }
         Ok(next)
     }
-    /// The sealed normal End of one write root: its SUMMARY must exist.
+    /// The sealed normal End of one write root: its ROW_COUNT must exist.
     pub fn finish(self) -> Result<(), WriteCommitCodecError> {
-        if self.summary_seen {
+        if self.row_count_seen {
             Ok(())
         } else {
-            Err(WriteCommitCodecError::MissingSummary)
+            Err(WriteCommitCodecError::MissingRowCount)
         }
     }
-    pub const fn summary_seen(&self) -> bool {
-        self.summary_seen
+    pub const fn row_count_seen(&self) -> bool {
+        self.row_count_seen
     }
     pub const fn fragments(&self) -> usize {
         self.fragments
@@ -531,6 +590,7 @@ impl WriteCommitTotals {
 enum Part {
     Header,
     Fragment,
+    DeleteVerification,
     Field(usize),
     Blob,
     Body,
@@ -561,6 +621,7 @@ struct CursorState {
     phase: Phase,
     header: Option<WriteCommitRecordHeader>,
     header_bytes: [u8; WRITE_COMMIT_HEADER_BYTES],
+    verification_bytes: [u8; DELETE_VERIFICATION_PAYLOAD_BYTES],
     pending: WriteCommitTotals,
     totals: WriteCommitTotals,
 }
@@ -577,6 +638,10 @@ struct Columns<'a> {
     properties: &'a MapArray,
     keys: &'a StringArray,
     values: &'a StringArray,
+    requested: &'a Int64Array,
+    matched: &'a Int64Array,
+    insufficient_keys: &'a Int64Array,
+    fingerprint: &'a FixedSizeBinaryArray,
 }
 
 pub struct WriteCommitEncoder {
@@ -604,6 +669,7 @@ impl WriteCommitEncoder {
                 },
                 header: None,
                 header_bytes: [0; WRITE_COMMIT_HEADER_BYTES],
+                verification_bytes: [0; DELETE_VERIFICATION_PAYLOAD_BYTES],
                 pending: totals,
                 totals,
             },
@@ -633,7 +699,7 @@ fn plain(field: &Field, name: &str, nullable: bool, data_type: &DataType) -> boo
         && field.metadata().is_empty()
         && field.data_type() == data_type
 }
-/// The fixed eight-column contract, compared without building a schema.
+/// The fixed twelve-column contract, compared without building a schema.
 fn validate_schema(batch: &RecordBatch) -> Result<(), WriteCommitCodecError> {
     let schema = batch.schema_ref();
     let fields = schema.fields();
@@ -674,6 +740,30 @@ fn validate_schema(batch: &RecordBatch) -> Result<(), WriteCommitCodecError> {
             ROOT_WRITE_RESULT_BODY_COLUMN,
             true,
             &DataType::Binary,
+        )
+        || !plain(
+            &fields[8],
+            ROOT_WRITE_RESULT_REQUESTED_COLUMN,
+            true,
+            &DataType::Int64,
+        )
+        || !plain(
+            &fields[9],
+            ROOT_WRITE_RESULT_MATCHED_COLUMN,
+            true,
+            &DataType::Int64,
+        )
+        || !plain(
+            &fields[10],
+            ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_COLUMN,
+            true,
+            &DataType::Int64,
+        )
+        || !plain(
+            &fields[11],
+            ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_COLUMN,
+            true,
+            &DataType::FixedSizeBinary(16),
         )
         || fields[4].name() != ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN
         || !fields[4].is_nullable()
@@ -718,6 +808,10 @@ fn validate_schema(batch: &RecordBatch) -> Result<(), WriteCommitCodecError> {
         || !concrete(5).is::<StringArray>()
         || !concrete(6).is::<BinaryArray>()
         || map_values != Some(true)
+        || !concrete(8).is::<Int64Array>()
+        || !concrete(9).is::<Int64Array>()
+        || !concrete(10).is::<Int64Array>()
+        || !concrete(11).is::<FixedSizeBinaryArray>()
     {
         return Err(WriteCommitCodecError::Schema);
     }
@@ -744,6 +838,10 @@ fn columns(batch: &RecordBatch) -> Columns<'_> {
         properties,
         keys: exact(properties.keys().as_ref()),
         values: exact(properties.values().as_ref()),
+        requested: exact(batch.column(8).as_ref()),
+        matched: exact(batch.column(9).as_ref()),
+        insufficient_keys: exact(batch.column(10).as_ref()),
+        fingerprint: exact(batch.column(11).as_ref()),
     }
 }
 
@@ -762,11 +860,24 @@ fn start_row(columns: &Columns<'_>, row: usize) -> Result<Phase, WriteCommitCode
         !c.blobs.is_null(row),
         !c.bodies.is_null(row),
         !c.properties.is_null(row),
+        !c.requested.is_null(row),
+        !c.matched.is_null(row),
+        !c.insufficient_keys.is_null(row),
+        !c.fingerprint.is_null(row),
     ];
     let expected = match kind {
-        RootRowKind::Summary => [false, true, false, false, false, false, false],
-        RootRowKind::PreparedFragment => [true, false, true, false, false, false, false],
-        RootRowKind::ArtifactDraft => [true, false, false, true, true, true, true],
+        RootRowKind::DeleteVerification => [
+            false, false, false, false, false, false, false, true, true, true, true,
+        ],
+        RootRowKind::RowCount => [
+            false, true, false, false, false, false, false, false, false, false, false,
+        ],
+        RootRowKind::PreparedFragment => [
+            true, false, true, false, false, false, false, false, false, false, false,
+        ],
+        RootRowKind::ArtifactDraft => [
+            true, false, false, true, true, true, true, false, false, false, false,
+        ],
     };
     if present != expected {
         return Err(WriteCommitCodecError::Shape);
@@ -777,10 +888,12 @@ fn start_row(columns: &Columns<'_>, row: usize) -> Result<Phase, WriteCommitCode
             property: 0,
             property_bytes: 0,
         },
-        RootRowKind::Summary | RootRowKind::PreparedFragment => Phase::Emit {
-            part: Part::Header,
-            offset: 0,
-        },
+        RootRowKind::RowCount | RootRowKind::PreparedFragment | RootRowKind::DeleteVerification => {
+            Phase::Emit {
+                part: Part::Header,
+                offset: 0,
+            }
+        }
     })
 }
 fn span(offsets: &[i32], row: usize) -> (usize, usize) {
@@ -793,7 +906,11 @@ fn header_for(
 ) -> Result<WriteCommitRecordHeader, WriteCommitCodecError> {
     let c = columns;
     match kind_from_wire(c.kinds.value(row))? {
-        RootRowKind::Summary => WriteCommitRecordHeader::summary(c.counts.value(row)),
+        RootRowKind::DeleteVerification => {
+            verification_from_columns(c, row)?;
+            WriteCommitRecordHeader::try_new(RootRowKind::DeleteVerification, 0, 0, 0, [0; 5])
+        }
+        RootRowKind::RowCount => WriteCommitRecordHeader::row_count_record(c.counts.value(row)),
         RootRowKind::PreparedFragment => WriteCommitRecordHeader::fragment(
             c.targets.value(row),
             c.fragments.value_length(row) as usize,
@@ -813,6 +930,34 @@ fn header_for(
     }
 }
 
+fn verification_from_columns(
+    c: &Columns<'_>,
+    row: usize,
+) -> Result<DeleteVerificationCounts, WriteCommitCodecError> {
+    DeleteVerificationCounts::try_from_wire(
+        c.requested.value(row),
+        c.matched.value(row),
+        c.insufficient_keys.value(row),
+        c.fingerprint
+            .value(row)
+            .try_into()
+            .expect("validated fixed width"),
+    )
+    .map_err(|_| WriteCommitCodecError::DeleteVerificationCount)
+}
+fn verification_payload(
+    c: &Columns<'_>,
+    row: usize,
+) -> Result<[u8; DELETE_VERIFICATION_PAYLOAD_BYTES], WriteCommitCodecError> {
+    let (counts, fingerprint) = verification_from_columns(c, row)?.into_wire();
+    let mut bytes = [0; DELETE_VERIFICATION_PAYLOAD_BYTES];
+    for (index, count) in counts.into_iter().enumerate() {
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&count.to_le_bytes());
+    }
+    bytes[24..].copy_from_slice(&fingerprint);
+    Ok(bytes)
+}
+
 enum Bytes<'a> {
     Borrowed(&'a [u8]),
     Word([u8; 4]),
@@ -825,6 +970,7 @@ fn part_bytes<'a>(columns: &Columns<'a>, state: &'a CursorState, part: Part) -> 
     match part {
         Part::Header => Bytes::Borrowed(&state.header_bytes),
         Part::Fragment => Bytes::Borrowed(c.fragments.value(row)),
+        Part::DeleteVerification => Bytes::Borrowed(&state.verification_bytes),
         Part::Field(index) => Bytes::Word(
             c.ids
                 .value(c.fields.value_offsets()[row] as usize + index)
@@ -850,7 +996,9 @@ fn next_part(header: WriteCommitRecordHeader, part: Part) -> Part {
         }
     };
     match (header.kind(), part) {
-        (RootRowKind::Summary, _) => Part::Done,
+        (RootRowKind::RowCount, _) => Part::Done,
+        (RootRowKind::DeleteVerification, Part::Header) => Part::DeleteVerification,
+        (RootRowKind::DeleteVerification, _) => Part::Done,
         (RootRowKind::PreparedFragment, Part::Header) => Part::Fragment,
         (RootRowKind::PreparedFragment, _) => Part::Done,
         (RootRowKind::ArtifactDraft, Part::Header) => Part::Field(0),
@@ -896,17 +1044,20 @@ fn advance(
         }
         match state.phase {
             Phase::Start => {
-                // Eight null flags, a kind and three offset pairs: fixed work.
-                if WRITE_COMMIT_TURN_WORK - turn.visited_cells < 12 {
+                // Twelve null flags, a kind, offsets and fixed verification values.
+                if WRITE_COMMIT_TURN_WORK - turn.visited_cells < 20 {
                     break;
                 }
-                turn.visited_cells += 12;
+                turn.visited_cells += 20;
                 let next = start_row(c, state.row)?;
                 if matches!(next, Phase::Emit { .. }) {
                     let header = header_for(c, state.row, 0)?;
                     state.pending = state.totals.checked_add(header)?;
                     state.header = Some(header);
                     state.header_bytes = header.bytes();
+                    if header.kind() == RootRowKind::DeleteVerification {
+                        state.verification_bytes = verification_payload(c, state.row)?;
+                    }
                 }
                 state.phase = next;
             }
@@ -1021,8 +1172,8 @@ impl novarocks_execution_contract::failure::FailureProjection for WriteCommitCod
             Self::Shape => (FailureClass::Data, 202),
             Self::Target => (FailureClass::Data, 203),
             Self::RowCount => (FailureClass::Data, 204),
-            Self::DuplicateSummary => (FailureClass::Invariant, 205),
-            Self::MissingSummary => (FailureClass::Invariant, 206),
+            Self::DuplicateRowCount => (FailureClass::Invariant, 205),
+            Self::MissingRowCount => (FailureClass::Invariant, 206),
             Self::FragmentLimit => (FailureClass::Resource, 207),
             Self::ArtifactLimit => (FailureClass::Resource, 208),
             Self::FieldIds => (FailureClass::Data, 209),
@@ -1037,6 +1188,8 @@ impl novarocks_execution_contract::failure::FailureProjection for WriteCommitCod
             Self::TruncatedRecord => (FailureClass::Data, 218),
             Self::TrailingRecordBytes => (FailureClass::Data, 219),
             Self::Failed => (FailureClass::Invariant, 220),
+            Self::DuplicateDeleteVerification => (FailureClass::Invariant, 224),
+            Self::DeleteVerificationCount => (FailureClass::Data, 225),
         };
         FailureFact::new(
             class,
