@@ -616,15 +616,15 @@ impl<'a> TreeContext<'a> {
                     self.render_edge_sink(*edge, out)?;
                 }
             }
-            FragmentSink::Router {
-                routes, summary, ..
-            } => {
+            FragmentSink::Router { routes, .. } => {
                 for route in routes.iter() {
                     self.render_edge_sink(route.edge, out)?;
                 }
-                self.render_edge_sink(summary.edge, out)?;
             }
             FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => {}
+        }
+        for summary in fragment.summaries() {
+            self.render_edge_sink(summary.edge, out)?;
         }
         Ok(())
     }
@@ -646,9 +646,11 @@ impl<'a> TreeContext<'a> {
                     target.get()
                 ))?;
             }
-            novarocks_physical_plan::OutputRole::LogicalSummary => {
+            novarocks_physical_plan::OutputRole::Summary(kind) => {
                 out.push(format_args!(
-                    "    ROLE: logical-summary(inserted, replaced, deleted)"
+                    "    ROLE: summary({}: {})",
+                    kind,
+                    joined(kind.fields(), ", ", |field, f| f.write_str(field.name()))
                 ))?;
             }
             novarocks_physical_plan::OutputRole::WriterResults => {

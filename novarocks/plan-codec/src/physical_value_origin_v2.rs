@@ -431,20 +431,8 @@ fn encode_core(
         physical::ValueOrigin::JoinMark { node } => {
             (wire::value_origin::Kind::JoinMarkNodeId(node.get()), 1)
         }
-        physical::ValueOrigin::LogicalSummary { field } => (
-            wire::value_origin::Kind::LogicalSummary(
-                (match field {
-                    physical::LogicalChangeCountField::Inserted => {
-                        wire::LogicalChangeCountField::Inserted
-                    }
-                    physical::LogicalChangeCountField::Replaced => {
-                        wire::LogicalChangeCountField::Replaced
-                    }
-                    physical::LogicalChangeCountField::Deleted => {
-                        wire::LogicalChangeCountField::Deleted
-                    }
-                }) as i32,
-            ),
+        physical::ValueOrigin::Summary { field } => (
+            wire::value_origin::Kind::Summary(crate::physical_summary_v2::encode_field(*field)),
             0,
         ),
         physical::ValueOrigin::ProviderField { scan_node, field } => {
@@ -671,24 +659,9 @@ fn decode_decision<'a>(
                 phase_refs(phase),
             )
         }
-        wire::value_origin::Kind::LogicalSummary(field) => (
-            physical::ValueOrigin::LogicalSummary {
-                field: match wire::LogicalChangeCountField::try_from(*field) {
-                    Ok(wire::LogicalChangeCountField::Inserted) => {
-                        physical::LogicalChangeCountField::Inserted
-                    }
-                    Ok(wire::LogicalChangeCountField::Replaced) => {
-                        physical::LogicalChangeCountField::Replaced
-                    }
-                    Ok(wire::LogicalChangeCountField::Deleted) => {
-                        physical::LogicalChangeCountField::Deleted
-                    }
-                    _ => {
-                        return Err(invalid(
-                            "logical summary origin field is unknown or unspecified",
-                        ));
-                    }
-                },
+        wire::value_origin::Kind::Summary(field) => (
+            physical::ValueOrigin::Summary {
+                field: crate::physical_summary_v2::decode_field(field).map_err(invalid)?,
             },
             0,
         ),

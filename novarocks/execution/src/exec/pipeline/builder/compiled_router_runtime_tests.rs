@@ -154,14 +154,14 @@ mod router_runtime_tests {
             .unwrap();
         let mut counter = |field| {
             builder
-                .add_value(int64(), p::ValueOrigin::LogicalSummary { field })
+                .add_value(int64(), p::ValueOrigin::Summary { field })
                 .unwrap()
         };
-        let summary_columns = p::LogicalSummaryColumns {
-            inserted: counter(p::LogicalChangeCountField::Inserted),
-            replaced: counter(p::LogicalChangeCountField::Replaced),
-            deleted: counter(p::LogicalChangeCountField::Deleted),
-        };
+        let summary_columns = p::SummaryColumns::write_counts(
+            counter(p::SummaryField::Inserted),
+            counter(p::SummaryField::Replaced),
+            counter(p::SummaryField::Deleted),
+        );
         let summary_edge = p::EdgeId::new(73);
         let ordinals = [
             p::WriteTargetOrdinal::try_new(0).unwrap(),
@@ -227,14 +227,14 @@ mod router_runtime_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let destinations = p::LogicalSummaryColumns {
-            inserted: p::ValueId::new(103),
-            replaced: p::ValueId::new(104),
-            deleted: p::ValueId::new(105),
-        };
+        let destinations = p::SummaryColumns::write_counts(
+            p::ValueId::new(103),
+            p::ValueId::new(104),
+            p::ValueId::new(105),
+        );
         let projection = summary_columns
-            .values()
-            .map(|value| p::CutValue { value, ty: int64() });
+            .values().iter().copied()
+            .map(|value| p::CutValue { value, ty: int64() }).collect::<Vec<_>>();
         outbound.push(p::OutboundFragmentCut {
             edge: summary_edge,
             kind: p::EdgeKind::Stream,
@@ -243,7 +243,7 @@ mod router_runtime_tests {
             projection: projection.clone().into(),
             destination_imports: projection
                 .into_iter()
-                .zip(destinations.values())
+                .zip(destinations.values().iter().copied())
                 .map(|(source, destination)| p::CutImport {
                     source,
                     destination,
@@ -255,23 +255,25 @@ mod router_runtime_tests {
                 source_multiplicity: multiplicity,
                 destination_multiplicity: multiplicity,
             },
-            source_port: p::FragmentOutputPort::LogicalSummary,
-            payload: p::ExchangePayloadContract::LogicalSummary(p::LogicalSummaryCut {
+            source_port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
+            payload: p::ExchangePayloadContract::Summary(p::SummaryCut {
                 source: summary_columns,
                 destination: destinations,
             }),
             delivery: p::DeliveryRequirement::MustDrain,
         });
+        builder.set_summaries(Box::new([p::SummaryOutput {
+                        edge: summary_edge,
+                        columns: summary_columns,
+                        author: p::SummaryAuthor::RouterSink,
+                    }]));
         let fragment = builder
             .finish_definition(
                 expand,
                 p::FragmentSink::Router {
                     effect,
                     routes: routes.into(),
-                    summary: p::LogicalSummaryOutput {
-                        edge: summary_edge,
-                        columns: summary_columns,
-                    },
+
                 },
                 p::PipelineDopDomain {
                     min: 1,

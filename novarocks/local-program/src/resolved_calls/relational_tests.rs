@@ -1498,7 +1498,7 @@ pub(crate) fn writer_program(
                 count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
                 input_roles: novarocks_result_contract::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
                 logical_summary_layout: None,
                 inputs: vec![ProgramNodeId::new(1)],

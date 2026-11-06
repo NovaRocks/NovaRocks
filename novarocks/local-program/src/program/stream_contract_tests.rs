@@ -266,7 +266,10 @@ fn finish_graph(shape: SummaryInput) -> Result<LocalProgramGraph, LocalProgramEr
         count_mode: novarocks_result_contract::FinishCountMode::LogicalChanges,
         input_roles: novarocks_result_contract::FinishInputs {
             writer_results: 0,
-            logical_summary: Some(1),
+            summaries: novarocks_result_contract::PerKind {
+                write_counts: Some(1),
+                delete_verification: None,
+            },
         },
         logical_summary_layout: Some(summary_layout.clone()),
         expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],

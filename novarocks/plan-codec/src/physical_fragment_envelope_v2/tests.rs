@@ -111,16 +111,19 @@ fn route(
         edge: p::EdgeId::new(edge),
     }
 }
+fn summary() -> p::SummaryOutput {
+    p::SummaryOutput {
+        edge: p::EdgeId::new(1),
+        columns: p::SummaryColumns::write_counts(
+            p::ValueId::new(2),
+            p::ValueId::new(3),
+            p::ValueId::new(4),
+        ),
+        author: p::SummaryAuthor::RouterSink,
+    }
+}
 fn router() -> p::FragmentSink {
     p::FragmentSink::Router {
-        summary: p::LogicalSummaryOutput {
-            edge: p::EdgeId::new(1),
-            columns: p::LogicalSummaryColumns {
-                inserted: p::ValueId::new(2),
-                replaced: p::ValueId::new(3),
-                deleted: p::ValueId::new(4),
-            },
-        },
         effect: p::ValueId::new(0),
         routes: Box::from([
             route(
@@ -188,13 +191,15 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
             },
         })
         .unwrap();
-    if let p::FragmentSink::Router { summary, .. } = &sink {
+    if matches!(&sink, p::FragmentSink::Router { .. }) {
+        let summary = summary();
+        builder.set_summaries(Box::new([summary]));
         for (field, id) in summary.columns.fields() {
             builder
                 .insert_value(p::ValueDef {
                     id,
                     ty: p::ValueType::new(DataType::Int64, false),
-                    origin: p::ValueOrigin::LogicalSummary { field },
+                    origin: p::ValueOrigin::Summary { field },
                 })
                 .unwrap();
         }
@@ -228,6 +233,7 @@ fn raw(output: EncodedFragmentEnvelope) -> wire::Fragment {
         id: output.id,
         root_node_id: Some(output.root_node_id),
         sink: Some(output.sink),
+        summaries: output.summaries,
         dop_domain: Some(output.dop_domain),
         stage_placement: Some(output.stage_placement),
         runtime_filter_ids: output.runtime_filter_ids,
@@ -315,15 +321,17 @@ fn envelope_all_five_sinks_preserve_hand_authored_headers_and_ordered_routes() {
         {
             assert_eq!(v.effect_value_id, Some(0));
             assert_eq!(
-                v.summary,
-                Some(wire::LogicalSummaryOutput {
+                raw.summaries,
+                [wire::SummaryOutput {
                     edge_id: Some(1),
-                    columns: Some(wire::LogicalSummaryColumns {
-                        inserted_value_id: Some(2),
-                        replaced_value_id: Some(3),
-                        deleted_value_id: Some(4),
+                    columns: Some(wire::SummaryColumns {
+                        kind: 1,
+                        value_ids: vec![2, 3, 4]
                     }),
-                })
+                    author: Some(wire::SummaryAuthor {
+                        kind: Some(wire::summary_author::Kind::RouterSink(Empty {}))
+                    }),
+                }]
             );
             assert_eq!(v.routes.len(), 2);
             assert_eq!(v.routes[0].route_id, [9; 32]);
@@ -384,38 +392,20 @@ fn envelope_presence_unknown_effect_tokens_and_original_ordinal_author_reject() 
                 .field_token
                 .push(0),
             11 => raw_router(&mut bad).routes[0].write_target_ordinal = 4096,
-            12 => raw_router(&mut bad).summary = None,
-            13 => raw_router(&mut bad).summary.as_mut().unwrap().edge_id = None,
-            14 => raw_router(&mut bad).summary.as_mut().unwrap().columns = None,
-            15 => {
-                raw_router(&mut bad)
-                    .summary
-                    .as_mut()
-                    .unwrap()
-                    .columns
-                    .as_mut()
-                    .unwrap()
-                    .inserted_value_id = None
-            }
+            12 => bad.summaries[0].author = None,
+            13 => bad.summaries[0].edge_id = None,
+            14 => bad.summaries[0].columns = None,
+            15 => bad.summaries[0].columns.as_mut().unwrap().kind = 0,
             16 => {
-                raw_router(&mut bad)
-                    .summary
-                    .as_mut()
-                    .unwrap()
+                bad.summaries[0]
                     .columns
                     .as_mut()
                     .unwrap()
-                    .replaced_value_id = None
+                    .value_ids
+                    .remove(1);
             }
             17 => {
-                raw_router(&mut bad)
-                    .summary
-                    .as_mut()
-                    .unwrap()
-                    .columns
-                    .as_mut()
-                    .unwrap()
-                    .deleted_value_id = None
+                bad.summaries[0].columns.as_mut().unwrap().value_ids.push(7);
             }
             _ => unreachable!(),
         }
@@ -492,20 +482,23 @@ fn envelope_independent_layout_golden_counts_separate_vec_box_requests_and_retai
         + layout::<i32>(3)
         + 2 * layout::<wire::WriteInputMapping>(2)
         + 2 * layout::<u32>(1)
-        + 4 * 32;
+        + 4 * 32
+        + layout::<wire::SummaryOutput>(1)
+        + layout::<u32>(3);
     let receive_retained = layout::<p::RuntimeFilterId>(2)
         + layout::<p::ChangeStreamRoute>(2)
         + layout::<ConnectorRowMutationEffect>(3)
         + 2 * layout::<(ConnectorWriteFieldToken, p::ValueId)>(2)
-        + 2 * layout::<p::ValueId>(1);
+        + 2 * layout::<p::ValueId>(1)
+        + layout::<p::SummaryOutput>(1);
     assert_eq!(sent.input_node_count, 0);
     assert_eq!(received.input_node_count, 0);
     assert_eq!(sent.value_reference_count, 11);
     assert_eq!(received.value_reference_count, 11);
     assert_eq!(sent.list_item_count, 17);
     assert_eq!(received.list_item_count, 17);
-    assert_eq!(sent.allocation_requests_upper_bound, 14);
-    assert_eq!(received.allocation_requests_upper_bound, 16);
+    assert_eq!(sent.allocation_requests_upper_bound, 16);
+    assert_eq!(received.allocation_requests_upper_bound, 18);
     assert_eq!(sent.allocation_request_bytes_upper_bound, send_bytes);
     assert_eq!(
         received.allocation_request_bytes_upper_bound,
@@ -784,16 +777,19 @@ fn caller_envelope_all_sinks_use_original_mapper_and_independent_layouts() {
                 + layout::<i32>(3)
                 + 2 * layout::<wire::WriteInputMapping>(2)
                 + 2 * layout::<u32>(1)
-                + 4 * 32;
+                + 4 * 32
+                + layout::<wire::SummaryOutput>(1)
+                + layout::<u32>(3);
             let received_bytes = 2
                 * (layout::<p::RuntimeFilterId>(2)
                     + layout::<p::ChangeStreamRoute>(2)
                     + layout::<ConnectorRowMutationEffect>(3)
                     + 2 * layout::<(ConnectorWriteFieldToken, p::ValueId)>(2)
-                    + 2 * layout::<p::ValueId>(1));
-            assert_eq!(sent_facts.allocation_requests_upper_bound, 14);
+                    + 2 * layout::<p::ValueId>(1)
+                    + layout::<p::SummaryOutput>(1));
+            assert_eq!(sent_facts.allocation_requests_upper_bound, 16);
             assert_eq!(sent_facts.allocation_request_bytes_upper_bound, sent_bytes);
-            assert_eq!(received.1.allocation_requests_upper_bound, 16);
+            assert_eq!(received.1.allocation_requests_upper_bound, 18);
             assert_eq!(
                 received.1.allocation_request_bytes_upper_bound,
                 received_bytes
@@ -877,8 +873,10 @@ fn caller_envelope_captured_route_requests_are_admitted_before_the_next_callback
     let source = fragment(router(), false);
     let input = encoded(&source).0;
     for receiving in [false, true] {
-        let root_requests = if receiving { 4 } else { 2 };
-        let expected_requests = if receiving { 10 } else { 8 };
+        // Root arrays include the summary declaration; encoding additionally
+        // allocates its ordered ValueId vector before any route allocation.
+        let root_requests = if receiving { 6 } else { 4 };
+        let expected_requests = if receiving { 12 } else { 10 };
         let baseline = Control::default();
         let mut work = CompileCheckpoints::try_new(&baseline, CompilePhase::LowerProgram).unwrap();
         let mut capture = None;

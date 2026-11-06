@@ -446,7 +446,7 @@ fn encode_static_packages(
         AttemptRuntimeFilterFacts::from_completed(plan)?,
         // A plan that writes states which targets its root delivers, because
         // that is what the commit is taken over; a read plan says none.
-        Some(written).filter(|targets| !targets.is_empty()),
+        completed_plan_write_root_facts(plan, !written.is_empty())?,
     );
     Ok(EncodedStaticPlan {
         candidate,
@@ -883,6 +883,41 @@ fn wire_node_id(node: NodeId) -> Result<i32, String> {
         .map_err(|_| format!("scan node {} exceeds the wire node identity", node.get()))
 }
 
+/// Freeze Root obligations from the exact TableFinish that owns publication.
+/// Writer membership authorizes recipes; it cannot infer a summary declaration.
+fn completed_plan_write_root_facts(
+    plan: &PhysicalPlan,
+    writes: bool,
+) -> Result<
+    Option<(
+        Vec<WriteTargetOrdinal>,
+        novarocks_result_contract::PerKind<()>,
+    )>,
+    String,
+> {
+    if !writes {
+        return Ok(None);
+    }
+    let result = plan
+        .result_port()
+        .ok_or("completed write has no Root result port")?;
+    let fragment = plan
+        .fragments()
+        .get(&result.fragment)
+        .ok_or("completed write Root fragment is absent")?;
+    let node = fragment
+        .nodes()
+        .get(&fragment.root())
+        .ok_or("completed write Root node is absent")?;
+    let NodeKind::TableFinish(finish) = &node.kind else {
+        return Err("completed write Root is not its original TableFinish".into());
+    };
+    Ok(Some((
+        finish.expected_target_ordinals.to_vec(),
+        finish.inputs.summaries.map(|_, _| ()),
+    )))
+}
+
 /// The write targets one completed plan writes, in ordinal order.
 fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> {
     let mut targets = plan
@@ -902,6 +937,19 @@ fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn write_root_kinds_are_taken_from_the_original_finish_declaration() {
+        let (plan, _session) = crate::query_execution::package_writes::tests::insert_values_plan();
+        let (targets, kinds) = completed_plan_write_root_facts(&plan, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(targets, [WriteTargetOrdinal::try_new(0).unwrap()]);
+        assert!(
+            kinds.is_empty(),
+            "ordinary INSERT does not acquire logical count or verification authorship"
+        );
+    }
 
     use novarocks_physical_plan::{
         MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
@@ -1473,14 +1521,6 @@ mod tests {
             .expect("a writer and its finish have a compiled shape");
         assert!(
             compiled_sink_refusal(&FragmentSink::Router {
-                summary: novarocks_physical_plan::LogicalSummaryOutput {
-                    edge: novarocks_physical_plan::EdgeId::new(1),
-                    columns: novarocks_physical_plan::LogicalSummaryColumns {
-                        inserted: ValueId::new(1),
-                        replaced: ValueId::new(2),
-                        deleted: ValueId::new(3),
-                    },
-                },
                 effect: ValueId::new(0),
                 routes: Box::default(),
             })

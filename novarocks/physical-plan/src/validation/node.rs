@@ -230,8 +230,8 @@ pub(crate) fn validate_value(
             )),
             None => require_node(fragment, *node, &path, errors),
         },
-        ValueOrigin::LogicalSummary { field } => {
-            validate_logical_summary_value(fragment, value, *field, errors);
+        ValueOrigin::Summary { field } => {
+            validate_summary_value(fragment, value, *field, errors);
         }
         ValueOrigin::ExchangeImport { .. } | ValueOrigin::CteImport { .. } => {
             // Cross-fragment definitions are checked with the complete graph.
@@ -738,6 +738,7 @@ pub(crate) fn value_origin_allowed(
                 output_ordinal,
             },
         ) => *owner == node.id && usize::try_from(*output_ordinal).ok() == Some(ordinal),
+        (_, ValueOrigin::Summary { field }) => node.kind.summary_authorship() == Some(field.kind()),
         _ => false,
     }
 }
@@ -752,13 +753,21 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
         NodeKind::TableFinish(spec) => {
             let logical = matches!(spec.count_mode, crate::FinishCountMode::LogicalChanges);
-            node.inputs.len() == if logical { 2 } else { 1 }
+            node.inputs.len() == 1 + spec.inputs.summaries.iter().count()
                 && usize::try_from(spec.inputs.writer_results).is_ok_and(|i| i < node.inputs.len())
-                && logical == spec.inputs.logical_summary.is_some()
-                && logical == spec.logical_summary.is_some()
-                && spec.inputs.logical_summary.is_none_or(|i| {
-                    i != spec.inputs.writer_results
-                        && usize::try_from(i).is_ok_and(|i| i < node.inputs.len())
+                && (spec.inputs.summaries.write_counts.is_none()
+                    || spec.inputs.summaries.write_counts
+                        != spec.inputs.summaries.delete_verification)
+                && logical == spec.inputs.summaries.write_counts.is_some()
+                && crate::SummaryKind::ALL.into_iter().all(|kind| {
+                    let input = spec.inputs.summaries.get(kind);
+                    let columns = spec.summaries.get(kind);
+                    input.is_some() == columns.is_some()
+                        && columns.is_none_or(|columns| columns.kind() == kind)
+                        && input.is_none_or(|input| {
+                            *input != spec.inputs.writer_results
+                                && usize::try_from(*input).is_ok_and(|i| i < node.inputs.len())
+                        })
                 })
         }
         NodeKind::TableFunction { .. } => node.inputs.len() <= 1,
@@ -1586,12 +1595,13 @@ pub(crate) fn validate_node_semantics(
                     "table finish input schema differs from its exact child output",
                 ));
             }
-            if let (Some(input), Some(columns)) =
-                (spec.inputs.logical_summary, spec.logical_summary)
-            {
+            for (kind, input) in spec.inputs.summaries.iter() {
+                let Some(columns) = spec.summaries.get(kind) else {
+                    continue;
+                };
                 let summary = node
                     .inputs
-                    .get(input as usize)
+                    .get(*input as usize)
                     .and_then(|id| fragment.nodes().get(id));
                 if summary.is_none_or(|child| {
                     child.output.columns.as_ref() != columns.values()
@@ -1599,7 +1609,7 @@ pub(crate) fn validate_node_semantics(
                         || child.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
                 }) || node
                     .required_inputs
-                    .get(input as usize)
+                    .get(*input as usize)
                     .is_none_or(|required| {
                         required.distribution != Distribution::Singleton
                             || required.row_multiplicity != RowMultiplicity::SingleCopy
@@ -1607,23 +1617,25 @@ pub(crate) fn validate_node_semantics(
                 {
                     errors.push(ValidationError::new(
                         path,
-                        "logical summary input differs from its declared exact port",
+                        format!("{kind} summary input differs from its declared exact port"),
                     ));
                 }
-                let values = columns.values();
-                if values[0] == values[1] || values[0] == values[2] || values[1] == values[2] {
+                if columns.values().iter().collect::<BTreeSet<_>>().len() != columns.values().len()
+                {
                     errors.push(ValidationError::new(
                         path,
-                        "logical summary columns must be distinct",
+                        "summary columns must be distinct",
                     ));
                 }
-                for value in values {
-                    if fragment.values().get(&value).is_none_or(|value| {
-                        *value.ty.data_type() != DataType::Int64 || value.ty.nullable()
-                    }) {
+                for (field, id) in columns.fields() {
+                    if fragment
+                        .values()
+                        .get(&id)
+                        .is_none_or(|value| !summary::field_type_matches(&value.ty, field))
+                    {
                         errors.push(ValidationError::new(
                             path,
-                            "logical summary requires exact non-null Int64 columns",
+                            format!("{kind} summary requires its exact non-null field types"),
                         ));
                     }
                 }

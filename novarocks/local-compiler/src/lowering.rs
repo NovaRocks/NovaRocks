@@ -1812,7 +1812,7 @@ fn lower_with_creation<
                     crate::writer::FinishLoweringInput {
                         child,
                         child_layout: nodes[child.index()].output_layout(),
-                        summary: spec.inputs.logical_summary.map(|port| {
+                        summary: spec.inputs.summaries.write_counts.map(|port| {
                             let id = local_ids[&node.inputs[port as usize]];
                             (id, nodes[id.index()].output_layout())
                         }),

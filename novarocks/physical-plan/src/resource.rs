@@ -438,7 +438,12 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                     policy,
                 )?
             }
-            crate::ExchangePayloadContract::LogicalSummary(_) => usage.add_items(6),
+            crate::ExchangePayloadContract::Summary(proof) => {
+                usage.add_item_counts([
+                    proof.source.values().len(),
+                    proof.destination.values().len(),
+                ]);
+            }
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -474,7 +479,12 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
                     policy,
                 )?
             }
-            crate::ExchangePayloadContract::LogicalSummary(_) => usage.add_items(6),
+            crate::ExchangePayloadContract::Summary(proof) => {
+                usage.add_item_counts([
+                    proof.source.values().len(),
+                    proof.destination.values().len(),
+                ]);
+            }
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -933,6 +943,14 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
             errors,
             policy,
         )?;
+    }
+    usage.add_items(fragment.summaries().len());
+    usage.add_bytes(std::mem::size_of_val(fragment.summaries()));
+    for summary in fragment.summaries() {
+        if usage.exhausted() {
+            return Ok(usage);
+        }
+        usage.add_items(summary.columns.values().len());
     }
     add_sink_usage(fragment.sink(), &mut usage);
     Ok(usage)
@@ -1407,7 +1425,10 @@ fn add_writer_finish_usage_core<P: TypeValidationPolicy>(
     usage.add_item_counts([
         spec.expected_target_ordinals.len(),
         spec.final_aggregates.len(),
-        if spec.logical_summary.is_some() { 3 } else { 0 },
+        spec.summaries
+            .iter()
+            .map(|(_, columns)| columns.values().len())
+            .sum(),
     ]);
     add_writer_schema_usage_core(
         &spec.input_schema,
@@ -1556,7 +1577,6 @@ fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
     match sink {
         FragmentSink::Multicast { edges } => usage.add_items(edges.len()),
         FragmentSink::Router { routes, .. } => {
-            usage.add_items(3);
             usage.add_items(routes.len());
             for route in routes {
                 if usage.exhausted() {

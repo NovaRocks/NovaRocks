@@ -38,8 +38,8 @@ use std::fmt;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 
 use crate::{
-    Edge, EdgeId, Fragment, FragmentId, FragmentOutputPort, FragmentSink, NodeId, NodeKind,
-    PhysicalNode, RuntimeFilter, RuntimeFilterApplyPoint, RuntimeFilterConsumerActivation,
+    Edge, EdgeId, Fragment, FragmentId, FragmentOutputPort, NodeId, NodeKind, PhysicalNode,
+    RuntimeFilter, RuntimeFilterApplyPoint, RuntimeFilterConsumerActivation,
     RuntimeFilterConsumerTarget, RuntimeFilterId, RuntimeFilterProducerTarget, SetOperationKind,
 };
 
@@ -59,8 +59,8 @@ pub struct FilterConsumerRef {
 pub enum WaitNode {
     Completion(OperatorRef),
     Backpressure(OperatorRef),
-    SummaryCompletion(FragmentId),
-    SummaryBackpressure(FragmentId),
+    SummaryCompletion(FragmentId, crate::SummaryKind),
+    SummaryBackpressure(FragmentId, crate::SummaryKind),
     InputPrefix {
         operator: OperatorRef,
         ordinal: usize,
@@ -227,11 +227,18 @@ impl WaitGraph {
         let mut graph = Self::default();
         for fragment in fragments.values() {
             work.step()?;
-            if matches!(fragment.sink(), FragmentSink::Router { .. }) {
-                graph.add_summary_output(OperatorRef {
+            for summary in fragment.summaries() {
+                work.step()?;
+                let node = match summary.author {
+                    crate::SummaryAuthor::RouterSink => fragment.root(),
+                    crate::SummaryAuthor::Node(node) => node,
+                };
+                let author = OperatorRef {
                     fragment: fragment.id(),
-                    node: fragment.root(),
-                });
+                    node,
+                };
+                plan.node(author)?;
+                graph.add_summary_output(author, summary.kind());
             }
             for node in fragment.nodes().values() {
                 work.step()?;
@@ -260,8 +267,8 @@ impl WaitGraph {
                         FragmentOutputPort::Root => {
                             graph.add_operator_input(operator, source, true)
                         }
-                        FragmentOutputPort::LogicalSummary => {
-                            graph.add_summary_input(operator, source.fragment);
+                        FragmentOutputPort::Summary(kind) => {
+                            graph.add_summary_input(operator, source.fragment, kind);
                         }
                     }
                 }
@@ -373,30 +380,35 @@ impl WaitGraph {
         }
     }
 
-    fn add_summary_output(&mut self, root: OperatorRef) {
-        // Summary is emitted by a separate pipeline after every actual
-        // computing driver finishes. Its downstream backpressure never
+    fn add_summary_output(&mut self, root: OperatorRef, kind: crate::SummaryKind) {
+        // Summary is emitted by a separate pipeline after all declared
+        // author units finish. Its downstream backpressure never
         // stops those computing drivers or their provider routes.
         self.add_edge(
-            WaitNode::SummaryCompletion(root.fragment),
+            WaitNode::SummaryCompletion(root.fragment, kind),
             WaitNode::Completion(root),
             WaitEdgeKind::DataWait,
         );
         self.add_edge(
-            WaitNode::SummaryCompletion(root.fragment),
-            WaitNode::SummaryBackpressure(root.fragment),
+            WaitNode::SummaryCompletion(root.fragment, kind),
+            WaitNode::SummaryBackpressure(root.fragment, kind),
             WaitEdgeKind::DataWait,
         );
     }
 
-    fn add_summary_input(&mut self, operator: OperatorRef, source: FragmentId) {
+    fn add_summary_input(
+        &mut self,
+        operator: OperatorRef,
+        source: FragmentId,
+        kind: crate::SummaryKind,
+    ) {
         self.add_edge(
             WaitNode::Completion(operator),
-            WaitNode::SummaryCompletion(source),
+            WaitNode::SummaryCompletion(source, kind),
             WaitEdgeKind::DataWait,
         );
         self.add_edge(
-            WaitNode::SummaryBackpressure(source),
+            WaitNode::SummaryBackpressure(source, kind),
             WaitNode::Backpressure(operator),
             WaitEdgeKind::Backpressure,
         );
@@ -749,8 +761,11 @@ impl PlanView<'_> {
             .fragments
             .get(&edge.source.fragment)
             .ok_or(WaitGraphError::MissingFragment(edge.source.fragment))?;
-        if edge.source.port == FragmentOutputPort::LogicalSummary
-            && !matches!(source.sink(), FragmentSink::Router { summary, .. } if summary.edge == edge.id)
+        if let FragmentOutputPort::Summary(kind) = edge.source.port
+            && !source
+                .summaries()
+                .iter()
+                .any(|summary| summary.edge == edge.id && summary.kind() == kind)
         {
             return Err(WaitGraphError::InvalidSummaryOutput(edge.id));
         }

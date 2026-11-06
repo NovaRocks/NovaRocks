@@ -186,7 +186,7 @@ fn build_logical_finish(
         .get(roles.writer_results as usize)
         .ok_or_else(invalid)?;
     let summary = *inputs
-        .get(roles.logical_summary.ok_or_else(invalid)? as usize)
+        .get(roles.summaries.write_counts.ok_or_else(invalid)? as usize)
         .ok_or_else(invalid)?;
     let binding = ctx
         .compiled_writers

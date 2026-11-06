@@ -667,8 +667,12 @@ fn summary_backpressure_does_not_stop_the_computing_root() {
     graph.add_operator_input(writer, root, true);
     graph.add_operator_input(consumer, writer, false);
     graph.add_operator_input(consumer, summary_receiver, true);
-    graph.add_summary_output(root);
-    graph.add_summary_input(summary_receiver, root.fragment);
+    graph.add_summary_output(root, crate::SummaryKind::WriteCounts);
+    graph.add_summary_input(
+        summary_receiver,
+        root.fragment,
+        crate::SummaryKind::WriteCounts,
+    );
     graph.add_edge(
         WaitNode::Backpressure(summary_receiver),
         WaitNode::Completion(writer),
@@ -679,7 +683,7 @@ fn summary_backpressure_does_not_stop_the_computing_root() {
     // separate B1b output port existed, this same gate would falsely cycle.
     graph.add_edge(
         WaitNode::Backpressure(root),
-        WaitNode::SummaryBackpressure(root.fragment),
+        WaitNode::SummaryBackpressure(root.fragment, crate::SummaryKind::WriteCounts),
         WaitEdgeKind::Backpressure,
     );
     let resolution = graph.resolve().unwrap();

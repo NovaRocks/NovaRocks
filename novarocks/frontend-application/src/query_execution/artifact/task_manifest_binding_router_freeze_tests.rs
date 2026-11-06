@@ -221,7 +221,8 @@ mod completed_router_placement_fixture {
                     .collect::<BTreeSet<_>>();
                 let actual_sources = manifest
                     .summary_sources()
-                    .map(|(task, output)| {
+                    .map(|(kind, task, output)| {
+                        assert_eq!(kind, novarocks_physical_plan::SummaryKind::WriteCounts);
                         assert_eq!(
                             output, summary,
                             "each source retains the exact original summary edge fact"

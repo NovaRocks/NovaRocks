@@ -44,15 +44,26 @@ pub(crate) struct LoweredStreamSink {
     pub requirements: Vec<BindingRequirement>,
     pub flow: SinkFlow,
 }
-pub(crate) fn cut_role(role: novarocks_physical_plan::OutputRole) -> ProgramOutputRole {
-    match role {
+pub(crate) fn cut_role(
+    role: novarocks_physical_plan::OutputRole,
+) -> Result<ProgramOutputRole, FragmentCompileError> {
+    Ok(match role {
         novarocks_physical_plan::OutputRole::Relational => ProgramOutputRole::Relational,
         novarocks_physical_plan::OutputRole::ProviderRoute { target } => {
             ProgramOutputRole::ProviderRoute { target }
         }
-        novarocks_physical_plan::OutputRole::LogicalSummary => ProgramOutputRole::LogicalSummary,
+        novarocks_physical_plan::OutputRole::Summary(
+            novarocks_physical_plan::SummaryKind::WriteCounts,
+        ) => ProgramOutputRole::LogicalSummary,
+        novarocks_physical_plan::OutputRole::Summary(
+            novarocks_physical_plan::SummaryKind::DeleteVerification,
+        ) => {
+            return Err(FragmentCompileError::Invalid(
+                "DeleteVerification has no admitted local summary author",
+            ));
+        }
         novarocks_physical_plan::OutputRole::WriterResults => ProgramOutputRole::WriterResults,
-    }
+    })
 }
 pub(crate) fn cut_delivery(
     delivery: novarocks_physical_plan::DeliveryRequirement,
@@ -197,14 +208,16 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             None
         }
         OutputSelection::Router { .. } => {
-            let FragmentSink::Router {
-                effect,
-                routes,
-                summary,
-            } = fragment.sink()
-            else {
+            let FragmentSink::Router { effect, routes } = fragment.sink() else {
                 return Err(FragmentCompileError::Invalid("router sink kind differs").into());
             };
+            let summary = fragment
+                .summaries()
+                .iter()
+                .find(|summary| summary.kind() == novarocks_physical_plan::SummaryKind::WriteCounts)
+                .ok_or(FragmentCompileError::Invalid(
+                    "Router has no WriteCounts summary",
+                ))?;
             reserve_vec(
                 &mut cuts,
                 routes
@@ -273,7 +286,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             u32::try_from(branch_index).map_err(|_| CompileControlError::ResourceExhausted)?;
         let is_summary = matches!(
             cut.payload,
-            novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+            novarocks_physical_plan::ExchangePayloadContract::Summary(_)
         );
         let (partition_type, keys, routing) = match &cut.partitioning.source {
             Distribution::Singleton | Distribution::Broadcast => (
@@ -434,7 +447,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )?;
             (columns, layout)
         };
-        let role = cut_role(cut.payload.role());
+        let role = cut_role(cut.payload.role())?;
         let delivery = cut_delivery(cut.delivery);
         let branch = StaticStreamBranch::try_new(
             i32::try_from(cut.destination_node.get()).map_err(|_| {

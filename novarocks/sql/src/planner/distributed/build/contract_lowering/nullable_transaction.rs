@@ -1141,7 +1141,7 @@ impl ContractLoweringVisitor<'_> {
         match origin {
             // Independently produced counters have no row-input NULL propagation.
             ValueOrigin::JoinMark { .. }
-            | ValueOrigin::LogicalSummary { .. }
+            | ValueOrigin::Summary { .. }
             | ValueOrigin::ProviderField { .. } => {}
             ValueOrigin::Expr { expr, .. } => {
                 if dirty_expressions.contains(&(fragment, expr)) {

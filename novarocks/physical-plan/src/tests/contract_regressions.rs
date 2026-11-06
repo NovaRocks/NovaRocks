@@ -3306,9 +3306,9 @@ fn grouped_writer_fragment_with_sources(
                 count_mode: crate::FinishCountMode::WriterReported,
                 inputs: crate::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([
                     write_target_ordinal(0),
                     write_target_ordinal(1),

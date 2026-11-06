@@ -124,13 +124,18 @@ pub(crate) enum AttemptPartitionKind {
     Hash,
 }
 
+struct WriteRootFacts {
+    targets: Box<[WriteTargetOrdinal]>,
+    summary_kinds: novarocks_result_contract::PerKind<()>,
+}
+
 pub(crate) struct AttemptPlanFacts {
     scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
     edges: Box<[AttemptEdgeFacts]>,
     scans: Box<[AttemptScanFacts]>,
     runtime_filters: AttemptRuntimeFilterFacts,
     submission: super::artifact::native_submission::SubmissionPlanFacts,
-    write_root_targets: Option<Box<[WriteTargetOrdinal]>>,
+    write_root: Option<WriteRootFacts>,
 }
 
 impl AttemptPlanFacts {
@@ -141,7 +146,10 @@ impl AttemptPlanFacts {
         scans: Vec<AttemptScanFacts>,
         submission: super::artifact::native_submission::SubmissionPlanFacts,
         runtime_filters: AttemptRuntimeFilterFacts,
-        write_root_targets: Option<Vec<WriteTargetOrdinal>>,
+        write_root: Option<(
+            Vec<WriteTargetOrdinal>,
+            novarocks_result_contract::PerKind<()>,
+        )>,
     ) -> Self {
         Self {
             scheduling,
@@ -149,7 +157,10 @@ impl AttemptPlanFacts {
             scans: scans.into_boxed_slice(),
             runtime_filters,
             submission,
-            write_root_targets: write_root_targets.map(Vec::into_boxed_slice),
+            write_root: write_root.map(|(targets, summary_kinds)| WriteRootFacts {
+                targets: targets.into_boxed_slice(),
+                summary_kinds,
+            }),
         }
     }
 
@@ -191,6 +202,14 @@ impl AttemptPlanFacts {
     }
 
     pub(crate) fn write_root_targets(&self) -> Option<&[WriteTargetOrdinal]> {
-        self.write_root_targets.as_deref()
+        self.write_root.as_ref().map(|root| root.targets.as_ref())
+    }
+
+    /// Declared kinds from the same original TableFinish as its target set.
+    /// No observed record, task status or receive order can mint this fact.
+    pub(crate) fn write_root_summary_kinds(
+        &self,
+    ) -> Option<&novarocks_result_contract::PerKind<()>> {
+        self.write_root.as_ref().map(|root| &root.summary_kinds)
     }
 }

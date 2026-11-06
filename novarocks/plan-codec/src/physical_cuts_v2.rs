@@ -325,14 +325,12 @@ fn count_partition(
     }
     Ok(())
 }
-closed!(
-    source_port,
-    read_source_port,
-    FragmentOutputPort,
-    FragmentOutputPort,
-    Root,
-    LogicalSummary
-);
+fn source_port(port: p::FragmentOutputPort) -> i32 {
+    crate::physical_summary_v2::encode_port(port)
+}
+fn read_source_port(raw: i32) -> Result<p::FragmentOutputPort, E> {
+    crate::physical_summary_v2::decode_port(raw).map_err(shape)
+}
 closed!(
     delivery,
     read_delivery,
@@ -347,7 +345,7 @@ enum RawPayload<'a> {
     Relational,
     ProviderRoute(&'a wire::ChangeStreamWriterCut),
     WriterResults(&'a wire::WriterResultCut),
-    LogicalSummary(&'a wire::LogicalSummaryCut),
+    Summary(&'a wire::SummaryCut),
 }
 fn raw_inbound_payload(
     value: Option<&wire::inbound_fragment_cut::Payload>,
@@ -357,7 +355,7 @@ fn raw_inbound_payload(
         P::Relational(_) => RawPayload::Relational,
         P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
         P::WriterResult(v) => RawPayload::WriterResults(v),
-        P::LogicalSummary(v) => RawPayload::LogicalSummary(v),
+        P::Summary(v) => RawPayload::Summary(v),
     })
 }
 fn raw_outbound_payload(
@@ -368,28 +366,46 @@ fn raw_outbound_payload(
         P::Relational(_) => RawPayload::Relational,
         P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
         P::WriterResult(v) => RawPayload::WriterResults(v),
-        P::LogicalSummary(v) => RawPayload::LogicalSummary(v),
+        P::Summary(v) => RawPayload::Summary(v),
     })
 }
-fn summary_columns(value: &wire::LogicalSummaryColumns) -> Result<p::LogicalSummaryColumns, E> {
-    Ok(p::LogicalSummaryColumns {
-        inserted: p::ValueId::new(req(value.inserted_value_id)?),
-        replaced: p::ValueId::new(req(value.replaced_value_id)?),
-        deleted: p::ValueId::new(req(value.deleted_value_id)?),
+fn decode_summary(
+    value: &wire::SummaryCut,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::SummaryCut, E> {
+    Ok(p::SummaryCut {
+        source: crate::physical_summary_v2::decode_columns(req(value.source.as_ref())?, w)?,
+        destination: crate::physical_summary_v2::decode_columns(
+            req(value.destination.as_ref())?,
+            w,
+        )?,
     })
 }
-fn encode_summary_columns(value: p::LogicalSummaryColumns) -> wire::LogicalSummaryColumns {
-    wire::LogicalSummaryColumns {
-        inserted_value_id: Some(value.inserted.get()),
-        replaced_value_id: Some(value.replaced.get()),
-        deleted_value_id: Some(value.deleted.get()),
+fn count_summary_columns(
+    c: &mut Count,
+    physical: Option<&p::SummaryColumns>,
+    raw: Option<&wire::SummaryColumns>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    let n = if let Some(columns) = physical {
+        let n = columns.values().len();
+        c.model.request::<u32>(n, 1)?;
+        n
+    } else {
+        let columns = req(raw)?;
+        let kind = crate::physical_summary_v2::decode_kind(columns.kind).map_err(shape)?;
+        if columns.value_ids.len() != kind.fields().len() {
+            return Err(shape("summary field count differs from its kind"));
+        }
+        c.known = r::add(c.known, r::bytes::<u32>(columns.value_ids.capacity())?)?;
+        columns.value_ids.len()
+    };
+    c.model.items = r::add(c.model.items, n)?;
+    c.gate()?;
+    for _ in 0..n {
+        c.id(w)?;
     }
-}
-fn decode_summary(value: &wire::LogicalSummaryCut) -> Result<p::LogicalSummaryCut, E> {
-    Ok(p::LogicalSummaryCut {
-        source: summary_columns(req(value.source.as_ref())?)?,
-        destination: summary_columns(req(value.destination.as_ref())?)?,
-    })
+    Ok(())
 }
 fn count_payload(
     c: &mut Count,
@@ -406,24 +422,21 @@ fn count_payload(
         (Some(p::ExchangePayloadContract::WriterResults(v)), None) => {
             (None, Some(v), None, None, false)
         }
-        (Some(p::ExchangePayloadContract::LogicalSummary(_)), None) => {
+        (Some(p::ExchangePayloadContract::Summary(v)), None) => {
+            count_summary_columns(c, Some(&v.source), None, w)?;
+            count_summary_columns(c, Some(&v.destination), None, w)?;
             (None, None, None, None, true)
         }
         (None, Some(RawPayload::ProviderRoute(v))) => (None, None, Some(v), None, false),
         (None, Some(RawPayload::WriterResults(v))) => (None, None, None, Some(v), false),
-        (None, Some(RawPayload::LogicalSummary(v))) => {
-            decode_summary(v)?;
+        (None, Some(RawPayload::Summary(v))) => {
+            count_summary_columns(c, None, Some(req(v.source.as_ref())?), w)?;
+            count_summary_columns(c, None, Some(req(v.destination.as_ref())?), w)?;
             (None, None, None, None, true)
         }
         _ => return Err(shape("cut payload counting has no exact source")),
     };
-    if summary {
-        c.model.items = r::add(c.model.items, 6)?;
-        c.gate()?;
-        for _ in 0..6 {
-            c.id(w)?;
-        }
-    }
+    let _ = summary;
     count_extra(c, change, result, rawchange, rawresult, w)
 }
 fn count_extra(
@@ -1322,9 +1335,7 @@ fn decode_payload(
         RawPayload::WriterResults(v) => {
             p::ExchangePayloadContract::WriterResults(decode_result(v, t, w)?)
         }
-        RawPayload::LogicalSummary(v) => {
-            p::ExchangePayloadContract::LogicalSummary(decode_summary(v)?)
-        }
+        RawPayload::Summary(v) => p::ExchangePayloadContract::Summary(decode_summary(v, w)?),
     })
 }
 macro_rules! encode_payload {
@@ -1338,12 +1349,13 @@ macro_rules! encode_payload {
             p::ExchangePayloadContract::WriterResults(v) => {
                 P::WriterResult(encode_result(v, $e, $w)?)
             }
-            p::ExchangePayloadContract::LogicalSummary(v) => {
-                P::LogicalSummary(wire::LogicalSummaryCut {
-                    source: Some(encode_summary_columns(v.source)),
-                    destination: Some(encode_summary_columns(v.destination)),
-                })
-            }
+            p::ExchangePayloadContract::Summary(v) => P::Summary(wire::SummaryCut {
+                source: Some(crate::physical_summary_v2::encode_columns(v.source, $w)?),
+                destination: Some(crate::physical_summary_v2::encode_columns(
+                    v.destination,
+                    $w,
+                )?),
+            }),
         }
     }};
 }
@@ -1973,13 +1985,14 @@ mod summary_contract_tests {
             assert!(read_source_port(value).is_err());
             assert!(read_delivery(value).is_err());
         }
-        let columns = wire::LogicalSummaryColumns {
-            inserted_value_id: Some(0),
-            replaced_value_id: Some(u32::MAX),
-            deleted_value_id: Some(7),
+        let columns = wire::SummaryColumns {
+            kind: 1,
+            value_ids: vec![0, u32::MAX, 7],
         };
         assert_eq!(
-            summary_columns(&columns).unwrap().values(),
+            crate::physical_summary_v2::decode_columns_shape(&columns)
+                .unwrap()
+                .values(),
             [
                 p::ValueId::new(0),
                 p::ValueId::new(u32::MAX),
@@ -1987,17 +2000,42 @@ mod summary_contract_tests {
             ]
         );
         assert!(
-            summary_columns(&wire::LogicalSummaryColumns {
-                inserted_value_id: None,
-                ..columns
+            crate::physical_summary_v2::decode_columns_shape(&wire::SummaryColumns {
+                kind: 1,
+                value_ids: vec![0, 7],
             })
             .is_err()
         );
+        assert!(read_source_port(2).is_err());
+        assert_eq!(
+            read_source_port(3).unwrap(),
+            p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts)
+        );
+        assert_eq!(
+            read_source_port(4).unwrap(),
+            p::FragmentOutputPort::Summary(p::SummaryKind::DeleteVerification)
+        );
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+        let mut work =
+            CompileCheckpoints::try_new(&Control, novarocks_type_contract::CompilePhase::Decode)
+                .unwrap();
         assert!(
-            decode_summary(&wire::LogicalSummaryCut {
-                source: None,
-                destination: None
-            })
+            decode_summary(
+                &wire::SummaryCut {
+                    source: None,
+                    destination: None
+                },
+                &mut work
+            )
             .is_err()
         );
     }

@@ -423,9 +423,9 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,

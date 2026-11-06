@@ -44,6 +44,7 @@ pub(crate) struct DecodedFragmentEnvelope {
     pub(crate) id: p::FragmentId,
     pub(crate) root: p::NodeId,
     pub(crate) sink: p::FragmentSink,
+    pub(crate) summaries: Box<[p::SummaryOutput]>,
     pub(crate) dop_domain: p::PipelineDopDomain,
     pub(crate) stage_placement: p::StagePlacementPolicy,
     pub(crate) runtime_filters: Box<[p::RuntimeFilterId]>,
@@ -53,6 +54,7 @@ pub(crate) struct EncodedFragmentEnvelope {
     pub(crate) id: u32,
     pub(crate) root_node_id: u32,
     pub(crate) sink: wire::FragmentSink,
+    pub(crate) summaries: Vec<wire::SummaryOutput>,
     pub(crate) dop_domain: wire::PipelineDopDomain,
     pub(crate) stage_placement: wire::StagePlacementPolicy,
     pub(crate) runtime_filter_ids: Vec<u32>,
@@ -173,12 +175,12 @@ fn decode_placement(
 fn physical_outer(input: &p::Fragment) -> Result<usize, Error> {
     add(
         add(
-            input.runtime_filters().len(),
+            add(input.runtime_filters().len(), input.summaries().len())?,
             physical_placement_sources(input.stage_placement()),
         )?,
         match input.sink() {
             p::FragmentSink::Multicast { edges } => edges.len(),
-            p::FragmentSink::Router { routes, .. } => add(routes.len(), 4)?,
+            p::FragmentSink::Router { routes, .. } => routes.len(),
             _ => 0,
         },
     )
@@ -205,12 +207,12 @@ fn raw_kind<'a>(
 fn wire_outer(input: &wire::Fragment, kind: &wire::fragment_sink::Kind) -> Result<usize, Error> {
     add(
         add(
-            input.runtime_filter_ids.len(),
+            add(input.runtime_filter_ids.len(), input.summaries.len())?,
             wire_placement_sources(input.stage_placement.as_ref()),
         )?,
         match kind {
             wire::fragment_sink::Kind::Multicast(v) => v.edge_ids.len(),
-            wire::fragment_sink::Kind::Router(v) => add(v.routes.len(), 4)?,
+            wire::fragment_sink::Kind::Router(v) => v.routes.len(),
             _ => 0,
         },
     )
@@ -275,7 +277,7 @@ fn encode_sink_requests(
         }
         p::FragmentSink::Multicast { edges } => admission.request::<u32>(model, edges.len(), 1)?,
         p::FragmentSink::Router { routes, .. } => {
-            model.refs = 5;
+            model.refs = admission.sum(model.refs, 1)?;
             admission.request::<wire::ChangeStreamRoute>(model, routes.len(), 1)?;
         }
         _ => {}
@@ -296,50 +298,12 @@ fn decode_sink_requests(
             admission.request::<p::EdgeId>(model, v.edge_ids.len(), 2)?;
         }
         Some(wire::fragment_sink::Kind::Router(v)) => {
-            model.refs = 5;
+            model.refs = admission.sum(model.refs, 1)?;
             admission.request::<p::ChangeStreamRoute>(model, v.routes.len(), 2)?;
         }
         _ => {}
     }
     Ok(())
-}
-fn encode_summary_columns(columns: p::LogicalSummaryColumns) -> wire::LogicalSummaryColumns {
-    wire::LogicalSummaryColumns {
-        inserted_value_id: Some(columns.inserted.get()),
-        replaced_value_id: Some(columns.replaced.get()),
-        deleted_value_id: Some(columns.deleted.get()),
-    }
-}
-fn decode_summary_output(
-    value: Option<&wire::LogicalSummaryOutput>,
-    w: &mut CompileCheckpoints<'_>,
-) -> Result<p::LogicalSummaryOutput, Error> {
-    let value = required(value, "router summary output is absent", w)?;
-    let columns = required(
-        value.columns.as_ref(),
-        "router summary columns are absent",
-        w,
-    )?;
-    Ok(p::LogicalSummaryOutput {
-        edge: p::EdgeId::new(required(value.edge_id, "router summary edge is absent", w)?),
-        columns: p::LogicalSummaryColumns {
-            inserted: p::ValueId::new(required(
-                columns.inserted_value_id,
-                "inserted summary field is absent",
-                w,
-            )?),
-            replaced: p::ValueId::new(required(
-                columns.replaced_value_id,
-                "replaced summary field is absent",
-                w,
-            )?),
-            deleted: p::ValueId::new(required(
-                columns.deleted_value_id,
-                "deleted summary field is absent",
-                w,
-            )?),
-        },
-    })
 }
 fn physical_route_keys(route: &p::ChangeStreamRoute) -> Result<usize, Error> {
     if matches!(&route.requirements.colocation, p::WriteColocation::ByKey(keys) if keys.is_empty())
@@ -506,6 +470,7 @@ fn preflight_encode(
             physical_placement_sources(input.stage_placement()),
             1,
         )?;
+        admission.request::<wire::SummaryOutput>(&mut model, input.summaries().len(), 1)?;
         encode_sink_requests(input.sink(), &mut model, admission)?;
         admission.gate(&model, source, l)?;
     }
@@ -524,8 +489,10 @@ fn preflight_encode(
             _ => 0,
         },
     )?;
+    known = add(known, bytes::<p::SummaryOutput>(input.summaries().len())?)?;
     count_prefix(0, outer, source, known, l, w)?;
     if !admission.observed() {
+        admission.request::<wire::SummaryOutput>(&mut model, input.summaries().len(), 1)?;
         admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
         admission.request::<u32>(
             &mut model,
@@ -536,6 +503,17 @@ fn preflight_encode(
     admission.facts(&model, source, l, w)?;
     if !admission.observed() {
         encode_sink_requests(input.sink(), &mut model, admission)?;
+    }
+    for summary in input.summaries() {
+        let n = summary.columns.values().len();
+        model.items = admission.sum(model.items, n)?;
+        let author_refs = usize::from(matches!(summary.author, p::SummaryAuthor::Node(_)));
+        model.refs = admission.sum(model.refs, admission.sum(n, 1 + author_refs)?)?;
+        admission.request::<u32>(&mut model, n, 1)?;
+        admission.facts(&model, source, l, w)?;
+        for _ in 0..n {
+            w.step()?;
+        }
     }
     if let p::FragmentSink::Router { routes, .. } = input.sink() {
         admission.facts(&model, source, l, w)?;
@@ -599,7 +577,7 @@ fn preflight_decode(
         let captured = input.sink.as_ref().and_then(|sink| sink.kind.as_ref());
         let outer = match captured {
             Some(kind) => admission.numeric(wire_outer(input, kind))?,
-            None => input.runtime_filter_ids.len(),
+            None => admission.sum(input.runtime_filter_ids.len(), input.summaries.len())?,
         };
         let mut model = Model {
             items: outer,
@@ -611,6 +589,7 @@ fn preflight_decode(
             wire_placement_sources(input.stage_placement.as_ref()),
             2,
         )?;
+        admission.request::<p::SummaryOutput>(&mut model, input.summaries.len(), 2)?;
         decode_sink_requests(captured, &mut model, admission)?;
         admission.gate(&model, source, l)?;
         initial = Some(model);
@@ -634,12 +613,17 @@ fn preflight_decode(
             _ => 0,
         },
     )?;
+    known = add(
+        known,
+        bytes::<wire::SummaryOutput>(input.summaries.capacity())?,
+    )?;
     count_prefix(0, outer, source, known, l, w)?;
     let mut model = initial.unwrap_or(Model {
         items: outer,
         ..Model::default()
     });
     if !admission.observed() {
+        admission.request::<p::SummaryOutput>(&mut model, input.summaries.len(), 2)?;
         admission.request::<p::RuntimeFilterId>(&mut model, input.runtime_filter_ids.len(), 2)?;
         admission.request::<p::FragmentId>(
             &mut model,
@@ -648,6 +632,32 @@ fn preflight_decode(
         )?;
     }
     admission.facts(&model, source, l, w)?;
+    for summary in &input.summaries {
+        let columns = summary
+            .columns
+            .as_ref()
+            .ok_or_else(|| invalid("summary columns are absent"))?;
+        let kind = crate::physical_summary_v2::decode_kind(columns.kind).map_err(invalid)?;
+        if columns.value_ids.len() != kind.fields().len() {
+            return Err(invalid("summary field count differs from its kind"));
+        }
+        known = add(known, bytes::<u32>(columns.value_ids.capacity())?)?;
+        model.items = admission.sum(model.items, columns.value_ids.len())?;
+        let author_refs = usize::from(matches!(
+            summary
+                .author
+                .as_ref()
+                .and_then(|author| author.kind.as_ref()),
+            Some(wire::summary_author::Kind::NodeId(_))
+        ));
+        model.refs = admission.sum(
+            model.refs,
+            admission.sum(columns.value_ids.len(), 1 + author_refs)?,
+        )?;
+        admission.facts(&model, source, l, w)?;
+        floor(source, known, w)?;
+        crate::physical_summary_v2::decode_output(summary, w)?;
+    }
     match kind {
         wire::fragment_sink::Kind::RootResult(_) => {
             if !admission.observed() {
@@ -661,7 +671,6 @@ fn preflight_decode(
         }
         wire::fragment_sink::Kind::Router(v) => {
             required(v.effect_value_id, "router effect ValueId is absent", w)?;
-            decode_summary_output(v.summary.as_ref(), w)?;
             if !admission.observed() {
                 decode_sink_requests(Some(kind), &mut model, admission)?;
             }
@@ -748,15 +757,7 @@ fn emit_encode(
         p::FragmentSink::Multicast { edges } => Kind::Multicast(wire::MulticastSink {
             edge_ids: list(edges, w, |id, _| Ok(id.get()))?,
         }),
-        p::FragmentSink::Router {
-            effect,
-            routes,
-            summary,
-        } => Kind::Router(wire::RouterSink {
-            summary: Some(wire::LogicalSummaryOutput {
-                edge_id: Some(summary.edge.get()),
-                columns: Some(encode_summary_columns(summary.columns)),
-            }),
+        p::FragmentSink::Router { effect, routes } => Kind::Router(wire::RouterSink {
             effect_value_id: Some(effect.get()),
             routes: list(routes, w, |route, w| {
                 Ok(wire::ChangeStreamRoute {
@@ -783,6 +784,9 @@ fn emit_encode(
         root_node_id: input.root().get(),
         stage_placement: encode_placement(input.stage_placement(), w)?,
         sink: wire::FragmentSink { kind: Some(kind) },
+        summaries: list(input.summaries(), w, |output, w| {
+            crate::physical_summary_v2::encode_output(*output, w)
+        })?,
         dop_domain: wire::PipelineDopDomain {
             min: dop.min,
             max: dop.max,
@@ -833,7 +837,6 @@ fn emit_decode(
             edges: boxed(list(&v.edge_ids, w, |id, _| Ok(p::EdgeId::new(*id)))?, w)?,
         },
         Kind::Router(v) => p::FragmentSink::Router {
-            summary: decode_summary_output(v.summary.as_ref(), w)?,
             effect: p::ValueId::new(required(
                 v.effect_value_id,
                 "prepared router effect ID is absent",
@@ -899,6 +902,14 @@ fn emit_decode(
             w,
         )?),
         sink,
+        summaries: boxed(
+            list(
+                &input.summaries,
+                w,
+                crate::physical_summary_v2::decode_output,
+            )?,
+            w,
+        )?,
         dop_domain: p::PipelineDopDomain {
             min: dop.min,
             max: dop.max,

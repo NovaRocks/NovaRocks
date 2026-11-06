@@ -142,7 +142,7 @@ pub(crate) fn assemble_manifest_round(
         .collect::<std::collections::BTreeSet<_>>();
     let summary_sources = manifest
         .summary_sources()
-        .map(|(task, _)| task)
+        .map(|(_, task, _)| task)
         .collect::<std::collections::BTreeSet<_>>();
     let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;

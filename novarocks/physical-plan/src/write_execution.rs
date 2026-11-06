@@ -33,7 +33,7 @@ pub enum DeliveryRequirement {
 pub enum OutputRole {
     Relational,
     ProviderRoute { target: WriteTargetOrdinal },
-    LogicalSummary,
+    Summary(SummaryKind),
     WriterResults,
 }
 
@@ -45,48 +45,66 @@ pub enum StagePlacementPolicy {
     FollowSources { sources: Box<[FragmentId]> },
 }
 
-pub use novarocks_result_contract::{FinishCountMode, FinishInputs};
+pub use novarocks_result_contract::{
+    FinishCountMode, FinishInputs, PerKind, SummaryField, SummaryKind, SummaryWireType,
+};
 
 /// Which fragment-owned output a source edge projects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FragmentOutputPort {
     Root,
-    LogicalSummary,
+    Summary(SummaryKind),
 }
 
-/// Fixed, ordered semantic fields of the Task-local logical-change relation.
+/// Kind fixes the exact ordered field identities without dynamic backing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LogicalChangeCountField {
-    Inserted,
-    Replaced,
-    Deleted,
+pub enum SummaryColumns {
+    WriteCounts([ValueId; 3]),
+    DeleteVerification([ValueId; 4]),
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogicalSummaryColumns {
-    pub inserted: ValueId,
-    pub replaced: ValueId,
-    pub deleted: ValueId,
-}
-
-impl LogicalSummaryColumns {
-    pub const fn values(self) -> [ValueId; 3] {
-        [self.inserted, self.replaced, self.deleted]
+impl SummaryColumns {
+    pub const fn write_counts(inserted: ValueId, replaced: ValueId, deleted: ValueId) -> Self {
+        Self::WriteCounts([inserted, replaced, deleted])
     }
-    pub const fn fields(self) -> [(LogicalChangeCountField, ValueId); 3] {
-        [
-            (LogicalChangeCountField::Inserted, self.inserted),
-            (LogicalChangeCountField::Replaced, self.replaced),
-            (LogicalChangeCountField::Deleted, self.deleted),
-        ]
+    pub const fn delete_verification(
+        requested: ValueId,
+        matched: ValueId,
+        insufficient_keys: ValueId,
+        fingerprint: ValueId,
+    ) -> Self {
+        Self::DeleteVerification([requested, matched, insufficient_keys, fingerprint])
+    }
+    pub const fn kind(self) -> SummaryKind {
+        match self {
+            Self::WriteCounts(_) => SummaryKind::WriteCounts,
+            Self::DeleteVerification(_) => SummaryKind::DeleteVerification,
+        }
+    }
+    pub const fn values(&self) -> &[ValueId] {
+        match self {
+            Self::WriteCounts(values) => values,
+            Self::DeleteVerification(values) => values,
+        }
+    }
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = (SummaryField, ValueId)> + '_ {
+        self.kind()
+            .fields()
+            .iter()
+            .copied()
+            .zip(self.values().iter().copied())
     }
 }
 
-/// Symmetric source/destination identities. Every field is non-null Int64.
+/// Both endpoints must declare the same kind and its exact ordered fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogicalSummaryCut {
-    pub source: LogicalSummaryColumns,
-    pub destination: LogicalSummaryColumns,
+pub struct SummaryCut {
+    pub source: SummaryColumns,
+    pub destination: SummaryColumns,
+}
+impl SummaryCut {
+    pub const fn kind(self) -> SummaryKind {
+        self.source.kind()
+    }
 }
 
 /// Mutually exclusive payload proofs. The payload is the sole cut-role author;
@@ -96,7 +114,7 @@ pub enum ExchangePayloadContract {
     Relational,
     ProviderRoute(ChangeStreamWriterCut),
     WriterResults(WriterResultCut),
-    LogicalSummary(LogicalSummaryCut),
+    Summary(SummaryCut),
 }
 
 impl ExchangePayloadContract {
@@ -119,7 +137,7 @@ impl ExchangePayloadContract {
                 target: proof.write_target_ordinal,
             },
             Self::WriterResults(_) => OutputRole::WriterResults,
-            Self::LogicalSummary(_) => OutputRole::LogicalSummary,
+            Self::Summary(proof) => OutputRole::Summary(proof.kind()),
         }
     }
 }
@@ -141,10 +159,22 @@ impl crate::OutboundFragmentCut {
     }
 }
 
+/// Static authorship, separate from fragment sink and live Task capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogicalSummaryOutput {
+pub enum SummaryAuthor {
+    RouterSink,
+    Node(crate::NodeId),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SummaryOutput {
     pub edge: EdgeId,
-    pub columns: LogicalSummaryColumns,
+    pub columns: SummaryColumns,
+    pub author: SummaryAuthor,
+}
+impl SummaryOutput {
+    pub const fn kind(self) -> SummaryKind {
+        self.columns.kind()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -51,8 +51,8 @@ pub enum ValueOrigin {
         node: NodeId,
     },
     /// A Task summary output; never a row in the relational root node.
-    LogicalSummary {
-        field: crate::LogicalChangeCountField,
+    Summary {
+        field: crate::SummaryField,
     },
     ProviderField {
         scan_node: NodeId,
@@ -694,7 +694,7 @@ pub struct WriterGroupedUnpivotSpec {
 pub struct WriterFinishSpec {
     pub count_mode: crate::FinishCountMode,
     pub inputs: crate::FinishInputs,
-    pub logical_summary: Option<crate::LogicalSummaryColumns>,
+    pub summaries: crate::PerKind<crate::SummaryColumns>,
     pub expected_target_ordinals: Box<[WriteTargetOrdinal]>,
     pub input_schema: WriterRelationSchema,
     pub output_schema: WriterRelationSchema,
@@ -946,6 +946,12 @@ pub struct ScanReadBudget {
 pub type AggregateContractRef<'a> = (&'a [(ExprId, ValueId)], &'a [AggregateCall]);
 
 impl NodeKind {
+    /// Authorship is a closed node-family fact, never inferred from values.
+    /// No current node family authors a Task summary.
+    pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
+        None
+    }
+
     /// The one aggregate state contract, shared by ordinary aggregation and
     /// key-budgeted reduction. No separate grouped-TopN binding vocabulary.
     pub fn aggregate_contract(&self) -> Option<AggregateContractRef<'_>> {
@@ -1110,7 +1116,6 @@ pub enum FragmentSink {
     Router {
         effect: ValueId,
         routes: Box<[ChangeStreamRoute]>,
-        summary: crate::LogicalSummaryOutput,
     },
     Noop,
 }
@@ -1123,6 +1128,7 @@ pub struct Fragment {
     expressions: ExprArena,
     nodes: BTreeMap<NodeId, PhysicalNode>,
     sink: FragmentSink,
+    summaries: Box<[crate::SummaryOutput]>,
     dop_domain: PipelineDopDomain,
     stage_placement: crate::StagePlacementPolicy,
     runtime_filters: Box<[RuntimeFilterId]>,
@@ -1138,6 +1144,7 @@ impl Fragment {
             expressions: self.expressions,
             nodes: self.nodes,
             sink: self.sink,
+            summaries: self.summaries,
             dop_domain: self.dop_domain,
             stage_placement: self.stage_placement,
             runtime_filters: self.runtime_filters,
@@ -1167,6 +1174,10 @@ impl Fragment {
 
     pub const fn sink(&self) -> &FragmentSink {
         &self.sink
+    }
+
+    pub fn summaries(&self) -> &[crate::SummaryOutput] {
+        &self.summaries
     }
 
     pub const fn stage_placement(&self) -> &crate::StagePlacementPolicy {
@@ -1777,6 +1788,7 @@ pub(crate) struct FragmentParts {
     pub expressions: ExprArena,
     pub nodes: BTreeMap<NodeId, PhysicalNode>,
     pub sink: FragmentSink,
+    pub summaries: Box<[crate::SummaryOutput]>,
     pub dop_domain: PipelineDopDomain,
     pub stage_placement: crate::StagePlacementPolicy,
     pub runtime_filters: Box<[RuntimeFilterId]>,
@@ -1792,6 +1804,7 @@ impl From<FragmentParts> for Fragment {
             expressions: parts.expressions,
             nodes: parts.nodes,
             sink: parts.sink,
+            summaries: parts.summaries,
             dop_domain: parts.dop_domain,
             stage_placement: parts.stage_placement,
             runtime_filters: parts.runtime_filters,

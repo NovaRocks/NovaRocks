@@ -457,9 +457,9 @@ fn fixture_with_types(
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -899,7 +899,11 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
         input_roles:
             novarocks_local_program::FinishInputs {
                 writer_results: 0,
-                logical_summary: None,
+                summaries:
+                    novarocks_physical_plan::PerKind {
+                        write_counts: None,
+                        delete_verification: None,
+                    },
             },
         logical_summary_layout: None,
         inputs,
@@ -1554,9 +1558,9 @@ fn statistics_fixture() -> StatisticsFixture {
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,

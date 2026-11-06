@@ -51,6 +51,7 @@ pub(crate) mod physical_fragment_envelope_v2;
 pub mod physical_node_v2;
 pub mod physical_package_metadata_v2;
 pub mod physical_package_v2;
+pub(crate) mod physical_summary_v2;
 pub use physical_package_v2::PhysicalEncodeError;
 pub mod physical_properties_v2;
 pub mod physical_provider_binding_v2;

@@ -163,7 +163,8 @@ impl CompiledWriterBindings {
                 unreachable!("finish binding set was checked above");
             };
             let receiver = input_roles
-                .logical_summary
+                .summaries
+                .write_counts
                 .and_then(|ordinal| inputs.get(ordinal as usize))
                 .and_then(|input| program.exchange_inputs().get(input));
             let valid =

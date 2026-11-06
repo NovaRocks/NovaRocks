@@ -234,6 +234,7 @@ fn relational_visitor_needs_no_expression_roots_for_zero_argument_occurrences() 
     )
     .unwrap();
     let rootless: Fragment = FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),

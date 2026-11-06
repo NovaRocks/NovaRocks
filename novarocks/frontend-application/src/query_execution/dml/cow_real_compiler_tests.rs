@@ -438,7 +438,7 @@ fn compile_signed_cow(
                     finish.count_mode,
                     novarocks_physical_plan::FinishCountMode::ExternalOwner
                 );
-                assert!(finish.inputs.logical_summary.is_none());
+                assert!(finish.inputs.summaries.write_counts.is_none());
             }
             let novarocks_physical_plan::NodeKind::TableWriter { target } = &node.kind else {
                 continue;

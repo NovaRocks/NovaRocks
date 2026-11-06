@@ -1503,7 +1503,7 @@ impl LocalProgramGraph {
                 inputs,
                 ..
             } = &node.kind
-                && let Some(port) = input_roles.logical_summary
+                && let Some(port) = input_roles.summaries.write_counts
             {
                 let source = inputs
                     .get(port as usize)
@@ -1951,7 +1951,7 @@ fn validate_relationships(
             for (ordinal, input) in inputs.iter().enumerate() {
                 let expected = if ordinal == input_roles.writer_results as usize {
                     writer_multiplex_layout
-                } else if Some(ordinal as u32) == input_roles.logical_summary {
+                } else if Some(ordinal as u32) == input_roles.summaries.write_counts {
                     logical_summary_layout
                         .as_ref()
                         .ok_or(LocalProgramError::InvalidNodeShape)?
@@ -2244,10 +2244,10 @@ fn validate_shape(
             }
             let logical = *count_mode == novarocks_result_contract::FinishCountMode::LogicalChanges;
             let roles_valid = input_roles.writer_results < inputs.len() as u32
-                && input_roles.logical_summary.is_some() == logical
+                && input_roles.summaries.write_counts.is_some() == logical
                 && logical_summary_layout.is_some() == logical
                 && inputs.len() == if logical { 2 } else { 1 }
-                && input_roles.logical_summary.is_none_or(|port| {
+                && input_roles.summaries.write_counts.is_none_or(|port| {
                     port < inputs.len() as u32 && port != input_roles.writer_results
                 });
             if let Some(summary) = logical_summary_layout {
@@ -2409,7 +2409,7 @@ mod tests {
                             count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
                             input_roles: novarocks_result_contract::FinishInputs {
                                 writer_results: 0,
-                                logical_summary: None,
+                                summaries: Default::default(),
                             },
                             logical_summary_layout: None,
                             inputs: vec![ProgramNodeId::new(0)],

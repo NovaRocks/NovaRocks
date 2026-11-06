@@ -572,6 +572,7 @@ fn package_rechecks_ordered_children_intrinsic_control_and_roots_with_reused_ids
             }
         };
         let changed = Fragment::from(FragmentParts {
+            summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
             id: original.id(),
             root: original.root(),
@@ -689,6 +690,7 @@ fn package_control_checks_correspondence_without_claiming_literal_content_identi
     literal.kind = ExprKind::Literal(LiteralValue::Int64(22));
     expressions.insert(literal);
     let changed = Fragment::from(FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: original.root(),
@@ -745,6 +747,7 @@ fn package_preserves_actual_case_branch_guards_and_root_occurrences() {
     values.get_mut(&outputs[0]).unwrap().ty = ty(DataType::Int64, true);
     values.get_mut(&outputs[1]).unwrap().ty = ty(DataType::Boolean, false);
     let fragment = Fragment::from(FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: node,
@@ -1410,6 +1413,7 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
         field: first_field,
     };
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        summaries: Box::default(),
         stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),
@@ -2218,6 +2222,7 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
     let value = values.get_mut(&input_value).unwrap();
     value.ty = ValueType::new(nested_type(1), value.ty.nullable());
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: original.id(),
         root: original.root(),
@@ -2603,6 +2608,7 @@ fn intrinsic_operator_profiles_refuse_missing_extra_or_foreign_key_refs() {
         assert_eq!(id, expression.id);
         expressions.insert(expression);
         let fragment = Fragment::from(FragmentParts {
+            summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
             id: input.fragment.id(),
             root: input.fragment.root(),

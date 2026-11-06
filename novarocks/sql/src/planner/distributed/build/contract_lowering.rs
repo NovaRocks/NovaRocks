@@ -4028,26 +4028,27 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
         self.current_fragment = source_fragment;
         let summary_edge = self.plan_builder.reserve_edge_id()?;
-        use novarocks_physical_plan::LogicalChangeCountField as CountField;
+        use novarocks_physical_plan::SummaryField as CountField;
         let mut count_value = |field| {
             self.fragment_mut().add_value(
                 ValueType::new(DataType::Int64, false),
-                ValueOrigin::LogicalSummary { field },
+                ValueOrigin::Summary { field },
             )
         };
-        let summary = novarocks_physical_plan::LogicalSummaryOutput {
+        let summary = novarocks_physical_plan::SummaryOutput {
             edge: summary_edge,
-            columns: novarocks_physical_plan::LogicalSummaryColumns {
-                inserted: count_value(CountField::Inserted)?,
-                replaced: count_value(CountField::Replaced)?,
-                deleted: count_value(CountField::Deleted)?,
-            },
+            columns: novarocks_physical_plan::SummaryColumns::write_counts(
+                count_value(CountField::Inserted)?,
+                count_value(CountField::Replaced)?,
+                count_value(CountField::Deleted)?,
+            ),
+            author: novarocks_physical_plan::SummaryAuthor::RouterSink,
         };
+        self.fragment_mut().set_summaries(Box::new([summary]));
         self.complete_fragment(
             source_fragment,
             source.node,
             FragmentSink::Router {
-                summary,
                 effect,
                 routes: router_routes.into_boxed_slice(),
             },
@@ -4083,7 +4084,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         ordinals: Box<[WriteTargetOrdinal]>,
         auxiliary: &WriterAuxiliaryPlan,
         sequences: &BTreeMap<u32, AggregateSequenceId>,
-        summary: Option<(FragmentId, novarocks_physical_plan::LogicalSummaryOutput)>,
+        summary: Option<(FragmentId, novarocks_physical_plan::SummaryOutput)>,
         count_mode: novarocks_physical_plan::FinishCountMode,
     ) -> Result<LoweredSqlPhysicalDraft, ContractLoweringError> {
         if matches!(
@@ -4452,7 +4453,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             let exchange = self.fragment_mut().reserve_node_id()?;
             let mut imported = Vec::with_capacity(3);
             let mut mapping = Vec::with_capacity(3);
-            for source_value in summary.columns.values() {
+            for source_value in summary.columns.values().iter().copied() {
                 let destination = self.fragment_mut().add_value(
                     ValueType::new(DataType::Int64, false),
                     ValueOrigin::ExchangeImport {
@@ -4474,12 +4475,16 @@ impl<'a> ContractLoweringVisitor<'a> {
             )?;
             let edge = Edge {
                 id: summary.edge,
-                role: novarocks_physical_plan::OutputRole::LogicalSummary,
+                role: novarocks_physical_plan::OutputRole::Summary(
+                    novarocks_physical_plan::SummaryKind::WriteCounts,
+                ),
                 delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
                 kind: EdgeKind::Stream,
                 source: EdgeSource {
                     fragment: source_fragment,
-                    port: novarocks_physical_plan::FragmentOutputPort::LogicalSummary,
+                    port: novarocks_physical_plan::FragmentOutputPort::Summary(
+                        novarocks_physical_plan::SummaryKind::WriteCounts,
+                    ),
                     projection: summary.columns.values().into(),
                 },
                 destination: EdgeDestination {
@@ -4499,11 +4504,11 @@ impl<'a> ContractLoweringVisitor<'a> {
             self.edges.insert(edge.id, edge);
             self.work.step()?;
             finish_inputs.push(exchange);
-            Some(novarocks_physical_plan::LogicalSummaryColumns {
-                inserted: imported[0],
-                replaced: imported[1],
-                deleted: imported[2],
-            })
+            Some(novarocks_physical_plan::SummaryColumns::write_counts(
+                imported[0],
+                imported[1],
+                imported[2],
+            ))
         } else {
             None
         };
@@ -4517,9 +4522,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                 count_mode,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: logical_summary.map(|_| 1),
+                    summaries: novarocks_physical_plan::PerKind {
+                        write_counts: logical_summary.map(|_| 1),
+                        delete_verification: None,
+                    },
                 },
-                logical_summary,
+                summaries: novarocks_physical_plan::PerKind {
+                    write_counts: logical_summary,
+                    delete_verification: None,
+                },
                 expected_target_ordinals: ordinals,
                 input_schema,
                 output_schema,
@@ -10698,7 +10709,7 @@ struct LoweredNode {
 struct LoweredChangeStreamWriters {
     writers: Vec<LoweredNode>,
     target_ordinals: Box<[WriteTargetOrdinal]>,
-    summary: (FragmentId, novarocks_physical_plan::LogicalSummaryOutput),
+    summary: (FragmentId, novarocks_physical_plan::SummaryOutput),
 }
 
 struct LoweredWriterRelation {
@@ -14589,8 +14600,8 @@ mod tests {
         assert_eq!(finish.expected_target_ordinals.as_ref(), &[ordinal]);
         assert_eq!(node.inputs.len(), 1);
         assert_eq!(finish.inputs.writer_results, 0);
-        assert!(finish.inputs.logical_summary.is_none());
-        assert!(finish.logical_summary.is_none());
+        assert!(finish.inputs.summaries.write_counts.is_none());
+        assert!(finish.summaries.write_counts.is_none());
         assert_eq!(
             finish.input_schema.fields.len(),
             novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
@@ -14890,18 +14901,28 @@ mod tests {
                 .fragments()
                 .values()
                 .find_map(|fragment| match fragment.sink() {
-                    FragmentSink::Router { summary, .. } => Some((fragment, summary)),
+                    FragmentSink::Router { .. } => fragment
+                        .summaries()
+                        .iter()
+                        .find(|summary| {
+                            summary.kind() == novarocks_physical_plan::SummaryKind::WriteCounts
+                        })
+                        .map(|summary| (fragment, summary)),
                     _ => None,
                 })
                 .unwrap();
             let summary_edge = &plan.edges()[&summary.edge];
             assert_eq!(
                 summary_edge.role,
-                novarocks_physical_plan::OutputRole::LogicalSummary
+                novarocks_physical_plan::OutputRole::Summary(
+                    novarocks_physical_plan::SummaryKind::WriteCounts
+                )
             );
             assert_eq!(
                 summary_edge.source.port,
-                novarocks_physical_plan::FragmentOutputPort::LogicalSummary
+                novarocks_physical_plan::FragmentOutputPort::Summary(
+                    novarocks_physical_plan::SummaryKind::WriteCounts
+                )
             );
             assert_eq!(
                 summary_edge.delivery,
@@ -14909,17 +14930,17 @@ mod tests {
             );
             assert_eq!(
                 summary_edge.source.projection.as_ref(),
-                &summary.columns.values()
+                summary.columns.values()
             );
-            for (value, expected_field) in summary.columns.values().into_iter().zip([
-                novarocks_physical_plan::LogicalChangeCountField::Inserted,
-                novarocks_physical_plan::LogicalChangeCountField::Replaced,
-                novarocks_physical_plan::LogicalChangeCountField::Deleted,
+            for (value, expected_field) in summary.columns.values().iter().copied().zip([
+                novarocks_physical_plan::SummaryField::Inserted,
+                novarocks_physical_plan::SummaryField::Replaced,
+                novarocks_physical_plan::SummaryField::Deleted,
             ]) {
                 let definition = &router_fragment.values()[&value];
                 assert_eq!(
                     definition.origin,
-                    ValueOrigin::LogicalSummary {
+                    ValueOrigin::Summary {
                         field: expected_field
                     }
                 );
@@ -14949,7 +14970,7 @@ mod tests {
             assert_eq!(finish_node.inputs.len(), 2);
             assert_ne!(
                 Some(finish.inputs.writer_results),
-                finish.inputs.logical_summary
+                finish.inputs.summaries.write_counts
             );
             assert_eq!(
                 finish_fragment.stage_placement(),
@@ -15026,7 +15047,7 @@ mod tests {
             .unwrap()
             .join("\n");
             for expected in [
-                "ROLE: logical-summary(inserted, replaced, deleted)",
+                "ROLE: summary(write-counts: inserted, replaced, deleted)",
                 "ROLE: provider-route(target=0)",
                 "ROLE: provider-route(target=1)",
                 "ROLE: writer-results(physical-received-rows, commit-fragments)",

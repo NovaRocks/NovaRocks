@@ -215,8 +215,8 @@ pub(crate) fn preflight_fragment_cut_resources(
     {
         let edge = plan.edges().get(edge_id)?;
         let source = plan.fragments().get(&edge.source.fragment)?;
-        if edge.role == crate::OutputRole::LogicalSummary {
-            usage.add_items(6);
+        if let crate::OutputRole::Summary(kind) = edge.role {
+            usage.add_items(kind.fields().len() * 2);
         }
         usage.add_items(edge.destination.receive_mapping.len() * if is_outbound { 2 } else { 1 });
         usage.add_distribution(&edge.partitioning.source);
@@ -362,24 +362,39 @@ fn edge_payload(
         crate::OutputRole::WriterResults => {
             writer_result_cut(plan, edge).map(Payload::WriterResults)
         }
-        crate::OutputRole::LogicalSummary => {
+        crate::OutputRole::Summary(kind) => {
             let source = plan.fragments().get(&edge.source.fragment)?;
-            let FragmentSink::Router { summary, .. } = source.sink() else {
-                return None;
-            };
-            let [(s0, d0), (s1, d1), (s2, d2)] = edge.destination.receive_mapping.as_ref() else {
-                return None;
-            };
-            if [*s0, *s1, *s2] != summary.columns.values() {
+            let summary = source
+                .summaries()
+                .iter()
+                .find(|summary| summary.kind() == kind && summary.edge == edge.id)?;
+            if edge.destination.receive_mapping.len() != summary.columns.values().len()
+                || !edge
+                    .destination
+                    .receive_mapping
+                    .iter()
+                    .map(|(s, _)| s)
+                    .eq(summary.columns.values())
+            {
                 return None;
             }
-            Some(Payload::LogicalSummary(crate::LogicalSummaryCut {
+            let mapping = &edge.destination.receive_mapping;
+            let destination = match kind {
+                crate::SummaryKind::WriteCounts => {
+                    crate::SummaryColumns::WriteCounts([mapping[0].1, mapping[1].1, mapping[2].1])
+                }
+                crate::SummaryKind::DeleteVerification => {
+                    crate::SummaryColumns::DeleteVerification([
+                        mapping[0].1,
+                        mapping[1].1,
+                        mapping[2].1,
+                        mapping[3].1,
+                    ])
+                }
+            };
+            Some(Payload::Summary(crate::SummaryCut {
                 source: summary.columns,
-                destination: crate::LogicalSummaryColumns {
-                    inserted: *d0,
-                    replaced: *d1,
-                    deleted: *d2,
-                },
+                destination,
             }))
         }
     }
@@ -453,11 +468,13 @@ pub(crate) fn validate_fragment_cuts_into(
     );
     let mut inbound_ids = BTreeSet::new();
     for cut in &cuts.inbound {
-        validate_logical_summary_cut(
+        validate_summary_cut(
             fragment,
             cut.source_port,
             &cut.payload,
             cut.delivery,
+            cut.kind,
+            &cut.partitioning,
             &cut.imports,
             false,
             errors,
@@ -614,11 +631,13 @@ pub(crate) fn validate_fragment_cuts_into(
         .map(|root| root.output_properties.row_multiplicity);
     let mut outbound_ids = BTreeSet::new();
     for cut in &cuts.outbound {
-        validate_logical_summary_cut(
+        validate_summary_cut(
             fragment,
             cut.source_port,
             &cut.payload,
             cut.delivery,
+            cut.kind,
+            &cut.partitioning,
             &cut.destination_imports,
             true,
             errors,
@@ -712,18 +731,13 @@ pub(crate) fn validate_fragment_cuts_into(
             ));
         }
     }
-    let sink_edges = match fragment.sink() {
+    let mut sink_edges = match fragment.sink() {
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
-        FragmentSink::Router {
-            routes, summary, ..
-        } => routes
-            .iter()
-            .map(|route| route.edge)
-            .chain(std::iter::once(summary.edge))
-            .collect(),
+        FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
         FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => Vec::new(),
     };
+    sink_edges.extend(fragment.summaries().iter().map(|summary| summary.edge));
     let sink_edge_ids = sink_edges.iter().copied().collect::<BTreeSet<_>>();
     if sink_edge_ids.len() != sink_edges.len() {
         errors.push(ValidationError::new(
@@ -742,31 +756,25 @@ pub(crate) fn validate_fragment_cuts_into(
         .iter()
         .map(|cut| (cut.edge, cut))
         .collect::<BTreeMap<_, _>>();
-    if let FragmentSink::Router {
-        routes, summary, ..
-    } = fragment.sink()
-    {
+    for summary in fragment.summaries() {
         let valid = outbound_by_edge.get(&summary.edge).is_some_and(|cut| {
-            cut.source_port == crate::FragmentOutputPort::LogicalSummary
+            cut.source_port == crate::FragmentOutputPort::Summary(summary.kind())
                 && cut.delivery == crate::DeliveryRequirement::MustDrain
                 && cut.kind == crate::EdgeKind::Stream
                 && cut.partitioning.destination == crate::Distribution::Singleton
                 && cut.partitioning.source_multiplicity == crate::RowMultiplicity::SingleCopy
                 && cut.partitioning.destination_multiplicity == crate::RowMultiplicity::SingleCopy
-                && matches!(cut.payload, crate::ExchangePayloadContract::LogicalSummary(proof)
-                    if proof.source == summary.columns)
-                && cut
-                    .projection
-                    .iter()
-                    .map(|value| value.value)
-                    .eq(summary.columns.values())
+                && matches!(cut.payload, crate::ExchangePayloadContract::Summary(proof) if proof.source == summary.columns)
+                && cut.projection.iter().map(|value| value.value).eq(summary.columns.values().iter().copied())
         });
         if !valid {
             errors.push(ValidationError::new(
                 &path,
-                "router summary cut differs from its exact independent output contract",
+                "summary cut differs from its exact independent output contract",
             ));
         }
+    }
+    if let FragmentSink::Router { routes, .. } = fragment.sink() {
         for route in routes {
             let cut = outbound_by_edge.get(&route.edge).copied();
             if cut.is_none_or(|cut| {

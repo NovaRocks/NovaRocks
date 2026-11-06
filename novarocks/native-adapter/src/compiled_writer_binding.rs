@@ -216,7 +216,8 @@ pub(crate) fn bind_compiled_writers(
                         )
                     };
                     let receiver = input_roles
-                        .logical_summary
+                        .summaries
+                        .write_counts
                         .and_then(|ordinal| inputs.get(ordinal as usize))
                         .and_then(|input| program.exchange_inputs().get(input))
                         .ok_or_else(|| invalid("the logical role has no compiled receiver"))?;

@@ -194,7 +194,8 @@ pub(crate) fn admit_writer_family(
             if logical {
                 let summary = spec
                     .inputs
-                    .logical_summary
+                    .summaries
+                    .write_counts
                     .and_then(|port| node.inputs.get(port as usize))
                     .and_then(|id| fragment.nodes().get(id))
                     .ok_or(FragmentCompileError::Invalid(
@@ -206,7 +207,7 @@ pub(crate) fn admit_writer_family(
                         && cut.delivery == novarocks_physical_plan::DeliveryRequirement::MustDrain
                         && matches!(
                             cut.payload,
-                            novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                            novarocks_physical_plan::ExchangePayloadContract::Summary(_)
                         );
                     work.step()?;
                 }
@@ -859,7 +860,8 @@ pub(crate) fn lower_finish_with_creation<H>(
                     if let Some((summary, _)) = input.summary {
                         inputs[spec
                             .inputs
-                            .logical_summary
+                            .summaries
+                            .write_counts
                             .ok_or(FragmentCompileError::Invalid("summary input has no role"))?
                             as usize] = summary;
                     }

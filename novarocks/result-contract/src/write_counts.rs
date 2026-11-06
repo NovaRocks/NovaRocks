@@ -30,7 +30,7 @@ pub enum FinishCountMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FinishInputs {
     pub writer_results: u32,
-    pub logical_summary: Option<u32>,
+    pub summaries: crate::PerKind<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

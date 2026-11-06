@@ -147,6 +147,7 @@ fn snapshot(
     nodes: BTreeMap<NodeId, PhysicalNode>,
 ) -> Fragment {
     Fragment::from(FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),

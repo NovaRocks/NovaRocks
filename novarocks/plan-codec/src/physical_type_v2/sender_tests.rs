@@ -805,6 +805,34 @@ fn relation_fields(
                 p::WriterRelationFieldRole::Auxiliary,
                 p::WriterDerivedKind::RelationAuxiliary,
             ),
+            (
+                "requested",
+                DataType::Int64,
+                true,
+                p::WriterRelationFieldRole::Auxiliary,
+                p::WriterDerivedKind::RelationAuxiliary,
+            ),
+            (
+                "matched",
+                DataType::Int64,
+                true,
+                p::WriterRelationFieldRole::Auxiliary,
+                p::WriterDerivedKind::RelationAuxiliary,
+            ),
+            (
+                "insufficient_keys",
+                DataType::Int64,
+                true,
+                p::WriterRelationFieldRole::Auxiliary,
+                p::WriterDerivedKind::RelationAuxiliary,
+            ),
+            (
+                "insufficient_fingerprint",
+                DataType::FixedSizeBinary(16),
+                true,
+                p::WriterRelationFieldRole::Auxiliary,
+                p::WriterDerivedKind::RelationAuxiliary,
+            ),
         ]
     } else {
         vec![
@@ -891,7 +919,7 @@ fn change_stream_source(
     pool: p::ConstantPoolId,
     route_edge: p::EdgeId,
     summary_edge: p::EdgeId,
-) -> (p::Fragment, p::ValueId, p::LogicalSummaryOutput) {
+) -> (p::Fragment, p::ValueId, p::SummaryOutput) {
     let mut builder = p::FragmentBuilder::new(p::FragmentId::new(3));
     let input = builder.reserve_node_id().unwrap();
     let expression = builder
@@ -967,23 +995,24 @@ fn change_stream_source(
         builder
             .add_value(
                 FunctionValueType::new(DataType::Int64, false),
-                p::ValueOrigin::LogicalSummary { field },
+                p::ValueOrigin::Summary { field },
             )
             .unwrap()
     };
-    let summary = p::LogicalSummaryOutput {
+    let summary = p::SummaryOutput {
         edge: summary_edge,
-        columns: p::LogicalSummaryColumns {
-            inserted: add_count(p::LogicalChangeCountField::Inserted),
-            replaced: add_count(p::LogicalChangeCountField::Replaced),
-            deleted: add_count(p::LogicalChangeCountField::Deleted),
-        },
+        columns: p::SummaryColumns::write_counts(
+            add_count(p::SummaryField::Inserted),
+            add_count(p::SummaryField::Replaced),
+            add_count(p::SummaryField::Deleted),
+        ),
+        author: p::SummaryAuthor::RouterSink,
     };
+    builder.set_summaries(Box::new([summary]));
     let fragment = builder
         .finish_definition(
             expand,
             p::FragmentSink::Router {
-                summary,
                 effect,
                 routes: Box::from([p::ChangeStreamRoute {
                     route_id: c::ConnectorWriteRouteId::from_bytes([9; 32]),
@@ -1201,9 +1230,9 @@ fn checked_writer_plan_packages_inner(
     let summary_input = router.as_ref().map(|(_, _, summary)| {
         let node = builder.reserve_node_id().unwrap();
         let original = [
-            summary.columns.inserted,
-            summary.columns.replaced,
-            summary.columns.deleted,
+            summary.columns.values()[0],
+            summary.columns.values()[1],
+            summary.columns.values()[2],
         ];
         let mut imports = Vec::new();
         for source_value in original {
@@ -1230,11 +1259,7 @@ fn checked_writer_plan_packages_inner(
             .unwrap();
         (
             node,
-            p::LogicalSummaryColumns {
-                inserted: imports[0].1,
-                replaced: imports[1].1,
-                deleted: imports[2].1,
-            },
+            p::SummaryColumns::write_counts(imports[0].1, imports[1].1, imports[2].1),
         )
     });
     let finish = builder.reserve_node_id().unwrap();
@@ -1263,9 +1288,15 @@ fn checked_writer_plan_packages_inner(
                 },
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: summary_input.map(|_| 1),
+                    summaries: novarocks_physical_plan::PerKind {
+                        write_counts: summary_input.map(|_| 1),
+                        delete_verification: None,
+                    },
                 },
-                logical_summary: summary_input.map(|(_, columns)| columns),
+                summaries: p::PerKind {
+                    write_counts: summary_input.map(|(_, columns)| columns),
+                    delete_verification: None,
+                },
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1344,26 +1375,26 @@ fn checked_writer_plan_packages_inner(
         let (summary_node, imported) =
             summary_input.expect("an actual Router always has its exact summary input");
         plan.add_edge(p::Edge {
-            role: p::OutputRole::LogicalSummary,
+            role: p::OutputRole::Summary(p::SummaryKind::WriteCounts),
             delivery: p::DeliveryRequirement::MustDrain,
             id: summary_edge,
             kind: p::EdgeKind::Stream,
             source: p::EdgeSource {
-                port: p::FragmentOutputPort::LogicalSummary,
+                port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
                 fragment: source_id,
                 projection: Box::from([
-                    summary.columns.inserted,
-                    summary.columns.replaced,
-                    summary.columns.deleted,
+                    summary.columns.values()[0],
+                    summary.columns.values()[1],
+                    summary.columns.values()[2],
                 ]),
             },
             destination: p::EdgeDestination {
                 fragment: consumer.id(),
                 node: summary_node,
                 receive_mapping: Box::from([
-                    (summary.columns.inserted, imported.inserted),
-                    (summary.columns.replaced, imported.replaced),
-                    (summary.columns.deleted, imported.deleted),
+                    (summary.columns.values()[0], imported.values()[0]),
+                    (summary.columns.values()[1], imported.values()[1]),
+                    (summary.columns.values()[2], imported.values()[2]),
                 ]),
             },
             partitioning: p::EdgePartitioning {

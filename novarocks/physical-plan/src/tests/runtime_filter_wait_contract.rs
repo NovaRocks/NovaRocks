@@ -888,6 +888,7 @@ fn replace_source_fragment(
 ) -> PhysicalPlan {
     let source = &plan.fragments()[&source_id];
     let mut parts = crate::plan::FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: source.id(),
         root: source.root(),

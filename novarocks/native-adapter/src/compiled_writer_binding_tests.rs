@@ -493,9 +493,9 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,

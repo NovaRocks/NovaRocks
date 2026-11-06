@@ -140,7 +140,12 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
         .nodes()
         .get(&fragment.root())
         .map(|root| root.output_properties.row_multiplicity);
-    let mut edge_ids = BTreeSet::new();
+    validate_fragment_summary_outputs(fragment, errors);
+    let mut edge_ids = fragment
+        .summaries()
+        .iter()
+        .map(|summary| summary.edge)
+        .collect::<BTreeSet<_>>();
     match fragment.sink() {
         FragmentSink::Multicast { edges } => {
             if edges.is_empty() {
@@ -158,13 +163,7 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 }
             }
         }
-        FragmentSink::Router {
-            effect,
-            routes,
-            summary,
-        } => {
-            validate_logical_summary_output(fragment, summary, errors);
-            edge_ids.insert(summary.edge);
+        FragmentSink::Router { effect, routes } => {
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
                     &path,
@@ -702,12 +701,14 @@ pub(crate) fn validate_edge(
             "source projection and receive mapping have different widths",
         ));
     }
-    if edge.source.port == crate::FragmentOutputPort::LogicalSummary {
-        match source.sink() {
-            FragmentSink::Router { summary, .. } => {
-                validate_logical_summary_edge(source, summary, edge, errors);
-            }
-            _ => errors.push(ValidationError::new(
+    if let crate::FragmentOutputPort::Summary(kind) = edge.source.port {
+        match source
+            .summaries()
+            .iter()
+            .find(|summary| summary.kind() == kind)
+        {
+            Some(summary) => validate_summary_edge(source, summary, edge, errors),
+            None => errors.push(ValidationError::new(
                 &path,
                 "summary source has no summary output",
             )),
@@ -744,7 +745,7 @@ pub(crate) fn validate_edge(
             ));
         }
         let role_matches = match edge.role {
-            crate::OutputRole::LogicalSummary => false,
+            crate::OutputRole::Summary(_) => false,
             crate::OutputRole::WriterResults => {
                 matches!(root.kind, NodeKind::TableWriter { .. })
                     && edge.delivery == crate::DeliveryRequirement::MustDrain
@@ -968,22 +969,22 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
     let mut referenced = BTreeSet::new();
     for fragment in plan.fragments().values() {
         let path = format!("fragments[{}].sink", fragment.id().get());
+        for summary in fragment.summaries() {
+            if !referenced.insert(summary.edge) {
+                errors.push(ValidationError::new(
+                    &path,
+                    "edge is referenced by more than one output",
+                ));
+            }
+            match plan.edges().get(&summary.edge) {
+                Some(edge) => validate_summary_edge(fragment, summary, edge, errors),
+                None => errors.push(ValidationError::new(&path, "summary edge is not defined")),
+            }
+        }
         let edges: &[EdgeId] = match fragment.sink() {
             FragmentSink::Stream { edge } => std::slice::from_ref(edge),
             FragmentSink::Multicast { edges } => edges,
-            FragmentSink::Router {
-                routes, summary, ..
-            } => {
-                if !referenced.insert(summary.edge) {
-                    errors.push(ValidationError::new(
-                        &path,
-                        "edge is referenced by more than one sink",
-                    ));
-                }
-                match plan.edges().get(&summary.edge) {
-                    Some(edge) => validate_logical_summary_edge(fragment, summary, edge, errors),
-                    None => errors.push(ValidationError::new(&path, "summary edge is not defined")),
-                }
+            FragmentSink::Router { routes, .. } => {
                 for route in routes {
                     if !referenced.insert(route.edge) {
                         errors.push(ValidationError::new(

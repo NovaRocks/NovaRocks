@@ -54,6 +54,7 @@ pub struct FragmentBuilder {
     nodes: BTreeMap<NodeId, PhysicalNode>,
     contains_scan: bool,
     runtime_filters: BTreeSet<RuntimeFilterId>,
+    summaries: Box<[crate::SummaryOutput]>,
 }
 
 impl FragmentBuilder {
@@ -68,7 +69,14 @@ impl FragmentBuilder {
             nodes: BTreeMap::new(),
             contains_scan: false,
             runtime_filters: BTreeSet::new(),
+            summaries: Box::default(),
         }
+    }
+
+    /// Install explicit side-output declarations before structural publication.
+    /// Full validation checks unique kinds, exact fields and legal authors.
+    pub fn set_summaries(&mut self, summaries: Box<[crate::SummaryOutput]>) {
+        self.summaries = summaries;
     }
 
     pub fn contains_scan(&self) -> bool {
@@ -1029,6 +1037,7 @@ impl FragmentBuilder {
             expressions: self.expressions,
             nodes: self.nodes,
             sink,
+            summaries: self.summaries,
             dop_domain,
             stage_placement,
             // The author installs the exact ordered references before this

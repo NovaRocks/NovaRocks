@@ -150,6 +150,7 @@ fn fragment(id: u32, definitions: Vec<ExprNode>, kind: NodeKind) -> Fragment {
     .unwrap();
     let node = NodeId::new(9);
     Fragment::from(FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: FragmentId::new(id),
         root: node,

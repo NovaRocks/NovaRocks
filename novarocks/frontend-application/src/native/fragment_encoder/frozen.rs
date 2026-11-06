@@ -127,7 +127,7 @@ pub(crate) struct FragmentFacts {
     fragment_id: FragmentId,
     dop_domain: PipelineDopDomain,
     sink_targets: Box<[StaticSinkTarget]>,
-    logical_summary_output: Option<StaticSinkTarget>,
+    summary_outputs: novarocks_physical_plan::PerKind<StaticSinkTarget>,
     #[cfg(test)]
     root_plan_node_id: i32,
     table_writers: Box<[StaticTableWriter]>,
@@ -152,8 +152,10 @@ impl FragmentFacts {
 
     /// The independent summary output declared by this exact checked package.
     /// This never grants provider writer membership.
-    pub(crate) const fn logical_summary_output(&self) -> Option<StaticSinkTarget> {
-        self.logical_summary_output
+    pub(crate) const fn summary_outputs(
+        &self,
+    ) -> &novarocks_physical_plan::PerKind<StaticSinkTarget> {
+        &self.summary_outputs
     }
 
     /// The plan-node id of this fragment's root (output) node.
@@ -234,28 +236,32 @@ impl FragmentArtifact {
             ))
         })?;
         let sink_targets = package_sink_targets(fragment, edges)?;
-        let logical_summary_output = match fragment.sink() {
-            FragmentSink::Router { summary, .. } => Some(
-                sink_targets
-                    .iter()
-                    .copied()
-                    .find(|target| {
-                        target.edge() == summary.edge
-                            && target.role() == novarocks_physical_plan::OutputRole::LogicalSummary
-                    })
-                    .ok_or_else(|| {
-                        PackageFreezeError::Facts(format!(
-                            "fragment {fragment_id} has no exact frozen logical-summary output"
-                        ))
-                    })?,
-            ),
-            _ => None,
-        };
+        let mut summary_outputs = novarocks_physical_plan::PerKind::empty();
+        for summary in fragment.summaries() {
+            let kind = summary.kind();
+            let target = sink_targets
+                .iter()
+                .copied()
+                .find(|target| {
+                    target.edge() == summary.edge
+                        && target.role() == novarocks_physical_plan::OutputRole::Summary(kind)
+                })
+                .ok_or_else(|| {
+                    PackageFreezeError::Facts(format!(
+                        "fragment {fragment_id} has no exact frozen {kind} summary output"
+                    ))
+                })?;
+            if summary_outputs.insert(kind, target).is_some() {
+                return Err(PackageFreezeError::Facts(format!(
+                    "fragment {fragment_id} repeats {kind} summary output"
+                )));
+            }
+        }
         let facts = FragmentFacts {
             fragment_id,
             dop_domain: fragment.dop_domain(),
             sink_targets,
-            logical_summary_output,
+            summary_outputs,
             #[cfg(test)]
             root_plan_node_id: _validated_root_plan_node_id,
             #[cfg(novarocks_dev_controls)]
@@ -315,13 +321,11 @@ fn package_sink_targets(
     edges: &BTreeMap<EdgeId, Edge>,
 ) -> Result<Box<[StaticSinkTarget]>, PackageFreezeError> {
     let fragment_id = fragment.id();
-    let branches = match fragment.sink() {
+    let mut branches = match fragment.sink() {
         FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => Vec::new(),
         FragmentSink::Stream { edge } => vec![(*edge, None)],
         FragmentSink::Multicast { edges } => edges.iter().map(|edge| (*edge, None)).collect(),
-        FragmentSink::Router {
-            routes, summary, ..
-        } => routes
+        FragmentSink::Router { routes, .. } => routes
             .iter()
             .map(|route| {
                 (
@@ -331,12 +335,14 @@ fn package_sink_targets(
                     }),
                 )
             })
-            .chain(std::iter::once((
-                summary.edge,
-                Some(novarocks_physical_plan::OutputRole::LogicalSummary),
-            )))
             .collect(),
     };
+    branches.extend(fragment.summaries().iter().map(|summary| {
+        (
+            summary.edge,
+            Some(novarocks_physical_plan::OutputRole::Summary(summary.kind())),
+        )
+    }));
     branches
         .into_iter()
         .map(|(edge_id, expected_role)| {
@@ -356,15 +362,19 @@ fn package_sink_targets(
                 )));
             }
             if let Some(expected_role) = expected_role {
-                let expected_port =
-                    if expected_role == novarocks_physical_plan::OutputRole::LogicalSummary {
-                        novarocks_physical_plan::FragmentOutputPort::LogicalSummary
-                    } else {
-                        novarocks_physical_plan::FragmentOutputPort::Root
-                    };
-                let exact_summary_projection = match fragment.sink() {
-                    FragmentSink::Router { summary, .. } if edge_id == summary.edge => {
-                        edge.source.projection.as_ref() == summary.columns.values().as_slice()
+                let expected_port = match expected_role {
+                    novarocks_physical_plan::OutputRole::Summary(kind) => {
+                        novarocks_physical_plan::FragmentOutputPort::Summary(kind)
+                    }
+                    _ => novarocks_physical_plan::FragmentOutputPort::Root,
+                };
+                let exact_summary_projection = match expected_role {
+                    novarocks_physical_plan::OutputRole::Summary(kind) => {
+                        fragment.summaries().iter().any(|summary| {
+                            summary.kind() == kind
+                                && summary.edge == edge_id
+                                && edge.source.projection.as_ref() == summary.columns.values()
+                        })
                     }
                     _ => true,
                 };
@@ -726,7 +736,7 @@ pub(crate) mod tests {
             )]
         );
         assert!(!facts.declares_table_writer());
-        assert_eq!(facts.logical_summary_output(), None);
+        assert_eq!(facts.summary_outputs().is_empty(), true);
         assert!(facts.carries_runtime_filter_bindings());
         let frozen = wire::FrozenFragment::decode(artifact.content().bytes().clone())
             .expect("FrozenFragment");

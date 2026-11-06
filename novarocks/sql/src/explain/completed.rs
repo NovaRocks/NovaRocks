@@ -840,7 +840,7 @@ pub fn render_completed_plan(
             )
         ))?;
         render_cut_attachments(&context, *fragment_id, &mut lines)?;
-        render_sink(&context, *fragment_id, fragment.sink(), &mut lines)?;
+        render_sink(&context, *fragment_id, fragment, &mut lines)?;
         if is_detailed(level) {
             render_annotations(
                 &context,
@@ -1246,10 +1246,30 @@ impl fmt::Display for WriterResultCutDisplay<'_> {
 fn render_sink(
     context: &RenderContext<'_>,
     fragment_id: FragmentId,
-    sink: &FragmentSink,
+    fragment: &Fragment,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    match sink {
+    for summary in fragment.summaries() {
+        lines.push(format_args!(
+            "  SUMMARY {} author={:?} edge=edge{} fields=[{}]",
+            summary.kind(),
+            summary.author,
+            summary.edge.get(),
+            joined(
+                summary.kind().fields(),
+                ", ",
+                |field: &novarocks_physical_plan::SummaryField, f: &mut fmt::Formatter<'_>| {
+                    write!(
+                        f,
+                        "{}={}",
+                        field.name(),
+                        context.value_name(fragment_id, summary.columns.values()[field.ordinal()])
+                    )
+                }
+            )
+        ))?;
+    }
+    match fragment.sink() {
         FragmentSink::RootResult(contract) => lines.push(format_args!(
             "  SINK root-result {:?} profile={}",
             contract.kind(),
@@ -1263,18 +1283,7 @@ fn render_sink(
             "  SINK multicast edges=[{}]",
             format_edge_ids(edges)
         ))?,
-        FragmentSink::Router {
-            effect,
-            routes,
-            summary,
-        } => {
-            lines.push(format_args!(
-                "  SUMMARY edge=edge{} inserted={} replaced={} deleted={}",
-                summary.edge.get(),
-                context.value_name(fragment_id, summary.columns.inserted),
-                context.value_name(fragment_id, summary.columns.replaced),
-                context.value_name(fragment_id, summary.columns.deleted)
-            ))?;
+        FragmentSink::Router { effect, routes } => {
             lines.push(format_args!(
                 "  SINK router effect={} routes={}",
                 context.value_name(fragment_id, *effect),
@@ -1356,8 +1365,8 @@ impl fmt::Display for ValueOriginDisplay<'_> {
         use novarocks_physical_plan::ValueOrigin;
         match self.0 {
             ValueOrigin::JoinMark { node } => write!(formatter, "join-mark(n{})", node.get()),
-            ValueOrigin::LogicalSummary { field } => {
-                write!(formatter, "logical-summary({field:?})")
+            ValueOrigin::Summary { field } => {
+                write!(formatter, "summary({}: {})", field.kind(), field.name())
             }
             ValueOrigin::ProviderField { scan_node, field } => {
                 let payload = &field.column_payload;
@@ -3240,11 +3249,11 @@ condition,
             format_writer_aggregates(&target.partial_aggregates)
         )),
         NodeKind::TableFinish(spec) => lines.push(format_args!(
-            "{pad}  targets=[{}], count-mode={}, writer-results-input={}, logical-summary-input={:?}, input-schema={}, output-schema={}, final-aggregates=[{}], grouped-unpivot={}",
+            "{pad}  targets=[{}], count-mode={}, writer-results-input={}, summary-inputs={:?}, input-schema={}, output-schema={}, final-aggregates=[{}], grouped-unpivot={}",
             joined(&spec.expected_target_ordinals, ", ", |ordinal: &WriteTargetOrdinal, formatter: &mut fmt::Formatter<'_>| ordinal.get().fmt(formatter)),
             finish_count_mode_name(spec.count_mode),
             spec.inputs.writer_results,
-            spec.inputs.logical_summary,
+            spec.inputs.summaries,
             format_writer_schema(&spec.input_schema),
             format_writer_schema(&spec.output_schema),
             format_writer_aggregates(&spec.final_aggregates),
