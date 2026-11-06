@@ -400,9 +400,9 @@ fn content_bytes_are_carrier_independent_and_json_stays_original_text() {
                     Int32Array::from(vec![Some(1), Some(0), Some(1)]),
                     Arc::new(StringArray::from(vec![None, Some("abc")])),
                 )
-                .unwrap(),
-            )
-            .slice(0, 2),
+                .unwrap()
+                .slice(0, 2),
+            ),
             DataType::Utf8,
         ),
     ];
@@ -418,7 +418,7 @@ fn content_bytes_are_carrier_independent_and_json_stays_original_text() {
         );
         let (owner, tracker) = owner_with_tracker();
         let spec = KeySpec::with_equalities(
-            &[ty.clone()],
+            std::slice::from_ref(&ty),
             &[KeyEquality::ResultContent],
             owner.as_ref(),
             &|| Ok(()),
@@ -473,7 +473,7 @@ fn content_identity_survives_bulk_capture_partition_build_read_and_export() {
         .unwrap();
         let domain =
             super::super::capture::BulkDomain::new(&spec, owner.as_ref(), &CopyControl).unwrap();
-        let host =
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
             crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
         let work = super::super::capture::CaptureWork {
             owner: owner.as_ref(),
@@ -526,6 +526,7 @@ fn content_identity_survives_bulk_capture_partition_build_read_and_export() {
                 break;
             }
             let mut next = Vec::new();
+            pending.reverse();
             for mut task in pending {
                 if task.advance(1, &ports).unwrap().is_done() {
                     let mut finished = task.finish().unwrap();
@@ -603,19 +604,17 @@ fn content_equal_values_keep_the_same_native_routing_hash() {
 }
 
 #[test]
-fn sliced_dictionary_float_fingerprints_retain_occurrence_and_null_coordinates() {
-    let source: ArrayRef = Arc::new(
-        DictionaryArray::<Int32Type>::try_new(
-            Int32Array::from(vec![Some(2), Some(1), None, Some(0), Some(3), Some(1)]),
-            Arc::new(Float64Array::from(vec![
-                Some(-0.0),
-                Some(0.0),
-                Some(f64::from_bits(FIRST_NAN)),
-                None,
-            ])),
-        )
-        .unwrap(),
-    );
+fn sliced_normalized_float_fingerprints_retain_occurrence_and_null_coordinates() {
+    // Fixed keys require the already-normalized carrier. Root dictionaries
+    // directly admitted by K are byte dictionaries, covered separately below.
+    let source: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(f64::from_bits(FIRST_NAN)),
+        Some(0.0),
+        None,
+        Some(-0.0),
+        None,
+        Some(0.0),
+    ]));
     let sliced = source.slice(1, 4);
     assert_eq!(
         fingerprints(
@@ -838,4 +837,227 @@ fn content_fingerprint_supports_the_existing_fixed_key_carriers() {
         let ty = FunctionValueType::new(array.data_type().clone(), false);
         assert_eq!(fingerprints(&[array], &[ty], &[0]), vec![expected]);
     }
+}
+
+#[test]
+fn logical_null_carrier_has_the_literal_null_content_fingerprint() {
+    let source: ArrayRef = Arc::new(NullArray::new(2));
+    assert_eq!(
+        fingerprints(
+            &[source],
+            &[FunctionValueType::new(DataType::Null, true)],
+            &[1, 0, 1]
+        ),
+        vec![0xffee988d572cc7360d9827fe527dc164; 3]
+    );
+}
+
+#[test]
+fn content_nested_dictionary_and_plain_bytes_share_classes_and_fingerprints() {
+    let (owner, tracker) = owner_with_tracker();
+    let plain: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+        Arc::new(StringArray::from(vec![Some("abc"), None, Some("abc")])),
+        None,
+    ));
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![1, 0, 1]),
+            Arc::new(StringArray::from(vec![None, Some("abc")])),
+        )
+        .unwrap(),
+    );
+    let encoded: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", dictionary.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+        dictionary,
+        None,
+    ));
+    let ty = FunctionValueType::new(plain.data_type().clone(), false);
+    let spec = KeySpec::with_equalities(
+        std::slice::from_ref(&ty),
+        &[KeyEquality::ResultContent],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut index = KeyIndex::new(
+        spec.clone(),
+        IndexPurpose::KeyIds,
+        tracker.clone(),
+        owner.as_ref(),
+    )
+    .unwrap();
+    let mut reference = None;
+    for array in [plain, encoded] {
+        let keys = input(
+            &[array],
+            std::slice::from_ref(&ty),
+            &[0, 1, 2],
+            owner.as_ref(),
+        );
+        let hashes = hash(&keys, &spec, index.policy(), owner.as_ref());
+        let values = prepared(&spec, &keys, &tracker, owner.as_ref());
+        let actual = (0..3)
+            .map(|row| values.content_fingerprint(row, &|| Ok(())).unwrap())
+            .collect::<Vec<_>>();
+        if let Some(reference) = &reference {
+            assert_eq!(&actual, reference);
+        } else {
+            reference = Some(actual);
+        }
+        assert_eq!(
+            index
+                .intern_batch(&values, &hashes, owner.as_ref(), &CopyControl)
+                .unwrap()
+                .matches(),
+            [
+                KeyMatch::Found(KeyId(0)),
+                KeyMatch::Found(KeyId(1)),
+                KeyMatch::Found(KeyId(0))
+            ]
+        );
+    }
+}
+
+#[test]
+fn reversed_route_partial_merge_preserves_the_first_actually_accepted_nan_representative() {
+    use super::super::{
+        capture::{BulkDomain, BulkInput, CaptureWork, EvaluatedPage},
+        hash_build::{BuildWork, PartitionBuildCursor},
+        hash_layout::HashLayout,
+        route::{MergeAccumulator, RouteAdvance, RoutePlan, RouteWork, RouteWorkspace},
+        sizing::{SizingDomain, SizingDomainKind},
+    };
+    use std::num::NonZeroUsize;
+    let (owner, tracker) = owner_with_tracker();
+    let ty = FunctionValueType::new(DataType::Float64, false);
+    let spec = KeySpec::with_equalities(
+        std::slice::from_ref(&ty),
+        &[KeyEquality::ResultContent],
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let domain = BulkDomain::new(&spec, owner.as_ref(), &CopyControl).unwrap();
+    let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+    let capture_work = CaptureWork {
+        owner: owner.as_ref(),
+        allocator: AggregateAllocator::new(tracker.clone()),
+        host: Arc::clone(&host),
+        control: &CopyControl,
+    };
+    let mut capture = domain.begin_capture(&capture_work).unwrap();
+    let mut ids = Vec::new();
+    for bits in [FIRST_NAN, SECOND_NAN] {
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![f64::from_bits(bits)]));
+        ids.push(
+            capture
+                .push_evaluated(
+                    EvaluatedPage {
+                        arrays: &[array],
+                        bindings: std::slice::from_ref(&ty),
+                        readable: &readable(1),
+                        occurrences: &[0],
+                    },
+                    &mut ValueConversionContext::default(),
+                    &capture_work,
+                )
+                .unwrap(),
+        );
+    }
+    let complete = CompleteInput::from_captures(
+        BulkInput::new(
+            &domain,
+            vec![capture.seal(&capture_work).unwrap()],
+            &capture_work,
+        )
+        .unwrap(),
+        IndexPurpose::KeyIds,
+        &capture_work,
+    )
+    .unwrap();
+    let layout = HashLayout::for_bulk(2, 2);
+    let route_work = RouteWork {
+        owner: owner.as_ref(),
+        host,
+        control: &CopyControl,
+    };
+    let domains = (0..layout.partitions())
+        .map(|p| {
+            SizingDomain::new(
+                &spec,
+                domain.policy(),
+                SizingDomainKind::Partition(p),
+                owner.as_ref(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let plan = RoutePlan::new(&complete, layout, domains, &route_work).unwrap();
+    let mut merged = (0..layout.partitions())
+        .map(|p| MergeAccumulator::new(Arc::clone(&plan), p, &route_work).unwrap())
+        .collect::<Vec<_>>();
+    let mut workspace = RouteWorkspace::new(
+        Arc::clone(&plan),
+        NonZeroUsize::new(1).unwrap(),
+        &route_work,
+    )
+    .unwrap();
+    // The later captured page is deliberately merged first. The contract is
+    // the first representative actually accepted by this partition index,
+    // independent of an unpromised global capture/parallel-completion order.
+    for page in ids.into_iter().rev() {
+        let mut cursor = workspace.start(page, 0..1, &route_work).unwrap();
+        loop {
+            match cursor.advance(1, &route_work).unwrap() {
+                RouteAdvance::Progress => {}
+                RouteAdvance::Yielded(partial) => {
+                    let p = partial.partition();
+                    merged[p].merge(partial, &route_work).unwrap();
+                }
+                RouteAdvance::Completed => break,
+            }
+        }
+        workspace = cursor.finish(&route_work).unwrap().0;
+    }
+    let build_work = BuildWork {
+        owner: owner.as_ref(),
+        allocator: AggregateAllocator::new(tracker.clone()),
+        control: &CopyControl,
+    };
+    let mut nonempty = 0;
+    for merge in merged {
+        let input = merge.finish(&route_work).unwrap();
+        if input.eligible() == 0 {
+            continue;
+        }
+        nonempty += 1;
+        let index = KeyIndex::new_for_bulk_hash(
+            spec.clone(),
+            IndexPurpose::KeyIds,
+            domain.policy().clone(),
+            layout,
+            tracker.clone(),
+            owner.as_ref(),
+        )
+        .unwrap();
+        let mut cursor =
+            PartitionBuildCursor::new(index, input, IndexPurpose::KeyIds, &build_work).unwrap();
+        while !cursor.advance(1, &build_work).unwrap() {}
+        let index = cursor.finish(&build_work).unwrap();
+        assert_eq!(index.len(), 1);
+        let exported = index
+            .export_key_range(
+                0..1,
+                std::slice::from_ref(&ty),
+                owner.as_ref(),
+                &CopyControl,
+            )
+            .unwrap();
+        assert_eq!(float_bits(&exported.arrays()[0], 0), Some(SECOND_NAN));
+    }
+    assert_eq!(nonempty, 1);
 }

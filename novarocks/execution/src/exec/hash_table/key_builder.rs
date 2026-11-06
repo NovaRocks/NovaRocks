@@ -758,7 +758,7 @@ pub(crate) fn append_content_nullable_tracked_observed<
 ) -> ExecutionResult<()> {
     checkpoint()?;
     let mut work = ObservedCanonicalKeyWork::new(checkpoint);
-    let count = if array.is_null(row) {
+    let count = if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         1
     } else {
         5usize
