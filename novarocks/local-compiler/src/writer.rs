@@ -758,7 +758,7 @@ pub(crate) struct LoweredFinish {
 pub(crate) struct FinishLoweringInput<'a> {
     pub child: ProgramNodeId,
     pub child_layout: &'a StaticLayout,
-    pub summary: Option<(ProgramNodeId, &'a StaticLayout)>,
+    pub summaries: novarocks_local_program::PerKind<(ProgramNodeId, &'a StaticLayout)>,
     /// Fresh slots of the Root relation, in field order.
     pub slots: &'a [SlotId],
     /// Fresh internal slots of the statistics: the grouped Unpivot's
@@ -853,17 +853,16 @@ pub(crate) fn lower_finish_with_creation<H>(
             kind: ProgramNodeKind::TableFinish {
                 count_mode: spec.count_mode,
                 input_roles: spec.inputs,
-                logical_summary_layout: input.summary.map(|(_, layout)| layout.clone()),
+                summary_layouts: input.summaries.map(|_, (_, layout)| layout.clone()),
                 inputs: {
                     let mut inputs = vec![child; node.inputs.len()];
                     inputs[spec.inputs.writer_results as usize] = child;
-                    if let Some((summary, _)) = input.summary {
-                        inputs[spec
-                            .inputs
-                            .summaries
-                            .write_counts
-                            .ok_or(FragmentCompileError::Invalid("summary input has no role"))?
-                            as usize] = summary;
+                    for (kind, (summary, _)) in input.summaries.iter() {
+                        let port =
+                            spec.inputs.summaries.get(kind).ok_or(
+                                FragmentCompileError::Invalid("summary input has no role"),
+                            )?;
+                        inputs[*port as usize] = *summary;
                     }
                     inputs
                 },

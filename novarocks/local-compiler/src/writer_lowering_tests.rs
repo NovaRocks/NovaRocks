@@ -905,7 +905,11 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
                         delete_verification: None,
                     },
             },
-        logical_summary_layout: None,
+        summary_layouts:
+            novarocks_local_program::PerKind {
+                write_counts: None,
+                delete_verification: None,
+            },
         inputs,
         expected_targets,
         writer_multiplex_layout,

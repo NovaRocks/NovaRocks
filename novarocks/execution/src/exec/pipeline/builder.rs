@@ -142,6 +142,8 @@ struct PipelineBuildContext {
     scan_bindings: ScanBindings,
     /// Exact task-owned write capabilities for the compiled program.
     compiled_writers: crate::runtime::task::CompiledWriterBindings,
+    summary_authors:
+        crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,

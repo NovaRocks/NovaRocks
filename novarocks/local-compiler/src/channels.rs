@@ -40,7 +40,7 @@ pub(crate) struct PlannedChannels {
     pub unpivot_sources: BTreeMap<NodeId, BTreeMap<ValueId, SlotId>>,
     pub assertion_keys: BTreeMap<NodeId, Vec<SlotId>>,
     pub sink_projection: Option<SinkProjectionChannels>,
-    pub summary_slots: Option<Arc<[SlotId]>>,
+    pub summary_slots: novarocks_local_program::PerKind<Arc<[SlotId]>>,
     pub assertion_applicability:
         BTreeMap<NodeId, novarocks_local_program::ProgramAssertionApplicability>,
     pub unions: BTreeMap<NodeId, Vec<UnionChannelBranch>>,
@@ -885,7 +885,7 @@ fn resolve_core_with_creation<H>(
         }
         work.step()?;
     }
-    let (sink_projection, summary_slots) =
+    let sink_projection =
         if let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() {
             let root = fragment
                 .nodes()
@@ -950,17 +950,41 @@ fn resolve_core_with_creation<H>(
                     input: root_channels.local,
                     sources,
                 });
-            (
-                Some(SinkProjectionChannels {
-                    node: local,
-                    slots,
-                    route_slots,
-                }),
-                Some(fresh_slots(3, &mut next_slot, work)?),
-            )
+            Some(SinkProjectionChannels {
+                node: local,
+                slots,
+                route_slots,
+            })
         } else {
-            (None, None)
+            None
         };
+    let mut summary_slots = novarocks_local_program::PerKind::empty();
+    for summary in fragment.summaries() {
+        let slots = match summary.author {
+            novarocks_physical_plan::SummaryAuthor::RouterSink => {
+                fresh_slots(summary.columns.values().len(), &mut next_slot, work)?
+            }
+            novarocks_physical_plan::SummaryAuthor::Node(author) => {
+                let owner = nodes.get(&author).ok_or(ChannelLoweringError::Invalid(
+                    "summary author channels are absent",
+                ))?;
+                let port = ports.get(&author).ok_or(ChannelLoweringError::Invalid(
+                    "summary author port is absent",
+                ))?;
+                let mut slots = Vec::new();
+                reserve_vec(&mut slots, summary.columns.values().len(), work)?;
+                for value in summary.columns.values() {
+                    slots.push(resolve_input(*value, owner, port)?.slot);
+                    work.step()?;
+                }
+                Arc::from(slots)
+            }
+        };
+        if summary_slots.insert(summary.kind(), slots).is_some() {
+            return Err(ChannelLoweringError::Invalid("duplicate summary channels").into());
+        }
+        work.step()?;
+    }
     Ok(PlannedChannels {
         nodes,
         inputs,

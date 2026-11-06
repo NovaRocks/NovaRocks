@@ -35,7 +35,10 @@ use crate::{
     repeat::{RepeatLoweringError, lower_repeat_with_creation},
     scan::{admit_scan, lower_scan_with_creation},
     sort::lower_sort,
-    stream_sink::{lower_router_sink_with_creation, lower_stream_sink_with_creation},
+    stream_sink::{
+        lower_router_sink_with_creation, lower_stream_sink_with_creation,
+        lower_summary_outputs_with_creation,
+    },
     topn::lower_topn,
     unpivot::{UnpivotLoweringError, UnpivotLoweringInput, lower_unpivot_with_creation},
     values::{lower_values_with_creation, retired_values_uses},
@@ -375,7 +378,7 @@ fn lower_with_creation<
     // one exact outbound cut. Every other sink family remains explicit.
     let stream_cut = match physical.sink() {
         FragmentSink::Result | FragmentSink::RootResult(_) => {
-            if !outbound.is_empty() {
+            if outbound.len() != physical.summaries().len() {
                 return Err((FragmentCompileError::Invalid(
                     "result sink has an outbound exchange cut",
                 ))
@@ -384,13 +387,11 @@ fn lower_with_creation<
             None
         }
         FragmentSink::Stream { edge } => {
-            let [cut] = &outbound[..] else {
-                return Err((FragmentCompileError::Invalid(
-                    "stream sink requires exactly one outbound cut",
-                ))
-                .into());
-            };
-            if cut.edge != *edge {
+            let cut = outbound
+                .iter()
+                .find(|cut| cut.edge == *edge)
+                .ok_or(FragmentCompileError::Invalid("stream sink cut is absent"))?;
+            if outbound.len() != physical.summaries().len() + 1 || cut.edge != *edge {
                 return Err((FragmentCompileError::Invalid(
                     "stream sink edge differs from its outbound cut",
                 ))
@@ -1812,7 +1813,7 @@ fn lower_with_creation<
                     crate::writer::FinishLoweringInput {
                         child,
                         child_layout: nodes[child.index()].output_layout(),
-                        summary: spec.inputs.summaries.write_counts.map(|port| {
+                        summaries: spec.inputs.summaries.map(|_, port| {
                             let id = local_ids[&node.inputs[port as usize]];
                             (id, nodes[id.index()].output_layout())
                         }),
@@ -2049,19 +2050,11 @@ fn lower_with_creation<
                 .sink_projection
                 .as_ref()
                 .ok_or(FragmentCompileError::Invalid("missing router projection"))?;
-            let summary_slots =
-                channels_plan
-                    .summary_slots
-                    .as_ref()
-                    .ok_or(FragmentCompileError::Invalid(
-                        "missing router summary slots",
-                    ))?;
             let lowered = lower_router_sink_with_creation(
                 package,
                 root,
                 root_layout,
                 &projection.route_slots,
-                summary_slots,
                 work.control(),
                 creation,
                 crate::creation::borrow_scope(&mut temporary),
@@ -2135,16 +2128,27 @@ fn lower_with_creation<
         }
     };
     work.flush()?;
+    let (summaries, summary_requirements) = lower_summary_outputs_with_creation(
+        package,
+        &channels_plan.summary_slots,
+        &local_ids,
+        sink.branches().len(),
+        work.control(),
+        creation,
+    )?;
+    requirement_entries.extend(summary_requirements);
+    work.flush()?;
     let requirements =
         BindingRequirements::try_new_for_compile(requirement_entries, work.control())?;
     work.flush()?;
-    let graph = LocalProgramGraph::try_new_with_sink_for_compile(
+    let graph = LocalProgramGraph::try_new_with_outputs_for_compile(
         nodes,
         root,
         expressions.arena.clone(),
         profile,
         requirements,
         Some(sink),
+        summaries,
         work.control(),
     )?;
     // A materialized constant Values cell is backing, not a runtime root.

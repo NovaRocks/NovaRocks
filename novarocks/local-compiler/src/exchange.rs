@@ -209,11 +209,22 @@ fn lower_core_with_creation<H>(
                     novarocks_physical_plan::ExchangePayloadContract::Summary(_)
                 ) =>
             {
-                let names = ["inserted", "replaced", "deleted"];
-                let name = names.get(ordinal).ok_or(FragmentCompileError::Invalid(
-                    "summary receiver width differs",
-                ))?;
-                crate::typed_layout::copy_name_with_creation(name, work, creation)?
+                let novarocks_physical_plan::ExchangePayloadContract::Summary(summary) =
+                    &cut.payload
+                else {
+                    return Err(
+                        FragmentCompileError::Invalid("summary receiver payload differs").into(),
+                    );
+                };
+                let field =
+                    summary
+                        .kind()
+                        .fields()
+                        .get(ordinal)
+                        .ok_or(FragmentCompileError::Invalid(
+                            "summary receiver width differs",
+                        ))?;
+                crate::typed_layout::copy_name_with_creation(field.name(), work, creation)?
             }
             (None, None) if cut.change_stream_writer().is_some() => {
                 let root = package

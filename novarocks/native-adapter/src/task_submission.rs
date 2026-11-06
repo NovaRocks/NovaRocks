@@ -33,43 +33,42 @@ use std::collections::BTreeSet;
 /// sink, never from a legacy plan tree.
 pub fn compiled_task_sink_assignment(
     sink: &novarocks_local_program::StaticSinkProgram,
+    summaries: &[novarocks_local_program::StaticSummaryBranch],
     sink_edge_ids: &[u32],
     source: UniqueId,
     topology: &ExchangeTopology,
 ) -> Result<TaskSinkAssignment, ProtocolError> {
     use novarocks_local_program::StaticSinkProgram;
     let path = FieldPath::root("fragment_package").field("sink");
-    let expected = match sink {
-        StaticSinkProgram::DataStream { branch, .. } => {
-            vec![(branch.dest_node_id(), branch.partition_type())]
-        }
-        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) | StaticSinkProgram::Noop => {
-            Vec::new()
-        }
-        StaticSinkProgram::MultiCastDataStream { .. }
-        | StaticSinkProgram::SplitDataStream { .. } => {
-            return Err(error(
-                path,
-                ProtocolErrorKind::InvalidValue,
-                "compiled multicast and router sinks are not executable yet",
-            ));
-        }
-        StaticSinkProgram::ChangeStreamRouter { branches, .. } => branches
-            .iter()
-            .map(|branch| (branch.dest_node_id(), branch.partition_type()))
-            .collect(),
-    };
+    if matches!(
+        sink,
+        StaticSinkProgram::MultiCastDataStream { .. } | StaticSinkProgram::SplitDataStream { .. }
+    ) {
+        return Err(error(
+            path,
+            ProtocolErrorKind::InvalidValue,
+            "compiled multicast and split sinks are not executable yet",
+        ));
+    }
+    let expected = sink
+        .branches()
+        .iter()
+        .chain(summaries.iter().map(|output| output.branch()))
+        .map(|branch| (branch.dest_node_id(), branch.partition_type()))
+        .collect::<Vec<_>>();
     let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path)?;
     let mut groups = edges
         .into_iter()
         .map(|edge| decode_edge_destinations(edge, source))
         .collect::<Result<Vec<_>, _>>()?;
     match sink {
-        StaticSinkProgram::DataStream { .. } => Ok(TaskSinkAssignment::StreamDestinations {
-            destinations: groups.pop().expect("one stream edge was validated"),
-            sender_id: None,
-        }),
-        StaticSinkProgram::ChangeStreamRouter { .. } => Ok(TaskSinkAssignment::DestinationGroups {
+        StaticSinkProgram::DataStream { .. } if summaries.is_empty() => {
+            Ok(TaskSinkAssignment::StreamDestinations {
+                destinations: groups.pop().expect("one stream edge was validated"),
+                sender_id: None,
+            })
+        }
+        _ if !groups.is_empty() => Ok(TaskSinkAssignment::DestinationGroups {
             groups,
             sender_id: None,
         }),
@@ -227,6 +226,7 @@ mod tests {
         let topology = ExchangeTopology::try_new(vec![edge], vec![]).expect("topology");
         let assignment = compiled_task_sink_assignment(
             &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
+            &[],
             &[3],
             SOURCE,
             &topology,
@@ -257,13 +257,36 @@ mod tests {
         };
         use std::sync::Arc;
         let slots = [10, 11, 12].map(novarocks_types::SlotId::new);
-        let layout = StaticLayout::try_new(
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let layout = StaticLayout::try_new_typed_for_compile(
             Arc::new(Schema::new(
                 ["inserted", "replaced", "deleted"]
                     .map(|name| Field::new(name, DataType::Int64, false))
                     .to_vec(),
             )),
             Arc::from(slots),
+            (0..3)
+                .map(|_| {
+                    (
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                            .typed_binding()
+                            .clone(),
+                        None,
+                    )
+                })
+                .collect(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
         )
         .unwrap();
         let branch = |node, columns, role| {
@@ -282,19 +305,14 @@ mod tests {
             .unwrap()
         };
         let sink = StaticSinkProgram::try_change_stream_router(
-            vec![
-                branch(
-                    9,
-                    vec![novarocks_types::SlotId::new(2)],
-                    ProgramOutputRole::ProviderRoute {
-                        target: novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(
-                            0,
-                        )
+            vec![branch(
+                9,
+                vec![novarocks_types::SlotId::new(2)],
+                ProgramOutputRole::ProviderRoute {
+                    target: novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
                         .unwrap(),
-                    },
-                ),
-                branch(10, slots.to_vec(), ProgramOutputRole::LogicalSummary),
-            ],
+                },
+            )],
             Arc::new(
                 ImmutableExpressions::try_new(
                     vec![],
@@ -312,10 +330,19 @@ mod tests {
                     novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
                 ]),
             }],
-            1,
-            layout,
         )
         .unwrap();
+        let outputs = [novarocks_local_program::StaticSummaryBranch::try_new(
+            novarocks_result_contract::SummaryKind::WriteCounts,
+            novarocks_local_program::StaticSummaryAuthor::RouterSink,
+            branch(
+                10,
+                slots.to_vec(),
+                ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts),
+            ),
+            layout,
+        )
+        .unwrap()];
         let execution = execution();
         let edge = |id, node| {
             ExchangeEdge::try_new(
@@ -334,7 +361,8 @@ mod tests {
             .unwrap()
         };
         let topology = ExchangeTopology::try_new(vec![edge(2, 10), edge(7, 9)], vec![]).unwrap();
-        let assignment = compiled_task_sink_assignment(&sink, &[7, 2], SOURCE, &topology).unwrap();
+        let assignment =
+            compiled_task_sink_assignment(&sink, &outputs, &[7, 2], SOURCE, &topology).unwrap();
         let TaskSinkAssignment::DestinationGroups { groups, .. } = assignment else {
             panic!("router requires independent output groups")
         };
@@ -342,7 +370,9 @@ mod tests {
         assert_eq!(*groups[0][0].task_key(), UniqueId::new(7, 1));
         assert_eq!(*groups[1][0].task_key(), UniqueId::new(2, 1));
         for edges in [vec![7], vec![2, 7], vec![7, 7]] {
-            assert!(compiled_task_sink_assignment(&sink, &edges, SOURCE, &topology).is_err());
+            assert!(
+                compiled_task_sink_assignment(&sink, &outputs, &edges, SOURCE, &topology).is_err()
+            );
         }
     }
 
@@ -407,6 +437,7 @@ mod tests {
         let topology = one_edge_topology(DataStreamPartitionType::Unpartitioned);
         let assignment = compiled_task_sink_assignment(
             &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
+            &[],
             &[3],
             SOURCE,
             &topology,
@@ -424,6 +455,7 @@ mod tests {
 
         let wrong_node = compiled_task_sink_assignment(
             &compiled_stream(8, DataStreamPartitionType::Unpartitioned),
+            &[],
             &[3],
             SOURCE,
             &topology,
@@ -437,6 +469,7 @@ mod tests {
         );
         let wrong_partitioning = compiled_task_sink_assignment(
             &compiled_stream(9, DataStreamPartitionType::HashPartitioned),
+            &[],
             &[3],
             SOURCE,
             &topology,
@@ -455,6 +488,7 @@ mod tests {
         let assignment = compiled_task_sink_assignment(
             &novarocks_local_program::StaticSinkProgram::Result,
             &[],
+            &[],
             SOURCE,
             &ExchangeTopology::default(),
         )
@@ -462,6 +496,7 @@ mod tests {
         assert!(matches!(assignment, TaskSinkAssignment::None));
         let stray = compiled_task_sink_assignment(
             &novarocks_local_program::StaticSinkProgram::Result,
+            &[],
             &[3],
             SOURCE,
             &one_edge_topology(DataStreamPartitionType::Unpartitioned),
@@ -545,6 +580,7 @@ mod tests {
             assert!(
                 compiled_task_sink_assignment(
                     &compiled_stream(9, DataStreamPartitionType::Unpartitioned),
+                    &[],
                     &ids,
                     SOURCE,
                     &one_edge_topology(DataStreamPartitionType::Unpartitioned)

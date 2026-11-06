@@ -136,25 +136,36 @@ pub(crate) fn compiled_logical_table_finish_factory(
     binding: &TableFinishRuntimeBinding,
     error: &Arc<RuntimeErrorState>,
     writer: crate::exec::operators::setop::union_all_shared::UnionAllSharedState,
-    summary: crate::exec::operators::logical_change_summary::SourceBoundSummaryInput,
+    summaries: novarocks_result_contract::PerKind<
+        crate::exec::operators::logical_change_summary::SourceBoundSummaryInput,
+    >,
 ) -> ExecutionResult<impl OperatorFactory + use<>> {
     let factory = compiled_finish_core(program, id, display_id, binding, error, true)?;
     let ProgramNodeKind::TableFinish {
-        logical_summary_layout: Some(layout),
-        ..
+        summary_layouts, ..
     } = program.graph().nodes()[id.index()].kind()
     else {
         return Err(failure::contract(
-            "logical finish has no summary declaration",
+            "summary finish has no finish declaration",
         ));
     };
-    if summary.layout().slots() != layout.slots() || summary.layout().schema() != layout.schema() {
-        return Err(failure::contract(
-            "logical finish summary binding differs from its frozen declaration",
-        ));
+    for kind in novarocks_result_contract::SummaryKind::ALL {
+        match (summary_layouts.get(kind), summaries.get(kind)) {
+            (Some(layout), Some(input))
+                if input.kind() == kind
+                    && input.layout().slots() == layout.slots()
+                    && input.layout().schema() == layout.schema() => {}
+            (None, None) => {}
+            _ => {
+                return Err(failure::contract(format_args!(
+                    "{kind} summary binding differs from its frozen declaration"
+                )));
+            }
+        }
     }
-    Ok(factory.with_logical_input(writer, summary))
+    Ok(factory.with_logical_input(writer, summaries))
 }
+
 fn compiled_finish_core(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
@@ -172,7 +183,6 @@ fn compiled_finish_core(
     let ProgramNodeKind::TableFinish {
         inputs,
         input_roles,
-        count_mode,
         expected_targets,
         writer_multiplex_layout,
         root_result_layout,
@@ -184,7 +194,7 @@ fn compiled_finish_core(
             id.index()
         )));
     };
-    if (*count_mode == novarocks_local_program::FinishCountMode::LogicalChanges) != logical {
+    if !input_roles.summaries.is_empty() != logical {
         return Err(failure::contract(
             "compiled finish factory differs from its explicit count mode",
         ));

@@ -37,12 +37,12 @@ use crate::{
         task::{ExecutionFailure, ExecutionReason, ExecutionResult},
     },
 };
-use arrow::{
-    array::{Array, ArrayRef, Int64Array},
-    datatypes::DataType,
-};
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Int64Array};
 use novarocks_execution_contract::ExchangeSource;
-use novarocks_local_program::{LogicalChangeCounts, StaticLayout};
+use novarocks_local_program::StaticLayout;
+use novarocks_result_contract::{
+    DeleteVerificationCounts, LogicalChangeCounts, SummaryKind, SummaryMergeError, SummaryValue,
+};
 use std::{
     alloc::Layout,
     sync::{Arc, Mutex},
@@ -50,76 +50,196 @@ use std::{
 
 #[derive(Debug)]
 pub(crate) enum SummaryFailure {
-    Contributors,
-    DuplicateContributor,
-    MissingContributor,
-    OutputClaimed,
-    Count(novarocks_result_contract::LogicalChangeCountError),
-    Schema,
-    Source,
-    DuplicateSource,
-    MissingSource,
+    Author(SummaryKind),
+    Contributors(SummaryKind),
+    DuplicateContributor(SummaryKind),
+    MissingContributor(SummaryKind),
+    OutputClaimed(SummaryKind),
+    Count {
+        kind: SummaryKind,
+        cause: SummaryMergeError,
+    },
+    Schema(SummaryKind),
+    Source(SummaryKind),
+    DuplicateSource(SummaryKind),
+    MissingSource(SummaryKind),
     WithdrawnWriter,
 }
 impl std::fmt::Display for SummaryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Contributors => f.write_str("logical summary requires the actual nonempty contributor set"),
-            Self::DuplicateContributor => f.write_str("logical summary contributor was claimed or finished twice"),
-            Self::MissingContributor => f.write_str("logical summary contributor exited before input exhaustion"),
-            Self::OutputClaimed => f.write_str("logical summary has more than one output owner"),
-            Self::Count(error) => error.fmt(f),
-            Self::Schema => f.write_str("logical summary must be one row of three required Int64 counts under its exact declaration"),
-            Self::Source => f.write_str("logical summary source differs from the frozen receiver source set"),
-            Self::DuplicateSource => f.write_str("logical summary source contributed more than once"),
-            Self::MissingSource => f.write_str("normal logical summary EOS has incomplete source coverage"),
-            Self::WithdrawnWriter => f.write_str("writer-results input withdrew before normal exhaustion"),
-        }
+        let (kind, message) = match self {
+            Self::Author(kind) => (
+                *kind,
+                "requires its exact author to declare units once before driver creation",
+            ),
+            Self::Contributors(kind) => (*kind, "requires the exact nonempty author unit set"),
+            Self::DuplicateContributor(kind) => (*kind, "unit was claimed or finished twice"),
+            Self::MissingContributor(kind) => (*kind, "unit exited before strict input exhaustion"),
+            Self::OutputClaimed(kind) => (*kind, "has more than one output owner"),
+            Self::Schema(kind) => (
+                *kind,
+                "requires one row under its exact ordered non-null field contract",
+            ),
+            Self::Source(kind) => (*kind, "source differs from the frozen receiver source set"),
+            Self::DuplicateSource(kind) => (*kind, "source contributed more than once"),
+            Self::MissingSource(kind) => (*kind, "normal EOS has incomplete source coverage"),
+            Self::Count { kind, cause } => return write!(f, "{kind} summary: {cause}"),
+            Self::WithdrawnWriter => {
+                return f.write_str("writer-results input withdrew before normal exhaustion");
+            }
+        };
+        write!(f, "{kind} summary {message}")
     }
 }
 impl std::error::Error for SummaryFailure {}
 impl novarocks_failure_contract::FailureProjection for SummaryFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass, FailureFact};
-        FailureFact::new(
-            FailureClass::Invariant,
-            if matches!(self, Self::Count(_)) {
-                ExecutionReason::LogicalChangeCount
-            } else {
-                ExecutionReason::LogicalSummaryContract
-            }
-            .reason(),
-        )
+        let reason = match self {
+            Self::Count {
+                cause: SummaryMergeError::WriteCounts(_) | SummaryMergeError::DeleteVerification(_),
+                ..
+            } => ExecutionReason::SummaryCount,
+            _ => ExecutionReason::SummaryContract,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
 pub(crate) fn summary_failure(cause: SummaryFailure) -> ExecutionFailure {
     ExecutionFailure::from_domain(cause)
 }
-fn add(
-    left: LogicalChangeCounts,
-    right: LogicalChangeCounts,
-) -> ExecutionResult<LogicalChangeCounts> {
-    left.checked_add(right)
-        .map_err(|error| summary_failure(SummaryFailure::Count(error)))
+fn add(left: SummaryValue, right: SummaryValue) -> ExecutionResult<SummaryValue> {
+    left.checked_merge(right).map_err(|cause| {
+        summary_failure(SummaryFailure::Count {
+            kind: left.kind(),
+            cause,
+        })
+    })
+}
+struct SummaryAuthorEntry {
+    author: novarocks_local_program::StaticSummaryAuthor,
+    claimed: bool,
+    state: Option<TaskSummaryState>,
+}
+/// Task-local preparation obligation. It is checked by `seal`, with no Drop
+/// panic or replacement of an earlier construction failure. Its frozen author
+/// facts grant no memory capacity; the actual author supplies the Task tracker.
+pub(crate) struct SummaryAuthorAssemblyObligation {
+    entries: novarocks_result_contract::PerKind<SummaryAuthorEntry>,
+}
+impl SummaryAuthorAssemblyObligation {
+    pub(crate) fn new(
+        outputs: &[novarocks_local_program::StaticSummaryBranch],
+    ) -> ExecutionResult<Self> {
+        let mut entries = novarocks_result_contract::PerKind::empty();
+        for output in outputs {
+            if entries
+                .insert(
+                    output.kind(),
+                    SummaryAuthorEntry {
+                        author: output.author(),
+                        claimed: false,
+                        state: None,
+                    },
+                )
+                .is_some()
+            {
+                return Err(summary_failure(SummaryFailure::Author(output.kind())));
+            }
+        }
+        Ok(Self { entries })
+    }
+    pub(crate) fn claim(
+        &mut self,
+        kind: SummaryKind,
+        author: novarocks_local_program::StaticSummaryAuthor,
+    ) -> ExecutionResult<SummaryAuthorObligation<'_>> {
+        let entry = self
+            .entries
+            .get_mut(kind)
+            .ok_or_else(|| summary_failure(SummaryFailure::Author(kind)))?;
+        if entry.author != author || entry.claimed {
+            return Err(summary_failure(SummaryFailure::Author(kind)));
+        }
+        entry.claimed = true;
+        Ok(SummaryAuthorObligation {
+            kind,
+            slot: &mut entry.state,
+        })
+    }
+    pub(crate) fn declares(
+        &self,
+        kind: SummaryKind,
+        author: novarocks_local_program::StaticSummaryAuthor,
+    ) -> bool {
+        self.entries
+            .get(kind)
+            .is_some_and(|entry| entry.author == author)
+    }
+    pub(crate) fn seal(
+        mut self,
+    ) -> ExecutionResult<novarocks_result_contract::PerKind<TaskSummaryState>> {
+        let mut states = novarocks_result_contract::PerKind::empty();
+        for kind in SummaryKind::ALL {
+            if let Some(entry) = self.entries.get_mut(kind) {
+                let state = entry
+                    .state
+                    .take()
+                    .ok_or_else(|| summary_failure(SummaryFailure::Author(kind)))?;
+                states.insert(kind, state);
+            }
+        }
+        Ok(states)
+    }
+}
+/// The selected factory must consume this preparation obligation by declaring
+/// its structural unit count. No Drop check; the original assembly's seal is
+/// the check, so a failed factory retains its original cause.
+pub(crate) struct SummaryAuthorObligation<'a> {
+    kind: SummaryKind,
+    slot: &'a mut Option<TaskSummaryState>,
+}
+impl SummaryAuthorObligation<'_> {
+    pub(crate) fn declare_units(
+        self,
+        units: usize,
+        tracker: Arc<MemTracker>,
+    ) -> ExecutionResult<TaskSummaryState> {
+        let tracker = MemTracker::new_child(
+            match self.kind {
+                SummaryKind::WriteCounts => "WriteCountsSummary",
+                SummaryKind::DeleteVerification => "DeleteVerificationSummary",
+            },
+            &tracker,
+        );
+        let state = TaskSummaryState::new(self.kind, units, tracker)?;
+        *self.slot = Some(state.clone());
+        Ok(state)
+    }
 }
 struct Reduction {
     // 0 = unclaimed, 1 = live, 2 = normally exhausted. No per-row ledger.
     contributors: Vec<u8>,
     remaining: usize,
-    counts: LogicalChangeCounts,
+    value: SummaryValue,
     failure: Option<ExecutionFailure>,
     output_claimed: bool,
 }
 #[derive(Clone)]
-pub(crate) struct LogicalSummaryState {
+pub(crate) struct TaskSummaryState {
+    kind: SummaryKind,
     inner: Arc<Mutex<Reduction>>,
     observable: Arc<Observable>,
     _accounting: Arc<TrackedBytes>,
 }
-impl LogicalSummaryState {
-    pub(crate) fn new(contributors: usize, tracker: Arc<MemTracker>) -> ExecutionResult<Self> {
+impl TaskSummaryState {
+    pub(crate) fn new(
+        kind: SummaryKind,
+        contributors: usize,
+        tracker: Arc<MemTracker>,
+    ) -> ExecutionResult<Self> {
         if contributors == 0 {
-            return Err(summary_failure(SummaryFailure::Contributors));
+            return Err(summary_failure(SummaryFailure::Contributors(kind)));
         }
         let bytes = contributors
             .checked_add(std::mem::size_of::<Reduction>())
@@ -129,10 +249,11 @@ impl LogicalSummaryState {
         let accounting =
             TrackedBytes::try_new(bytes, tracker).map_err(ExecutionFailure::from_domain)?;
         Ok(Self {
+            kind,
             inner: Arc::new(Mutex::new(Reduction {
                 contributors: vec![0; contributors],
                 remaining: contributors,
-                counts: LogicalChangeCounts::ZERO,
+                value: SummaryValue::zero(kind),
                 failure: None,
                 output_claimed: false,
             })),
@@ -140,75 +261,92 @@ impl LogicalSummaryState {
             _accounting: Arc::new(accounting),
         })
     }
-    pub(crate) fn validate_geometry(&self, dop: i32) -> ExecutionResult<()> {
-        if usize::try_from(dop).ok()
-            != Some(
-                self.inner
-                    .lock()
-                    .expect("logical summary lock")
-                    .contributors
-                    .len(),
-            )
-        {
-            return Err(summary_failure(SummaryFailure::Contributors));
+    pub(crate) const fn kind(&self) -> SummaryKind {
+        self.kind
+    }
+    pub(crate) fn validate_units(&self, units: usize) -> ExecutionResult<()> {
+        if self.inner.lock().expect("summary lock").contributors.len() != units {
+            return Err(summary_failure(SummaryFailure::Contributors(self.kind)));
         }
         Ok(())
     }
-    pub(crate) fn contributor(&self, ordinal: usize) -> ExecutionResult<LogicalSummaryContributor> {
+    pub(crate) fn contributor(&self, ordinal: usize) -> ExecutionResult<SummaryUnitObligation> {
         let mut state = self.inner.lock().expect("logical summary lock");
         let slot = state
             .contributors
             .get_mut(ordinal)
-            .ok_or_else(|| summary_failure(SummaryFailure::Contributors))?;
+            .ok_or_else(|| summary_failure(SummaryFailure::Contributors(self.kind)))?;
         if *slot != 0 {
-            return Err(summary_failure(SummaryFailure::DuplicateContributor));
+            return Err(summary_failure(SummaryFailure::DuplicateContributor(
+                self.kind,
+            )));
         }
         *slot = 1;
-        Ok(LogicalSummaryContributor {
+        Ok(SummaryUnitObligation {
             state: self.clone(),
             ordinal,
-            counts: LogicalChangeCounts::ZERO,
+            value: SummaryValue::zero(self.kind),
             finished: false,
         })
+    }
+    fn validate_claimed_units(&self) -> ExecutionResult<()> {
+        if self
+            .inner
+            .lock()
+            .expect("summary lock")
+            .contributors
+            .contains(&0)
+        {
+            return Err(summary_failure(SummaryFailure::MissingContributor(
+                self.kind,
+            )));
+        }
+        Ok(())
     }
     fn claim_output(&self) -> ExecutionResult<()> {
         let mut state = self.inner.lock().expect("logical summary lock");
         if state.output_claimed {
-            return Err(summary_failure(SummaryFailure::OutputClaimed));
+            return Err(summary_failure(SummaryFailure::OutputClaimed(self.kind)));
         }
         state.output_claimed = true;
         Ok(())
     }
-    fn result(&self) -> ExecutionResult<Option<LogicalChangeCounts>> {
+    fn result(&self) -> ExecutionResult<Option<SummaryValue>> {
         let state = self.inner.lock().expect("logical summary lock");
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        Ok((state.remaining == 0).then_some(state.counts))
+        Ok((state.remaining == 0).then_some(state.value))
     }
 }
-pub(crate) struct LogicalSummaryContributor {
-    state: LogicalSummaryState,
+/// Must be finished once after this unit's complete input reaches strict EOS.
+/// Drop is checked against the same Task state and prevents summary publication.
+pub(crate) struct SummaryUnitObligation {
+    state: TaskSummaryState,
     ordinal: usize,
-    counts: LogicalChangeCounts,
+    value: SummaryValue,
     finished: bool,
 }
-impl LogicalSummaryContributor {
-    pub(crate) fn accept(&mut self, counts: LogicalChangeCounts) -> ExecutionResult<()> {
+impl SummaryUnitObligation {
+    pub(crate) fn accept(&mut self, value: SummaryValue) -> ExecutionResult<()> {
         if self.finished {
-            return Err(summary_failure(SummaryFailure::DuplicateContributor));
+            return Err(summary_failure(SummaryFailure::DuplicateContributor(
+                self.state.kind(),
+            )));
         }
-        self.counts = add(self.counts, counts)?;
+        self.value = add(self.value, value)?;
         Ok(())
     }
     pub(crate) fn finish(&mut self) -> ExecutionResult<()> {
         if self.finished {
-            return Err(summary_failure(SummaryFailure::DuplicateContributor));
+            return Err(summary_failure(SummaryFailure::DuplicateContributor(
+                self.state.kind(),
+            )));
         }
         let notify = self.state.observable.defer_notify();
         let mut state = self.state.inner.lock().expect("logical summary lock");
-        match add(state.counts, self.counts) {
-            Ok(counts) => state.counts = counts,
+        match add(state.value, self.value) {
+            Ok(counts) => state.value = counts,
             Err(error) => {
                 state.failure.get_or_insert(error.clone());
                 notify.arm();
@@ -222,7 +360,7 @@ impl LogicalSummaryContributor {
         Ok(())
     }
 }
-impl Drop for LogicalSummaryContributor {
+impl Drop for SummaryUnitObligation {
     fn drop(&mut self) {
         if !self.finished {
             let notify = self.state.observable.defer_notify();
@@ -231,45 +369,44 @@ impl Drop for LogicalSummaryContributor {
                 .lock()
                 .expect("logical summary lock")
                 .failure
-                .get_or_insert_with(|| summary_failure(SummaryFailure::MissingContributor));
+                .get_or_insert_with(|| {
+                    summary_failure(SummaryFailure::MissingContributor(self.state.kind()))
+                });
             notify.arm();
         }
     }
 }
-pub(crate) struct LogicalSummarySourceFactory {
-    state: LogicalSummaryState,
+pub(crate) struct SummarySourceFactory {
+    state: TaskSummaryState,
     layout: StaticLayout,
 }
-impl LogicalSummarySourceFactory {
-    pub(crate) fn new(state: LogicalSummaryState, layout: StaticLayout) -> ExecutionResult<Self> {
-        validate_layout(&layout)?;
+impl SummarySourceFactory {
+    pub(crate) fn new(state: TaskSummaryState, layout: StaticLayout) -> ExecutionResult<Self> {
+        validate_layout(state.kind(), &layout)?;
         Ok(Self { state, layout })
     }
 }
-fn validate_layout(layout: &StaticLayout) -> ExecutionResult<()> {
-    if layout.slots().len() != 3
-        || layout
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| field.data_type() != &DataType::Int64 || field.is_nullable())
-    {
-        return Err(summary_failure(SummaryFailure::Schema));
-    }
-    Ok(())
+fn validate_layout(kind: SummaryKind, layout: &StaticLayout) -> ExecutionResult<()> {
+    novarocks_local_program::validate_summary_layout(kind, layout)
+        .map_err(|_| summary_failure(SummaryFailure::Schema(kind)))
 }
-impl OperatorFactory for LogicalSummarySourceFactory {
+impl OperatorFactory for SummarySourceFactory {
     fn name(&self) -> &str {
-        "LogicalChangeSummary"
+        "TypedSummary"
     }
     fn is_source(&self) -> bool {
         true
     }
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let failure = if dop != 1 || driver_id != 0 {
-            Some(summary_failure(SummaryFailure::OutputClaimed))
+            Some(summary_failure(SummaryFailure::OutputClaimed(
+                self.state.kind(),
+            )))
         } else {
-            self.state.claim_output().err()
+            self.state
+                .claim_output()
+                .and_then(|()| self.state.validate_claimed_units())
+                .err()
         };
         Box::new(Source::new(SummarySource {
             state: self.state.clone(),
@@ -284,7 +421,7 @@ impl OperatorFactory for LogicalSummarySourceFactory {
     }
 }
 struct SummarySource {
-    state: LogicalSummaryState,
+    state: TaskSummaryState,
     layout: StaticLayout,
     schema: Option<ChunkSchemaRef>,
     factory: Option<Arc<dyn InputConstructionFactory>>,
@@ -295,7 +432,7 @@ struct SummarySource {
 }
 impl OperatorLifecycle for SummarySource {
     fn name(&self) -> &str {
-        "LogicalChangeSummary"
+        "TypedSummary"
     }
     fn creates_typed_storage(&self) -> bool {
         true
@@ -352,7 +489,8 @@ impl SourceKernel for SummarySource {
                     })
                     .unwrap_or_else(|| "unavailable".into());
                 format!(
-                    "emitted={} generation={} reduction={reduction}",
+                    "kind={} emitted={} generation={} reduction={reduction}",
+                    self.state.kind(),
                     self.emitted,
                     self.state.observable.generation()
                 )
@@ -405,20 +543,29 @@ fn copy_failure(
     }
 }
 pub(crate) fn summary_chunk(
-    counts: LogicalChangeCounts,
+    value: SummaryValue,
     schema: &ChunkSchemaRef,
     factory: &dyn InputConstructionFactory,
 ) -> ExecutionResult<Chunk> {
     use novarocks_functions::selected_copy;
     use novarocks_type_contract::ValueSchemaCreation;
     let owner = factory.begin_typed_construction(schema)?;
-    owner.request(Layout::array::<ArrayRef>(3).map_err(|_| {
-        ConstructionFailure::Resource(
-            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
-        )
-    })?)?;
-    let mut columns = Vec::with_capacity(3);
-    for value in counts.into_wire() {
+    owner.request(
+        Layout::array::<ArrayRef>(value.kind().fields().len()).map_err(|_| {
+            ConstructionFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?,
+    )?;
+    let mut columns = Vec::with_capacity(value.kind().fields().len());
+    let (wire, fingerprint) = match value {
+        SummaryValue::WriteCounts(counts) => (counts.into_wire(), None),
+        SummaryValue::DeleteVerification(counts) => {
+            let (wire, bytes) = counts.into_wire();
+            (wire, Some(bytes))
+        }
+    };
+    for value in wire {
         // Exact value buffer plus the public Arrow host's metadata invoice.
         owner.request(Layout::new::<i64>())?;
         let mut request = |layout| owner.request(layout);
@@ -433,6 +580,25 @@ pub(crate) fn summary_chunk(
         )
         .map_err(copy_failure)?;
         columns.push(Arc::new(Int64Array::from(vec![value])) as ArrayRef);
+    }
+    if let Some(bytes) = fingerprint {
+        owner.request(Layout::new::<[u8; 16]>())?;
+        let mut request = |layout| owner.request(layout);
+        let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+        let mut creation =
+            ValueSchemaCreation::new(owner.storage_lifetime(), &mut request, &mut opaque);
+        selected_copy::preflight_flat_array_structure_construction(
+            schema.slots()[3].typed_binding().layout(),
+            false,
+            &mut creation,
+            &mut |boundary| factory.observe_input_work(usize::from(!boundary)),
+        )
+        .map_err(copy_failure)?;
+        columns.push(Arc::new(FixedSizeBinaryArray::new(
+            16,
+            arrow::buffer::Buffer::from_vec(bytes.to_vec()),
+            None,
+        )) as ArrayRef);
     }
     Ok(Chunk::try_new_typed_with_columns_owned_observed::<
         ConstructionFailure,
@@ -450,7 +616,7 @@ pub(crate) fn summary_chunk(
 /// Payloads contain counts only, never an identity chosen by their sender.
 pub(crate) struct SourceBoundSummary {
     source: ExchangeSource,
-    counts: LogicalChangeCounts,
+    value: SummaryValue,
 }
 pub(crate) enum SummaryRead {
     Summary(SourceBoundSummary),
@@ -460,17 +626,19 @@ pub(crate) enum SummaryRead {
 /// One immutable index shared by ingress validation and finish coverage.
 /// The descriptor's original order does not become a semantic source ordinal.
 pub(crate) struct SummarySourceIndex {
+    kind: SummaryKind,
     sorted: Vec<ExchangeSource>,
     _accounting: TrackedBytes,
 }
 impl SummarySourceIndex {
     fn new(
+        kind: SummaryKind,
         expected: &[ExchangeSource],
         tracker: Arc<MemTracker>,
         factory: &dyn InputConstructionFactory,
     ) -> ExecutionResult<Arc<Self>> {
         if expected.is_empty() {
-            return Err(summary_failure(SummaryFailure::Source));
+            return Err(summary_failure(SummaryFailure::Source(kind)));
         }
         let bytes = Layout::array::<ExchangeSource>(expected.len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?.size()
             .checked_add(std::mem::size_of::<Self>()).ok_or(ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
@@ -497,10 +665,11 @@ impl SummarySourceIndex {
                 factory.observe_input_work(256.min(sorted.len() - ordinal))?;
             }
             if pair[0] == pair[1] {
-                return Err(summary_failure(SummaryFailure::Source));
+                return Err(summary_failure(SummaryFailure::Source(kind)));
             }
         }
         Ok(Arc::new(Self {
+            kind,
             sorted,
             _accounting: accounting,
         }))
@@ -510,6 +679,7 @@ impl SummarySourceIndex {
     }
 }
 pub(crate) struct SourceBoundSummaryInput {
+    kind: SummaryKind,
     receiver: ExchangeReceiverPin,
     expected: Arc<[ExchangeSource]>,
     index: Option<Arc<SummarySourceIndex>>,
@@ -521,15 +691,17 @@ pub(crate) struct SourceBoundSummaryInput {
 }
 impl SourceBoundSummaryInput {
     pub(crate) fn new(
+        kind: SummaryKind,
         receiver: ExchangeReceiverPin,
         expected: Arc<[ExchangeSource]>,
         layout: StaticLayout,
     ) -> ExecutionResult<Self> {
-        validate_layout(&layout)?;
+        validate_layout(kind, &layout)?;
         if expected.is_empty() {
-            return Err(summary_failure(SummaryFailure::Source));
+            return Err(summary_failure(SummaryFailure::Source(kind)));
         }
         Ok(Self {
+            kind,
             receiver,
             expected,
             index: None,
@@ -546,8 +718,16 @@ impl SourceBoundSummaryInput {
         tracker: Arc<MemTracker>,
     ) -> ExecutionResult<()> {
         self.schema = Some(factory.create_compiled_chunk_schema(&self.layout)?);
-        self.index = Some(SummarySourceIndex::new(&self.expected, tracker, factory)?);
+        self.index = Some(SummarySourceIndex::new(
+            self.kind,
+            &self.expected,
+            tracker,
+            factory,
+        )?);
         Ok(())
+    }
+    pub(crate) const fn kind(&self) -> SummaryKind {
+        self.kind
     }
     pub(crate) fn layout(&self) -> &StaticLayout {
         &self.layout
@@ -590,35 +770,22 @@ impl SourceBoundSummaryInput {
                     .ok_or(ConstructionFailure::MissingOwner)?;
                 let source = source
                     .filter(|source| index.ordinal(source).is_some())
-                    .ok_or_else(|| summary_failure(SummaryFailure::Source))?;
+                    .ok_or_else(|| summary_failure(SummaryFailure::Source(self.kind)))?;
                 let schema = self
                     .schema
                     .as_ref()
                     .ok_or(ConstructionFailure::MissingOwner)?;
-                if chunk.len() != 1 || chunk.chunk_schema() != schema.as_ref() {
-                    return Err(summary_failure(SummaryFailure::Schema));
-                }
-                let mut wire = [0; 3];
-                for (ordinal, value) in wire.iter_mut().enumerate() {
-                    let a = chunk.columns()[ordinal]
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .filter(|a| a.null_count() == 0)
-                        .ok_or_else(|| summary_failure(SummaryFailure::Schema))?;
-                    *value = a.value(0);
-                }
-                let counts = LogicalChangeCounts::try_from_wire(wire[0], wire[1], wire[2])
-                    .map_err(|e| summary_failure(SummaryFailure::Count(e)))?;
+                let value = decode_summary_value(self.kind, &chunk, schema)?;
                 #[cfg(novarocks_dev_controls)]
                 if let Some(scope) = &self.diagnostics {
                     scope.emit("summary_input_handoff", || {
                         format!(
-                            "source={source:?} counts={counts:?} expected={:?}",
+                            "source={source:?} value={value:?} expected={:?}",
                             self.expected
                         )
                     });
                 }
-                Ok(SummaryRead::Summary(SourceBoundSummary { source, counts }))
+                Ok(SummaryRead::Summary(SourceBoundSummary { source, value }))
             }
             Some(SourcedExchangePopResult::Finished(_)) => {
                 self.receiver
@@ -628,7 +795,7 @@ impl SourceBoundSummaryInput {
                 #[cfg(novarocks_dev_controls)]
                 if let Some(scope) = &self.diagnostics {
                     scope.emit("summary_input_consumed", || {
-                        format!("expected={:?}", self.expected)
+                        format!("kind={} expected={:?}", self.kind, self.expected)
                     });
                 }
                 Ok(SummaryRead::End)
@@ -637,7 +804,10 @@ impl SourceBoundSummaryInput {
                 #[cfg(novarocks_dev_controls)]
                 if let Some(scope) = &self.diagnostics {
                     scope.emit("summary_input_wait", || {
-                        format!("generation={generation} expected={:?}", self.expected)
+                        format!(
+                            "kind={} generation={generation} expected={:?}",
+                            self.kind, self.expected
+                        )
                     });
                 }
                 Ok(SummaryRead::Pending(WaitFact {
@@ -650,12 +820,61 @@ impl SourceBoundSummaryInput {
         }
     }
 }
+fn decode_summary_value(
+    kind: SummaryKind,
+    chunk: &Chunk,
+    schema: &ChunkSchemaRef,
+) -> ExecutionResult<SummaryValue> {
+    if chunk.len() != 1 || chunk.chunk_schema() != schema.as_ref() {
+        return Err(summary_failure(SummaryFailure::Schema(kind)));
+    }
+    let mut wire = [0; 3];
+    for (ordinal, value) in wire.iter_mut().enumerate() {
+        let a = chunk.columns()[ordinal]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .filter(|a| a.null_count() == 0)
+            .ok_or_else(|| summary_failure(SummaryFailure::Schema(kind)))?;
+        *value = a.value(0);
+    }
+    let value = match kind {
+        SummaryKind::WriteCounts => SummaryValue::WriteCounts(
+            LogicalChangeCounts::try_from_wire(wire[0], wire[1], wire[2]).map_err(|error| {
+                summary_failure(SummaryFailure::Count {
+                    kind: kind,
+                    cause: SummaryMergeError::WriteCounts(error),
+                })
+            })?,
+        ),
+        SummaryKind::DeleteVerification => {
+            let fingerprint = chunk.columns()[3]
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .filter(|array| array.value_length() == 16 && array.null_count() == 0)
+                .ok_or_else(|| summary_failure(SummaryFailure::Schema(kind)))?;
+            let fingerprint: [u8; 16] = fingerprint
+                .value(0)
+                .try_into()
+                .map_err(|_| summary_failure(SummaryFailure::Schema(kind)))?;
+            SummaryValue::DeleteVerification(
+                DeleteVerificationCounts::try_from_wire(wire[0], wire[1], wire[2], fingerprint)
+                    .map_err(|error| {
+                        summary_failure(SummaryFailure::Count {
+                            kind: kind,
+                            cause: SummaryMergeError::DeleteVerification(error),
+                        })
+                    })?,
+            )
+        }
+    };
+    Ok(value)
+}
 /// Finish-owned coverage, independent of writer target ordinals and profiles.
 pub(crate) struct SummaryCoverage {
     expected: Arc<SummarySourceIndex>,
     remaining: usize,
     seen: Vec<bool>,
-    counts: LogicalChangeCounts,
+    value: SummaryValue,
     _accounting: TrackedBytes,
 }
 impl SummaryCoverage {
@@ -668,8 +887,8 @@ impl SummaryCoverage {
         Ok(Self {
             seen: vec![false; expected.sorted.len()],
             remaining: expected.sorted.len(),
+            value: SummaryValue::zero(expected.kind),
             expected,
-            counts: LogicalChangeCounts::ZERO,
             _accounting: accounting,
         })
     }
@@ -677,21 +896,25 @@ impl SummaryCoverage {
         let ordinal = self
             .expected
             .ordinal(&summary.source)
-            .ok_or_else(|| summary_failure(SummaryFailure::Source))?;
+            .ok_or_else(|| summary_failure(SummaryFailure::Source(self.expected.kind)))?;
         if self.seen[ordinal] {
-            return Err(summary_failure(SummaryFailure::DuplicateSource));
+            return Err(summary_failure(SummaryFailure::DuplicateSource(
+                self.expected.kind,
+            )));
         }
-        let next = add(self.counts, summary.counts)?;
-        self.counts = next;
+        let next = add(self.value, summary.value)?;
+        self.value = next;
         self.seen[ordinal] = true;
         self.remaining -= 1;
         Ok(())
     }
-    pub(crate) fn finish(&self) -> ExecutionResult<LogicalChangeCounts> {
+    pub(crate) fn finish(&self) -> ExecutionResult<SummaryValue> {
         if self.remaining != 0 {
-            return Err(summary_failure(SummaryFailure::MissingSource));
+            return Err(summary_failure(SummaryFailure::MissingSource(
+                self.expected.kind,
+            )));
         }
-        Ok(self.counts)
+        Ok(self.value)
     }
 }
 
@@ -703,21 +926,40 @@ pub(crate) mod tests {
         exchange::{ExchangeKey, ExecutionExchangeRegistry, online_unit},
         runtime_state::RuntimeState,
     };
+    use arrow::datatypes::DataType;
     use novarocks_execution_contract::ExchangeStreamIdentity;
     use novarocks_types::{SlotId, UniqueId};
     pub(crate) fn summary_layout() -> StaticLayout {
+        summary_layout_for(SummaryKind::WriteCounts)
+    }
+    pub(crate) fn summary_layout_for(kind: SummaryKind) -> StaticLayout {
+        let types = kind
+            .fields()
+            .iter()
+            .map(|field| match field.wire_type() {
+                novarocks_result_contract::SummaryWireType::Int64 => DataType::Int64,
+                novarocks_result_contract::SummaryWireType::FixedSizeBinary(width) => {
+                    DataType::FixedSizeBinary(i32::from(width))
+                }
+            })
+            .collect::<Vec<_>>();
         crate::exec::chunk::typed_fixture::layout(
             Arc::new(arrow::datatypes::Schema::new(
-                (0..3)
-                    .map(|i| {
-                        arrow::datatypes::Field::new(format!("count{i}"), DataType::Int64, false)
+                kind.fields()
+                    .iter()
+                    .zip(&types)
+                    .map(|(field, ty)| {
+                        arrow::datatypes::Field::new(field.name(), ty.clone(), false)
                     })
                     .collect::<Vec<_>>(),
             )),
-            &[SlotId(801), SlotId(802), SlotId(803)],
-            &std::array::from_fn::<_, 3, _>(|_| {
-                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
-            }),
+            &(0..types.len())
+                .map(|i| SlotId(801 + i as u32))
+                .collect::<Vec<_>>(),
+            &types
+                .into_iter()
+                .map(|ty| novarocks_type_contract::FunctionValueType::new(ty, false))
+                .collect::<Vec<_>>(),
         )
     }
     pub(crate) fn creator(state: &RuntimeState) -> Arc<dyn InputConstructionFactory> {
@@ -729,6 +971,7 @@ pub(crate) mod tests {
         .unwrap()
     }
     pub(crate) struct IngressFixture {
+        kind: SummaryKind,
         pub(crate) registry: Arc<ExecutionExchangeRegistry>,
         pub(crate) key: ExchangeKey,
         pub(crate) streams: Vec<ExchangeStreamIdentity>,
@@ -762,6 +1005,9 @@ pub(crate) mod tests {
             ))
         }
         pub(crate) fn new(sources: usize, state: &RuntimeState) -> Self {
+            Self::new_kind(sources, state, SummaryKind::WriteCounts)
+        }
+        pub(crate) fn new_kind(sources: usize, state: &RuntimeState, kind: SummaryKind) -> Self {
             let target = state
                 .error_state()
                 .task_identity()
@@ -773,9 +1019,12 @@ pub(crate) mod tests {
             let key = ExchangeKey {
                 task_key_hi: 946801,
                 task_key_lo: 946802,
-                node_id: 31,
+                node_id: match kind {
+                    SummaryKind::WriteCounts => 31,
+                    SummaryKind::DeleteVerification => 32,
+                },
             };
-            let layout = summary_layout();
+            let layout = summary_layout_for(kind);
             let factory = creator(state);
             let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
             registry
@@ -811,6 +1060,7 @@ pub(crate) mod tests {
                 .collect();
             registry.bind_unit_receiver(key, streams.clone(), state.error_state(), novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
             Self {
+                kind,
                 registry,
                 key,
                 streams,
@@ -824,6 +1074,7 @@ pub(crate) mod tests {
         }
         pub(crate) fn input(&self) -> SourceBoundSummaryInput {
             SourceBoundSummaryInput::new(
+                self.kind,
                 self.registry
                     .get_receiver_pin(self.key, self.streams.len())
                     .unwrap(),
@@ -843,8 +1094,18 @@ pub(crate) mod tests {
             counts: Option<LogicalChangeCounts>,
             eos: bool,
         ) {
+            self.send_value(source, sequence, counts.map(SummaryValue::WriteCounts), eos);
+        }
+        pub(crate) fn send_value(
+            &self,
+            source: usize,
+            sequence: u64,
+            value: Option<SummaryValue>,
+            eos: bool,
+        ) {
+            assert!(value.is_none_or(|value| value.kind() == self.kind));
             let stream = self.streams[source];
-            let payload = counts
+            let payload = value
                 .map(|c| {
                     let recipe =
                         online_unit::prepare_recipe(&self.schema, &[], self.factory.as_ref())
@@ -859,7 +1120,7 @@ pub(crate) mod tests {
                 ExchangeUnitReceiverFrame, ExchangeUnitSequence,
             };
             let sequence = ExchangeUnitSequence::try_new(sequence).unwrap();
-            let item = if counts.is_some() {
+            let item = if value.is_some() {
                 let demand = ExchangeUnitDemand {
                     sequence,
                     wire_bytes: payload.len() as u64,
@@ -897,11 +1158,389 @@ pub(crate) mod tests {
                 .unwrap();
         }
     }
+    fn declared_output(
+        kind: SummaryKind,
+        author: novarocks_local_program::StaticSummaryAuthor,
+    ) -> novarocks_local_program::StaticSummaryBranch {
+        use novarocks_local_program::*;
+        let layout = summary_layout_for(kind);
+        let branch = StaticStreamBranch::try_new(
+            31,
+            DataStreamPartitionType::Unpartitioned,
+            vec![],
+            layout.slots().to_vec(),
+            None,
+            StaticStreamContract {
+                role: ProgramOutputRole::Summary(kind),
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain,
+                routing: StaticStreamRouting::Ordinary,
+            },
+        )
+        .unwrap();
+        StaticSummaryBranch::try_new(kind, author, branch, layout).unwrap()
+    }
+    #[test]
+    fn node_author_declares_one_unit_for_two_probe_groups_and_keeps_fingerprint_wrapping() {
+        use novarocks_local_program::{ProgramNodeId, StaticSummaryAuthor};
+        let kind = SummaryKind::DeleteVerification;
+        let author = StaticSummaryAuthor::Node(ProgramNodeId::new(0));
+        let mut assembly =
+            SummaryAuthorAssemblyObligation::new(&[declared_output(kind, author)]).unwrap();
+        assert!(
+            assembly
+                .claim(kind, StaticSummaryAuthor::RouterSink)
+                .is_err()
+        );
+        let state = assembly
+            .claim(kind, author)
+            .unwrap()
+            .declare_units(1, MemTracker::new_root("node summary units"))
+            .unwrap();
+        assert!(assembly.claim(kind, author).is_err());
+        let states = assembly.seal().unwrap();
+        assert!(states.write_counts.is_none());
+        let mut unit = state.contributor(0).unwrap();
+        // Two independent probe groups contribute through the original author.
+        // Its one obligation remains live until both complete their full input.
+        unit.accept(SummaryValue::DeleteVerification(
+            DeleteVerificationCounts::try_new(3, 2, 1, u128::MAX).unwrap(),
+        ))
+        .unwrap();
+        assert!(state.result().unwrap().is_none());
+        unit.accept(SummaryValue::DeleteVerification(
+            DeleteVerificationCounts::try_new(4, 3, 2, 2).unwrap(),
+        ))
+        .unwrap();
+        assert!(state.result().unwrap().is_none());
+        unit.finish().unwrap();
+        assert_eq!(
+            state.result().unwrap(),
+            Some(SummaryValue::DeleteVerification(
+                DeleteVerificationCounts::try_new(7, 5, 3, 1).unwrap()
+            ))
+        );
+    }
+    #[test]
+    fn every_declared_author_and_unit_must_be_handed_off_before_source_preparation() {
+        use novarocks_local_program::StaticSummaryAuthor;
+        for kind in SummaryKind::ALL {
+            let output = declared_output(kind, StaticSummaryAuthor::RouterSink);
+            assert!(
+                SummaryAuthorAssemblyObligation::new(std::slice::from_ref(&output))
+                    .unwrap()
+                    .seal()
+                    .is_err()
+            );
+            let mut assembly = SummaryAuthorAssemblyObligation::new(&[output]).unwrap();
+            let state = assembly
+                .claim(kind, StaticSummaryAuthor::RouterSink)
+                .unwrap()
+                .declare_units(2, MemTracker::new_root("exact summary handoff"))
+                .unwrap();
+            assembly.seal().unwrap();
+            let _one = state.contributor(0).unwrap();
+            assert!(
+                SummarySourceFactory::new(state, summary_layout_for(kind))
+                    .unwrap()
+                    .create(1, 0)
+                    .prepare()
+                    .is_err(),
+                "an unclaimed unit cannot leave a running Source waiting forever"
+            );
+        }
+    }
+    #[test]
+    fn verification_zero_input_emits_one_exact_raw_fingerprint_row_and_missing_unit_refuses() {
+        let kind = SummaryKind::DeleteVerification;
+        let state =
+            TaskSummaryState::new(kind, 1, MemTracker::new_root("verification zero")).unwrap();
+        state.contributor(0).unwrap().finish().unwrap();
+        let runtime = RuntimeState::default();
+        let mut source = SummarySourceFactory::new(state, summary_layout_for(kind))
+            .unwrap()
+            .create(1, 0);
+        source.set_construction_factory(creator(&runtime));
+        source.prepare().unwrap();
+        let output = source.drive_for_test(&runtime).unwrap().output.unwrap();
+        assert_eq!(output.len(), 1);
+        for column in &output.columns()[..3] {
+            assert_eq!(
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                0
+            );
+        }
+        assert_eq!(
+            output.columns()[3]
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(0),
+            &[0; 16]
+        );
+        assert!(source.drive_for_test(&runtime).unwrap().output.is_none());
+        let missing =
+            TaskSummaryState::new(kind, 1, MemTracker::new_root("verification missing")).unwrap();
+        drop(missing.contributor(0).unwrap());
+        let error = missing.result().unwrap_err();
+        assert!(error.to_string().contains("delete-verification"));
+    }
+    #[test]
+    fn per_kind_coverage_refuses_duplicate_foreign_and_missing_sources_independently() {
+        for kind in SummaryKind::ALL {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let fixture = IngressFixture::new_kind(3, &runtime, kind);
+            let sources = fixture.streams[..2]
+                .iter()
+                .map(|stream| stream.source())
+                .collect::<Vec<_>>();
+            let expected = SummarySourceIndex::new(
+                kind,
+                &sources,
+                MemTracker::new_root("typed coverage index"),
+                fixture.factory.as_ref(),
+            )
+            .unwrap();
+            let mut coverage =
+                SummaryCoverage::new(expected, MemTracker::new_root("typed coverage")).unwrap();
+            coverage
+                .accept(SourceBoundSummary {
+                    source: sources[0],
+                    value: SummaryValue::zero(kind),
+                })
+                .unwrap();
+            assert!(
+                coverage
+                    .accept(SourceBoundSummary {
+                        source: sources[0],
+                        value: SummaryValue::zero(kind)
+                    })
+                    .is_err()
+            );
+            assert!(
+                coverage
+                    .accept(SourceBoundSummary {
+                        source: fixture.streams[2].source(),
+                        value: SummaryValue::zero(kind)
+                    })
+                    .is_err()
+            );
+            assert!(
+                coverage
+                    .finish()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&kind.to_string())
+            );
+            coverage
+                .accept(SourceBoundSummary {
+                    source: sources[1],
+                    value: SummaryValue::zero(kind),
+                })
+                .unwrap();
+            assert_eq!(coverage.finish().unwrap(), SummaryValue::zero(kind));
+        }
+    }
+    #[test]
+    fn summary_wire_negative_fields_and_each_verification_overflow_are_typed_refusals() {
+        let runtime = RuntimeState::default();
+        let factory = creator(&runtime);
+        for kind in SummaryKind::ALL {
+            let schema = factory
+                .create_compiled_chunk_schema(&summary_layout_for(kind))
+                .unwrap();
+            let zero = summary_chunk(SummaryValue::zero(kind), &schema, factory.as_ref()).unwrap();
+            for ordinal in 0..3 {
+                let mut columns = zero.columns().to_vec();
+                columns[ordinal] = Arc::new(Int64Array::from(vec![-1]));
+                let corrupt = Chunk::try_new_with_columns(schema.clone(), columns).unwrap();
+                assert!(
+                    decode_summary_value(kind, &corrupt, &schema)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&kind.to_string())
+                );
+            }
+        }
+        for ordinal in 0..3 {
+            let mut large = [0; 3];
+            large[ordinal] = i64::MAX as u64;
+            let mut delta = [0; 3];
+            delta[ordinal] = 1;
+            let state = TaskSummaryState::new(
+                SummaryKind::DeleteVerification,
+                2,
+                MemTracker::new_root("verification checked fields"),
+            )
+            .unwrap();
+            let mut first = state.contributor(0).unwrap();
+            let mut second = state.contributor(1).unwrap();
+            first
+                .accept(SummaryValue::DeleteVerification(
+                    DeleteVerificationCounts::try_new(large[0], large[1], large[2], 0).unwrap(),
+                ))
+                .unwrap();
+            second
+                .accept(SummaryValue::DeleteVerification(
+                    DeleteVerificationCounts::try_new(delta[0], delta[1], delta[2], 0).unwrap(),
+                ))
+                .unwrap();
+            first.finish().unwrap();
+            assert!(
+                second
+                    .finish()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("delete-verification")
+            );
+            assert!(state.result().is_err());
+        }
+    }
+    #[test]
+    fn verification_author_unit_patterns_reduce_two_original_sources_without_using_pipeline_width()
+    {
+        use novarocks_local_program::{ProgramNodeId, StaticSummaryAuthor};
+        for per_driver in [false, true] {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let ingress = IngressFixture::new_kind(2, &runtime, SummaryKind::DeleteVerification);
+            let mut input = ingress.input();
+            input
+                .prepare(
+                    ingress.factory.as_ref(),
+                    MemTracker::new_root("verification input"),
+                )
+                .unwrap();
+            let mut coverage = SummaryCoverage::new(
+                input.sources().unwrap(),
+                MemTracker::new_root("verification coverage"),
+            )
+            .unwrap();
+            for source_ordinal in 0..2 {
+                let kind = SummaryKind::DeleteVerification;
+                let author = StaticSummaryAuthor::Node(ProgramNodeId::new(0));
+                let mut assembly =
+                    SummaryAuthorAssemblyObligation::new(&[declared_output(kind, author)]).unwrap();
+                // This test author's three input groups may share one unit or
+                // each own a unit. Neither case reads a pipeline profile.
+                let units = if per_driver { 3 } else { 1 };
+                let state = assembly
+                    .claim(kind, author)
+                    .unwrap()
+                    .declare_units(units, MemTracker::new_root("original author Task"))
+                    .unwrap();
+                assembly.seal().unwrap();
+                let mut contributors = (0..units)
+                    .map(|ordinal| state.contributor(ordinal).unwrap())
+                    .collect::<Vec<_>>();
+                let mut source = SummarySourceFactory::new(state, summary_layout_for(kind))
+                    .unwrap()
+                    .create(1, 0);
+                source.set_construction_factory(creator(&runtime));
+                source.prepare().unwrap();
+                for group in 0..3 {
+                    let unit = if per_driver { group } else { 0 };
+                    contributors[unit]
+                        .accept(SummaryValue::DeleteVerification(
+                            DeleteVerificationCounts::try_new(2, 1, 1, source_ordinal as u128 + 1)
+                                .unwrap(),
+                        ))
+                        .unwrap();
+                    if per_driver {
+                        contributors[unit].finish().unwrap();
+                    }
+                    if group != 2 {
+                        assert!(
+                            source.drive_for_test(&runtime).unwrap().output.is_none(),
+                            "a partial set of group EOS cannot publish"
+                        );
+                    }
+                }
+                if !per_driver {
+                    contributors[0].finish().unwrap();
+                }
+                let output = source.drive_for_test(&runtime).unwrap().output.unwrap();
+                let value =
+                    decode_summary_value(kind, &output, &output.chunk_schema_ref()).unwrap();
+                ingress.send_value(source_ordinal, 1, Some(value), true);
+                assert!(source.drive_for_test(&runtime).unwrap().output.is_none());
+            }
+            let errors = runtime.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::new(128).unwrap(), 128);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..2 {
+                work.begin_turn(128).unwrap();
+                let SummaryRead::Summary(value) = input
+                    .poll(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap()
+                else {
+                    panic!("one row per original source")
+                };
+                coverage.accept(value).unwrap();
+            }
+            work.begin_turn(128).unwrap();
+            assert!(matches!(
+                input
+                    .poll(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap(),
+                SummaryRead::End
+            ));
+            assert_eq!(
+                coverage.finish().unwrap(),
+                SummaryValue::DeleteVerification(
+                    DeleteVerificationCounts::try_new(12, 6, 6, 9).unwrap()
+                )
+            );
+        }
+    }
+    #[test]
+    fn verification_author_abandoned_unit_never_publishes_for_either_unit_pattern() {
+        use novarocks_local_program::{ProgramNodeId, StaticSummaryAuthor};
+        for units in [1, 3] {
+            let kind = SummaryKind::DeleteVerification;
+            let author = StaticSummaryAuthor::Node(ProgramNodeId::new(0));
+            let mut assembly =
+                SummaryAuthorAssemblyObligation::new(&[declared_output(kind, author)]).unwrap();
+            let state = assembly
+                .claim(kind, author)
+                .unwrap()
+                .declare_units(
+                    units,
+                    MemTracker::new_root("canceling original author Task"),
+                )
+                .unwrap();
+            assembly.seal().unwrap();
+            let mut contributors = (0..units)
+                .map(|ordinal| state.contributor(ordinal).unwrap())
+                .collect::<Vec<_>>();
+            let runtime = RuntimeState::default();
+            let mut source = SummarySourceFactory::new(state, summary_layout_for(kind))
+                .unwrap()
+                .create(1, 0);
+            source.set_construction_factory(creator(&runtime));
+            source.prepare().unwrap();
+            let abandoned = contributors.pop().unwrap();
+            for unit in &mut contributors {
+                unit.finish().unwrap();
+            }
+            drop(abandoned);
+            assert!(
+                source
+                    .drive_for_test(&runtime)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("delete-verification")
+            );
+        }
+    }
     #[test]
     fn logical_change_summary_reduces_actual_contributors_once_and_zero_is_a_real_row() {
         let tracker = MemTracker::new_root("summary state");
         for empty in [true, false] {
-            let state = LogicalSummaryState::new(3, tracker.clone()).unwrap();
+            let state =
+                TaskSummaryState::new(SummaryKind::WriteCounts, 3, tracker.clone()).unwrap();
             let mut contributors = (0..3)
                 .map(|i| state.contributor(i).unwrap())
                 .collect::<Vec<_>>();
@@ -909,8 +1548,10 @@ pub(crate) mod tests {
             assert!(state.result().unwrap().is_none());
             if !empty {
                 for c in &mut contributors {
-                    c.accept(LogicalChangeCounts::try_new(2, 3, 4).unwrap())
-                        .unwrap();
+                    c.accept(SummaryValue::WriteCounts(
+                        LogicalChangeCounts::try_new(2, 3, 4).unwrap(),
+                    ))
+                    .unwrap();
                 }
             }
             contributors[2].finish().unwrap();
@@ -919,7 +1560,7 @@ pub(crate) mod tests {
             contributors[1].finish().unwrap();
             assert!(contributors[1].finish().is_err());
             let runtime = RuntimeState::default();
-            let mut source = LogicalSummarySourceFactory::new(state.clone(), summary_layout())
+            let mut source = SummarySourceFactory::new(state.clone(), summary_layout())
                 .unwrap()
                 .create(1, 0);
             source.set_construction_factory(creator(&runtime));
@@ -936,7 +1577,7 @@ pub(crate) mod tests {
             );
             assert!(source.drive_for_test(&runtime).unwrap().output.is_none());
             assert!(
-                LogicalSummarySourceFactory::new(state, summary_layout())
+                SummarySourceFactory::new(state, summary_layout())
                     .unwrap()
                     .create(1, 0)
                     .prepare()
@@ -947,16 +1588,20 @@ pub(crate) mod tests {
     #[test]
     fn logical_change_summary_missing_contributor_and_cross_driver_overflow_refuse_output() {
         let tracker = MemTracker::new_root("summary failures");
-        let state = LogicalSummaryState::new(1, tracker.clone()).unwrap();
+        let state = TaskSummaryState::new(SummaryKind::WriteCounts, 1, tracker.clone()).unwrap();
         drop(state.contributor(0).unwrap());
         assert!(state.result().is_err());
-        let state = LogicalSummaryState::new(2, tracker).unwrap();
+        let state = TaskSummaryState::new(SummaryKind::WriteCounts, 2, tracker).unwrap();
         let mut first = state.contributor(0).unwrap();
         let mut second = state.contributor(1).unwrap();
         first
-            .accept(LogicalChangeCounts::try_new(i64::MAX as u64, 0, 0).unwrap())
+            .accept(SummaryValue::WriteCounts(
+                LogicalChangeCounts::try_new(i64::MAX as u64, 0, 0).unwrap(),
+            ))
             .unwrap();
-        second.accept(LogicalChangeCounts::DELETE).unwrap();
+        second
+            .accept(SummaryValue::WriteCounts(LogicalChangeCounts::DELETE))
+            .unwrap();
         first.finish().unwrap();
         assert!(second.finish().is_err());
         assert!(state.result().is_err());
@@ -1026,7 +1671,13 @@ pub(crate) mod tests {
         };
         assert_eq!(summary.source, fixture.streams[0].source());
         coverage.accept(summary).unwrap();
-        assert_eq!(coverage.finish().unwrap().affected_rows(), 9);
+        assert_eq!(
+            match coverage.finish().unwrap() {
+                SummaryValue::WriteCounts(counts) => counts.affected_rows(),
+                _ => panic!("wrong kind"),
+            },
+            9
+        );
         let SummaryRead::Pending(before_end) = input.poll(&mut ctx).unwrap() else {
             panic!("summary DATA is not End")
         };
@@ -1123,7 +1774,13 @@ pub(crate) mod tests {
             panic!("zero sourced DATA")
         };
         coverage.accept(summary).unwrap();
-        assert_eq!(coverage.finish().unwrap().affected_rows(), 9);
+        assert_eq!(
+            match coverage.finish().unwrap() {
+                SummaryValue::WriteCounts(counts) => counts.affected_rows(),
+                _ => panic!("wrong kind"),
+            },
+            9
+        );
         assert!(
             matches!(input.poll(&mut ctx).unwrap(), SummaryRead::Pending(_)),
             "summary coverage alone is not EOS"
@@ -1153,6 +1810,7 @@ pub(crate) mod tests {
             .into();
         let mut coverage = SummaryCoverage::new(
             SummarySourceIndex::new(
+                SummaryKind::WriteCounts,
                 &expected,
                 MemTracker::new_root("coverage index"),
                 fixture.factory.as_ref(),
@@ -1164,14 +1822,16 @@ pub(crate) mod tests {
         coverage
             .accept(SourceBoundSummary {
                 source: fixture.streams[0].source(),
-                counts: LogicalChangeCounts::try_new(i64::MAX as u64, 0, 0).unwrap(),
+                value: SummaryValue::WriteCounts(
+                    LogicalChangeCounts::try_new(i64::MAX as u64, 0, 0).unwrap(),
+                ),
             })
             .unwrap();
         assert!(
             coverage
                 .accept(SourceBoundSummary {
                     source: fixture.streams[0].source(),
-                    counts: LogicalChangeCounts::ZERO
+                    value: SummaryValue::WriteCounts(LogicalChangeCounts::ZERO)
                 })
                 .is_err()
         );
@@ -1179,7 +1839,7 @@ pub(crate) mod tests {
             coverage
                 .accept(SourceBoundSummary {
                     source: fixture.streams[2].source(),
-                    counts: LogicalChangeCounts::ZERO
+                    value: SummaryValue::WriteCounts(LogicalChangeCounts::ZERO)
                 })
                 .is_err()
         );
@@ -1187,7 +1847,7 @@ pub(crate) mod tests {
             coverage
                 .accept(SourceBoundSummary {
                     source: fixture.streams[1].source(),
-                    counts: LogicalChangeCounts::DELETE
+                    value: SummaryValue::WriteCounts(LogicalChangeCounts::DELETE)
                 })
                 .is_err()
         );
@@ -1205,8 +1865,13 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         sources.reverse();
         let tracker = MemTracker::new_root("source index ownership");
-        let index =
-            SummarySourceIndex::new(&sources, tracker.clone(), fixture.factory.as_ref()).unwrap();
+        let index = SummarySourceIndex::new(
+            SummaryKind::WriteCounts,
+            &sources,
+            tracker.clone(),
+            fixture.factory.as_ref(),
+        )
+        .unwrap();
         assert!(tracker.current() > 0);
         for source in &sources {
             assert!(index.ordinal(source).is_some());
@@ -1217,14 +1882,26 @@ pub(crate) mod tests {
             coverage
                 .accept(SourceBoundSummary {
                     source: *source,
-                    counts: LogicalChangeCounts::INSERT,
+                    value: SummaryValue::WriteCounts(LogicalChangeCounts::INSERT),
                 })
                 .unwrap();
         }
-        assert_eq!(coverage.finish().unwrap().affected_rows(), 64);
+        assert_eq!(
+            match coverage.finish().unwrap() {
+                SummaryValue::WriteCounts(counts) => counts.affected_rows(),
+                _ => panic!("wrong kind"),
+            },
+            64
+        );
         sources.push(sources[0]);
         assert!(
-            SummarySourceIndex::new(&sources, tracker.clone(), fixture.factory.as_ref()).is_err()
+            SummarySourceIndex::new(
+                SummaryKind::WriteCounts,
+                &sources,
+                tracker.clone(),
+                fixture.factory.as_ref()
+            )
+            .is_err()
         );
         drop(coverage);
         drop(index);
@@ -1232,7 +1909,13 @@ pub(crate) mod tests {
         let limited = MemTracker::new_root("source index original query limit");
         limited.install_limit_once(1).unwrap();
         assert!(
-            SummarySourceIndex::new(&sources, limited.clone(), fixture.factory.as_ref()).is_err()
+            SummarySourceIndex::new(
+                SummaryKind::WriteCounts,
+                &sources,
+                limited.clone(),
+                fixture.factory.as_ref()
+            )
+            .is_err()
         );
         assert_eq!(limited.current(), 0);
     }

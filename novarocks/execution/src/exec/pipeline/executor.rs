@@ -380,7 +380,10 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_sche
     prepare_compiled_program_with_sink_materializer(
         program,
         time_slice,
-        |_| Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(sink)),
+        |_, authors| {
+            authors.seal().map_err(compiled_pipeline_launch_error)?;
+            Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(sink))
+        },
         exchange_bindings,
         scan_bindings,
         writer_bindings,
@@ -404,6 +407,7 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
     time_slice: Duration,
     materialize: impl FnOnce(
         std::num::NonZeroUsize,
+        crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
     ) -> Result<
         crate::runtime::task::sink::MaterializedCompiledSink,
         crate::runtime::task::error::LocalTaskLaunchError,
@@ -420,7 +424,7 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> Result<PreparedPipelineExecution, crate::runtime::task::error::LocalTaskLaunchError> {
-    let mut graph = (|| -> ExecutionResult<PipelineGraph> {
+    let (mut graph, authors) = (|| -> ExecutionResult<(PipelineGraph, crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation)> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings.get(node_id).ok_or_else(|| {
             crate::runtime::task::ExecutionFailure::from(
@@ -513,8 +517,11 @@ pub(crate) fn prepare_compiled_program_with_sink_materializer(
             ),
         ));
     }
-    let sink = materialize(width.expect("positive original root width was checked"))?;
-    if let Some(summary) = sink.summary {
+    let sink = materialize(
+        width.expect("positive original root width was checked"),
+        authors,
+    )?;
+    for summary in sink.summaries {
         graph
             .append_summary_pipeline(summary.source, summary.sink)
             .map_err(compiled_pipeline_launch_error)?;

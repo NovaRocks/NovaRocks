@@ -22,7 +22,7 @@
 use super::{
     compiled_writer_failure::contract,
     data_stream_sink::take_partition_rows_created,
-    logical_change_summary::{LogicalSummaryContributor, LogicalSummaryState},
+    logical_change_summary::{SummaryUnitObligation, TaskSummaryState},
 };
 use crate::{
     exec::{
@@ -51,7 +51,7 @@ pub(crate) struct CompiledChangeRouterFactory {
     effect: SlotId,
     routes: Arc<[StaticRouterRoute]>,
     branches: Vec<Arc<dyn OperatorFactory>>,
-    summary: LogicalSummaryState,
+    summary: Option<TaskSummaryState>,
 }
 impl CompiledChangeRouterFactory {
     /// Branches are provider routes only. The Task's one summary source is an
@@ -60,7 +60,7 @@ impl CompiledChangeRouterFactory {
         effect: SlotId,
         routes: Arc<[StaticRouterRoute]>,
         branches: Vec<Arc<dyn OperatorFactory>>,
-        summary: LogicalSummaryState,
+        summary: Option<TaskSummaryState>,
     ) -> ExecutionResult<Self> {
         if routes.is_empty()
             || routes.len() != branches.len()
@@ -90,20 +90,32 @@ impl OperatorFactory for CompiledChangeRouterFactory {
         true
     }
     fn bind_pipeline_dop(&self, dop: i32) -> ExecutionResult<()> {
-        self.summary.validate_geometry(dop)?;
+        if let Some(summary) = &self.summary {
+            summary.validate_units(
+                usize::try_from(dop).map_err(|_| contract("change router has invalid width"))?,
+            )?;
+        }
         for branch in &self.branches {
             branch.bind_pipeline_dop(dop)?;
         }
         Ok(())
     }
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let contribution = self.summary.validate_geometry(dop).and_then(|()| {
-            usize::try_from(driver_id)
-                .map_err(|_| contract("change router has a negative driver ordinal"))
-                .and_then(|id| self.summary.contributor(id))
-        });
+        let contribution = self
+            .summary
+            .as_ref()
+            .map(|summary| {
+                summary.validate_units(
+                    usize::try_from(dop)
+                        .map_err(|_| contract("change router has invalid width"))?,
+                )?;
+                let id = usize::try_from(driver_id)
+                    .map_err(|_| contract("change router has a negative driver ordinal"))?;
+                summary.contributor(id)
+            })
+            .transpose();
         let (contributor, failure) = match contribution {
-            Ok(c) => (Some(c), None),
+            Ok(c) => (c, None),
             Err(e) => (None, Some(e)),
         };
         Box::new(Fanout::new(
@@ -125,7 +137,7 @@ impl OperatorFactory for CompiledChangeRouterFactory {
 struct ChangeRouter {
     effect: SlotId,
     routes: Arc<[StaticRouterRoute]>,
-    contributor: Option<LogicalSummaryContributor>,
+    contributor: Option<SummaryUnitObligation>,
     exhausted: bool,
 }
 pub(crate) struct ChangeCursor {
@@ -197,15 +209,17 @@ impl FanoutRouter for ChangeRouter {
             };
             counts = counts.checked_add(delta).map_err(|e| {
                 super::logical_change_summary::summary_failure(
-                    super::logical_change_summary::SummaryFailure::Count(e),
+                    super::logical_change_summary::SummaryFailure::Count {
+                        kind: novarocks_result_contract::SummaryKind::WriteCounts,
+                        cause: novarocks_result_contract::SummaryMergeError::WriteCounts(e),
+                    },
                 )
             })?;
         }
         ctx.checkpoint()?;
-        self.contributor
-            .as_mut()
-            .ok_or_else(|| contract("change router contributor is missing"))?
-            .accept(counts)?;
+        if let Some(contributor) = &mut self.contributor {
+            contributor.accept(novarocks_result_contract::SummaryValue::WriteCounts(counts))?;
+        }
         Ok(ChangeCursor {
             input,
             effect_ordinal: ordinal,
@@ -264,10 +278,9 @@ impl FanoutRouter for ChangeRouter {
     fn input_exhausted(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         ctx.checkpoint()?;
         if !self.exhausted {
-            self.contributor
-                .as_mut()
-                .ok_or_else(|| contract("change router contributor is missing"))?
-                .finish()?;
+            if let Some(contributor) = &mut self.contributor {
+                contributor.finish()?;
+            }
             self.exhausted = true;
         }
         Ok(())
@@ -380,8 +393,12 @@ mod tests {
     #[test]
     fn change_router_logical_nine_physical_five_and_seven_across_driver_and_batch_boundaries() {
         for dop in [1, 3, 4] {
-            let summary =
-                LogicalSummaryState::new(dop, MemTracker::new_root("task contributors")).unwrap();
+            let summary = TaskSummaryState::new(
+                novarocks_result_contract::SummaryKind::WriteCounts,
+                dop,
+                MemTracker::new_root("task contributors"),
+            )
+            .unwrap();
             let data = Arc::new(Mutex::new(Vec::new()));
             let deletes = Arc::new(Mutex::new(Vec::new()));
             let factory = CompiledChangeRouterFactory::new(
@@ -396,7 +413,7 @@ mod tests {
                         }) as Arc<dyn OperatorFactory>
                     })
                     .collect(),
-                summary.clone(),
+                Some(summary.clone()),
             )
             .unwrap();
             assert!(factory.bind_pipeline_dop(dop as i32 + 1).is_err());
@@ -427,13 +444,12 @@ mod tests {
             assert_eq!(deletes.lock().unwrap().len(), 7);
             // The real summary source, independent of all provider counters.
             let state = RuntimeState::default();
-            let mut source =
-                super::super::logical_change_summary::LogicalSummarySourceFactory::new(
-                    summary,
-                    super::super::logical_change_summary::tests::summary_layout(),
-                )
-                .unwrap()
-                .create(1, 0);
+            let mut source = super::super::logical_change_summary::SummarySourceFactory::new(
+                summary,
+                super::super::logical_change_summary::tests::summary_layout(),
+            )
+            .unwrap()
+            .create(1, 0);
             prepare(source.as_mut(), &state);
             let output = source.drive_for_test(&state).unwrap().output.unwrap();
             assert_eq!(
@@ -454,9 +470,12 @@ mod tests {
     fn change_router_validates_the_complete_effect_block_before_any_branch_side_effect() {
         for bad in [None, Some(0), Some(4)] {
             let state = RuntimeState::default();
-            let summary =
-                LogicalSummaryState::new(1, MemTracker::new_root("invalid effect summary"))
-                    .unwrap();
+            let summary = TaskSummaryState::new(
+                novarocks_result_contract::SummaryKind::WriteCounts,
+                1,
+                MemTracker::new_root("invalid effect summary"),
+            )
+            .unwrap();
             let recorded = Arc::new(Mutex::new(Vec::new()));
             let factory = CompiledChangeRouterFactory::new(
                 SlotId(301),
@@ -469,7 +488,7 @@ mod tests {
                         }) as Arc<dyn OperatorFactory>
                     })
                     .collect(),
-                summary,
+                Some(summary),
             )
             .unwrap();
             let mut operator = factory.create(1, 0);
@@ -487,7 +506,12 @@ mod tests {
     #[test]
     fn change_router_required_branch_withdrawal_is_an_error_even_before_the_first_batch() {
         let state = RuntimeState::default();
-        let summary = LogicalSummaryState::new(1, MemTracker::new_root("strict summary")).unwrap();
+        let summary = TaskSummaryState::new(
+            novarocks_result_contract::SummaryKind::WriteCounts,
+            1,
+            MemTracker::new_root("strict summary"),
+        )
+        .unwrap();
         let factory = CompiledChangeRouterFactory::new(
             SlotId(301),
             routes(),
@@ -499,7 +523,7 @@ mod tests {
                     }) as Arc<dyn OperatorFactory>
                 })
                 .collect(),
-            summary,
+            Some(summary),
         )
         .unwrap();
         let mut operator = factory.create(1, 0);

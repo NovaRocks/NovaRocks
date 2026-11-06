@@ -101,7 +101,7 @@ pub(crate) fn materialize_compiled_sink(
 /// All factories join the original Task driver batch before activation.
 pub(crate) struct MaterializedCompiledSink {
     pub(crate) root: Box<dyn OperatorFactory>,
-    pub(crate) summary: Option<IndependentSummaryPipeline>,
+    pub(crate) summaries: Vec<IndependentSummaryPipeline>,
 }
 pub(crate) struct IndependentSummaryPipeline {
     pub(crate) source: Box<dyn OperatorFactory>,
@@ -111,7 +111,7 @@ impl MaterializedCompiledSink {
     pub(crate) fn single(root: Box<dyn OperatorFactory>) -> Self {
         Self {
             root,
-            summary: None,
+            summaries: Vec::new(),
         }
     }
 }
@@ -158,8 +158,41 @@ fn materialize_stream_branch(
     Ok(Box::new(factory))
 }
 
-/// The computing graph has already authored its exact root width. The
-/// summary contributor set is frozen once here, before any driver exists.
+/// Borrow the original assignment. Side outputs do not clone destination groups
+/// or acquire a new routing authority.
+struct AssignedStreams<'a> {
+    assignment: &'a TaskSinkAssignment,
+}
+impl AssignedStreams<'_> {
+    fn len(&self) -> usize {
+        match self.assignment {
+            TaskSinkAssignment::None => 0,
+            TaskSinkAssignment::StreamDestinations { .. } => 1,
+            TaskSinkAssignment::DestinationGroups { groups, .. } => groups.len(),
+        }
+    }
+    fn get(&self, index: usize) -> Option<&[crate::runtime::endpoint::TaskDestination]> {
+        match self.assignment {
+            TaskSinkAssignment::None => None,
+            TaskSinkAssignment::StreamDestinations { destinations, .. } => {
+                (index == 0).then_some(destinations.as_slice())
+            }
+            TaskSinkAssignment::DestinationGroups { groups, .. } => {
+                groups.get(index).map(Vec::as_slice)
+            }
+        }
+    }
+    fn sender_id(&self) -> Option<i32> {
+        match self.assignment {
+            TaskSinkAssignment::None => None,
+            TaskSinkAssignment::StreamDestinations { sender_id, .. }
+            | TaskSinkAssignment::DestinationGroups { sender_id, .. } => *sender_id,
+        }
+    }
+}
+
+/// The graph has authored its exact root width. Every author freezes its unit
+/// set before any driver exists; every independent Source joins this Task's batch.
 pub(crate) fn materialize_compiled_sink_for_pipeline(
     program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
     assignment: &TaskSinkAssignment,
@@ -169,21 +202,22 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
     actual_root_dop: std::num::NonZeroUsize,
     tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
+    mut authors: crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
 ) -> Result<MaterializedCompiledSink, LocalTaskLaunchError> {
     use crate::exec::operators::{
         compiled_change_router::CompiledChangeRouterFactory,
-        logical_change_summary::{LogicalSummarySourceFactory, LogicalSummaryState},
+        logical_change_summary::SummarySourceFactory,
     };
+    use novarocks_local_program::StaticSummaryAuthor;
+    use novarocks_result_contract::SummaryKind;
     use std::sync::Arc;
-    let Some(StaticSinkProgram::ChangeStreamRouter {
-        branches,
-        effect_slot,
-        routes,
-        summary_branch,
-        summary_layout,
-        ..
-    }) = program.graph().sink()
-    else {
+    let graph = program.graph();
+    let sink = graph
+        .sink()
+        .ok_or_else(|| materialization_contract("compiled local program has no static sink"))?;
+    if graph.summaries().is_empty() && !matches!(sink, StaticSinkProgram::ChangeStreamRouter { .. })
+    {
+        authors.seal().map_err(materialization_error)?;
         return materialize_compiled_sink(
             program,
             assignment,
@@ -193,91 +227,141 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             edge_gates,
         )
         .map(MaterializedCompiledSink::single);
-    };
-    if result_sink.is_some() {
+    }
+    let assigned = AssignedStreams { assignment };
+    let root_branches = sink.branches().len();
+    if assigned.len() != graph.stream_branches().count() {
         return Err(materialization_contract(
-            "compiled change router cannot take a result sink",
+            "compiled output assignment differs from its exact branch set",
         ));
     }
-    let TaskSinkAssignment::DestinationGroups { groups, sender_id } = assignment else {
+    if !matches!(
+        sink,
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
+    ) && result_sink.is_some()
+    {
         return Err(materialization_contract(
-            "compiled change router requires its exact destination groups",
-        ));
-    };
-    if groups.len() != branches.len() {
-        return Err(materialization_contract(
-            "compiled change router destination count differs from its branch set",
+            "compiled non-result sink cannot take a result sink",
         ));
     }
-    let tracker = tracker.ok_or_else(|| {
-        materialization_contract("logical summary has no original Task memory tracker")
-    })?;
-    let tracker =
-        crate::runtime::mem_tracker::MemTracker::new_child("logical_change_summary", &tracker);
-    let state =
-        LogicalSummaryState::new(actual_root_dop.get(), tracker).map_err(materialization_error)?;
-    let mut provider_factories = Vec::with_capacity(routes.len());
-    let mut dense_routes = Vec::with_capacity(routes.len());
-    for (dense, route) in routes.iter().enumerate() {
-        let index = usize::try_from(route.branch)
-            .map_err(|_| materialization_contract("router branch index exceeds usize"))?;
-        let branch = branches
-            .get(index)
-            .ok_or_else(|| materialization_contract("router provider branch is absent"))?;
-        let destinations = groups
-            .get(index)
-            .ok_or_else(|| materialization_contract("router provider assignment is absent"))?;
-        provider_factories.push(Arc::from(materialize_stream_branch(
+    let root_layout = graph.nodes()[graph.root().index()].output_layout();
+    let root: Box<dyn OperatorFactory> = match sink {
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) => {
+            result_sink.ok_or_else(|| {
+                materialization_contract("compiled RESULT_SINK requires a result sink")
+            })?
+        }
+        StaticSinkProgram::Noop => Box::new(NoopSinkFactory::new()),
+        StaticSinkProgram::DataStream { branch, .. } => materialize_stream_branch(
             program,
-            program.graph().nodes()[program.graph().root().index()].output_layout(),
+            root_layout,
             branch,
-            route.branch,
-            destinations,
-            *sender_id,
+            0,
+            assigned
+                .get(0)
+                .ok_or_else(|| materialization_contract("root stream assignment is absent"))?,
+            assigned.sender_id(),
             task_key,
-            Arc::clone(&transmitter),
+            transmitter.clone(),
             edge_gates.clone(),
-        )?));
-        let mut dense_route = route.clone();
-        dense_route.branch = u32::try_from(dense)
-            .map_err(|_| materialization_contract("router provider count exceeds u32"))?;
-        dense_routes.push(dense_route);
-    }
-    let index = usize::try_from(*summary_branch)
-        .map_err(|_| materialization_contract("summary branch index exceeds usize"))?;
-    let branch = branches
-        .get(index)
-        .ok_or_else(|| materialization_contract("router summary branch is absent"))?;
-    let destinations = groups
-        .get(index)
-        .ok_or_else(|| materialization_contract("router summary assignment is absent"))?;
-    let summary_sink = materialize_stream_branch(
-        program,
-        summary_layout,
-        branch,
-        *summary_branch,
-        destinations,
-        *sender_id,
-        task_key,
-        transmitter,
-        edge_gates,
-    )?;
-    let summary_source = LogicalSummarySourceFactory::new(state.clone(), summary_layout.clone())
-        .map_err(materialization_error)?;
-    let root = CompiledChangeRouterFactory::new(
-        *effect_slot,
-        dense_routes.into(),
-        provider_factories,
-        state,
-    )
-    .map_err(materialization_error)?;
-    Ok(MaterializedCompiledSink {
-        root: Box::new(root),
-        summary: Some(IndependentSummaryPipeline {
-            source: Box::new(summary_source),
+        )?,
+        StaticSinkProgram::ChangeStreamRouter {
+            branches,
+            effect_slot,
+            routes,
+            ..
+        } => {
+            let state =
+                if authors.declares(SummaryKind::WriteCounts, StaticSummaryAuthor::RouterSink) {
+                    let tracker = tracker.ok_or_else(|| {
+                        materialization_contract("summary author has no original Task tracker")
+                    })?;
+                    Some(
+                        authors
+                            .claim(SummaryKind::WriteCounts, StaticSummaryAuthor::RouterSink)
+                            .and_then(|obligation| {
+                                obligation.declare_units(actual_root_dop.get(), tracker)
+                            })
+                            .map_err(materialization_error)?,
+                    )
+                } else {
+                    None
+                };
+            let mut factories = Vec::with_capacity(routes.len());
+            let mut dense_routes = Vec::with_capacity(routes.len());
+            for (dense, route) in routes.iter().enumerate() {
+                let index = usize::try_from(route.branch)
+                    .map_err(|_| materialization_contract("router branch index exceeds usize"))?;
+                let branch = branches
+                    .get(index)
+                    .ok_or_else(|| materialization_contract("router provider branch is absent"))?;
+                factories.push(Arc::from(materialize_stream_branch(
+                    program,
+                    root_layout,
+                    branch,
+                    route.branch,
+                    assigned.get(index).ok_or_else(|| {
+                        materialization_contract("router provider assignment is absent")
+                    })?,
+                    assigned.sender_id(),
+                    task_key,
+                    transmitter.clone(),
+                    edge_gates.clone(),
+                )?));
+                let mut dense_route = route.clone();
+                dense_route.branch = u32::try_from(dense)
+                    .map_err(|_| materialization_contract("router provider count exceeds u32"))?;
+                dense_routes.push(dense_route);
+            }
+            Box::new(
+                CompiledChangeRouterFactory::new(
+                    *effect_slot,
+                    dense_routes.into(),
+                    factories,
+                    state,
+                )
+                .map_err(materialization_error)?,
+            )
+        }
+        StaticSinkProgram::MultiCastDataStream { .. }
+        | StaticSinkProgram::SplitDataStream { .. } => {
+            return Err(materialization_contract(
+                "compiled multicast or split sink is not executable yet",
+            ));
+        }
+    };
+    let states = authors.seal().map_err(materialization_error)?;
+    let mut summaries = Vec::with_capacity(graph.summaries().len());
+    for (ordinal, output) in graph.summaries().iter().enumerate() {
+        let index = root_branches
+            .checked_add(ordinal)
+            .ok_or_else(|| materialization_contract("summary branch index exceeds usize"))?;
+        let state = states.get(output.kind()).ok_or_else(|| {
+            materialization_contract("summary author did not register its exact state")
+        })?;
+        let summary_sink = materialize_stream_branch(
+            program,
+            output.layout(),
+            output.branch(),
+            u32::try_from(index)
+                .map_err(|_| materialization_contract("summary branch index exceeds u32"))?,
+            assigned
+                .get(index)
+                .ok_or_else(|| materialization_contract("summary assignment is absent"))?,
+            assigned.sender_id(),
+            task_key,
+            transmitter.clone(),
+            edge_gates.clone(),
+        )?;
+        summaries.push(IndependentSummaryPipeline {
+            source: Box::new(
+                SummarySourceFactory::new(state.clone(), output.layout().clone())
+                    .map_err(materialization_error)?,
+            ),
             sink: summary_sink,
-        }),
-    })
+        });
+    }
+    Ok(MaterializedCompiledSink { root, summaries })
 }
 
 /// The compiled partition-key roots of the one DataStream branch, in key

@@ -493,7 +493,7 @@ fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgramGraph {
                         writer_results: 0,
                         summaries: Default::default(),
                     },
-                    logical_summary_layout: None,
+                    summary_layouts: novarocks_result_contract::PerKind::empty(),
                     inputs: vec![ProgramNodeId::new(0)],
                     expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
                     writer_multiplex_layout: layout.clone(),

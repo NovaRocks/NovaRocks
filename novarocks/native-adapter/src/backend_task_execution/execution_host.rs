@@ -1027,6 +1027,7 @@ impl NativeTaskExecutionHost {
         .map_err(protocol_failure)?;
         let sink_assignment = compiled_task_sink_assignment(
             sink,
+            program.graph().summaries(),
             &instance_input.sink_edge_ids,
             descriptor_task_key,
             descriptor.topology(),

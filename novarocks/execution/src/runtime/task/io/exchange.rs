@@ -222,23 +222,30 @@ pub(crate) mod test_support {
             use super::super::exchange_edge::{ExchangeDestinationKey, ExchangeEdgeGates};
             use crate::runtime::task::instance::TaskSinkAssignment;
             use crate::task_execution::domain::{EdgeOpenVersion, ExchangeEdgeId};
-            let branches: Vec<_> = match (assignment, program.graph().sink()) {
-                (
-                    TaskSinkAssignment::StreamDestinations { destinations, .. },
-                    Some(novarocks_local_program::StaticSinkProgram::DataStream { branch, .. }),
-                ) => vec![(branch.dest_node_id(), destinations)],
-                (
-                    TaskSinkAssignment::DestinationGroups { groups, .. },
-                    Some(novarocks_local_program::StaticSinkProgram::ChangeStreamRouter {
-                        branches,
-                        ..
-                    }),
-                ) => branches
-                    .iter()
-                    .zip(groups)
-                    .map(|(branch, group)| (branch.dest_node_id(), group))
-                    .collect(),
-                _ => return None,
+            let branches: Vec<_> = match assignment {
+                TaskSinkAssignment::StreamDestinations { destinations, .. } => {
+                    let mut branches = program.graph().stream_branches();
+                    let branch = branches.next().expect("one exact stream branch");
+                    assert!(
+                        branches.next().is_none(),
+                        "one assignment cannot cover multiple streams"
+                    );
+                    vec![(branch.dest_node_id(), destinations)]
+                }
+                TaskSinkAssignment::DestinationGroups { groups, .. } => {
+                    assert_eq!(
+                        program.graph().stream_branches().count(),
+                        groups.len(),
+                        "fixture groups cover every program output"
+                    );
+                    program
+                        .graph()
+                        .stream_branches()
+                        .zip(groups)
+                        .map(|(branch, group)| (branch.dest_node_id(), group))
+                        .collect()
+                }
+                TaskSinkAssignment::None => return None,
             };
             let edges: Vec<_> = branches
                 .into_iter()

@@ -517,29 +517,27 @@ mod router_runtime_tests {
         }
         let Some(StaticSinkProgram::ChangeStreamRouter {
             branches,
-            summary_branch,
-            summary_layout,
             ..
         }) = program.graph().sink()
         else {
             panic!("the original compiler must lower the checked Router")
         };
-        assert_eq!(branches.len(), 3);
-        assert_eq!(
-            *summary_branch, 2,
-            "this compiler author keeps its independent summary last"
-        );
+        assert_eq!(branches.len(), 2);
+        let [summary] = program.graph().summaries() else { panic!("one independent summary") };
+        let summary_layout = summary.layout();
+        assert_eq!(summary.kind(), novarocks_result_contract::SummaryKind::WriteCounts);
+        let summary_branch = branches.len();
         let fixture = Fixture::new();
         let port = fixture.port.clone();
         let mut keys = Vec::new();
         let mut groups = Vec::new();
-        for (index, branch) in branches.iter().enumerate() {
+        for (index, branch) in program.graph().stream_branches().enumerate() {
             let instance = UniqueId::new(0x762, index as i64 + 1);
             let key = ExchangeReceiverKey {
                 task_key: instance,
                 node_id: branch.dest_node_id(),
             };
-            let layout = if index == *summary_branch as usize {
+            let layout = if index == summary_branch {
                 summary_layout.clone()
             } else {
                 receiver_projection(
@@ -656,7 +654,7 @@ mod router_runtime_tests {
         let prepared = prepare_compiled_program_with_sink_materializer(
             Arc::clone(&program),
             Duration::from_millis(10),
-            |actual| {
+            |actual, authors| {
                 assert_eq!(
                     observed_width.replace(Some(actual.get())),
                     None,
@@ -671,6 +669,7 @@ mod router_runtime_tests {
                     Some(gates),
                     actual,
                     state.mem_tracker(),
+                    authors,
                 )
             },
             bindings,

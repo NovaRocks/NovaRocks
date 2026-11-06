@@ -156,38 +156,33 @@ impl CompiledWriterBindings {
             let ProgramNodeKind::TableFinish {
                 inputs,
                 input_roles,
-                count_mode,
                 ..
             } = program.graph().nodes()[id.index()].kind()
             else {
                 unreachable!("finish binding set was checked above");
             };
-            let receiver = input_roles
-                .summaries
-                .write_counts
-                .and_then(|ordinal| inputs.get(ordinal as usize))
-                .and_then(|input| program.exchange_inputs().get(input));
-            let valid =
-                match (count_mode, receiver, &binding.logical_summary) {
-                    (
-                        novarocks_local_program::FinishCountMode::LogicalChanges,
-                        Some(receiver),
-                        Some(bound),
-                    ) => !bound.sources.is_empty()
+            for kind in novarocks_result_contract::SummaryKind::ALL {
+                let receiver = input_roles
+                    .summaries
+                    .get(kind)
+                    .and_then(|ordinal| inputs.get(*ordinal as usize))
+                    .and_then(|input| program.exchange_inputs().get(input));
+                let valid = match (receiver, binding.summaries.get(kind)) {
+                    (Some(receiver), Some(bound)) => !bound.sources.is_empty()
                         && receiver.role
-                            == novarocks_local_program::ProgramOutputRole::LogicalSummary
+                            == novarocks_local_program::ProgramOutputRole::Summary(kind)
                         && receiver.delivery
                             == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
                         && i32::try_from(receiver.receiver_node).ok() == Some(bound.receiver_node),
-                    (novarocks_local_program::FinishCountMode::LogicalChanges, _, _) => false,
-                    (_, None, None) => true,
+                    (None, None) => input_roles.summaries.get(kind).is_none(),
                     _ => false,
                 };
-            if !valid {
-                return Err(crate::exec::fragment::error::program_binding_failure(
-                    FragmentBindingErrorKind::InvalidAssignment,
-                    "Task finish summary binding differs from its exact input role",
-                ));
+                if !valid {
+                    return Err(crate::exec::fragment::error::program_binding_failure(
+                        FragmentBindingErrorKind::InvalidAssignment,
+                        format!("Task {kind} summary binding differs from its exact input role"),
+                    ));
+                }
             }
         }
         for (node, binding) in &self.writers {
@@ -586,7 +581,7 @@ fn prepare_compiled_task_in(
         prepare_compiled_program_with_sink_materializer(
             Arc::clone(program),
             Duration::from_millis(50),
-            |actual_root_dop| {
+            |actual_root_dop, authors| {
                 materialize_compiled_sink_for_pipeline(
                     program,
                     instance.sink_assignment(),
@@ -596,6 +591,7 @@ fn prepare_compiled_task_in(
                     context.edge_gates.clone(),
                     actual_root_dop,
                     runtime_state.mem_tracker(),
+                    authors,
                 )
             },
             receivers.bindings,

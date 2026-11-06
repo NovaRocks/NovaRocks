@@ -1500,7 +1500,7 @@ pub(crate) fn writer_program(
                     writer_results: 0,
                     summaries: Default::default(),
                 },
-                logical_summary_layout: None,
+                summary_layouts: novarocks_result_contract::PerKind::empty(),
                 inputs: vec![ProgramNodeId::new(1)],
                 expected_targets: vec![target],
                 writer_multiplex_layout: intermediate.clone(),

@@ -257,7 +257,7 @@ mod logical_finish_graph {
             .exchange_inputs()
             .iter()
             .find(|(_, input)| {
-                input.role == novarocks_local_program::ProgramOutputRole::LogicalSummary
+                input.role == novarocks_local_program::ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts)
             })
             .unwrap();
         let summary_node = i32::try_from(summary_input.receiver_node).unwrap();
@@ -412,7 +412,7 @@ mod logical_finish_graph {
         let send_summary = || {
             let counts = novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap();
             let chunk = crate::exec::operators::logical_change_summary::summary_chunk(
-                counts,
+                novarocks_result_contract::SummaryValue::WriteCounts(counts),
                 &summary_schema,
                 summary_creation.as_ref(),
             )
@@ -464,7 +464,7 @@ mod logical_finish_graph {
             .bind_finish(
                 root_of(&compiled.finish),
                 TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers))
-                    .with_logical_summary(summary_node, Arc::from([summary_stream.source()]))
+                    .with_summary(novarocks_result_contract::SummaryKind::WriteCounts, summary_node, Arc::from([summary_stream.source()]))
                     .unwrap(),
             )
             .unwrap();

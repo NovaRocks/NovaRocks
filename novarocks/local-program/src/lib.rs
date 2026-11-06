@@ -120,7 +120,7 @@ pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
     ProgramOutputRole, ProgramWriteLayoutPreference, SinkCompileError, StaticRouterRoute,
     StaticSinkError, StaticSinkProgram, StaticStreamBranch, StaticStreamContract,
-    StaticStreamRouting,
+    StaticStreamRouting, StaticSummaryAuthor, StaticSummaryBranch, validate_summary_layout,
 };
 pub use typed_channels::*;
 pub use typed_expressions::*;
@@ -137,4 +137,7 @@ pub use novarocks_type_contract::ValueTypeRef;
 #[cfg(test)]
 mod test_value_types;
 
-pub use novarocks_result_contract::{FinishCountMode, FinishInputs, LogicalChangeCounts};
+pub use novarocks_result_contract::{
+    DeleteVerificationCounts, FinishCountMode, FinishInputs, LogicalChangeCounts, PerKind,
+    SummaryField, SummaryKind, SummaryValue, SummaryWireType,
+};

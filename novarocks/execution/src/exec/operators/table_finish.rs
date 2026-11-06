@@ -30,10 +30,6 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
-#[expect(
-    dead_code,
-    reason = "P07 dual-input kernels await P08 Task binding and P09 builder integration."
-)]
 pub(crate) mod logical_input;
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
@@ -380,6 +376,7 @@ impl TableFinishOperatorFactory {
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
             logical_rows: None,
+            delete_verification: None,
             ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             aggregate: None,
@@ -433,6 +430,7 @@ struct BufferedFragment {
 /// prepared fragments then move through bounded, byte-aware batches.
 struct PrefixOutputCursor {
     row_count_rows: Option<i64>,
+    delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
     fragments: VecDeque<BufferedFragment>,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<Arc<MemTracker>>,
@@ -441,6 +439,7 @@ struct PrefixOutputCursor {
 impl PrefixOutputCursor {
     fn try_new(
         rows: u64,
+        delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
         fragments: Vec<BufferedFragment>,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
@@ -456,6 +455,7 @@ impl PrefixOutputCursor {
         .map_err(finish_connector)?;
         Ok(Self {
             row_count_rows: Some(row_count_rows),
+            delete_verification,
             fragments: fragments.into(),
             root_schema,
             tracker,
@@ -463,7 +463,9 @@ impl PrefixOutputCursor {
     }
 
     fn has_output(&self) -> bool {
-        self.row_count_rows.is_some() || !self.fragments.is_empty()
+        self.row_count_rows.is_some()
+            || self.delete_verification.is_some()
+            || !self.fragments.is_empty()
     }
 
     fn is_finished(&self) -> bool {
@@ -491,6 +493,33 @@ impl PrefixOutputCursor {
                 ],
             )
             .map_err(|error| finish_arrow(FinishArrowOperation::RowCount, error))?;
+            return self.track_batch(batch).map(Some);
+        }
+        if let Some(verification) = self.delete_verification.take() {
+            let (counts, fingerprint) = verification.into_wire();
+            let schema = self.root_schema.arrow_schema_ref();
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+            columns.extend((0..8).map(|ordinal| {
+                if ordinal == 0 {
+                    Arc::new(Int8Array::from(vec![
+                        RootRowKind::DeleteVerification.to_wire(),
+                    ])) as ArrayRef
+                } else {
+                    new_null_array(schema.field(ordinal).data_type(), 1)
+                }
+            }));
+            columns.extend(
+                counts
+                    .into_iter()
+                    .map(|count| Arc::new(Int64Array::from(vec![count])) as ArrayRef),
+            );
+            columns.push(Arc::new(arrow::array::FixedSizeBinaryArray::new(
+                16,
+                arrow::buffer::Buffer::from_vec(fingerprint.to_vec()),
+                None,
+            )));
+            let batch = RecordBatch::try_new(schema, columns)
+                .map_err(|error| finish_arrow(FinishArrowOperation::DeleteVerification, error))?;
             return self.track_batch(batch).map(Some);
         }
         if self.fragments.is_empty() {
@@ -674,6 +703,7 @@ struct TableFinishOperator {
     rows: WriteRowCountAccumulator,
     // Set only by the finish-owned logical input after both inputs reach EOS.
     logical_rows: Option<novarocks_local_program::LogicalChangeCounts>,
+    delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
     aggregate: Option<ChildStep>,
@@ -991,6 +1021,7 @@ impl TableFinishOperator {
         self.prefix_output = Some(PrefixOutputCursor::try_new(
             self.logical_rows
                 .map_or(self.rows.get(), |counts| counts.affected_rows()),
+            self.delete_verification,
             std::mem::take(&mut self.fragments),
             Arc::clone(self.prepared_root_schema()?.chunk_schema()),
             self.output_tracker.as_ref().map(Arc::clone),
@@ -6208,6 +6239,193 @@ mod tests {
         operator.prepare().unwrap();
     }
     #[test]
+    fn typed_finish_cannot_replace_one_kinds_missing_source_with_another_complete_kind() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use novarocks_result_contract::{PerKind, SummaryKind, SummaryValue};
+        for missing in SummaryKind::ALL {
+            let state = IngressFixture::task_state(&RuntimeState::default());
+            let writers = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            writers
+                .push_chunk(None, writer_rows(vec![row_count_row(0, 0)]))
+                .unwrap();
+            writers.producer_finished();
+            let counts = IngressFixture::new(1, &state);
+            let verification = IngressFixture::new_kind(1, &state, SummaryKind::DeleteVerification);
+            let factory = factory(1).with_logical_input(
+                writers,
+                PerKind {
+                    write_counts: Some(counts.input()),
+                    delete_verification: Some(verification.input()),
+                },
+            );
+            let mut source = factory.create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            for (kind, input) in [
+                (SummaryKind::WriteCounts, &counts),
+                (SummaryKind::DeleteVerification, &verification),
+            ] {
+                input.send_value(
+                    0,
+                    1,
+                    (kind != missing).then_some(SummaryValue::zero(kind)),
+                    true,
+                );
+            }
+            let mut failure = None;
+            for _ in 0..100 {
+                match source.drive_for_test(&state) {
+                    Ok(step) => assert!(
+                        step.output.is_none(),
+                        "incomplete typed coverage never emits a Root record"
+                    ),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                failure
+                    .expect("normal End with missing source must fail")
+                    .to_string()
+                    .contains(&missing.to_string())
+            );
+            source.cancel();
+            source.close().unwrap();
+        }
+    }
+    #[test]
+    fn typed_finish_waits_for_every_kind_end_and_emits_exact_verification_after_row_count() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::driver_step::TurnWork;
+        use novarocks_result_contract::{
+            DeleteVerificationCounts, LogicalChangeCounts, PerKind, SummaryKind, SummaryValue,
+        };
+        for with_counts in [false, true] {
+            let state = IngressFixture::task_state(&RuntimeState::default());
+            let writers = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            writers
+                .push_chunk(None, writer_rows(vec![row_count_row(0, 5)]))
+                .unwrap();
+            writers.producer_finished();
+            let counts = with_counts.then(|| IngressFixture::new(1, &state));
+            let verification = IngressFixture::new_kind(1, &state, SummaryKind::DeleteVerification);
+            let expected = DeleteVerificationCounts::try_new(9, 7, 2, u128::MAX - 17).unwrap();
+            let factory = factory(1).with_logical_input(
+                writers.clone(),
+                PerKind {
+                    write_counts: counts.as_ref().map(IngressFixture::input),
+                    delete_verification: Some(verification.input()),
+                },
+            );
+            let mut source = factory.create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            if let Some(counts) = &counts {
+                counts.send(
+                    0,
+                    1,
+                    Some(LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                    true,
+                );
+            }
+            verification.send_value(
+                0,
+                1,
+                Some(SummaryValue::DeleteVerification(expected)),
+                false,
+            );
+            let errors = state.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 1);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..120 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                assert!(
+                    step.output.is_none(),
+                    "coverage DATA and another kind's EOS cannot finalize verification"
+                );
+                assert!(!matches!(step.next, NextStep::Finished));
+            }
+            assert!(
+                writers.need_input(),
+                "writer input drains independently of verification End"
+            );
+            verification.send_value(0, 2, None, true);
+            let mut outputs = Vec::new();
+            let mut finished = false;
+            for _ in 0..240 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                outputs.extend(step.output);
+                if matches!(step.next, NextStep::Finished) {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished);
+            assert_eq!(outputs.len(), 2);
+            let kinds = outputs
+                .iter()
+                .map(|output| {
+                    output.columns()[0]
+                        .as_any()
+                        .downcast_ref::<Int8Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                [
+                    RootRowKind::RowCount.to_wire(),
+                    RootRowKind::DeleteVerification.to_wire()
+                ]
+            );
+            assert_eq!(
+                outputs[0].columns()[2]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                if with_counts { 9 } else { 5 }
+            );
+            let verification = &outputs[1];
+            for column in &verification.columns()[1..8] {
+                assert!(column.is_null(0));
+            }
+            let (counts, fingerprint) = expected.into_wire();
+            for (column, count) in verification.columns()[8..11].iter().zip(counts) {
+                assert_eq!(
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    count
+                );
+            }
+            assert_eq!(
+                verification.columns()[11]
+                    .as_any()
+                    .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                    .unwrap()
+                    .value(0),
+                &fingerprint
+            );
+            source.close().unwrap();
+        }
+    }
+    #[test]
     fn logical_change_summary_finish_one_unit_turns_drain_writers_before_summary_end() {
         use crate::exec::operators::{
             logical_change_summary::tests::IngressFixture,
@@ -6226,7 +6444,13 @@ mod tests {
                 )
                 .unwrap();
             assert!(!shared.need_input());
-            let factory = factory(2).with_logical_input(shared.clone(), ingress.input());
+            let factory = factory(2).with_logical_input(
+                shared.clone(),
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            );
             let mut source = factory.create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let errors = state.error_state();
@@ -6358,9 +6582,13 @@ mod tests {
                 ],
             ),
         ];
-        let factory = fixture
-            .inner
-            .with_logical_input(shared.clone(), ingress.input());
+        let factory = fixture.inner.with_logical_input(
+            shared.clone(),
+            novarocks_result_contract::PerKind {
+                write_counts: Some(ingress.input()),
+                delete_verification: None,
+            },
+        );
         let mut source = factory.create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let output = ResultSinkBuffer::new();
@@ -6448,7 +6676,13 @@ mod tests {
             }
             ingress.send(0, 1, None, true);
             let mut source = factory(1)
-                .with_logical_input(shared, ingress.input())
+                .with_logical_input(
+                    shared,
+                    novarocks_result_contract::PerKind {
+                        write_counts: Some(ingress.input()),
+                        delete_verification: None,
+                    },
+                )
                 .create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let mut calls = TestDriver::new(source.as_mut(), &state);
@@ -6469,7 +6703,13 @@ mod tests {
         shared.producer_finished();
         ingress.send(0, 1, None, true);
         let mut source = factory(1)
-            .with_logical_input(shared, ingress.input())
+            .with_logical_input(
+                shared,
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            )
             .create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let original = finish_contract(
@@ -6545,7 +6785,13 @@ mod tests {
         );
         let mut source = fixture
             .inner
-            .with_logical_input(shared, ingress.input())
+            .with_logical_input(
+                shared,
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            )
             .create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let errors = state.error_state();
@@ -6652,7 +6898,13 @@ mod tests {
             // Source preparation/subscription. No producer emits another wake below.
             let mut source = fixture
                 .inner
-                .with_logical_input(shared, ingress.input())
+                .with_logical_input(
+                    shared,
+                    novarocks_result_contract::PerKind {
+                        write_counts: Some(ingress.input()),
+                        delete_verification: None,
+                    },
+                )
                 .create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let errors = state.error_state();

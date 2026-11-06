@@ -30,23 +30,24 @@ use crate::exec::pipeline::{
     step::InputResult,
 };
 use crate::runtime::observable::ObserverSubscription;
+use novarocks_result_contract::{PerKind, SummaryKind, SummaryValue};
 use std::sync::Mutex;
 
 pub(crate) struct LogicalTableFinishFactory {
     core: TableFinishOperatorFactory,
     writer: UnionAllSharedState,
-    summary: Mutex<Option<SourceBoundSummaryInput>>,
+    summaries: Mutex<Option<PerKind<SourceBoundSummaryInput>>>,
 }
 impl TableFinishOperatorFactory {
     pub(crate) fn with_logical_input(
         self,
         writer: UnionAllSharedState,
-        summary: SourceBoundSummaryInput,
+        summaries: PerKind<SourceBoundSummaryInput>,
     ) -> LogicalTableFinishFactory {
         LogicalTableFinishFactory {
             core: self,
             writer,
-            summary: Mutex::new(Some(summary)),
+            summaries: Mutex::new(Some(summaries)),
         }
     }
 }
@@ -59,15 +60,15 @@ impl OperatorFactory for LogicalTableFinishFactory {
     }
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let mut failure = None;
-        let summary = if dop == 1 && driver_id == 0 {
-            self.summary
+        let summaries = if dop == 1 && driver_id == 0 {
+            self.summaries
                 .lock()
                 .expect("logical finish binding lock")
                 .take()
         } else {
             None
         };
-        if summary.is_none() {
+        if summaries.is_none() {
             failure = Some(finish_contract(
                 FinishContractSite::Binding,
                 "logical finish requires exactly one owner of both inputs",
@@ -84,10 +85,14 @@ impl OperatorFactory for LogicalTableFinishFactory {
             writer_admission: None,
             writer_end: false,
             receiver: ReceiverSlot::new(HydrateInput::default()),
-            summary,
-            summary_wait: None,
-            summary_end: false,
-            coverage: None,
+            summaries: summaries.unwrap_or_else(PerKind::empty).map(|_, input| {
+                FinishSummaryInput {
+                    input,
+                    wait: None,
+                    end: false,
+                    coverage: None,
+                }
+            }),
             observable,
             subscriptions: Vec::new(),
             cursor: 0,
@@ -99,6 +104,17 @@ impl OperatorFactory for LogicalTableFinishFactory {
         }))
     }
 }
+struct FinishSummaryInput {
+    input: SourceBoundSummaryInput,
+    wait: Option<WaitFact>,
+    end: bool,
+    coverage: Option<SummaryCoverage>,
+}
+impl FinishSummaryInput {
+    fn ready(&self) -> bool {
+        !self.end && (self.wait.as_ref().is_none_or(WaitFact::is_ready) || self.input.ready())
+    }
+}
 struct LogicalFinish {
     core: TableFinishOperator,
     core_next: NextStep,
@@ -108,10 +124,7 @@ struct LogicalFinish {
     writer_admission: Option<AdmissionNext>,
     writer_end: bool,
     receiver: ReceiverSlot<HydrateInput>,
-    summary: Option<SourceBoundSummaryInput>,
-    summary_wait: Option<WaitFact>,
-    summary_end: bool,
-    coverage: Option<SummaryCoverage>,
+    summaries: PerKind<FinishSummaryInput>,
     observable: Arc<Observable>,
     subscriptions: Vec<ObserverSubscription>,
     cursor: usize,
@@ -134,7 +147,7 @@ impl LogicalFinish {
         if let Some(scope) = &self.diagnostics {
             scope.emit(event, || format!(
                 "service={service:?} cursor={} writer_end={} summary_end={} writer_pending={} receiver_occupied={} core_next={:?} summary_wait={:?}",
-                self.cursor, self.writer_end, self.summary_end, self.writer_pending.is_some(), self.receiver.is_occupied(), self.core_next, self.summary_wait
+                self.cursor, self.writer_end, self.summaries.iter().all(|(_, input)| input.end), self.writer_pending.is_some(), self.receiver.is_occupied(), self.core_next, self.summaries.iter().map(|(kind, input)| (kind, &input.wait)).collect::<Vec<_>>()
             ));
         }
     }
@@ -154,16 +167,11 @@ impl LogicalFinish {
             && (self.writer_pending.is_some() || self.writer.runnable())
     }
     fn summary_ready(&self) -> bool {
-        !self.summary_end
-            && (self.summary_wait.as_ref().is_none_or(WaitFact::is_ready)
-                || self
-                    .summary
-                    .as_ref()
-                    .is_some_and(SourceBoundSummaryInput::ready))
+        self.summaries.iter().any(|(_, input)| input.ready())
     }
     fn can_finalize(&self) -> bool {
         self.writer_end
-            && self.summary_end
+            && self.summaries.iter().all(|(_, input)| input.end)
             && !self.receiver.is_occupied()
             && self.writer_pending.is_none()
             && matches!(self.core_next, NextStep::NeedInput)
@@ -217,24 +225,28 @@ impl LogicalFinish {
         }
         Ok(())
     }
-    fn service_summary(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
-        match self
-            .summary
-            .as_mut()
-            .ok_or(ConstructionFailure::MissingOwner)?
-            .poll(ctx)?
-        {
+    fn service_summary(
+        &mut self,
+        kind: SummaryKind,
+        ctx: &mut DriverStep<'_>,
+    ) -> ExecutionResult<()> {
+        let input = self
+            .summaries
+            .get_mut(kind)
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        match input.input.poll(ctx)? {
             SummaryRead::Summary(summary) => {
-                self.summary_wait = None;
-                self.coverage
+                input.wait = None;
+                input
+                    .coverage
                     .as_mut()
                     .ok_or(ConstructionFailure::MissingOwner)?
                     .accept(summary)?;
             }
-            SummaryRead::Pending(wait) => self.summary_wait = Some(wait),
+            SummaryRead::Pending(wait) => input.wait = Some(wait),
             SummaryRead::End => {
-                self.summary_end = true;
-                self.summary_wait = None;
+                input.end = true;
+                input.wait = None;
             }
         }
         Ok(())
@@ -253,12 +265,19 @@ impl LogicalFinish {
             }
         } else if self.can_finalize() {
             ctx.checkpoint()?;
-            self.core.logical_rows = Some(
-                self.coverage
+            for (_, input) in self.summaries.iter() {
+                match input
+                    .coverage
                     .as_ref()
                     .ok_or(ConstructionFailure::MissingOwner)?
-                    .finish()?,
-            );
+                    .finish()?
+                {
+                    SummaryValue::WriteCounts(counts) => self.core.logical_rows = Some(counts),
+                    SummaryValue::DeleteVerification(counts) => {
+                        self.core.delete_verification = Some(counts)
+                    }
+                }
+            }
             TransformKernel::finish(&mut self.core, ctx)?
         } else {
             TransformKernel::drive(&mut self.core, ctx)?
@@ -282,7 +301,11 @@ impl LogicalFinish {
                 NextStep::Wait(w) => w.deadline,
                 _ => None,
             })
-            .chain(self.summary_wait.as_ref().and_then(|w| w.deadline))
+            .chain(
+                self.summaries
+                    .iter()
+                    .filter_map(|(_, input)| input.wait.as_ref().and_then(|w| w.deadline)),
+            )
             .chain(match &self.writer_admission {
                 Some(AdmissionNext::Wait(w)) => w.deadline,
                 _ => None,
@@ -318,12 +341,20 @@ impl SourceKernel for LogicalFinish {
         let generation = self.observable.generation();
         self.poll_children(ctx)?;
         let mut output = None;
-        for offset in 0..3 {
-            let service = (self.cursor + offset) % 3;
-            let ready = match service {
-                0 => self.writer_ready(),
-                1 => self.summary_ready(),
-                _ => self.core_ready(),
+        let services = self.summaries.iter().count() + 2;
+        for offset in 0..services {
+            let service = (self.cursor + offset) % services;
+            let kind = service
+                .checked_sub(1)
+                .and_then(|index| self.summaries.iter().nth(index).map(|(kind, _)| kind));
+            let ready = if service == 0 {
+                self.writer_ready()
+            } else if let Some(kind) = kind {
+                self.summaries
+                    .get(kind)
+                    .is_some_and(FinishSummaryInput::ready)
+            } else {
+                self.core_ready()
             };
             if !ready {
                 continue;
@@ -333,18 +364,18 @@ impl SourceKernel for LogicalFinish {
             if ctx.work().remaining() == 0 {
                 return Ok(StepResult::new(None, NextStep::Yield, 0));
             }
-            self.cursor = (service + 1) % 3;
+            self.cursor = (service + 1) % services;
             #[cfg(novarocks_dev_controls)]
             self.emit_diagnostic("logical_finish_service_enter", Some(service));
-            match service {
-                0 => self.service_writer(ctx)?,
-                1 => {
-                    if !ctx.work().try_consume(1) {
-                        return Ok(StepResult::new(None, NextStep::Yield, 0));
-                    }
-                    self.service_summary(ctx)?;
+            if service == 0 {
+                self.service_writer(ctx)?;
+            } else if let Some(kind) = kind {
+                if !ctx.work().try_consume(1) {
+                    return Ok(StepResult::new(None, NextStep::Yield, 0));
                 }
-                _ => output = self.service_core(ctx)?,
+                self.service_summary(kind, ctx)?;
+            } else {
+                output = self.service_core(ctx)?;
             }
             #[cfg(novarocks_dev_controls)]
             self.emit_diagnostic("logical_finish_service_returned", Some(service));
@@ -398,8 +429,8 @@ impl OperatorLifecycle for LogicalFinish {
         {
             self.diagnostics =
                 crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(state);
-            if let Some(summary) = &mut self.summary {
-                summary.bind_diagnostics(self.diagnostics.clone());
+            for (_, input) in self.summaries.iter_mut() {
+                input.input.bind_diagnostics(self.diagnostics.clone());
             }
         }
         self.writer_state.bind_runtime(state)?;
@@ -414,32 +445,36 @@ impl OperatorLifecycle for LogicalFinish {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        let summary = self
-            .summary
-            .as_mut()
-            .ok_or(ConstructionFailure::MissingOwner)?;
-        summary.prepare(
-            self.construction
-                .as_deref()
-                .ok_or(ConstructionFailure::MissingOwner)?,
-            self.tracker
-                .clone()
-                .ok_or(ConstructionFailure::MissingOwner)?,
-        )?;
-        self.coverage = Some(SummaryCoverage::new(
-            summary.sources()?,
-            self.tracker
-                .clone()
-                .ok_or(ConstructionFailure::MissingOwner)?,
-        )?);
-        for source in [summary.observable(), self.core.source_observable.clone()] {
+        for (_, input) in self.summaries.iter_mut() {
+            input.input.prepare(
+                self.construction
+                    .as_deref()
+                    .ok_or(ConstructionFailure::MissingOwner)?,
+                self.tracker
+                    .clone()
+                    .ok_or(ConstructionFailure::MissingOwner)?,
+            )?;
+            input.coverage = Some(SummaryCoverage::new(
+                input.input.sources()?,
+                self.tracker
+                    .clone()
+                    .ok_or(ConstructionFailure::MissingOwner)?,
+            )?);
             let target = Arc::downgrade(&self.observable);
-            self.subscriptions.push(source.subscribe(Arc::new(move || {
+            self.subscriptions
+                .push(input.input.observable().subscribe(Arc::new(move || {
+                    if let Some(target) = target.upgrade() {
+                        target.notify_observers();
+                    }
+                })));
+        }
+        let target = Arc::downgrade(&self.observable);
+        self.subscriptions
+            .push(self.core.source_observable.subscribe(Arc::new(move || {
                 if let Some(target) = target.upgrade() {
                     target.notify_observers();
                 }
             })));
-        }
         self.core.prepare()?;
         self.writer.prepare()
     }

@@ -2496,6 +2496,10 @@ mod statistics {
                     rows.iter().map(|row| row.5.as_deref()).collect::<Vec<_>>(),
                 )),
                 Arc::new(maps),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::FixedSizeBinary(16), rows.len()),
             ],
         )
         .unwrap()

@@ -590,7 +590,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             ));
             assert_eq!(
                 program.exchange_inputs()[&summary].role,
-                ProgramOutputRole::LogicalSummary
+                ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts)
             );
             compiled_finishes += 1;
         }

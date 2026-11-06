@@ -41,14 +41,14 @@ use crate::exec::node::table_write_relation::{
 /// Runtime validation authority for a single Task instance of TableFinish.
 pub struct TableFinishRuntimeBinding {
     pub(crate) fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    pub(crate) logical_summary: Option<LogicalSummaryRuntimeBinding>,
+    pub(crate) summaries: novarocks_result_contract::PerKind<SummaryRuntimeBinding>,
     #[cfg(novarocks_dev_controls)]
     pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateFaultHook>,
 }
 
 /// Exact Native input custody, separate from the pure finish declaration.
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalSummaryRuntimeBinding {
+pub(crate) struct SummaryRuntimeBinding {
     pub(crate) receiver_node: i32,
     pub(crate) sources: Arc<[novarocks_execution_contract::ExchangeSource]>,
 }
@@ -58,15 +58,16 @@ impl TableFinishRuntimeBinding {
     pub fn new(fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>) -> Self {
         Self {
             fragment_validator,
-            logical_summary: None,
+            summaries: novarocks_result_contract::PerKind::empty(),
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         }
     }
 
     /// The host binds the same frozen source set that authorizes this input.
-    pub fn with_logical_summary(
+    pub fn with_summary(
         mut self,
+        kind: novarocks_result_contract::SummaryKind,
         receiver_node: i32,
         sources: Arc<[novarocks_execution_contract::ExchangeSource]>,
     ) -> crate::runtime::task::ExecutionResult<Self> {
@@ -74,16 +75,25 @@ impl TableFinishRuntimeBinding {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        if receiver_node < 0 || sources.is_empty() || unique.len() != sources.len() {
+        if receiver_node < 0
+            || sources.is_empty()
+            || unique.len() != sources.len()
+            || self.summaries.get(kind).is_some()
+        {
             return Err(crate::exec::fragment::error::program_binding_failure(
                 crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
-                "logical summary requires one exact nonempty source set",
+                format!(
+                    "{kind} summary requires one unique binding with an exact nonempty source set"
+                ),
             ));
         }
-        self.logical_summary = Some(LogicalSummaryRuntimeBinding {
-            receiver_node,
-            sources,
-        });
+        self.summaries.insert(
+            kind,
+            SummaryRuntimeBinding {
+                receiver_node,
+                sources,
+            },
+        );
         Ok(self)
     }
 

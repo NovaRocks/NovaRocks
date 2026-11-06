@@ -632,17 +632,23 @@ fn router_has_independent_summary_and_occurrence_preserving_provider_branches() 
         let Some(StaticSinkProgram::ChangeStreamRouter {
             branches,
             routes,
-            summary_branch,
-            summary_layout,
             effect_slot,
             arena,
         }) = graph.sink()
         else {
             panic!("router")
         };
-        assert_eq!(branches.len(), 3);
+        assert_eq!(branches.len(), 2);
+        let [summary] = graph.summaries() else {
+            panic!("one independent output")
+        };
+        assert_eq!(
+            summary.kind(),
+            novarocks_local_program::SummaryKind::WriteCounts
+        );
+        let summary_layout = summary.layout();
         assert_eq!(routes.len(), 2);
-        assert_eq!(*summary_branch, 2);
+        assert_eq!(graph.stream_branches().count(), 3);
         assert_eq!(summary_layout.schema().fields().len(), 3);
         assert!(
             summary_layout
@@ -771,7 +777,7 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
             input_roles,
             inputs,
             expected_targets,
-            logical_summary_layout,
+            summary_layouts,
             writer_multiplex_layout,
             ..
         } = graph.nodes()[graph.root().index()].kind()
@@ -794,10 +800,13 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
             ProgramNodeKind::ExchangeSource { .. }
         ));
         let facts = &program.exchange_inputs()[&inputs[summary_index]];
-        assert_eq!(facts.role, ProgramOutputRole::LogicalSummary);
+        assert_eq!(
+            facts.role,
+            ProgramOutputRole::Summary(novarocks_local_program::SummaryKind::WriteCounts)
+        );
         assert_eq!(facts.delivery, ExchangeDeliveryRequirement::MustDrain);
         assert_eq!(
-            logical_summary_layout.as_ref().unwrap().slots(),
+            summary_layouts.write_counts.as_ref().unwrap().slots(),
             summary.output_layout().slots()
         );
         let multiplex = &graph.nodes()[inputs[writer_index].index()];

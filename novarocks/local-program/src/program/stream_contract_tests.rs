@@ -131,14 +131,11 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
     };
     let target = WriteTargetOrdinal::try_new(0).unwrap();
     let sink = StaticSinkProgram::try_change_stream_router(
-        vec![
-            branch(20, columns, ProgramOutputRole::ProviderRoute { target }),
-            branch(
-                21,
-                summary_layout.slots().to_vec(),
-                ProgramOutputRole::LogicalSummary,
-            ),
-        ],
+        vec![branch(
+            20,
+            columns,
+            ProgramOutputRole::ProviderRoute { target },
+        )],
         expressions(),
         SlotId::new(1),
         vec![StaticRouterRoute {
@@ -146,7 +143,16 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
             branch: 0,
             accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
         }],
-        1,
+    )
+    .unwrap();
+    let summary_output = crate::StaticSummaryBranch::try_new(
+        crate::SummaryKind::WriteCounts,
+        crate::StaticSummaryAuthor::RouterSink,
+        branch(
+            21,
+            summary_layout.slots().to_vec(),
+            ProgramOutputRole::Summary(crate::SummaryKind::WriteCounts),
+        ),
         summary_layout.clone(),
     )
     .unwrap();
@@ -189,7 +195,7 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
             root_layout.clone(),
         ),
     ];
-    LocalProgramGraph::try_new_with_sink(
+    LocalProgramGraph::try_new_with_outputs(
         nodes,
         ProgramNodeId::new(1),
         main,
@@ -204,13 +210,80 @@ fn router_graph(projection: RouteProjection) -> Result<LocalProgramGraph, LocalP
             BindingRequirement::ExchangeOutput {
                 branch: 1,
                 layout: summary_layout,
-                role: ProgramOutputRole::LogicalSummary,
+                role: ProgramOutputRole::Summary(
+                    novarocks_result_contract::SummaryKind::WriteCounts,
+                ),
                 delivery: ExchangeDeliveryRequirement::MustDrain,
             },
         ])
         .unwrap(),
         Some(sink),
+        vec![summary_output],
     )
+}
+
+#[test]
+fn program_summary_table_rejects_duplicate_kinds_and_all_current_node_authors() {
+    let graph = router_graph(RouteProjection::Data).unwrap();
+    let rebuild = |summaries| {
+        LocalProgramGraph::try_new_with_outputs(
+            graph.nodes().to_vec(),
+            graph.root(),
+            graph.expressions().clone(),
+            graph.profile().clone(),
+            graph.requirements().clone(),
+            graph.sink().cloned(),
+            summaries,
+        )
+    };
+    let original = graph.summaries()[0].clone();
+    assert!(rebuild(vec![original.clone(), original.clone()]).is_err());
+    for node in [ProgramNodeId::new(0), ProgramNodeId::new(1)] {
+        let output = crate::StaticSummaryBranch::try_new(
+            crate::SummaryKind::WriteCounts,
+            crate::StaticSummaryAuthor::Node(node),
+            original.branch().clone(),
+            original.layout().clone(),
+        )
+        .unwrap();
+        assert!(rebuild(vec![output]).is_err());
+    }
+    let verification = layout(&[
+        ("requested", DataType::Int64, 10),
+        ("matched", DataType::Int64, 11),
+        ("insufficient_keys", DataType::Int64, 12),
+        (
+            "insufficient_fingerprint",
+            DataType::FixedSizeBinary(16),
+            13,
+        ),
+    ]);
+    let branch = StaticStreamBranch::try_new(
+        21,
+        DataStreamPartitionType::Unpartitioned,
+        vec![],
+        verification.slots().to_vec(),
+        None,
+        StaticStreamContract {
+            role: ProgramOutputRole::Summary(crate::SummaryKind::DeleteVerification),
+            delivery: ExchangeDeliveryRequirement::MustDrain,
+            routing: StaticStreamRouting::Ordinary,
+        },
+    )
+    .unwrap();
+    for author in [
+        crate::StaticSummaryAuthor::RouterSink,
+        crate::StaticSummaryAuthor::Node(ProgramNodeId::new(1)),
+    ] {
+        let output = crate::StaticSummaryBranch::try_new(
+            crate::SummaryKind::DeleteVerification,
+            author,
+            branch.clone(),
+            verification.clone(),
+        )
+        .unwrap();
+        assert!(rebuild(vec![output]).is_err());
+    }
 }
 
 #[test]
@@ -271,7 +344,10 @@ fn finish_graph(shape: SummaryInput) -> Result<LocalProgramGraph, LocalProgramEr
                 delete_verification: None,
             },
         },
-        logical_summary_layout: Some(summary_layout.clone()),
+        summary_layouts: novarocks_result_contract::PerKind {
+            write_counts: Some(summary_layout.clone()),
+            delete_verification: None,
+        },
         expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
         writer_multiplex_layout: writer_layout.clone(),
         root_result_layout: root_layout.clone(),
@@ -306,7 +382,7 @@ fn finish_graph(shape: SummaryInput) -> Result<LocalProgramGraph, LocalProgramEr
             )
         } else {
             (
-                ProgramOutputRole::LogicalSummary,
+                ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts),
                 if matches!(shape, SummaryInput::WrongDelivery) {
                     ExchangeDeliveryRequirement::DemandDriven
                 } else {
