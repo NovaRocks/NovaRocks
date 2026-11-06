@@ -65,15 +65,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_pjagg_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW pjagg_mv_${uuid0}
-PARTITION BY region
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
-FROM ice_ivm_pjagg_${uuid0}.ns_${uuid0}.fact AS f
-JOIN ice_ivm_pjagg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
-GROUP BY d.region;
 
 -- query 2
 -- @skip_result_check=true
@@ -86,6 +77,15 @@ INSERT INTO ice_ivm_pjagg_${uuid0}.ns_${uuid0}.fact VALUES
   (2, 10, 200),
   (3, 20, 50),
   (4, 30, 70);
+CREATE MATERIALIZED VIEW pjagg_mv_${uuid0}
+PARTITION BY region
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT d.region, COUNT(*) AS c, SUM(f.amount) AS s
+FROM ice_ivm_pjagg_${uuid0}.ns_${uuid0}.fact AS f
+JOIN ice_ivm_pjagg_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
+GROUP BY d.region;
 REFRESH MATERIALIZED VIEW pjagg_mv_${uuid0};
 
 -- query 3

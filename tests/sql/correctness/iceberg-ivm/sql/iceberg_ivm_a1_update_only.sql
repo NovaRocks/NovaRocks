@@ -57,12 +57,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_upd_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW sales_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 2
-PROPERTIES('storage_engine' = 'iceberg')
-AS SELECT id, region, amount
-FROM ice_ivm_upd_${uuid0}.ns_${uuid0}.sales_${uuid0}
-WHERE amount > 300;
 
 -- query 2
 -- @skip_result_check=true
@@ -78,6 +72,12 @@ FROM TABLE(generate_series(1, 1000));
 -- query 3
 -- @skip_result_check=true
 -- Initial full refresh
+CREATE MATERIALIZED VIEW sales_mv_${uuid0}
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PROPERTIES('storage_engine' = 'iceberg')
+AS SELECT id, region, amount
+FROM ice_ivm_upd_${uuid0}.ns_${uuid0}.sales_${uuid0}
+WHERE amount > 300;
 REFRESH MATERIALIZED VIEW sales_mv_${uuid0};
 
 -- query 4

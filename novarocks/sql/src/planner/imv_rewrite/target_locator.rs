@@ -235,7 +235,7 @@ fn build_target_locator_join(
     let right_row_id_id = allocate_imv_column(
         ctx,
         crate::common::ICEBERG_ROW_ID_COL,
-        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
     )?;
     let right_last_updated_seq_id = allocate_imv_column(
         ctx,
@@ -416,7 +416,7 @@ fn build_target_locator_scan(
         ColumnDef {
             name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
-            nullable: false,
+            nullable: true,
             write_default: None,
             logical_type: None,
         },
@@ -457,7 +457,7 @@ fn build_target_locator_scan(
     scan_columns.push(output_column(
         right_row_id_id,
         crate::common::ICEBERG_ROW_ID_COL,
-        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     ));
     scan_columns.push(output_column(

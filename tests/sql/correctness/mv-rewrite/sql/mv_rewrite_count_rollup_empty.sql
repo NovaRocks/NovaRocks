@@ -70,11 +70,11 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags (
 ) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
 -- query 4
--- Give the empty table a real snapshot so the MV refresh records a pin the
--- strict freshness check can compare against.
+-- Commit v3 lineage, then leave the source empty for every initial COUNT
+-- oracle. A zero-row INSERT can be a no-op without a snapshot.
 -- @skip_result_check=true
-INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags
-SELECT '2023-04-13', 1, 'a', 1 FROM TABLE(generate_series(1, 1)) t(n) WHERE n < 0;
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.user_tags VALUES ('seed', 0, 'seed', 0);
+DELETE FROM mvrw_${uuid0}.ns_${uuid0}.user_tags WHERE dt = 'seed';
 
 -- query 5
 -- @skip_result_check=true

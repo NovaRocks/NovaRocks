@@ -806,7 +806,7 @@ fn build_target_locator_scan(
         ColumnDef {
             name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
-            nullable: false,
+            nullable: true,
             write_default: None,
             logical_type: None,
         },
@@ -840,7 +840,7 @@ fn build_target_locator_scan(
         output_column(
             locator_row_id_column_id,
             crate::common::ICEBERG_ROW_ID_COL,
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             true,
         ),
         output_column(
@@ -1729,6 +1729,18 @@ mod tests {
             assert_eq!(scan.columns[0].column_id, ColumnId(2));
             assert!(sql_mv_target_locator_scan(&scan.table.source).is_some());
             assert_eq!(scan.table.iceberg_row_lineage_metadata_columns.len(), 4);
+            for (metadata, output) in scan
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .zip(&scan.columns[1..])
+            {
+                let lineage = metadata.name == crate::common::ICEBERG_ROW_ID_COL
+                    || metadata.name == crate::common::ICEBERG_LAST_UPDATED_SEQ_COL;
+                assert_eq!(metadata.nullable, lineage, "{}", metadata.name);
+                assert_eq!(output.value_type.nullable(), lineage, "{}", output.name);
+                assert_eq!(metadata.declared_value_type().unwrap(), output.value_type);
+            }
         }
     }
 

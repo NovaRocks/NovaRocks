@@ -58,14 +58,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_join_logical_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW mv_w9_join_refresh_logical_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT l.id AS id, l.region AS region, r.category AS category, l.amount AS amount
-FROM ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} AS l
-JOIN ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} AS r ON l.id = r.id
-WHERE l.amount > 0;
 
 -- query 2
 -- @skip_result_check=true
@@ -78,6 +70,14 @@ INSERT INTO ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} VALUES
 
 -- query 3
 -- @skip_result_check=true
+CREATE MATERIALIZED VIEW mv_w9_join_refresh_logical_${uuid0}
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT l.id AS id, l.region AS region, r.category AS category, l.amount AS amount
+FROM ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} AS l
+JOIN ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_right_${uuid0} AS r ON l.id = r.id
+WHERE l.amount > 0;
 REFRESH MATERIALIZED VIEW mv_w9_join_refresh_logical_${uuid0};
 
 -- query 4

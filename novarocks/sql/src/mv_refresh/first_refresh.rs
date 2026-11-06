@@ -1973,20 +1973,16 @@ fn find_row_id_column(
         crate::common::ICEBERG_ROW_ID_COL,
         &format!("{role} row-id"),
     )?;
-    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64
-        || column.value_type.nullable()
-    {
+    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64 {
         return Err(format!(
             "join first-refresh {role} row-id has invalid shape"
         ));
     }
-    Ok(output_column(
-        column.column_id,
-        crate::common::ICEBERG_ROW_ID_COL,
-        arrow::datatypes::DataType::Int64,
-        false,
-        true,
-    ))
+    Ok(crate::analysis::OutputColumn {
+        name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
+        is_internal: true,
+        ..column
+    })
 }
 
 fn join_key_pairs(
@@ -3034,6 +3030,65 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn join_first_refresh_row_id_retains_exact_source_nullability() {
+        for nullable in [false, true] {
+            let column = output_column(
+                crate::column_id::ColumnId(7),
+                "_row_id",
+                DataType::Int64,
+                nullable,
+                false,
+            );
+            let scan = JoinBaseScan {
+                columns: vec![column.clone()],
+            };
+            let actual = find_row_id_column(&scan, "left").unwrap();
+            assert_eq!(actual.column_id, column.column_id);
+            assert_eq!(actual.name, column.name);
+            assert_eq!(actual.value_type, column.value_type);
+            assert!(actual.is_internal);
+        }
+    }
+
+    #[test]
+    fn join_first_refresh_row_id_still_requires_unique_int64_source() {
+        let column = output_column(
+            crate::column_id::ColumnId(7),
+            "_row_id",
+            DataType::Utf8,
+            true,
+            false,
+        );
+        assert_eq!(
+            find_row_id_column(
+                &JoinBaseScan {
+                    columns: vec![column]
+                },
+                "left"
+            )
+            .unwrap_err(),
+            "join first-refresh left row-id has invalid shape"
+        );
+        let column = output_column(
+            crate::column_id::ColumnId(7),
+            "_row_id",
+            DataType::Int64,
+            true,
+            false,
+        );
+        assert!(
+            find_row_id_column(
+                &JoinBaseScan {
+                    columns: vec![column.clone(), column]
+                },
+                "left"
+            )
+            .unwrap_err()
+            .contains("multiple left row-id columns")
+        );
+    }
 
     type FinalJoinFirstRefreshCompile =
         fn(
