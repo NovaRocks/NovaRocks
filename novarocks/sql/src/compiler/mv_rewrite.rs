@@ -3960,6 +3960,174 @@ mod tests {
     }
 
     #[test]
+    fn candidate_and_query_signed_integer_ranges_survive_fold_policy() {
+        use crate::compiler::{
+            ConversionPlan, FoldRequest, FrozenFoldIntrinsic, FrozenFoldNode, SqlAnalyzeRequest,
+            SqlCompiler, SqlConstantEvaluationError, SqlConstantEvaluator, SqlPlannerTableSnapshot,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
+        };
+        use crate::optimizer::rewrite::{
+            context::RewriteContext,
+            phase::RewritePhase,
+            pipeline::{RewritePipeline, RewriteStage},
+            rules,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct SignedCastFoldPort(AtomicUsize);
+        impl SqlConstantEvaluator for SignedCastFoldPort {
+            fn eval_scalar(
+                &self,
+                request: &FoldRequest,
+                control: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
+                let FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                    plan: ConversionPlan::Carrier(step),
+                }) = &request.kind
+                else {
+                    return Ok(None);
+                };
+                let [argument] = request.args.as_slice() else {
+                    panic!("the original CAST fold request has one argument");
+                };
+                if !crate::optimizer::scalar_expr::nonnull_signed_literal_widening(
+                    &argument.value_type,
+                    &request.result_type,
+                ) {
+                    return Ok(None);
+                }
+                assert_eq!(step.target(), &request.result_type);
+                assert_eq!(argument.value.value_type(), &argument.value_type);
+                let Some(value) = argument.value.signed_integer_observed(
+                    novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                    control,
+                )?
+                else {
+                    return Ok(None);
+                };
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // This test port models an already admitted lossless signed CAST.
+                // The production FoldConstant rule still owns the CV publication.
+                Ok(Some(crate::constant::admit_syntax_constant(
+                    &crate::analysis::LiteralValue::Int(value),
+                    &request.result_type,
+                    request.constant_policy,
+                    control,
+                )?))
+            }
+        }
+
+        for (disabled, port_absent) in [(false, false), (true, false), (false, true)] {
+            for minimum in [98, 99] {
+                let evaluator: &'static SignedCastFoldPort =
+                    Box::leak(Box::new(SignedCastFoldPort(AtomicUsize::new(0))));
+                let catalog = CandidateCatalog::new();
+                let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+                let mut definitions = candidate_index();
+                definitions.definitions[0].select_query =
+                    test_query("SELECT k FROM iceberg.db.base WHERE k > 98");
+                let mut settings = crate::optimizer::options::SessionOptimizerSettings::default();
+                if disabled {
+                    settings.disabled_rules.push("FoldConstant".into());
+                }
+                let control = crate::compiler::SqlCompileControl::unbounded();
+                let mut request = SqlAnalyzeRequest::new(
+                    SqlStatementInput::sql(format!(
+                        "SELECT k FROM iceberg.db.base WHERE k > {minimum}"
+                    )),
+                    crate::compiler::SqlCompileIntent::Query,
+                    SqlSessionContext {
+                        current_catalog: Some("iceberg".into()),
+                        current_database: "db".into(),
+                        sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
+                        optimizer_settings: settings,
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    &snapshot,
+                    crate::functions::builtin_sql_function_catalog(),
+                    evaluator,
+                    Some(&definitions),
+                    crate::constant::test_constant_policy(),
+                    control.clone(),
+                );
+                if port_absent {
+                    request.constant_evaluator = None;
+                }
+                let analyzed = SqlCompiler::analyze(request)
+                    .unwrap()
+                    .into_pending()
+                    .unwrap();
+                let [SqlMvRewriteAnalysisEntry::Candidate(candidate)] =
+                    analyzed.mv_rewrite.entries.as_slice()
+                else {
+                    panic!("the original published candidate must survive analysis");
+                };
+                let mut arena = crate::optimizer::scalar::ScalarArena::with_constant_policy(
+                    analyzed.constant_policy,
+                );
+                let plan = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+                    &analyzed.logical_plan,
+                    &mut arena,
+                    &control,
+                )
+                .unwrap();
+                let arena = Rc::new(RefCell::new(arena));
+                let mut context = RewriteContext::for_query_with_settings(
+                    analyzed.settings.clone(),
+                    analyzed.decimal_overflow_policy,
+                    &control,
+                );
+                context.set_root_allow_throw_exception(analyzed.root_allow_throw_exception);
+                context.set_function_catalog(Arc::clone(&analyzed.function_catalog));
+                context.set_fold_dependency_observer(control.fold_dependency_observer().cloned());
+                context.set_scalar_arena(Rc::clone(&arena));
+                if let Some(port) = analyzed.constant_evaluator {
+                    context.set_constant_evaluator(port);
+                }
+                let plan = RewritePipeline::from_stages(vec![RewriteStage::new(
+                    "ConstantFold",
+                    RewritePhase::LogicalNormalize,
+                    rules::fold_constant_rules(),
+                )])
+                .rewrite(plan, &mut context)
+                .unwrap();
+                drop(context);
+                let mut arena = Rc::try_unwrap(arena)
+                    .unwrap_or_else(|_| panic!("the test retains one original scalar arena"))
+                    .into_inner();
+                let query = SpjgDescriptor::from_opt_expr(&plan, &mut arena, &control).unwrap();
+                let contained =
+                    crate::optimizer::cascades_rules::mv_rewrite::predicate_split::check_containment(
+                        &query.predicates,
+                        &arena,
+                        &candidate.mv.predicates,
+                        &candidate.mv_scalars,
+                        &query.base_name_of(),
+                        &candidate.mv.base_name_of(),
+                        &control,
+                    )
+                    .unwrap();
+                assert!(
+                    contained.is_some(),
+                    "signed range containment must survive minimum={minimum}, FoldConstant disabled={disabled}, port absent={port_absent}"
+                );
+                let contained = contained.unwrap();
+                assert_eq!(contained.compensation.len(), usize::from(minimum > 98));
+                if disabled || port_absent {
+                    assert_eq!(evaluator.0.load(Ordering::SeqCst), 0);
+                } else {
+                    assert!(
+                        evaluator.0.load(Ordering::SeqCst) >= 1,
+                        "the query must consume the original FoldConstant port and publish a typed CV"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn candidate_names_bind_once_to_unique_targets_independent_of_storage_order() {
         let mut target = CandidateCatalog::table("mv_target", 2);
         let mut hidden = target.columns[0].clone();
