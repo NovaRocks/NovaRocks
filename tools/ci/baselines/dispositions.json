@@ -1822,27 +1822,7 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:table-function/table_function_unnest_cross_empty_result",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Int8, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 1; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:table-function/table_function_unnest_left_join_empty_null",
-      "failure": {
-        "class": "error_code",
-        "code": "query.execution.unsupported"
-      },
-      "reason": "Unsupported compiled cast from: List(Field { data_type: Int8, nullable: true; owner B7, B8, I1, I5; remove after capability repair and native verification Native b722 and TST-G9b1 c30 both refuse unchanged step 1; the typed FE Coordinator projection now reports query.execution.unsupported. Original failure, repair owner and exit requirement remain.",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:table-function/table_function_unnest_multi_array_uneven_left_join",
       "failure": {
         "class": "error_code",
         "code": "query.execution.unsupported"
