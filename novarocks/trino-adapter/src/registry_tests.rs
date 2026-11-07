@@ -44,9 +44,16 @@ use novarocks_query_application::{
     },
     session_control::{QueryControlService, QuerySessionLease, SessionIdentity, SessionToken},
     session_effects::SessionEffects,
-    session_error::QueryServiceError,
+    session_error::{QueryServiceError, QueryServiceErrorKind},
     session_value::StatementSessionError,
-    sql::session::SessionSqlState,
+    sql::session::{
+        SessionSqlState,
+        registry::{
+            CatalogPropertyIdentity, CatalogPropertyMetadata,
+            EmptyCatalogPropertyDeclarationFactory, SessionCatalogPropertyAdmission,
+            SessionCatalogPropertyPort, SessionPropertyRegistry,
+        },
+    },
     statement_kind::StatementKind,
 };
 use novarocks_result_contract::BorrowedPayloadSpan;
@@ -89,7 +96,59 @@ enum OutputMode {
     FailureWithEffect(QueryFailureReason, StatementExternalEffectDisposition),
 }
 
+// An explicit test catalog admission owns its immutable instance declaration.
+// There is no Provider materialization or production empty/default fallback.
+struct FixtureCatalogs {
+    ready: Arc<CatalogPropertyMetadata>,
+    unavailable: QueryServiceError,
+    requested: Mutex<Vec<String>>,
+}
+impl FixtureCatalogs {
+    fn new(registry: &SessionPropertyRegistry) -> Self {
+        use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+        let identity = CatalogPropertyIdentity {
+            attachment_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            instance_id: ConnectorInstanceId::parse("input_lake").unwrap(),
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            generation: 7,
+        };
+        let ready = registry
+            .bind_catalog(
+                "input_lake",
+                identity,
+                &[("iceberg.catalog.type".into(), "rest".into())],
+            )
+            .unwrap();
+        Self {
+            ready: Arc::new(ready),
+            unavailable: QueryServiceError::new(
+                QueryServiceErrorKind::Unavailable,
+                "Original test catalog admission unavailable",
+            ),
+            requested: Mutex::new(Vec::new()),
+        }
+    }
+}
+impl SessionCatalogPropertyPort for FixtureCatalogs {
+    fn session_property_catalog(
+        &self,
+        catalog: &str,
+    ) -> Result<SessionCatalogPropertyAdmission, QueryServiceError> {
+        self.requested.lock().unwrap().push(catalog.to_owned());
+        Ok(match catalog {
+            "input_lake" => SessionCatalogPropertyAdmission::Ready(Arc::clone(&self.ready)),
+            "unavailable_lake" => {
+                SessionCatalogPropertyAdmission::Unavailable(self.unavailable.clone())
+            }
+            "trc_nocatalog" => SessionCatalogPropertyAdmission::Absent,
+            _ => panic!("unexpected catalog request outside the explicit test fixture"),
+        })
+    }
+}
+
 struct FixtureState {
+    property_registry: SessionPropertyRegistry,
+    catalogs: FixtureCatalogs,
     host: WorkloadControl,
     capacity: ResultCapacityHandle,
     control: QueryControlService,
@@ -140,7 +199,16 @@ impl Fixture {
         let control = QueryControlService::new(Arc::new(QueryApplicationControl::new(
             novarocks_types::FrontendProcessId::new_v7(),
         )));
+        let property_registry = SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(
+            EmptyCatalogPropertyDeclarationFactory::new(
+                novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            ),
+        )])
+        .unwrap();
+        let catalogs = FixtureCatalogs::new(&property_registry);
         let state = Arc::new(FixtureState {
+            property_registry,
+            catalogs,
             host,
             capacity,
             control: control.clone(),
@@ -167,10 +235,19 @@ impl Fixture {
         Self::new(false, false, Duration::from_secs(60))
     }
     fn register(&self) -> (Arc<QueryEntry>, Value) {
+        self.register_with_properties(None)
+    }
+    fn register_with_properties(&self, properties: Option<&str>) -> (Arc<QueryEntry>, Value) {
         let mut headers = HeaderMap::new();
         headers.insert("x-trino-user", HeaderValue::from_static("root"));
         headers.insert("x-trino-catalog", HeaderValue::from_static("input_lake"));
         headers.insert("x-trino-schema", HeaderValue::from_static("input_schema"));
+        if let Some(properties) = properties {
+            headers.insert(
+                "x-trino-session",
+                HeaderValue::from_str(properties).unwrap(),
+            );
+        }
         let request =
             ParsedStatementRequest::parse(&headers, "SELECT fixture".into(), "root").unwrap();
         let first = self
@@ -307,7 +384,11 @@ impl QuerySessionFactory for Factory {
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
         let admission = request.admission();
         let (id, principal, value) = request.into_parts();
-        let input = SessionSqlState::from_session_value(value)?;
+        let input = SessionSqlState::from_session_value(
+            value,
+            &self.0.property_registry,
+            &self.0.catalogs,
+        )?;
         let lease = self
             .0
             .control
@@ -1951,4 +2032,75 @@ async fn caught_post_handoff_panic_keeps_original_error_effect_and_actual_resour
     assert!(Arc::ptr_eq(&terminal, &replay));
     assert_eq!(bytes(&terminal), bytes(&replay));
     fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn header_property_catalog_admission_preserves_ready_absent_unavailable_and_system_first() {
+    for (properties, number, name, kind, catalogs) in [
+        (
+            "trc_nocatalog.unknown=1",
+            44,
+            "CATALOG_NOT_FOUND",
+            "USER_ERROR",
+            vec!["trc_nocatalog"],
+        ),
+        (
+            "input_lake.unknown=1",
+            14,
+            "INVALID_SESSION_PROPERTY",
+            "USER_ERROR",
+            vec!["input_lake"],
+        ),
+        (
+            "unavailable_lake.unknown=1",
+            65548,
+            "SERVER_STARTING_UP",
+            "INTERNAL_ERROR",
+            vec!["unavailable_lake"],
+        ),
+        (
+            "trc_nocatalog.unknown=1,trc_unknown_property=1",
+            14,
+            "INVALID_SESSION_PROPERTY",
+            "USER_ERROR",
+            vec![],
+        ),
+    ] {
+        let fixture = Fixture::standard();
+        let (entry, _) = fixture.register_with_properties(Some(properties));
+        let terminal = get(&fixture.registry, &entry, 0).await;
+        let body = json(&terminal);
+        assert_eq!(body["error"]["errorCode"], number, "{properties}");
+        assert_eq!(body["error"]["errorName"], name, "{properties}");
+        assert_eq!(body["error"]["errorType"], kind, "{properties}");
+        assert_eq!(*fixture.state.catalogs.requested.lock().unwrap(), catalogs);
+        assert_eq!(
+            fixture.state.catalogs.ready.identity().unwrap().generation,
+            7
+        );
+        assert!(fixture.state.catalogs.ready.declarations().next().is_none());
+        assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
+        assert!(fixture.state.captured.lock().unwrap().is_empty());
+        assert!(!terminal.headers.contains_key("x-trino-set-session"));
+        assert!(!terminal.headers.contains_key("x-trino-clear-session"));
+        assert!(!terminal.headers.contains_key("x-trino-set-catalog"));
+        assert!(!terminal.headers.contains_key("x-trino-set-schema"));
+        if name == "SERVER_STARTING_UP" {
+            assert_eq!(
+                body["error"]["message"],
+                fixture.state.catalogs.unavailable.message()
+            );
+        }
+        fixture.registry.finalize().await;
+        assert_eq!(
+            fixture
+                .state
+                .host
+                .observation()
+                .snapshot()
+                .root_responsibilities,
+            0
+        );
+        assert_eq!(fixture.state.capacity.snapshot().held_positions, [0; 4]);
+    }
 }

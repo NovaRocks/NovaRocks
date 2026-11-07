@@ -388,7 +388,6 @@ fn derived_values_factor(
     Ok(ast::TableFactor::Derived {
         lateral: false,
         subquery: Box::new(values_query),
-        hints: Vec::new(),
         alias: Some(alias),
         span: Span::new(0, 0),
     })

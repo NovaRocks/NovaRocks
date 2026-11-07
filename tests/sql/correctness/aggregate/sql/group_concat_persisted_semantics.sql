@@ -58,7 +58,7 @@ SELECT group_concat('a','b') AS value;
 
 -- query 9
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 
 -- query 10
 SELECT value FROM default_catalog.${case_db}.v_persisted_mode;

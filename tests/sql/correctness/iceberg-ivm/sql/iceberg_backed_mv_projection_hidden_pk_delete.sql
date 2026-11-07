@@ -66,8 +66,7 @@ INSERT INTO mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'A', 10),
   (2, 'A', 20),
   (3, 'B', 30);
-SET CATALOG mv_hidden_pk_delete_ice_${uuid0};
-USE ns_${uuid0};
+USE mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_hidden_pk_delete_mv
 DISTRIBUTED BY HASH(customer) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

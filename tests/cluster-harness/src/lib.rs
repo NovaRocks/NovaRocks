@@ -638,6 +638,21 @@ impl Default for NativeTrustFixture {
 }
 
 impl NativeTrustFixture {
+    /// Select an explicit deployment identity for a cold recovery fixture.
+    ///
+    /// The caller must retain evidence that the prior roles using this
+    /// identity are actually isolated. Choosing the identity is configuration,
+    /// not proof of isolation or authority to resume an existing MV owner.
+    /// Fresh secrets, process identities, transport mode and advertise host
+    /// continue to belong to the original fixture preparation path.
+    pub fn with_deployment_id(mut self, id: &str) -> Result<Self> {
+        let id = DeploymentId::parse(id)
+            .map_err(anyhow::Error::msg)
+            .context("configure explicit Native trust deployment identity")?;
+        self.deployment_id = id.as_str().to_owned();
+        Ok(self)
+    }
+
     pub fn plaintext_ip() -> Self {
         Self {
             deployment_id: format!(
@@ -8781,6 +8796,7 @@ mod tests {
     fn native_proxy_cluster_keeps_advertisement_across_process_restarts() -> Result<()> {
         use native_fault_proxy::{ProxyDirection, ProxyMode};
 
+        let deployment_id = NativeTrustFixture::default().deployment_id;
         let binary = std::env::var_os("NOVAROCKS_BIN")
             .map(PathBuf::from)
             .context("native proxy integration test requires NOVAROCKS_BIN")?;
@@ -8815,7 +8831,8 @@ mod tests {
             startup_timeout: Duration::from_secs(60),
             child_environment: CrossProcessChildEnvironment::default(),
             config_overlay,
-            native_trust_fixture: NativeTrustFixture::default(),
+            native_trust_fixture: NativeTrustFixture::default()
+                .with_deployment_id(&deployment_id)?,
         };
         let mut cluster = CrossProcessCluster::launch_with_native_fault_proxies(
             options,
@@ -8823,6 +8840,30 @@ mod tests {
                 backend_retained_byte_limits: BTreeMap::from([(1, 64 * 1024)]),
             },
         )?;
+        let check_deployment = |cluster: &CrossProcessCluster| -> Result<()> {
+            for path in
+                std::iter::once(&cluster.fe_config_path).chain(cluster.be_config_paths.iter())
+            {
+                let config: Value = fs::read_to_string(path)?.parse()?;
+                assert_eq!(
+                    config["native_trust"]["deployment_id"].as_str(),
+                    Some(deployment_id.as_str())
+                );
+            }
+            assert_eq!(
+                cluster.native_probe_trust()?.deployment_id().as_str(),
+                deployment_id.as_str()
+            );
+            assert_eq!(
+                cluster
+                    .native_backend_probe_trust()?
+                    .deployment_id()
+                    .as_str(),
+                deployment_id.as_str()
+            );
+            Ok(())
+        };
+        check_deployment(&cluster)?;
         let control = cluster.native_fault_proxy(1)?;
         let endpoint = cluster.native_be_endpoint(1)?;
         let control_endpoint = cluster.native_be_control_endpoint(1)?;
@@ -8867,6 +8908,7 @@ mod tests {
         assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
         TestClusterOwner::restart_fe(&mut cluster)?;
         assert_ne!(cluster.process_ids().frontend, before.frontend);
+        check_deployment(&cluster)?;
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
         assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
         let client = novarocks_test_trino_client::TrinoClient::new(
@@ -8924,6 +8966,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(probe.deployment_id().as_str(), expected);
+    }
+
+    #[test]
+    fn explicit_native_deployment_reaches_role_renderer_restart_and_both_probes() {
+        let expected = "retained-native-deployment";
+        let mut fixture = rendered_native_trust_fixture();
+        fixture.fixture = NativeTrustFixture::automatic_dns()
+            .with_deployment_id(expected)
+            .expect("admit explicit cold recovery identity");
+        fixture.shared_secret = "test-only-native-trust-secret-at-least-32-bytes".into();
+        let runtime = make_runtime_1be();
+        let render = |fixture: &PreparedNativeTrustFixture, role| {
+            render_cross_process_launch_config(CrossProcessLaunchConfig {
+                base_config: BASE_CONFIG,
+                source_config_dir: Path::new("/tmp"),
+                role,
+                be_index: 0,
+                runtime: &runtime,
+                be_advertised_grpc_port: None,
+                be_advertised_control_grpc_port: None,
+                runtime_dir: Path::new("/tmp/novarocks-explicit-deployment"),
+                query_lifecycle_faults_enabled: false,
+                cleanup_faults_enabled: false,
+                overlays: Vec::new(),
+                native_trust_fixture: fixture,
+            })
+            .expect("render explicit deployment role")
+            .parse::<Value>()
+            .expect("parse actual rendered role config")
+        };
+        let fe = render(&fixture, ClusterProcessRole::Fe);
+        let be = render(&fixture, ClusterProcessRole::Be);
+        let restarted = render(&fixture.clone(), ClusterProcessRole::Fe);
+        for config in [&fe, &be, &restarted] {
+            assert_eq!(
+                config["native_trust"]["deployment_id"].as_str(),
+                Some(expected)
+            );
+            assert_eq!(
+                config["native_trust"]["transport"]["mode"].as_str(),
+                Some("automatic")
+            );
+            assert_eq!(
+                config["native_trust"]["shared_secret"].as_str(),
+                Some(format!("${{ENV:{SYSTEM_NATIVE_TRUST_SECRET_ENV}}}").as_str())
+            );
+        }
+        assert_eq!(be["cluster"]["advertise_host"].as_str(), Some("localhost"));
+        assert_eq!(
+            be["cluster"]["frontend_endpoint"].as_str(),
+            Some("localhost:29070")
+        );
+        let frontend_probe = fixture.probe_trust().expect("original frontend probe");
+        let backend_probe = fixture
+            .backend_probe_trust()
+            .expect("original backend probe");
+        assert_eq!(frontend_probe.deployment_id().as_str(), expected);
+        assert_eq!(backend_probe.deployment_id().as_str(), expected);
+        assert_eq!(
+            frontend_probe.local_process_identity(),
+            Some(NativeProcessIdentity::Frontend(fixture.probe_frontend))
+        );
+        assert_eq!(
+            backend_probe.local_process_identity(),
+            Some(NativeProcessIdentity::Backend(fixture.probe_backend))
+        );
+    }
+
+    #[test]
+    fn explicit_native_deployment_rejects_invalid_identifiers() {
+        for id in [
+            "",
+            " leading",
+            "trailing ",
+            "Uppercase",
+            "with/slash",
+            "-edge",
+        ] {
+            assert!(
+                NativeTrustFixture::default()
+                    .with_deployment_id(id)
+                    .is_err()
+            );
+        }
     }
 
     fn rendered_native_trust_fixture() -> PreparedNativeTrustFixture {

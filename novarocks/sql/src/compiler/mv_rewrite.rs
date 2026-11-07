@@ -27,8 +27,8 @@ use std::sync::Arc;
 use novarocks_parser::ast::{
     Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
     Select, SelectHintValue, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor,
-    TableWithJoins, TypeName, UserVariable, Visit, WildcardOptions, WindowSpec, walk_expr,
-    walk_function_call, walk_object_name, walk_query, walk_table_factor, walk_type_name,
+    TableWithJoins, TypeName, Visit, WildcardOptions, WindowSpec, walk_expr, walk_function_call,
+    walk_object_name, walk_query, walk_table_factor, walk_type_name,
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
@@ -2840,13 +2840,6 @@ impl CompletionRetainedBytes {
         }
     }
 
-    fn add_table_hint_containers(&mut self, hints: &Vec<novarocks_parser::ast::TableHint>) {
-        self.add_vec_capacity::<novarocks_parser::ast::TableHint>(hints.capacity());
-        for hint in hints {
-            self.add_vec_capacity::<Expr>(hint.arguments.capacity());
-        }
-    }
-
     fn add_window_spec_containers(&mut self, window: &WindowSpec) {
         self.add(std::mem::size_of::<WindowSpec>());
         self.add_vec_capacity::<Expr>(window.partition_by.capacity());
@@ -2903,7 +2896,6 @@ impl Visit for CompletionRetainedBytes {
                 self.add_vec_capacity::<Ident>(expression.parameters.capacity());
             }
             Expr::Identifier(_)
-            | Expr::UserVariable(_)
             | Expr::Literal(_)
             | Expr::FunctionCall(_)
             | Expr::Unary(_)
@@ -2953,11 +2945,6 @@ impl Visit for CompletionRetainedBytes {
         }
     }
 
-    fn visit_user_variable(&mut self, variable: &UserVariable) {
-        self.add(std::mem::size_of::<UserVariable>());
-        self.add(variable.value.capacity());
-    }
-
     fn visit_function_call(&mut self, call: &FunctionCall) {
         self.add(std::mem::size_of::<FunctionCall>());
         self.add_vec_capacity::<Expr>(call.arguments.capacity());
@@ -2971,11 +2958,10 @@ impl Visit for CompletionRetainedBytes {
     fn visit_table_factor(&mut self, factor: &TableFactor) {
         self.add(std::mem::size_of::<TableFactor>());
         match factor {
-            TableFactor::Table { alias, hints, .. }
-            | TableFactor::Derived { alias, hints, .. }
-            | TableFactor::TableFunction { alias, hints, .. } => {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. } => {
                 self.add_alias_containers(alias);
-                self.add_table_hint_containers(hints);
             }
             TableFactor::Unnest {
                 array_exprs, alias, ..

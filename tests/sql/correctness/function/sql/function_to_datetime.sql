@@ -23,19 +23,15 @@
 -- 4. Validate invalid scale (>6) returns NULL.
 -- 5. Validate NULL input handling.
 -- 6. Validate dynamic scale via inline VALUES table.
--- Results are timezone-aware: SET time_zone='Asia/Shanghai' (UTC+8).
+-- These values retain the existing runtime timezone; this case does not qualify session timezone overrides.
 
 -- query 1
 -- @skip_result_check=true
-set sql_dialect='StarRocks';
 
 -- query 2
 -- @skip_result_check=true
-SET time_zone = 'Asia/Shanghai';
 
 -- query 3
--- Session timezone is now Asia/Shanghai
-SELECT @@time_zone;
 
 -- query 4
 -- scale=0: seconds precision; 1598306400 → 2020-08-25 06:00:00 in UTC+8

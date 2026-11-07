@@ -73,6 +73,26 @@ impl CatalogCompletionState {
         )
     }
 
+    pub(super) fn try_new_with_semantics(
+        query: ast::Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        lookup_mode: TableLookupMode,
+        first_need_ordinal: u32,
+        semantics: &crate::sql_mode::SqlSemanticSettings,
+    ) -> Result<Self, SqlCompileError> {
+        Self::try_new_with_additional_queries_and_semantics(
+            query,
+            &[],
+            &[],
+            current_catalog,
+            current_database,
+            lookup_mode,
+            first_need_ordinal,
+            semantics,
+        )
+    }
+
     pub(super) fn try_new_with_additional_queries(
         query: ast::Query,
         additional_queries: &[ast::Query],
@@ -82,8 +102,30 @@ impl CatalogCompletionState {
         lookup_mode: TableLookupMode,
         first_need_ordinal: u32,
     ) -> Result<Self, SqlCompileError> {
-        let query =
-            crate::analyzer::query_prepass::preanalyze(query).map_err(SqlCompileError::Analyze)?;
+        Self::try_new_with_additional_queries_and_semantics(
+            query,
+            additional_queries,
+            additional_relations,
+            current_catalog,
+            current_database,
+            lookup_mode,
+            first_need_ordinal,
+            &crate::sql_mode::SqlSemanticSettings::default(),
+        )
+    }
+
+    pub(super) fn try_new_with_additional_queries_and_semantics(
+        query: ast::Query,
+        additional_queries: &[ast::Query],
+        additional_relations: &[TableIdentity],
+        current_catalog: Option<&str>,
+        current_database: &str,
+        lookup_mode: TableLookupMode,
+        first_need_ordinal: u32,
+        semantics: &crate::sql_mode::SqlSemanticSettings,
+    ) -> Result<Self, SqlCompileError> {
+        let query = crate::analyzer::query_prepass::preanalyze_with_semantics(query, semantics)
+            .map_err(SqlCompileError::Analyze)?;
         let current_catalog = current_catalog
             .map(normalize_identifier)
             .transpose()
@@ -100,6 +142,7 @@ impl CatalogCompletionState {
         );
         collector.collect_query(&query, &CteScope::default())?;
         for additional in additional_queries {
+            // Optional definitions do not acquire the root query's session depth.
             let additional = crate::analyzer::query_prepass::preanalyze(additional.clone())
                 .map_err(SqlCompileError::Analyze)?;
             collector.collect_query(&additional, &CteScope::default())?;
@@ -259,6 +302,10 @@ impl CatalogCompletionState {
             let [ast::Statement::Query(query)] = statements.as_slice() else {
                 continue;
             };
+            // Stored definitions keep their original replay boundary. Their saved
+            // SQL/context has no session-depth snapshot, so discovery must agree
+            // with the view analyzer's default prepass rather than the caller's
+            // recursive-depth override.
             let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
                 continue;
             };
@@ -655,7 +702,6 @@ impl<'a> CatalogNeedCollector<'a> {
                 name,
                 metadata,
                 version,
-                hints,
                 ..
             } => {
                 if metadata.is_none() && name.parts.len() == 1 {
@@ -669,14 +715,14 @@ impl<'a> CatalogNeedCollector<'a> {
                         )));
                     }
                     if scope.visible.contains(&name) {
-                        self.collect_table_decorations(version.as_ref(), hints, scope)?;
+                        self.collect_table_decorations(version.as_ref(), scope)?;
                         return Ok(());
                     }
                 }
                 let relation = match self.resolve_name(name) {
                     Ok(relation) => relation,
                     Err(SqlCompileError::Compilation(_)) if self.defer_semantic_refusals => {
-                        return self.collect_table_decorations(version.as_ref(), hints, scope);
+                        return self.collect_table_decorations(version.as_ref(), scope);
                     }
                     Err(error) => return Err(error),
                 };
@@ -685,11 +731,7 @@ impl<'a> CatalogNeedCollector<'a> {
                         let kind = match SqlMetadataTableKind::parse(&metadata.value) {
                             Ok(kind) => kind,
                             Err(_) if self.defer_semantic_refusals => {
-                                return self.collect_table_decorations(
-                                    version.as_ref(),
-                                    hints,
-                                    scope,
-                                );
+                                return self.collect_table_decorations(version.as_ref(), scope);
                             }
                             Err(error) => return Err(SqlCompileError::Compilation(error)),
                         };
@@ -709,7 +751,7 @@ impl<'a> CatalogNeedCollector<'a> {
                 let selection = match version {
                     Some(version) if metadata.is_some() => {
                         if self.defer_semantic_refusals {
-                            return self.collect_table_decorations(Some(version), hints, scope);
+                            return self.collect_table_decorations(Some(version), scope);
                         }
                         return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
                             "time travel is not supported on metadata relations",
@@ -721,7 +763,7 @@ impl<'a> CatalogNeedCollector<'a> {
                         match CatalogTableSelection::try_new(version.clone(), &relation) {
                             Ok(selection) => Some(selection),
                             Err(_) if self.defer_semantic_refusals => {
-                                return self.collect_table_decorations(Some(version), hints, scope);
+                                return self.collect_table_decorations(Some(version), scope);
                             }
                             Err(error) => return Err(error.into()),
                         }
@@ -737,18 +779,16 @@ impl<'a> CatalogNeedCollector<'a> {
                         && name.parts.len() < 3,
                     selection,
                 )?;
-                self.collect_table_decorations(version.as_ref(), hints, scope)
+                self.collect_table_decorations(version.as_ref(), scope)
             }
-            ast::TableFactor::Derived {
-                subquery, hints, ..
-            } => {
+            ast::TableFactor::Derived { subquery, .. } => {
                 self.collect_query(subquery, scope)?;
-                self.collect_hints(hints, scope)
+                Ok(())
             }
-            ast::TableFactor::TableFunction { expr, hints, .. } => {
+            ast::TableFactor::TableFunction { expr, .. } => {
                 self.collect_internal_table_function_need(expr)?;
                 self.collect_expr(expr, scope)?;
-                self.collect_hints(hints, scope)
+                Ok(())
             }
             ast::TableFactor::Unnest { array_exprs, .. } => {
                 for expression in array_exprs {
@@ -765,27 +805,10 @@ impl<'a> CatalogNeedCollector<'a> {
     fn collect_table_decorations(
         &mut self,
         version: Option<&ast::TableVersion>,
-        hints: &[ast::TableHint],
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
         if let Some(version) = version {
             self.collect_expr(&version.value, scope)?;
-        }
-        self.collect_hints(hints, scope)
-    }
-
-    fn collect_hints(
-        &mut self,
-        hints: &[ast::TableHint],
-        scope: &CteScope,
-    ) -> Result<(), SqlCompileError> {
-        for hint in hints {
-            for argument in &hint.arguments {
-                self.collect_expr(argument, scope)?;
-            }
-            if let Some(target) = &hint.target {
-                self.collect_expr(target, scope)?;
-            }
         }
         Ok(())
     }
@@ -1486,6 +1509,36 @@ mod tests {
             10,
         )
         .expect("catalog needs must collect")
+    }
+
+    #[test]
+    fn catalog_prepass_keeps_the_session_depth_before_analysis() {
+        fn branch_count(body: &ast::SetExpr) -> usize {
+            match body {
+                ast::SetExpr::SetOperation(operation) => {
+                    branch_count(&operation.left) + branch_count(&operation.right)
+                }
+                _ => 1,
+            }
+        }
+        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
+        let hinted = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT /*+ SET_VAR(recursive_cte_max_depth = 4) */ x FROM n";
+        let semantics =
+            crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
+        for (source, expected) in [(sql, 2), (hinted, 4)] {
+            let state = CatalogCompletionState::try_new_with_semantics(
+                parse_query(source),
+                Some("session_catalog"),
+                "session_db",
+                TableLookupMode::SchemaOnly,
+                0,
+                &semantics,
+            )
+            .expect("session-aware catalog prepass");
+            assert!(state.needs().is_empty(), "recursive names remain local");
+            let with = state.query().with.as_ref().expect("WITH must remain");
+            assert_eq!(branch_count(&with.ctes[0].query.body), expected);
+        }
     }
 
     fn keys(state: &CatalogCompletionState) -> HashSet<CatalogFactKey> {

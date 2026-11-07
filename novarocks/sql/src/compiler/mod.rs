@@ -34,6 +34,12 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod required_constant;
+pub use required_constant::{
+    PreparedRequiredConstant, RequiredConstantInput, RequiredConstantRequest,
+    RequiredConstantTarget, prepare_required_constant,
+};
+
 mod captured_catalog;
 mod dml_catalog;
 mod logical_explain;

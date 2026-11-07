@@ -55,6 +55,17 @@ const ADMIT_CLIENT_TYPE_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
+const ADMIT_INVALID_SESSION_PROPERTY: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.invalid_session_property"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+const ADMIT_SESSION_CATALOG_NOT_FOUND: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.session_catalog_not_found"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
+
 /// A frozen public output has no exact SQL expression span to publish.
 pub fn client_type_unsupported_error(message: impl Into<String>) -> UserError {
     UserError::from_descriptor(
@@ -73,11 +84,15 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_KILL_DENIED,
     ADMIT_PERSISTED_DEFINITION_SEMANTICS_UNSUPPORTED,
     ADMIT_CLIENT_TYPE_UNSUPPORTED,
+    ADMIT_INVALID_SESSION_PROPERTY,
+    ADMIT_SESSION_CATALOG_NOT_FOUND,
 ];
 
 /// Capability failures owned by Query Application SQL admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionAdmitError {
+    InvalidSessionProperty,
+    CatalogNotFound,
     GlobalScopeUnsupported,
     TransactionUnsupported,
     KillDenied,
@@ -87,6 +102,8 @@ pub enum SessionAdmitError {
 impl SessionAdmitError {
     const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
+            Self::InvalidSessionProperty => ADMIT_INVALID_SESSION_PROPERTY,
+            Self::CatalogNotFound => ADMIT_SESSION_CATALOG_NOT_FOUND,
             Self::GlobalScopeUnsupported => ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
             Self::TransactionUnsupported => ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
             Self::KillDenied => ADMIT_KILL_DENIED,
@@ -103,6 +120,10 @@ impl SessionAdmitError {
             Some(span.to_user_error_location(source)),
             RetryClass::Never,
         )
+    }
+
+    pub fn without_location(self, message: impl Into<String>) -> UserError {
+        UserError::from_descriptor(self.descriptor(), message, None, RetryClass::Never)
     }
 }
 

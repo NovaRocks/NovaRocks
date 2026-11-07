@@ -26,7 +26,6 @@
 -- Setup: enable union-all rewrite; create and populate tables
 -- @skip_result_check=true
 USE ${case_db};
-SET enable_rewrite_groupingsets_to_union_all = true;
 CREATE TABLE tbl_with_null1 (
     k1  date,
     k2  datetime,

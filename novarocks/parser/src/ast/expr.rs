@@ -25,7 +25,6 @@ use crate::{
 pub enum Expr {
     Identifier(Ident),
     CompoundIdentifier(CompoundIdentifier),
-    UserVariable(UserVariable),
     Literal(Literal),
     FunctionCall(FunctionCall),
     Unary(UnaryExpr),
@@ -55,7 +54,6 @@ impl Expr {
         match self {
             Self::Identifier(ident) => ident.span,
             Self::CompoundIdentifier(ident) => ident.span,
-            Self::UserVariable(variable) => variable.span,
             Self::Literal(literal) => literal.span,
             Self::FunctionCall(call) => call.span,
             Self::Unary(expression) => expression.span,
@@ -85,13 +83,6 @@ impl Expr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompoundIdentifier {
     pub parts: Vec<Ident>,
-    pub span: Span,
-}
-
-/// A MySQL-style user or system variable token, including its `@` prefix.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UserVariable {
-    pub value: String,
     pub span: Span,
 }
 

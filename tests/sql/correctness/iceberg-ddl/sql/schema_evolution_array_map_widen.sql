@@ -47,4 +47,3 @@ ALTER TABLE samples MODIFY COLUMN scores.element INT;
 -- query 5
 DROP TABLE samples;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_arrmap_${uuid0};
-SET catalog default_catalog;

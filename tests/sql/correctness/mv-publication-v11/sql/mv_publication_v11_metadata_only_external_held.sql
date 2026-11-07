@@ -47,8 +47,7 @@ CREATE DATABASE mvfrozen_${uuid0}.ns_${uuid0};
 CREATE TABLE mvfrozen_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO mvfrozen_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
-SET CATALOG mvfrozen_${uuid0};
-USE ns_${uuid0};
+USE mvfrozen_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW target_mv
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -90,8 +89,7 @@ print("MV_EXTERNAL_REQUEST_FROZEN", snapshot)
 -- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0,metadata-only-last=true,failed-table-commits=1
 -- @publication_service_hold=ns_${uuid0}.target_mv,actor=shell
 -- @publication_catalog_concurrent_shell=request_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.json"; response_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.response.json"; status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'Content-Type: application/json' --data-binary "@$request_file" '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/target_mv')"; if [ "$status" != 409 ]; then printf 'frozen external status=%s\n' "$status" >&2; python3 -c 'import json,sys; body=json.load(open(sys.argv[1])); print(str(body.get("error", {}).get("message", "unexpected success"))[:400], file=sys.stderr)' "$response_file"; exit 1; fi
-SET CATALOG mvfrozen_${uuid0};
-USE ns_${uuid0};
+USE mvfrozen_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW target_mv WITH SYNC MODE;
 
 -- query 5

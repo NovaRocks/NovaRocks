@@ -492,11 +492,8 @@ impl Scenario for PreReadyReplan {
             .execute(format!("CREATE DATABASE {catalog}.ns"))
             .context("create replan Iceberg namespace")?;
         setup
-            .execute(format!("SET CATALOG {catalog}"))
-            .context("select replan Iceberg catalog")?;
-        setup
-            .execute("USE ns")
-            .context("select replan Iceberg namespace")?;
+            .execute(format!("USE {catalog}.ns"))
+            .context("select replan Iceberg catalog and namespace")?;
         setup
             .execute("CREATE TABLE probe (v BIGINT)")
             .context("create replan scan table")?;
@@ -715,11 +712,8 @@ impl Scenario for PreReadyDmlNoRecovery {
             .execute(format!("CREATE DATABASE {catalog}.ns"))
             .context("create DML Iceberg namespace")?;
         setup
-            .execute(format!("SET CATALOG {catalog}"))
-            .context("select DML Iceberg catalog")?;
-        setup
-            .execute("USE ns")
-            .context("select DML Iceberg namespace")?;
+            .execute(format!("USE {catalog}.ns"))
+            .context("select DML Iceberg catalog and namespace")?;
         setup
             .execute("CREATE TABLE orders (k1 INT, v2 BIGINT)")
             .context("create DML target table")?;

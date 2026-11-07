@@ -17,18 +17,24 @@
 
 -- @order_sensitive=true
 -- Validate Iceberg TIME round-trip through the Parquet write/read path.
+-- query 1
 CREATE DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};
+-- query 2
 CREATE TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} (
   col_id INT,
   col_time TIME
 );
+-- query 3
 INSERT INTO iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} VALUES
   (1, '01:02:03'),
   (2, '20:20:20'),
   (3, NULL);
+-- query 4
 SELECT col_id, col_time
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0}
 ORDER BY col_id;
-SET catalog default_catalog;
+-- query 5
+-- query 6
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0}.iceberg_time_tbl_${uuid0} FORCE;
+-- query 7
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_time_db_${uuid0};

@@ -202,12 +202,13 @@ impl SqlFinalPlanCompileRequest {
                 .map_err(SqlCompileError::from)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
-        let initial_catalog = CatalogCompletionState::try_new(
+        let initial_catalog = CatalogCompletionState::try_new_with_semantics(
             query.clone(),
             common.session.current_catalog.as_deref(),
             &common.session.current_database,
             TableLookupMode::SchemaOnly,
             if mv_enabled { 1 } else { 0 },
+            &common.session.sql_semantics,
         )?;
         let mut seen_relations = HashSet::new();
         let referenced_relations = initial_catalog
@@ -479,7 +480,7 @@ pub(super) fn resume_materialized_view(
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
         .map_err(|error| SqlCompileError::Compilation(format!("MV completion facts: {error}")))?;
-    let catalog = CatalogCompletionState::try_new_with_additional_queries(
+    let catalog = CatalogCompletionState::try_new_with_additional_queries_and_semantics(
         *state.query,
         &[],
         &additional_relations,
@@ -487,6 +488,7 @@ pub(super) fn resume_materialized_view(
         &state.common.session.current_database,
         TableLookupMode::SchemaOnly,
         1,
+        &state.common.session.sql_semantics,
     )?;
     catalog_or_analyze_step(state.common, catalog, Some(mv_definitions), control)
 }

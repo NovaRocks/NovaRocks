@@ -66,21 +66,6 @@ branch	product
 1	1.5241578766956256E27
 2	NULL
 
--- query 17
--- types	bigint
-enabled
-0
-
--- query 18
--- types	bigint
-enabled
-1
-
--- query 19
--- types	bigint
-enabled
-0
-
 -- query 27
 -- types	decimal(38, 19)
 product

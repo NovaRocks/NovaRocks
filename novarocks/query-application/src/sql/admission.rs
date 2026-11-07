@@ -252,7 +252,12 @@ mod tests {
             let error = admit_statement_session(&statement).unwrap_err();
             assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported, "{sql}");
         }
-        for sql in ["SELECT 1", "USE db", "SET @v = 1", "SHOW BACKENDS"] {
+        for sql in [
+            "SELECT 1",
+            "USE db",
+            "SET SESSION pipeline_dop = 1",
+            "SHOW BACKENDS",
+        ] {
             admit_statement_session(&parse_single_statement(sql).unwrap()).unwrap();
         }
     }

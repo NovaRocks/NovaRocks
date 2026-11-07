@@ -39,4 +39,4 @@ SET cbo_broadcast_node_mem_budget_bytes = 0;
 -- query 4
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
 SELECT COUNT(*) AS row_count
-FROM ${case_db}.count_seed l JOIN [shuffle] ${case_db}.count_seed r ON l.id = r.id;
+FROM ${case_db}.count_seed l JOIN  ${case_db}.count_seed r ON l.id = r.id;

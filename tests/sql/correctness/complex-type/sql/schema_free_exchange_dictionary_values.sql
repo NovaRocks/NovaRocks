@@ -33,7 +33,7 @@ SET cbo_broadcast_node_mem_budget_bytes = 0;
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
 SELECT l.id, r.label
-FROM ${case_db}.dictionary_seed l JOIN [shuffle] ${case_db}.dictionary_seed r ON l.id = r.id
+FROM ${case_db}.dictionary_seed l JOIN  ${case_db}.dictionary_seed r ON l.id = r.id
 ORDER BY l.id;
 
 -- query 3
@@ -44,5 +44,5 @@ SET cbo_broadcast_node_mem_budget_bytes = 1073741824;
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (BROADCAST, INNER
 SELECT l.id, r.label
-FROM ${case_db}.dictionary_seed l JOIN [broadcast] ${case_db}.dictionary_seed r ON l.id = r.id
+FROM ${case_db}.dictionary_seed l JOIN  ${case_db}.dictionary_seed r ON l.id = r.id
 ORDER BY l.id;

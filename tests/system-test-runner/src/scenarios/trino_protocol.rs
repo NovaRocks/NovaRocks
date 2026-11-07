@@ -534,6 +534,12 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
             == "second",
         "USE returned wrong schema"
     );
+    for header in ["x-trino-set-session", "x-trino-clear-session"] {
+        ensure!(
+            !end.headers.contains_key(header),
+            "qualified USE emitted unexpected session effect {header}"
+        );
+    }
     stateful.apply_effects(end)?;
     success(&stateful, "DROP DATABASE trc1_catalog.second")?;
     let pages = success(&stateful, "USE trc1_catalog.first")?;
@@ -545,6 +551,36 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
             == "first",
         "USE failed to replace dropped current schema"
     );
+    for (sql, expected_effect) in [
+        ("SET SESSION pipeline_dop = 1 + 2", "pipeline_dop=3"),
+        (
+            "SET SESSION global_runtime_filter_probe_min_selectivity = 1",
+            "global_runtime_filter_probe_min_selectivity=1.0",
+        ),
+    ] {
+        let pages = success(actor, sql)?;
+        let end = terminal(&pages)?;
+        let effects = end
+            .headers
+            .get_all("x-trino-set-session")
+            .iter()
+            .map(|value| value.to_str().context("Set-Session effect is not text"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            effects == vec![expected_effect],
+            "SET returned wrong evaluated effect: expected {expected_effect}, got {effects:?}"
+        );
+        for header in [
+            "x-trino-set-catalog",
+            "x-trino-set-schema",
+            "x-trino-clear-session",
+        ] {
+            ensure!(
+                !end.headers.contains_key(header),
+                "SET emitted unrelated effect {header}"
+            );
+        }
+    }
     let pages = success(actor, "SET query_timeout = 1")?;
     let end = terminal(&pages)?;
     ensure!(
@@ -566,6 +602,54 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
         "SELECT 1",
         (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
     )?;
+    for (raw, expected) in [
+        ("trc_nocatalog.x=1", (44, "CATALOG_NOT_FOUND", "USER_ERROR")),
+        (
+            "trc1_catalog.x=1",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "PIPELINE_DOP=1",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "catalog=trc1_catalog",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "enable_global_runtime_filter=yes",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "pipeline_dop=abc",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "trc_nocatalog.x=1,trc_unknown_property=1",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+        (
+            "trc_unknown_property=1,trc_nocatalog.x=1",
+            (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
+        ),
+    ] {
+        let request = actor.with_session(&[("x-trino-session", raw)]);
+        let pages = request.execute("SELECT 1")?;
+        require_error(terminal(&pages)?, expected)?;
+        for page in &pages {
+            for header in [
+                "x-trino-set-session",
+                "x-trino-clear-session",
+                "x-trino-set-catalog",
+                "x-trino-set-schema",
+            ] {
+                ensure!(
+                    !page.headers.contains_key(header),
+                    "refused session header {raw} emitted effect {header}"
+                );
+            }
+        }
+    }
     failed_query(
         &actor.with_session(&[("x-trino-time-zone", "Mars/Olympus")]),
         "SELECT 1",
@@ -581,7 +665,7 @@ fn session_effects(context: &mut ScenarioContext, actor: &TrinoClient) -> Result
         only_schema.status == 400,
         "schema without catalog did not fail during POST syntax validation"
     );
-    context.action("verified name headers, USE effects after dropped current schema, SET round-trip behavior, and typed session refusals");
+    context.action("verified name headers, qualified USE without session clearing, evaluated SET effects, exact double rendering, typed 14/44 refusals, strict header decoding and system-before-catalog validation in both mixed orders");
     Ok(())
 }
 fn cancel(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {

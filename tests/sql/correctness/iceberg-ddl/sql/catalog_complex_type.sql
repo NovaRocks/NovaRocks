@@ -48,6 +48,5 @@ FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 EXPLAIN CONTRACT
 SELECT array_filter(x -> x.`user` = 'official', name)[1].family AS family_name
 FROM iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_db_${uuid0};

@@ -62,7 +62,6 @@ USE ${case_db};
 -- query 7
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 8
 USE ${case_db};

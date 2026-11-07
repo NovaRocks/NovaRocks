@@ -65,11 +65,10 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10), ('east', 20), 
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -96,8 +95,7 @@ ORDER BY region;
 
 -- query 10
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 11
 -- The view is still there. Nothing dropped it to make the local failure
@@ -120,8 +118,7 @@ SELECT 1;
 
 -- query 13
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_total;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};

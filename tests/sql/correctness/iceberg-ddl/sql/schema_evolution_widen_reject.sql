@@ -48,4 +48,3 @@ ALTER TABLE bad MODIFY COLUMN ts DATE;
 -- query 6
 DROP TABLE bad;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reject_${uuid0};
-SET catalog default_catalog;

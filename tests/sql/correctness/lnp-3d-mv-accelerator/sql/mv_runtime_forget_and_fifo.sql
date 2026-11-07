@@ -46,8 +46,7 @@ CREATE DATABASE lnp3d_runtime_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_runtime_${uuid0}.ns_${uuid0}.orders (k1 INT NOT NULL, v1 BIGINT)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO lnp3d_runtime_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
-SET CATALOG lnp3d_runtime_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_runtime_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PRIMARY KEY (k1)
@@ -85,8 +84,7 @@ SELECT 1;
 -- @result_not_contains=RUNNING
 -- @result_not_contains=BLOCKED_RECOVERY
 -- @result_not_contains=BACKOFF
-SET CATALOG lnp3d_runtime_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_runtime_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6
@@ -107,8 +105,7 @@ SELECT 1;
 -- The resulting data proves the fresh attempt is not a restored old slot.
 -- @skip_result_check=true
 INSERT INTO lnp3d_runtime_${uuid0}.ns_${uuid0}.orders VALUES (3, 30);
-SET CATALOG lnp3d_runtime_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_runtime_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 9
@@ -123,8 +120,7 @@ SELECT k1, v1 FROM lnp3d_runtime_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- refresh and leave no process-local gate/runtime state to carry elsewhere.
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG lnp3d_runtime_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_runtime_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE lnp3d_runtime_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE lnp3d_runtime_${uuid0}.ns_${uuid0};

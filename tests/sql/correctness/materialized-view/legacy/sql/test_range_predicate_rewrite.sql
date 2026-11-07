@@ -95,10 +95,10 @@ INSERT INTO `t1` VALUES
 (20, 'varchar_value_20', 'varchar_value_40', 1050, 0);
 
 -- query 7
-set new_planner_optimize_timeout=10000;
+
 
 -- query 8
-set materialized_view_rewrite_mode="force";
+
 
 -- query 9
 create MATERIALIZED VIEW flat_mv
@@ -167,7 +167,7 @@ analyze table month_mv with sync mode;
 analyze table year_mv with sync mode;
 
 -- query 23
-select /*+ set_Var(enable_fine_grained_range_predicate = true, enable_force_rule_based_mv_rewrite = true, nested_mv_rewrite_max_level = 10) */
+select
 sum(t0.float_col_1 * t1.int_col_1), t0.tinyint_col from  t0 join t1 on t0.tinyint_col = t1.tinyint_col_1 where t0.id in (1, 2, 3, 4, 5, 6, 6, 7, 9, 10)
 and date_col > '2024-02-11' and date_col < '2028-05-14' group by tinyint_col order by 1;
 
@@ -180,7 +180,7 @@ and date_col > '2024-02-11' and date_col < '2028-05-14' group by tinyint_col ord
 -- @result_contains_any=month_mv
 -- @result_contains_any=year_mv
 SET enable_materialized_view_rewrite = true;
-EXPLAIN select /*+ set_Var(enable_fine_grained_range_predicate = true, enable_force_rule_based_mv_rewrite = true, nested_mv_rewrite_max_level = 10) */ sum(t0.float_col_1 * t1.int_col_1), t0.tinyint_col from  t0 join t1 on t0.tinyint_col = t1.tinyint_col_1 where t0.id in (1, 2, 3, 4, 5, 6, 6, 7, 9, 10) and date_col > '2024-02-11' and date_col < '2028-05-14' group by tinyint_col;
+EXPLAIN select  sum(t0.float_col_1 * t1.int_col_1), t0.tinyint_col from  t0 join t1 on t0.tinyint_col = t1.tinyint_col_1 where t0.id in (1, 2, 3, 4, 5, 6, 6, 7, 9, 10) and date_col > '2024-02-11' and date_col < '2028-05-14' group by tinyint_col;
 
 -- query 26
 drop database db_${uuid0} force;

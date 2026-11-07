@@ -58,7 +58,6 @@ SELECT
 
 -- query 9
 -- @skip_result_check=true
-SET catalog default_catalog;
 ALTER TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0} DROP BRANCH backup;
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0}.t_tt_${uuid0};
 DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_tt_db_${uuid0};

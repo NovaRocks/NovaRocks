@@ -25,11 +25,13 @@ use novarocks_spi::connector::ConnectorRequestContext;
 use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::session_error::QueryServiceError;
 
-/// Read-only Catalog and connector facts required to resolve `USE` and
-/// `SET CATALOG`. This port carries neither a command executor nor a
+/// Read-only Catalog and connector facts required for `USE` and session input.
+/// This port carries neither a command executor nor a
 /// connector binding, so session admission cannot acquire mutation authority.
 #[async_trait]
-pub trait SessionCatalogPort: Send + Sync + 'static {
+pub trait SessionCatalogPort:
+    super::session::registry::SessionCatalogPropertyPort + Send + Sync + 'static
+{
     fn database_exists(&self, database_name: &str) -> Result<bool, QueryServiceError>;
 
     fn require_external_catalog_ready(&self, catalog_name: &str) -> Result<(), QueryServiceError>;

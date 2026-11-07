@@ -364,10 +364,9 @@ fn select_catalog_and_database(
     execute(
         context,
         conn,
-        "select maintenance catalog",
-        &format!("SET CATALOG {catalog}"),
-    )?;
-    execute(context, conn, "select maintenance namespace", "USE ns")
+        "select maintenance catalog and namespace",
+        &format!("USE {catalog}.ns"),
+    )
 }
 
 fn execute(

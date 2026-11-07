@@ -66,11 +66,10 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10), ('east', 20), 
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -100,8 +99,7 @@ REFRESH MATERIALIZED VIEW z_count WITH SYNC MODE;
 -- @skip_result_check=true
 -- @result_contains=a_total
 -- @result_contains=z_count
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 12
@@ -115,8 +113,7 @@ SELECT 1;
 -- One view is missing from the inventory. Nothing dropped it.
 -- @skip_result_check=true
 -- @result_not_contains=a_mv
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 14
@@ -142,8 +139,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_contains=z_count
 -- @result_contains=a_total
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 17
@@ -171,8 +167,7 @@ SELECT 1;
 
 -- query 21
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW z_count;
 DROP MATERIALIZED VIEW a_total;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders FORCE;

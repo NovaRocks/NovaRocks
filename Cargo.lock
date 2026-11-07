@@ -3895,6 +3895,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "novarocks-connector-contract",
+ "novarocks-constant-contract",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-failpoint",

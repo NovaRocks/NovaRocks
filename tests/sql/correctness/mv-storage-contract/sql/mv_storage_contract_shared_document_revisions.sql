@@ -47,8 +47,7 @@ INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 -- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=0,slot-changes=0
-SET CATALOG mvgraph_${uuid0};
-USE ns_${uuid0};
+USE mvgraph_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_graph
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -80,8 +79,7 @@ SELECT k, v FROM mv_graph ORDER BY k, v;
 -- query 10
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvgraph_${uuid0};
-USE ns_${uuid0};
+USE mvgraph_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW mv_graph;
 DROP TABLE mvgraph_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvgraph_${uuid0}.ns_${uuid0};

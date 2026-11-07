@@ -615,6 +615,8 @@ pub fn compose_frontend_role_config(
         logical_runtime,
         constant_policy,
         static_plan.frontend_carrier(),
+        std::sync::Arc::new(static_plan.frontend_required_constant_interpreter()),
+        std::sync::Arc::new(provider_manifest.compose_session_property_registry()?),
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(

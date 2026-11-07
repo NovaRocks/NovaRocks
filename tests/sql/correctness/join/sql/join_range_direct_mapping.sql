@@ -109,22 +109,22 @@ FROM ${case_db}.__row_util;
 -- query 12
 -- inner join on c_int (non-null)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
 
 -- query 13
 -- left join on c_bigint (non-null)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 14
 -- inner join on c_int_null (nullable)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
 
 -- query 15
 -- left join on c_bigint_null (nullable)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
 
 -- ============================================================
 -- CTE union-all doubling + broadcast join
@@ -136,7 +136,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 17
 -- CTE inner join on c_int (duplicate to match original)
@@ -144,7 +144,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 18
 -- CTE inner join on c_bigint
@@ -152,7 +152,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 19
 -- CTE inner join on c_bigint (duplicate to match original)
@@ -160,7 +160,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- ============================================================
 -- Broadcast join with modulo filter (% 10 != 0)
@@ -169,22 +169,22 @@ FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
 -- query 20
 -- inner join on c_int with modulo filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
 
 -- query 21
 -- left join on c_bigint with modulo filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
 
 -- query 22
 -- inner join on c_int_null with modulo filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 != 0;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 != 0;
 
 -- query 23
 -- left join on c_bigint_null with modulo filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 != 0;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 != 0;
 
 -- query 24
 -- CTE inner join on c_int with modulo filter
@@ -192,7 +192,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
 
 -- query 25
 -- CTE inner join on c_int with modulo filter (duplicate)
@@ -200,7 +200,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 != 0;
 
 -- query 26
 -- CTE inner join on c_bigint with modulo filter
@@ -208,7 +208,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
 
 -- query 27
 -- CTE inner join on c_bigint with modulo filter (duplicate)
@@ -216,7 +216,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 != 0;
 
 -- ============================================================
 -- Broadcast join with modulo filter (% 10 < 5)
@@ -225,22 +225,22 @@ FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 
 -- query 28
 -- inner join on c_int with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
 
 -- query 29
 -- left join on c_bigint with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 
 -- query 30
 -- inner join on c_int_null with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
 
 -- query 31
 -- left join on c_bigint_null with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
 
 -- query 32
 -- CTE inner join on c_int with modulo < 5 filter
@@ -248,7 +248,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
 
 -- query 33
 -- CTE inner join on c_int with modulo < 5 filter (duplicate)
@@ -256,7 +256,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
+FROM w1 t1 JOIN  w1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
 
 -- query 34
 -- CTE inner join on c_bigint with modulo < 5 filter
@@ -264,7 +264,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 
 -- query 35
 -- CTE inner join on c_bigint with modulo < 5 filter (duplicate)
@@ -272,7 +272,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
+FROM w1 t1 JOIN  w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 
 -- ============================================================
 -- LEFT SEMI JOIN with broadcast hint
@@ -281,22 +281,22 @@ FROM w1 t1 JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 
 -- query 36
 -- left semi join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
 
 -- query 37
 -- left semi join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 38
 -- left semi join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
 
 -- query 39
 -- left semi join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT SEMI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 LEFT SEMI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
 
 -- query 40
 -- CTE left semi join on c_int
@@ -304,7 +304,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 41
 -- CTE left semi join on c_int (duplicate)
@@ -312,7 +312,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 42
 -- CTE left semi join on c_bigint
@@ -320,7 +320,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 43
 -- CTE left semi join on c_bigint (duplicate)
@@ -328,7 +328,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT SEMI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 LEFT SEMI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- ============================================================
 -- LEFT ANTI JOIN with broadcast hint
@@ -337,22 +337,22 @@ FROM w1 t1 LEFT SEMI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
 -- query 44
 -- left anti join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
 
 -- query 45
 -- left anti join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 46
 -- left anti join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
 
 -- query 47
 -- left anti join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
 
 -- query 48
 -- CTE left anti join on c_int
@@ -360,7 +360,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 49
 -- CTE left anti join on c_int (duplicate)
@@ -368,7 +368,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN [broadcast] w1 t2 on t1.c_int = t2.c_int;
+FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_int = t2.c_int;
 
 -- query 50
 -- CTE left anti join on c_bigint
@@ -376,7 +376,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 51
 -- CTE left anti join on c_bigint (duplicate)
@@ -384,7 +384,7 @@ with w1 as (
     select * from ${case_db}.t1 union all select * from ${case_db}.t1
 )
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM w1 t1 LEFT ANTI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
+FROM w1 t1 LEFT ANTI JOIN  w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- ============================================================
 -- With optimization disabled: enable_hash_join_range_direct_mapping_opt = false
@@ -392,84 +392,83 @@ FROM w1 t1 LEFT ANTI JOIN [broadcast] w1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 52
 -- @skip_result_check=true
-set enable_hash_join_range_direct_mapping_opt = false;
 
 -- query 53
 -- opt disabled: inner join on c_int with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
 
 -- query 54
 -- opt disabled: left join on c_bigint with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 
 -- query 55
 -- opt disabled: inner join on c_int_null with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
 
 -- query 56
 -- opt disabled: left join on c_bigint_null with modulo < 5 filter
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
 
 -- query 57
 -- opt disabled: inner join on c_int with modulo < 5 filter (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int where t2.c_int % 10 < 5;
 
 -- query 58
 -- opt disabled: left join on c_bigint with modulo < 5 filter (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint where t2.c_int % 10 < 5;
 
 -- query 59
 -- opt disabled: inner join on c_int_null with modulo < 5 filter (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null where t2.c_int % 10 < 5;
 
 -- query 60
 -- opt disabled: left join on c_bigint_null with modulo < 5 filter (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint), count(t2.c_int), count(t2.c_bigint)
-FROM ${case_db}.t1 LEFT JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
+FROM ${case_db}.t1 LEFT JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null where t2.c_int % 10 < 5;
 
 -- query 61
 -- opt disabled: left anti join on c_int
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
 
 -- query 62
 -- opt disabled: left anti join on c_bigint
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 63
 -- opt disabled: left anti join on c_int_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
 
 -- query 64
 -- opt disabled: left anti join on c_bigint_null
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
 
 -- query 65
 -- opt disabled: left anti join on c_int (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int = t2.c_int;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int = t2.c_int;
 
 -- query 66
 -- opt disabled: left anti join on c_bigint (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint = t2.c_bigint;
 
 -- query 67
 -- opt disabled: left anti join on c_int_null (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_int_null = t2.c_int_null;
 
 -- query 68
 -- opt disabled: left anti join on c_bigint_null (duplicate)
 SELECT count(t1.c_int), count(t1.c_bigint)
-FROM ${case_db}.t1 LEFT ANTI JOIN [broadcast] ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;
+FROM ${case_db}.t1 LEFT ANTI JOIN  ${case_db}.t1 t2 on t1.c_bigint_null = t2.c_bigint_null;

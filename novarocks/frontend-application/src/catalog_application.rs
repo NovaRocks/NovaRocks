@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use novarocks_catalog_application::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
-    CatalogCreateCommand, CatalogDropCommand, CatalogReferenceReader, CatalogRuntimeObservation,
-    CatalogRuntimePublisherSink,
+    CatalogConfigurationAdmission, CatalogCreateCommand, CatalogDropCommand,
+    CatalogReferenceReader, CatalogRuntimeObservation, CatalogRuntimePublisherSink,
 };
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_state_store_api::StateStore;
@@ -414,6 +414,23 @@ impl CatalogApplicationPort for PublishedCatalogApplicationPort {
         self.application.drop_catalog(command)
     }
 
+    fn admit_catalog_configuration(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> CatalogConfigurationAdmission {
+        match self.application.admit_catalog_configuration(instance_id) {
+            CatalogConfigurationAdmission::Ready(facts) => {
+                match self.projection.require_exact(&facts.runtime) {
+                    Ok(()) => CatalogConfigurationAdmission::Ready(facts),
+                    Err(error) => CatalogConfigurationAdmission::Unavailable {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            admission => admission,
+        }
+    }
+
     fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
         match self.application.admit_catalog(instance_id) {
             CatalogAdmission::Ready(observation) => {
@@ -503,6 +520,7 @@ mod tests {
 
     struct FixedApplication {
         admission: Mutex<CatalogAdmission>,
+        configuration: Mutex<CatalogConfigurationAdmission>,
     }
 
     impl CatalogApplicationPort for FixedApplication {
@@ -527,6 +545,110 @@ mod tests {
         fn admit_catalog(&self, _instance_id: &ConnectorInstanceId) -> CatalogAdmission {
             self.admission.lock().expect("admission lock").clone()
         }
+
+        fn admit_catalog_configuration(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+        ) -> CatalogConfigurationAdmission {
+            self.configuration
+                .lock()
+                .expect("configuration lock")
+                .clone()
+        }
+    }
+
+    #[test]
+    fn configuration_admission_requires_exact_publication_and_preserves_original_facts() {
+        use novarocks_catalog_application::{
+            CatalogConfigurationObservation, CatalogLogicalConfig,
+        };
+
+        let projection = CatalogRuntimeProjection::new();
+        let current = observation();
+        let configuration = Arc::new(
+            CatalogLogicalConfig::try_new(
+                current.instance_id.clone(),
+                current.provider_id.clone(),
+                "warehouse",
+                vec![
+                    ("type".into(), "iceberg".into()),
+                    (
+                        "warehouse".into(),
+                        "file:///owned-configuration-fixture".into(),
+                    ),
+                ],
+                Vec::new(),
+                1,
+            )
+            .expect("validated original configuration"),
+        );
+        let facts = CatalogConfigurationObservation {
+            runtime: current.clone(),
+            configuration: Arc::clone(&configuration),
+        };
+        let application = Arc::new(FixedApplication {
+            admission: Mutex::new(CatalogAdmission::Ready(current.clone())),
+            configuration: Mutex::new(CatalogConfigurationAdmission::Ready(facts.clone())),
+        });
+        let bound = projection.bind_application(application.clone());
+        assert!(matches!(
+            bound.admit_catalog_configuration(&current.instance_id),
+            CatalogConfigurationAdmission::Unavailable { .. }
+        ));
+        projection
+            .publish_catalog_runtime(current.clone())
+            .expect("publish the admitted runtime");
+        let observed = bound
+            .admit_catalog_configuration(&current.instance_id)
+            .require_ready(&current.instance_id)
+            .expect("forward the exact published configuration");
+        assert_eq!(observed.runtime, current);
+        assert!(Arc::ptr_eq(&observed.configuration, &configuration));
+
+        let mut another_generation = facts.clone();
+        another_generation.runtime.generation += 1;
+        *application
+            .configuration
+            .lock()
+            .expect("configuration lock") =
+            CatalogConfigurationAdmission::Ready(another_generation);
+        assert!(matches!(
+            bound.admit_catalog_configuration(&current.instance_id),
+            CatalogConfigurationAdmission::Unavailable { reason }
+                if reason.contains("does not match the admitted attachment generation")
+        ));
+
+        let unavailable = CatalogConfigurationAdmission::Unavailable {
+            reason: "the original configuration is unavailable".to_owned(),
+        };
+        *application
+            .configuration
+            .lock()
+            .expect("configuration lock") = unavailable.clone();
+        assert_eq!(
+            bound.admit_catalog_configuration(&current.instance_id),
+            unavailable
+        );
+        *application
+            .configuration
+            .lock()
+            .expect("configuration lock") = CatalogConfigurationAdmission::Absent;
+        assert_eq!(
+            bound.admit_catalog_configuration(&current.instance_id),
+            CatalogConfigurationAdmission::Absent
+        );
+
+        *application
+            .configuration
+            .lock()
+            .expect("configuration lock") = CatalogConfigurationAdmission::Ready(facts);
+        projection
+            .unpublish_catalog_runtime(&current.instance_id, current.generation)
+            .expect("withdraw the original publication");
+        assert!(matches!(
+            bound.admit_catalog_configuration(&current.instance_id),
+            CatalogConfigurationAdmission::Unavailable { .. }
+        ));
     }
 
     #[test]
@@ -535,6 +657,9 @@ mod tests {
         let current = observation();
         let application: Arc<dyn CatalogApplicationPort> = Arc::new(FixedApplication {
             admission: Mutex::new(CatalogAdmission::Ready(current.clone())),
+            configuration: Mutex::new(CatalogConfigurationAdmission::Unavailable {
+                reason: "fixture does not supply configuration".to_owned(),
+            }),
         });
         let bound = projection.bind_application(application);
 

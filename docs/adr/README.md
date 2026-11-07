@@ -300,6 +300,7 @@ code-anchors:
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
+- [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active；补充 ADR-0100/0191/0203，optional folding 与原协议生命周期保留）
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
 - [ADR-0218](ADR-0218-sql-output-declarations-and-stored-view-analysis.md) — SQL 为何分离自然名称、内部标签与冻结根，并从同版本完整事实分析视图声明（active；应用接线与验证状态独立核对，部分替代 ADR-0095 的 MV String 例外）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
@@ -328,6 +329,7 @@ code-anchors:
 normalizer、AST mutation或printer生成的内部表示。运行期可以按请求派生typed/canonical facts，但派生物不能反向成为
 语言或durable authority。
 
+- [ADR-0222](ADR-0222-session-property-declarations-and-required-constant-evaluation.md) — 会话属性为何共用唯一声明、分离四层输入与实例代次，并由原受监督 CPU 必求值后一次提交（active；补充 ADR-0100/0191/0203，optional folding 与原协议生命周期保留）
 - [ADR-0220](ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md) — JSON membership为何共用规范键与哈希null-aware LeftMark、JSON与VARIANT为何分析期隔离、Variant时间戳为何纯UTC渲染（active；补充ADR-0212的mark输出，原join生命周期保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）

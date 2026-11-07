@@ -48,7 +48,7 @@ create materialized view mv3 refresh async as select * from mv1;
 
 -- query 8
 -- check mv dependency
-set enable_drop_table_check_mv_dependency=true;
+
 
 -- query 9
 -- Dropping the base table must be blocked while dependent MVs still exist.
@@ -67,7 +67,7 @@ drop materialized view mv1;
 
 -- query 12
 -- not check mv dependency
-set enable_drop_table_check_mv_dependency=false;
+
 
 -- query 13
 drop table t1;

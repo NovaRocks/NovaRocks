@@ -373,6 +373,25 @@ struct Budget {
     emitted: usize,
     cells: usize,
 }
+
+/// Render a session SQL double with the same Java-compatible decimal author
+/// used for Trino result values. Session effects carry text, without JSON quotes.
+pub fn render_session_double(value: f64) -> Result<String, RenderError> {
+    let atom = trino_json::float64(value, &mut Budget::new())?;
+    let bytes = &atom.data[..atom.len];
+    let bytes = if value.is_finite() {
+        bytes
+    } else {
+        &bytes[1..bytes.len() - 1]
+    };
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| RenderError {
+            kind: crate::RenderErrorKind::CursorInvariant,
+            output_ordinal: None,
+            required: None,
+        })
+}
 impl Budget {
     fn new() -> Self {
         Self {

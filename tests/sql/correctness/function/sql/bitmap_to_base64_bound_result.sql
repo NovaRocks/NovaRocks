@@ -17,7 +17,6 @@
 
 -- query 1
 -- @skip_result_check=true
-SET enable_fold_constant_by_be = false;
 
 -- query 2
 SELECT bitmap_to_base64(bitmap_empty()) AS empty_text,
@@ -36,4 +35,3 @@ FROM (SELECT 0 AS n UNION ALL SELECT 7 UNION ALL SELECT 4294967296) t ORDER BY n
 
 -- query 5
 -- @skip_result_check=true
-SET enable_fold_constant_by_be = true;

@@ -388,12 +388,10 @@ select group_concat( 3.1323,subject order by 1,-20) from ss order by 1;
 -- query 83
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = 2;
 
 -- query 84
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = force_streaming;
 
 -- query 85
 USE ${case_db};
@@ -666,12 +664,10 @@ select group_concat( 3.1323,subject order by 1,-20) from ss order by 1;
 -- query 149
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = 0;
 
 -- query 150
 -- @skip_result_check=true
 USE ${case_db};
-set enable_exchange_pass_through = false;
 
 -- query 151
 USE ${case_db};
@@ -944,7 +940,6 @@ select group_concat( 3.1323,subject order by 1,-20) from ss order by 1;
 -- query 215
 -- @skip_result_check=true
 USE ${case_db};
-set enable_query_cache = true;
 
 -- query 216
 USE ${case_db};
@@ -989,7 +984,6 @@ select group_concat(name,subject order by 1,2), group_concat(distinct name,score
 -- query 226
 -- @skip_result_check=true
 USE ${case_db};
-set enable_query_cache = false;
 
 -- query 227
 USE ${case_db};
@@ -1234,7 +1228,7 @@ select group_concat( value, '-' ) from t1;
 -- query 278
 -- @skip_result_check=true
 USE ${case_db};
-set sql_mode = 32;
+set sql_mode = '32';
 
 -- query 279
 USE ${case_db};

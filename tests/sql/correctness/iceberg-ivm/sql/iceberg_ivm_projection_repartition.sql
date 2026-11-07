@@ -56,8 +56,7 @@ CREATE TABLE ice_ivm_repart_${uuid0}.ns_${uuid0}.orders (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_ivm_repart_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_repart_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -227,7 +226,7 @@ ALTER MATERIALIZED VIEW unsupported_repart_mv_${uuid0} REPARTITION BY (truncate(
 -- query 19
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG ice_ivm_repart_${uuid0};
+USE ice_ivm_repart_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.unsupported_repart_mv_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.join_repart_mv_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_repart_mv_${uuid0};

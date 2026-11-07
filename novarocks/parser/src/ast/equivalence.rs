@@ -63,12 +63,6 @@ impl SyntaxEq for Literal {
     }
 }
 
-impl SyntaxEq for UserVariable {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
 impl SyntaxEq for TypeName {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.name.syntax_eq(&other.name)
@@ -332,7 +326,6 @@ impl SyntaxEq for TableFactor {
                     metadata: left_metadata,
                     alias: left_alias,
                     version: left_version,
-                    hints: left_hints,
                     ..
                 },
                 Self::Table {
@@ -340,7 +333,6 @@ impl SyntaxEq for TableFactor {
                     metadata: right_metadata,
                     alias: right_alias,
                     version: right_version,
-                    hints: right_hints,
                     ..
                 },
             ) => {
@@ -348,27 +340,23 @@ impl SyntaxEq for TableFactor {
                     && syntax_eq_option(left_metadata, right_metadata)
                     && syntax_eq_option(left_alias, right_alias)
                     && syntax_eq_option(left_version, right_version)
-                    && syntax_eq_slice(left_hints, right_hints)
             }
             (
                 Self::Derived {
                     lateral: left_lateral,
                     subquery: left_query,
-                    hints: left_hints,
                     alias: left_alias,
                     ..
                 },
                 Self::Derived {
                     lateral: right_lateral,
                     subquery: right_query,
-                    hints: right_hints,
                     alias: right_alias,
                     ..
                 },
             ) => {
                 left_lateral == right_lateral
                     && left_query.syntax_eq(right_query)
-                    && syntax_eq_slice(left_hints, right_hints)
                     && syntax_eq_option(left_alias, right_alias)
             }
             (
@@ -376,7 +364,6 @@ impl SyntaxEq for TableFactor {
                     lateral: left_lateral,
                     syntax: left_syntax,
                     expr: left_expr,
-                    hints: left_hints,
                     alias: left_alias,
                     ..
                 },
@@ -384,7 +371,6 @@ impl SyntaxEq for TableFactor {
                     lateral: right_lateral,
                     syntax: right_syntax,
                     expr: right_expr,
-                    hints: right_hints,
                     alias: right_alias,
                     ..
                 },
@@ -392,7 +378,6 @@ impl SyntaxEq for TableFactor {
                 left_lateral == right_lateral
                     && left_syntax == right_syntax
                     && left_expr.syntax_eq(right_expr)
-                    && syntax_eq_slice(left_hints, right_hints)
                     && syntax_eq_option(left_alias, right_alias)
             }
             (
@@ -449,19 +434,6 @@ impl SyntaxEq for TableAlias {
 impl SyntaxEq for TableVersion {
     fn syntax_eq(&self, other: &Self) -> bool {
         self.kind == other.kind && self.value.syntax_eq(&other.value)
-    }
-}
-
-impl SyntaxEq for TableHint {
-    fn syntax_eq(&self, other: &Self) -> bool {
-        self.name.syntax_eq(&other.name)
-            && syntax_eq_slice(&self.arguments, &other.arguments)
-            && self.attached_to_relation == other.attached_to_relation
-            && match (&self.target, &other.target) {
-                (Some(left), Some(right)) => left.syntax_eq(right),
-                (None, None) => true,
-                _ => false,
-            }
     }
 }
 
@@ -530,7 +502,6 @@ impl SyntaxEq for Expr {
             (Self::CompoundIdentifier(left), Self::CompoundIdentifier(right)) => {
                 syntax_eq_slice(&left.parts, &right.parts)
             }
-            (Self::UserVariable(left), Self::UserVariable(right)) => left.syntax_eq(right),
             (Self::Literal(left), Self::Literal(right)) => left.syntax_eq(right),
             (Self::FunctionCall(left), Self::FunctionCall(right)) => left.syntax_eq(right),
             (Self::Unary(left), Self::Unary(right)) => left.syntax_eq(right),

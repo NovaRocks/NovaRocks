@@ -52,8 +52,7 @@ printf '%s\n' "$spark_out" | tee "$interop_dir/prepare.log"
 printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx 'SPARK_UPGRADE_NULL_LINEAGE_READY'
 
 -- query 2
-SET CATALOG iceberg_compat_${suite_uuid0};
-USE ${case_db};
+USE iceberg_compat_${suite_uuid0}.${case_db};
 SELECT id, _row_id IS NULL AS missing_row_id,
        _last_updated_sequence_number IS NULL AS missing_sequence
 FROM ${case_db}.upgrade_lineage_${uuid0} ORDER BY id;

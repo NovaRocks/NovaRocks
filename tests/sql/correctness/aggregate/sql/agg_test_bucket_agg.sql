@@ -51,7 +51,6 @@ insert into t0 select * from t0;
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-set tablet_internal_parallel_mode="force_split";
 
 -- query 7
 USE ${case_db};
@@ -92,7 +91,6 @@ select count(*) from (select distinct c0 from t0 limit 100) tb;
 -- query 16
 -- @skip_result_check=true
 USE ${case_db};
-set tablet_internal_parallel_mode="auto";
 
 -- query 17
 USE ${case_db};

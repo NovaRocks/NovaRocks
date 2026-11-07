@@ -252,46 +252,14 @@ fn validate_table_with_joins(table_with_joins: &TableWithJoins) -> Result<(), Va
 
 fn validate_table_factor(table_factor: &TableFactor) -> Result<(), ValidateError> {
     match table_factor {
-        TableFactor::Table { version, hints, .. } => {
+        TableFactor::Table { version, .. } => {
             if let Some(version) = version {
                 validate_expr(&version.value)?;
             }
-            for hint in hints {
-                for argument in &hint.arguments {
-                    validate_expr(argument)?;
-                }
-                if let Some(target) = &hint.target {
-                    validate_expr(target)?;
-                }
-            }
             Ok(())
         }
-        TableFactor::Derived {
-            subquery, hints, ..
-        } => {
-            validate_query(subquery)?;
-            for hint in hints {
-                for argument in &hint.arguments {
-                    validate_expr(argument)?;
-                }
-                if let Some(target) = &hint.target {
-                    validate_expr(target)?;
-                }
-            }
-            Ok(())
-        }
-        TableFactor::TableFunction { expr, hints, .. } => {
-            validate_expr(expr)?;
-            for hint in hints {
-                for argument in &hint.arguments {
-                    validate_expr(argument)?;
-                }
-                if let Some(target) = &hint.target {
-                    validate_expr(target)?;
-                }
-            }
-            Ok(())
-        }
+        TableFactor::Derived { subquery, .. } => validate_query(subquery),
+        TableFactor::TableFunction { expr, .. } => validate_expr(expr),
         TableFactor::Unnest { array_exprs, .. } => {
             if array_exprs.is_empty() {
                 return Err(ValidateError::invalid_structure(
@@ -515,7 +483,6 @@ fn validate_expr(expression: &Expr) -> Result<(), ValidateError> {
         }
         Expr::Identifier(_)
         | Expr::CompoundIdentifier(_)
-        | Expr::UserVariable(_)
         | Expr::Literal(_)
         | Expr::TypedString(_) => {}
     }

@@ -42,8 +42,7 @@ PROPERTIES (
 );
 
 CREATE DATABASE trc_views_${uuid0}.views_${uuid0};
-SET CATALOG trc_views_${uuid0};
-USE views_${uuid0};
+USE trc_views_${uuid0}.views_${uuid0};
 
 -- query 2
 CREATE TABLE trc_views_${uuid0}.views_${uuid0}.header_source (a integer, b integer);
@@ -324,7 +323,6 @@ DROP DATABASE IF EXISTS trc_views_${uuid0}.caller_${uuid0};
 -- @cleanup=true
 -- @skip_result_check=true
 
-SET CATALOG iceberg_ddl_cat_${suite_uuid0};
-USE ${case_db};
+USE iceberg_ddl_cat_${suite_uuid0}.${case_db};
 DROP DATABASE IF EXISTS trc_views_${uuid0}.views_${uuid0};
 DROP CATALOG trc_views_${uuid0};

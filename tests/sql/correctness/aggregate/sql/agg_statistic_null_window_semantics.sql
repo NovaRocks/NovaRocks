@@ -59,7 +59,7 @@ SELECT
     total = 4 AS pair_count_match
 FROM (
     SELECT
-        /*+ SET_VAR (new_planner_agg_stage='3') */
+
         corr(k, v) AS co,
         COUNT(DISTINCT k) AS total
     FROM ${case_db}.t_agg_statistic_null_window

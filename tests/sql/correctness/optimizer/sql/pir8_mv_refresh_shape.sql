@@ -55,8 +55,7 @@ INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 20),
   (2, 40),
   (3, 5);
-SET CATALOG pir8_mv_cut_${uuid0};
-USE ns_${uuid0};
+USE pir8_mv_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW pir8_pf_mv_${uuid0}
 DISTRIBUTED BY HASH(k1) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -89,7 +88,7 @@ SELECT 'pir8_mv_refresh_shape_ok' AS status;
 -- query 6
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG pir8_mv_cut_${uuid0};
+USE pir8_mv_cut_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.pir8_pf_mv_${uuid0};
 DROP TABLE IF EXISTS pir8_mv_cut_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE IF EXISTS pir8_mv_cut_${uuid0}.ns_${uuid0};

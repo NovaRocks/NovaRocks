@@ -27,7 +27,6 @@
 
 -- query 1
 -- @skip_result_check=true
-set sql_dialect='StarRocks';
 
 -- query 2
 -- scale=0: seconds; 1598306400 → 2020-08-24 22:00:00 UTC

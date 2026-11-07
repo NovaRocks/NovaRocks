@@ -66,4 +66,3 @@ ALTER TABLE reorder_nested ALTER COLUMN address.street AFTER id;
 DROP TABLE reorder_top;
 DROP TABLE reorder_nested;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_reorder_${uuid0};
-SET catalog default_catalog;

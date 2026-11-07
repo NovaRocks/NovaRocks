@@ -299,6 +299,29 @@ impl ServerProviderManifest {
             .collect()
     }
 
+    /// Every sealed provider explicitly declares the current empty property
+    /// capability. Instance defaults are bound later from admitted config facts.
+    pub fn compose_session_property_registry(
+        &self,
+    ) -> anyhow::Result<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>
+    {
+        use novarocks_query_application::sql::session::registry::{
+            CatalogPropertyDeclarationFactory, EmptyCatalogPropertyDeclarationFactory,
+            SessionPropertyRegistry,
+        };
+        let factories = self
+            .builders
+            .iter()
+            .map(|builder| {
+                Arc::new(EmptyCatalogPropertyDeclarationFactory::new(
+                    builder.provider_id.clone(),
+                )) as Arc<dyn CatalogPropertyDeclarationFactory>
+            })
+            .collect();
+        SessionPropertyRegistry::with_catalog_factories(factories)
+            .context("compose sealed provider session property declarations")
+    }
+
     /// Composes the installed pure provider program catalogue.
     ///
     /// Active pure builders are checked against their sealed read/write

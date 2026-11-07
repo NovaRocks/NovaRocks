@@ -98,7 +98,6 @@ EXPLAIN
 SELECT COUNT(1) AS cnt, payment.id
 FROM payment
 GROUP BY payment.id;
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.txn FORCE;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.payment FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};

@@ -78,11 +78,10 @@ DELETE FROM mvrw_${uuid0}.ns_${uuid0}.user_tags WHERE dt = 'seed';
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -160,7 +159,7 @@ SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id > 2 GROUP BY use
 -- query 24
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.cnt_mv;
 
 -- query 25

@@ -995,7 +995,7 @@ fn validate_result_rows_assertion(meta: &QueryMeta) -> Result<()> {
     Ok(())
 }
 
-fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
+pub(crate) fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
     if meta.expect_trino_error.is_none() {
         return Ok(());
     }
@@ -1347,6 +1347,87 @@ pub fn extract_query_number(line: &str, marker_re: &Regex) -> Option<usize> {
     captures.get(1)?.as_str().parse::<usize>().ok()
 }
 
+/// The native case framing shared by execution and source-position consumers.
+/// Ranges refer to the supplied bytes; no SQL or metadata is rewritten here.
+pub(crate) struct CaseSourceFrames {
+    pub file_preface: std::ops::Range<usize>,
+    pub sections: Vec<(usize, std::ops::Range<usize>)>,
+}
+
+pub(crate) fn frame_case_source(source: &str, marker_re: &Regex) -> Result<CaseSourceFrames> {
+    let mut offset = 0;
+    let lines: Vec<_> = source
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            (start, offset, line)
+        })
+        .collect();
+    let markers: Vec<_> = lines
+        .iter()
+        .filter_map(|(start, _, line)| {
+            extract_query_number(line, marker_re).map(|number| (*start, number))
+        })
+        .collect();
+    // A single marker is decorative. Multiple markers must be consecutive
+    // from one, exactly as in the native loader's original line framing.
+    if markers.len() > 1 {
+        for (index, (_, number)) in markers.iter().enumerate() {
+            let expected = index + 1;
+            if *number != expected {
+                bail!(
+                    "expected marker '-- query {}', found '-- query {}'",
+                    expected,
+                    number
+                );
+            }
+        }
+        let sections = markers
+            .iter()
+            .enumerate()
+            .map(|(index, (start, number))| {
+                let end = markers
+                    .get(index + 1)
+                    .map(|(next, _)| *next)
+                    .unwrap_or(source.len());
+                (*number, *start..end)
+            })
+            .collect();
+        return Ok(CaseSourceFrames {
+            file_preface: 0..markers[0].0,
+            sections,
+        });
+    }
+
+    // Unmarked cases retain the original line-ending-semicolon rule. This
+    // is case framing, not the SQL statement splitter or a second SQL parser.
+    let mut sections = Vec::new();
+    let mut start = 0;
+    let mut has_sql = false;
+    for (_, end, line) in &lines {
+        let trimmed = line.trim();
+        has_sql |= !trimmed.is_empty() && !trimmed.starts_with("--");
+        if trimmed.ends_with(';') {
+            if has_sql {
+                sections.push((sections.len() + 1, start..*end));
+            }
+            start = *end;
+            has_sql = false;
+        }
+    }
+    if has_sql {
+        sections.push((sections.len() + 1, start..source.len()));
+    }
+    if sections.is_empty() {
+        sections.push((1, 0..source.len()));
+    }
+    Ok(CaseSourceFrames {
+        file_preface: 0..source.len(),
+        sections,
+    })
+}
+
 pub fn load_sql_case_from_file(
     sql_path: &Path,
     meta_re: &Regex,
@@ -1413,36 +1494,12 @@ fn load_sql_case_from_file_with_variables(
     let content = catalogs.rewrite_source(&content)?;
 
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let markers: Vec<(usize, usize)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
+    let frames = frame_case_source(&content, marker_re)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", sql_path.display()))?;
+    let file_meta_lines: Vec<_> = content[frames.file_preface.clone()]
+        .lines()
+        .map(ToString::to_string)
         .collect();
-    // A single marker (e.g. "-- query 14") is a decorative label, not a
-    // multi-step split boundary.  Only split when there are 2+ markers with
-    // consecutive numbering starting from 1.
-    let markers = if markers.len() <= 1 {
-        Vec::new()
-    } else {
-        for (expected_idx, (_, query_number)) in markers.iter().enumerate() {
-            let expected_query_number = expected_idx + 1;
-            if *query_number != expected_query_number {
-                bail!(
-                    "{}: expected marker '-- query {}', found '-- query {}'",
-                    sql_path.display(),
-                    expected_query_number,
-                    query_number
-                );
-            }
-        }
-        markers
-    };
-
-    let file_meta_lines = if let Some((first_marker_idx, _)) = markers.first() {
-        lines[..*first_marker_idx].to_vec()
-    } else {
-        lines.clone()
-    };
     let (file_meta, _) =
         extract_meta_and_sql_with_name_binding(&file_meta_lines, meta_re, name_binding)
             .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
@@ -1451,57 +1508,9 @@ fn load_sql_case_from_file_with_variables(
     // from migrated legacy `-- name: ... @sequential` markers.
     let is_sequential = detect_case_sequential(&lines, &file_meta_lines, meta_re);
 
-    let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
-        // No query markers: split by semicolons into separate statements.
-        // This handles files like q39 that have multiple SQL statements
-        // separated by ';' without '-- query N' markers.
-        let mut stmts: Vec<(usize, Vec<String>)> = Vec::new();
-        let mut current_lines: Vec<String> = Vec::new();
-        let mut stmt_num = 1usize;
-        for line in &lines {
-            current_lines.push(line.clone());
-            let trimmed = line.trim();
-            if trimmed.ends_with(';') {
-                if !current_lines.iter().all(|l| {
-                    let t = l.trim();
-                    t.is_empty() || t.starts_with("--")
-                }) {
-                    stmts.push((stmt_num, std::mem::take(&mut current_lines)));
-                    stmt_num += 1;
-                } else {
-                    current_lines.clear();
-                }
-            }
-        }
-        // Remaining lines (no trailing ';')
-        if !current_lines.is_empty()
-            && !current_lines
-                .iter()
-                .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
-        {
-            stmts.push((stmt_num, current_lines));
-        }
-        if stmts.is_empty() {
-            vec![(1, lines.clone())]
-        } else {
-            stmts
-        }
-    } else {
-        markers
-            .iter()
-            .enumerate()
-            .map(|(idx, (start, query_number))| {
-                let end = markers
-                    .get(idx + 1)
-                    .map(|(next_start, _)| *next_start)
-                    .unwrap_or(lines.len());
-                (*query_number, lines[*start..end].to_vec())
-            })
-            .collect()
-    };
-
     let mut steps = Vec::new();
-    for (query_number, section) in sections {
+    for (query_number, range) in frames.sections {
+        let section: Vec<_> = content[range].lines().map(ToString::to_string).collect();
         let section_id = if query_number == 1 {
             base_name.as_str().to_string()
         } else {
@@ -1681,6 +1690,71 @@ pub fn load_suite_hook(
 mod opt5_directive_tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn native_source_frames_preserve_marked_byte_ranges_and_empty_steps() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let source = "-- café\r\n-- query 1\r\nSELECT 1;\r\n-- query 2\r\n-- metadata only\r\n-- query 3\nSELECT 1;\n";
+        let frames = frame_case_source(source, &marker).unwrap();
+        assert_eq!(&source[frames.file_preface], "-- café\r\n");
+        assert_eq!(frames.sections.len(), 3);
+        assert_eq!(
+            frames.sections.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            &source[frames.sections[0].1.clone()],
+            "-- query 1\r\nSELECT 1;\r\n"
+        );
+        assert_eq!(
+            &source[frames.sections[1].1.clone()],
+            "-- query 2\r\n-- metadata only\r\n"
+        );
+        assert_eq!(
+            &source[frames.sections[2].1.clone()],
+            "-- query 3\nSELECT 1;\n"
+        );
+        assert!(
+            frame_case_source("-- query 1\nSELECT 1;\n-- query 3\nSELECT 2;", &marker).is_err()
+        );
+    }
+
+    #[test]
+    fn native_source_frames_keep_unmarked_line_rules_and_local_directives() {
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let source = "-- comment ending in semicolon;\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x;\r\nSELECT 1;\n-- trailing comment\n";
+        let frames = frame_case_source(source, &marker).unwrap();
+        assert_eq!(frames.file_preface, 0..source.len());
+        assert_eq!(frames.sections.len(), 2);
+        let mut seen = Vec::new();
+        for (number, range) in frames.sections {
+            let lines = source[range]
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let (controls, sql) = extract_meta_and_sql(&lines, &meta).unwrap();
+            seen.push((number, controls.expect_trino_error.is_some(), sql));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (1, true, "SELECT @x;".into()),
+                (2, false, "SELECT 1;".into())
+            ]
+        );
+        let decorative = "-- query 14\nSELECT 1; SELECT 2;\nSELECT 3";
+        let frames = frame_case_source(decorative, &marker).unwrap();
+        assert_eq!(
+            frames.sections.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            &decorative[frames.sections[0].1.clone()],
+            "-- query 14\nSELECT 1; SELECT 2;\n"
+        );
+        assert_eq!(&decorative[frames.sections[1].1.clone()], "SELECT 3");
+    }
 
     fn meta_re() -> Regex {
         // Same regex used by the runner — see tests/sql/runner/src/main.rs:1600.

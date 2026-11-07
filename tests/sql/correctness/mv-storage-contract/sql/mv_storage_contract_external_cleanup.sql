@@ -43,8 +43,7 @@ INSERT INTO mvclean_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvclean_${uuid0};
-USE ns_${uuid0};
+USE mvclean_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW cleanup_mv
 PARTITION BY bucket(k, 4)
 DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
@@ -154,8 +153,7 @@ REFRESH MATERIALIZED VIEW rewrite_mv WITH SYNC MODE;
 -- query 13
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvclean_${uuid0};
-USE ns_${uuid0};
+USE mvclean_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS rewrite_mv;
 DROP MATERIALIZED VIEW IF EXISTS cleanup_mv;
 DROP TABLE mvclean_${uuid0}.ns_${uuid0}.fact FORCE;

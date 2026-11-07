@@ -54,8 +54,7 @@ TBLPROPERTIES (
   "format-version" = "3",
   "write.row-lineage" = "true"
 );
-SET CATALOG ice_ivm_opt_replace_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_opt_replace_${uuid0}.ns_${uuid0};
 INSERT INTO fact VALUES (1, 'east', 10);
 CREATE MATERIALIZED VIEW fact_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1

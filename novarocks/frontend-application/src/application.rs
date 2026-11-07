@@ -881,6 +881,9 @@ pub struct FrontendApplicationHost {
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
+    required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -978,6 +981,9 @@ pub struct FrontendExecutionConfig {
     /// into. It travels with the function catalog to every owner that
     /// encodes a plan, and is never chosen per statement.
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
+    required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -1043,6 +1049,10 @@ impl FrontendExecutionConfig {
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
+        required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyRegistry,
+        >,
     ) -> Self {
         Self {
             #[cfg(novarocks_dev_controls)]
@@ -1052,6 +1062,8 @@ impl FrontendExecutionConfig {
             function_catalog,
             constant_policy,
             static_plan_carrier,
+            required_constant_interpreter,
+            session_properties,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -1121,6 +1133,14 @@ impl FrontendExecutionConfig {
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                 novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
             ),
+            Arc::new(
+                crate::query_execution::required_constant_eval::test_required_constant_interpreter(
+                ),
+            ),
+            Arc::new(
+                novarocks_query_application::sql::session::registry::SessionPropertyRegistry::new()
+                    .expect("valid test system property declarations"),
+            ),
         )
     }
 
@@ -1149,6 +1169,15 @@ impl FrontendExecutionConfig {
             self.transport_budget,
         )?;
         Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_session_property_registry_for_test(
+        mut self,
+        registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+    ) -> Self {
+        self.session_properties = registry;
+        self
     }
 
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -1527,6 +1556,8 @@ impl FrontendApplicationHost {
             function_catalog: execution.function_catalog(),
             constant_policy: execution.constant_policy,
             static_plan_carrier: execution.static_plan_carrier,
+            required_constant_interpreter: execution.required_constant_interpreter,
+            session_properties: execution.session_properties,
         };
 
         Ok(host)
@@ -2112,6 +2143,15 @@ impl FrontendApplicationHost {
     /// This is an admission ceiling, not a memory allocation capability.
     pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
         self.constant_policy
+    }
+
+    pub(crate) fn required_constant_interpreter(&self) -> Arc<crate::RequiredConstantInterpreter> {
+        Arc::clone(&self.required_constant_interpreter)
+    }
+    pub(crate) fn session_properties(
+        &self,
+    ) -> Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry> {
+        Arc::clone(&self.session_properties)
     }
 
     pub fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {

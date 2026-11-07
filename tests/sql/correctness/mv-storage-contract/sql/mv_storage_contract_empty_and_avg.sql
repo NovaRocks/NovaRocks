@@ -66,11 +66,10 @@ DELETE FROM mvsc_${uuid0}.ns_${uuid0}.readings WHERE sensor = 'seed';
 
 -- query 4
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
 
 -- query 5
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 6
 -- The source is empty at CREATE and still empty at the first refresh.
@@ -142,8 +141,7 @@ SELECT sensor, mean FROM readings_avg ORDER BY sensor;
 
 -- query 19
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW readings_avg;
 DROP MATERIALIZED VIEW readings_total;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.readings FORCE;

@@ -33,7 +33,7 @@ TBLPROPERTIES ("format-version" = "3");
 INSERT INTO mt1 values (1,'a',1,1), (2,'aa',1,2),  (3,'a',1,3), (4,'aa',1,4), (5,'aa',1,5), (6,'aa',1,6);
 
 -- query 3
-set enable_materialized_view_transparent_union_rewrite=false;
+
 
 -- query 4
 CREATE MATERIALIZED VIEW mv0
@@ -47,7 +47,7 @@ REFRESH MATERIALIZED VIEW mv0 PARTITION START ('1') END ('3') with sync mode;
 
 -- query 6
 -- default mode
-set materialized_view_union_rewrite_mode = 0;
+
 
 -- query 7
 -- @result_contains=mv0
@@ -134,7 +134,7 @@ SELECT k1,k2, v1,v2 from mt1 WHERE k1 <6 and v2 >= 4  order by 1;
 
 -- query 27
 -- mode 1
-set materialized_view_union_rewrite_mode = 1;
+
 
 -- query 28
 -- @result_contains_any=mv0
@@ -211,7 +211,7 @@ SELECT k1,k2, v1,v2 from mt1 WHERE k1 <6 and v2 >= 4  order by 1;
 
 -- query 46
 -- mode 2
-set materialized_view_union_rewrite_mode = 2;
+
 
 -- query 47
 -- @result_contains_any=mv0
@@ -307,7 +307,7 @@ group by k1, k2 ;
 REFRESH MATERIALIZED VIEW mv0 PARTITION START ('1') END ('3') with sync mode;
 
 -- query 68
-set materialized_view_union_rewrite_mode = 0;
+
 
 -- query 69
 -- @result_contains=mv0
@@ -358,7 +358,7 @@ select k1, sum(v1), sum(v2) from mt1 where k1 < 5 group by k1 order by 1;
 select k1, sum(v1), sum(v2) from mt1 where k1 <= 3 group by k1 order by 1;
 
 -- query 81
-set materialized_view_union_rewrite_mode = 1;
+
 
 -- query 82
 -- @result_contains=mv0
@@ -409,7 +409,7 @@ select k1, sum(v1), sum(v2) from mt1 where k1 < 5 group by k1 order by 1;
 select k1, sum(v1), sum(v2) from mt1 where k1 <= 3 group by k1 order by 1;
 
 -- query 94
-set materialized_view_union_rewrite_mode = 2;
+
 
 -- query 95
 -- @result_contains=mv0

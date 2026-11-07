@@ -67,10 +67,7 @@ pub(super) async fn prepare_read(
     input: ReadPreparationInput,
 ) -> Result<Result<PreparedQueryOperation, QueryServiceError>, StatementNativeHealthFailure> {
     let prepared: Result<_, QueryServiceError> = async {
-        let parsed = input
-            .state
-            .substitute_user_variables(input.parsed)
-            .map_err(|e| internal_error(e.to_string()))?;
+        let parsed = input.parsed;
         let topology =
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;

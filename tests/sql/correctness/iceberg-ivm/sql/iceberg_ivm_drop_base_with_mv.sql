@@ -60,8 +60,7 @@ INSERT INTO ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} VALUES
 -- query 2
 -- Switch the session context to the new iceberg catalog.
 -- @skip_result_check=true
-SET CATALOG ice_ivm_dropbase_${uuid0};
-USE dropbase_${uuid0};
+USE ice_ivm_dropbase_${uuid0}.dropbase_${uuid0};
 
 -- query 3
 -- Create an MV that depends on the base table.

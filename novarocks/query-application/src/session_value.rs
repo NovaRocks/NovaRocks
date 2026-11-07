@@ -127,6 +127,18 @@ impl From<QueryServiceError> for StatementSessionError {
 
 #[cfg(test)]
 mod tests {
+    struct NoCatalogAccess;
+    impl crate::sql::session::registry::SessionCatalogPropertyPort for NoCatalogAccess {
+        fn session_property_catalog(
+            &self,
+            _: &str,
+        ) -> Result<
+            crate::sql::session::registry::SessionCatalogPropertyAdmission,
+            crate::session_error::QueryServiceError,
+        > {
+            panic!("system-only session input must not acquire catalog facts")
+        }
+    }
     use super::*;
     #[test]
     fn time_zone_inputs_are_validated_without_assigning_semantics() {
@@ -204,7 +216,12 @@ mod tests {
             family,
         )
         .unwrap();
-        let state = SessionSqlState::from_session_value(value).unwrap();
+        let state = SessionSqlState::from_session_value(
+            value,
+            &crate::sql::session::registry::SessionPropertyRegistry::new().unwrap(),
+            &NoCatalogAccess,
+        )
+        .unwrap();
         assert_eq!(state.current_catalog(), Some("unknown_lake"));
         assert_eq!(state.current_database(), "deleted_schema");
         assert_eq!(state.presentation(), Some(&family));
@@ -281,7 +298,12 @@ mod tests {
             }),
         )
         .unwrap();
-        let state = SessionSqlState::from_session_value(value).unwrap();
+        let state = SessionSqlState::from_session_value(
+            value,
+            &crate::sql::session::registry::SessionPropertyRegistry::new().unwrap(),
+            &NoCatalogAccess,
+        )
+        .unwrap();
         assert_eq!(state.current_catalog(), None);
         assert_eq!(state.current_database(), DEFAULT_DATABASE);
         assert_eq!(

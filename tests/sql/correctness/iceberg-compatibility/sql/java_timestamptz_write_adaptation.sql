@@ -29,7 +29,6 @@ receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 
 -- query 2
 -- @skip_result_check=true
-SET time_zone='+08:00';
 INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} VALUES
  (1,'2024-01-02 03:04:05.123456',12.34,'東京',X'FF00'),
  (2,NULL,NULL,NULL,NULL);
@@ -52,5 +51,4 @@ SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_
 
 -- query 6
 -- @skip_result_check=true
-SET time_zone='UTC';
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} FORCE;

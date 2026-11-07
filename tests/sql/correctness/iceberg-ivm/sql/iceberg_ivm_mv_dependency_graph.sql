@@ -61,8 +61,7 @@ INSERT INTO ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} VALUES
 
 -- query 2
 -- @skip_result_check=true
-SET CATALOG ice_ivm_dep_${uuid0};
-USE dep_${uuid0};
+USE ice_ivm_dep_${uuid0}.dep_${uuid0};
 
 -- query 3
 -- @skip_result_check=true

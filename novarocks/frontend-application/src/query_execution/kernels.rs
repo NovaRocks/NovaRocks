@@ -596,12 +596,14 @@ impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 /// Session catalog admission and namespace lookup.
 ///
 /// This is deliberately not part of generic command dispatch: `USE` and
-/// `SET CATALOG` are session admission operations.
+/// property admission remain separate from generic command dispatch.
 #[derive(Clone)]
 pub struct SessionCatalogResolver {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
 }
 
 impl SessionCatalogResolver {
@@ -609,11 +611,75 @@ impl SessionCatalogResolver {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyRegistry,
+        >,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
+            session_properties,
+        }
+    }
+}
+
+impl novarocks_query_application::sql::session::registry::SessionCatalogPropertyPort
+    for SessionCatalogResolver
+{
+    fn session_property_catalog(
+        &self,
+        catalog: &str,
+    ) -> Result<
+        novarocks_query_application::sql::session::registry::SessionCatalogPropertyAdmission,
+        QueryServiceError,
+    > {
+        use novarocks_catalog_application::CatalogConfigurationAdmission;
+        use novarocks_query_application::sql::session::registry::{
+            CatalogPropertyIdentity, CatalogPropertyMetadata, SessionCatalogPropertyAdmission,
+        };
+        if catalog == novarocks_types::naming::DEFAULT_CATALOG {
+            let _local = self.catalog_service.local().read().map_err(|_| {
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Internal,
+                    "query catalog read lock poisoned",
+                )
+            })?;
+            return Ok(SessionCatalogPropertyAdmission::Ready(Arc::new(
+                CatalogPropertyMetadata::local(catalog),
+            )));
+        }
+        let application = self.catalog_application.as_ref().ok_or_else(|| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Unavailable,
+                "external catalog configuration admission is not installed",
+            )
+        })?;
+        let instance = match novarocks_spi::connector::ConnectorInstanceId::parse(catalog) {
+            Ok(instance) if instance.as_str() == catalog => instance,
+            _ => return Ok(SessionCatalogPropertyAdmission::Absent),
+        };
+        match application.admit_catalog_configuration(&instance) {
+            CatalogConfigurationAdmission::Absent => Ok(SessionCatalogPropertyAdmission::Absent),
+            CatalogConfigurationAdmission::Unavailable { reason } => {
+                Ok(SessionCatalogPropertyAdmission::Unavailable(
+                    QueryServiceError::new(QueryServiceErrorKind::Unavailable, reason),
+                ))
+            }
+            CatalogConfigurationAdmission::Ready(facts) => {
+                let runtime = facts.runtime;
+                let identity = CatalogPropertyIdentity {
+                    attachment_id: runtime.attachment_id,
+                    instance_id: runtime.instance_id,
+                    provider_id: runtime.provider_id,
+                    generation: runtime.generation,
+                };
+                let metadata = self
+                    .session_properties
+                    .bind_catalog(catalog, identity, facts.configuration.durable_properties())
+                    .map_err(novarocks_query_application::sql::session::session_property_error)?;
+                Ok(SessionCatalogPropertyAdmission::Ready(Arc::new(metadata)))
+            }
         }
     }
 }
@@ -714,6 +780,10 @@ mod session_catalog_tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+            Arc::new(
+                novarocks_query_application::sql::session::registry::SessionPropertyRegistry::new()
+                    .unwrap(),
+            ),
         )
     }
 
@@ -744,6 +814,10 @@ mod session_catalog_tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+            Arc::new(
+                novarocks_query_application::sql::session::registry::SessionPropertyRegistry::new()
+                    .unwrap(),
+            ),
         );
         let cancellation = novarocks_spi::connector::ConnectorStopOwner::new();
         let request = crate::connector::connector_request_context(None, cancellation.view())

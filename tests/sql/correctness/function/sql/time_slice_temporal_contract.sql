@@ -19,7 +19,6 @@
 -- Typed temporal result domains; independent calendar/epoch oracles.
 
 -- query 1
-SET disable_function_fold_constants=off;
 SELECT time_slice('2023-12-31 03:12:04',INTERVAL 2147483647 YEAR) AS sliced;
 
 -- query 2
@@ -58,7 +57,6 @@ SELECT time_slice('2020-01-01',INTERVAL 2147483648 DAY) AS sliced;
 SELECT time_slice('0000-01-01',INTERVAL 1 DAY) AS sliced;
 
 -- query 12
-SET disable_function_fold_constants=on;
 SELECT time_slice('2023-12-31 03:12:04',INTERVAL 2147483647 YEAR) AS sliced;
 
 -- query 13
@@ -87,4 +85,3 @@ SELECT time_slice([1],1,'day','floor') AS sliced;
 
 -- query 20
 SELECT date_slice(NULL,INTERVAL 1 DAY) AS sliced;
-SET disable_function_fold_constants=off;

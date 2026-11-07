@@ -79,7 +79,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0) AS sum_left,
          COALESCE(SUM(t2.c2), 0) AS sum_right
   FROM ${case_db}.t1
-  JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+  JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
   UNION ALL
   SELECT '02_left_outer',
          COUNT(*),
@@ -88,7 +88,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t2.c2), 0)
   FROM ${case_db}.t1
-  LEFT JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+  LEFT JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
   UNION ALL
   SELECT '03_left_semi',
          COUNT(*),
@@ -97,7 +97,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT SEMI JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+  LEFT SEMI JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
   UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
@@ -106,7 +106,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT ANTI JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+  LEFT ANTI JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
   UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
@@ -115,7 +115,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  RIGHT OUTER JOIN [shuffle] ${case_db}.t3 ON t1.c1 > t3.c1
+  RIGHT OUTER JOIN  ${case_db}.t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '06_full_outer',
          COUNT(*),
@@ -124,7 +124,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t4.c2), 0)
   FROM ${case_db}.t1
-  FULL OUTER JOIN [shuffle] ${case_db}.t4 ON t1.c1 > t4.c1
+  FULL OUTER JOIN  ${case_db}.t4 ON t1.c1 > t4.c1
   UNION ALL
   SELECT '07_right_semi',
          COUNT(*),
@@ -133,7 +133,7 @@ FROM (
          0,
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  RIGHT SEMI JOIN [shuffle] ${case_db}.t3 ON t1.c1 > t3.c1
+  RIGHT SEMI JOIN  ${case_db}.t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
@@ -142,7 +142,7 @@ FROM (
          0,
          COALESCE(SUM(t4.c2), 0)
   FROM ${case_db}.t1
-  RIGHT ANTI JOIN [shuffle] ${case_db}.t4 ON t1.c1 > t4.c1
+  RIGHT ANTI JOIN  ${case_db}.t4 ON t1.c1 > t4.c1
 ) s
 ORDER BY scenario;
 
@@ -157,7 +157,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0) AS sum_left,
          COALESCE(SUM(t3.c2), 0) AS sum_right
   FROM ${case_db}.t1
-  JOIN [broadcast] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '02_left_outer',
          COUNT(*),
@@ -166,7 +166,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  LEFT JOIN [broadcast] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  LEFT JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '03_left_semi',
          COUNT(*),
@@ -175,7 +175,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT SEMI JOIN [broadcast] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  LEFT SEMI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
@@ -184,7 +184,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          0
   FROM ${case_db}.t1
-  LEFT ANTI JOIN [broadcast] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  LEFT ANTI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
@@ -193,7 +193,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  RIGHT OUTER JOIN [shuffle] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  RIGHT OUTER JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '06_full_outer',
          COUNT(*),
@@ -202,7 +202,7 @@ FROM (
          COALESCE(SUM(t1.c2), 0),
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  FULL OUTER JOIN [shuffle] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  FULL OUTER JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '07_right_semi',
          COUNT(*),
@@ -211,7 +211,7 @@ FROM (
          0,
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  RIGHT SEMI JOIN [shuffle] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  RIGHT SEMI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
   UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
@@ -220,7 +220,7 @@ FROM (
          0,
          COALESCE(SUM(t3.c2), 0)
   FROM ${case_db}.t1
-  RIGHT ANTI JOIN [shuffle] (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
+  RIGHT ANTI JOIN  (SELECT * FROM ${case_db}.t2 WHERE c1 < 1) t3 ON t1.c1 > t3.c1
 ) s
 ORDER BY scenario;
 
@@ -235,7 +235,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0) AS sum_left,
          COALESCE(SUM(t2.c2), 0) AS sum_right
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  JOIN [broadcast] ${case_db}.t2 ON t3.c1 > t2.c1
+  JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '02_left_outer',
          COUNT(*),
@@ -244,7 +244,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          COALESCE(SUM(t2.c2), 0)
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  LEFT JOIN [broadcast] ${case_db}.t2 ON t3.c1 > t2.c1
+  LEFT JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '03_left_semi',
          COUNT(*),
@@ -253,7 +253,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          0
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  LEFT SEMI JOIN [broadcast] ${case_db}.t2 ON t3.c1 > t2.c1
+  LEFT SEMI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '04_left_anti',
          COUNT(*),
@@ -262,7 +262,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          0
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  LEFT ANTI JOIN [broadcast] ${case_db}.t2 ON t3.c1 > t2.c1
+  LEFT ANTI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '05_right_outer',
          COUNT(*),
@@ -271,7 +271,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          COALESCE(SUM(t2.c2), 0)
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  RIGHT OUTER JOIN [shuffle] ${case_db}.t2 ON t3.c1 > t2.c1
+  RIGHT OUTER JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '06_full_outer',
          COUNT(*),
@@ -280,7 +280,7 @@ FROM (
          COALESCE(SUM(t3.c2), 0),
          COALESCE(SUM(t2.c2), 0)
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  FULL OUTER JOIN [shuffle] ${case_db}.t2 ON t3.c1 > t2.c1
+  FULL OUTER JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '07_right_semi',
          COUNT(*),
@@ -289,7 +289,7 @@ FROM (
          0,
          COALESCE(SUM(t2.c2), 0)
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  RIGHT SEMI JOIN [shuffle] ${case_db}.t2 ON t3.c1 > t2.c1
+  RIGHT SEMI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
   UNION ALL
   SELECT '08_right_anti',
          COUNT(*),
@@ -298,7 +298,7 @@ FROM (
          0,
          COALESCE(SUM(t2.c2), 0)
   FROM (SELECT * FROM ${case_db}.t1 WHERE c1 < 1) t3
-  RIGHT ANTI JOIN [shuffle] ${case_db}.t2 ON t3.c1 > t2.c1
+  RIGHT ANTI JOIN  ${case_db}.t2 ON t3.c1 > t2.c1
 ) s
 ORDER BY scenario;
 
@@ -317,13 +317,13 @@ SELECT 'left_large' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 5
 -- Sample the low-key edge without sorting the full large join result.
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 <= 5
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
@@ -332,7 +332,7 @@ LIMIT 10;
 -- Sample the high-key edge to preserve descending tail coverage cheaply.
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 >= 4094
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
@@ -352,19 +352,19 @@ SELECT 'right_large' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 8
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
 
 -- query 9
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
 
@@ -383,12 +383,12 @@ SELECT 'multi_chunk_equal' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 11
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 <= 5
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
@@ -396,7 +396,7 @@ LIMIT 10;
 -- query 12
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 >= 4094
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
@@ -416,12 +416,12 @@ SELECT 'multi_chunk_left_boundary' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 14
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 <= 5
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
@@ -429,7 +429,7 @@ LIMIT 10;
 -- query 15
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 >= 4092
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
@@ -449,12 +449,12 @@ SELECT 'multi_chunk_right_boundary' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 17
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 <= 5
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
@@ -462,7 +462,7 @@ LIMIT 10;
 -- query 18
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 WHERE t1.c1 >= 4094
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
@@ -482,19 +482,19 @@ SELECT 'multi_small_chunk' AS scenario,
        COALESCE(SUM(t1.c2), 0) AS sum_left,
        COALESCE(SUM(t2.c2), 0) AS sum_right
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1;
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1;
 
 -- query 20
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 ORDER BY t1.c2, t2.c2
 LIMIT 10;
 
 -- query 21
 SELECT t1.c2, t2.c2
 FROM ${case_db}.t1
-JOIN [broadcast] ${case_db}.t2 ON t1.c1 > t2.c1
+JOIN  ${case_db}.t2 ON t1.c1 > t2.c1
 ORDER BY t1.c2 DESC, t2.c2 DESC
 LIMIT 10;
 
@@ -528,6 +528,6 @@ dim AS (
 )
 SELECT COUNT(*)
 FROM l
-JOIN [shuffle] r ON lk = rk
+JOIN  r ON lk = rk
 JOIN dim
 WHERE rk >= mn_lo_orderkey AND rk <= mx_lo_orderkey;

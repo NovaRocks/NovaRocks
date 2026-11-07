@@ -264,9 +264,10 @@ The HTTP listener binds to `127.0.0.1`; its configured port is reported as
 `NOVAROCKS_READY role=fe trino_port=<actual-port> pid=<pid>`.
 `trino_query_max_length` counts UTF-16 code units, defaults to 1,000,000,
 and accepts `0..=1000000000`. Retired MySQL listener configuration is rejected.
-The SQL dialect is unchanged. The server supports session context such as `USE <db>`,
-`SET catalog = <catalog>`, `SET query_timeout = N`, and
-`SET group_concat_max_len = N`.
+会话上下文使用 `USE <catalog>.<schema>`，已有 catalog 时也可使用 `USE <schema>`。
+已登记属性使用 `SET SESSION query_timeout = N`、`SET SESSION group_concat_max_len = N`
+等写法；值按属性声明接受类型正确的常量表达式，未知属性明确拒绝。会话属性的声明、求值与
+所有权见 [ADR-0222](docs/adr/ADR-0222-session-property-declarations-and-required-constant-evaluation.md)。
 
 ## Local Iceberg REST + MinIO + Spark Environment
 

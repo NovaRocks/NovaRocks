@@ -53,14 +53,13 @@ INSERT INTO ${case_db}.t0 SELECT generate_series, generate_series, generate_seri
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 
 -- query 5
-SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN [broadcast] ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;
+SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN  ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;
 
 -- query 6
 -- @skip_result_check=true
-SET enable_query_cache = true;
 
 -- query 7
-SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN [broadcast] ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;
+SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN  ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;
 
 -- query 8
-SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN [broadcast] ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;
+SELECT count(l1), count(l2), count(l3), count(l4) FROM (SELECT l.c0 l1, r.c1 l2, r.c2 l3, r.c3 l4 FROM ${case_db}.t0 l JOIN  ${case_db}.t1 r ON l.c0=r.c0 AND l.c1=r.c1 GROUP BY 1,2,3,4) t;

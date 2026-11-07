@@ -65,10 +65,10 @@ select st2.ss3.sss1, st2.ss3.sss2.ssss2, st2.ss3 from ${case_db}.sc2;
 select * from ${case_db}.t1 join ${case_db}.sc2 on ${case_db}.t1.v2 = ${case_db}.sc2.v1;
 
 -- query 6
-select st1.sm2, map_keys(map1) from ${case_db}.t1 join[broadcast] ${case_db}.sc2 on ${case_db}.t1.v2 = ${case_db}.sc2.v1;
+select st1.sm2, map_keys(map1) from ${case_db}.t1 join ${case_db}.sc2 on ${case_db}.t1.v2 = ${case_db}.sc2.v1;
 
 -- query 7
-select st1.sm2, map_keys(map1) from ${case_db}.t1 join[shuffle] ${case_db}.sc2 on ${case_db}.t1.v2 = ${case_db}.sc2.v1;
+select st1.sm2, map_keys(map1) from ${case_db}.t1 join ${case_db}.sc2 on ${case_db}.t1.v2 = ${case_db}.sc2.v1;
 
 -- query 8
 select * from ${case_db}.sc2 union all select * from ${case_db}.sc2;

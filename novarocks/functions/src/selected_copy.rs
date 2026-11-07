@@ -25,7 +25,7 @@ mod zip;
 mod take_host;
 pub use take_host::{
     CopyIndexView, CopyIndices, CopyOperationError, CopyOperationFacts, RetainedTakeResult,
-    take_copy_in,
+    take_copy_in, take_flat_owned_copy_in,
 };
 #[path = "selected_copy/fixed_binary.rs"]
 mod fixed_binary;

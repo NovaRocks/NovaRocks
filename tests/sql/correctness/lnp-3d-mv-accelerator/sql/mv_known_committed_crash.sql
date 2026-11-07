@@ -46,8 +46,7 @@ CREATE DATABASE lnp3d_commit_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_commit_${uuid0}.ns_${uuid0}.orders (k1 INT NOT NULL, v1 BIGINT)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO lnp3d_commit_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
-SET CATALOG lnp3d_commit_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_commit_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PRIMARY KEY (k1)
@@ -84,8 +83,7 @@ SELECT 1;
 -- query 6
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG lnp3d_commit_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_commit_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE lnp3d_commit_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE lnp3d_commit_${uuid0}.ns_${uuid0};

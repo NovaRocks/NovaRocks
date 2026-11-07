@@ -35,29 +35,29 @@ use test_create_mv_with_user;
 SELECT '%' AS mv_creator_host_pattern;
 
 -- query 5
-DROP USER IF EXISTS mv_creator@'%';
+DROP USER IF EXISTS mv_creator;
 
 -- query 6
-CREATE USER mv_creator@'%';
+CREATE USER mv_creator;
 
 -- query 7
 GRANT DELETE, DROP, INSERT, SELECT, ALTER, UPDATE ON ALL TABLES IN DATABASE test_create_mv_with_user
-    TO USER mv_creator@'%';
+    TO USER mv_creator;
 
 -- query 8
 GRANT CREATE TABLE, CREATE MATERIALIZED VIEW ON DATABASE test_create_mv_with_user
-    TO USER mv_creator@'%';
+    TO USER mv_creator;
 
 -- query 9
 GRANT SELECT, DROP, ALTER, REFRESH ON ALL MATERIALIZED VIEWS IN DATABASE test_create_mv_with_user
-    TO USER mv_creator@'%';
+    TO USER mv_creator;
 
 -- query 10
 -- switch user mv_creator
-GRANT IMPERSONATE ON USER root TO mv_creator@'%';
+GRANT IMPERSONATE ON USER root TO mv_creator;
 
 -- query 11
-EXECUTE AS mv_creator@'%' with no revert;
+EXECUTE AS mv_creator with no revert;
 
 -- query 12
 -- create & use materialized view
@@ -93,14 +93,14 @@ drop materialized view mv1;
 execute as root with no revert;
 
 -- query 21
-drop user mv_creator@'%';
+drop user mv_creator;
 
 -- query 22
 -- Test TaskRun role activation fix: User with multiple roles, only one has REFRESH privilege
 -- This test verifies that MV refresh works regardless of session default roles
 -- because TaskRun context activates all user roles
 -- Tests both creator-based and root-based authorization modes
-DROP USER IF EXISTS mv_multi_role_user@'%';
+DROP USER IF EXISTS mv_multi_role_user;
 
 -- query 23
 DROP ROLE IF EXISTS role_with_refresh;
@@ -133,13 +133,13 @@ GRANT SELECT  ON ALL TABLES IN DATABASE test_create_mv_with_user TO ROLE role_wi
 GRANT CREATE TABLE, CREATE MATERIALIZED VIEW ON DATABASE test_create_mv_with_user TO ROLE role_without_refresh;
 
 -- query 33
-CREATE USER mv_multi_role_user@'%';
+CREATE USER mv_multi_role_user;
 
 -- query 34
-GRANT role_with_refresh, role_without_refresh TO USER mv_multi_role_user@'%';
+GRANT role_with_refresh, role_without_refresh TO USER mv_multi_role_user;
 
 -- query 35
-GRANT IMPERSONATE ON USER root TO mv_multi_role_user@'%';
+GRANT IMPERSONATE ON USER root TO mv_multi_role_user;
 
 -- query 36
 -- Grant direct privileges to user so they can create tables even with default_role=none
@@ -147,10 +147,10 @@ GRANT IMPERSONATE ON USER root TO mv_multi_role_user@'%';
 -- GRANT SELECT ON ALL TABLES IN DATABASE test_create_mv_with_user TO USER mv_multi_role_user@'${ip[1]}';
 -- Test Case 1: Creator-based authorization (mv_use_creator_based_authorization=true)
 -- This tests the default behavior where MV refresh uses the creator's context
-SET DEFAULT ROLE NONE TO mv_multi_role_user@'%';
+SET DEFAULT ROLE NONE TO mv_multi_role_user;
 
 -- query 37
-EXECUTE AS mv_multi_role_user@'%' with no revert;
+EXECUTE AS mv_multi_role_user with no revert;
 
 -- query 38
 SET ROLE role_with_refresh;
@@ -184,7 +184,7 @@ REFRESH MATERIALIZED VIEW test_create_mv_with_user.test_mv_async WITH SYNC MODE;
 
 -- query 46
 -- Test Case 2: Creator-based authorization with default role
-SET DEFAULT ROLE role_with_refresh TO mv_multi_role_user@'%';
+SET DEFAULT ROLE role_with_refresh TO mv_multi_role_user;
 
 -- query 47
 SET ROLE role_with_refresh;
@@ -215,7 +215,7 @@ REFRESH MATERIALIZED VIEW test_create_mv_with_user.test_mv_async2 WITH SYNC MODE
 
 -- query 54
 -- Test Case 3: Creator-based authorization with insufficient default role
-SET DEFAULT ROLE role_without_refresh TO mv_multi_role_user@'%';
+SET DEFAULT ROLE role_without_refresh TO mv_multi_role_user;
 
 -- query 55
 SET ROLE role_with_refresh;
@@ -250,13 +250,13 @@ REFRESH MATERIALIZED VIEW test_create_mv_with_user.test_mv_async3 WITH SYNC MODE
 EXECUTE AS root with no revert;
 
 -- query 63
-REVOKE role_with_refresh FROM mv_multi_role_user@'%';
+REVOKE role_with_refresh FROM mv_multi_role_user;
 
 -- query 64
-SET DEFAULT ROLE NONE TO mv_multi_role_user@'%';
+SET DEFAULT ROLE NONE TO mv_multi_role_user;
 
 -- query 65
-EXECUTE AS mv_multi_role_user@'%' with no revert;
+EXECUTE AS mv_multi_role_user with no revert;
 
 -- query 66
 SET ROLE role_without_refresh;
@@ -311,4 +311,4 @@ DROP ROLE role_with_refresh;
 DROP ROLE role_without_refresh;
 
 -- query 81
-DROP USER mv_multi_role_user@'%';
+DROP USER mv_multi_role_user;

@@ -72,7 +72,6 @@ INSERT INTO ${case_db}.employees VALUES
 (23, 'Wendy', 17, 'Research Associate'),
 (24, 'Xavier', 18, 'ML Engineer'),
 (25, 'Yolanda', 14, 'Junior Engineer');
-set recursive_cte_throw_limit_exception=false;
 
 -- query 2
 -- @order_sensitive=true
@@ -87,7 +86,7 @@ WITH RECURSIVE org_hierarchy AS (
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.employee_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ employee_id, name, title, `level`, path
+SELECT  employee_id, name, title, `level`, path
 FROM org_hierarchy
 ORDER BY employee_id;
 
@@ -103,7 +102,7 @@ WITH RECURSIVE org_hierarchy(emp_id, emp_name, mgr_id, emp_title, emp_level, emp
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.emp_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ emp_id, emp_name, emp_title, emp_level, emp_path
+SELECT  emp_id, emp_name, emp_title, emp_level, emp_path
 FROM org_hierarchy
 ORDER BY emp_id;
 
@@ -117,7 +116,7 @@ WITH RECURSIVE numbers AS (
     FROM numbers
     WHERE n < 10
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ n, square, cc
+SELECT  n, square, cc
 FROM numbers
 ORDER BY n;
 
@@ -135,9 +134,9 @@ cte2 AS (
     UNION ALL
     SELECT n + 1 FROM cte2 WHERE n < 15
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ 'cte1' AS source, n FROM cte1
+SELECT  'cte1' AS source, n FROM cte1
 UNION ALL
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ 'cte2' AS source, n FROM cte2
+SELECT  'cte2' AS source, n FROM cte2
 ORDER BY source, n;
 
 -- query 6
@@ -152,7 +151,7 @@ WITH RECURSIVE subordinates AS (
     FROM ${case_db}.employees e
     INNER JOIN subordinates s ON e.manager_id = s.employee_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ s.employee_id, s.name, s.title, e.name AS manager_name
+SELECT  s.employee_id, s.name, s.title, e.name AS manager_name
 FROM subordinates s
 LEFT JOIN ${case_db}.employees e ON s.manager_id = e.employee_id
 ORDER BY s.employee_id;
@@ -169,7 +168,7 @@ WITH RECURSIVE org_hierarchy AS (
     FROM ${case_db}.employees e
     INNER JOIN org_hierarchy oh ON e.manager_id = oh.employee_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ `level`, COUNT(*) AS employee_count
+SELECT  `level`, COUNT(*) AS employee_count
 FROM org_hierarchy
 GROUP BY `level`
 ORDER BY `level`;
@@ -187,7 +186,7 @@ WITH RECURSIVE parent_cte AS (
     INNER JOIN parent_cte p ON e.manager_id = p.employee_id
     WHERE p.`level` < 3
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ employee_id, name, `level`
+SELECT  employee_id, name, `level`
 FROM parent_cte
 ORDER BY employee_id;
 
@@ -202,7 +201,7 @@ WITH RECURSIVE numbers AS (
     UNION
     SELECT n, 2 FROM numbers
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ DISTINCT n, category
+SELECT  DISTINCT n, category
 FROM numbers
 ORDER BY n, category;
 
@@ -216,7 +215,7 @@ WITH RECURSIVE numbers AS (
     UNION
     SELECT n, 2 FROM numbers
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ DISTINCT n, category
+SELECT  DISTINCT n, category
 FROM numbers
 ORDER BY n, category;
 
@@ -231,7 +230,7 @@ WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
     FROM fibonacci
     WHERE n < 10
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ n, fib_n AS fibonacci_number
+SELECT  n, fib_n AS fibonacci_number
 FROM fibonacci
 ORDER BY n;
 
@@ -245,7 +244,7 @@ WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
     FROM fibonacci
     WHERE n < 10
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true, recursive_cte_max_depth=10)*/ n, fib_n AS fibonacci_number
+SELECT /*+ SET_VAR( recursive_cte_max_depth=10)*/ n, fib_n AS fibonacci_number
 FROM fibonacci
 ORDER BY n;
 
@@ -261,7 +260,7 @@ WITH RECURSIVE manager_chain AS (
     FROM ${case_db}.employees e
     INNER JOIN manager_chain mc ON mc.manager_id = e.employee_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ employee_id, name, title, steps
+SELECT  employee_id, name, title, steps
 FROM manager_chain
 ORDER BY steps;
 
@@ -274,7 +273,7 @@ WITH RECURSIVE invalid_cte AS (
     UNION ALL
     SELECT employee_id, name FROM ${case_db}.employees WHERE manager_id = 1
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ * FROM invalid_cte;
+SELECT  * FROM invalid_cte;
 
 -- query 15
 -- @order_sensitive=true
@@ -283,7 +282,7 @@ SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ * FROM invalid_cte;
 WITH RECURSIVE invalid_cte AS (
     SELECT employee_id, name FROM ${case_db}.employees WHERE employee_id = 1
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ * FROM invalid_cte;
+SELECT  * FROM invalid_cte;
 
 -- query 16
 -- @order_sensitive=true
@@ -300,6 +299,6 @@ manager_chain AS (
     FROM ${case_db}.employees e
     INNER JOIN manager_chain mc ON mc.manager_id = e.employee_id
 )
-SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ employee_id, name, title, steps, id
+SELECT  employee_id, name, title, steps, id
 FROM manager_chain, const_cte
 ORDER BY steps;

@@ -41,12 +41,13 @@ impl SqlLogicalExplainCatalog {
         control.check()?;
         let query = crate::sql_mode::normalize_concat_query(query, &session.sql_semantics)
             .map_err(SqlCompileError::from)?;
-        let catalog = CatalogCompletionState::try_new(
+        let catalog = CatalogCompletionState::try_new_with_semantics(
             query,
             session.current_catalog.as_deref(),
             &session.current_database,
             crate::catalog::TableLookupMode::ExplainStats,
             0,
+            &session.sql_semantics,
         )?
         .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         Ok(Self {

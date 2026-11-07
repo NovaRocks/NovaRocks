@@ -49,8 +49,7 @@ CREATE TABLE ice_ivm_agg_part_${uuid0}.ns_${uuid0}.orders (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_ivm_agg_part_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_agg_part_${uuid0}.ns_${uuid0};
 INSERT INTO orders VALUES ('east', 10), ('west', 5);
 CREATE MATERIALIZED VIEW agg_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1

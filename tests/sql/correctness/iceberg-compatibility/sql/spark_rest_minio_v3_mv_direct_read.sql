@@ -21,9 +21,8 @@
 
 -- query 1
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
-CREATE DATABASE IF NOT EXISTS ${case_db};
-USE ${case_db};
+CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
+USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS mv_direct_read_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;
 CREATE TABLE mv_direct_base_${uuid0} (
@@ -88,6 +87,6 @@ printf 'SPARK_SQL_OK\n'
 -- query 3
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
+USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_direct_read_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;

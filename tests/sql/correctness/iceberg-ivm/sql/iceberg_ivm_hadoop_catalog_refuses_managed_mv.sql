@@ -58,8 +58,7 @@ DELETE FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders WHERE region = '__rwm5_li
 
 -- query 2
 -- @expect_error=application-document management requires an Iceberg REST catalog
-SET CATALOG ice_ivm_hadoop_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_hadoop_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW agg_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

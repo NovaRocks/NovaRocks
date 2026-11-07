@@ -48,7 +48,6 @@ use novarocks_sql::compiler::{
 pub(crate) enum FrontendQueryPurpose {
     ClientRows,
     LocalRows,
-    ScalarValue,
 }
 
 impl FrontendQueryPurpose {
@@ -65,7 +64,6 @@ impl FrontendQueryPurpose {
         match self {
             Self::ClientRows => ResultWindowClass::Client,
             Self::LocalRows => ResultWindowClass::Local,
-            Self::ScalarValue => ResultWindowClass::Internal,
         }
     }
 
@@ -77,7 +75,6 @@ impl FrontendQueryPurpose {
             (Self::LocalRows, Statement::Query(query)) => {
                 information_schema::is_local_materialized_views_query(query)
             }
-            (Self::ScalarValue, Statement::Query(_)) => true,
             _ => false,
         };
         if valid {
@@ -234,6 +231,32 @@ impl FrontendQueryCompiler {
         self.constant_policy
     }
 
+    pub(crate) fn session_property_input(
+        &self,
+        source: Arc<str>,
+        set: novarocks_parser::ast::SetStatement,
+        staged: novarocks_query_application::sql::session::SessionSqlState,
+        registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+        interpreter: Arc<crate::RequiredConstantInterpreter>,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        scope: novarocks_workload_control::WorkScope,
+        window: novarocks_workload_control::ResultWindowAlias,
+    ) -> super::session_property_computation::SessionPropertyCpuInput {
+        super::session_property_computation::SessionPropertyCpuInput {
+            source,
+            set,
+            staged,
+            registry,
+            interpreter,
+            control,
+            scope,
+            window,
+            catalog: Arc::clone(self.query.catalog_service().local()),
+            functions: self.functions.clone(),
+            policy: self.constant_policy,
+        }
+    }
+
     /// The owners in this process that can answer what completing a statement
     /// asks, and the lane their synchronous calls are admitted through.
     fn completion_fact_owners(
@@ -302,21 +325,6 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
-}
-
-pub(crate) fn scalar_root_output_from_public_port(
-    port: Option<&novarocks_physical_plan::ResultPort>,
-) -> Result<novarocks_result_contract::FrozenRootOutput, FrontendQueryCompilerError> {
-    novarocks_sql::compiler::validate_public_result_logical_identities(port)
-        .map_err(FrontendQueryCompilerError::Engine)?;
-    Ok(novarocks_result_contract::FrozenRootOutput::ScalarValue(
-        port.and_then(|port| port.scalar_schema.clone())
-            .ok_or_else(|| {
-                FrontendQueryCompilerError::Engine(
-                    "completed scalar query has no frozen SQL scalar schema".into(),
-                )
-            })?,
-    ))
 }
 
 #[cfg(test)]
@@ -708,44 +716,6 @@ mod purpose_tests {
     }
 
     #[test]
-    fn public_scalar_complete_uuid_is_named_before_the_original_missing_proof_error() {
-        use novarocks_physical_plan::{
-            ResultField, ResultPort, ResultValueDomain, ValueId, ValueType,
-        };
-        use novarocks_type_contract::ValueLogicalType;
-        let ty = ValueType::try_with_logical_type(
-            arrow::datatypes::DataType::FixedSizeBinary(16),
-            true,
-            ValueLogicalType::Uuid,
-        )
-        .unwrap();
-        let port = ResultPort {
-            fragment: novarocks_physical_plan::FragmentId::new(1),
-            output: novarocks_physical_plan::OutputPort {
-                node: novarocks_physical_plan::NodeId::new(1),
-                columns: vec![ValueId::new(1)].into(),
-            },
-            fields: vec![ResultField {
-                domain: ResultValueDomain::Plain,
-                name: "u".into(),
-                alias: None,
-                value: ValueId::new(1),
-                ty,
-            }]
-            .into(),
-            scalar_schema: None,
-        };
-        let error = scalar_root_output_from_public_port(Some(&port)).unwrap_err();
-        assert!(
-            matches!(error, FrontendQueryCompilerError::Engine(ref text) if text.contains("UUID") && text.contains("unsupported"))
-        );
-        let error = scalar_root_output_from_public_port(None).unwrap_err();
-        assert!(
-            matches!(error, FrontendQueryCompilerError::Engine(ref text) if text == "completed scalar query has no frozen SQL scalar schema")
-        );
-    }
-
-    #[test]
     fn client_admission_uses_only_the_exact_local_immediate_shape() {
         for sql in [
             "SELECT * FROM information_schema.materialized_views",
@@ -789,18 +759,14 @@ mod purpose_tests {
     fn synchronous_read_purposes_reject_explain_and_do_not_infer_scalar_output() {
         let select = statement("SELECT 1");
         assert!(FrontendQueryPurpose::ClientRows.validate(&select).is_ok());
-        assert!(FrontendQueryPurpose::ScalarValue.validate(&select).is_ok());
         for sql in ["EXPLAIN SELECT 1", "EXPLAIN ANALYZE SELECT 1"] {
             let explain = statement(sql);
             for purpose in [
                 FrontendQueryPurpose::ClientRows,
                 FrontendQueryPurpose::LocalRows,
-                FrontendQueryPurpose::ScalarValue,
             ] {
                 assert!(purpose.validate(&explain).is_err(), "{sql}: {purpose:?}");
             }
         }
-        let local = statement("SELECT TABLE_NAME FROM information_schema.materialized_views");
-        assert!(FrontendQueryPurpose::ScalarValue.validate(&local).is_ok());
     }
 }

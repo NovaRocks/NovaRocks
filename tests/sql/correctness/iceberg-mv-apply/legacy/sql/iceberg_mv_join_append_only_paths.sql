@@ -54,8 +54,7 @@ CREATE TABLE ice_mv_join_paths_${uuid0}.ns_${uuid0}.dim_${uuid0} (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_mv_join_paths_${uuid0};
-USE ns_${uuid0};
+USE ice_mv_join_paths_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW join_paths_mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

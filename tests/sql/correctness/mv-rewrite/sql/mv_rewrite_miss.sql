@@ -77,11 +77,10 @@ FROM TABLE(generate_series(1, 1200)) t(number);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -142,13 +141,13 @@ SELECT region, day, SUM(amount) FROM orders GROUP BY region, day;
 -- query 16
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv_d1;
 
 -- query 17
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 18

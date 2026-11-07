@@ -51,4 +51,3 @@ ALTER TABLE sales MODIFY COLUMN price DECIMAL(15, 2);
 -- query 7
 DROP TABLE sales;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_decimal_${uuid0};
-SET catalog default_catalog;

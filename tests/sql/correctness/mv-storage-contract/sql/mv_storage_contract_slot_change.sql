@@ -43,8 +43,7 @@ INSERT INTO mvslot_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvslot_${uuid0};
-USE ns_${uuid0};
+USE mvslot_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW first_slot_mv
 DISTRIBUTED BY HASH(k) BUCKETS 1 REFRESH DEFERRED MANUAL
 PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k, v FROM fact;
@@ -101,8 +100,7 @@ curl --silent --show-error --fail '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-slot-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.conflict_slot_mv SELECT * FROM ice_rest.ns_${uuid0}.conflict_slot_mv LIMIT 1;" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_error=disposition=KnownUncommitted
-SET CATALOG mvslot_${uuid0};
-USE ns_${uuid0};
+USE mvslot_${uuid0}.ns_${uuid0};
 ALTER MATERIALIZED VIEW conflict_slot_mv PAUSE REFRESH;
 
 -- query 15
@@ -148,8 +146,7 @@ CALL novarocks_mv_management_status('mvslot_${uuid0}', 'ns_${uuid0}', 'unknown_s
 -- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvslot_${uuid0};
-USE ns_${uuid0};
+USE mvslot_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS first_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS conflict_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS unknown_slot_mv;

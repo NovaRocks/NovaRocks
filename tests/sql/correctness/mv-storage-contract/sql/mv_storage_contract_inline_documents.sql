@@ -57,8 +57,7 @@ INSERT INTO mvside_${uuid0}.ns_${uuid0}.fact VALUES ('east');
 -- query 5
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=0,slot-changes=0
-SET CATALOG mvside_${uuid0};
-USE ns_${uuid0};
+USE mvside_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_wide
 DISTRIBUTED BY HASH(key_projection_001_with_stable_identity) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -235,8 +234,7 @@ printf '%s\n' OVERSIZED_MV_NOT_VISIBLE
 -- query 12
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvside_${uuid0};
-USE ns_${uuid0};
+USE mvside_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS mv_wide;
 DROP TABLE mvside_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvside_${uuid0}.ns_${uuid0};

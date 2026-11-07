@@ -29,7 +29,7 @@ create database db_${uuid0};
 use db_${uuid0};
 
 -- query 3
-set enable_materialized_view_transparent_union_rewrite = true;
+
 
 -- query 4
 -- test mv with range partition

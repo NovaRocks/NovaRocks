@@ -21,13 +21,13 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_show_materialized_view
 
 -- query 1
-set enable_rewrite_bitmap_union_to_bitamp_agg = false;
+
 
 -- query 2
-set new_planner_optimize_timeout=10000;
+
 
 -- query 3
-set enable_evaluate_schema_scan_rule=false;
+
 
 -- query 4
 create database test_show_materialized_view;
@@ -122,10 +122,10 @@ select
 from information_schema.materialized_views where table_name = 'user_tags_mv1' and TABLE_SCHEMA = 'test_show_materialized_view';
 
 -- query 17
-set @last_refresh_time = (
-    select max(last_refresh_start_time)
-    from information_schema.materialized_views where table_name = 'user_tags_mv1' and TABLE_SCHEMA = 'test_show_materialized_view'
-);
+CREATE TABLE trc5c_snapshot_before_refresh AS
+SELECT date_format(max(last_refresh_start_time), '%Y-%m-%d %H:%i:%s') AS value
+FROM information_schema.materialized_views
+WHERE table_name = 'user_tags_mv1' AND TABLE_SCHEMA = 'test_show_materialized_view';
 
 -- query 18
 -- multiple refresh tasks
@@ -156,14 +156,17 @@ select
 from information_schema.materialized_views where table_name = 'user_tags_mv1' and TABLE_SCHEMA = 'test_show_materialized_view';
 
 -- query 21
-set @this_refresh_time = (
-    select max(last_refresh_start_time)
-    from information_schema.materialized_views where table_name = 'user_tags_mv1' and TABLE_SCHEMA = 'test_show_materialized_view'
-);
+CREATE TABLE trc5c_snapshot_after_refresh AS
+SELECT date_format(max(last_refresh_start_time), '%Y-%m-%d %H:%i:%s') AS value
+FROM information_schema.materialized_views
+WHERE table_name = 'user_tags_mv1' AND TABLE_SCHEMA = 'test_show_materialized_view';
 
 -- query 22
-select if(@last_refresh_time != @this_refresh_time,
-    'refreshed', concat('no refresh after ', @last_refresh_time));
+SELECT if(a.value != b.value,
+    'refreshed', concat('no refresh after ', a.value))
+    AS `if((@last_refresh_time) != (@this_refresh_time), 'refreshed', concat('no refresh after ', @last_refresh_time))`
+FROM trc5c_snapshot_before_refresh a
+CROSS JOIN trc5c_snapshot_after_refresh b;
 
 -- query 23
 select
@@ -257,4 +260,6 @@ show materialized views where name like '%user_tags_mv1%';
 show materialized views where name = 'user_tags_mv1';
 
 -- query 39
+DROP TABLE trc5c_snapshot_after_refresh;
+DROP TABLE trc5c_snapshot_before_refresh;
 drop database test_show_materialized_view;

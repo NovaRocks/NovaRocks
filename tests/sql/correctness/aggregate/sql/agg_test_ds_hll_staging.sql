@@ -67,72 +67,72 @@ SELECT DS_HLL_ESTIMATE(ds_id) AS merged FROM ${case_db}.t_stage_state;
 -- force_streaming + stage 2
 
 -- query 8
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '2') */
+SELECT
   ds_hll_count_distinct(id) AS ungrouped FROM ${case_db}.t_stage;
 
 -- query 9
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '2') */
+SELECT
   grp, ds_hll_count_distinct(id) BETWEEN 12300 AND 12700 AS grouped_ok
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 10
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '2') */
+SELECT
   DS_HLL_ESTIMATE(ds_id) AS merged FROM ${case_db}.t_stage_state;
 
 -- force_streaming + stage 3
 
 -- query 11
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '3') */
+SELECT
   ds_hll_count_distinct(id) AS ungrouped FROM ${case_db}.t_stage;
 
 -- query 12
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '3') */
+SELECT
   grp, ds_hll_count_distinct(id) BETWEEN 12300 AND 12700 AS grouped_ok
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 13
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '3') */
+SELECT
   DS_HLL_ESTIMATE(ds_id) AS merged FROM ${case_db}.t_stage_state;
 
 -- auto + stage 2
 
 -- query 14
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '2') */
+SELECT
   ds_hll_count_distinct(id) AS ungrouped FROM ${case_db}.t_stage;
 
 -- query 15
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '2') */
+SELECT
   grp, ds_hll_count_distinct(id) BETWEEN 12300 AND 12700 AS grouped_ok
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 16
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '2') */
+SELECT
   DS_HLL_ESTIMATE(ds_id) AS merged FROM ${case_db}.t_stage_state;
 
 -- auto + stage 3
 
 -- query 17
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '3') */
+SELECT
   ds_hll_count_distinct(id) AS ungrouped FROM ${case_db}.t_stage;
 
 -- query 18
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '3') */
+SELECT
   grp, ds_hll_count_distinct(id) BETWEEN 12300 AND 12700 AS grouped_ok
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 19
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '3') */
+SELECT
   DS_HLL_ESTIMATE(ds_id) AS merged FROM ${case_db}.t_stage_state;
 
 -- Non-default lg_k and target type must survive the same boundary, because the
 -- intermediate state carries both.
 
 -- query 20
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming', new_planner_agg_stage = '2') */
+SELECT
   grp, ds_hll_count_distinct(id, 10, "HLL_6") AS grouped_hll6
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;
 
 -- query 21
-SELECT /*+ SET_VAR (streaming_preaggregation_mode = 'auto', new_planner_agg_stage = '3') */
+SELECT
   grp, ds_hll_count_distinct(id, 10, "HLL_6") AS grouped_hll6
 FROM ${case_db}.t_stage GROUP BY grp ORDER BY grp;

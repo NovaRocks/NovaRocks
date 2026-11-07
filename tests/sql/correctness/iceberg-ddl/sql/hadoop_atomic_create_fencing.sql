@@ -52,6 +52,5 @@ INSERT INTO events VALUES (1, 'winner');
 SELECT * FROM events ORDER BY id;
 
 -- query 5
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0}.events FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.hadoop_fence_${uuid0};

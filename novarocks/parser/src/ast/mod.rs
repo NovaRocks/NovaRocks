@@ -54,7 +54,7 @@ pub use expr::{
     FunctionQuantifier, InListExpr, InSubqueryExpr, IntervalExpr, IntervalField, IsPredicate,
     IsPredicateExpr, JsonOperator, LambdaExpr, LikeExpr, LikeOperator, MapEntry, MapExpr,
     NestedExpr, NullTreatment, StructExpr, StructExprField, SubqueryExpr, TupleExpr,
-    TypedStringExpr, UnaryExpr, UnaryOperator, UserVariable,
+    TypedStringExpr, UnaryExpr, UnaryOperator,
 };
 pub use iceberg::{
     AddFiles, AlterIcebergTable, ColumnPath, ColumnPosition, IcebergColumnAction,
@@ -82,13 +82,13 @@ pub use query::{
     SetOperation, SetOperator, SetQuantifier, Values, WildcardOptions, With,
 };
 pub use relation::{
-    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,
-    TableVersion, TableVersionKind, TableWithJoins,
+    Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableVersion,
+    TableVersionKind, TableWithJoins,
 };
 pub use session::ShowProcessList;
 pub use session::{
-    KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement, SetTarget,
-    SetValue, SetWord, TransactionControlKind, TransactionControlStatement, UseStatement,
+    KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
+    TransactionControlKind, TransactionControlStatement, UseStatement,
 };
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,

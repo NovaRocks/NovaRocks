@@ -21,7 +21,7 @@
 
 -- query 1
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 SET decimal_overflow_to_double=false;
 CREATE TABLE ${case_db}.decimal_error_policy (k INT,a DECIMAL(38,0),b DECIMAL(2,1))
 TBLPROPERTIES ("format-version"="3");
@@ -103,7 +103,7 @@ SELECT a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 16
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 
 -- query 17
 SELECT CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
@@ -212,18 +212,18 @@ CREATE VIEW default_catalog.${case_db}.decimal_error_inherited_v AS SELECT 1 AS 
 
 -- query 38
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 
 -- query 39
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 SET decimal_overflow_to_double=false;
 DROP VIEW default_catalog.${case_db}.decimal_error_allowed_v;
 DROP TABLE ${case_db}.decimal_error_policy;
 
 -- query 40
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 SET decimal_overflow_to_double=false;
 CREATE TABLE ${case_db}.decimal_implicit_left (id INT,k DECIMAL(3,0),c BIGINT) TBLPROPERTIES ("format-version"="3");
 CREATE TABLE ${case_db}.decimal_implicit_right (id INT,k BIGINT) TBLPROPERTIES ("format-version"="3");
@@ -258,6 +258,6 @@ ORDER BY COALESCE(l.id,r.id);
 
 -- query 45
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 DROP TABLE ${case_db}.decimal_implicit_left;
 DROP TABLE ${case_db}.decimal_implicit_right;

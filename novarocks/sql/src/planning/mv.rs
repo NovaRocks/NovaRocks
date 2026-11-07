@@ -3012,17 +3012,12 @@ pub fn table_factor_name_and_alias(factor: &TableFactor) -> Result<(ObjectName, 
         alias,
         version,
         metadata,
-        hints,
         ..
     } = factor
     else {
         return Err("incremental join MV base relation must be a table".to_string());
     };
-    if metadata.is_some()
-        || version.is_some()
-        || !hints.is_empty()
-        || !is_three_part_object_name(name)
-    {
+    if metadata.is_some() || version.is_some() || !is_three_part_object_name(name) {
         return Err(
             "incremental join MV base relation must be a plain 3-part Iceberg table".to_string(),
         );
@@ -3168,13 +3163,12 @@ fn extract_single_base_table(
         name,
         version,
         metadata,
-        hints,
         ..
     } = &from.relation
     else {
         return Err(shape_error());
     };
-    if metadata.is_some() || version.is_some() || !hints.is_empty() {
+    if metadata.is_some() || version.is_some() {
         return Err(single_table_error());
     }
     if !is_three_part_object_name(name) {
@@ -3525,7 +3519,7 @@ fn contains_match_against(expr: &Expr) -> bool {
 
 fn reject_unsupported_expr(expr: &Expr) -> Result<(), String> {
     match expr {
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) | Expr::UserVariable(_) => {
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => {
             return Err(projection_filter_error());
         }
         Expr::FunctionCall(function) => reject_unsupported_function(function)?,

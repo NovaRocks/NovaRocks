@@ -61,6 +61,12 @@ impl ServerStaticPlan {
     pub fn frontend_carrier(&self) -> novarocks_frontend_application::CompiledPackageCarrier {
         self.compiled.frontend_carrier()
     }
+
+    pub fn frontend_required_constant_interpreter(
+        &self,
+    ) -> novarocks_frontend_application::RequiredConstantInterpreter {
+        self.compiled.frontend_required_constant_interpreter()
+    }
 }
 
 /// Startup composition runs once, before any listener opens, over statically

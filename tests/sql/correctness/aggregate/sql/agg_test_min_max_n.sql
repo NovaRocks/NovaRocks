@@ -68,19 +68,19 @@ VALUES
 
 -- query 4
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_tinyint, 3) FROM t_without_null;
+SELECT  MIN_N(c_tinyint, 3) FROM t_without_null;
 
 -- query 5
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_smallint, 3) FROM t_without_null;
+SELECT  MIN_N(c_smallint, 3) FROM t_without_null;
 
 -- query 6
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_int, 3) FROM t_without_null;
+SELECT  MIN_N(c_int, 3) FROM t_without_null;
 
 -- query 7
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_bigint, 3) FROM t_without_null;
+SELECT  MIN_N(c_bigint, 3) FROM t_without_null;
 
 -- query 8
 USE ${case_db};
@@ -89,77 +89,77 @@ SELECT CONCAT('[',
               CAST(boundary_result.min_values[2] AS VARCHAR), ',',
               CAST(boundary_result.min_values[3] AS VARCHAR), ']') AS `min_n(c_largeint, 3)`
 FROM (
-  SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_largeint, 3) AS min_values
+  SELECT  MIN_N(c_largeint, 3) AS min_values
   FROM t_without_null
 ) AS boundary_result;
 
 -- query 9
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_float, 3) FROM t_without_null;
+SELECT  MIN_N(c_float, 3) FROM t_without_null;
 
 -- query 10
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_double, 3) FROM t_without_null;
+SELECT  MIN_N(c_double, 3) FROM t_without_null;
 
 -- query 11
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_char, 3) FROM t_without_null;
+SELECT  MIN_N(c_char, 3) FROM t_without_null;
 
 -- query 12
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_varchar, 3) FROM t_without_null;
+SELECT  MIN_N(c_varchar, 3) FROM t_without_null;
 
 -- query 13
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_date, 3) FROM t_without_null;
+SELECT  MIN_N(c_date, 3) FROM t_without_null;
 
 -- query 14
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_datetime, 3) FROM t_without_null;
+SELECT  MIN_N(c_datetime, 3) FROM t_without_null;
 
 -- query 15
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_decimal, 3) FROM t_without_null;
+SELECT  MIN_N(c_decimal, 3) FROM t_without_null;
 
 -- query 16
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_tinyint, 1) FROM t_without_null;
+SELECT  MIN_N(c_tinyint, 1) FROM t_without_null;
 
 -- query 17
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_smallint, 1) FROM t_without_null;
+SELECT  MIN_N(c_smallint, 1) FROM t_without_null;
 
 -- query 18
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_int, 1) FROM t_without_null;
+SELECT  MIN_N(c_int, 1) FROM t_without_null;
 
 -- query 19
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_tinyint, 5) FROM t_without_null;
+SELECT  MIN_N(c_tinyint, 5) FROM t_without_null;
 
 -- query 20
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_smallint, 5) FROM t_without_null;
+SELECT  MIN_N(c_smallint, 5) FROM t_without_null;
 
 -- query 21
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_int, 5) FROM t_without_null;
+SELECT  MIN_N(c_int, 5) FROM t_without_null;
 
 -- query 22
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_id % 2 AS g, MIN_N(c_int, 2) FROM t_without_null GROUP BY g ORDER BY g;
+SELECT  c_id % 2 AS g, MIN_N(c_int, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 23
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
+SELECT  c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 24
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
+SELECT  c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 25
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_id % 4 AS g, MIN_N(c_date, 2) FROM t_without_null GROUP BY g ORDER BY g;
+SELECT  c_id % 4 AS g, MIN_N(c_date, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 26
 USE ${case_db};

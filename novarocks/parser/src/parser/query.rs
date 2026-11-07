@@ -23,8 +23,7 @@ use crate::{
         Cte, ExplainFormat, ExplainQuery, Expr, Fetch, GroupBy, Join, JoinConstraint, JoinOperator,
         NamedWindow, Offset, OffsetRows, OrderByExpr, Query, Select, SelectHint, SelectHintValue,
         SelectItem, SelectQuantifier, SetExpr, SetOperation, SetOperator, SetQuantifier, Statement,
-        TableFactor, TableHint, TableVersion, TableVersionKind, TableWithJoins, Values,
-        WildcardOptions, With,
+        TableFactor, TableVersion, TableVersionKind, TableWithJoins, Values, WildcardOptions, With,
     },
     lex,
     token::{Keyword, Symbol},
@@ -797,7 +796,6 @@ fn parse_from(
 fn parse_table_factor(
     parser: &mut StatementParser<'_, '_>,
 ) -> Result<TableFactor, crate::ParseError> {
-    let mut hints = parse_table_hints(parser)?;
     let lateral = parser.consume_if_word("LATERAL");
     if parser.current_is_symbol(Symbol::LParen) {
         let start = parser.consume_symbol(Symbol::LParen)?.start();
@@ -815,15 +813,11 @@ fn parse_table_factor(
         return Ok(TableFactor::Derived {
             lateral,
             subquery: Box::new(subquery),
-            hints,
             alias,
             span: Span::new(start, span_end),
         });
     }
     if parser.current_is_keyword(Keyword::Unnest) {
-        if !hints.is_empty() {
-            return Err(parser.unexpected("table after table hint"));
-        }
         let keyword_span = parser.consume_word("UNNEST")?;
         let start = keyword_span.start();
         parser.consume_symbol(Symbol::LParen)?;
@@ -860,14 +854,12 @@ fn parse_table_factor(
         parser.consume_symbol(Symbol::LParen)?;
         let expr = parse_table_function_expression_until(parser, &[], &[Symbol::RParen])?;
         let end = parser.consume_symbol(Symbol::RParen)?.end();
-        hints.extend(parse_table_hints(parser)?);
         let alias = parse_optional_table_alias(parser)?;
         let span_end = alias.as_ref().map_or(end, |alias| alias.span.end());
         return Ok(TableFactor::TableFunction {
             lateral,
             syntax: crate::ast::TableFunctionSyntax::TableWrapper,
             expr,
-            hints,
             alias,
             span: Span::new(start, span_end),
         });
@@ -880,7 +872,6 @@ fn parse_table_factor(
         let expr = parse_table_function_expression_range(parser, function_start, end)?;
         parser.position = end;
         parser.skip_trivia();
-        hints.extend(parse_table_hints(parser)?);
         let alias = parse_optional_table_alias(parser)?;
         let span_end = alias
             .as_ref()
@@ -889,7 +880,6 @@ fn parse_table_factor(
             lateral,
             syntax: crate::ast::TableFunctionSyntax::BareCall,
             expr,
-            hints,
             alias,
             span: Span::new(start, span_end),
         });
@@ -904,11 +894,6 @@ fn parse_table_factor(
         },
         |version| version.span.end(),
     );
-    let postfix_hint_start = hints.len();
-    hints.extend(parse_table_hints(parser)?);
-    if let Some(hint) = hints.get_mut(postfix_hint_start) {
-        hint.attached_to_relation = hint.span.start() == relation_end;
-    }
     let alias = parse_optional_table_alias(parser)?;
     let end = alias
         .as_ref()
@@ -918,7 +903,6 @@ fn parse_table_factor(
         metadata,
         alias,
         version,
-        hints,
         span: Span::new(start, end),
     })
 }
@@ -1037,46 +1021,6 @@ fn parse_atomic_expression(
     parser.position = end;
     parser.skip_trivia();
     Ok(expression)
-}
-
-fn parse_table_hints(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<TableHint>, crate::ParseError> {
-    let mut hints = Vec::new();
-    while parser.current_is_symbol(Symbol::LBracket) {
-        let start = parser.consume_symbol(Symbol::LBracket)?.start();
-        let name = parser.parse_ident()?;
-        let mut arguments = Vec::new();
-        if parser.consume_if_symbol(Symbol::LParen) {
-            if !parser.current_is_symbol(Symbol::RParen) {
-                loop {
-                    arguments.push(parse_expression_until(
-                        parser,
-                        &[],
-                        &[Symbol::Comma, Symbol::RParen],
-                    )?);
-                    if !parser.consume_if_symbol(Symbol::Comma) {
-                        break;
-                    }
-                }
-            }
-            parser.consume_symbol(Symbol::RParen)?;
-        }
-        let target = if parser.consume_if_symbol(Symbol::Pipe) {
-            Some(parse_expression_until(parser, &[], &[Symbol::RBracket])?)
-        } else {
-            None
-        };
-        let end = parser.consume_symbol(Symbol::RBracket)?.end();
-        hints.push(TableHint {
-            name,
-            arguments,
-            target,
-            attached_to_relation: false,
-            span: Span::new(start, end),
-        });
-    }
-    Ok(hints)
 }
 
 fn parse_optional_table_alias(

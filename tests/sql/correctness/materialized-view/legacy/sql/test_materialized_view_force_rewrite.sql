@@ -74,10 +74,10 @@ refresh materialized view mv1 with sync mode;
 analyze full table mv1;
 
 -- query 10
-set enable_force_rule_based_mv_rewrite=false;
+
 
 -- query 11
-set materialized_view_rewrite_mode="disable";
+
 
 -- query 12
 -- hit
@@ -108,7 +108,7 @@ SELECT t1.t1_id, bitmap_union_count(to_bitmap(t1.t1_age + 1)) FROM t1 INNER JOIN
 SELECT t1.t1_id, count(distinct t1.t1_age + 1) FROM t1 INNER JOIN t2 ON t1.t1_t2_id=t2.t2_id INNER JOIN t3 ON t1.t1_t3_id=t3.t3_id group by t1.t1_id order by t1.t1_id;
 
 -- query 18
-set materialized_view_rewrite_mode="default";
+
 
 -- query 19
 -- hit
@@ -139,7 +139,7 @@ SELECT t1.t1_id, bitmap_union_count(to_bitmap(t1.t1_age + 1)) FROM t1 INNER JOIN
 SELECT t1.t1_id, count(distinct t1.t1_age + 1) FROM t1 INNER JOIN t2 ON t1.t1_t2_id=t2.t2_id INNER JOIN t3 ON t1.t1_t3_id=t3.t3_id group by t1.t1_id order by t1.t1_id;
 
 -- query 25
-set materialized_view_rewrite_mode="default_or_error";
+
 
 -- query 26
 -- hit
@@ -163,7 +163,7 @@ SELECT t1.t1_id, bitmap_union_count(to_bitmap(t1.t1_age + 1)) FROM t1 INNER JOIN
 SELECT t1.t1_id, count(distinct t1.t1_age + 1) FROM t1 INNER JOIN t2 ON t1.t1_t2_id=t2.t2_id INNER JOIN t3 ON t1.t1_t3_id=t3.t3_id group by t1.t1_id order by t1.t1_id;
 
 -- query 30
-set materialized_view_rewrite_mode="force";
+
 
 -- query 31
 -- hit
@@ -194,7 +194,7 @@ SELECT t1.t1_id, bitmap_union_count(to_bitmap(t1.t1_age + 1)) FROM t1 INNER JOIN
 SELECT t1.t1_id, count(distinct t1.t1_age + 1) FROM t1 INNER JOIN t2 ON t1.t1_t2_id=t2.t2_id INNER JOIN t3 ON t1.t1_t3_id=t3.t3_id group by t1.t1_id order by t1.t1_id;
 
 -- query 37
-set materialized_view_rewrite_mode="force_or_error";
+
 
 -- query 38
 -- hit
@@ -221,4 +221,3 @@ SELECT t1.t1_id, bitmap_union_count(to_bitmap(t1.t1_age + 1)) FROM t1 INNER JOIN
 SELECT t1.t1_id, count(distinct t1.t1_age + 1) FROM t1 INNER JOIN t2 ON t1.t1_t2_id=t2.t2_id INNER JOIN t3 ON t1.t1_t3_id=t3.t3_id group by t1.t1_id order by t1.t1_id;
 
 -- query 43
-set materialized_view_rewrite_mode="default";

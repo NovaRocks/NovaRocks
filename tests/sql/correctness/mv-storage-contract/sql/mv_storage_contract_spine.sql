@@ -79,11 +79,10 @@ FROM TABLE(generate_series(1, 4000)) t(n);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -142,8 +141,7 @@ ORDER BY region, channel;
 -- below name their catalog again rather than relying on a session that no
 -- longer exists.
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 15
 -- The restart left a barrier: the previous process could have had a dispatch
@@ -171,8 +169,7 @@ SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 -- @skip_result_check=true
 -- @expect_error_tier=drift
 -- @expect_error=MV target requires a successful fresh Current observation
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
 
 -- query 18
@@ -196,8 +193,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 'online', 1000), ('
 -- query 21
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-overwrite-last=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_rollup FULL WITH SYNC MODE;
 
 -- query 22
@@ -205,8 +201,7 @@ SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, chann
 
 -- query 23
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_rollup;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};

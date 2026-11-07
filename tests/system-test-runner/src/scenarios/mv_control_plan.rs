@@ -313,8 +313,7 @@ impl ObservedQuery {
             REWRITE_SQL.into(),
             Some(selected),
             move |session| {
-                session.execute(format!("SET CATALOG {catalog}"))?;
-                session.execute(format!("USE {namespace}"))?;
+                session.execute(format!("USE {catalog}.{namespace}"))?;
                 Ok(())
             },
             Ok,

@@ -57,7 +57,7 @@ with w1 as (
 ), w2 as (
   select * from ${case_db}.t1 where k1 = 1
 )
-select count(1) from w1 join [broadcast] w2 on w1.k1 = w2.k1;
+select count(1) from w1 join  w2 on w1.k1 = w2.k1;
 
 -- query 3
 -- OR predicate matches the row: count = 1
@@ -66,4 +66,4 @@ with w1 as (
 ), w2 as (
   select * from ${case_db}.t1 where k1 = 1
 )
-select count(1) from w1 join [broadcast] w2 on w1.k1 = w2.k1;
+select count(1) from w1 join  w2 on w1.k1 = w2.k1;

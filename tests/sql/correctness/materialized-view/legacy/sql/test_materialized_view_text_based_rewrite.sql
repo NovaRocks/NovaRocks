@@ -28,7 +28,7 @@ TBLPROPERTIES ("format-version" = "3");
 insert into user_tags values('2023-04-11', 1, 'a', 1), ('2023-04-12', 2, 'e', 5),('2023-04-13', 3, 'e', 6);
 
 -- query 3
-set enable_materialized_view_text_match_rewrite=true;
+
 
 -- query 4
 CREATE MATERIALIZED VIEW mv1 REFRESH DEFERRED MANUAL AS

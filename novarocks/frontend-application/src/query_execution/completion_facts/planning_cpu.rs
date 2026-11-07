@@ -92,9 +92,6 @@ fn root_output_for_read(
                 .map_err(client_render_schema_error)?,
             )
         }
-        ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue) => {
-            crate::query::compiler::scalar_root_output_from_public_port(port)?
-        }
         ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows) => {
             return Err(FrontendQueryCompilerError::Engine(
                 "distributed read received a different application output purpose".into(),
@@ -170,6 +167,7 @@ struct SystemRelationInput {
     control: SqlCompileControl,
 }
 enum PlanningCpuInput {
+    SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
     SystemRelation(Box<SystemRelationInput>),
     Start(Box<SqlFinalPlanCompileRequest>),
     Finish {
@@ -190,6 +188,14 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    SessionProperties(
+        Box<
+            Result<
+                crate::query::session_property_computation::PreparedSessionProperties,
+                novarocks_query_application::session_error::QueryServiceError,
+            >,
+        >,
+    ),
     SystemRelation(
         Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
     ),
@@ -256,6 +262,9 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::SessionProperties(input) => {
+                PlanningCpuOutput::SessionProperties(Box::new(input.run()))
+            }
             PlanningCpuInput::SystemRelation(input) => PlanningCpuOutput::SystemRelation(
                 input
                     .source
@@ -820,6 +829,22 @@ impl FrontendPlanningCpuSource {
         };
         Ok(result)
     }
+    pub(crate) async fn session_properties(
+        &self,
+        input: crate::query::session_property_computation::SessionPropertyCpuInput,
+    ) -> Result<
+        Result<
+            crate::query::session_property_computation::PreparedSessionProperties,
+            novarocks_query_application::session_error::QueryServiceError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SessionProperties(Box::new(input)));
+        let PlanningCpuOutput::SessionProperties(result) = self.receive().await? else {
+            panic!("session properties returned another CPU phase")
+        };
+        Ok(*result)
+    }
     pub(crate) async fn logical_catalog(
         &self,
         query: novarocks_parser::ast::Query,
@@ -989,31 +1014,12 @@ mod client_render_error_tests {
     }
 
     #[test]
-    fn internal_outputs_keep_scalar_and_count_only_without_a_client_presentation() {
-        use novarocks_result_contract::{
-            FrozenRootOutput, ScalarField, ScalarSchema, ScalarValueType,
-        };
-        let mut port = result_port(novarocks_physical_plan::ValueType::new(
+    fn internal_count_only_does_not_require_a_client_presentation() {
+        use novarocks_result_contract::FrozenRootOutput;
+        let port = result_port(novarocks_physical_plan::ValueType::new(
             arrow::datatypes::DataType::Int64,
             true,
         ));
-        let scalar = ScalarSchema::try_new(ScalarField {
-            nullable: true,
-            value_type: ScalarValueType::SignedInteger(64),
-        })
-        .unwrap()
-        .bind_native_slots(&[1])
-        .unwrap();
-        port.scalar_schema = Some(scalar.clone());
-        assert_eq!(
-            root_output_for_read(
-                ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue),
-                None,
-                Some(&port)
-            )
-            .unwrap(),
-            FrozenRootOutput::ScalarValue(scalar)
-        );
         assert_eq!(
             root_output_for_read(
                 ReadEncodingPurpose::Profile(std::time::Instant::now()),

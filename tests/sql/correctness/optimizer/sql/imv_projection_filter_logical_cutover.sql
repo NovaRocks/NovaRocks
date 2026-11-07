@@ -53,8 +53,7 @@ CREATE TABLE imv_pf_cut_${uuid0}.ns_${uuid0}.orders (
 );
 INSERT INTO imv_pf_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10), (1, 20), (2, 40), (3, 5);
-SET CATALOG imv_pf_cut_${uuid0};
-USE ns_${uuid0};
+USE imv_pf_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW pf_mv_${uuid0}
 DISTRIBUTED BY HASH(k1) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -94,7 +93,7 @@ EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 -- query 6
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG imv_pf_cut_${uuid0};
+USE imv_pf_cut_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.pf_mv_${uuid0};
 DROP TABLE IF EXISTS imv_pf_cut_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE IF EXISTS imv_pf_cut_${uuid0}.ns_${uuid0};

@@ -32,7 +32,7 @@ SELECT g, count(DISTINCT x) AS n, sum(DISTINCT x) AS total,
 FROM ${case_db}.t_avg_distinct GROUP BY g ORDER BY g;
 
 -- query 3
-SELECT /*+ set_var(pipeline_dop=3) */ avg(DISTINCT x) AS distinct_avg
+SELECT  avg(DISTINCT x) AS distinct_avg
 FROM ${case_db}.t_avg_distinct;
 
 -- query 4

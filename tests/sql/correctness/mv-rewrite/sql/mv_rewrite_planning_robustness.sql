@@ -82,11 +82,10 @@ FROM TABLE(generate_series(1, 2400)) t(n);
 
 -- query 6
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 8
 -- full-projection SPJ MV over the wide base table
@@ -199,7 +198,7 @@ SELECT region, SUM(amount) AS s FROM part_sales GROUP BY region ORDER BY region;
 -- query 25
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.part_mv;
 
 -- query 26
@@ -209,7 +208,7 @@ USE ns2_${uuid0};
 -- query 27
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns2_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns2_${uuid0}.xns_mv;
 
 -- query 28
@@ -219,7 +218,7 @@ USE ns_${uuid0};
 -- query 29
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.sales_full_mv;
 
 -- query 30

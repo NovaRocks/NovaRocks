@@ -30,7 +30,6 @@ impl Fold for CatalogStripper {
                 metadata,
                 alias,
                 version,
-                hints,
                 span,
             } => {
                 if name.parts.len() == 3 {
@@ -41,7 +40,6 @@ impl Fold for CatalogStripper {
                     metadata,
                     alias,
                     version,
-                    hints,
                     span,
                 }
             }

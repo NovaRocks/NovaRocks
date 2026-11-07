@@ -32,8 +32,7 @@ NovaRocks 的受管物化视图以 Iceberg 表保存结果。本文说明当前�
 ## 创建与刷新
 
 ```sql
-SET CATALOG ice_rest;
-USE analytics;
+USE ice_rest.analytics;
 
 CREATE MATERIALIZED VIEW orders_by_region
 DISTRIBUTED BY HASH(region) BUCKETS 1

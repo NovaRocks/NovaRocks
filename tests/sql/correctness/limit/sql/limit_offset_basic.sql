@@ -144,9 +144,6 @@ SELECT count(*) FROM (SELECT * FROM TABLE(generate_series(1, 100000)) LIMIT 1, 1
 -- query 20
 -- @skip_result_check=true
 -- Disable multi-cast limit push-down; both CTE branches get the more conservative limit
-SET enable_multi_cast_limit_push_down = false;
-SET cbo_enable_low_cardinality_optimize = false;
-SET cbo_cte_force_reuse_limit_without_order_by = false;
 
 -- query 21
 -- push-down=false: count is still correct (7 = 3 + 4)
@@ -161,12 +158,11 @@ SELECT count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 EXPLAIN VERBOSE WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT /*+SET_VAR(cbo_cte_reuse_rate=0)*/ count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT  count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 23
 -- @skip_result_check=true
 -- Enable multi-cast limit push-down; each branch uses its own tighter limit
-SET enable_multi_cast_limit_push_down = true;
 
 -- query 24
 -- push-down=true: count is still 7
@@ -181,10 +177,8 @@ SELECT count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 EXPLAIN VERBOSE WITH C AS (SELECT region, sum(income) AS total FROM ${case_db}.t0 GROUP BY 1),
      L AS (SELECT total FROM C LIMIT 3),
      R AS (SELECT total FROM C LIMIT 4)
-SELECT /*+SET_VAR(cbo_cte_reuse_rate=0)*/ count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
+SELECT  count(*) FROM (SELECT * FROM L UNION ALL SELECT * FROM R) AS U;
 
 -- query 26
 -- @skip_result_check=true
 -- Restore session defaults
-SET cbo_enable_low_cardinality_optimize = true;
-SET cbo_cte_force_reuse_limit_without_order_by = true;

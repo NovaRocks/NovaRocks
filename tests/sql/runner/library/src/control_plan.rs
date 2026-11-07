@@ -24,10 +24,7 @@ use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
 use novarocks_failpoint::session::DomainGrant;
-use novarocks_parser::ast::{
-    LiteralKind, MaterializedViewStatement, SessionStatement, SetTarget, SetValue, SetWord,
-    Statement,
-};
+use novarocks_parser::ast::{MaterializedViewStatement, SessionStatement, Statement};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -236,30 +233,11 @@ impl SqlContext {
             return;
         };
         for statement in statements {
-            match statement {
-                Statement::Session(SessionStatement::Use(value)) => {
-                    if let Some(catalog) = value.catalog {
-                        self.catalog = Some(catalog.value);
-                    }
-                    self.namespace = Some(value.database.value);
+            if let Statement::Session(SessionStatement::Use(value)) = statement {
+                if let Some(catalog) = value.catalog {
+                    self.catalog = Some(catalog.value);
                 }
-                Statement::Session(SessionStatement::Set(value)) => {
-                    for assignment in value.assignments {
-                        if matches!(assignment.target, SetTarget::Catalog { .. }) {
-                            self.catalog = match assignment.value {
-                                SetValue::Words(words) if words.len() == 1 => match &words[0] {
-                                    SetWord::Ident(value) => Some(value.value.clone()),
-                                    SetWord::Literal(value) => match &value.kind {
-                                        LiteralKind::String(value) => Some(value.clone()),
-                                        _ => None,
-                                    },
-                                },
-                                _ => None,
-                            };
-                        }
-                    }
-                }
-                _ => {}
+                self.namespace = Some(value.database.value);
             }
         }
     }

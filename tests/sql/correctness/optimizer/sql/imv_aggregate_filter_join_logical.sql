@@ -68,8 +68,7 @@ INSERT INTO imv_afj_cut_${uuid0}.ns_${uuid0}.fact VALUES
   (1, 10, 100),
   (2, 10, -7),
   (3, 20, 50);
-SET CATALOG imv_afj_cut_${uuid0};
-USE ns_${uuid0};
+USE imv_afj_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW agg_filter_join_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -106,7 +105,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW agg_filter_join_mv_${uuid0};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG imv_afj_cut_${uuid0};
+USE imv_afj_cut_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_filter_join_mv_${uuid0};
 DROP TABLE IF EXISTS imv_afj_cut_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP TABLE IF EXISTS imv_afj_cut_${uuid0}.ns_${uuid0}.dim FORCE;

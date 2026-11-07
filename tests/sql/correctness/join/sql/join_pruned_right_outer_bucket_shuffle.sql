@@ -41,13 +41,13 @@ INSERT INTO ${case_db}.t1 SELECT generate_series, generate_series FROM TABLE(gen
 -- query 3
 WITH
   w1 AS (SELECT k1 FROM ${case_db}.t1 WHERE k1 = 10),
-  w2 AS (SELECT k1 FROM ${case_db}.t1 tt1 RIGHT OUTER JOIN [bucket] ${case_db}.t1 tt2 USING(k1)),
-  w3 AS (SELECT k1 FROM w1 RIGHT OUTER JOIN [colocate] w2 USING(k1))
+  w2 AS (SELECT k1 FROM ${case_db}.t1 tt1 RIGHT OUTER JOIN  ${case_db}.t1 tt2 USING(k1)),
+  w3 AS (SELECT k1 FROM w1 RIGHT OUTER JOIN  w2 USING(k1))
 SELECT count(1) FROM w3;
 
 -- query 4
 WITH
   w1 AS (SELECT k1 FROM ${case_db}.t1 WHERE k1 = 10),
-  w2 AS (SELECT k1 FROM ${case_db}.t1 tt1 RIGHT OUTER JOIN [bucket] ${case_db}.t1 tt2 USING(k1)),
-  w3 AS (SELECT k1 FROM w1 RIGHT OUTER JOIN [colocate] w2 USING(k1))
+  w2 AS (SELECT k1 FROM ${case_db}.t1 tt1 RIGHT OUTER JOIN  ${case_db}.t1 tt2 USING(k1)),
+  w3 AS (SELECT k1 FROM w1 RIGHT OUTER JOIN  w2 USING(k1))
 SELECT count(1) FROM w3;

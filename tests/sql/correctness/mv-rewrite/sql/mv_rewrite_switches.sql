@@ -71,11 +71,10 @@ FROM TABLE(generate_series(1, 1200)) t(number);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -92,7 +91,7 @@ REFRESH MATERIALIZED VIEW agg_mv WITH SYNC MODE;
 
 -- query 9
 -- @skip_result_check=true
-SET enable_materialized_view_rewrite = off;
+SET enable_materialized_view_rewrite = false;
 
 -- query 10
 -- switch off -> no rewrite
@@ -102,7 +101,7 @@ SELECT region, SUM(amount) FROM orders GROUP BY region;
 
 -- query 11
 -- @skip_result_check=true
-SET enable_materialized_view_rewrite = on;
+SET enable_materialized_view_rewrite = true;
 
 -- query 12
 -- switch on -> hit
@@ -133,7 +132,7 @@ SELECT region, SUM(amount) FROM orders GROUP BY region;
 -- query 17
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 18

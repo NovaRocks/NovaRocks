@@ -42,8 +42,7 @@ PROPERTIES (
 );
 
 CREATE DATABASE trc_names_${uuid0}.names_${uuid0};
-SET CATALOG trc_names_${uuid0};
-USE names_${uuid0};
+USE trc_names_${uuid0}.names_${uuid0};
 
 -- query 2
 -- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
@@ -157,7 +156,6 @@ DROP TABLE IF EXISTS trc_names_${uuid0}.names_${uuid0}.c05;
 DROP TABLE IF EXISTS trc_names_${uuid0}.names_${uuid0}.duplicate_first;
 DROP TABLE IF EXISTS trc_names_${uuid0}.names_${uuid0}.missing_first;
 DROP TABLE IF EXISTS trc_names_${uuid0}.names_${uuid0}.relation_names;
-SET CATALOG iceberg_ddl_cat_${suite_uuid0};
-USE ${case_db};
+USE iceberg_ddl_cat_${suite_uuid0}.${case_db};
 DROP DATABASE IF EXISTS trc_names_${uuid0}.names_${uuid0};
 DROP CATALOG trc_names_${uuid0};

@@ -210,7 +210,7 @@ mod tests {
     }
     #[test]
     fn explicit_mv_tag_resolves_only_literal_observation_targets_and_never_wipe() {
-        let sql = "SET CATALOG c; USE n; CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'package'); CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'provenance')";
+        let sql = "USE c.n; CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'package'); CALL c.system.novarocks_imv_stateless_rebuild(table => 'n.m', level => 'provenance')";
         assert!(
             tagged_mv_document_demands(&["regression".into()], sql)
                 .unwrap()

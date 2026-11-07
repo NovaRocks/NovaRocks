@@ -1104,7 +1104,7 @@ mod tests {
 
         let sql = "SELECT COUNT(*) AS row_count \
             FROM (VALUES (7), (19)) AS l(id) \
-            JOIN [shuffle] (VALUES (7), (19)) AS r(id) ON l.id = r.id";
+            JOIN (VALUES (7), (19)) AS r(id) ON l.id = r.id";
         let request = request_with_settings(
             sql,
             crate::query_execution::constant_eval::constant_evaluator(),

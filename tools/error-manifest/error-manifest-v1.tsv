@@ -22,10 +22,12 @@ sql.admit.create_table_unsupported_form	Admit
 sql.admit.delete_requires_where	Admit
 sql.admit.delete_unsupported_form	Admit
 sql.admit.insert_unsupported_form	Admit
+sql.admit.invalid_session_property	Admit
 sql.admit.kill_connection_unsupported	Admit
 sql.admit.kill_denied	Admit
 sql.admit.merge_unsupported_form	Admit
 sql.admit.persisted_definition_semantics_unsupported	Admit
+sql.admit.session_catalog_not_found	Admit
 sql.admit.session_global_scope_unsupported	Admit
 sql.admit.session_transaction_unsupported	Admit
 sql.admit.update_unsupported_form	Admit

@@ -860,8 +860,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         let result_rx = spawn_cancellable_sql_actor(move |cancellation| {
             let mut writer = SqlSession::new(&user, port, deadline)?;
 
-            writer.execute(format!("SET CATALOG {catalog}"))?;
-            writer.execute("USE ns")?;
+            writer.execute(format!("USE {catalog}.ns"))?;
             started_tx
                 .send(())
                 .context("signal configuration writer readiness")?;
@@ -1234,8 +1233,7 @@ fn hold_source_refresh(
     let held = spawn_cancellable_sql_actor(move |cancellation| {
         let mut conn = SqlSession::new(&user, port, deadline)?;
 
-        conn.execute(format!("SET CATALOG {catalog}"))?;
-        conn.execute("USE ns")?;
+        conn.execute(format!("USE {catalog}.ns"))?;
         run_original_mv_statement(&mut conn, &sql, deadline, &cancellation)?;
         Ok(())
     });
@@ -2596,10 +2594,9 @@ fn select_catalog_and_database(
     execute(
         context,
         conn,
-        "select MV catalog",
-        &format!("SET CATALOG {catalog}"),
-    )?;
-    execute(context, conn, "select MV namespace", "USE ns")
+        "select MV catalog and namespace",
+        &format!("USE {catalog}.ns"),
+    )
 }
 
 fn externally_drop_rest_table(
@@ -3653,8 +3650,7 @@ fn spawn_refresh(
     spawn_cancellable_sql_actor(move |cancellation| {
         let mut conn = SqlSession::new(&user, port, deadline)?;
 
-        conn.execute(format!("SET CATALOG {catalog}"))?;
-        conn.execute("USE ns")?;
+        conn.execute(format!("USE {catalog}.ns"))?;
         run_original_mv_statement(
             &mut conn,
             &format!("REFRESH MATERIALIZED VIEW {mv}"),

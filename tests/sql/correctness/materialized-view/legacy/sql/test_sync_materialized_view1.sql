@@ -24,7 +24,7 @@
 admin set frontend config('alter_scheduler_interval_millisecond' = '100');
 
 -- query 2
-set enable_rewrite_simple_agg_to_meta_scan = false;
+
 
 -- query 3
 create table user_tags (time date, user_id int, user_name varchar(20), tag_id int)
@@ -67,7 +67,7 @@ insert into user_tags values('2023-04-13', 1, 'a', 1), ('2023-04-13', 1, 'b', 2)
 
 -- query 12
 -- bitmap
-select count(1) from user_tags_mv1 [_SYNC_MV_];
+select count(1) from user_tags_mv1 ;
 
 -- query 13
 select user_id, count(distinct tag_id) from user_tags group by user_id  order by 1,2;
@@ -80,7 +80,7 @@ select user_id, bitmap_count(bitmap_union(to_bitmap(tag_id))) x from user_tags g
 
 -- query 16
 -- hll
-select count(1) from user_tags_hll_mv1 [_SYNC_MV_];
+select count(1) from user_tags_hll_mv1 ;
 
 -- query 17
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id  order by 1,2;
@@ -95,7 +95,7 @@ select user_id, hll_union_agg(hll_hash(tag_id)) x from user_tags group by user_i
 select user_id, hll_cardinality(hll_union(hll_hash(tag_id))) x from user_tags group by user_id  order by 1,2;
 
 -- query 21
-select count(1) from user_tags_percential_mv1 [_SYNC_MV_];
+select count(1) from user_tags_percential_mv1 ;
 
 -- query 22
 -- percentile

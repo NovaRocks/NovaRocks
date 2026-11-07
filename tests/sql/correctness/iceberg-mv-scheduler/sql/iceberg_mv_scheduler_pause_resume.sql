@@ -49,8 +49,7 @@ CREATE TABLE ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_mv_sched_pause_${uuid0};
-USE ns_${uuid0};
+USE ice_mv_sched_pause_${uuid0}.ns_${uuid0};
 INSERT INTO ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10);
 CREATE MATERIALIZED VIEW orders_pause_mv_${uuid0}

@@ -13,6 +13,8 @@ doctest = false
 [features]
 
 [dependencies]
+novarocks-local-compiler.workspace = true
+novarocks-local-program.workspace = true
 novarocks-arrow-batch-codec.workspace = true
 novarocks-resource-contract.workspace = true
 novarocks-coordination-contract.workspace = true
@@ -74,8 +76,6 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-local-compiler.workspace = true
-novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true }
 novarocks-mv-application = { workspace = true }
 novarocks-catalog-application = { workspace = true }

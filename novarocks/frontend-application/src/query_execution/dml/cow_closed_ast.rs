@@ -641,7 +641,6 @@ pub(super) fn values(
             explicit_row: false,
             span: S,
         }))),
-        hints: Vec::new(),
         alias: Some(TableAlias {
             name: ident(alias, true)?,
             columns,
@@ -667,7 +666,6 @@ pub(super) fn materialized_values(alias: &str, columns: Vec<Ident>) -> Result<Ta
             explicit_row: false,
             span: S,
         }))),
-        hints: Vec::new(),
         alias: Some(TableAlias {
             name: ident(alias, true)?,
             columns,
@@ -697,7 +695,6 @@ pub(super) fn table(
             span: S,
         }),
         version: None,
-        hints: Vec::new(),
         span: S,
     })
 }

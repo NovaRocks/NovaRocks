@@ -19,16 +19,25 @@
 -- Test Objective:
 -- Apply-mode EXISTS / NOT EXISTS subqueries are eliminated into semi/anti joins.
 -- Disabling ExistentialApplyToJoin is covered by an explicit sanity query.
+-- query 1
 DROP TABLE IF EXISTS ${case_db}.sq_t1;
+-- query 2
 DROP TABLE IF EXISTS ${case_db}.sq_t2;
+-- query 3
 CREATE TABLE ${case_db}.sq_t1 (k INT, v INT);
+-- query 4
 CREATE TABLE ${case_db}.sq_t2 (k INT, v INT);
+-- query 5
 INSERT INTO ${case_db}.sq_t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+-- query 6
 INSERT INTO ${case_db}.sq_t2 VALUES (1, 100), (1, 101), (3, 300), (5, 500);
+-- query 7
 ANALYZE TABLE ${case_db}.sq_t1;
+-- query 8
 ANALYZE TABLE ${case_db}.sq_t2;
+-- query 9
 
-SET subquery_unnest_mode='apply';
+-- query 10
 
 -- Correlated EXISTS rewrites to a LEFT SEMI join and leaves no Apply node.
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT SEMI
@@ -41,6 +50,7 @@ WHERE EXISTS (
     WHERE t2.k = t1.k
 )
 ORDER BY k;
+-- query 11
 
 -- Correlated NOT EXISTS rewrites to a LEFT ANTI join and leaves no Apply node.
 -- @explain_contains=HASH JOIN (BROADCAST, LEFT ANTI
@@ -53,8 +63,10 @@ WHERE NOT EXISTS (
     WHERE t2.k = t1.k
 )
 ORDER BY k;
+-- query 12
 
 SET disable_optimizer_rules='ExistentialApplyToJoin';
+-- query 13
 
 -- Disabling ExistentialApplyToJoin should make the Apply backstop reject the
 -- still-correlated EXISTS instead of silently changing shape.
@@ -67,6 +79,7 @@ WHERE EXISTS (
     WHERE t2.k = t1.k
 )
 ORDER BY k;
+-- query 14
 
 SET disable_optimizer_rules='';
-SET subquery_unnest_mode='legacy';
+-- query 15

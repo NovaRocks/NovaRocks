@@ -156,7 +156,7 @@ select sleep(1);
 select * from tbl1 order by k1;
 
 -- query 34
-select * from test_ce_mv1 [_SYNC_MV_] order by mv_k1_2;
+select * from test_ce_mv1  order by mv_k1_2;
 
 -- query 35
 drop materialized view test_ce_mv1;
@@ -184,7 +184,7 @@ SHOW ALTER MATERIALIZED VIEW ORDER BY JobId DESC LIMIT 1;
 SELECT sleep(2);
 
 -- query 40
-select * from UPPER_MV1 [_SYNC_MV_] order by K1, mv_sum_V1;
+select * from UPPER_MV1  order by K1, mv_sum_V1;
 
 -- query 41
 select K1, sum(V1) from UPPER_TBL1 group by K1;
@@ -193,7 +193,7 @@ select K1, sum(V1) from UPPER_TBL1 group by K1;
 insert into UPPER_TBL1 values ('2020-01-01', 1, 1), ('2020-01-01', 1, 1), ('2020-01-01', 1, 2),  ('2020-01-01', 2, 1);
 
 -- query 43
-select * from UPPER_MV1 [_SYNC_MV_] order by K1, mv_sum_V1;
+select * from UPPER_MV1  order by K1, mv_sum_V1;
 
 -- query 44
 select K1, sum(V1) from UPPER_TBL1 group by K1;
@@ -222,7 +222,7 @@ SHOW ALTER MATERIALIZED VIEW ORDER BY JobId DESC LIMIT 1;
 SELECT sleep(2);
 
 -- query 51
-select k2 from sync_mv_base_table_with_delete_mv1 [_SYNC_MV_];
+select k2 from sync_mv_base_table_with_delete_mv1 ;
 
 -- query 52
 drop materialized view sync_mv_base_table_with_delete_mv1;

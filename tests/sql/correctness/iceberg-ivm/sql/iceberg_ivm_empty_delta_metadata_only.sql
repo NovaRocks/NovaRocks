@@ -61,8 +61,7 @@ INSERT INTO ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders VALUES
   (200, 200, 'keep'),
   (1, 1, 'delete-miss'),
   (2, 2, 'update-miss');
-SET CATALOG ice_ivm_empty_delta_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_empty_delta_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(id) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

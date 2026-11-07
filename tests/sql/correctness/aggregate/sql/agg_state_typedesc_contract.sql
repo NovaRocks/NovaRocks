@@ -31,7 +31,7 @@ INSERT INTO ${case_db}.agg_state_typedesc_contract VALUES
     (2, 21, 200, 0.50),
     (2, 22, NULL, NULL);
 
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation') */
+SELECT
        grp,
        CAST(avg(v) AS DECIMAL(18, 4)) AS avg_v,
        ndv(k) AS ndv_k,
@@ -41,7 +41,7 @@ FROM ${case_db}.agg_state_typedesc_contract
 GROUP BY grp
 ORDER BY grp;
 
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming') */
+SELECT
        grp,
        CAST(avg(v) AS DECIMAL(18, 4)) AS avg_v,
        ndv(k) AS ndv_k

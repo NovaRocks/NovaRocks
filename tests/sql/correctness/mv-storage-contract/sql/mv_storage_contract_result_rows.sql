@@ -43,8 +43,7 @@ INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10), ('west', 20);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrows_${uuid0};
-USE ns_${uuid0};
+USE mvrows_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW rows_mv
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -134,8 +133,7 @@ SELECT COUNT(*) AS row_count FROM rows_mv;
 -- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrows_${uuid0};
-USE ns_${uuid0};
+USE mvrows_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS rows_mv;
 DROP TABLE mvrows_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvrows_${uuid0}.ns_${uuid0};

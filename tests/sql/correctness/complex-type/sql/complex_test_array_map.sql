@@ -79,7 +79,7 @@ select
     w1.*
 from
     w1
-    join [broadcast] t2 using(k1)
+    join  t2 using(k1)
 where
     array_sum(w1.c1) <= t2.c1
 order by
@@ -149,7 +149,7 @@ INSERT INTO table2 (id, arr_str) VALUES
 USE ${case_db};
 SELECT t1.id AS t1_id, t2.id AS t2_id, t1.arr_largeint
 FROM table1 t1
-LEFT JOIN[broadcast] table2 t2
+LEFT JOIN table2 t2
 ON t1.id = t2.id
 AND array_length(array_map(x -> x + array_length(t2.arr_str), t1.arr_largeint)) >= 2;
 

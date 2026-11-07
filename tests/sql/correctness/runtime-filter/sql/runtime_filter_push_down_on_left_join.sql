@@ -58,13 +58,13 @@ with
     select
       t1.c1,
       coalesce(t2.c2, 'unknown') as c2
-    from ${case_db}.t1 left join [broadcast] ${case_db}.t2 on t1.c3 = t2.c3
+    from ${case_db}.t1 left join  ${case_db}.t2 on t1.c3 = t2.c3
   )
 select
   w2.*
 from
   w2
-  join [bucket] ${case_db}.t3 on w2.c1 = t3.c1 and w2.c2 = t3.c2;
+  join  ${case_db}.t3 on w2.c1 = t3.c1 and w2.c2 = t3.c2;
 
 -- query 3
 -- Shuffle variant: same semantics, same expected empty result.
@@ -73,10 +73,10 @@ with
     select
       t1.c1,
       coalesce(t2.c2, 'unknown') as c2
-    from ${case_db}.t1 left join [shuffle] ${case_db}.t2 on t1.c3 = t2.c3
+    from ${case_db}.t1 left join  ${case_db}.t2 on t1.c3 = t2.c3
   )
 select
   w2.*
 from
   w2
-  join [shuffle] ${case_db}.t3 on w2.c1 = t3.c1 and w2.c2 = t3.c2;
+  join  ${case_db}.t3 on w2.c1 = t3.c1 and w2.c2 = t3.c2;

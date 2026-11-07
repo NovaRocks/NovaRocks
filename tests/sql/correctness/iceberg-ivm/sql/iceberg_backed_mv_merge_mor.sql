@@ -76,8 +76,7 @@ TBLPROPERTIES ("format-version" = "3",
 INSERT INTO mv_merge_mor_ice_${uuid0}.ns_${uuid0}.staging VALUES
   (2, 'open', 25),
   (3, 'open', 30);
-SET CATALOG mv_merge_mor_ice_${uuid0};
-USE ns_${uuid0};
+USE mv_merge_mor_ice_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_merge_mor_mv
 DISTRIBUTED BY HASH(id) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

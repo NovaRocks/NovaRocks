@@ -36,11 +36,10 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 3
 -- @skip_result_check=true
 USE ${case_db};
-set enable_rewrite_simple_agg_to_meta_scan=true;
 
 -- query 4
 USE ${case_db};
-select count(*) from t0[_META_];
+select count(*) from t0;
 
 -- query 5
 -- @skip_result_check=true
@@ -50,7 +49,6 @@ insert into t0 values ('2024-01-01', 1, 1), ('2024-01-02', 2, 2), ('2024-01-03',
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-set enable_exchange_pass_through=false;
 
 -- query 7
 USE ${case_db};
@@ -74,27 +72,27 @@ select min(c0),max(c0),min(c1),max(c1),min(c2),max(c2) from t0;
 
 -- query 12
 USE ${case_db};
-select count(c0) from t0[_META_];
+select count(c0) from t0;
 
 -- query 13
 USE ${case_db};
-select count(c1) from t0[_META_];
+select count(c1) from t0;
 
 -- query 14
 USE ${case_db};
-select count(c2) from t0[_META_];
+select count(c2) from t0;
 
 -- query 15
 USE ${case_db};
-select min(c0),max(c0),min(c1),max(c1),min(c2),max(c2) from t0[_META_];
+select min(c0),max(c0),min(c1),max(c1),min(c2),max(c2) from t0;
 
 -- query 16
 USE ${case_db};
-select count(1) from t0[_META_];
+select count(1) from t0;
 
 -- query 17
 USE ${case_db};
-select count(*) from t0[_META_];
+select count(*) from t0;
 
 -- query 18
 -- @skip_result_check=true
@@ -126,7 +124,7 @@ insert into t2 values (1), (2), (3);
 
 -- query 22
 USE ${case_db};
-select count(*) from t2[_META_];
+select count(*) from t2;
 
 -- query 23
 USE ${case_db};
@@ -139,7 +137,7 @@ alter table t2 rename column c0 to c1;
 
 -- query 25
 USE ${case_db};
-select count(*) from t2[_META_];
+select count(*) from t2;
 
 -- query 26
 USE ${case_db};
@@ -152,7 +150,7 @@ alter table t2 rename column c1 to c2;
 
 -- query 28
 USE ${case_db};
-select count(*) from t2[_META_];
+select count(*) from t2;
 
 -- query 29
 USE ${case_db};
