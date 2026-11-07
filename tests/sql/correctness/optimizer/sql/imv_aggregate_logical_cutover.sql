@@ -57,8 +57,7 @@ INSERT INTO imv_agg_cut_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'east', 10),
   (2, 'east', 20),
   (3, 'west', 30);
-SET CATALOG imv_agg_cut_${uuid0};
-USE ns_${uuid0};
+USE imv_agg_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW agg_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -91,8 +90,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG imv_agg_cut_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS imv_agg_cut_${uuid0}.ns_${uuid0}.agg_mv_${uuid0};
 DROP TABLE IF EXISTS imv_agg_cut_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE IF EXISTS imv_agg_cut_${uuid0}.ns_${uuid0};
 DROP CATALOG IF EXISTS imv_agg_cut_${uuid0};

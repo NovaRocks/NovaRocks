@@ -98,6 +98,7 @@ enum Code {
     NumericOutOfRange,
     QueryTextTooLarge,
     AdministrativelyKilled,
+    CatalogNotFound,
     SchemaNotFound,
     TableNotFound,
     ColumnNotFound,
@@ -143,6 +144,7 @@ impl Code {
             NumericOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE", "USER_ERROR"),
             QueryTextTooLarge => (35, "QUERY_TEXT_TOO_LARGE", "USER_ERROR"),
             AdministrativelyKilled => (38, "ADMINISTRATIVELY_KILLED", "USER_ERROR"),
+            CatalogNotFound => (44, "CATALOG_NOT_FOUND", "USER_ERROR"),
             SchemaNotFound => (45, "SCHEMA_NOT_FOUND", "USER_ERROR"),
             TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
             ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
@@ -494,6 +496,8 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.type_mismatch" => TypeMismatch,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.invalid_argument" => InvalidArguments,
+        "sql.admit.invalid_session_property" => InvalidSessionProperty,
+        "sql.admit.session_catalog_not_found" => CatalogNotFound,
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => GenericUser,
         "sql.parse.unsupported_statement"
         | "sql.analyze.unsupported_expression"
@@ -650,5 +654,53 @@ mod effect_projection_tests {
             None,
         );
         assert_eq!(no_effect, original);
+    }
+}
+
+#[cfg(test)]
+mod session_property_projection_tests {
+    use super::*;
+    use novarocks_query_application::sql::session_admit::SessionAdmitError;
+
+    #[test]
+    fn nominal_session_descriptors_select_14_and_44_for_service_and_session_sources() {
+        for (kind, descriptor, number, name) in [
+            (
+                SessionAdmitError::InvalidSessionProperty,
+                "sql.admit.invalid_session_property",
+                14,
+                "INVALID_SESSION_PROPERTY",
+            ),
+            (
+                SessionAdmitError::CatalogNotFound,
+                "sql.admit.session_catalog_not_found",
+                44,
+                "CATALOG_NOT_FOUND",
+            ),
+        ] {
+            // Identical public detail cannot select these different identities.
+            let user = kind.without_location("same original safe detail");
+            assert_eq!(user.code().as_str(), descriptor);
+            let service = QueryServiceError::from_user_error(user);
+            let session = StatementSessionError::Service(service.clone());
+            for source in [
+                TrinoErrorSource::Service {
+                    error: &service,
+                    sql: "SET SESSION x=1",
+                },
+                TrinoErrorSource::Session {
+                    error: &session,
+                    sql: "SELECT 1",
+                },
+            ] {
+                let error = query_error(source);
+                assert_eq!(
+                    (error.error_code, error.error_name, error.error_type),
+                    (number, name, "USER_ERROR")
+                );
+                assert_eq!(error.error_location, None);
+            }
+            assert_eq!(service.user_error().unwrap().code().as_str(), descriptor);
+        }
     }
 }

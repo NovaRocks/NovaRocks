@@ -57,8 +57,7 @@ INSERT INTO ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} VALUES
   (1, 100, 'Alice'),
   (2, 40, 'Bob'),
   (3, 70, 'Carol');
-SET CATALOG ice_ivm_row_lineage_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_row_lineage_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')

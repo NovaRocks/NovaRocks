@@ -74,8 +74,7 @@ INSERT INTO mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders VALUES
 
 -- query 4
 -- @skip_result_check=true
-SET CATALOG mv_read_sem_part_v3_${uuid0};
-USE ns_${uuid0};
+USE mv_read_sem_part_v3_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_read_sem_part_v3_orders
 DISTRIBUTED BY HASH(id) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

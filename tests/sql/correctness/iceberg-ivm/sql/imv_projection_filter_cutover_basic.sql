@@ -75,8 +75,7 @@ INSERT INTO ice_pfcut_${uuid0}.ns_${uuid0}.orders VALUES
 
 -- query 2
 -- @skip_result_check=true
-SET CATALOG ice_pfcut_${uuid0};
-USE ns_${uuid0};
+USE ice_pfcut_${uuid0}.ns_${uuid0};
 
 CREATE MATERIALIZED VIEW proj_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 2
@@ -118,8 +117,7 @@ SELECT * FROM proj_mv ORDER BY k1, v2;
 -- current session catalog; without a prior touch the freshly created
 -- Iceberg base may not be visible to that lookup.
 -- @skip_result_check=true
-SET CATALOG ice_pfcut_${uuid0};
-USE ns_${uuid0};
+USE ice_pfcut_${uuid0}.ns_${uuid0};
 SELECT k1, v2 FROM orders LIMIT 1;
 
 -- query 7

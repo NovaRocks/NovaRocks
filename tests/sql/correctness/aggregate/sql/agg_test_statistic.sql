@@ -60,27 +60,27 @@ select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select
 
 -- query 9
 USE ${case_db};
-select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select /*+ SET_VAR (new_planner_agg_stage='1') */CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 10
 USE ${case_db};
-select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 11
 USE ${case_db};
-select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'FORCE_PREAGGREGATION',new_planner_agg_stage='2') */CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001 from (select CORR(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 12
 USE ${case_db};
-select co is NULL,total = 1  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/CORR(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
+select co is NULL,total = 1  from (select CORR(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
 
 -- query 13
 USE ${case_db};
-select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/CORR(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001,total = 4  from (select CORR(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 14
 USE ${case_db};
-select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/CORR(k, v)co, count(distinct k)total FROM aggtest)result;
+select abs(co - 0.9988445981121532)  / 0.9988445981121532 < 0.00001,total = 4  from (select CORR(k, v)co, count(distinct k)total FROM aggtest)result;
 
 -- query 15
 USE ${case_db};
@@ -129,27 +129,27 @@ select abs(co - 80)  / 80 < 0.00001 from (select covar_pop(k, v)co FROM aggtest 
 
 -- query 24
 USE ${case_db};
-select abs(co - 80)  / 80 < 0.00001 from (select /*+ SET_VAR (new_planner_agg_stage='1') */covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 80)  / 80 < 0.00001 from (select covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 25
 USE ${case_db};
-select abs(co - 80)  / 80 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 80)  / 80 < 0.00001 from (select covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 26
 USE ${case_db};
-select abs(co - 80)  / 80 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'FORCE_PREAGGREGATION',new_planner_agg_stage='2') */covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 80)  / 80 < 0.00001 from (select covar_pop(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 27
 USE ${case_db};
-select co is NULL,total = 1  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/covar_pop(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
+select co is NULL,total = 1  from (select covar_pop(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
 
 -- query 28
 USE ${case_db};
-select abs(co - 80)  / 80 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/covar_pop(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 80)  / 80 < 0.00001,total = 4  from (select covar_pop(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 29
 USE ${case_db};
-select abs(co - 80)  / 80 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/covar_pop(k, v)co, count(distinct k)total FROM aggtest)result;
+select abs(co - 80)  / 80 < 0.00001,total = 4  from (select covar_pop(k, v)co, count(distinct k)total FROM aggtest)result;
 
 -- query 30
 USE ${case_db};
@@ -198,27 +198,27 @@ select abs(co - 120)  / 120 < 0.00001 from (select COVAR_SAMP(k, v)co FROM aggte
 
 -- query 39
 USE ${case_db};
-select abs(co - 120)  / 120 < 0.00001 from (select /*+ SET_VAR (new_planner_agg_stage='1') */COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 120)  / 120 < 0.00001 from (select COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 40
 USE ${case_db};
-select abs(co - 120)  / 120 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 120)  / 120 < 0.00001 from (select COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 41
 USE ${case_db};
-select abs(co - 120)  / 120 < 0.00001 from (select /*+ SET_VAR (streaming_preaggregation_mode = 'FORCE_PREAGGREGATION',new_planner_agg_stage='2') */COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 120)  / 120 < 0.00001 from (select COVAR_SAMP(k, v)co FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 42
 USE ${case_db};
-select co is NULL,total = 1  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
+select co is NULL,total = 1  from (select COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 0,1)result;
 
 -- query 43
 USE ${case_db};
-select abs(co - 120)  / 120 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
+select abs(co - 120)  / 120 < 0.00001,total = 4  from (select COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest group by no order by no limit 1,1)result;
 
 -- query 44
 USE ${case_db};
-select abs(co - 120)  / 120 < 0.00001,total = 4  from (select /*+ SET_VAR (new_planner_agg_stage='3')*/COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest)result;
+select abs(co - 120)  / 120 < 0.00001,total = 4  from (select COVAR_SAMP(k, v)co, count(distinct k)total FROM aggtest)result;
 
 -- query 45
 USE ${case_db};

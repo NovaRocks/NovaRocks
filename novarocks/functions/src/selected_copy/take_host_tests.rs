@@ -213,3 +213,146 @@ fn original_array_iterator_vec_upper_keeps_minimum_capacity_for_single_slot() {
     );
     assert_eq!(original_unreserved_vec_upper::<u64>(0).unwrap(), 0);
 }
+
+struct FlatCopyHost(std::sync::atomic::AtomicUsize);
+impl crate::opaque_memory::OpaqueAllocationHost for FlatCopyHost {
+    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+        self.0.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn release_opaque(&self, bytes: usize) {
+        let previous = self.0.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        assert!(previous >= bytes, "release follows the original admission");
+    }
+}
+impl crate::AggregateStateAllocator for FlatCopyHost {
+    fn opaque_allocation_host(&self) -> Option<&dyn crate::opaque_memory::OpaqueAllocationHost> {
+        Some(self)
+    }
+    fn allocate(&self, layout: std::alloc::Layout) -> Result<std::ptr::NonNull<u8>, KernelFailure> {
+        self.0
+            .fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: this fixture implements the original exact layout host.
+        match std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }) {
+            Some(pointer) => Ok(pointer),
+            None => {
+                self.0
+                    .fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst);
+                Err(KernelFailure::ResourceExhausted)
+            }
+        }
+    }
+    unsafe fn release(&self, pointer: std::ptr::NonNull<u8>, layout: std::alloc::Layout) {
+        // SAFETY: the original host allocator returns this block and layout.
+        unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
+        let previous = self
+            .0
+            .fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst);
+        assert!(previous >= layout.size());
+    }
+}
+struct FlatCopyControl;
+impl crate::KernelEvaluationControl for FlatCopyControl {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        panic!("flat take does not wait")
+    }
+}
+struct FlatSourceLease(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for FlatSourceLease {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn independent_flat_take_releases_source_but_keeps_real_new_backing_until_last_alias() {
+    use arrow_array::{BooleanArray, Float64Array, Int32Array, UInt64Array};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let sources: Vec<ArrayRef> = vec![
+        Arc::new(BooleanArray::from(vec![Some(false), None, Some(true)])),
+        Arc::new(Int32Array::from(vec![Some(i32::MIN), None, Some(i32::MAX)])),
+        Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(i64::MAX)])),
+        Arc::new(Float64Array::from(vec![Some(-3.0), None, Some(7.5)])),
+        Arc::new(StringArray::from(vec![
+            Some("unselected"),
+            None,
+            Some("α\0Z"),
+        ])),
+    ];
+    for source in sources {
+        // A nonzero source offset and an actual NULL are both copied. Expected
+        // bytes come from the original Arrow take, not the new custody entry.
+        let source = source.slice(1, 2);
+        let weak_source = Arc::downgrade(&source);
+        let indices = Arc::new(UInt64Array::from(vec![1, 0, 1]));
+        let expected = arrow_select::take::take(source.as_ref(), indices.as_ref(), None).unwrap();
+        let host = Arc::new(FlatCopyHost(AtomicUsize::new(0)));
+        let released = Arc::new(AtomicBool::new(false));
+        let copied = take_flat_owned_copy_in(
+            source,
+            CopyIndices::UInt64(indices),
+            FlatSourceLease(released.clone()),
+            host.clone(),
+            &FlatCopyControl,
+        )
+        .unwrap();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the original source lease really exited"
+        );
+        assert!(weak_source.upgrade().is_none());
+        assert_eq!(copied.values().to_data(), expected.to_data());
+        assert!(copied.new_buffer_stock() > 0);
+        assert!(host.0.load(Ordering::SeqCst) > 0);
+        let data = copied.values().to_data();
+        let last_buffer = data.buffers()[0].clone();
+        drop(data);
+        drop(copied);
+        assert!(
+            host.0.load(Ordering::SeqCst) > 0,
+            "a surviving real Buffer still retains its receipt"
+        );
+        drop(last_buffer);
+        assert_eq!(host.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn ordinary_take_keeps_source_lease_and_independent_gate_refuses_nested_carrier() {
+    use arrow_array::UInt64Array;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let host = Arc::new(FlatCopyHost(AtomicUsize::new(0)));
+    let released = Arc::new(AtomicBool::new(false));
+    let copied = take_copy_in(
+        Arc::new(Int64Array::from(vec![7])),
+        CopyIndices::UInt64(Arc::new(UInt64Array::from(vec![0]))),
+        FlatSourceLease(released.clone()),
+        host.clone(),
+        &FlatCopyControl,
+    )
+    .unwrap();
+    assert!(!released.load(Ordering::SeqCst));
+    drop(copied);
+    assert!(released.load(Ordering::SeqCst));
+    assert_eq!(host.0.load(Ordering::SeqCst), 0);
+    let source: ArrayRef = arrow_array::new_null_array(
+        &DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        1,
+    );
+    // Constructing the actual nested ArrayRef does not grant flat admission.
+    let refused = take_flat_owned_copy_in(
+        source,
+        CopyIndices::UInt64(Arc::new(UInt64Array::from(vec![0]))),
+        (),
+        host.clone(),
+        &FlatCopyControl,
+    );
+    assert!(matches!(
+        refused,
+        Err(CopyOperationError::Preflight(CopyError::Unsupported(_)))
+    ));
+    assert_eq!(host.0.load(Ordering::SeqCst), 0);
+}

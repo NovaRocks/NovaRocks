@@ -110,35 +110,47 @@ impl Scenario for CatalogPartialReadiness {
             context.remaining("connect healthy partial catalog")?;
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
         };
+        let namespace = format!("lnp8ns_{}", context.trino_port());
         connection
-            .execute("SET CATALOG lnp8_healthy")
-            .context("select healthy catalog after partial bootstrap")?;
-        let rows: Vec<(i64,)> = sql::integer_column(
-            &connection
-                .execute("SELECT 1")
-                .context("query through healthy partial catalog session")?,
-        )?
-        .into_iter()
-        .map(|value| (value,))
-        .collect();
-        ensure!(rows == vec![(1,)]);
-        let mut unavailable = {
-            context.remaining("connect unavailable partial catalog")?;
-            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
-        };
-        let failure = unavailable
-            .execute("SET CATALOG lnp8_unavailable")
-            .expect_err("invalid catalog definition must remain unavailable");
-        let StatementFailure::Trino(server) = &failure else {
-            return Err(failure.into());
-        };
-        let error = &server.message;
-        ensure!(
-            error.contains("iceberg.catalog.warehouse"),
-            "unavailable catalog returned an unexpected error: {error}"
-        );
-        context.action("proved one unavailable StaticFile catalog leaves the healthy catalog and FE readiness usable");
-        Ok(())
+            .execute(format!("CREATE DATABASE lnp8_healthy.{namespace}"))
+            .context("create healthy partial catalog namespace")?;
+        let phase = (|| -> Result<()> {
+            connection
+                .execute(format!("USE lnp8_healthy.{namespace}"))
+                .context("select healthy catalog after partial bootstrap")?;
+            let rows: Vec<(i64,)> = sql::integer_column(
+                &connection
+                    .execute("SELECT 1")
+                    .context("query through healthy partial catalog session")?,
+            )?
+            .into_iter()
+            .map(|value| (value,))
+            .collect();
+            ensure!(rows == vec![(1,)]);
+            let mut unavailable = {
+                context.remaining("connect unavailable partial catalog")?;
+                SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
+            };
+            let failure = match unavailable.execute(format!("USE lnp8_unavailable.{namespace}")) {
+                Err(failure) => failure,
+                Ok(_) => anyhow::bail!("invalid catalog definition must remain unavailable"),
+            };
+            let StatementFailure::Trino(server) = &failure else {
+                return Err(failure.into());
+            };
+            let error = &server.message;
+            ensure!(
+                error.contains("iceberg.catalog.warehouse"),
+                "unavailable catalog returned an unexpected error: {error}"
+            );
+            context.action("proved one unavailable StaticFile catalog leaves the healthy catalog and FE readiness usable");
+            Ok(())
+        })();
+        let cleanup = connection
+            .execute(format!("DROP DATABASE lnp8_healthy.{namespace}"))
+            .map(|_| ())
+            .context("drop healthy partial catalog namespace");
+        finish_namespace_cleanup(phase, cleanup)
     }
 }
 
@@ -198,13 +210,13 @@ impl Scenario for StaticFileDisposableCarrier {
             context.remaining("connect StaticFile client")?;
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
         };
-        connection
-            .execute("SET CATALOG lnp8_static")
-            .context("select StaticFile catalog")?;
         let namespace = format!("lnp8ns_{}", context.trino_port());
         connection
-            .execute(format!("CREATE DATABASE {namespace}"))
+            .execute(format!("CREATE DATABASE lnp8_static.{namespace}"))
             .context("create StaticFile catalog namespace")?;
+        connection
+            .execute(format!("USE lnp8_static.{namespace}"))
+            .context("select StaticFile catalog namespace")?;
         connection
             .execute(format!(
                 "CREATE TABLE {namespace}.orders (id INT, amount INT)"
@@ -255,8 +267,8 @@ impl Scenario for StaticFileDisposableCarrier {
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?
         };
         connection
-            .execute("SET CATALOG lnp8_static")
-            .context("reselect StaticFile catalog")?;
+            .execute(format!("USE lnp8_static.{namespace}"))
+            .context("reselect StaticFile catalog namespace")?;
         let rebuilt = static_file_rows(
             &connection
                 .execute(format!(
@@ -639,61 +651,88 @@ fn run_blue_green_cutover(
     context.remaining("connect blue pre-cutover session")?;
     let mut blue_idle =
         SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+    let namespace = format!("lnp8ns_{}", context.trino_port());
     blue_idle
-        .execute("SET CATALOG lnp8_blue")
-        .context("select blue StaticFile catalog")?;
-    let session = SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
-    let blue_query = FrontendStatementActor::start(
-        session,
-        "SELECT sleep(2)",
-        context.deadline(),
-        "blue-cutover",
-    )?;
-    let phase = (|| -> Result<()> {
-        wait_for_active_statement(context)?;
-        context.action("admitted one blue query before removing the blue route");
-        context
-            .handle()
-            .begin_fe_drain()
-            .context("SIGTERM blue frontend after green readiness")?;
-        wait_for_drain_observation(context)?;
-        assert_new_statement_is_rejected_during_drain(&mut blue_idle)?;
-        context.action("blue accepted no new statement after route cutover and returned typed SERVER_SHUTTING_DOWN");
-        context.remaining("connect green post-cutover session")?;
-        let mut green_connection = SqlSession::new(
+        .execute(format!("CREATE DATABASE lnp8_blue.{namespace}"))
+        .context("create shared blue-green namespace")?;
+    let result = (|| -> Result<()> {
+        blue_idle
+            .execute(format!("USE lnp8_blue.{namespace}"))
+            .context("select blue StaticFile catalog")?;
+        let session =
+            SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
+        let blue_query = FrontendStatementActor::start(
+            session,
+            "SELECT sleep(2)",
+            context.deadline(),
+            "blue-cutover",
+        )?;
+        let phase = (|| -> Result<()> {
+            wait_for_active_statement(context)?;
+            context.action("admitted one blue query before removing the blue route");
+            context
+                .handle()
+                .begin_fe_drain()
+                .context("SIGTERM blue frontend after green readiness")?;
+            wait_for_drain_observation(context)?;
+            assert_new_statement_is_rejected_during_drain(&mut blue_idle)?;
+            context.action("blue accepted no new statement after route cutover and returned typed SERVER_SHUTTING_DOWN");
+            context.remaining("connect green post-cutover session")?;
+            let mut green_connection = SqlSession::new(
+                green.sql_user(),
+                green.runtime().fe_trino_port,
+                context.deadline(),
+            )?;
+            green_connection
+                .execute(format!("USE lnp8_green.{namespace}"))
+                .context("select green StaticFile catalog")?;
+            let green_rows: Vec<(i64,)> = sql::integer_column(
+                &green_connection
+                    .execute("SELECT 1")
+                    .context("run a new query through green")?,
+            )?
+            .into_iter()
+            .map(|value| (value,))
+            .collect();
+            ensure!(green_rows == vec![(1,)]);
+            context.action("green accepted a new query after blue route withdrawal");
+            let result = blue_query
+                .result
+                .recv_timeout(context.remaining("wait for pre-cutover blue query")?)
+                .map_err(|error| {
+                    anyhow::anyhow!("blue pre-cutover query did not finish: {error}")
+                })??;
+            require_completed_sleep(&result, "blue pre-cutover query")?;
+            let deadline = context.deadline();
+            context
+                .handle()
+                .wait_fe_exit_until(deadline)
+                .context("wait for drained blue frontend exit")?;
+            context.action(
+                "blue pre-cutover attempt terminated on blue; no query attempt was migrated to green",
+            );
+            Ok(())
+        })();
+        blue_query.finish_after(context, phase)
+    })();
+    // The original statement actor has finished before namespace cleanup.
+    // Green remains owned and running until the outer scenario's shutdown.
+    let cleanup = (|| -> Result<()> {
+        let mut connection = SqlSession::new(
             green.sql_user(),
             green.runtime().fe_trino_port,
             context.deadline(),
         )?;
-        green_connection
-            .execute("SET CATALOG lnp8_green")
-            .context("select green StaticFile catalog")?;
-        let green_rows: Vec<(i64,)> = sql::integer_column(
-            &green_connection
-                .execute("SELECT 1")
-                .context("run a new query through green")?,
-        )?
-        .into_iter()
-        .map(|value| (value,))
-        .collect();
-        ensure!(green_rows == vec![(1,)]);
-        context.action("green accepted a new query after blue route withdrawal");
-        let result = blue_query
-            .result
-            .recv_timeout(context.remaining("wait for pre-cutover blue query")?)
-            .map_err(|error| anyhow::anyhow!("blue pre-cutover query did not finish: {error}"))??;
-        require_completed_sleep(&result, "blue pre-cutover query")?;
-        let deadline = context.deadline();
-        context
-            .handle()
-            .wait_fe_exit_until(deadline)
-            .context("wait for drained blue frontend exit")?;
-        context.action(
-            "blue pre-cutover attempt terminated on blue; no query attempt was migrated to green",
-        );
+        connection
+            .execute(format!("DROP DATABASE lnp8_green.{namespace}"))
+            .context("drop shared blue-green namespace")?;
         Ok(())
     })();
-    blue_query.finish_after(context, phase)
+    finish_namespace_cleanup(result, cleanup)
+}
+
+fn finish_namespace_cleanup(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    frontend_cleanup(primary, cleanup)
 }
 
 fn static_file_rows(result: &StatementResult) -> Result<Vec<(i32, i32)>> {

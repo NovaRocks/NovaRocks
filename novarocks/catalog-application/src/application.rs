@@ -17,7 +17,7 @@
 
 //! Catalog command, admission, and error contracts.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
 use uuid::Uuid;
@@ -43,6 +43,44 @@ pub struct CatalogRuntimeObservation {
     pub instance_id: ConnectorInstanceId,
     pub provider_id: ConnectorProviderId,
     pub generation: u64,
+}
+
+/// One immutable read of a locally admitted runtime and the exact logical
+/// configuration whose successful installation published that generation.
+/// This fact grants no Provider I/O, generation lease or mutation permission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogConfigurationObservation {
+    pub runtime: CatalogRuntimeObservation,
+    pub configuration: Arc<crate::CatalogLogicalConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogConfigurationAdmission {
+    Absent,
+    Unavailable { reason: String },
+    Ready(CatalogConfigurationObservation),
+}
+
+impl CatalogConfigurationAdmission {
+    pub fn require_ready(
+        self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<CatalogConfigurationObservation, CatalogApplicationError> {
+        match self {
+            Self::Ready(observation) => Ok(observation),
+            Self::Absent => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::NotFound,
+                format!("unknown catalog `{}`", instance_id.as_str()),
+            )),
+            Self::Unavailable { reason } => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                format!(
+                    "catalog `{}` is unavailable on this frontend: {reason}",
+                    instance_id.as_str()
+                ),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -493,6 +531,18 @@ pub trait CatalogApplicationPort: Send + Sync {
     }
 
     fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission;
+
+    /// Read-only admission and installed configuration from the same local
+    /// generation. Implementations may not synthesize an empty configuration
+    /// or combine an admission with a later desired-state/configuration read.
+    fn admit_catalog_configuration(
+        &self,
+        _instance_id: &ConnectorInstanceId,
+    ) -> CatalogConfigurationAdmission {
+        CatalogConfigurationAdmission::Unavailable {
+            reason: "catalog admission configuration observation is unavailable".to_owned(),
+        }
+    }
 }
 
 /// The local runtime publication sink supplied by the query-owning application.

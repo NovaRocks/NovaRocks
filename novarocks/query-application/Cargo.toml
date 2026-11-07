@@ -15,6 +15,7 @@ novarocks-coordination-contract.workspace = true
 novarocks-function-contract.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-type-contract.workspace = true
+novarocks-constant-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 novarocks-execution-contract.workspace = true

@@ -46,7 +46,6 @@ PROPERTIES (
   "aws.s3.region" = "${oss_region}",
   "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
-SET CATALOG ice_4g_ivm_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -80,8 +79,7 @@ printf 'UEA4G_IVM_STAGE_0_OK\n'
 
 -- query 3
 -- @skip_result_check=true
-SET CATALOG ice_4g_ivm_${uuid0};
-USE uea4g_ivm_${uuid0};
+USE ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
 SET enable_materialized_view_rewrite = false;
 CREATE MATERIALIZED VIEW incremental_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 3

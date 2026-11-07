@@ -62,24 +62,24 @@ INSERT INTO ${case_db}.rf_bitset_decimal_wide_build VALUES
 -- query 2
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN [broadcast] ${case_db}.rf_bitset_decimal_build b USING(d32);
+JOIN  ${case_db}.rf_bitset_decimal_build b USING(d32);
 
 -- query 3
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN [broadcast] ${case_db}.rf_bitset_decimal_build b USING(d64);
+JOIN  ${case_db}.rf_bitset_decimal_build b USING(d64);
 
 -- query 4
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN [broadcast] ${case_db}.rf_bitset_decimal_build b USING(d128);
+JOIN  ${case_db}.rf_bitset_decimal_build b USING(d128);
 
 -- query 5
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN [broadcast] ${case_db}.rf_bitset_decimal_build b ON p.d64 <=> b.d64;
+JOIN  ${case_db}.rf_bitset_decimal_build b ON p.d64 <=> b.d64;
 
 -- query 6
 SELECT count(1)
 FROM ${case_db}.rf_bitset_decimal_probe p
-JOIN [broadcast] ${case_db}.rf_bitset_decimal_wide_build b USING(d64);
+JOIN  ${case_db}.rf_bitset_decimal_wide_build b USING(d64);

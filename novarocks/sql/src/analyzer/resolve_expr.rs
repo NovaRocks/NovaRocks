@@ -238,35 +238,6 @@ impl<'a> super::AnalyzerContext<'a> {
         match expr {
             // Simple column reference
             ast::Expr::Identifier(ident) => {
-                // `@@var` references a MySQL session variable. We do not yet
-                // maintain a per-session variable store, so resolve a small
-                // set of known names to constants and return any other as
-                // an empty string rather than failing with "column not found".
-                if ident.value.starts_with("@@") {
-                    let name = ident.value[2..].to_ascii_lowercase();
-                    let value = session_variable_default(&name);
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String(value)),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            false,
-                        ),
-                    });
-                }
-                // `@var` is a MySQL-style user variable. Bound variables are
-                // substituted textually by the standalone server before the SQL
-                // reaches the analyzer. If an `@var` token still arrives here,
-                // it means the variable was not bound — MySQL semantics for an
-                // unbound user variable is NULL.
-                if ident.value.starts_with('@') {
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Null),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Null,
-                            true,
-                        ),
-                    });
-                }
                 if let Some(param) = scope.resolve_lambda_param(&ident.value) {
                     return Ok(TypedExpr {
                         kind: ExprKind::LambdaParamRef {
@@ -297,54 +268,6 @@ impl<'a> super::AnalyzerContext<'a> {
             // native parser as a compound identifier (for example `c13.a`).
             ast::Expr::CompoundIdentifier(parts) if parts.parts.len() >= 2 => {
                 self.analyze_compound_identifier(&parts.parts, scope)
-            }
-
-            // MySQL user and system variables are parser-native syntax rather
-            // than disguised identifiers. Keep the historical analyzer
-            // behaviour: known `@@` variables resolve to defaults and unbound
-            // `@` variables resolve to NULL.
-            ast::Expr::UserVariable(variable) => {
-                if variable.value.starts_with("@@") {
-                    let name = variable.value[2..].to_ascii_lowercase();
-                    if name == "global.decimal_overflow_to_double" {
-                        return Err(AnalyzeError::unsupported_expression(
-                            "global decimal_overflow_to_double state is not supported",
-                            variable.span,
-                        ));
-                    }
-                    if matches!(
-                        name.as_str(),
-                        "decimal_overflow_to_double"
-                            | "session.decimal_overflow_to_double"
-                            | "local.decimal_overflow_to_double"
-                    ) {
-                        return Ok(TypedExpr {
-                            kind: ExprKind::Literal(LiteralValue::Int(i64::from(
-                                self.sql_semantics.decimal_overflow_to_double(),
-                            ))),
-                            value_type: novarocks_type_contract::FunctionValueType::new(
-                                DataType::Int64,
-                                false,
-                            ),
-                        });
-                    }
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String(session_variable_default(
-                            &name,
-                        ))),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            DataType::Utf8,
-                            false,
-                        ),
-                    });
-                }
-                Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Null),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        DataType::Null,
-                        true,
-                    ),
-                })
             }
 
             ast::Expr::Literal(value) => self.analyze_literal(value),
@@ -7113,24 +7036,6 @@ fn collect_lambda_param_refs<'a>(
     }
 }
 
-/// Best-effort defaults for MySQL-style `@@var` session variables. We do not
-/// yet store per-session state for these, so we just hand back the value the
-/// regression tests assume so they can run end-to-end. Unknown names resolve
-/// to an empty string rather than failing the query.
-fn session_variable_default(name: &str) -> String {
-    match name {
-        "time_zone" => "Asia/Shanghai".to_string(),
-        "sql_mode" => String::new(),
-        "version" => "8.0.33".to_string(),
-        "version_comment" => "NovaRocks".to_string(),
-        "tx_isolation" | "transaction_isolation" => "READ-COMMITTED".to_string(),
-        "character_set_connection" | "character_set_client" | "character_set_results" => {
-            "utf8".to_string()
-        }
-        _ => String::new(),
-    }
-}
-
 /// If the two types are both complex (ARRAY/MAP/STRUCT) but their nested
 /// shapes cannot be reconciled, return a short human-readable description of
 /// the incompatibility. Used to short-circuit comparison operators that would
@@ -10380,21 +10285,6 @@ mod tests {
             };
             Ok(select.projection.into_iter().next().unwrap().expr)
         }
-        for prefix in ["", "session.", "local."] {
-            for enabled in [false, true] {
-                let value = projection(
-                    &format!("SELECT @@{prefix}decimal_overflow_to_double"),
-                    enabled,
-                )
-                .unwrap();
-                assert_eq!(value.value_type.data_type().clone(), DataType::Int64);
-                assert!(!value.value_type.nullable());
-                assert!(
-                    matches!(value.kind, ExprKind::Literal(LiteralValue::Int(v)) if v == i64::from(enabled))
-                );
-            }
-        }
-        assert!(projection("SELECT @@global.decimal_overflow_to_double", true).is_err());
         let expression = "CAST(0 AS DECIMAL(30,10))*CAST(0 AS DECIMAL(18,9))";
         let checked = projection(&format!("SELECT {expression}"), false).unwrap();
         assert_eq!(

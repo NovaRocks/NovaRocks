@@ -478,7 +478,6 @@ select array_agg(distinct 1 order by 1) from ss order by 1;
 -- query 108
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = 2;
 
 -- query 109
 USE ${case_db};
@@ -750,12 +749,10 @@ select array_agg(name order by 1 nulls first), array_agg(name order by 1 nulls l
 -- query 175
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = 0;
 
 -- query 176
 -- @skip_result_check=true
 USE ${case_db};
-set enable_exchange_pass_through = false;
 
 -- query 177
 USE ${case_db};
@@ -1026,7 +1023,6 @@ select array_agg(name order by 1 nulls first), array_agg(name order by 1 nulls l
 -- query 243
 -- @skip_result_check=true
 USE ${case_db};
-set enable_query_cache = true;
 
 -- query 244
 USE ${case_db};
@@ -1270,7 +1266,6 @@ insert into test_array_agg values
 -- query 294
 -- @skip_result_check=true
 USE ${case_db};
-set enable_per_bucket_optimize=false;
 
 -- query 295
 USE ${case_db};

@@ -20,15 +20,21 @@
 -- Test Objective:
 -- 1. Regression coverage for writing INT target columns through Iceberg sink.
 -- 2. Validate INT INSERT casts with statement-local integer inputs.
+-- query 1
 DROP TABLE IF EXISTS ${case_db}.t_int_insert_regression;
+-- query 2
 CREATE TABLE ${case_db}.t_int_insert_regression (
   id INT,
   v INT
 );
-SET @i = 1;
+-- query 3
+-- query 4
 INSERT INTO ${case_db}.t_int_insert_regression VALUES (1, 1);
+-- query 5
 INSERT INTO ${case_db}.t_int_insert_regression VALUES (2, 2);
+-- query 6
 INSERT INTO ${case_db}.t_int_insert_regression VALUES (3, 3);
+-- query 7
 SELECT id, v
 FROM ${case_db}.t_int_insert_regression
 ORDER BY id;

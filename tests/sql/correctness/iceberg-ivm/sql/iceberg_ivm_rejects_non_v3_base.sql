@@ -60,8 +60,7 @@ CREATE TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage (
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage VALUES (1, 10);
 
-SET CATALOG ice_ivm_reject_v2_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_reject_v2_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @expect_error=Iceberg format-version=3

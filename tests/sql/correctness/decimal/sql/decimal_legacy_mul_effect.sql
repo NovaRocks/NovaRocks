@@ -21,7 +21,7 @@
 
 -- query 1
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 SET decimal_overflow_to_double=false;
 CREATE TABLE ${case_db}.legacy_mul_effect (k INT,a DECIMAL(38,0)) TBLPROPERTIES ("format-version"="3");
 INSERT INTO ${case_db}.legacy_mul_effect VALUES (1,1),(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))),(3,NULL);
@@ -73,5 +73,5 @@ SELECT k FROM (SELECT k,CAST(a AS DECIMAL(76,0)) AS safe_widening FROM ${case_db
 
 -- query 10
 -- @skip_result_check=true
-SET sql_mode=32;
+SET sql_mode='32';
 DROP TABLE ${case_db}.legacy_mul_effect;

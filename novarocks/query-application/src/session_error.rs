@@ -137,6 +137,18 @@ impl QueryServiceError {
         }
     }
 
+    /// A business projection may retain its original typed calculation cause.
+    /// The descriptor selects the public error; the cause remains available
+    /// to the original owner and is never reconstructed from its display text.
+    pub fn from_user_error_with_cause(
+        error: UserError,
+        cause: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
+        let mut result = Self::from_user_error(error);
+        result.failure_cause = Some(cause);
+        result
+    }
+
     /// Carries the selected execution fact, safe detail and site as one sum.
     /// User-visible rendering is derived here; it grants no new acceptance.
     pub fn from_execution_failure(input: crate::execution_error::ExecutionFailureInput) -> Self {

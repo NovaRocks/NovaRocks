@@ -87,56 +87,56 @@ FROM ${case_db}.phj_row_util;
 
 -- query 12
 -- count(k1) from probe side, no filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
 -- query 13
 -- count(k1) with mod 2 filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
 -- query 14
 -- count(k1) with mod 3 filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 3 = 0;
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 3 = 0;
 
 -- query 15
 -- count(k1) with mod 5 filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 5 = 0;
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 5 = 0;
 
 -- query 16
 -- count(k1) with mod 10 filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
 -- query 17
 -- count(k1) with mod 100 filter
-SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
+SELECT count(tt1.k1) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
 
 -- query 18
 -- count(c_string) from probe side, no filter
-SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
+SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
 -- query 19
 -- count(c_string) from probe side with mod 2 filter
-SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
+SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
 -- query 20
 -- count(c_string) from probe side with mod 10 filter
-SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
+SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
 -- query 21
 -- count(c_string) from probe side with mod 100 filter
-SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
+SELECT count(tt1.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
 
 -- query 22
 -- count(c_string) from build side, no filter
-SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null);
+SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null);
 
 -- query 23
 -- count(c_string) from build side with mod 2 filter
-SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
+SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 2 = 0;
 
 -- query 24
 -- count(c_string) from build side with mod 10 filter
-SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
+SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 10 = 0;
 
 -- query 25
 -- count(c_string) from build side with mod 100 filter
-SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN [broadcast] ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;
+SELECT count(tt2.c_string) FROM ${case_db}.phj_t1 tt1 JOIN  ${case_db}.phj_t1 tt2 USING(c_bigint_null) WHERE tt1.k1 % 100 = 0;

@@ -746,6 +746,43 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
     host: Arc<dyn AggregateStateAllocator>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<RetainedTakeResult, CopyOperationError> {
+    take_copy_with_source_release(source, indices, original_owner, host, control, false)
+}
+
+/// Materialize one independent flat result under the original take invoice.
+/// Only these five physical carriers have no borrowed child/value buffers in
+/// Arrow's take. Complete logical typing remains the caller's separate proof.
+/// The same original settlement additionally rejects any nonempty input alias
+/// before releasing the real input owner. Existing take_copy_in keeps its lease.
+pub fn take_flat_owned_copy_in<C: Send + Sync + 'static>(
+    source: ArrayRef,
+    indices: CopyIndices,
+    original_owner: C,
+    host: Arc<dyn AggregateStateAllocator>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<RetainedTakeResult, CopyOperationError> {
+    if !matches!(
+        source.data_type(),
+        DataType::Boolean | DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Utf8
+    ) {
+        return Err(
+            CopyError::Unsupported(novarocks_failure_contract::BoundedDetail::truncating(
+                "independent take requires an admitted flat scalar carrier",
+            ))
+            .into(),
+        );
+    }
+    take_copy_with_source_release(source, indices, original_owner, host, control, true)
+}
+
+fn take_copy_with_source_release<C: Send + Sync + 'static>(
+    source: ArrayRef,
+    indices: CopyIndices,
+    original_owner: C,
+    host: Arc<dyn AggregateStateAllocator>,
+    control: &dyn KernelEvaluationControl,
+    release_source: bool,
+) -> Result<RetainedTakeResult, CopyOperationError> {
     // Pin input/index backing before its original owner on EVERY exit,
     // including constructor refusal before any actual output exists.
     let sources = CopySources {
@@ -808,15 +845,27 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
         };
     facts.bind_original_copy(&copied);
     work.flush()?;
-    let result = crate::arrow_result_custody::retain_copied_result_backing(
-        copied,
-        sources,
-        charge,
-        &mut reservation,
-        allocator,
-        &facts,
-        &mut work,
-    )?;
+    let result = if release_source {
+        crate::arrow_result_custody::retain_independent_flat_take_backing(
+            copied,
+            sources,
+            charge,
+            &mut reservation,
+            allocator,
+            &facts,
+            &mut work,
+        )?
+    } else {
+        crate::arrow_result_custody::retain_copied_result_backing(
+            copied,
+            sources,
+            charge,
+            &mut reservation,
+            allocator,
+            &facts,
+            &mut work,
+        )?
+    };
     work.finish()?;
     Ok(RetainedTakeResult {
         values: result.values,

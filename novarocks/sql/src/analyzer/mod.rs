@@ -37,6 +37,8 @@ pub(crate) fn view_value_type(
     root_output_declaration::widen_declaration(value, control)
 }
 
+pub(crate) mod constant_expression;
+
 #[cfg(test)]
 mod canonical_call_tests;
 #[cfg(test)]
@@ -317,7 +319,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     )
     .map_err(AnalyzeError::control)?;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
-    let query = query_prepass::preanalyze(query)?;
+    let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
     let materialized_source = materialized
         .map(|source| source.loan(&query, control))
         .transpose()

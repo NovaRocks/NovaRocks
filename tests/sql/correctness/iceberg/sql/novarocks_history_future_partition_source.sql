@@ -52,8 +52,7 @@ PROPERTIES (
   "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 CREATE DATABASE futuresource_${uuid0}.${case_db};
-SET CATALOG futuresource_${uuid0};
-USE ${case_db};
+USE futuresource_${uuid0}.${case_db};
 SET enable_materialized_view_rewrite = false;
 
 -- query 2

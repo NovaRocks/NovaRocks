@@ -41,8 +41,7 @@ CREATE DATABASE lnp3d_disc_${uuid0}.ns_${uuid0};
 CREATE TABLE lnp3d_disc_${uuid0}.ns_${uuid0}.z_source (k1 INT NOT NULL, v1 BIGINT)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO lnp3d_disc_${uuid0}.ns_${uuid0}.z_source VALUES (1, 10);
-SET CATALOG lnp3d_disc_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_disc_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW a_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PRIMARY KEY (k1)
@@ -62,8 +61,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_contains=a_mv
 -- @result_contains=UNAVAILABLE
-SET CATALOG lnp3d_disc_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_disc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 4
@@ -74,8 +72,7 @@ SELECT 1;
 -- query 5
 -- @skip_result_check=true
 -- @result_contains=a_mv
-SET CATALOG lnp3d_disc_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_disc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6

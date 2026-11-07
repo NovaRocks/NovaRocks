@@ -1215,8 +1215,8 @@ suspected case against a clean server before attributing it to the change.
   Analyze). `EXPLAIN ANALYZE` returns a query-level Planning/Execution/
   Rows header above the Verbose plan; per-operator runtime stats are a
   follow-up. Verbose/Costs/Analyze append a stable `stats={rows=N}`
-  trailer to each physical node. `SET disable_optimizer_rules = 'RuleA,RuleB'`
-  (alias `cbo_disabled_rules`) bisects optimizer rules at session level;
+  trailer to each physical node. `SET SESSION disable_optimizer_rules = 'RuleA,RuleB'`
+  bisects optimizer rules at session level;
   see `novarocks/sql/src/optimizer/options.rs`. Use the `tests/sql/correctness/optimizer/` suite
   for plan-golden cases, and `-- @explain_contains=<substr>` /
   `-- @normalize_explain_timing` in any sql-test case to assert plan-shape

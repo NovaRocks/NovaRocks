@@ -118,30 +118,9 @@ impl Printer {
                         SetScope::Local => self.output.push_str("LOCAL "),
                         SetScope::Global => self.output.push_str("GLOBAL "),
                     }
-                    match &assignment.target {
-                        SetTarget::UserVariable(variable) => self.output.push_str(&variable.value),
-                        SetTarget::SystemVariable(variable) => self.write_ident(variable),
-                        SetTarget::Names { .. } => self.output.push_str("NAMES"),
-                        SetTarget::Transaction { .. } => self.output.push_str("TRANSACTION"),
-                        SetTarget::Catalog { .. } => self.output.push_str("CATALOG"),
-                    }
-                    if matches!(
-                        assignment.target,
-                        SetTarget::UserVariable(_) | SetTarget::SystemVariable(_)
-                    ) {
-                        self.output.push_str(" = ");
-                    } else {
-                        self.output.push(' ');
-                    }
-                    match &assignment.value {
-                        SetValue::Expression(value) => self.write_expr(value),
-                        SetValue::Query(value) => {
-                            self.output.push('(');
-                            self.write_query(value);
-                            self.output.push(')');
-                        }
-                        SetValue::Words(words) => self.write_set_words(words),
-                    }
+                    self.write_ident(&assignment.name);
+                    self.output.push_str(" = ");
+                    self.write_expr(&assignment.value);
                 }
             }
             SessionStatement::Use(statement) => {
@@ -512,18 +491,11 @@ impl Printer {
                 metadata,
                 alias,
                 version,
-                hints,
                 ..
             } => {
                 self.write_table_name(name, metadata.as_ref());
                 if let Some(version) = version {
                     self.write_table_version(version);
-                }
-                for hint in hints {
-                    if !hint.attached_to_relation {
-                        self.output.push(' ');
-                    }
-                    self.write_table_hint(hint);
                 }
                 if let Some(alias) = alias {
                     self.output.push(' ');
@@ -533,14 +505,9 @@ impl Printer {
             TableFactor::Derived {
                 lateral,
                 subquery,
-                hints,
                 alias,
                 ..
             } => {
-                for hint in hints {
-                    self.write_table_hint(hint);
-                    self.output.push(' ');
-                }
                 if *lateral {
                     self.output.push_str("LATERAL ");
                 }
@@ -556,7 +523,6 @@ impl Printer {
                 lateral,
                 syntax,
                 expr,
-                hints,
                 alias,
                 ..
             } => {
@@ -570,10 +536,6 @@ impl Printer {
                         self.output.push(')');
                     }
                     crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
-                }
-                for hint in hints {
-                    self.output.push(' ');
-                    self.write_table_hint(hint);
                 }
                 if let Some(alias) = alias {
                     self.output.push(' ');
@@ -639,20 +601,6 @@ impl Printer {
         self.write_expr(&version.value);
     }
 
-    fn write_table_hint(&mut self, hint: &TableHint) {
-        self.output.push('[');
-        self.write_ident(&hint.name);
-        if let Some(target) = &hint.target {
-            self.output.push('|');
-            self.write_expr(target);
-        } else if !hint.arguments.is_empty() {
-            self.output.push('(');
-            self.write_expr_list(&hint.arguments);
-            self.output.push(')');
-        }
-        self.output.push(']');
-    }
-
     fn write_join(&mut self, join: &Join) {
         if matches!(join.constraint, JoinConstraint::Natural(_)) {
             self.output.push_str("NATURAL ");
@@ -672,7 +620,7 @@ impl Printer {
             JoinOperator::LeftAnti => "LEFT ANTI JOIN ",
             JoinOperator::RightAnti => "RIGHT ANTI JOIN ",
         });
-        self.write_join_relation(&join.relation);
+        self.write_table_factor(&join.relation);
         match &join.constraint {
             JoinConstraint::None | JoinConstraint::Natural(_) => {}
             JoinConstraint::On(expr) => {
@@ -684,92 +632,6 @@ impl Printer {
                 self.write_ident_list(columns);
                 self.output.push(')');
             }
-        }
-    }
-
-    fn write_join_relation(&mut self, relation: &TableFactor) {
-        match relation {
-            TableFactor::Table {
-                name,
-                metadata,
-                alias,
-                version,
-                hints,
-                ..
-            } if hints.iter().any(|hint| hint.attached_to_relation) => {
-                let first_postfix = hints
-                    .iter()
-                    .position(|hint| hint.attached_to_relation)
-                    .expect("matched attached table hint");
-                for hint in &hints[..first_postfix] {
-                    self.write_table_hint(hint);
-                    self.output.push(' ');
-                }
-                self.write_table_name(name, metadata.as_ref());
-                if let Some(version) = version {
-                    self.write_table_version(version);
-                }
-                for hint in &hints[first_postfix..] {
-                    if !hint.attached_to_relation {
-                        self.output.push(' ');
-                    }
-                    self.write_table_hint(hint);
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            TableFactor::Table {
-                name,
-                metadata,
-                alias,
-                version,
-                hints,
-                ..
-            } if !hints.is_empty() => {
-                for hint in hints {
-                    self.write_table_hint(hint);
-                    self.output.push(' ');
-                }
-                self.write_table_name(name, metadata.as_ref());
-                if let Some(version) = version {
-                    self.write_table_version(version);
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            TableFactor::TableFunction {
-                lateral,
-                syntax,
-                expr,
-                hints,
-                alias,
-                ..
-            } if !hints.is_empty() => {
-                for hint in hints {
-                    self.write_table_hint(hint);
-                    self.output.push(' ');
-                }
-                if *lateral {
-                    self.output.push_str("LATERAL ");
-                }
-                match syntax {
-                    crate::ast::TableFunctionSyntax::TableWrapper => {
-                        self.output.push_str("TABLE(");
-                        self.write_expr(expr);
-                        self.output.push(')');
-                    }
-                    crate::ast::TableFunctionSyntax::BareCall => self.write_expr(expr),
-                }
-                if let Some(alias) = alias {
-                    self.output.push(' ');
-                    self.write_table_alias(alias);
-                }
-            }
-            _ => self.write_table_factor(relation),
         }
     }
 
@@ -856,7 +718,6 @@ impl Printer {
             Expr::CompoundIdentifier(ident) => {
                 self.write_ident_list_with_separator(&ident.parts, ".")
             }
-            Expr::UserVariable(variable) => self.output.push_str(&variable.value),
             Expr::Literal(literal) => self.write_literal(literal),
             Expr::FunctionCall(call) => self.write_function_call(call),
             Expr::Unary(expression) => self.write_unary_expr(expression),
@@ -1413,18 +1274,6 @@ impl Printer {
             self.write_ident(ident);
         }
     }
-
-    fn write_set_words(&mut self, words: &[SetWord]) {
-        for (index, word) in words.iter().enumerate() {
-            if index != 0 {
-                self.output.push(' ');
-            }
-            match word {
-                SetWord::Ident(word) => self.write_ident(word),
-                SetWord::Literal(word) => self.write_literal(word),
-            }
-        }
-    }
 }
 
 /// Renders one statement into canonical SQL.
@@ -1679,7 +1528,6 @@ mod tests {
                             span: span(),
                         }),
                         version: None,
-                        hints: Vec::new(),
                         span: span(),
                     },
                     joins: Vec::new(),

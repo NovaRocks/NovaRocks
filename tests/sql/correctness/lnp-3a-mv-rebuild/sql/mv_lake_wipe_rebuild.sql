@@ -56,8 +56,7 @@ CREATE TABLE lnp3a_ice_${uuid0}.ns_${uuid0}.orders (
 )
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO lnp3a_ice_${uuid0}.ns_${uuid0}.orders VALUES (1, 10), (2, 20);
-SET CATALOG lnp3a_ice_${uuid0};
-USE ns_${uuid0};
+USE lnp3a_ice_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PRIMARY KEY (k1)
@@ -90,8 +89,7 @@ SELECT k1, v1 FROM lnp3a_ice_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 -- query 6
 -- The restart replaced the session, so name the catalog again.
 -- @skip_result_check=true
-SET CATALOG lnp3a_ice_${uuid0};
-USE ns_${uuid0};
+USE lnp3a_ice_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true
@@ -115,8 +113,7 @@ SELECT 1;
 
 -- query 11
 -- @skip_result_check=true
-SET CATALOG lnp3a_ice_${uuid0};
-USE ns_${uuid0};
+USE lnp3a_ice_${uuid0}.ns_${uuid0};
 ALTER MATERIALIZED VIEW orders_mv RESUME REFRESH;
 
 -- query 12

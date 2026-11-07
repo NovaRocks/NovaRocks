@@ -53,7 +53,7 @@ create materialized view user_tags_mv1  distributed by hash(user_id) as select u
 refresh materialized view user_tags_mv1 with sync mode;
 
 -- query 11
-set enable_materialized_view_rewrite = off;
+set enable_materialized_view_rewrite = false;
 
 -- query 12
 select user_id, count(distinct tag_id) from user_tags group by user_id order by user_id;
@@ -65,7 +65,7 @@ select user_id, bitmap_union_count(to_bitmap(tag_id)) from user_tags group by us
 select user_id, bitmap_count(bitmap_union(to_bitmap(tag_id))) x from user_tags group by user_id order by user_id;
 
 -- query 15
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 16
 -- explain logical select user_id, count(distinct tag_id) from user_tags group by user_id order by user_id;
@@ -88,7 +88,7 @@ create materialized view user_tags_mv2  distributed by hash(user_id) as select u
 refresh materialized view user_tags_mv2 with sync mode;
 
 -- query 22
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 23
 explain logical select user_id, count(distinct tag_id) from user_tags group by user_id order by user_id;
@@ -113,7 +113,7 @@ create materialized view user_tags_hll_mv1  distributed by hash(user_id) as sele
 refresh materialized view user_tags_hll_mv1 with sync mode;
 
 -- query 30
-set enable_materialized_view_rewrite = off;
+set enable_materialized_view_rewrite = false;
 
 -- query 31
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -128,7 +128,7 @@ select user_id, hll_union_agg(hll_hash(tag_id)) x from user_tags group by user_i
 select user_id, hll_cardinality(hll_union(hll_hash(tag_id))) x from user_tags group by user_id order by user_id;
 
 -- query 35
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 36
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -153,7 +153,7 @@ create materialized view user_tags_hll_mv2  distributed by hash(user_id) as sele
 refresh materialized view user_tags_hll_mv2 with sync mode;
 
 -- query 43
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 44
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -178,7 +178,7 @@ create materialized view user_tags_percential_mv1 distributed by hash(user_id) a
 refresh materialized view user_tags_percential_mv1 with sync mode;
 
 -- query 51
-set enable_materialized_view_rewrite = off;
+set enable_materialized_view_rewrite = false;
 
 -- query 52
 select user_id, percentile_approx(tag_id, 1) x from user_tags group by user_id order by user_id;
@@ -190,7 +190,7 @@ select user_id, percentile_approx(tag_id, 0) x from user_tags group by user_id o
 select user_id, round(percentile_approx(tag_id, 0)) x from user_tags group by user_id order by user_id;
 
 -- query 55
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 56
 select user_id, percentile_approx_raw(percentile_union(percentile_hash(tag_id)), 1) x from user_tags group by user_id order by user_id;
@@ -215,7 +215,7 @@ create materialized view user_tags_percential_mv2 distributed by hash(user_id) a
 refresh materialized view user_tags_percential_mv2 with sync mode;
 
 -- query 63
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 64
 select user_id, percentile_approx(tag_id, 1) x from user_tags group by user_id order by user_id;
@@ -243,7 +243,7 @@ create materialized view user_tags_mv3  distributed by hash(user_id) as select u
 refresh materialized view user_tags_mv3 with sync mode;
 
 -- query 72
-set enable_materialized_view_rewrite = off;
+set enable_materialized_view_rewrite = false;
 
 -- query 73
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -258,7 +258,7 @@ select user_id, hll_union_agg(hll_hash(tag_id)) x from user_tags group by user_i
 select user_id, hll_cardinality(hll_union(hll_hash(tag_id))) x from user_tags group by user_id order by user_id;
 
 -- query 77
-set enable_materialized_view_rewrite = on;
+set enable_materialized_view_rewrite = true;
 
 -- query 78
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -303,7 +303,7 @@ EXPLAIN select user_id, sum(tag_id) as total from user_tags  group by user_id ha
 select user_id, sum(tag_id) as total from user_tags  group by user_id having sum(tag_id) > 2 order by user_id;
 
 -- query 89
-set enable_materialized_view_rewrite = off;
+set enable_materialized_view_rewrite = false;
 
 -- query 90
 -- @result_contains=agg_mv1

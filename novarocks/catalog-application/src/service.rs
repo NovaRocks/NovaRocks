@@ -38,10 +38,11 @@ use std::time::{Duration, Instant};
 use crate::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal, CatalogCreateCommand,
-    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
-    CatalogDesiredStateSourceMode, CatalogDropCommand, CatalogReferenceReader,
-    CatalogRuntimeObservation, CatalogRuntimePublisherSink,
+    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal, CatalogConfigurationAdmission,
+    CatalogConfigurationObservation, CatalogCreateCommand, CatalogDesiredStateEntry,
+    CatalogDesiredStateSnapshot, CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
+    CatalogDropCommand, CatalogLogicalConfig, CatalogReferenceReader, CatalogRuntimeObservation,
+    CatalogRuntimePublisherSink,
 };
 #[cfg(test)]
 use futures::future::BoxFuture;
@@ -187,6 +188,8 @@ enum LocalProjection {
         attachment_id: Uuid,
         provider_id: ConnectorProviderId,
         generation: u64,
+        configuration: Arc<CatalogLogicalConfig>,
+        binding_key: novarocks_spi::connector::ConnectorProviderBindingKey,
     },
 }
 
@@ -377,6 +380,7 @@ impl CatalogApplicationService {
                 attachment_id,
                 provider_id,
                 generation,
+                ..
             } => match self.control.observe_current_binding(instance_id) {
                 Ok(_) => CatalogAdmission::Ready(CatalogRuntimeObservation {
                     attachment_id,
@@ -388,6 +392,59 @@ impl CatalogApplicationService {
                     reason: error.to_string(),
                 },
             },
+        }
+    }
+
+    fn configuration_observation(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> CatalogConfigurationAdmission {
+        // Identity and configuration are cloned from one original projection
+        // while holding its lock once. Never reread the desired-state source.
+        let projection = match self.projections.lock() {
+            Ok(projections) => projections.get(instance_id).cloned(),
+            Err(_) => {
+                return CatalogConfigurationAdmission::Unavailable {
+                    reason: "catalog projection lock is poisoned".to_owned(),
+                };
+            }
+        };
+        match projection {
+            None => CatalogConfigurationAdmission::Absent,
+            Some(LocalProjection::Unavailable { reason, .. }) => {
+                CatalogConfigurationAdmission::Unavailable { reason }
+            }
+            Some(LocalProjection::Ready {
+                attachment_id,
+                provider_id,
+                generation,
+                configuration,
+                binding_key,
+            }) => {
+                // This existing pure observation is outside the projection
+                // lock. A replacement in between cannot lend its new live
+                // binding to the old configuration snapshot.
+                match self.control.observe_current_binding(instance_id) {
+                    Ok(current) if current == binding_key => {
+                        CatalogConfigurationAdmission::Ready(CatalogConfigurationObservation {
+                            runtime: CatalogRuntimeObservation {
+                                attachment_id,
+                                instance_id: instance_id.clone(),
+                                provider_id,
+                                generation,
+                            },
+                            configuration,
+                        })
+                    }
+                    Ok(_) => CatalogConfigurationAdmission::Unavailable {
+                        reason: "catalog control binding changed during configuration admission"
+                            .to_owned(),
+                    },
+                    Err(error) => CatalogConfigurationAdmission::Unavailable {
+                        reason: error.to_string(),
+                    },
+                }
+            }
         }
     }
 
@@ -432,6 +489,10 @@ impl CatalogApplicationService {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id();
         let provider_id = entry.config().provider_id();
+        let binding_key = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: binding.control().incarnation(),
+        };
         self.control
             .register_role_binding(binding)
             .map_err(connector_error)?;
@@ -453,6 +514,8 @@ impl CatalogApplicationService {
             attachment_id,
             provider_id: provider_id.clone(),
             generation,
+            configuration: Arc::new(entry.config().clone()),
+            binding_key,
         };
         let publish_result = self
             .projections
@@ -1276,6 +1339,18 @@ impl CatalogApplicationPort for CatalogApplicationService {
             };
         }
         self.observation(instance_id)
+    }
+
+    fn admit_catalog_configuration(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> CatalogConfigurationAdmission {
+        if self.source.is_none() {
+            return CatalogConfigurationAdmission::Unavailable {
+                reason: "this frontend has no configured catalog desired-state source".to_owned(),
+            };
+        }
+        self.configuration_observation(instance_id)
     }
 }
 
@@ -3466,6 +3541,224 @@ mod tests {
             drop(state);
             // Server Drop releases any gate and joins every actual HTTP thread.
             drop(server);
+        }
+    }
+
+    mod configuration_snapshot_tests {
+        use super::*;
+        use crate::{
+            CatalogConfigurationAdmission, CatalogConfigurationObservation, CatalogLogicalConfig,
+        };
+
+        fn entry(name: &str, warehouse: &str) -> CatalogDesiredStateEntry {
+            CatalogDesiredStateEntry::new(
+                crate::CatalogSourceEntryIdentity::new(Uuid::now_v7()),
+                CatalogLogicalConfig::try_new(
+                    ConnectorInstanceId::parse(name).unwrap(),
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    name,
+                    vec![
+                        ("type".into(), "iceberg".into()),
+                        ("warehouse".into(), warehouse.into()),
+                    ],
+                    Vec::new(),
+                    1,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn service(
+            entries: Vec<CatalogDesiredStateEntry>,
+            calls: Arc<AtomicUsize>,
+        ) -> CatalogApplicationService {
+            let snapshot = CatalogDesiredStateSnapshot::try_new(
+                CatalogDesiredStateSourceMode::StaticFile,
+                entries,
+            )
+            .unwrap();
+            let source = CatalogDesiredStateSource::static_file(snapshot).unwrap();
+            let control = Arc::new(
+                ConnectorControlHost::with_role_factories(vec![Arc::new(CountingRoleFactory {
+                    calls,
+                })])
+                .unwrap(),
+            );
+            CatalogApplicationService::new(
+                source,
+                control,
+                Arc::new(TestRuntimePublisher),
+                tokio::runtime::Handle::current(),
+                Arc::new(TestReferenceReader),
+            )
+        }
+
+        async fn install(service: &CatalogApplicationService, entry: CatalogDesiredStateEntry) {
+            let (_, work) = service
+                .submit_materialization(entry, CatalogDesiredStateSourceMode::StaticFile, None)
+                .unwrap();
+            service
+                .run_materialization(work.expect("original materialization work"))
+                .await;
+        }
+
+        fn ready(
+            service: &CatalogApplicationService,
+            instance: &ConnectorInstanceId,
+        ) -> CatalogConfigurationObservation {
+            service
+                .admit_catalog_configuration(instance)
+                .require_ready(instance)
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn configuration_snapshot_keeps_same_provider_instances_independent_without_io() {
+            let first = entry("catalog.first", "file:///first");
+            let second = entry("catalog.second", "file:///second");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let service = service(vec![first.clone(), second.clone()], calls.clone());
+            install(&service, first.clone()).await;
+            install(&service, second.clone()).await;
+            let before_calls = calls.load(Ordering::SeqCst);
+            assert_eq!(before_calls, 2);
+            let first_snapshot = ready(&service, first.config().instance_id());
+            let second_snapshot = ready(&service, second.config().instance_id());
+            assert_eq!(
+                first_snapshot.runtime.provider_id,
+                second_snapshot.runtime.provider_id
+            );
+            assert_ne!(
+                first_snapshot.runtime.attachment_id,
+                second_snapshot.runtime.attachment_id
+            );
+            assert_eq!(first_snapshot.configuration.as_ref(), first.config());
+            assert_eq!(second_snapshot.configuration.as_ref(), second.config());
+            let repeated = ready(&service, first.config().instance_id());
+            assert_eq!(repeated.runtime, first_snapshot.runtime);
+            assert!(Arc::ptr_eq(
+                &repeated.configuration,
+                &first_snapshot.configuration
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before_calls,
+                "read-only admission must not rematerialize a Provider"
+            );
+            assert!(
+                matches!(service.admit_catalog(first.config().instance_id()), CatalogAdmission::Ready(ref original) if original == &first_snapshot.runtime)
+            );
+        }
+
+        #[tokio::test]
+        async fn configuration_snapshot_drop_and_recreate_keeps_old_generation_immutable() {
+            let first = entry("catalog.recreated", "file:///before");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut service = service(vec![first.clone()], calls.clone());
+            install(&service, first.clone()).await;
+            let old = ready(&service, first.config().instance_id());
+            // Retire through the real projection/control owner. A retained
+            // metadata snapshot is not a live runtime lease and cannot block it.
+            service.retire_projection(first.config().instance_id());
+            assert!(matches!(
+                service.admit_catalog_configuration(first.config().instance_id()),
+                CatalogConfigurationAdmission::Absent
+            ));
+            let next = entry("catalog.recreated", "file:///after");
+            let snapshot = CatalogDesiredStateSnapshot::try_new(
+                CatalogDesiredStateSourceMode::StaticFile,
+                vec![next.clone()],
+            )
+            .unwrap();
+            service.source = Some(CatalogDesiredStateSource::static_file(snapshot).unwrap());
+            install(&service, next.clone()).await;
+            let current = ready(&service, next.config().instance_id());
+            assert_eq!(current.runtime.instance_id, old.runtime.instance_id);
+            assert_eq!(current.runtime.provider_id, old.runtime.provider_id);
+            assert_ne!(current.runtime.attachment_id, old.runtime.attachment_id);
+            assert_ne!(current.runtime.generation, old.runtime.generation);
+            assert_eq!(old.configuration.as_ref(), first.config());
+            assert_eq!(current.configuration.as_ref(), next.config());
+            assert!(!Arc::ptr_eq(&old.configuration, &current.configuration));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn configuration_snapshot_preserves_unavailable_and_rejects_another_live_binding() {
+            let original = entry("catalog.unavailable", "file:///original");
+            let service = service(vec![original.clone()], Arc::new(AtomicUsize::new(0)));
+            let instance = original.config().instance_id();
+            install(&service, original.clone()).await;
+            let old = ready(&service, instance);
+            // Model the original lifecycle window explicitly: another
+            // control binding is live while the old Ready record is retained.
+            service.control.retire_current(instance).unwrap();
+            let properties = NormalizedCatalogProperties::try_new(
+                original
+                    .catalog_properties(CatalogDesiredStateSourceMode::StaticFile)
+                    .unwrap(),
+            )
+            .unwrap();
+            let control = crate::test_support::test_control_binding_for(instance.clone(), 200)
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .unwrap();
+            let binding = novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
+                properties,
+                Arc::new(control),
+                None,
+                None,
+            )
+            .unwrap();
+            service.control.register_role_binding(binding).unwrap();
+            assert!(
+                matches!(service.admit_catalog_configuration(instance), CatalogConfigurationAdmission::Unavailable { reason } if reason == "catalog control binding changed during configuration admission")
+            );
+            assert_eq!(old.configuration.as_ref(), original.config());
+            service.mark_unavailable(
+                instance,
+                original.identity().as_uuid(),
+                original.config().provider_id(),
+                "original provider unavailable",
+            );
+            assert_eq!(
+                service.admit_catalog_configuration(instance),
+                CatalogConfigurationAdmission::Unavailable {
+                    reason: "original provider unavailable".into()
+                }
+            );
+            assert_eq!(
+                service.admit_catalog(instance),
+                CatalogAdmission::Unavailable {
+                    reason: "original provider unavailable".into()
+                }
+            );
+        }
+
+        #[test]
+        fn a_legacy_admission_port_cannot_fabricate_configuration_support() {
+            struct LegacyPort;
+            impl CatalogApplicationPort for LegacyPort {
+                fn create_catalog(
+                    &self,
+                    _: CatalogCreateCommand,
+                ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+                    unreachable!("read-only test")
+                }
+                fn drop_catalog(
+                    &self,
+                    _: CatalogDropCommand,
+                ) -> Result<(), CatalogApplicationError> {
+                    unreachable!("read-only test")
+                }
+                fn admit_catalog(&self, _: &ConnectorInstanceId) -> CatalogAdmission {
+                    CatalogAdmission::Absent
+                }
+            }
+            let instance = ConnectorInstanceId::parse("catalog.unsupported").unwrap();
+            assert!(matches!(
+                LegacyPort.admit_catalog_configuration(&instance),
+                CatalogConfigurationAdmission::Unavailable { .. }
+            ));
         }
     }
 }

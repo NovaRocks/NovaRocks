@@ -54,8 +54,7 @@ INSERT INTO ice_w6_${uuid0}.ns_${uuid0}.base_orders VALUES
   (1, 10),
   (2, 20);
 
-SET CATALOG ice_w6_${uuid0};
-USE ns_${uuid0};
+USE ice_w6_${uuid0}.ns_${uuid0};
 
 CREATE MATERIALIZED VIEW target_mv
 DISTRIBUTED BY HASH(order_id) BUCKETS 2

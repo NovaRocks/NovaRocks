@@ -164,7 +164,6 @@ with cte0 as (select avg(c3), sum(c3) sc3, c0 from t3 group by c0 limit 10000), 
 -- query 28
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 29
 USE ${case_db};
@@ -222,7 +221,6 @@ insert into t5 select * from t4;
 -- query 38
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="auto";
 
 -- query 39
 USE ${case_db};
@@ -235,7 +233,6 @@ select * from (select max(c3), sum(c3) sc3, c1 from t5 group by c1 limit 10) t o
 -- query 41
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 42
 USE ${case_db};
@@ -252,7 +249,6 @@ select * from (select max(c3), sum(c3) sc3, c2 from t5 group by c2 limit 10) t o
 -- query 45
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 46
 -- @skip_result_check=true

@@ -81,24 +81,12 @@ ROLLBACK;
 -- @expect_error_at=1:1
 SAVEPOINT before_publish;
 
--- Rejecting autocommit-off is an admission decision and the preceding SET
--- assignment in the same command must not be applied first. The location is
--- the offending assignment, not the statement head, so it stays on
--- `autocommit` even when an accepted assignment precedes it.
--- @expect_error_tier=target
--- @expect_sql_code=sql.admit.session_transaction_unsupported
--- @expect_sql_phase=Admit
--- @expect_error_at=1:24
+-- Unknown autocommit is rejected before any assignment can be published.
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 SET query_timeout = 1, autocommit = OFF;
 
--- @expect_error_tier=target
--- @expect_sql_code=sql.admit.session_transaction_unsupported
--- @expect_sql_phase=Admit
--- @expect_error_at=1:5
+-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR
 SET autocommit = FALSE;
 
--- @expect_error_tier=target
--- @expect_sql_code=sql.admit.session_transaction_unsupported
--- @expect_sql_phase=Admit
--- @expect_error_at=1:5
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SET @@session.autocommit = 0;

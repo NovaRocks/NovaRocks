@@ -63,4 +63,3 @@ SELECT id, email FROM members ORDER BY id;
 -- query 9
 DROP TABLE members;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nullable_${uuid0};
-SET catalog default_catalog;

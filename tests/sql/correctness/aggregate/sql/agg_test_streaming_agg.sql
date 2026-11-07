@@ -45,7 +45,6 @@ set pipeline_dop=1;
 -- query 5
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage=2;
 
 -- query 6
 USE ${case_db};

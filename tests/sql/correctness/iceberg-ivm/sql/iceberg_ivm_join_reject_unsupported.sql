@@ -61,8 +61,7 @@ CREATE TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_extra_${uuid0} (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_ivm_join_reject_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_join_reject_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @expect_error=Iceberg IMV refresh contract supports only inner/cross join shapes

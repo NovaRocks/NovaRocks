@@ -54,8 +54,7 @@ INSERT INTO mvocc_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 4
 -- @skip_result_check=true
-SET CATALOG mvocc_${uuid0};
-USE ns_${uuid0};
+USE mvocc_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_conflict
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -78,8 +77,7 @@ INSERT INTO mvocc_${uuid0}.ns_${uuid0}.fact VALUES ('west', 20);
 -- @publication_service_hold=ns_${uuid0}.mv_conflict
 -- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-mv-physical-conflict-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.mv_conflict WHERE k = 'east';" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 -- @expect_error=Broken { dependency: RefUnchanged
-SET CATALOG mvocc_${uuid0};
-USE ns_${uuid0};
+USE mvocc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW mv_conflict FULL WITH SYNC MODE;
 
 -- query 8

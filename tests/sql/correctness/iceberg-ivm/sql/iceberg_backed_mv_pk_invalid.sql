@@ -59,8 +59,7 @@ TBLPROPERTIES ("format-version" = "3",
 INSERT INTO mv_ivm_pk_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'A', 100.0, ['x']),
   (2, 'B', 200.0, ['y']);
-SET CATALOG mv_ivm_pk_${uuid0};
-USE ns_${uuid0};
+USE mv_ivm_pk_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @expect_error=iceberg-backed aggregate materialized views do not support PRIMARY KEY

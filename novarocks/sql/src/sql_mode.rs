@@ -103,6 +103,8 @@ impl SqlMode {
     }
 }
 
+pub const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: i32 = 5;
+
 /// Immutable SQL semantics frozen once for a connection or statement.
 /// Each field keeps its SQL owner; assigning one setting preserves the rest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -111,9 +113,18 @@ pub struct SqlSemanticSettings {
     decimal_overflow_to_double: bool,
     /// Raw value projected from the actual admitted SessionExecutionSettings.
     group_concat_max_len: Option<i64>,
+    recursive_cte_max_depth: Option<i32>,
 }
 
 impl SqlSemanticSettings {
+    pub const fn recursive_cte_max_depth(&self) -> Option<i32> {
+        self.recursive_cte_max_depth
+    }
+
+    pub fn with_recursive_cte_max_depth(mut self, value: i32) -> Self {
+        self.recursive_cte_max_depth = Some(value);
+        self
+    }
     pub const fn sql_mode(&self) -> &SqlMode {
         &self.sql_mode
     }

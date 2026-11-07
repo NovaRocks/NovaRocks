@@ -355,7 +355,7 @@ select * from (select col0, col2, col3, id, col1 from test_base_table1 where col
 
 -- query 74
 -- if no force convert or to union all, only chooose mv
-set select_ratio_threshold = 0.15;
+
 
 -- query 75
 -- @result_contains=rollup: mv_test_base_table1
@@ -385,7 +385,7 @@ select * from (select col0, col2, col3, id, col1 from test_base_table1 where col
 
 -- query 81
 -- if force convert or to union all, chooose mv and base table's short key
-set select_ratio_threshold=-1;
+
 
 -- query 82
 -- Current NovaRocks cannot EXPLAIN the force-converted OR-to-UNION path under select_ratio_threshold = -1.
@@ -410,22 +410,22 @@ EXPLAIN select * from (select col0, col2, col3, id, col1 from test_base_table1 w
 select * from (select col0, col2, col3, id, col1 from test_base_table1 where col0=123456789 or col2 ='2022-04-30 12:00:00') t;
 
 -- query 86
-set select_ratio_threshold = 0.15;
+
 
 -- query 87
-set enable_sync_materialized_view_rewrite=false;
+
 
 -- query 88
 -- @result_contains_any=rollup: mv_test_base_table1
 -- @result_contains_any=rollup: test_base_table1
 SET enable_materialized_view_rewrite = true;
-EXPLAIN select * from (select col0, col2, col3, id, col1 from test_base_table1 where col0=123456789 union select col0, col2, col3, id, col1 from mv_test_base_table1 [_SYNC_MV_] where col2 >='2022-04-30 12:00:00') t;
+EXPLAIN select * from (select col0, col2, col3, id, col1 from test_base_table1 where col0=123456789 union select col0, col2, col3, id, col1 from mv_test_base_table1  where col2 >='2022-04-30 12:00:00') t;
 
 -- query 89
-select * from (select col0, col2, col3, id, col1 from test_base_table1 where col0=123456789 union select col0, col2, col3, id, col1 from mv_test_base_table1 [_SYNC_MV_] where col2 >='2022-04-30 12:00:00') t order by 1;
+select * from (select col0, col2, col3, id, col1 from test_base_table1 where col0=123456789 union select col0, col2, col3, id, col1 from mv_test_base_table1  where col2 >='2022-04-30 12:00:00') t order by 1;
 
 -- query 90
-set enable_sync_materialized_view_rewrite=true;
+
 
 -- query 91
 drop table test_base_table1;

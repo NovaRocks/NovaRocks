@@ -272,11 +272,11 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 56
 USE ${case_db};
-with tt as (select @v1 as v1, c1, c2 from t1) select /*+ set_user_variable(@v1 = 0.5) */ cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 57
 USE ${case_db};
-with tt as (select @v1 as v1, @v2 as v2, c1, c2 from t1) select /*+ set_user_variable(@v1= 0.5, @v2 = 4096) */ cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 58
 -- @skip_result_check=true
@@ -461,11 +461,11 @@ select cast(percentile_approx_weighted(c13.b, 1, 0.5) as int) from t1;
 
 -- query 102
 USE ${case_db};
-with tt as (select @v1 as v1, c1, c2 from t1) select /*+ set_user_variable(@v1 = 0.5) */ cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
+with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1) as int) from tt;
 
 -- query 103
 USE ${case_db};
-with tt as (select @v1 as v1, @v2 as v2, c1, c2 from t1) select /*+ set_user_variable(@v1= 0.5, @v2 = 4096) */ cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
+with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx_weighted(c2, c1, v1, v2 + 1) as int) from tt;
 
 -- query 104
 -- @skip_result_check=true
@@ -483,7 +483,7 @@ insert into t2 values(2,1),(3,2),(4,3);
 
 -- query 106
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx_weighted(k, v, 0.5, 10000) from t2;
+select  percentile_approx_weighted(k, v, 0.5, 10000) from t2;
 
 -- query 107
 -- @expect_error=Type check failed. percentile parameter must be between 0 and 1 in percentile_approx_weighted, but got: 1.5
@@ -524,7 +524,7 @@ select percentile_approx_weighted(k, v, []) from t2;
 
 -- query 115
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx_weighted(k, v, array<float>[0.0, 0.5, 1.0]) from t2;
+select  percentile_approx_weighted(k, v, array<float>[0.0, 0.5, 1.0]) from t2;
 
 -- query 116
 USE ${case_db};
@@ -550,11 +550,11 @@ select percentile_approx_weighted(k, v, 0.5, 100) from t2;
 
 -- query 121
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx_weighted(k, v, 0.5, 10000) from t2;
+select  percentile_approx_weighted(k, v, 0.5, 10000) from t2;
 
 -- query 122
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx_weighted(k, v, [0.25, 0.5, 0.75], 1000) from t2;
+select  percentile_approx_weighted(k, v, [0.25, 0.5, 0.75], 1000) from t2;
 
 -- query 123
 USE ${case_db};
@@ -577,15 +577,15 @@ insert into test_sorted_streaming_agg_percentile_weighted values(2,1),(2,6),(4,3
 
 -- query 126
 USE ${case_db};
-select /*+ SET_VAR (enable_sort_aggregate = 'true') */ percentile_approx_weighted(value, 10, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, 10, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 127
 USE ${case_db};
-select /*+ SET_VAR (enable_sort_aggregate = 'true') */ percentile_approx_weighted(value, 0, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, 0, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 128
 USE ${case_db};
-select /*+ SET_VAR (enable_sort_aggregate = 'true') */ percentile_approx_weighted(value, value, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
+select  percentile_approx_weighted(value, value, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile_weighted group by id_int;
 
 -- query 129
 -- @skip_result_check=true
@@ -619,12 +619,12 @@ insert into t1_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
 
 -- query 133
 USE ${case_db};
-select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming') */ percentile_approx_weighted(v2, 10, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 10, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
 
 -- query 134
 USE ${case_db};
-select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming') */ percentile_approx_weighted(v2, 0, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, 0, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
 
 -- query 135
 USE ${case_db};
-select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming') */ percentile_approx_weighted(v2, v1, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx_weighted(v2, v1, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';

@@ -46,8 +46,7 @@ CREATE DATABASE mvfrozen_${uuid0}.ns_${uuid0};
 CREATE TABLE mvfrozen_${uuid0}.ns_${uuid0}.fact (k STRING, v BIGINT)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 INSERT INTO mvfrozen_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
-SET CATALOG mvfrozen_${uuid0};
-USE ns_${uuid0};
+USE mvfrozen_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW target_mv
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL

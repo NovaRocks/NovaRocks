@@ -77,7 +77,6 @@ INSERT INTO ${case_db}.t0 (`region`, `order_date`, `income`, `ship_mode`, `ship_
 
 -- query 3
 -- @skip_result_check=true
-set ENABLE_SIMPLIFY_CASE_WHEN = true;
 
 -- Section 1: Nullable INT column (ship_code) with CASE WHEN col>=N THEN letter
 

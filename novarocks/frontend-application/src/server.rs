@@ -712,6 +712,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
+            host.session_properties(),
         ));
     let catalog_command_executor =
         core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(
@@ -810,6 +811,8 @@ fn build_frontend_query_session_factory_from_role_products(
     );
     let query_service = crate::query::FrontendQueryService::new(
         session_catalog_resolver,
+        host.session_properties(),
+        host.required_constant_interpreter(),
         query_compiler,
         product_command_router,
         backend_command_executor,
@@ -1753,11 +1756,21 @@ mod tests {
                 "cp2-cutover",
             ))
             .expect("open fresh statement session");
+        // This control fixture admits the catalog but intentionally has no
+        // namespace capability. Qualified USE must reach that original refusal.
         let result = session
-            .execute_statement("SET CATALOG warehouse")
+            .execute_statement("USE warehouse.admission_probe")
             .await
-            .expect("the committed attachment is admitted by this frontend session");
-        settle_governed_completion(result);
+            .expect("the admitted catalog reaches its original namespace capability");
+        let (result, terminal) = result.into_parts();
+        let StatementResult::GovernedError(result) = result else {
+            panic!("the test-only namespace capability must refuse the lookup");
+        };
+        let (error, mut protocol) = result.into_parts();
+        assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
+        assert!(error.message().contains("test-only control capability"));
+        let _ = protocol.fail();
+        terminal.complete();
 
         session.close();
         drop(session);
@@ -1793,7 +1806,7 @@ mod tests {
             ))
             .expect("open fresh statement session");
         let result = session
-            .execute_statement("SET CATALOG warehouse")
+            .execute_statement("USE warehouse.admission_probe")
             .await
             .expect("admission error is retained until the protocol terminal error");
         let (result, terminal) = result.into_parts();

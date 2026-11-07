@@ -122,7 +122,6 @@ const KEYWORDS: &[(&str, Keyword)] = &[
     ("CATALOG", Keyword::Catalog),
     ("CASE", Keyword::Case),
     ("CAST", Keyword::Cast),
-    ("COLLATE", Keyword::Collate),
     ("COLUMN", Keyword::Column),
     ("COLUMNS", Keyword::Columns),
     ("COMMENT", Keyword::Comment),

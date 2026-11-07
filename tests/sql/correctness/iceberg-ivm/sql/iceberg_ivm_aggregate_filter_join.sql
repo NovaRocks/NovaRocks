@@ -58,8 +58,7 @@ CREATE TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.dim (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_ivm_fjoin_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_fjoin_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true

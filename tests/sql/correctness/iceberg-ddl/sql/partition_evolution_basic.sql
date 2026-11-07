@@ -73,6 +73,5 @@ EXPLAIN VERBOSE
 SELECT COUNT(*), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.iceberg_part_db_${uuid0};

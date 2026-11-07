@@ -29,11 +29,9 @@
 
 -- query 1
 -- @skip_result_check=true
-set enable_hash_join_range_direct_mapping_opt = false;
 
 -- query 2
 -- @skip_result_check=true
-set enable_partition_hash_join = false;
 
 -- query 3
 -- @skip_result_check=true
@@ -147,7 +145,7 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join ${case_db}.t1 tt
 -- query 25
 with
     w1 as (select k1, c_int from ${case_db}.t1 union all select k1, c_int + 2560000 from ${case_db}.t1 union all select k1, c_int + 2560000 * 2 from ${case_db}.t1)
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join [broadcast] w1 tt2 using(c_int);
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 join  w1 tt2 using(c_int);
 
 -- Left semi join tests
 
@@ -211,7 +209,7 @@ select count(tt1.k1) from ${case_db}.t1 tt1 left semi join ${case_db}.t1 tt2 on 
 -- query 40
 with
     w1 as (select k1, c_int from ${case_db}.t1 union all select k1, c_int + 2560000 from ${case_db}.t1 union all select k1, c_int + 2560000 * 2 from ${case_db}.t1)
-select count(tt1.k1) from ${case_db}.t1 tt1 left semi join [broadcast] w1 tt2 using(c_int);
+select count(tt1.k1) from ${case_db}.t1 tt1 left semi join  w1 tt2 using(c_int);
 
 -- Left outer join tests
 
@@ -275,4 +273,4 @@ select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join ${cas
 -- query 55
 with
     w1 as (select k1, c_int from ${case_db}.t1 union all select k1, c_int + 2560000 from ${case_db}.t1 union all select k1, c_int + 2560000 * 2 from ${case_db}.t1)
-select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join [broadcast] w1 tt2 using(c_int);
+select count(tt1.k1), count(tt2.k1) from ${case_db}.t1 tt1 left outer join  w1 tt2 using(c_int);

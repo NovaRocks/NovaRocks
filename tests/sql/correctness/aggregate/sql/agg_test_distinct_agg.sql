@@ -163,59 +163,59 @@ select avg(distinct c1), count(c2) from skew_agg;
 
 -- query 34
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='3') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
 (sum(distinct length(c2))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', c4),             c0     ) as t;
 
 -- query 35
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
 (sum(distinct length(c2))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', c4),             c0     ) as t;
 
 -- query 36
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'auto',new_planner_agg_stage='3') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
 (sum(distinct length(c2))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', c4),             c0     ) as t;
 
 -- query 37
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'auto',new_planner_agg_stage='3') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0)     ) as fingerprint from     (         select             date_trunc('week', c4) as week,             c0, (array_length(array_agg(c1))) as __col_0,
 (sum(distinct length(c2))) as __col_1, (length(group_concat(cast(c3 as VARCHAR)))) as __col_2, (min(c2)) as __col_3         from             skew_agg         group by             date_trunc('week', c4),             c0     ) as t;
 
 -- query 38
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 39
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='3') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 40
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'auto',new_planner_agg_stage='2') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 41
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'auto',new_planner_agg_stage='3') */     (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
+select          (         ifnull(sum(murmur_hash3_32(week)), 0) + ifnull(sum(murmur_hash3_32(c0)), 0) + ifnull(sum(murmur_hash3_32(__col_0)), 0) + ifnull(sum(murmur_hash3_32(__col_1)), 0) + ifnull(sum(murmur_hash3_32(__col_2)), 0) + ifnull(sum(murmur_hash3_32(__col_3)), 0) + ifnull(sum(murmur_hash3_32(__col_4)), 0) + ifnull(sum(murmur_hash3_32(__col_5)), 0) + ifnull(sum(murmur_hash3_32(__col_6)), 0) + ifnull(sum(murmur_hash3_32(__col_7)), 0) + ifnull(sum(murmur_hash3_32(__col_8)), 0)     ) as fingerprint from     (         select             date_trunc('week', c2) as week,             c0, (array_length(array_agg(c1))) as __col_0, (sum(distinct length(c0))) as __col_1, (length(group_concat(cast(c1 as VARCHAR)))) as __col_2, (min(c3)) as __col_3, (left(variance(c1), 6)) as __col_4, (multi_distinct_count(length(c2))) as __col_5, (ndv(cast(c4 as BIGINT))) as __col_6, (hll_union_agg(hll_hash(c5))) as __col_7, (bitmap_union_int(cast(length(c1) as INT))) as __col_8         from
       skew_agg         group by             date_trunc('week', c2),             c0     ) as t;
 
 -- query 42
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'auto',new_planner_agg_stage='3') */  array_length(array_agg(a1)), count(distinct a1) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
+select       array_length(array_agg(a1)), count(distinct a1) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
 
 -- query 43
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='3') */  array_length(array_agg(a1)), count(distinct a1) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
+select       array_length(array_agg(a1)), count(distinct a1) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
 
 -- query 44
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='2') */  array_length(array_agg(a1)) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
+select       array_length(array_agg(a1)) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
 
 -- query 45
 USE ${case_db};
-select     /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming',new_planner_agg_stage='3') */  array_length(array_agg(a1)) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
+select       array_length(array_agg(a1)) as cnt from (select split('a,b,c', ',') as a1, 'aaa' as b1) t1 group by b1;
 
 -- query 46
 USE ${case_db};
@@ -240,12 +240,10 @@ select count(distinct t1.c1, if(t2.c3 is null, 1, 0)), sum(t1.c2 + if(t2.c3 is n
 -- query 51
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'auto';
 
 -- query 52
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '0';
 
 -- query 53
 USE ${case_db};
@@ -302,12 +300,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 66
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'auto';
 
 -- query 67
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '2';
 
 -- query 68
 USE ${case_db};
@@ -364,12 +360,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 81
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'auto';
 
 -- query 82
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '3';
 
 -- query 83
 USE ${case_db};
@@ -426,12 +420,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 96
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'auto';
 
 -- query 97
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '4';
 
 -- query 98
 USE ${case_db};
@@ -492,12 +484,10 @@ select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group b
 -- query 112
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_streaming';
 
 -- query 113
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '0';
 
 -- query 114
 USE ${case_db};
@@ -550,12 +540,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 126
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_streaming';
 
 -- query 127
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '2';
 
 -- query 128
 USE ${case_db};
@@ -608,12 +596,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 140
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_streaming';
 
 -- query 141
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '3';
 
 -- query 142
 USE ${case_db};
@@ -666,12 +652,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 154
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_streaming';
 
 -- query 155
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '4';
 
 -- query 156
 USE ${case_db};
@@ -728,12 +712,10 @@ select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group b
 -- query 169
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_preaggregation';
 
 -- query 170
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '0';
 
 -- query 171
 USE ${case_db};
@@ -786,12 +768,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 183
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_preaggregation';
 
 -- query 184
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '2';
 
 -- query 185
 USE ${case_db};
@@ -844,12 +824,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 197
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_preaggregation';
 
 -- query 198
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '3';
 
 -- query 199
 USE ${case_db};
@@ -902,12 +880,10 @@ select group_concat(distinct c2), array_agg(distinct c2), count(distinct c2), su
 -- query 211
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode = 'force_preaggregation';
 
 -- query 212
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage = '4';
 
 -- query 213
 USE ${case_db};
@@ -964,7 +940,6 @@ select array_agg(distinct c2), count(distinct c2), sum(c3) from skew_agg group b
 -- query 226
 -- @skip_result_check=true
 USE ${case_db};
-set enable_constant_execute_in_fe = true;
 
 -- query 227
 USE ${case_db};
@@ -985,7 +960,6 @@ select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on
 -- query 231
 -- @skip_result_check=true
 USE ${case_db};
-set enable_constant_execute_in_fe = false;
 
 -- query 232
 USE ${case_db};
@@ -1006,7 +980,6 @@ select sum(c2),  'a' as a from (select t1.* from skew_agg t0 join skew_agg t1 on
 -- query 236
 -- @skip_result_check=true
 USE ${case_db};
-set enable_constant_execute_in_fe = true;
 
 -- query 237
 USE ${case_db};

@@ -17,7 +17,6 @@
 
 -- Independent legacy mode and catching controls; no recorded outputs.
 -- query 1
-SET disable_function_fold_constants=on;
 SET sql_mode='0';
 SELECT CAST(CAST(2147483648 AS DOUBLE) AS INT) IS NULL AS caught_range;
 
@@ -39,4 +38,3 @@ SELECT CAST(CAST('2020-01-01' AS DATE) AS VARCHAR) AS rendered;
 
 -- query 6
 -- @skip_result_check=true
-SET disable_function_fold_constants=off;

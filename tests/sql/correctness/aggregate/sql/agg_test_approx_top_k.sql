@@ -116,23 +116,23 @@ VALUES
 
 -- query 4
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_tinyint) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_tinyint) FROM t_without_null;
 
 -- query 5
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_smallint) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_smallint) FROM t_without_null;
 
 -- query 6
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_int) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_int) FROM t_without_null;
 
 -- query 7
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bigint) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_bigint) FROM t_without_null;
 
 -- query 8
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/
+SELECT
        CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
             ELSE CONCAT('[',
                  CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
@@ -182,57 +182,57 @@ FROM (
            __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
            __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
     FROM (
-        SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) AS __topk_a FROM t_without_null
+        SELECT  APPROX_TOP_K(c_largeint) AS __topk_a FROM t_without_null
     ) AS __original
 ) AS __projection;
 
 -- query 9
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_float) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_float) FROM t_without_null;
 
 -- query 10
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_double) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_double) FROM t_without_null;
 
 -- query 11
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_char) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_char) FROM t_without_null;
 
 -- query 12
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_varchar) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_varchar) FROM t_without_null;
 
 -- query 13
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_date) FROM t_without_null;
 
 -- query 14
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_datetime) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_datetime) FROM t_without_null;
 
 -- query 15
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_decimal) FROM t_without_null;
 
 -- query 16
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_tinyint, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_tinyint, 3) FROM t_without_null;
 
 -- query 17
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_smallint, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_smallint, 3) FROM t_without_null;
 
 -- query 18
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_int, 3) FROM t_without_null;
 
 -- query 19
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bigint, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_bigint, 3) FROM t_without_null;
 
 -- query 20
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/
+SELECT
        CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
             ELSE CONCAT('[',
                  CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
@@ -266,57 +266,57 @@ FROM (
            __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
            __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
     FROM (
-        SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) AS __topk_a FROM t_without_null
+        SELECT  APPROX_TOP_K(c_largeint, 3) AS __topk_a FROM t_without_null
     ) AS __original
 ) AS __projection;
 
 -- query 21
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_float, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_float, 3) FROM t_without_null;
 
 -- query 22
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_double, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_double, 3) FROM t_without_null;
 
 -- query 23
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_char, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_char, 3) FROM t_without_null;
 
 -- query 24
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_varchar, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_varchar, 3) FROM t_without_null;
 
 -- query 25
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_date, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_date, 3) FROM t_without_null;
 
 -- query 26
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_datetime, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_datetime, 3) FROM t_without_null;
 
 -- query 27
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_decimal, 3) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_decimal, 3) FROM t_without_null;
 
 -- query 28
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_tinyint, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_tinyint, 3, 10) FROM t_without_null;
 
 -- query 29
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_smallint, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_smallint, 3, 10) FROM t_without_null;
 
 -- query 30
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_int, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_int, 3, 10) FROM t_without_null;
 
 -- query 31
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bigint, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_bigint, 3, 10) FROM t_without_null;
 
 -- query 32
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/
+SELECT
        CASE WHEN __topk_a IS NULL THEN CAST(NULL AS VARCHAR)
             ELSE CONCAT('[',
                  CASE WHEN __topk_n >= 1 THEN CASE WHEN element_at(__topk_a, 1) IS NULL THEN 'null'
@@ -350,37 +350,37 @@ FROM (
            __array_struct_subfield(__original.__topk_a, 'item') AS __topk_items,
            __array_struct_subfield(__original.__topk_a, 'count') AS __topk_counts
     FROM (
-        SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) AS __topk_a FROM t_without_null
+        SELECT  APPROX_TOP_K(c_largeint, 3, 10) AS __topk_a FROM t_without_null
     ) AS __original
 ) AS __projection;
 
 -- query 33
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_float, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_float, 3, 10) FROM t_without_null;
 
 -- query 34
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_double, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_double, 3, 10) FROM t_without_null;
 
 -- query 35
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_char, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_char, 3, 10) FROM t_without_null;
 
 -- query 36
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_varchar, 3, 10) FROM t_without_null;
 
 -- query 37
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_date, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_date, 3, 10) FROM t_without_null;
 
 -- query 38
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_datetime, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_datetime, 3, 10) FROM t_without_null;
 
 -- query 39
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_without_null;
+SELECT  APPROX_TOP_K(c_decimal, 3, 10) FROM t_without_null;
 
 -- query 40
 USE ${case_db};
@@ -528,163 +528,163 @@ VALUES
 
 -- query 54
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_tinyint) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_tinyint) FROM t_with_null;
 
 -- query 55
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_smallint) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_smallint) FROM t_with_null;
 
 -- query 56
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_int) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_int) FROM t_with_null;
 
 -- query 57
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bigint) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_bigint) FROM t_with_null;
 
 -- query 58
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_largeint) FROM t_with_null;
 
 -- query 59
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_float) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_float) FROM t_with_null;
 
 -- query 60
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_double) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_double) FROM t_with_null;
 
 -- query 61
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_char) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_char) FROM t_with_null;
 
 -- query 62
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_varchar) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_varchar) FROM t_with_null;
 
 -- query 63
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_date) FROM t_with_null;
 
 -- query 64
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_datetime) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_datetime) FROM t_with_null;
 
 -- query 65
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_decimal) FROM t_with_null;
 
 -- query 66
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_tinyint, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_tinyint, 3) FROM t_with_null;
 
 -- query 67
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_smallint, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_smallint, 3) FROM t_with_null;
 
 -- query 68
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_int, 3) FROM t_with_null;
 
 -- query 69
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bigint, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_bigint, 3) FROM t_with_null;
 
 -- query 70
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_largeint, 3) FROM t_with_null;
 
 -- query 71
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_float, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_float, 3) FROM t_with_null;
 
 -- query 72
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_double, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_double, 3) FROM t_with_null;
 
 -- query 73
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_char, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_char, 3) FROM t_with_null;
 
 -- query 74
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_varchar, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_varchar, 3) FROM t_with_null;
 
 -- query 75
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_date, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_date, 3) FROM t_with_null;
 
 -- query 76
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_datetime, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_datetime, 3) FROM t_with_null;
 
 -- query 77
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_decimal, 3) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_decimal, 3) FROM t_with_null;
 
 -- query 78
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_tinyint, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_tinyint, 3, 10) FROM t_with_null;
 
 -- query 79
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_smallint, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_smallint, 3, 10) FROM t_with_null;
 
 -- query 80
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_int, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_int, 3, 10) FROM t_with_null;
 
 -- query 81
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bigint, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_bigint, 3, 10) FROM t_with_null;
 
 -- query 82
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_largeint, 3, 10) FROM t_with_null;
 
 -- query 83
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_float, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_float, 3, 10) FROM t_with_null;
 
 -- query 84
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_double, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_double, 3, 10) FROM t_with_null;
 
 -- query 85
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_char, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_char, 3, 10) FROM t_with_null;
 
 -- query 86
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_varchar, 3, 10) FROM t_with_null;
 
 -- query 87
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_date, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_date, 3, 10) FROM t_with_null;
 
 -- query 88
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_datetime, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_datetime, 3, 10) FROM t_with_null;
 
 -- query 89
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null;
+SELECT  APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null;
 
 -- query 90
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int) FROM t_with_null WHERE c_id > 100;
+SELECT  APPROX_TOP_K(c_int) FROM t_with_null WHERE c_id > 100;
 
 -- query 91
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3) FROM t_with_null WHERE c_id > 100;
+SELECT  APPROX_TOP_K(c_varchar, 3) FROM t_with_null WHERE c_id > 100;
 
 -- query 92
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null WHERE c_id > 100;
+SELECT  APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null WHERE c_id > 100;
 
 -- query 93
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date, 1) FROM t_with_null WHERE c_id > 100;
+SELECT  APPROX_TOP_K(c_date, 1) FROM t_with_null WHERE c_id > 100;
 
 -- query 94
 USE ${case_db};
@@ -863,147 +863,147 @@ VALUES
 
 -- query 120
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_tinyint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_tinyint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 121
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_smallint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_smallint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 122
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_int) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_int) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 123
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_bigint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bigint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 124
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_largeint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_largeint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 125
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_float) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_float) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 126
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_double) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_double) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 127
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_char) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_char) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 128
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_varchar) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_varchar) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 129
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_date) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_date) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 130
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_datetime) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_datetime) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 131
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_decimal) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_decimal) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 132
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_tinyint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_tinyint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 133
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_smallint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_smallint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 134
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_int, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_int, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 135
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_bigint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bigint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 136
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_largeint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_largeint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 137
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_float, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_float, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 138
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_double, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_double, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 139
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_char, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_char, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 140
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_varchar, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_varchar, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 141
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_date, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_date, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 142
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_datetime, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_datetime, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 143
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_decimal, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_decimal, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 144
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_tinyint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_tinyint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 145
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_smallint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_smallint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 146
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_int, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_int, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 147
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_bigint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bigint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 148
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_largeint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_largeint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 149
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_float, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_float, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 150
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_double, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_double, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 151
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_char, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_char, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 152
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_varchar, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_varchar, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 153
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_date, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_date, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 154
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_datetime, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_datetime, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 155
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_decimal, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_decimal, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 156
 USE ${case_db};
@@ -1083,27 +1083,27 @@ VALUES
 
 -- query 165
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bool) FROM t_bool;
+SELECT  APPROX_TOP_K(c_bool) FROM t_bool;
 
 -- query 166
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bool, 1) FROM t_bool;
+SELECT  APPROX_TOP_K(c_bool, 1) FROM t_bool;
 
 -- query 167
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bool, 3, 100) FROM t_bool;
+SELECT  APPROX_TOP_K(c_bool, 3, 100) FROM t_bool;
 
 -- query 168
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_bool) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bool) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 169
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_bool, 1) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bool, 1) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 170
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_bool, 3, 100) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
+SELECT  c_partition, APPROX_TOP_K(c_bool, 3, 100) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 171
 USE ${case_db};

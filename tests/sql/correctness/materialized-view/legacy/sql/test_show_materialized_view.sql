@@ -21,13 +21,13 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_show_materialized_view
 
 -- query 1
-set enable_rewrite_bitmap_union_to_bitamp_agg = false;
+
 
 -- query 2
-set new_planner_optimize_timeout=10000;
+
 
 -- query 3
-set enable_evaluate_schema_scan_rule=false;
+
 
 -- query 4
 create database test_show_materialized_view;

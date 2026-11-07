@@ -51,8 +51,7 @@ PROPERTIES (
   "aws.s3.enable_path_style_access" = "${oss_path_style}"
 );
 CREATE DATABASE hadoopmetadata64_${uuid0}.${case_db};
-SET CATALOG hadoopmetadata64_${uuid0};
-USE ${case_db};
+USE hadoopmetadata64_${uuid0}.${case_db};
 
 -- query 3
 -- @skip_result_check=true

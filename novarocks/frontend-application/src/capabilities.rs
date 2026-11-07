@@ -626,6 +626,8 @@ pub struct SessionCatalogPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
 }
 
 impl SessionCatalogPorts {
@@ -633,11 +635,15 @@ impl SessionCatalogPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyRegistry,
+        >,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
+            session_properties,
         }
     }
 }
@@ -650,6 +656,7 @@ pub fn session_catalog_resolver(
             ports.catalog_service,
             ports.catalog_application,
             ports.connector_control,
+            ports.session_properties,
         ),
     )
 }

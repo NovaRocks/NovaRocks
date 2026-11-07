@@ -61,6 +61,5 @@ INSERT INTO orders_s3 (id, total_amount, note_text) VALUES (4, 40.5, 's3-fresh')
 SELECT id, total_amount, note_text FROM orders_s3 ORDER BY id;
 
 -- query 11
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0}.orders_s3 FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_s3_${uuid0};

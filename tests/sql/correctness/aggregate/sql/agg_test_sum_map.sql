@@ -103,7 +103,6 @@ select sum_map(c2)[5] from t1;
 -- query 18
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode=force_streaming;
 
 -- query 19
 USE ${case_db};
@@ -124,7 +123,6 @@ select c1, sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_m
 -- query 23
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode=force_preaggregation;
 
 -- query 24
 USE ${case_db};
@@ -145,7 +143,6 @@ select c1, sum_map(c2)[1], sum_map(c2)[2], sum_map(c2)[3], sum_map(c2)[4], sum_m
 -- query 28
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode=auto;
 
 -- query 29
 -- @skip_result_check=true

@@ -68,8 +68,7 @@ INSERT INTO imv_jagg_cut_${uuid0}.ns_${uuid0}.fact VALUES
   (1, 10, 100),
   (2, 10, 200),
   (3, 20, 50);
-SET CATALOG imv_jagg_cut_${uuid0};
-USE ns_${uuid0};
+USE imv_jagg_cut_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW join_agg_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -104,8 +103,7 @@ EXPLAIN REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG imv_jagg_cut_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.join_agg_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.join_agg_mv_${uuid0};
 DROP TABLE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP TABLE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.dim FORCE;
 DROP DATABASE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0};

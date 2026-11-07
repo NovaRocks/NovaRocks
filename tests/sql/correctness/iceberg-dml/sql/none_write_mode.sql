@@ -17,14 +17,20 @@
 
 -- @order_sensitive=true
 -- Validate Iceberg writes when write.metadata.metrics.default is set to none.
+-- query 1
 CREATE DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};
+-- query 2
 CREATE TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0} (
   k1 INT
 ) PROPERTIES ("write.metadata.metrics.default" = "none");
+-- query 3
 INSERT INTO iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0}
 SELECT 1;
+-- query 4
 SELECT k1
 FROM iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0};
-SET catalog default_catalog;
+-- query 5
+-- query 6
 DROP TABLE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0}.iceberg_none_tbl_${uuid0} FORCE;
+-- query 7
 DROP DATABASE iceberg_dml_cat_${suite_uuid0}.iceberg_none_db_${uuid0};

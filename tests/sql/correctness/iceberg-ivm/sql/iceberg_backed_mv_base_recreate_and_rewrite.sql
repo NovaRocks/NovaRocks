@@ -71,8 +71,7 @@ INSERT INTO mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} VALUES
   ('3e82e36e56718dc4abc1168d21ec91ab', 2001, '2023-12-03'),
   ('abc', 2001, '2023-12-04'),
   (NULL, 2001, '2023-12-04');
-SET CATALOG mv_iceberg_${uuid0};
-USE mv_ice_db_${uuid0};
+USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 CREATE MATERIALIZED VIEW test_mv1
 DISTRIBUTED BY HASH(dt) BUCKETS 2
 REFRESH DEFERRED MANUAL
@@ -86,8 +85,7 @@ REFRESH MATERIALIZED VIEW test_mv1;
 
 -- query 3
 -- @skip_result_check=true
-SET CATALOG mv_iceberg_${uuid0};
-USE mv_ice_db_${uuid0};
+USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 SET enable_materialized_view_rewrite = true;
 EXPLAIN SELECT dt, sum(col_int) FROM mv_ice_tbl_${uuid0} WHERE dt='2023-12-01' GROUP BY dt;
 
@@ -128,8 +126,7 @@ TBLPROPERTIES ("format-version" = "3",
 INSERT INTO mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} VALUES
   ('1d8cf2a2c0e14fa89d8117792be6eb6f', 2000, '2023-12-01'),
   ('3e82e36e56718dc4abc1168d21ec91ab', 2000, '2023-12-01');
-SET CATALOG mv_iceberg_${uuid0};
-USE mv_ice_db_${uuid0};
+USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 CREATE MATERIALIZED VIEW test_mv1
 DISTRIBUTED BY HASH(dt) BUCKETS 2
 REFRESH DEFERRED MANUAL
@@ -151,8 +148,7 @@ SELECT * FROM test_mv1 ORDER BY 1, 2;
 -- query 13
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mv_iceberg_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS mv_ice_db_${uuid0}.test_mv1;
+DROP MATERIALIZED VIEW IF EXISTS mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.test_mv1;
 
 -- query 14
 -- @cleanup=true

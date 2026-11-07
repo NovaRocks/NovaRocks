@@ -59,8 +59,7 @@ INSERT INTO ice_ivm_a11_add_col_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES
 
 -- query 2
 -- @skip_result_check=true
-SET CATALOG ice_ivm_a11_add_col_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_a11_add_col_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')

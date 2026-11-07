@@ -17,11 +17,14 @@
 
 -- @order_sensitive=true
 -- Validate representative IN/NOT IN predicate semantics on Iceberg string columns.
+-- query 1
 CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0};
+-- query 2
 CREATE TABLE iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0}.iceberg_in_tbl_${uuid0} (
   col_str STRING,
   col_int INT
 );
+-- query 3
 INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0}.iceberg_in_tbl_${uuid0} VALUES
   ('1d8cf2a2c0e14fa89d8117792be6eb6f', 2000),
   ('3e82e36e56718dc4abc1168d21ec91ab', 2000),
@@ -31,6 +34,7 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0}.iceberg_in_tbl_${u
   ('3e82e36e56718dc4abc1168d21ec91ab', 2001),
   ('abc', 2001),
   (NULL, 2001);
+-- query 4
 SELECT
   COALESCE((
     SELECT GROUP_CONCAT(IFNULL(col_str, 'NULL') ORDER BY IF(col_str IS NULL, 1, 0), col_str SEPARATOR ',')
@@ -80,6 +84,8 @@ SELECT
     WHERE col_int = 2000
       AND (col_str IN ('1d8cf2a2c0e14fa89d8117792be6eb6f', md5('abc')) OR col_str IS NULL)
   ), '') AS in_or_null;
-SET catalog default_catalog;
+-- query 5
+-- query 6
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0}.iceberg_in_tbl_${uuid0} FORCE;
+-- query 7
 DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_in_db_${uuid0};

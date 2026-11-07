@@ -79,11 +79,10 @@ FROM TABLE(generate_series(1, 12000)) t(number);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- @skip_result_check=true

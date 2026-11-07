@@ -497,30 +497,6 @@ impl Visit for CatalogEdits<'_> {
                     self.ident(c);
                 }
             }
-            Statement::Session(SessionStatement::Set(s)) => {
-                for assignment in &s.assignments {
-                    if matches!(assignment.target, SetTarget::Catalog { .. }) {
-                        match &assignment.value {
-                            SetValue::Words(words) => {
-                                for word in words {
-                                    match word {
-                                        SetWord::Ident(n) => self.ident(n),
-                                        SetWord::Literal(l) => self.literal(l),
-                                    }
-                                }
-                            }
-                            SetValue::Expression(Expr::Identifier(n)) => self.ident(n),
-                            SetValue::Expression(Expr::Literal(l)) => self.literal(l),
-                            _ => {
-                                self.error = Some(
-                                    "dynamic SET CATALOG cannot use sealed catalog ownership"
-                                        .into(),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
             Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
                 if let Some(from) = &show.from
                     && from.parts.len() == 2
@@ -907,9 +883,9 @@ mod tests {
     fn ast_positions_preserve_literals_columns_aliases_and_external_catalogs() {
         let s = symbols();
         let name = s.lookup("owned").unwrap();
-        let raw = "-- keep owned\nSET CATALOG owned; USE owned.ns; SELECT owned, 'owned', 'owned.ns.t', owned.data.deep.value FROM external.ns.t AS owned; SELECT owned.ns.t.k FROM owned.ns.t; DROP CATALOG owned;";
+        let raw = "-- keep owned\nUSE owned.ns; SELECT owned, 'owned', 'owned.ns.t', owned.data.deep.value FROM external.ns.t AS owned; SELECT owned.ns.t.k FROM owned.ns.t; DROP CATALOG owned;";
         let out = s.rewrite_source(raw).unwrap();
-        assert!(out.contains(&format!("SET CATALOG {name}; USE {name}.ns;")));
+        assert!(out.contains(&format!("USE {name}.ns;")));
         assert!(out.contains(
             "SELECT owned, 'owned', 'owned.ns.t', owned.data.deep.value FROM external.ns.t AS owned"
         ));

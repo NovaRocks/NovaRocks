@@ -72,9 +72,6 @@ impl<'source> Lexer<'source> {
             } else if character == '\'' || character == '"' {
                 self.consume_string(start, character)?;
                 self.push(TokenKind::String, start);
-            } else if character == '@' {
-                self.consume_user_variable();
-                self.push(TokenKind::UserVariable, start);
             } else if self.has_string_prefix() {
                 self.advance(); // literal prefix
                 let quote = self.current().expect("prefixed string has a quote");
@@ -210,33 +207,6 @@ impl<'source> Lexer<'source> {
         Err(LexError::UnterminatedString {
             span: Span::new(start, self.position),
         })
-    }
-
-    fn consume_user_variable(&mut self) {
-        self.advance(); // `@`
-        if self.current() == Some('@') {
-            self.advance();
-        }
-        if matches!(self.current(), Some('`' | '\'' | '"')) {
-            let quote = self.current().expect("matched above");
-            self.advance();
-            while let Some(character) = self.current() {
-                self.advance();
-                if character == '\\' && quote != '`' {
-                    if self.current().is_some() {
-                        self.advance();
-                    }
-                } else if character == quote {
-                    if self.current() == Some(quote) {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        } else {
-            self.consume_while(is_identifier_part);
-        }
     }
 
     fn has_string_prefix(&self) -> bool {
@@ -375,8 +345,8 @@ mod tests {
     }
 
     #[test]
-    fn preserves_mysql_identifiers_variables_numbers_and_string_escapes() {
-        let source = "SELECT `odd``name`, @user, @@global$t, t$snapshots, 'e\\\\f', \"x\\\"y\", 1.2e-3, .5, 0xDeAd";
+    fn preserves_quoted_identifiers_numbers_and_string_escapes() {
+        let source = "SELECT `odd``name`, t$snapshots, 'e\\\\f', \"x\\\"y\", 1.2e-3, .5, 0xDeAd";
         let tokens = lex(source).expect("source should lex");
         assert_eq!(reconstruct(source), source);
         assert_eq!(tokens[0].kind, TokenKind::Keyword(Keyword::Select));
@@ -384,13 +354,6 @@ mod tests {
             tokens
                 .iter()
                 .any(|token| token.kind == TokenKind::QuotedIdent)
-        );
-        assert_eq!(
-            tokens
-                .iter()
-                .filter(|token| token.kind == TokenKind::UserVariable)
-                .count(),
-            2
         );
         assert_eq!(
             tokens

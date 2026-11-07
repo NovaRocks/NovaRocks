@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use novarocks_parser::{TokenKind, lex};
+use novarocks_parser::{TokenKind, lex, parse};
 
 const MUTATION_SEED: u64 = 0x5A11_C0DE_2026_0818;
 
@@ -56,13 +56,13 @@ fn lex_smoke_deterministic_mutations_do_not_panic() {
 
     for path in sql_suite_files(&repo_root) {
         for payload in sql_payloads(&repo_root, &path) {
-            let tokens = match lex(&payload.sql) {
-                Ok(tokens) => tokens,
+            let tokens = match checked_payload_tokens(&payload) {
+                Ok(Some(tokens)) => tokens,
+                // A declared syntax negative that the lexer actually refused
+                // has no token stream to mutate. Parse negatives still do.
+                Ok(None) => continue,
                 Err(error) => {
-                    failures.push(format!(
-                        "{}: cannot construct token-level mutations because SQL payload lex failed: {error:?}",
-                        payload.label
-                    ));
+                    failures.push(format!("{}: {error}", payload.label));
                     continue;
                 }
             };
@@ -150,21 +150,35 @@ fn collect_sql_files(directory: &Path, files: &mut Vec<PathBuf>) {
 fn corpus_failures(repo_root: &Path, path: &Path) -> Vec<String> {
     sql_payloads(repo_root, path)
         .into_iter()
-        .filter_map(|payload| match lex(&payload.sql) {
-            Ok(tokens) => lossless_token_stream(&payload.sql, &tokens)
+        .filter_map(|payload| {
+            checked_payload_tokens(&payload)
                 .err()
-                .map(|error| format!("{}: {error}", payload.label)),
-            Err(error) => Some(format!(
-                "{}: SQL payload lex failed: {error:?}",
-                payload.label
-            )),
+                .map(|error| format!("{}: {error}", payload.label))
         })
         .collect()
+}
+
+fn checked_payload_tokens(
+    payload: &SqlPayload,
+) -> Result<Option<Vec<novarocks_parser::Token>>, String> {
+    let tokens = match lex(&payload.sql) {
+        Ok(tokens) => tokens,
+        Err(_) if payload.expects_syntax_error => return Ok(None),
+        Err(error) => return Err(format!("SQL payload lex failed: {error:?}")),
+    };
+    // A syntax-negative payload whose lexer succeeded has the same lossless
+    // token obligation as any other input, and must actually fail parsing.
+    lossless_token_stream(&payload.sql, &tokens)?;
+    if payload.expects_syntax_error && parse(&payload.sql).is_ok() {
+        return Err("declared SYNTAX_ERROR payload was accepted by the parser".to_owned());
+    }
+    Ok(Some(tokens))
 }
 
 struct SqlPayload {
     label: String,
     sql: String,
+    expects_syntax_error: bool,
 }
 
 fn sql_payloads(repo_root: &Path, path: &Path) -> Vec<SqlPayload> {
@@ -175,6 +189,10 @@ fn sql_payloads(repo_root: &Path, path: &Path) -> Vec<SqlPayload> {
         .to_string();
     let source = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    payloads_from_source(&relative, &source)
+}
+
+fn payloads_from_source(relative: &str, source: &str) -> Vec<SqlPayload> {
     let lines = source.lines().collect::<Vec<_>>();
     let markers = lines
         .iter()
@@ -197,8 +215,38 @@ fn sql_payloads(repo_root: &Path, path: &Path) -> Vec<SqlPayload> {
                 (*number, lines[*start..end].join("\n"))
             })
             .collect()
+    } else if is_shell_payload(source) {
+        Vec::new()
     } else {
-        vec![(1, source)]
+        // Match the native loader's no-marker, line-ending-semicolon frames.
+        // A negative directive on one statement cannot excuse a later input.
+        let mut sections = Vec::new();
+        let mut current = Vec::new();
+        let mut number = 1;
+        for line in &lines {
+            current.push(*line);
+            if line.trim().ends_with(';') {
+                if current
+                    .iter()
+                    .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with("--"))
+                {
+                    sections.push((number, current.join("\n")));
+                    number += 1;
+                }
+                current.clear();
+            }
+        }
+        if current
+            .iter()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with("--"))
+        {
+            sections.push((number, current.join("\n")));
+        }
+        if sections.is_empty() {
+            vec![(1, source.to_owned())]
+        } else {
+            sections
+        }
     };
 
     sections
@@ -206,9 +254,37 @@ fn sql_payloads(repo_root: &Path, path: &Path) -> Vec<SqlPayload> {
         .filter(|(_, section)| !is_shell_payload(section))
         .map(|(number, sql)| SqlPayload {
             label: format!("{relative} (query {number})"),
+            expects_syntax_error: expects_syntax_error(&sql),
             sql,
         })
         .collect()
+}
+
+fn expects_syntax_error(section: &str) -> bool {
+    // The native loader reads directives only in the statement's preface.
+    // Exact error name/type and last-wins apply; prose or SQL comments after
+    // the first executable line grant no negative-input exception.
+    section
+        .lines()
+        .map(str::trim)
+        .take_while(|line| line.is_empty() || line.starts_with("--"))
+        .filter_map(|line| {
+            let body = line.strip_prefix("--")?.trim_start().strip_prefix('@')?;
+            let Some((key, value)) = body.split_once('=') else {
+                return body
+                    .trim()
+                    .eq_ignore_ascii_case("expect_trino_error")
+                    .then_some(false);
+            };
+            key.trim()
+                .eq_ignore_ascii_case("expect_trino_error")
+                .then(|| {
+                    value.split(',').map(str::trim).collect::<Vec<_>>()
+                        == ["SYNTAX_ERROR", "USER_ERROR"]
+                })
+        })
+        .last()
+        .unwrap_or(false)
 }
 
 fn query_number(line: &str) -> Option<usize> {
@@ -315,4 +391,79 @@ fn next_index(seed: &mut u64, upper_bound: usize) -> usize {
     );
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     ((*seed >> 32) as usize) % upper_bound
+}
+
+#[test]
+fn syntax_negative_payload_requires_an_actual_lexer_or_parser_rejection() {
+    let payload = |sql: &str| SqlPayload {
+        label: "independent negative input".to_owned(),
+        sql: sql.to_owned(),
+        expects_syntax_error: true,
+    };
+    assert!(
+        checked_payload_tokens(&payload("SELECT @x;"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        checked_payload_tokens(&payload("SELECT (1;"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(checked_payload_tokens(&payload("SELECT 1;")).is_err());
+    let ordinary = SqlPayload {
+        expects_syntax_error: false,
+        ..payload("SELECT @x;")
+    };
+    assert!(checked_payload_tokens(&ordinary).is_err());
+}
+
+#[test]
+fn syntax_negative_directive_is_local_to_a_marked_payload_preface() {
+    let source = "-- query 1\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x;\n\
+                  -- query 2\nSELECT 1;\n\
+                  -- query 3\nSELECT '-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR';\n\
+                  -- query 4\nSELECT 1;\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @late;\n";
+    let payloads = payloads_from_source("independent.sql", source);
+    assert_eq!(payloads.len(), 4);
+    assert!(payloads[0].expects_syntax_error);
+    assert!(
+        payloads[1..]
+            .iter()
+            .all(|payload| !payload.expects_syntax_error)
+    );
+    assert!(checked_payload_tokens(&payloads[0]).unwrap().is_none());
+    assert!(checked_payload_tokens(&payloads[1]).unwrap().is_some());
+    assert!(checked_payload_tokens(&payloads[2]).unwrap().is_some());
+    assert!(checked_payload_tokens(&payloads[3]).is_err());
+}
+
+#[test]
+fn syntax_negative_directive_does_not_leak_across_semicolon_frames() {
+    let payloads = payloads_from_source(
+        "independent.sql",
+        "-- query 9\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x;\nSELECT @unmarked;\n",
+    );
+    assert_eq!(payloads.len(), 2);
+    assert!(payloads[0].expects_syntax_error);
+    assert!(!payloads[1].expects_syntax_error);
+    assert!(checked_payload_tokens(&payloads[0]).unwrap().is_none());
+    assert!(checked_payload_tokens(&payloads[1]).is_err());
+    assert!(payloads_from_source("independent.sql", "shell: echo first;\necho next;").is_empty());
+}
+
+#[test]
+fn syntax_negative_directive_requires_exact_type_and_respects_last_assignment() {
+    for preface in [
+        "-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR",
+        "-- @expect_trino_error=SYNTAX_ERROR,INTERNAL_ERROR",
+        "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR,extra",
+        "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\n-- @expect_trino_error",
+        "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\n-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR",
+    ] {
+        assert!(!expects_syntax_error(&format!("{preface}\nSELECT @x;")));
+    }
+    assert!(expects_syntax_error(
+        "-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR\n-- @expect_trino_error = SYNTAX_ERROR, USER_ERROR\nSELECT @x;",
+    ));
 }

@@ -58,8 +58,7 @@ INSERT INTO mvcfg_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 -- query 5
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=0,slot-changes=0
-SET CATALOG mvcfg_${uuid0};
-USE ns_${uuid0};
+USE mvcfg_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_config
 DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -151,8 +150,7 @@ SHOW MATERIALIZED VIEWS;
 -- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvcfg_${uuid0};
-USE ns_${uuid0};
+USE mvcfg_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW mv_config;
 DROP TABLE mvcfg_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvcfg_${uuid0}.ns_${uuid0};

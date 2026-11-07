@@ -47,8 +47,7 @@ VALUES
 
 -- query 4
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
-USE ${case_db};
+USE iceberg_compat_${suite_uuid0}.${case_db};
 CREATE MATERIALIZED VIEW mv_nr_interop_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -107,6 +106,5 @@ printf 'SPARK_MV_SCHEMA_OK\n'
 -- query 9
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_nr_interop_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_nr_interop_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} FORCE;

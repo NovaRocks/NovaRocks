@@ -150,12 +150,10 @@ select percentile_disc_lc(db, 1) from test_pc;
 -- query 29
 -- @skip_result_check=true
 USE ${case_db};
-set new_planner_agg_stage=2;
 
 -- query 30
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 31
 USE ${case_db};
@@ -164,7 +162,6 @@ select `date`, percentile_disc_lc(score, 0) from test_pc group by `date` order b
 -- query 32
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_preaggregation";
 
 -- query 33
 USE ${case_db};

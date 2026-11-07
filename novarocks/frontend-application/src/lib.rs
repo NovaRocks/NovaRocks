@@ -95,3 +95,5 @@ pub mod test_session;
     all(not(novarocks_dev_controls), debug_assertions)
 ))]
 compile_error!("novarocks_dev_controls must match debug_assertions");
+
+pub use query_execution::required_constant_eval::RequiredConstantInterpreter;

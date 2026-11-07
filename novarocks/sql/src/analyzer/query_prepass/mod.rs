@@ -21,8 +21,6 @@
 //! It must never rebuild SQL text or invoke a parser.  T4 wires
 //! [`preanalyze`] into the production typed-query admission path.
 
-use std::collections::HashMap;
-
 use novarocks_parser::{
     Span,
     ast::{
@@ -34,11 +32,6 @@ use novarocks_parser::{
 
 use crate::analyze_error::AnalyzeError;
 
-const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: usize = 5;
-
-/// The hint that binds a user variable for the statement it is written on.
-const SET_USER_VARIABLE_HINT: &str = "set_user_variable";
-
 /// Applies syntax-complete, catalog-independent query semantics.
 ///
 /// This is intentionally not connected to an analyzer entry point yet.  The
@@ -47,19 +40,29 @@ const SET_USER_VARIABLE_HINT: &str = "set_user_variable";
 ///
 /// The pass is idempotent, and has to be: more than one owner preanalyzes the
 /// same statement.  Collecting a completed plan's catalog needs requires the
-/// rewritten query -- CTE unrolling and variable substitution decide which
+/// rewritten query -- CTE unrolling decides which
 /// relations the statement names -- and the analyzer preanalyzes whatever it
 /// is handed.  So everything this pass applies it also consumes, and running
 /// it on its own output changes nothing.
-pub(crate) fn preanalyze(mut query: Query) -> Result<Query, AnalyzeError> {
-    let max_depth = recursive_cte_max_depth(&query).unwrap_or(DEFAULT_RECURSIVE_CTE_MAX_DEPTH);
+pub(crate) fn preanalyze(query: Query) -> Result<Query, AnalyzeError> {
+    preanalyze_with_semantics(query, &crate::sql_mode::SqlSemanticSettings::default())
+}
+
+/// Unrolls with the statement hint, then the frozen session override, then the
+/// original default. The selected depth still uses the existing finite unroller.
+pub(crate) fn preanalyze_with_semantics(
+    mut query: Query,
+    semantics: &crate::sql_mode::SqlSemanticSettings,
+) -> Result<Query, AnalyzeError> {
+    let max_depth = recursive_cte_max_depth(&query)
+        .or_else(|| {
+            semantics
+                .recursive_cte_max_depth()
+                .and_then(|depth| usize::try_from(depth).ok())
+        })
+        .unwrap_or(crate::sql_mode::DEFAULT_RECURSIVE_CTE_MAX_DEPTH as usize);
     rewrite_nested_queries(&mut query, max_depth.max(1))?;
     normalize_cross_joins(&mut query);
-
-    let assignments = collect_user_variable_assignments(&query)?;
-    if !assignments.is_empty() {
-        query = UserVariableSubstituter { assignments }.fold_query(query);
-    }
 
     remove_bare_top_level_dual(&mut query);
     Ok(query)
@@ -377,7 +380,6 @@ fn inline_iteration(
     let relation = TableFactor::Derived {
         lateral: false,
         subquery: Box::new(query),
-        hints: Vec::new(),
         alias: Some(TableAlias {
             name: synthetic_ident(format!("__nr_rec_{cte_name}_{index}"), span),
             columns: aliases.to_vec(),
@@ -641,7 +643,6 @@ fn substitute_table_with_derived(
             TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(self.replacement.clone()),
-                hints: Vec::new(),
                 alias: Some(TableAlias {
                     name: alias,
                     columns: self.aliases.to_vec(),
@@ -726,126 +727,6 @@ fn normalize_cross_factor(factor: &mut TableFactor) {
     }
 }
 
-fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Expr>, AnalyzeError> {
-    fn collect(query: &Query, assignments: &mut HashMap<String, Expr>) -> Result<(), AnalyzeError> {
-        fn collect_set_expr(
-            expr: &SetExpr,
-            assignments: &mut HashMap<String, Expr>,
-        ) -> Result<(), AnalyzeError> {
-            match expr {
-                SetExpr::Select(select) => {
-                    for hint in &select.hints {
-                        if !hint.name.value.eq_ignore_ascii_case(SET_USER_VARIABLE_HINT) {
-                            continue;
-                        }
-                        let SelectHintValue::Call { arguments } = &hint.value else {
-                            return Err(AnalyzeError::invalid_argument(
-                                "invalid set_user_variable hint assignment",
-                                hint.span,
-                            ));
-                        };
-                        for assignment in arguments {
-                            let Expr::Binary(binary) = assignment else {
-                                return Err(AnalyzeError::invalid_argument(
-                                    "invalid set_user_variable hint assignment",
-                                    assignment.span(),
-                                ));
-                            };
-                            let Expr::UserVariable(variable) = binary.left.as_ref() else {
-                                return Err(AnalyzeError::invalid_argument(
-                                    "invalid set_user_variable hint assignment",
-                                    binary.left.span(),
-                                ));
-                            };
-                            if binary.operator != BinaryOperator::Equal {
-                                return Err(AnalyzeError::invalid_argument(
-                                    "invalid set_user_variable hint assignment",
-                                    assignment.span(),
-                                ));
-                            }
-                            assignments.insert(
-                                variable.value.to_ascii_lowercase(),
-                                (*binary.right).clone(),
-                            );
-                        }
-                    }
-                    for table in &select.from {
-                        collect_factor(&table.relation, assignments)?;
-                        for join in &table.joins {
-                            collect_factor(&join.relation, assignments)?;
-                        }
-                    }
-                }
-                SetExpr::Query(query) => collect(query, assignments)?,
-                SetExpr::SetOperation(operation) => {
-                    collect_set_expr(operation.left.as_ref(), assignments)?;
-                    collect_set_expr(operation.right.as_ref(), assignments)?;
-                }
-                SetExpr::Values(_) => {}
-            }
-            Ok(())
-        }
-        fn collect_factor(
-            factor: &TableFactor,
-            assignments: &mut HashMap<String, Expr>,
-        ) -> Result<(), AnalyzeError> {
-            match factor {
-                TableFactor::Derived { subquery, .. } => collect(subquery, assignments),
-                TableFactor::NestedJoin {
-                    table_with_joins, ..
-                } => {
-                    collect_factor(&table_with_joins.relation, assignments)?;
-                    for join in &table_with_joins.joins {
-                        collect_factor(&join.relation, assignments)?;
-                    }
-                    Ok(())
-                }
-                TableFactor::Table { .. }
-                | TableFactor::TableFunction { .. }
-                | TableFactor::Unnest { .. } => Ok(()),
-            }
-        }
-        if let Some(with) = &query.with {
-            for cte in &with.ctes {
-                collect(&cte.query, assignments)?;
-            }
-        }
-        collect_set_expr(query.body.as_ref(), assignments)
-    }
-
-    let mut assignments = HashMap::new();
-    collect(query, &mut assignments)?;
-    Ok(assignments)
-}
-
-struct UserVariableSubstituter {
-    assignments: HashMap<String, Expr>,
-}
-
-impl Fold for UserVariableSubstituter {
-    /// A `set_user_variable` hint is a declaration this pass consumes, not an
-    /// expression it rewrites.  Dropping it here is what makes `preanalyze`
-    /// idempotent: the hint's own `@v` sits in the fold's path, so a hint left
-    /// behind would read `0.5 = 0.5` and the next pass over the same query
-    /// would refuse the statement this one just accepted.  Nothing downstream
-    /// reads the hint -- this pass is its only consumer.
-    fn fold_select(&mut self, mut select: Select) -> Select {
-        select
-            .hints
-            .retain(|hint| !hint.name.value.eq_ignore_ascii_case(SET_USER_VARIABLE_HINT));
-        novarocks_parser::ast::fold_select(self, select)
-    }
-
-    fn fold_expr(&mut self, expression: Expr) -> Expr {
-        if let Expr::UserVariable(variable) = &expression
-            && let Some(value) = self.assignments.get(&variable.value.to_ascii_lowercase())
-        {
-            return value.clone();
-        }
-        novarocks_parser::ast::fold_expr(self, expression)
-    }
-}
-
 fn remove_bare_top_level_dual(query: &mut Query) {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return;
@@ -873,7 +754,6 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         name,
         alias,
         version,
-        hints,
         ..
     } = &table.relation
     else {
@@ -884,7 +764,6 @@ fn remove_bare_top_level_dual(query: &mut Query) {
         && !name.parts[0].quoted
         && alias.is_none()
         && version.is_none()
-        && hints.is_empty()
     {
         select.from.clear();
     }
@@ -915,6 +794,46 @@ mod tests {
             with.ctes[0].query.body.as_ref(),
             "n"
         ));
+    }
+
+    #[test]
+    fn recursive_depth_uses_hint_then_session_then_original_default() {
+        let sql =
+            "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT x FROM n";
+        let hinted_sql = "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n) SELECT /*+ SET_VAR(recursive_cte_max_depth = 4) */ x FROM n";
+        let session =
+            crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
+        for (source, semantics, expected_branches) in [
+            (sql, session.clone(), 2),
+            (hinted_sql, session, 4),
+            (sql, crate::sql_mode::SqlSemanticSettings::default(), 5),
+        ] {
+            let rewritten = preanalyze_with_semantics(parse_query(source), &semantics)
+                .expect("recursive CTE should retain finite depth semantics");
+            let with = rewritten.with.as_ref().expect("WITH must remain");
+            let (_, branches) = extract_union_chain(with.ctes[0].query.body.as_ref())
+                .expect("unrolled query has multiple branches")
+                .expect("unrolled branches retain UNION ALL");
+            assert_eq!(branches.len(), expected_branches);
+            assert!(!set_expr_references_table(
+                with.ctes[0].query.body.as_ref(),
+                "n"
+            ));
+            let replayed = preanalyze_with_semantics(rewritten.clone(), &semantics)
+                .expect("preanalysis remains idempotent");
+            assert!(rewritten.syntax_eq(&replayed));
+        }
+    }
+
+    #[test]
+    fn session_depth_does_not_change_recursive_anchor_refusal() {
+        let semantics =
+            crate::sql_mode::SqlSemanticSettings::default().with_recursive_cte_max_depth(2);
+        let query =
+            parse_query("WITH RECURSIVE n AS (SELECT * FROM n UNION ALL SELECT 1) SELECT * FROM n");
+        let error = preanalyze_with_semantics(query, &semantics)
+            .expect_err("session depth does not admit a recursive anchor");
+        assert_eq!(error.message(), "unknown table: n");
     }
 
     #[test]
@@ -994,41 +913,6 @@ mod tests {
             with.ctes[0].query.body.as_ref(),
             "n"
         ));
-    }
-
-    #[test]
-    fn substitutes_typed_set_user_variable_assignments() {
-        let query = parse_query("SELECT /*+ set_user_variable(@v = 7) */ @v + 1");
-        let query = preanalyze(query).expect("hint should substitute");
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        assert!(matches!(
-            select.projection[0],
-            SelectItem::UnnamedExpr(Expr::Binary(_))
-        ));
-    }
-
-    #[test]
-    fn preanalyze_consumes_the_user_variable_hint_it_applied() {
-        let query = parse_query(
-            "WITH tt AS (SELECT @v1 AS v1 FROM t1) \
-             SELECT /*+ set_user_variable(@v1 = 0.5) */ v1 FROM tt",
-        );
-        let once = preanalyze(query).expect("hint should substitute");
-        let SetExpr::Select(select) = once.body.as_ref() else {
-            panic!("expected select");
-        };
-        assert!(
-            select.hints.is_empty(),
-            "the applied hint must not survive the pass that applied it"
-        );
-
-        // A second owner preanalyzing the same statement must reach the same
-        // query, not a refusal: the hint's `@v1` would otherwise have been
-        // folded into its own value.
-        let twice = preanalyze(once.clone()).expect("preanalyze must be idempotent");
-        assert!(twice.syntax_eq(&once));
     }
 
     #[test]

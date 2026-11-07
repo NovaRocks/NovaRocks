@@ -89,6 +89,35 @@ pub struct SessionOptimizerSettings {
 }
 
 impl SessionOptimizerSettings {
+    /// Declaration metadata from the original optimizer defaults. This is not
+    /// a session initializer: live topology and resource overrides stay absent.
+    pub fn declaration_defaults() -> Self {
+        let original = OptimizerOptions::default_settings();
+        let empty = Self::default();
+        Self {
+            enable_common_subexpr_reuse: Some(
+                original.is_enabled(crate::optimizer::cse_pass::CSE_RULE),
+            ),
+            rf_build_max_bytes: Some(original.rf_build_max_bytes),
+            rf_build_min_bytes: Some(original.rf_build_min_bytes),
+            rf_probe_min_bytes: Some(original.rf_probe_min_bytes),
+            rf_probe_min_selectivity: Some(original.rf_probe_min_selectivity),
+            allow_cross_exchange_rf: Some(original.allow_cross_exchange_rf),
+            enable_dp_join_reorder: Some(original.reorder.enable_dp),
+            enable_greedy_join_reorder: Some(original.reorder.enable_greedy),
+            max_reorder_node_use_exhaustive: Some(original.reorder.max_reorder_node_use_exhaustive),
+            max_reorder_node_use_dp: Some(original.reorder.max_reorder_node_use_dp),
+            max_reorder_node_use_greedy: Some(original.reorder.max_reorder_node_use_greedy),
+            max_reorder_node: Some(original.reorder.max_reorder_node),
+            enable_global_runtime_filter: Some(empty.global_runtime_filter_enabled()),
+            enable_materialized_view_rewrite: Some(empty.mv_rewrite_enabled()),
+            enable_connector_static_predicate_pushdown: Some(
+                empty.connector_static_predicate_pushdown_enabled(),
+            ),
+            ..empty
+        }
+    }
+
     pub(crate) fn stable_digest_material(&self) -> Vec<u8> {
         let mut disabled_rules = self.disabled_rules.clone();
         disabled_rules.sort();

@@ -85,11 +85,10 @@ FROM TABLE(generate_series(1, 2400)) t(n);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- alias-qualified definition; select list deliberately unordered: an
@@ -168,8 +167,7 @@ FROM t1 WHERE k2 = 'a' GROUP BY k3, substring(k4, 1, 7) ORDER BY k3, month;
 -- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.month_mv;
+DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.month_mv;
 
 -- query 22
 -- @cleanup=true

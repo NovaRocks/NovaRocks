@@ -64,7 +64,7 @@ EXPLAIN SELECT k3, DATE_FORMAT(k4, "%Y-%m") AS month, sum(v1) AS cnt FROM t1  WH
 -- slightly before the _SYNC_MV_ alias becomes queryable.
 -- @retry_count=60
 -- @retry_interval_ms=1000
-select count(1) from test_mv1 [_SYNC_MV_];
+select count(1) from test_mv1 ;
 
 -- query 9
 SELECT k3, DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY k3, DATE_FORMAT(k4, '%Y-%m');
@@ -97,7 +97,7 @@ SET enable_materialized_view_rewrite = true;
 EXPLAIN SELECT a.k3, DATE_FORMAT(a.k4, "%Y-%m") AS month, sum(v1) AS cnt FROM t1 a WHERE k2 = "a" GROUP BY a.k3, DATE_FORMAT(a.k4, "%Y-%m");
 
 -- query 17
-select count(1) from test_mv1 [_SYNC_MV_];
+select count(1) from test_mv1 ;
 
 -- query 18
 SELECT k3, DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY k3, DATE_FORMAT(k4, '%Y-%m');
@@ -106,7 +106,7 @@ SELECT k3, DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 =
 SELECT a.k3, DATE_FORMAT(a.k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1 a WHERE k2 = 'a' GROUP BY a.k3, DATE_FORMAT(a.k4, '%Y-%m');
 
 -- query 20
-set enable_sync_materialized_view_rewrite=false;
+
 
 -- query 21
 SELECT k3, DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY k3, DATE_FORMAT(k4, '%Y-%m');
@@ -115,7 +115,7 @@ SELECT k3, DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 =
 drop materialized view test_mv1;
 
 -- query 23
-set enable_sync_materialized_view_rewrite=true;
+
 
 -- query 24
 -- case2: with unordered columns
@@ -139,7 +139,7 @@ SELECT sleep(1);
 -- @skip_result_check=true
 -- @retry_count=60
 -- @retry_interval_ms=1000
-select count(1) from test_mv1 [_SYNC_MV_];
+select count(1) from test_mv1 ;
 
 -- query 28
 -- The second unordered variant explain is also planner-state dependent; keep it as smoke only.
@@ -154,7 +154,7 @@ SET enable_materialized_view_rewrite = true;
 EXPLAIN SELECT DATE_FORMAT(a.k4, "%Y-%m") AS month, sum(v1) AS cnt FROM t1 a WHERE k2 = "a" GROUP BY DATE_FORMAT(a.k4, "%Y-%m");
 
 -- query 30
-select count(1) from test_mv1 [_SYNC_MV_];
+select count(1) from test_mv1 ;
 
 -- query 31
 SELECT DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY DATE_FORMAT(k4, '%Y-%m');
@@ -187,7 +187,7 @@ SET enable_materialized_view_rewrite = true;
 EXPLAIN SELECT DATE_FORMAT(a.k4, "%Y-%m") AS month, sum(v1) AS cnt FROM t1 a WHERE k2 = "a" GROUP BY DATE_FORMAT(a.k4, "%Y-%m");
 
 -- query 39
-select count(1) from test_mv1 [_SYNC_MV_];
+select count(1) from test_mv1 ;
 
 -- query 40
 SELECT DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY DATE_FORMAT(k4, '%Y-%m');
@@ -196,10 +196,9 @@ SELECT DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a'
 SELECT DATE_FORMAT(a.k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1 a WHERE k2 = 'a' GROUP BY DATE_FORMAT(a.k4, '%Y-%m');
 
 -- query 42
-set enable_sync_materialized_view_rewrite=false;
+
 
 -- query 43
 SELECT DATE_FORMAT(k4, '%Y-%m') AS month, sum(v1) AS cnt FROM t1  WHERE k2 = 'a' GROUP BY DATE_FORMAT(k4, '%Y-%m');
 
 -- query 44
-set enable_sync_materialized_view_rewrite=true;

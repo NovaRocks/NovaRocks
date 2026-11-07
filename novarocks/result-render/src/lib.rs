@@ -22,6 +22,7 @@
 
 mod encoder;
 pub use encoder::ArrowTrinoJsonEncoder as ClientRowEncoder;
+pub use encoder::render_session_double;
 pub use encoder::{ArrowTrinoJsonEncoder, ValidatedClientInput};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

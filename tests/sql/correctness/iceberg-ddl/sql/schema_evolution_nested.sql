@@ -57,4 +57,3 @@ ALTER TABLE people DROP COLUMN address.bogus;
 -- query 8
 DROP TABLE people;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_nested_${uuid0};
-SET catalog default_catalog;

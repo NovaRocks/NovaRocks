@@ -19,16 +19,25 @@
 -- Test Objective: a correlated scalar-aggregate subquery in a WHERE comparison
 -- is rewritten to an analytic WINDOW over the outer relation (StarRocks WinMagic),
 -- not a re-scan + LEFT OUTER JOIN. apply mode only.
+-- query 1
 DROP TABLE IF EXISTS ${case_db}.wm_line;
+-- query 2
 DROP TABLE IF EXISTS ${case_db}.wm_part;
+-- query 3
 CREATE TABLE ${case_db}.wm_line (l_partkey INT, l_quantity INT, l_ext INT);
+-- query 4
 CREATE TABLE ${case_db}.wm_part (p_partkey INT, p_brand VARCHAR(16));
+-- query 5
 INSERT INTO ${case_db}.wm_line VALUES (1,5,100),(1,50,200),(2,7,300),(2,8,150),(3,9,90);
+-- query 6
 INSERT INTO ${case_db}.wm_part VALUES (1,'B1'),(2,'B1'),(3,'B2');
+-- query 7
 ANALYZE TABLE ${case_db}.wm_line;
+-- query 8
 ANALYZE TABLE ${case_db}.wm_part;
+-- query 9
 
-SET subquery_unnest_mode='apply';
+-- query 10
 
 -- Apply mode rewrites the scalar aggregate subquery to a window function.
 -- @explain_contains=WINDOW [
@@ -38,6 +47,7 @@ FROM ${case_db}.wm_line, ${case_db}.wm_part
 WHERE p_partkey = l_partkey
   AND p_brand = 'B1'
   AND l_quantity < (SELECT 2 * avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey);
+-- query 11
 
 -- Correctness: apply-mode result rows (golden captures them; they must equal legacy).
 SELECT sum(l_ext)
@@ -45,8 +55,10 @@ FROM ${case_db}.wm_line, ${case_db}.wm_part
 WHERE p_partkey = l_partkey
   AND p_brand = 'B1'
   AND l_quantity < (SELECT 2 * avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey);
+-- query 12
 
 SET disable_optimizer_rules='ApplyToWindow';
+-- query 13
 
 -- With ApplyToWindow disabled, falls back to the outer JOIN form.
 -- @explain_contains=OUTER
@@ -56,5 +68,6 @@ FROM ${case_db}.wm_line, ${case_db}.wm_part
 WHERE p_partkey = l_partkey
   AND p_brand = 'B1'
   AND l_quantity < (SELECT 2 * avg(l_quantity) FROM ${case_db}.wm_line WHERE l_partkey = p_partkey);
+-- query 14
 
 SET disable_optimizer_rules='';

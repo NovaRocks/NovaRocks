@@ -64,27 +64,27 @@ select cast(percentile_approx(c2, 0.9, 10000) as int) from t1;
 
 -- query 10
 USE ${case_db};
-with tt as (select @v1 as v1, c1, c2 from t1) select /*+ set_user_variable(@v1 = 0.5) */ cast(percentile_approx(c2, v1) as int) from tt;
+with tt as (select (0.5) as v1, c1, c2 from t1) select  cast(percentile_approx(c2, v1) as int) from tt;
 
 -- query 11
 USE ${case_db};
-with tt as (select @v1 as v1, @v2 as v2, c1, c2 from t1) select /*+ set_user_variable(@v1= 0.5, @v2 = 4096) */ cast(percentile_approx(c2, v1, v2 + 1) as int) from tt;
+with tt as (select (0.5) as v1, (4096) as v2, c1, c2 from t1) select  cast(percentile_approx(c2, v1, v2 + 1) as int) from tt;
 
 -- query 12
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx(c2, array<double>[0.25, 0.5, 0.75]) from t1;
+select  percentile_approx(c2, array<double>[0.25, 0.5, 0.75]) from t1;
 
 -- query 13
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx(c2, array<double>[0.0, 0.5, 1.0]) from t1;
+select  percentile_approx(c2, array<double>[0.0, 0.5, 1.0]) from t1;
 
 -- query 14
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx(c2, [0.1, 0.25, 0.5, 0.75, 0.9]) from t1;
+select  percentile_approx(c2, [0.1, 0.25, 0.5, 0.75, 0.9]) from t1;
 
 -- query 15
 USE ${case_db};
-select /*+ SET_VAR (new_planner_agg_stage = '2') */ percentile_approx(c2, [0.25, 0.5, 0.75], 2048) from t1;
+select  percentile_approx(c2, [0.25, 0.5, 0.75], 2048) from t1;
 
 -- query 16
 USE ${case_db};
@@ -111,7 +111,7 @@ insert into test_sorted_streaming_agg_percentile values(2,1),(2,6),(4,3),(4,8);
 
 -- query 20
 USE ${case_db};
-select /*+ SET_VAR (enable_sort_aggregate = 'true') */ percentile_approx(value, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile group by id_int;
+select  percentile_approx(value, array<double>[0.5, 0.9], 5000) from test_sorted_streaming_agg_percentile group by id_int;
 
 -- query 21
 -- @skip_result_check=true
@@ -145,4 +145,4 @@ insert into t1_convert_to_serialize_format values(1,2,3),(4,5,6),(7,8,9);
 
 -- query 25
 USE ${case_db};
-select /*+ SET_VAR (streaming_preaggregation_mode = 'force_streaming') */ percentile_approx(v2, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';
+select  percentile_approx(v2, array<double>[0.1, 0.5, 0.9], 5000) from t0_convert_to_serialize_format join t1_convert_to_serialize_format group by 'a';

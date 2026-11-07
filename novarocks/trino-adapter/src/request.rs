@@ -433,7 +433,25 @@ pub(crate) fn session_effect_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_query_application::sql::session::SessionSqlState;
+    use novarocks_query_application::sql::session::{
+        SessionSqlState,
+        registry::{
+            SessionCatalogPropertyAdmission, SessionCatalogPropertyPort, SessionPropertyRegistry,
+            SessionPropertyValue,
+        },
+    };
+    struct NoCatalogAccess;
+    impl SessionCatalogPropertyPort for NoCatalogAccess {
+        fn session_property_catalog(
+            &self,
+            _: &str,
+        ) -> Result<
+            SessionCatalogPropertyAdmission,
+            novarocks_query_application::session_error::QueryServiceError,
+        > {
+            panic!("system-only session properties must not inspect catalog facts")
+        }
+    }
     fn headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-trino-user", HeaderValue::from_static("root"));
@@ -682,17 +700,26 @@ mod tests {
         let mut input = headers();
         input.insert("x-trino-catalog", HeaderValue::from_static("unknown_lake"));
         input.insert("x-trino-schema", HeaderValue::from_static("removed_schema"));
+        let registry = SessionPropertyRegistry::new().unwrap();
         assert!(
-            SessionSqlState::from_session_value(parse(&input).unwrap().session_value().unwrap())
-                .is_ok()
+            SessionSqlState::from_session_value(
+                parse(&input).unwrap().session_value().unwrap(),
+                &registry,
+                &NoCatalogAccess,
+            )
+            .is_ok()
         );
         input.insert(
             "x-trino-session",
             HeaderValue::from_static("unknown_setting=1"),
         );
         assert!(matches!(
-            SessionSqlState::from_session_value(parse(&input).unwrap().session_value().unwrap()),
-            Err(StatementSessionError::InvalidSessionProperty { .. })
+            SessionSqlState::from_session_value(
+                parse(&input).unwrap().session_value().unwrap(), &registry, &NoCatalogAccess,
+            ),
+            Err(StatementSessionError::Service(error)) if error.user_error().is_some_and(
+                |user| user.code().as_str() == "sql.admit.invalid_session_property"
+            )
         ));
     }
     #[test]
@@ -739,36 +766,32 @@ mod tests {
         assert_eq!(headers["x-trino-set-catalog"], "default_catalog");
         assert_eq!(headers["x-trino-set-schema"], "db");
         assert!(!headers.contains_key("x-trino-set-session"));
-        assert_eq!(headers["x-trino-clear-session"], "catalog");
-        let headers = session_effect_headers(&SessionEffects::set_catalog_assignment(
+        assert!(!headers.contains_key("x-trino-clear-session"));
+        let headers = session_effect_headers(&SessionEffects::set_catalog_schema(
             Some("lake".into()),
             "sales".into(),
         ))
         .unwrap();
-        assert_eq!(headers["x-trino-set-session"], "catalog=lake");
+        assert_eq!(headers["x-trino-set-catalog"], "lake");
+        assert_eq!(headers["x-trino-set-schema"], "sales");
+        assert!(!headers.contains_key("x-trino-set-session"));
         assert!(!headers.contains_key("x-trino-clear-session"));
-        let source = "SET sql_mode = 'A,B=C +中', pipeline_dop = 2";
-        let statements = novarocks_parser::parse(source).unwrap();
-        let [
-            novarocks_parser::ast::Statement::Session(
-                novarocks_parser::ast::SessionStatement::Set(statement),
-            ),
-        ] = statements.as_slice()
-        else {
-            panic!("expected one SET statement");
-        };
-        let mut effects = SessionEffects::default();
-        for assignment in &statement.assignments {
-            let novarocks_query_application::sql::session::SessionAssignment::Effects(change) =
-                novarocks_query_application::sql::session::session_set_assignment_effects(
-                    source, assignment,
+        // This adapter consumes already admitted typed effects. SQL evaluation
+        // belongs to the original required-constant service, not this test.
+        let registry = SessionPropertyRegistry::new().unwrap();
+        let mut effects = SessionEffects::property(
+            registry
+                .prepare_sql(
+                    "sql_mode",
+                    SessionPropertyValue::Varchar("A,B=C +中".into()),
                 )
-                .unwrap()
-            else {
-                panic!("expected typed session property effect");
-            };
-            effects.append(change);
-        }
+                .unwrap(),
+        );
+        effects.append(SessionEffects::property(
+            registry
+                .prepare_sql("pipeline_dop", SessionPropertyValue::Integer(2))
+                .unwrap(),
+        ));
         let headers = session_effect_headers(&effects).unwrap();
         assert_eq!(
             headers
@@ -788,31 +811,26 @@ mod tests {
         assert_eq!(encode_form_value("A,B=C +中"), "A%2CB%3DC+%2B%E4%B8%AD");
     }
     #[test]
-    fn canonical_property_headers_clear_obsolete_client_aliases() {
-        let sql = "SET CBO_DISABLED_RULES = 'new_rule'";
-        let statements = novarocks_parser::parse(sql).unwrap();
-        let [
-            novarocks_parser::ast::Statement::Session(
-                novarocks_parser::ast::SessionStatement::Set(set),
-            ),
-        ] = statements.as_slice()
-        else {
-            panic!("expected one SET");
-        };
-        let novarocks_query_application::sql::session::SessionAssignment::Effects(effects) =
-            novarocks_query_application::sql::session::session_set_assignment_effects(
-                sql,
-                &set.assignments[0],
-            )
-            .unwrap()
-        else {
-            panic!("expected typed effects");
-        };
+    fn retired_alias_is_rejected_and_canonical_effects_do_not_clear_properties() {
+        use novarocks_query_application::sql::session::registry::SessionPropertyError;
+        let registry = SessionPropertyRegistry::new().unwrap();
+        assert!(matches!(
+            registry.prepare_sql("CBO_DISABLED_RULES", SessionPropertyValue::Varchar("new_rule".into())),
+            Err(SessionPropertyError::UnknownProperty { name }) if name == "cbo_disabled_rules"
+        ));
+        let effects = SessionEffects::property(
+            registry
+                .prepare_sql(
+                    "DISABLE_OPTIMIZER_RULES",
+                    SessionPropertyValue::Varchar("new_rule".into()),
+                )
+                .unwrap(),
+        );
         let headers = session_effect_headers(&effects).unwrap();
         assert_eq!(
             headers["x-trino-set-session"],
             "disable_optimizer_rules=new_rule"
         );
-        assert_eq!(headers["x-trino-clear-session"], "cbo_disabled_rules");
+        assert!(!headers.contains_key("x-trino-clear-session"));
     }
 }

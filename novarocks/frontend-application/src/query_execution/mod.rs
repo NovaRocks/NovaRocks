@@ -62,6 +62,7 @@ pub mod post_compile;
 pub mod preparation;
 pub(crate) mod profile;
 pub(crate) mod provider_read_facts;
+pub mod required_constant_eval;
 pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;

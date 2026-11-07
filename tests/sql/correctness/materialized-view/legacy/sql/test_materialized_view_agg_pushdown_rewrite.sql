@@ -141,7 +141,7 @@ INSERT INTO part (p_partkey, p_name, p_mfgr, p_category, p_brand, p_color, p_typ
 VALUES (1, 'Part1', 'Manufr1', 'Catey1', 'Brand1', 'Red', 'Type1', 10, 'Container1');
 
 -- query 11
-set enable_materialized_view_agg_pushdown_rewrite=true;
+
 
 -- query 12
 -- - test simple case

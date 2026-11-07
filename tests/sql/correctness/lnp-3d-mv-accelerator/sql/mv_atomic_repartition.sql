@@ -56,8 +56,7 @@ INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 'east', 10),
   (2, 'west', 20),
   (3, 'east', 30);
-SET CATALOG lnp3d_repart_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_repart_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 PARTITION BY bucket(k1, 2)
 DISTRIBUTED BY HASH(k1) BUCKETS 1
@@ -108,8 +107,7 @@ SELECT 1;
 -- @skip_result_check=true
 INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (4, 'north', 40);
-SET CATALOG lnp3d_repart_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_repart_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 8
@@ -124,8 +122,7 @@ ORDER BY k1;
 -- query 9
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG lnp3d_repart_${uuid0};
-USE ns_${uuid0};
+USE lnp3d_repart_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE lnp3d_repart_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE lnp3d_repart_${uuid0}.ns_${uuid0};

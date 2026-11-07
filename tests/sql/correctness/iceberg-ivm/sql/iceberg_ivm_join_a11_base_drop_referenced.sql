@@ -65,8 +65,7 @@ INSERT INTO ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUE
 
 -- query 2
 -- @skip_result_check=true
-SET CATALOG ice_ivm_join_a11_drop_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW join_mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

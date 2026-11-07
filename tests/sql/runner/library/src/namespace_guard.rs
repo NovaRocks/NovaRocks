@@ -22,8 +22,8 @@ use novarocks_cluster_harness::fixture_run::{RunStorageScope, ScratchIdentity, c
 use novarocks_cluster_harness::isolated_iceberg_rest::{RestObjectStoreOwner, RestStorageBinding};
 use novarocks_parser::ast::{
     CatalogStatement, DmlStatement, IcebergStatement, LiteralKind, MaintenanceStatement,
-    MaterializedViewStatement, ObjectName, SessionStatement, SetTarget, SetValue, SetWord,
-    Statement, TableStatement, ViewStatement,
+    MaterializedViewStatement, ObjectName, SessionStatement, Statement, TableStatement,
+    ViewStatement,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -361,22 +361,6 @@ impl NamespaceGuard {
                         self.catalog = Some(catalog.value);
                     }
                     self.namespace = Some(value.database.value);
-                }
-                Statement::Session(SessionStatement::Set(value)) => {
-                    for assignment in value.assignments {
-                        if matches!(assignment.target, SetTarget::Catalog { .. }) {
-                            self.catalog = match assignment.value {
-                                SetValue::Words(words) if words.len() == 1 => match &words[0] {
-                                    SetWord::Ident(v) => Some(v.value.clone()),
-                                    SetWord::Literal(v) => match &v.kind {
-                                        LiteralKind::String(v) => Some(v.clone()),
-                                        _ => None,
-                                    },
-                                },
-                                _ => None,
-                            };
-                        }
-                    }
                 }
                 _ => {}
             }

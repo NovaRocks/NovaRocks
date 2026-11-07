@@ -87,6 +87,5 @@ ALTER TABLE orders_local ADD EQUALITY DELETE (id) VALUES (1);
 ALTER TABLE orders_local DROP COLUMN id;
 
 -- query 19
-SET catalog default_catalog;
 DROP TABLE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0}.orders_local FORCE;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.schema_evolution_local_${uuid0};

@@ -35,9 +35,6 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "SELECT u.x FROM t CROSS JOIN LATERAL UNNEST(t.arr) AS u(x)",
         "SELECT x.a FROM (SELECT 1 AS a) AS x",
         "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a IN (SELECT b FROM v)",
-        "SELECT t1.c_int FROM t1 LEFT SEMI JOIN [broadcast] t2 ON t1.c_int = t2.c_int",
-        "SELECT t1.c_int FROM t1 JOIN [skew|t1.c_int(1, 2, 8)] t2 ON t1.c_int = t2.c_int",
-        "SELECT t1.c_int FROM t1 JOIN [broadcast] (SELECT c_int FROM t2) AS t2 ON t1.c_int = t2.c_int",
         "SELECT * FROM TABLE(generate_series(1, 10)) AS g(x)",
         "SELECT * FROM a NATURAL LEFT JOIN b",
         "SELECT * FROM events FOR VERSION AS OF 'release_7' AS e",
@@ -60,7 +57,6 @@ fn query_forms_parse_and_print_as_typed_syntax() {
         "EXPLAIN VERBOSE SELECT k1 FROM __nr_ivm_delta('orders', 0, 0)",
         "EXPLAIN LOGICAL VERBOSE SELECT k1 FROM t",
         "EXPLAIN LOGICAL COSTS SELECT k1 FROM t",
-        "SELECT @@time_zone, @user_name",
         "SELECT 1 AS \"order count\"",
         "SELECT array_sortby((x) -> x.item, x)",
         "SELECT l.id FROM left_table l LEFT JOIN right_table r ON l.id = r.id JOIN third_table s ON s.id = l.id",
@@ -218,46 +214,17 @@ fn quoted_or_incomplete_dollar_names_remain_regular_table_names() {
 }
 
 #[test]
-fn table_metadata_postfix_adjacency_is_retained() {
-    let source = "SELECT count(*) FROM t0[_META_]";
-    let statements = parse(source).expect("metadata postfix should parse");
-    let Statement::Query(query) = &statements[0] else {
-        panic!("expected query");
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        panic!("expected SELECT");
-    };
-    let TableFactor::Table { hints, .. } = &select.from[0].relation else {
-        panic!("expected table relation");
-    };
-    assert!(hints[0].attached_to_relation);
-
-    let canonical = Printer::new().statements(&statements);
-    assert_eq!(canonical, source);
-    let reparsed = parse(&canonical).expect("canonical metadata postfix should parse");
-    assert_eq!(Printer::new().statements(&reparsed), canonical);
-    let Statement::Query(reparsed_query) = &reparsed[0] else {
-        panic!("expected reparsed query");
-    };
-    assert!(query.syntax_eq(reparsed_query));
-
-    let spaced = parse("SELECT count(*) FROM t0 [_META_]").expect("spaced hint should parse");
-    assert_eq!(
-        Printer::new().statements(&spaced),
-        "SELECT count(*) FROM t0 [_META_]"
-    );
-
-    let join_hint = parse("SELECT * FROM t1 JOIN [broadcast] t2 ON t1.id = t2.id")
-        .expect("join hint should parse");
-    assert_eq!(
-        Printer::new().statements(&join_hint),
-        "SELECT * FROM t1 JOIN [broadcast] t2 ON t1.id = t2.id"
-    );
-
-    let join_metadata = parse("SELECT * FROM t1 JOIN t2[_META_] ON t1.id = t2.id")
-        .expect("joined metadata postfix should parse");
-    assert_eq!(
-        Printer::new().statements(&join_metadata),
-        "SELECT * FROM t1 JOIN t2[_META_] ON t1.id = t2.id"
-    );
+fn table_hints_are_rejected_in_every_relation_position() {
+    for source in [
+        "SELECT * FROM [broadcast] t",
+        "SELECT * FROM t [shuffle]",
+        "SELECT * FROM t[_META_]",
+        "SELECT * FROM t [_META_]",
+        "SELECT * FROM t JOIN [broadcast] u ON t.id = u.id",
+        "SELECT * FROM t JOIN [skew|t.id(1, 2)] u ON t.id = u.id",
+        "SELECT * FROM t JOIN [broadcast] (SELECT 1) u ON true",
+        "SELECT * FROM TABLE(generate_series(1, 3)) [shuffle]",
+    ] {
+        assert!(parse(source).is_err(), "{source}");
+    }
 }

@@ -243,10 +243,6 @@ impl PreparedLogicalRead {
         self.description.row_carrier()
     }
 
-    pub(crate) fn scalar_schema(&self) -> Option<&novarocks_result_contract::ScalarSchema> {
-        self.description.scalar_schema()
-    }
-
     pub(super) fn into_parts(
         self,
     ) -> (

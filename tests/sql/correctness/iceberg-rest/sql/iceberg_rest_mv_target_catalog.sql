@@ -37,8 +37,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0} (
 );
 INSERT INTO iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0}
 VALUES (1, 'a'), (2, 'b');
-SET CATALOG iceberg_rest_${suite_uuid0};
-USE sales_${uuid0};
+USE iceberg_rest_${suite_uuid0}.sales_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
@@ -77,8 +76,7 @@ DROP TABLE analytics_${uuid0}.mv_conflict_${uuid0};
 
 -- query 9
 -- @expect_error=requires current Iceberg catalog context
-SET CATALOG default_catalog;
-USE default;
+USE default_catalog.default;
 CREATE MATERIALIZED VIEW mv_bad_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -87,8 +85,7 @@ FROM iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 
 -- query 10
 -- @skip_result_check=true
-SET CATALOG iceberg_rest_${suite_uuid0};
-USE sales_${uuid0};
+USE iceberg_rest_${suite_uuid0}.sales_${uuid0};
 DROP MATERIALIZED VIEW analytics_${uuid0}.mv_orders_${uuid0};
 
 -- query 11
@@ -98,9 +95,8 @@ SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
 -- query 12
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG iceberg_rest_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_orders_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_conflict_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_orders_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0};

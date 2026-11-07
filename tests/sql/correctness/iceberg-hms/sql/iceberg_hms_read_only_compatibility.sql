@@ -278,8 +278,7 @@ DROP VIEW IF EXISTS ice_hms_${uuid0}.iru7_${uuid0}.new_view;
 
 -- query 51
 -- @skip_result_check=true
-SET CATALOG ice_hms_${uuid0};
-USE iru7_${uuid0};
+USE ice_hms_${uuid0}.iru7_${uuid0};
 
 -- query 52
 -- Application-document creation

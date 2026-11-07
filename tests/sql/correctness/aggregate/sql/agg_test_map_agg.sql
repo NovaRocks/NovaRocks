@@ -56,7 +56,6 @@ INSERT INTO t1 values
 -- query 4
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode=force_preaggregation;
 
 -- query 5
 USE ${case_db};
@@ -129,7 +128,6 @@ select c13, map_agg(c9, c13) res from t1 group by c13 order by c13.a;
 -- query 22
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode=force_streaming;
 
 -- query 23
 USE ${case_db};

@@ -78,11 +78,10 @@ FROM TABLE(generate_series(1, 3000)) t(n);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- fine-grained MV: 25 (user_id, user_name) groups, extra sum aggregate
@@ -152,14 +151,12 @@ SELECT user_id, SUM(tag_id) AS total FROM user_tags GROUP BY user_id ORDER BY us
 -- query 19
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.coarse_mv;
+DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.coarse_mv;
 
 -- query 20
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.fine_mv;
+DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.fine_mv;
 
 -- query 21
 -- @cleanup=true

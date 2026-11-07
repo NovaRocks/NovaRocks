@@ -127,9 +127,8 @@ PROPERTIES (
     "aws.s3.region"="${oss_region}",
     "aws.s3.enable_path_style_access"="${oss_path_style}"
 );
-SET CATALOG function_view_rest_${suite_uuid0};
-CREATE DATABASE IF NOT EXISTS ${case_db};
-USE ${case_db};
+CREATE DATABASE IF NOT EXISTS function_view_rest_${suite_uuid0}.${case_db};
+USE function_view_rest_${suite_uuid0}.${case_db};
 DROP VIEW IF EXISTS vvv;
 DROP VIEW IF EXISTS vv;
 DROP VIEW IF EXISTS v;
@@ -191,15 +190,13 @@ SELECT field(dv.c1, vv.c1, dvv.c1) FROM dv, dvv, vv;
 -- query 30
 -- Setup: create t2 for concurrency test with 16 buckets
 -- @skip_result_check=true
-SET CATALOG function_view_rest_${suite_uuid0};
-USE ${case_db};
+USE function_view_rest_${suite_uuid0}.${case_db};
 DROP VIEW IF EXISTS vvv;
 DROP VIEW IF EXISTS vv;
 DROP VIEW IF EXISTS v;
 DROP VIEW IF EXISTS dv;
 DROP VIEW IF EXISTS dvv;
-SET CATALOG function_cat_${suite_uuid0};
-USE ${case_db};
+USE function_cat_${suite_uuid0}.${case_db};
 CREATE TABLE t2 (c1 int, c2 string)
 TBLPROPERTIES ("format-version" = "3");
 

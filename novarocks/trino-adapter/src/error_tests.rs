@@ -46,6 +46,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
+    ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
     ("COLUMN_NOT_FOUND", 47, "USER_ERROR"),
@@ -148,6 +149,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "sql.admit.create_table_unsupported_form"
         | "UnsupportedCompiledShape"
         | "query.execution.unsupported" => "NOT_SUPPORTED",
+        "sql.admit.invalid_session_property" => "INVALID_SESSION_PROPERTY",
+        "sql.admit.session_catalog_not_found" => "CATALOG_NOT_FOUND",
         "sql.admit.kill_denied" => "PERMISSION_DENIED",
         "sql.analyze.internal"
         | "query.execution.invariant"

@@ -81,11 +81,10 @@ FROM TABLE(generate_series(1, 2400)) t(n);
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- plain-SUM MV grouped by (k1, k6): the conditional-derivation miss guard
@@ -206,9 +205,8 @@ SELECT k1, AVG(k9) AS a FROM t1 GROUP BY k1 ORDER BY k1;
 -- query 29
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG mvrw_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_cond;
-DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_plain;
+DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.mv_cond;
+DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.mv_plain;
 
 -- query 30
 -- @cleanup=true

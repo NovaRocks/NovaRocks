@@ -33,7 +33,6 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0}.iceberg_mm_tbl_${u
   (1, 10, 100, 1000, true, 1.1, 2.2, '2025-06-29'),
   (2, 20, 200, 2000, false, 2.2, 3.3, '2025-06-30'),
   (3, 30, 300, 3000, true, 3.3, 4.4, '2025-07-01');
-SET enable_min_max_optimization = true;
 SELECT
   MIN(c_tinyint) AS min_tinyint,
   MAX(c_tinyint) AS max_tinyint,
@@ -55,7 +54,6 @@ FROM iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0}.iceberg_mm_tbl_${uuid0};
 
 -- query 2
 USE iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0};
-SET enable_min_max_optimization = false;
 SELECT
   MIN(c_tinyint) AS min_tinyint,
   MAX(c_tinyint) AS max_tinyint,
@@ -74,6 +72,5 @@ SELECT
   MIN(c_date) AS min_date,
   MAX(c_date) AS max_date
 FROM iceberg_mm_tbl_${uuid0};
-SET catalog default_catalog;
 DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0}.iceberg_mm_tbl_${uuid0} FORCE;
 DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_mm_db_${uuid0};

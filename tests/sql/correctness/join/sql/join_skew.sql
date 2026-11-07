@@ -72,11 +72,9 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
-SET enable_optimize_skew_join_v1=false;
 
 -- query 6
 -- @skip_result_check=true
-SET enable_optimize_skew_join_v2=false;
 
 -- ============================================================
 -- TINYINT skew join
@@ -99,19 +97,19 @@ INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES (1, 1), (2, 2), (3, 3);
 
 -- query 11
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- query 12
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t1 t1 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN  ${case_db}.t1 t1 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- query 13
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- query 14
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t1 t1 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN  ${case_db}.t1 t1 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- INT skew join
@@ -134,11 +132,11 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 19
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_int(1,1234567,4444)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 20
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_int(1,1234567,4444)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- BIGINT skew join
@@ -161,11 +159,11 @@ INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 12345678912), (3, 
 
 -- query 25
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,12345678912,4444)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- query 26
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,12345678912,4444)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- LARGEINT skew join
@@ -188,11 +186,11 @@ INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, CAST('1844674407
 
 -- query 31
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- query 32
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DOUBLE skew join
@@ -215,11 +213,11 @@ INSERT INTO ${case_db}.t2(c_key, c_double) VALUES (1, 1.1), (2, 2.1), (3, 3);
 
 -- query 37
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_double(1.1,2.1,4444)] ${case_db}.t2 t2 ON t1.c_double=t2.c_double ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_double=t2.c_double ORDER BY t1.c_key, t2.c_key;
 
 -- query 38
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_double(1.1,2.1,4444)] ${case_db}.t2 t2 ON t1.c_double=t2.c_double ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_double=t2.c_double ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DECIMAL skew join
@@ -242,11 +240,11 @@ INSERT INTO ${case_db}.t2(c_key, c_decimal) VALUES (1, 1.1), (2, 2.1), (3, 3);
 
 -- query 43
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_decimal(1.1,2.1,4444)] ${case_db}.t2 t2 ON t1.c_decimal=t2.c_decimal ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_decimal=t2.c_decimal ORDER BY t1.c_key, t2.c_key;
 
 -- query 44
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_decimal(1.1,2.1,4444)] ${case_db}.t2 t2 ON t1.c_decimal=t2.c_decimal ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_decimal=t2.c_decimal ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DATE skew join
@@ -271,11 +269,11 @@ INSERT INTO ${case_db}.t2(c_key, c_date) VALUES (1, "2024-01-01"), (2, "2024-01-
 
 -- query 49
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_date("2024-01-01","2024-01-02","2024-01-04")] ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
 
 -- query 50
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_date("2024-01-01","2024-01-02","2024-01-04")] ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- STRING skew join
@@ -298,11 +296,11 @@ INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ("1", "1"), ("2", "1234567"), 
 
 -- query 55
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_string("1","1234567","4444")] ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
 
 -- query 56
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_string("1","1234567","4444")] ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Cross-type skew join: t1.c_int vs t2.c_bigint
@@ -325,11 +323,11 @@ INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 61
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_int(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- query 62
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_int(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Cross-type skew join: t1.c_bigint vs t2.c_int
@@ -352,11 +350,11 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 67
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 68
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Cross-type skew join: t1.c_string vs t2.c_int
@@ -379,8 +377,8 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 73
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_string("1","2","99999")] ${case_db}.t2 t2 ON t1.c_string=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 74
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_string("1","2","99999")] ${case_db}.t2 t2 ON t1.c_string=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_int ORDER BY t1.c_key, t2.c_key;

@@ -103,7 +103,6 @@ pub(super) fn partitions_query(name: &ast::ObjectName, partitioned: bool) -> ast
                     metadata: Some(ident("files", span)),
                     alias: None,
                     version: None,
-                    hints: Vec::new(),
                     span,
                 },
                 joins: Vec::new(),

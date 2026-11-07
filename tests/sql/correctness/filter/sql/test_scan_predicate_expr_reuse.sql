@@ -53,7 +53,6 @@ SELECT * FROM t WHERE v1 < 10 AND array_max(array_map(x->length(x) + v2, v4)) > 
 -- query 5
 -- Same queries with enable_scan_predicate_expr_reuse disabled
 USE ${case_db};
-SET enable_scan_predicate_expr_reuse = false;
 SELECT * FROM t WHERE v1 = 10 AND v2 = v3;
 
 -- query 6
@@ -71,7 +70,6 @@ SELECT * FROM t WHERE v1 < 10 AND array_max(array_map(x->length(x) + v2, v4)) > 
 -- query 9
 -- Complex types: PRIMARY KEY table with arrays, structs, maps, JSON
 USE ${case_db};
-SET enable_scan_predicate_expr_reuse = true;
 CREATE TABLE t0 (
     k BIGINT NOT NULL,
     v1 ARRAY<BIGINT> NULL,

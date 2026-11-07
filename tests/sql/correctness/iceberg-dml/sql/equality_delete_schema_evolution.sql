@@ -52,6 +52,5 @@ ALTER TABLE orders_eq_evo MODIFY COLUMN total_amount DOUBLE;
 SELECT id, total_amount FROM orders_eq_evo ORDER BY id;
 
 -- query 7
-SET catalog default_catalog;
 DROP TABLE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0}.orders_eq_evo FORCE;
 DROP DATABASE iceberg_dml_cat_${suite_uuid0}.eq_delete_schema_evolution_${uuid0};

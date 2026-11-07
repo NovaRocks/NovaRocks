@@ -53,8 +53,7 @@ INSERT INTO ice_ivm_agg_a11_group_${uuid0}.ns_${uuid0}.orders VALUES
   ('east', 10),
   ('east', 20),
   ('west', 5);
-SET CATALOG ice_ivm_agg_a11_group_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_agg_a11_group_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW agg_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

@@ -750,6 +750,8 @@ struct CopyInputPacket<C> {
 struct CopyBackingSettlement {
     identities: allocator_api2::vec::Vec<usize, HostAggregateAllocator>,
     source_phase: bool,
+    source_identity_count: usize,
+    aliases_source: bool,
     new_bytes: usize,
 }
 impl CopyBackingSettlement {
@@ -757,6 +759,8 @@ impl CopyBackingSettlement {
         Self {
             identities: allocator_api2::vec::Vec::new_in(allocator),
             source_phase: true,
+            source_identity_count: 0,
+            aliases_source: false,
             new_bytes: 0,
         }
     }
@@ -769,9 +773,15 @@ impl CustodyBackingObservation for CopyBackingSettlement {
     ) -> Result<(), KernelFailure> {
         work.step()?;
         let address = buffer.data_ptr().as_ptr().addr();
-        for known in &self.identities {
+        for (ordinal, known) in self.identities.iter().enumerate() {
             work.step()?;
             if *known == address {
+                if !self.source_phase
+                    && ordinal < self.source_identity_count
+                    && buffer.capacity() != 0
+                {
+                    self.aliases_source = true;
+                }
                 return Ok(());
             }
         }
@@ -802,12 +812,61 @@ impl CustodyBackingObservation for CopyBackingSettlement {
 pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + 'static>(
     original: ArrayRef,
     source: C,
-    mut charge: OpaqueRetainedCharge,
+    charge: OpaqueRetainedCharge,
     reservation: &mut OpaqueReservation,
     allocator: HostAggregateAllocator,
     facts: &crate::selected_copy::CopyOperationFacts,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<RetainedCopiedArrowResult, KernelFailure> {
+    retain_copy_backing_with_source_transfer(
+        (original, source),
+        charge,
+        reservation,
+        allocator,
+        facts,
+        work,
+        (false, |source| source),
+    )
+}
+
+/// Only the narrow flat take caller may release the original input after the
+/// same settlement proves that every nonempty output backing is independent.
+/// Identity observes aliasing here; it never asserts that a buffer was funded.
+pub(crate) fn retain_independent_flat_take_backing<C: CopyInputBacking + Send + Sync + 'static>(
+    original: ArrayRef,
+    source: C,
+    charge: OpaqueRetainedCharge,
+    reservation: &mut OpaqueReservation,
+    allocator: HostAggregateAllocator,
+    facts: &crate::selected_copy::CopyOperationFacts,
+    work: &mut EvaluationCheckpoints<'_>,
+) -> Result<RetainedCopiedArrowResult, KernelFailure> {
+    retain_copy_backing_with_source_transfer(
+        (original, source),
+        charge,
+        reservation,
+        allocator,
+        facts,
+        work,
+        (true, drop),
+    )
+}
+
+fn retain_copy_backing_with_source_transfer<C, D>(
+    input: (ArrayRef, C),
+    mut charge: OpaqueRetainedCharge,
+    reservation: &mut OpaqueReservation,
+    allocator: HostAggregateAllocator,
+    facts: &crate::selected_copy::CopyOperationFacts,
+    work: &mut EvaluationCheckpoints<'_>,
+    transfer: (bool, impl FnOnce(C) -> D),
+) -> Result<RetainedCopiedArrowResult, KernelFailure>
+where
+    C: CopyInputBacking + Send + Sync + 'static,
+    D: Send + Sync + 'static,
+{
+    let (original, source) = input;
+    let (independent, transfer) = transfer;
     // Failed exits destroy output aliases before their source lease. No
     // temporary caller Arc loan can outlive and invalidate this custody order.
     let packet = CopyInputPacket { original, source };
@@ -869,10 +928,16 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
             .ok_or_else(|| invalid("copied backing owner has no original index array"))?;
         custody_original_metadata(indices, index_data, work, Some(&mut settlement))?;
     }
+    settlement.source_identity_count = settlement.identities.len();
     settlement.source_phase = false;
     let metadata =
         custody_original_metadata(packet.original.as_ref(), &data, work, Some(&mut settlement))?;
     let new_buffer_stock = settlement.new_bytes;
+    if independent && settlement.aliases_source {
+        return Err(invalid(
+            "flat take retained a nonempty original input backing",
+        ));
+    }
     if new_buffer_stock > facts.retained_new_backing_upper() {
         return Err(invalid(
             "copy output backing exceeds its earlier selected-copy envelope",
@@ -892,7 +957,7 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
         packet.original,
         data,
         CopiedBacking {
-            _source: packet.source,
+            _source: transfer(packet.source),
             _charge: charge,
         },
         allocator,

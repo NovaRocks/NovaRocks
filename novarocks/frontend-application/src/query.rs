@@ -45,18 +45,15 @@ use crate::query_execution::maintenance::command::{
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
 use async_trait::async_trait;
-use novarocks_parser::{
-    ast::{self, Statement as ParsedStatement},
-    printer::print_expr,
-};
+use novarocks_parser::ast::{self, Statement as ParsedStatement};
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::{
     BackendCommandExecutor, CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind,
-    CommandFuture, ExecutionOutput, MaintenanceCommandConsumer, MaterializedViewCommand,
+    CommandFuture, MaintenanceCommandConsumer, MaterializedViewCommand,
     MaterializedViewCommandConsumer, OptionalCommandFuture, QueryExecutionError,
-    QueryExecutionErrorKind, ResultDelivery, StatisticsCommandConsumer,
+    StatisticsCommandConsumer,
 };
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
 use novarocks_query_application::api::{QueryResult, build_string_query_result};
@@ -84,7 +81,6 @@ use novarocks_query_application::session_error::{QueryServiceError, QueryService
 use novarocks_query_application::session_outcome::{
     cancellation_error, cancellation_requires_statement_fence, governed_cancellation_error,
     governed_query_deadline, governed_query_execution_error, governed_statement_begin_error,
-    scalar_query_error,
 };
 use novarocks_query_application::session_value::StatementSessionError;
 use novarocks_query_application::sql::admission::{
@@ -92,10 +88,7 @@ use novarocks_query_application::sql::admission::{
 };
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
-use novarocks_query_application::sql::session::{
-    SessionExecutionSettings, SessionSqlState,
-    admit_session_set_assignment as admit_query_application_session_set_assignment,
-};
+use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSqlState};
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::{
     ProductCommandRouter, ProductSqlCommand, lower_product_sql_command,
@@ -126,6 +119,7 @@ pub(crate) mod mutation_action;
 pub(crate) mod mv_action;
 pub(crate) mod mv_read_action;
 pub(crate) mod read_action;
+pub(crate) mod session_property_computation;
 mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
@@ -1048,6 +1042,9 @@ pub struct FrontendQueryService {
     #[cfg(novarocks_dev_controls)]
     result_handoff: Option<Arc<crate::test_session::result_handoff::ResultHandoffControl>>,
     session_catalog_resolver: SessionCatalogService,
+    session_properties:
+        Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+    required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn SpecializedStatementRoute>,
     product_command_router: ProductCommandRouter,
@@ -1104,6 +1101,10 @@ impl FrontendQueryService {
     )]
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
+        session_properties: Arc<
+            novarocks_query_application::sql::session::registry::SessionPropertyRegistry,
+        >,
+        required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
         query_compiler: FrontendQueryCompiler,
         product_command_router: ProductCommandRouter,
         backend_command_executor: BackendCommandExecutor,
@@ -1134,6 +1135,8 @@ impl FrontendQueryService {
             #[cfg(novarocks_dev_controls)]
             result_handoff: None,
             session_catalog_resolver,
+            session_properties,
+            required_constant_interpreter,
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
                 backend_command_executor,
@@ -1171,7 +1174,11 @@ impl QuerySessionFactory for FrontendQueryService {
     ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
         let admission = request.admission();
         let (query_id, principal, value) = request.into_parts();
-        let state = SessionSqlState::from_session_value(value)?;
+        let state = SessionSqlState::from_session_value(
+            value,
+            &self.session_properties,
+            self.session_catalog_resolver.as_ref(),
+        )?;
         let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
         let lease = self
             .serving_admission
@@ -1302,15 +1309,6 @@ impl FrontendQuerySession {
         *self.output_shape.lock().unwrap_or_else(|p| p.into_inner()) = Some(admitted.shape);
         let kind = admitted.kind;
         let result = match parsed_statement {
-            ParsedStatement::Session(ast::SessionStatement::Set(statement))
-                if statement
-                    .assignments
-                    .iter()
-                    .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
-            {
-                self.execute_governed_set(source.to_string(), statement)
-                    .await
-            }
             ParsedStatement::Session(statement) => {
                 self.execute_session_statement(source, &statement).await
             }
@@ -1339,6 +1337,12 @@ impl FrontendQuerySession {
         source: &str,
         statement: &ast::SessionStatement,
     ) -> Result<StatementResult, QueryServiceError> {
+        let (deadline, timeout_ms) = if matches!(statement, ast::SessionStatement::Set(_)) {
+            let state = self.state.lock().map_err(poisoned_state)?;
+            governed_query_deadline(&state)?
+        } else {
+            (None, None)
+        };
         let token = self.token()?;
         let governed = self
             .service
@@ -1347,8 +1351,8 @@ impl FrontendQuerySession {
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
-                None,
-                None,
+                deadline.map(tokio::time::Instant::from_std),
+                timeout_ms,
                 Some(Arc::from(source)),
                 ResultWindowClass::Local,
             )
@@ -1356,18 +1360,7 @@ impl FrontendQuerySession {
         let mut effects = SessionEffects::default();
         let result = match statement {
             ast::SessionStatement::Set(statement) => {
-                for assignment in &statement.assignments {
-                    if let Err(error) = self.admit_session_set_assignment(source, assignment) {
-                        return Ok(self.governed_typed_error(error, governed));
-                    }
-                }
-                for assignment in &statement.assignments {
-                    match self.apply_session_set_assignment(source, assignment).await {
-                        Ok(change) => effects.append(change),
-                        Err(error) => return Ok(self.governed_typed_error(error, governed)),
-                    }
-                }
-                Ok(StatementResult::Ok)
+                return self.execute_observed_set(Arc::from(source), statement.clone(), deadline, governed).await;
             }
             ast::SessionStatement::Use(statement) => {
                 let schema = statement.catalog.as_ref().map_or_else(
@@ -1443,37 +1436,6 @@ impl FrontendQuerySession {
         }
     }
 
-    fn admit_session_set_assignment(
-        &self,
-        source: &str,
-        assignment: &ast::SetAssignment,
-    ) -> Result<(), QueryServiceError> {
-        admit_query_application_session_set_assignment(source, assignment)
-    }
-
-    async fn apply_session_set_assignment(
-        &self,
-        source: &str,
-        assignment: &ast::SetAssignment,
-    ) -> Result<SessionEffects, QueryServiceError> {
-        let mut state = self.state.lock().map_err(poisoned_state)?;
-        self.apply_session_set_assignment_to_state(source, assignment, &mut state)
-    }
-
-    fn apply_session_set_assignment_to_state(
-        &self,
-        source: &str,
-        assignment: &ast::SetAssignment,
-        state: &mut SessionSqlState,
-    ) -> Result<SessionEffects, QueryServiceError> {
-        set_action::apply_session_assignment_in(
-            &self.service.session_catalog_resolver,
-            source,
-            assignment,
-            state,
-        )
-    }
-
     async fn init_database_with_cancellation(
         &self,
         schema: &str,
@@ -1510,52 +1472,6 @@ impl FrontendQuerySession {
         let effects = SessionEffects::set_catalog_schema(context.catalog, context.database);
         state.apply_effects(&effects)?;
         Ok(effects)
-    }
-
-    async fn execute_governed_set(
-        &self,
-        source: String,
-        set: ast::SetStatement,
-    ) -> Result<StatementResult, QueryServiceError> {
-        let source: Arc<str> = source.into();
-        for assignment in &set.assignments {
-            self.admit_session_set_assignment(&source, assignment)?;
-        }
-        let (deadline, timeout_ms) = {
-            let state = self.state.lock().map_err(poisoned_state)?;
-            governed_query_deadline(&state)?
-        };
-        let window_class = if set
-            .assignments
-            .iter()
-            .any(|assignment| matches!(&assignment.value, ast::SetValue::Query(_)))
-        {
-            ResultWindowClass::Internal
-        } else {
-            ResultWindowClass::Local
-        };
-        let token = self.token()?;
-        let statement = self
-            .service
-            .query_control
-            .begin_queued_governed_query_statement_with_result(
-                token,
-                &self.service.workload_root_admission,
-                deadline.map(tokio::time::Instant::from_std),
-                timeout_ms,
-                Some(Arc::clone(&source)),
-                window_class,
-            )
-            .await
-            .map_err(|error| self.governed_statement_begin_error(error))?;
-        #[cfg(novarocks_dev_controls)]
-        if let Some(owner) = &self.service.statement_observation
-            && let Err(error) = owner.bind_statement(statement.token(), &source)
-        {
-            return Ok(self.governed_typed_error(internal_error(error), statement));
-        }
-        self.execute_observed_set(source, set, deadline, statement)
-            .await
     }
 
     async fn execute_governed_read(
@@ -1676,9 +1592,6 @@ impl FrontendQuerySession {
             Err(error) => return Ok(self.governed_typed_error(internal_error(error), statement)),
         };
         let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let parsed_statement = state
-            .substitute_user_variables(parsed_statement)
-            .map_err(|error| internal_error(error.to_string()))?;
         novarocks_query_application::sql::admission::admit_persisted_definition_semantics(
             &sql,
             &parsed_statement,
@@ -2691,16 +2604,6 @@ fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWin
     }
 }
 
-#[cfg(test)]
-async fn consume_governed_scalar_stream(
-    execution: &mut novarocks_query_application::api::ExecutionOutputObligation,
-    stream: novarocks_query_application::api::QueryResultStream,
-    scalar_schema: Option<&novarocks_result_contract::ScalarSchema>,
-) -> Result<String, QueryServiceError> {
-    let mut scalar = set_action::GovernedScalarStream::new(stream, scalar_schema.cloned());
-    std::future::poll_fn(|cx| scalar.poll_value(execution, cx)).await
-}
-
 async fn wait_for_initial_query_topology(
     topology: &BackendTopologyService,
     cancellation: &QueryCancellationView,
@@ -2803,6 +2706,7 @@ async fn wait_for_eligible_query_topology_after(
 fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
     QueryOptions::from_proto(novarocks::QueryOptions {
         group_concat_max_len: Some(settings.group_concat_max_len()),
+        query_mem_limit: settings.query_mem_limit_bytes().unwrap_or_default(),
         query_timeout: settings
             .query_timeout_secs()
             .and_then(|value| value.try_into().ok())
@@ -2961,13 +2865,10 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use arrow::{array::StringArray, datatypes::DataType};
-    use novarocks_query_application::api::{BackendTopologySnapshot, ResultField};
+    use arrow::array::StringArray;
+    use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
-    use novarocks_query_application::test_support::{
-        ResultStreamTestProducer, TestResultDeliveryDisposition,
-    };
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
     use novarocks_workload_control::{
         CancellationReason as WorkCancellationReason, ResourceConfig,
@@ -3064,346 +2965,6 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("status text column");
         assert_eq!(values.value(0), "Added 2 file(s)");
-    }
-
-    fn scalar_stream_fixture(
-        fields: Vec<ResultField>,
-    ) -> (
-        ResultStreamTestProducer,
-        novarocks_query_application::api::ExecutionOutputObligation,
-        novarocks_query_application::test_support::TestResultDeliveryReceipt,
-    ) {
-        let (producer, execution, _resources, receipt) = ResultStreamTestProducer::open(
-            QueryExecutionId::new(
-                QueryId::new(83, 1),
-                AttemptId::new(1).expect("test attempt"),
-            )
-            .expect("test execution"),
-            fields,
-            1,
-            ResourceConfig {
-                total_bytes: 1024 * 1024,
-                control_bytes: 1024,
-                per_scope_bytes: 1024 * 1024 - 1024,
-            },
-        )
-        .expect("open scalar result stream");
-        (producer, execution, receipt)
-    }
-
-    fn scalar_field(nullable: bool) -> ResultField {
-        ResultField::new(
-            "value",
-            novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
-        )
-    }
-
-    fn relayed_scalar_fixture() -> (
-        ResultStreamTestProducer,
-        novarocks_query_application::api::ExecutionOutputObligation,
-        novarocks_query_application::test_support::TestResultDeliveryReceipt,
-        novarocks_types::QueryExecutionId,
-        novarocks_result_contract::ScalarSchema,
-    ) {
-        use novarocks_result_contract::{
-            InternalResultDomain, RootOutputKind, ScalarField, ScalarSchema, ScalarValueType,
-        };
-        let execution_id = novarocks_types::QueryExecutionId::new(
-            novarocks_types::QueryId::new(71, 1),
-            novarocks_types::AttemptId::new(1).unwrap(),
-        )
-        .unwrap();
-        let schema = ScalarSchema::try_new(ScalarField {
-            nullable: true,
-            value_type: ScalarValueType::SignedInteger(64),
-        })
-        .unwrap();
-        let (producer, execution, _resources, receipt) =
-            ResultStreamTestProducer::open_with_carrier(
-                execution_id,
-                vec![scalar_field(true)],
-                1,
-                ResourceConfig {
-                    total_bytes: 1 << 20,
-                    control_bytes: 1024,
-                    per_scope_bytes: (1 << 20) - 1024,
-                },
-                novarocks_query_application::api::ResultRowCarrier::relayed(
-                    RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
-                    None,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        (producer, execution, receipt, execution_id, schema)
-    }
-
-    fn scalar_root_reply(
-        execution_id: novarocks_types::QueryExecutionId,
-        schema: &novarocks_result_contract::ScalarSchema,
-        leaf: novarocks_result_contract::BorrowedScalarLeaf<'_>,
-        sequence: u64,
-    ) -> (
-        novarocks_execution_contract::root_result::RootResultReply,
-        u64,
-    ) {
-        use novarocks_execution_contract::{
-            TaskIdentity,
-            root_result::{RootReadOutcome, RootResultData, RootResultReply},
-        };
-        use novarocks_result_contract::{
-            InternalResultDomain, RootOutputKind, RootProfileId, ScalarLeafCursor,
-        };
-        use novarocks_types::{StageId, TaskId};
-        let cursor = ScalarLeafCursor::try_new(schema, leaf).unwrap();
-        let rows = cursor.rows();
-        let mut body = vec![0; cursor.encoded_len()];
-        cursor.copy_range(0, &mut body).unwrap();
-        let kind = RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1);
-        (
-            RootResultReply {
-                root_task: TaskIdentity::new(
-                    execution_id,
-                    StageId::new(1).unwrap(),
-                    TaskId::new(1).unwrap(),
-                    novarocks_types::BackendProcessId::new_v7(),
-                ),
-                profile: RootProfileId::V1,
-                kind,
-                accepted_consumed: 0,
-                outcome: RootReadOutcome::Data(
-                    RootResultData::try_new(
-                        kind,
-                        std::num::NonZeroU64::new(sequence).unwrap(),
-                        bytes::Bytes::from(body),
-                        None,
-                    )
-                    .unwrap(),
-                ),
-            },
-            rows,
-        )
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_consumes_typed_value_null_and_no_rows_after_success_end() {
-        use novarocks_result_contract::BorrowedScalarLeaf as V;
-        for (leaf, expected) in [
-            (V::SignedInteger { bits: 64, value: 7 }, "7"),
-            (V::Null, "NULL"),
-            (V::NoRows, "null"),
-        ] {
-            let (producer, mut execution, schema_receipt, execution_id, schema) =
-                relayed_scalar_fixture();
-            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
-                panic!("rows");
-            };
-            let capacity = producer.result_capacity();
-            let (reply, rows) = scalar_root_reply(execution_id, &schema, leaf, 1);
-            let produce = async {
-                assert_eq!(
-                    schema_receipt.wait().await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                assert_eq!(
-                    producer
-                        .enqueue_segment(0, reply, None, rows)
-                        .await
-                        .unwrap()
-                        .wait()
-                        .await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                assert_eq!(
-                    producer.enqueue_end(1).await.wait().await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
-                producer.finish();
-                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-            };
-            let (result, ()) = tokio::join!(
-                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
-                produce
-            );
-            assert_eq!(result.unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_refuses_missing_duplicate_foreign_and_late_failed_records() {
-        use novarocks_result_contract::{BorrowedScalarLeaf, InternalResultDomain, RootOutputKind};
-        for fault in ["missing", "duplicate", "foreign", "late"] {
-            let (producer, mut execution, schema_receipt, execution_id, schema) =
-                relayed_scalar_fixture();
-            let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
-                panic!("rows");
-            };
-            let produce = async {
-                assert_eq!(
-                    schema_receipt.wait().await,
-                    TestResultDeliveryDisposition::Completed
-                );
-                if fault == "missing" {
-                    assert!(matches!(
-                        producer.enqueue_end(0).await.wait().await,
-                        TestResultDeliveryDisposition::Failed(_)
-                    ));
-                } else {
-                    let (mut reply, rows) =
-                        scalar_root_reply(execution_id, &schema, BorrowedScalarLeaf::NoRows, 1);
-                    if fault == "foreign" {
-                        reply.kind = RootOutputKind::InternalFacts(
-                            InternalResultDomain::StatisticsArtifactV1,
-                        );
-                        let novarocks_execution_contract::root_result::RootReadOutcome::Data(data) =
-                            &reply.outcome
-                        else {
-                            panic!("data");
-                        };
-                        reply.outcome =
-                            novarocks_execution_contract::root_result::RootReadOutcome::Data(
-                                novarocks_execution_contract::root_result::RootResultData::try_new(
-                                    reply.kind,
-                                    data.sequence(),
-                                    data.body().clone(),
-                                    None,
-                                )
-                                .unwrap(),
-                            );
-                    }
-                    let receipt = producer
-                        .enqueue_segment(0, reply, None, rows)
-                        .await
-                        .unwrap()
-                        .wait()
-                        .await;
-                    if fault == "foreign" {
-                        assert!(matches!(receipt, TestResultDeliveryDisposition::Failed(_)));
-                    } else {
-                        assert_eq!(receipt, TestResultDeliveryDisposition::Completed);
-                        if fault == "duplicate" {
-                            let (reply, rows) = scalar_root_reply(
-                                execution_id,
-                                &schema,
-                                BorrowedScalarLeaf::NoRows,
-                                2,
-                            );
-                            assert!(matches!(
-                                producer
-                                    .enqueue_segment(1, reply, None, rows)
-                                    .await
-                                    .unwrap()
-                                    .wait()
-                                    .await,
-                                TestResultDeliveryDisposition::Failed(_)
-                            ));
-                        } else {
-                            producer.fail(QueryExecutionError::new(
-                                QueryExecutionErrorKind::Failed,
-                                "late scalar failure",
-                            ));
-                        }
-                    }
-                }
-                producer.finish();
-            };
-            let (result, ()) = tokio::join!(
-                consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
-                produce
-            );
-            assert!(result.is_err(), "{fault}");
-        }
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_rejects_foreign_record_row_count_and_cancels_execution() {
-        let (producer, mut execution, schema_receipt, execution_id, schema) =
-            relayed_scalar_fixture();
-        let capacity = producer.result_capacity();
-        let ExecutionOutput::Rows(stream) = execution.take_output().unwrap() else {
-            panic!("scalar rows");
-        };
-        let (reply, _) = scalar_root_reply(
-            execution_id,
-            &schema,
-            novarocks_result_contract::BorrowedScalarLeaf::NoRows,
-            1,
-        );
-        let producer_side = async {
-            assert_eq!(
-                schema_receipt.wait().await,
-                TestResultDeliveryDisposition::Completed
-            );
-            let receipt = producer.enqueue_segment(0, reply, None, 2).await.unwrap();
-            assert!(matches!(
-                receipt.wait().await,
-                TestResultDeliveryDisposition::Failed(_)
-            ));
-        };
-        let (result, ()) = tokio::join!(
-            consume_governed_scalar_stream(&mut execution, stream, Some(&schema)),
-            producer_side
-        );
-        let error = result.expect_err("record and delivery row counts must agree");
-        assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
-        assert_eq!(
-            producer.cancellation_reason(),
-            Some(WorkCancellationReason::Requested)
-        );
-        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
-        producer.finish();
-        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_rejects_schema_and_fails_its_delivery() {
-        let fields = vec![scalar_field(false), scalar_field(false)];
-        let (producer, mut execution, schema_receipt) = scalar_stream_fixture(fields);
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
-        };
-
-        let error = consume_governed_scalar_stream(&mut execution, stream, None)
-            .await
-            .expect_err("two-column scalar result must fail");
-        assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
-        assert!(matches!(
-            schema_receipt.wait().await,
-            TestResultDeliveryDisposition::Failed(_)
-        ));
-        assert_eq!(
-            producer.cancellation_reason(),
-            Some(WorkCancellationReason::Requested)
-        );
-        producer.finish();
-    }
-
-    #[tokio::test]
-    async fn governed_scalar_stream_failure_cancels_execution_after_schema_ack() {
-        let (producer, mut execution, schema_receipt, _execution_id, schema) =
-            relayed_scalar_fixture();
-        let ExecutionOutput::Rows(stream) = execution.take_output().expect("scalar output") else {
-            panic!("expected row output")
-        };
-        producer.fail(QueryExecutionError::new(
-            QueryExecutionErrorKind::Failed,
-            "test scalar stream failure",
-        ));
-
-        let error = consume_governed_scalar_stream(&mut execution, stream, Some(&schema))
-            .await
-            .expect_err("failed scalar result stream must fail");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
-        assert_eq!(
-            schema_receipt.wait().await,
-            TestResultDeliveryDisposition::Completed
-        );
-        assert_eq!(
-            producer.cancellation_reason(),
-            Some(WorkCancellationReason::Requested)
-        );
-        producer.finish();
     }
 
     struct ChangingTopology {

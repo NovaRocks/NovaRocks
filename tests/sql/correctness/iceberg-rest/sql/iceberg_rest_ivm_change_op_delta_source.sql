@@ -25,9 +25,8 @@
 
 -- query 1
 -- @skip_result_check=true
-SET CATALOG iceberg_rest_${suite_uuid0};
 DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} FORCE;
-CREATE DATABASE ivm_${uuid0};
+CREATE DATABASE iceberg_rest_${suite_uuid0}.ivm_${uuid0};
 CREATE TABLE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} (
   id INT NOT NULL,
   customer STRING,
@@ -39,7 +38,7 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} (
 INSERT INTO iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0} VALUES
   (1, 'Alice', 100),
   (2, 'Bob', 40);
-USE ivm_${uuid0};
+USE iceberg_rest_${suite_uuid0}.ivm_${uuid0};
 CREATE MATERIALIZED VIEW orders_projection_mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -120,7 +119,6 @@ ORDER BY customer;
 -- query 15
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG iceberg_rest_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_sum_mv_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ivm_${uuid0}.orders_projection_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_sum_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_projection_mv_${uuid0};
 DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.ivm_${uuid0} FORCE;

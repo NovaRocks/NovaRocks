@@ -55,8 +55,7 @@ INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10),
   (2, 20),
   (3, 50);
-SET CATALOG mv_ice_${uuid0};
-USE ns_${uuid0};
+USE mv_ice_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')

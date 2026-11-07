@@ -19,7 +19,7 @@
 
 use crate::Span;
 
-use super::{Expr, Ident, Literal, Query, UserVariable};
+use super::{Expr, Ident, Literal};
 
 /// `SHOW [FULL] PROCESSLIST`.
 ///
@@ -103,8 +103,8 @@ pub struct SetStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetAssignment {
     pub scope: SetScope,
-    pub target: SetTarget,
-    pub value: SetValue,
+    pub name: Ident,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -115,66 +115,6 @@ pub enum SetScope {
     Session,
     Local,
     Global,
-}
-
-/// The target shape of one `SET` assignment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SetTarget {
-    UserVariable(UserVariable),
-    SystemVariable(Ident),
-    Names { span: Span },
-    Transaction { span: Span },
-    Catalog { span: Span },
-}
-
-impl SetTarget {
-    pub const fn span(&self) -> Span {
-        match self {
-            Self::UserVariable(variable) => variable.span,
-            Self::SystemVariable(variable) => variable.span,
-            Self::Names { span } | Self::Transaction { span } | Self::Catalog { span } => *span,
-        }
-    }
-}
-
-/// The value syntax accepted after a `SET` target.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SetValue {
-    Expression(Expr),
-    Query(Box<Query>),
-    Words(Vec<SetWord>),
-}
-
-/// One keyword, identifier, or literal in a special `SET` form.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SetWord {
-    Ident(Ident),
-    Literal(Literal),
-}
-
-impl SetWord {
-    pub const fn span(&self) -> Span {
-        match self {
-            Self::Ident(word) => word.span,
-            Self::Literal(word) => word.span,
-        }
-    }
-}
-
-impl SetValue {
-    pub fn span(&self) -> Span {
-        match self {
-            Self::Expression(expression) => expression.span(),
-            Self::Query(query) => query.span,
-            Self::Words(words) => match words.first() {
-                Some(first) => Span::new(
-                    first.span().start(),
-                    words.last().expect("non-empty").span().end(),
-                ),
-                None => Span::new(0, 0),
-            },
-        }
-    }
 }
 
 /// `USE <database>` or `USE <catalog>.<database>`.

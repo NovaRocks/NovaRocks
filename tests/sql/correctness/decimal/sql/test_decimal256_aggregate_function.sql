@@ -137,7 +137,6 @@ GROUP BY p40s10
 ORDER BY p40s10;
 
 -- query 9
-set new_planner_agg_stage=0;
 SELECT
     'Test7_COUNT_DISTINCT_planner0' as test_name,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
@@ -147,7 +146,6 @@ SELECT
 FROM ${case_db}.decimal256_agg_test;
 
 -- query 10
-set new_planner_agg_stage=2;
 SELECT
     'Test7_COUNT_DISTINCT_planner2' as test_name,
     COUNT(DISTINCT p40s10) as distinct_p40s10,
@@ -155,10 +153,8 @@ SELECT
     COUNT(DISTINCT p76s20) as distinct_p76s20,
     COUNT(DISTINCT p76s0) as distinct_p76s0
 FROM ${case_db}.decimal256_agg_test;
-set new_planner_agg_stage=0;
 
 -- query 11
-set new_planner_agg_stage=0;
 SELECT
     'Test8_SUM_DISTINCT_planner0' as test_name,
     SUM(DISTINCT p40s10) as sum_distinct_p40s10,
@@ -168,7 +164,6 @@ SELECT
 FROM ${case_db}.decimal256_agg_test;
 
 -- query 12
-set new_planner_agg_stage=2;
 SELECT
     'Test8_SUM_DISTINCT_planner2' as test_name,
     SUM(DISTINCT p40s10) as sum_distinct_p40s10,
@@ -176,10 +171,8 @@ SELECT
     SUM(DISTINCT p76s20) as sum_distinct_p76s20,
     SUM(DISTINCT p76s0) as sum_distinct_p76s0
 FROM ${case_db}.decimal256_agg_test;
-set new_planner_agg_stage=0;
 
 -- query 13
-set new_planner_agg_stage=0;
 SELECT
     'Test9_AVG_DISTINCT_planner0' as test_name,
     AVG(DISTINCT p40s10) as avg_distinct_p40s10,
@@ -189,7 +182,6 @@ SELECT
 FROM ${case_db}.decimal256_agg_test;
 
 -- query 14
-set new_planner_agg_stage=2;
 SELECT
     'Test9_AVG_DISTINCT_planner2' as test_name,
     AVG(DISTINCT p40s10) as avg_distinct_p40s10,
@@ -197,10 +189,8 @@ SELECT
     AVG(DISTINCT p76s20) as avg_distinct_p76s20,
     AVG(DISTINCT p76s0) as avg_distinct_p76s0
 FROM ${case_db}.decimal256_agg_test;
-set new_planner_agg_stage=0;
 
 -- query 15
-set new_planner_agg_stage=0;
 SELECT
     'Test10_GROUP_COUNT_DISTINCT_planner0' as test_name,
     category,
@@ -212,7 +202,6 @@ GROUP BY category
 ORDER BY category;
 
 -- query 16
-set new_planner_agg_stage=2;
 SELECT
     'Test10_GROUP_COUNT_DISTINCT_planner2' as test_name,
     category,
@@ -222,10 +211,8 @@ SELECT
 FROM ${case_db}.decimal256_agg_test
 GROUP BY category
 ORDER BY category;
-set new_planner_agg_stage=0;
 
 -- query 17
-set new_planner_agg_stage=0;
 SELECT
     'Test11_GROUP_SUM_DISTINCT_planner0' as test_name,
     category,
@@ -236,7 +223,6 @@ GROUP BY category
 ORDER BY category;
 
 -- query 18
-set new_planner_agg_stage=2;
 SELECT
     'Test11_GROUP_SUM_DISTINCT_planner2' as test_name,
     category,
@@ -245,10 +231,8 @@ SELECT
 FROM ${case_db}.decimal256_agg_test
 GROUP BY category
 ORDER BY category;
-set new_planner_agg_stage=0;
 
 -- query 19
-set new_planner_agg_stage=0;
 SELECT
     'Test12_GROUP_AVG_DISTINCT_planner0' as test_name,
     category,
@@ -259,7 +243,6 @@ GROUP BY category
 ORDER BY category;
 
 -- query 20
-set new_planner_agg_stage=2;
 SELECT
     'Test12_GROUP_AVG_DISTINCT_planner2' as test_name,
     category,
@@ -268,10 +251,8 @@ SELECT
 FROM ${case_db}.decimal256_agg_test
 GROUP BY category
 ORDER BY category;
-set new_planner_agg_stage=0;
 
 -- query 21
-set new_planner_agg_stage=0;
 SELECT
     'Test13_GROUP_BY_DECIMAL_DISTINCT_planner0' as test_name,
     p76s0,
@@ -285,7 +266,6 @@ GROUP BY p76s0
 ORDER BY p76s0;
 
 -- query 22
-set new_planner_agg_stage=2;
 SELECT
     'Test13_GROUP_BY_DECIMAL_DISTINCT_planner2' as test_name,
     p76s0,
@@ -297,40 +277,32 @@ FROM ${case_db}.decimal256_agg_test
 WHERE p76s0 IS NOT NULL
 GROUP BY p76s0
 ORDER BY p76s0;
-set new_planner_agg_stage=0;
 
 -- query 23
-set new_planner_agg_stage=0;
 SELECT DISTINCT 'Test14_SELECT_DISTINCT_SINGLE_planner0' as test_name, p40s10
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 ORDER BY p40s10;
 
 -- query 24
-set new_planner_agg_stage=2;
 SELECT DISTINCT 'Test14_SELECT_DISTINCT_SINGLE_planner2' as test_name, p40s10
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 ORDER BY p40s10;
-set new_planner_agg_stage=0;
 
 -- query 25
-set new_planner_agg_stage=0;
 SELECT DISTINCT 'Test15_SELECT_DISTINCT_MULTI_planner0' as test_name, p40s10, p50s15, p76s0
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 ORDER BY p40s10, p50s15;
 
 -- query 26
-set new_planner_agg_stage=2;
 SELECT DISTINCT 'Test15_SELECT_DISTINCT_MULTI_planner2' as test_name, p40s10, p50s15, p76s0
 FROM ${case_db}.decimal256_agg_test
 WHERE p40s10 IS NOT NULL
 ORDER BY p40s10, p50s15;
-set new_planner_agg_stage=0;
 
 -- query 27
-set new_planner_agg_stage=0;
 SELECT
     'Test16_COMPLEX_DISTINCT_planner0' as test_name,
     COUNT(DISTINCT p40s10) as count_distinct_p40s10,
@@ -342,7 +314,6 @@ SELECT
 FROM ${case_db}.decimal256_agg_test;
 
 -- query 28
-set new_planner_agg_stage=2;
 SELECT
     'Test16_COMPLEX_DISTINCT_planner2' as test_name,
     COUNT(DISTINCT p40s10) as count_distinct_p40s10,
@@ -352,10 +323,8 @@ SELECT
     SUM(DISTINCT p76s0) as sum_distinct_p76s0,
     AVG(DISTINCT p76s0) as avg_distinct_p76s0
 FROM ${case_db}.decimal256_agg_test;
-set new_planner_agg_stage=0;
 
 -- query 29
-set new_planner_agg_stage=0;
 SELECT
     'Test17_HAVING_DISTINCT_planner0' as test_name,
     p40s10,
@@ -369,7 +338,6 @@ HAVING COUNT(*) > 1
 ORDER BY p40s10;
 
 -- query 30
-set new_planner_agg_stage=2;
 SELECT
     'Test17_HAVING_DISTINCT_planner2' as test_name,
     p40s10,
@@ -381,7 +349,6 @@ WHERE p40s10 IS NOT NULL
 GROUP BY p40s10
 HAVING COUNT(*) > 1
 ORDER BY p40s10;
-set new_planner_agg_stage=0;
 
 -- query 31
 SELECT

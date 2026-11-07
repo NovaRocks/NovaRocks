@@ -29,11 +29,9 @@
 
 -- query 1
 -- @skip_result_check=true
-SET large_in_predicate_threshold=3;
 
 -- query 2
 -- @skip_result_check=true
-SET enable_large_in_predicate=true;
 
 -- query 3
 -- @skip_result_check=true
@@ -672,7 +670,6 @@ SELECT id, int_col FROM ${case_db}.t_int WHERE int_col NOT IN (1000, 2000, 3000,
 -- ============================================================
 -- query 71
 -- @skip_result_check=true
-SET enable_query_cache=true;
 
 -- query 72
 -- @order_sensitive=true
@@ -680,8 +677,6 @@ SELECT dim_id, count(dim_id) FROM ${case_db}.t_dimension WHERE dim_id IN (1,2,3,
 
 -- query 73
 -- @skip_result_check=true
-SET enable_query_cache=false;
 
 -- query 74
 -- @skip_result_check=true
-SET large_in_predicate_threshold=100000;

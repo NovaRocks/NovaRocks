@@ -456,10 +456,9 @@ pub(super) fn select_catalog_and_namespace(
     execute(
         context,
         conn,
-        "select managed MV catalog",
-        &format!("SET CATALOG {catalog}"),
-    )?;
-    execute(context, conn, "select managed MV namespace", "USE ns")
+        "select managed MV catalog and namespace",
+        &format!("USE {catalog}.ns"),
+    )
 }
 
 pub(super) fn assert_rows(

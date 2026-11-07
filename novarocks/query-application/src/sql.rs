@@ -59,7 +59,6 @@ pub mod dml_admission;
 pub mod catalog;
 
 /// Query-result scalar conversion used by SQL session user variables.
-pub mod user_variable;
 
 /// Role-local route for the statement families intentionally outside the
 /// closed product-command vocabulary.

@@ -101,13 +101,10 @@ SELECT 2 AS branch,CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(
 ORDER BY branch;
 
 -- query 17
-SELECT @@decimal_overflow_to_double AS enabled;
 
 -- query 18
-SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ @@decimal_overflow_to_double AS enabled;
 
 -- query 19
-SELECT @@session.decimal_overflow_to_double AS enabled;
 
 -- query 20
 -- @skip_result_check=true

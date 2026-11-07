@@ -27,13 +27,11 @@ pub enum TableFactor {
         metadata: Option<Ident>,
         alias: Option<TableAlias>,
         version: Option<TableVersion>,
-        hints: Vec<TableHint>,
         span: Span,
     },
     Derived {
         lateral: bool,
         subquery: Box<Query>,
-        hints: Vec<TableHint>,
         alias: Option<TableAlias>,
         span: Span,
     },
@@ -41,7 +39,6 @@ pub enum TableFactor {
         lateral: bool,
         syntax: TableFunctionSyntax,
         expr: Expr,
-        hints: Vec<TableHint>,
         alias: Option<TableAlias>,
         span: Span,
     },
@@ -98,18 +95,6 @@ pub struct TableVersion {
 pub enum TableVersionKind {
     ForSystemTimeAsOf,
     ForVersionAsOf,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TableHint {
-    pub name: Ident,
-    pub arguments: Vec<Expr>,
-    /// The expression selected by a pipe-style hint such as `[skew|key(1, 2)]`.
-    pub target: Option<Expr>,
-    /// Whether this postfix hint was written directly after its relation with
-    /// no intervening trivia, as in `table[_META_]`.
-    pub attached_to_relation: bool,
-    pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

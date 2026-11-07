@@ -75,11 +75,9 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 5
 -- @skip_result_check=true
-SET enable_optimize_skew_join_v1=false;
 
 -- query 6
 -- @skip_result_check=true
-SET enable_optimize_skew_join_v2=true;
 
 -- ============================================================
 -- TINYINT skew join v2
@@ -102,11 +100,11 @@ INSERT INTO ${case_db}.t2(c_key, c_tinyint) VALUES (1, 1), (2, 2), (3, 3);
 
 -- query 11
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- query 12
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_tinyint(1,2,8)] ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_tinyint=t2.c_tinyint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- INT skew join v2
@@ -129,11 +127,11 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 17
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_int(1,1234567,4444)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 18
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_int(1,1234567,4444)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- BIGINT skew join v2
@@ -156,11 +154,11 @@ INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 12345678912), (3, 
 
 -- query 23
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,12345678912,4444)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- query 24
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,12345678912,4444)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DATE skew join v2
@@ -185,11 +183,11 @@ INSERT INTO ${case_db}.t2(c_key, c_date) VALUES (1, "2024-01-01"), (2, "2024-01-
 
 -- query 29
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_date("2024-01-01","2024-01-02","2024-01-04")] ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
 
 -- query 30
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_date("2024-01-01","2024-01-02","2024-01-04")] ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_date=t2.c_date ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- STRING skew join v2
@@ -212,11 +210,11 @@ INSERT INTO ${case_db}.t2(c_key, c_string) VALUES ("1", "1"), ("2", "1234567"), 
 
 -- query 35
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_string("1","1234567","4444")] ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
 
 -- query 36
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_string("1","1234567","4444")] ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Cross-type: t1.c_int vs t2.c_bigint
@@ -239,11 +237,11 @@ INSERT INTO ${case_db}.t2(c_key, c_bigint) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 41
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_int(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- query 42
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_int(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_bigint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Expression-based join key: abs() with skew on build side
@@ -266,22 +264,22 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 47
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN [skew|t2.c_int(1,2,99999)] ${case_db}.t1 t1 ON abs(t1.c_bigint)=abs(t2.c_int) ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN  ${case_db}.t1 t1 ON abs(t1.c_bigint)=abs(t2.c_int) ORDER BY t1.c_key, t2.c_key;
 
 -- query 48
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN [skew|t2.c_int(1,2,99999)] ${case_db}.t1 t1 ON abs(t2.c_int) = abs(t1.c_bigint) ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN  ${case_db}.t1 t1 ON abs(t2.c_int) = abs(t1.c_bigint) ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Compound predicate: skew join with additional equality condition
 -- ============================================================
 -- query 49
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN [skew|t2.c_int(1,2,99999)] ${case_db}.t1 t1 ON t1.c_key = t2.c_key AND abs(t2.c_int) = abs(t1.c_bigint) ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 JOIN  ${case_db}.t1 t1 ON t1.c_key = t2.c_key AND abs(t2.c_int) = abs(t1.c_bigint) ORDER BY t1.c_key, t2.c_key;
 
 -- query 50
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t2.c_int(1,2,99999)] ${case_db}.t2 t2 ON t1.c_key = t2.c_key AND abs(t1.c_bigint) = abs(t2.c_int) ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_key = t2.c_key AND abs(t1.c_bigint) = abs(t2.c_int) ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- NULL skew values
@@ -303,10 +301,10 @@ INSERT INTO ${case_db}.t1(c_key, c_bigint) VALUES (1, null), (2, 1), (3, 2), (4,
 INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 2), (3, 3);
 
 -- query 55
-SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,null)] ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
+SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
 
 -- query 56
-SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(null)] ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
+SELECT count(*) FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON abs(t1.c_bigint)=abs(t2.c_int);
 
 -- ============================================================
 -- Skew join with multi-key and additional predicate + NULL results
@@ -329,48 +327,48 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (1, 1), (2, 1234567), (3, 3);
 
 -- query 61
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
 
 -- query 62
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
 
 -- query 63
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN  ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int AND t1.c_key = t2.c_key ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Skew join with LIMIT
 -- ============================================================
 -- query 64
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key LIMIT 2;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key LIMIT 2;
 
 -- query 65
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key LIMIT 2;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key LIMIT 2;
 
 -- ============================================================
 -- Non-matching skew values (no actual skew)
 -- ============================================================
 -- query 66
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(555,666,777)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 67
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(555,666,777)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- All-matching skew values
 -- ============================================================
 -- query 68
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,1234567,3)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 69
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,1234567,3)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Additional rows and 4 skew values
@@ -385,35 +383,35 @@ INSERT INTO ${case_db}.t2(c_key, c_int) VALUES (4,9);
 
 -- query 72
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,1234567,3,4)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 73
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,1234567,3,4)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- query 74
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN [skew|t1.c_bigint(1,1234567,3,4)] ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t2 t2 LEFT JOIN  ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- Aggregate queries with skew join
 -- ============================================================
 -- query 75
 -- @order_sensitive=true
-SELECT sum(t1.c_key), t1.c_bigint FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t1.c_bigint ORDER BY c_bigint LIMIT 1;
+SELECT sum(t1.c_key), t1.c_bigint FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t1.c_bigint ORDER BY c_bigint LIMIT 1;
 
 -- query 76
-SELECT sum(t2.c_key), t2.c_bigint FROM ${case_db}.t2 t2 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
+SELECT sum(t2.c_key), t2.c_bigint FROM ${case_db}.t2 t2 JOIN  ${case_db}.t1 t1 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
 
 -- query 77
 -- @order_sensitive=true
-SELECT sum(t1.c_key), t1.c_bigint FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t1.c_bigint ORDER BY c_bigint LIMIT 1;
+SELECT sum(t1.c_key), t1.c_bigint FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t1.c_bigint ORDER BY c_bigint LIMIT 1;
 
 -- query 78
-SELECT sum(t1.c_key), t2.c_bigint FROM ${case_db}.t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
+SELECT sum(t1.c_key), t2.c_bigint FROM ${case_db}.t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
 
 -- query 79
-SELECT sum(t1.c_key), t2.c_bigint FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
+SELECT sum(t1.c_key), t2.c_bigint FROM ${case_db}.t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int GROUP BY t2.c_bigint;
 
 -- ============================================================
 -- Large-scale skew data test
@@ -463,37 +461,37 @@ SELECT t.c_key % 1, t.c_key % 1 as c_tinyint, t.c_key % 1 as c_smallint, t.c_key
 FROM TABLE(generate_series(1, 4095*2)) t(c_key);
 
 -- query 86
-SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int;
 
 -- query 87
-SELECT count(1) FROM ${case_db}.t2 t2 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.skew_t1 t1 ON t1.c_bigint=t2.c_int;
+SELECT count(1) FROM ${case_db}.t2 t2 JOIN  ${case_db}.skew_t1 t1 ON t1.c_bigint=t2.c_int;
 
 -- query 88
-SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint;
 
 -- query 89
-SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_smallint=t2.c_smallint;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_smallint=t2.c_smallint;
 
 -- query 90
-SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int;
 
 -- query 91
-SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_string=t2.c_string;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string;
 
 -- query 92
-SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_int;
 
 -- query 93
-SELECT count(1) FROM ${case_db}.t2 t2 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.skew_t1 t1 ON t1.c_bigint=t2.c_int;
+SELECT count(1) FROM ${case_db}.t2 t2 LEFT JOIN  ${case_db}.skew_t1 t1 ON t1.c_bigint=t2.c_int;
 
 -- query 94
-SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_bigint=t2.c_bigint;
 
 -- query 95
-SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_int=t2.c_int;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_int=t2.c_int;
 
 -- query 96
-SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN [skew|t1.c_bigint(1,2,99999)] ${case_db}.t2 t2 ON t1.c_string=t2.c_string;
+SELECT count(1) FROM ${case_db}.skew_t1 t1 LEFT JOIN  ${case_db}.t2 t2 ON t1.c_string=t2.c_string;
 
 -- ============================================================
 -- MCV-based skew join: t_mcv_l / t_mcv_r
@@ -524,27 +522,21 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 101
 -- @skip_result_check=true
-SET enable_stats_to_optimize_skew_join = true;
 
 -- query 102
 -- @skip_result_check=true
-SET skew_join_use_mcv_count = 5;
 
 -- query 103
 -- @skip_result_check=true
-SET skew_join_data_skew_threshold = 0.1;
 
 -- query 104
 -- @skip_result_check=true
-SET skew_join_mcv_single_threshold = 0.05;
 
 -- query 105
 -- @skip_result_check=true
-SET skew_join_mcv_min_input_rows = 1000;
 
 -- query 106
 -- @skip_result_check=true
-SET broadcast_row_limit = 0;
 
 -- query 107
 -- @skip_result_check=true
@@ -577,52 +569,46 @@ ANALYZE TABLE ${case_db}.t_mcv_r;
 -- @skip_result_check=true
 
 -- query 115
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN[shuffle] ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 116
-WITH l AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_l), r AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_r) SELECT count(*) FROM l JOIN[shuffle] r ON l.k2 = r.k2;
+WITH l AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_l), r AS (SELECT (cast(k AS bigint) + 10) AS k2, v FROM ${case_db}.t_mcv_r) SELECT count(*) FROM l JOIN r ON l.k2 = r.k2;
 
 -- ============================================================
 -- MCV thresholds: high skew threshold
 -- ============================================================
 -- query 117
 -- @skip_result_check=true
-SET skew_join_data_skew_threshold = 0.9;
 
 -- query 118
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN[shuffle] ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 119
 -- @skip_result_check=true
-SET skew_join_data_skew_threshold = 0.1;
 
 -- ============================================================
 -- MCV thresholds: high single threshold
 -- ============================================================
 -- query 120
 -- @skip_result_check=true
-SET skew_join_mcv_single_threshold = 0.3;
 
 -- query 121
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN[shuffle] ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 122
 -- @skip_result_check=true
-SET skew_join_mcv_single_threshold = 0.05;
 
 -- ============================================================
 -- MCV thresholds: high min input rows
 -- ============================================================
 -- query 123
 -- @skip_result_check=true
-SET skew_join_mcv_min_input_rows = 20000;
 
 -- query 124
-SELECT count(*) FROM ${case_db}.t_mcv_l JOIN[shuffle] ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l JOIN ${case_db}.t_mcv_r ON ${case_db}.t_mcv_l.k = ${case_db}.t_mcv_r.k;
 
 -- query 125
 -- @skip_result_check=true
-SET skew_join_mcv_min_input_rows = 1000;
 
 -- ============================================================
 -- MCV right-side skew: t_mcv_l2 / t_mcv_r2
@@ -679,10 +665,10 @@ ANALYZE TABLE ${case_db}.t_mcv_r2;
 -- @skip_result_check=true
 
 -- query 137
-SELECT count(*) FROM ${case_db}.t_mcv_l2 JOIN[shuffle] ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l2 JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
 
 -- query 138
-SELECT count(*) FROM ${case_db}.t_mcv_l2 LEFT JOIN[shuffle] ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
+SELECT count(*) FROM ${case_db}.t_mcv_l2 LEFT JOIN ${case_db}.t_mcv_r2 ON ${case_db}.t_mcv_l2.k = ${case_db}.t_mcv_r2.k;
 
 -- query 139
 -- @skip_result_check=true
@@ -750,7 +736,7 @@ ANALYZE TABLE ${case_db}.t_null_r;
 -- @skip_result_check=true
 
 -- query 153
-SELECT count(*) FROM ${case_db}.t_null_l LEFT JOIN[shuffle] ${case_db}.t_null_r ON ${case_db}.t_null_l.k = ${case_db}.t_null_r.k;
+SELECT count(*) FROM ${case_db}.t_null_l LEFT JOIN ${case_db}.t_null_r ON ${case_db}.t_null_l.k = ${case_db}.t_null_r.k;
 
 -- ============================================================
 -- Cleanup

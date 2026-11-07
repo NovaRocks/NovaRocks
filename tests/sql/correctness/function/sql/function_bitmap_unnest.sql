@@ -59,7 +59,6 @@ select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) AS
 
 -- query 6
 -- @skip_result_check=true
-set enable_rewrite_unnest_bitmap_to_array=true;
 
 -- query 7
 -- @skip_result_check=true

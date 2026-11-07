@@ -55,8 +55,7 @@ TBLPROPERTIES ("format-version" = "3",
 INSERT INTO mv_phase4a_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10), (1, 20), (2, 40), (3, 0);
 
-SET CATALOG mv_phase4a_${uuid0};
-USE ns_${uuid0};
+USE mv_phase4a_${uuid0}.ns_${uuid0};
 
 CREATE MATERIALIZED VIEW proj_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 2

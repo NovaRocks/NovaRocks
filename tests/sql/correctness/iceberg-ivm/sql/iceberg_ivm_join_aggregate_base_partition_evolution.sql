@@ -56,8 +56,7 @@ CREATE TABLE ice_ivm_join_agg_part_${uuid0}.ns_${uuid0}.dim (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_ivm_join_agg_part_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_join_agg_part_${uuid0}.ns_${uuid0};
 INSERT INTO dim VALUES (10, 'east'), (20, 'west');
 INSERT INTO fact VALUES (1, 10, 100), (2, 10, 200), (3, 20, 50);
 CREATE MATERIALIZED VIEW join_agg_mv_${uuid0}

@@ -49,8 +49,7 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
-USE ${case_db};
+USE iceberg_compat_${suite_uuid0}.${case_db};
 CREATE MATERIALIZED VIEW mv_spark_refresh_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -93,6 +92,5 @@ ORDER BY id;
 -- query 8
 -- @cleanup=true
 -- @skip_result_check=true
-SET CATALOG iceberg_compat_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_spark_refresh_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_spark_refresh_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_mv_base_${uuid0} FORCE;

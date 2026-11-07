@@ -46,7 +46,7 @@ insert into user_tags values('2023-04-13', 2, 'e', 5);
 insert into user_tags values('2023-04-13', 3, 'e', 6);
 
 -- query 9
-set count_distinct_implementation='ndv';
+
 
 -- query 10
 select user_id, count(distinct tag_id), count(distinct user_name) from user_tags group by user_id order by user_id;
@@ -55,7 +55,7 @@ select user_id, count(distinct tag_id), count(distinct user_name) from user_tags
 select count(distinct tag_id), count(distinct user_name) from user_tags;
 
 -- query 12
-set count_distinct_implementation='multi_count_distinct';
+
 
 -- query 13
 select user_id, count(distinct tag_id), count(distinct user_name) from user_tags group by user_id order by user_id;
@@ -64,7 +64,7 @@ select user_id, count(distinct tag_id), count(distinct user_name) from user_tags
 select count(distinct tag_id), count(distinct user_name) from user_tags;
 
 -- query 15
-set count_distinct_implementation='default';
+
 
 -- query 16
 create materialized view test_mv1
@@ -75,7 +75,7 @@ as select user_id, bitmap_union(to_bitmap(tag_id)), bitmap_union(to_bitmap(user_
 refresh materialized view test_mv1 with sync mode;
 
 -- query 18
-set enable_count_distinct_rewrite_by_hll_bitmap=true;
+
 
 -- query 19
 -- Current NovaRocks rewrites the bitmap-based distinct aggregation through the MV.
@@ -95,7 +95,7 @@ select user_id, count(distinct tag_id), count(distinct user_name) from user_tags
 select count(distinct tag_id), count(distinct user_name) from user_tags;
 
 -- query 23
-set enable_count_distinct_rewrite_by_hll_bitmap=false;
+
 
 -- query 24
 -- @result_not_contains=MaterializedView: true
@@ -125,7 +125,7 @@ as select user_id, time, hll_union(hll_hash(tag_id)) as agg1, hll_union(hll_hash
 refresh materialized view test_mv1 with sync mode;
 
 -- query 31
-set enable_count_distinct_rewrite_by_hll_bitmap=true;
+
 
 -- query 32
 -- Current NovaRocks can rewrite the grouped count-distinct query through the HLL MV.
@@ -146,7 +146,7 @@ select user_id, count(distinct tag_id), count(distinct user_name) from user_tags
 select count(distinct tag_id), count(distinct user_name) from user_tags;
 
 -- query 36
-set enable_count_distinct_rewrite_by_hll_bitmap=false;
+
 
 -- query 37
 -- @result_not_contains=MaterializedView: true

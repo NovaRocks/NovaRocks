@@ -40,7 +40,7 @@ create materialized view mv_2 refresh manual as select v1.k1,v1.sum_v1,t1.v1 fro
 refresh materialized view mv_2 with sync mode;
 
 -- query 6
-set enable_view_based_mv_rewrite = true;
+
 
 -- query 7
 -- @skip_result_check=true

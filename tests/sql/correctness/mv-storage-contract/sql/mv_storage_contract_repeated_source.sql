@@ -76,11 +76,10 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.moves VALUES
 
 -- query 5
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
 
 -- query 6
 -- @skip_result_check=true
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 
 -- query 7
 -- Two occurrences of `moves`: outgoing and the incoming it is matched against.
@@ -98,14 +97,12 @@ GROUP BY out.account;
 -- @skip_result_check=true
 -- @result_contains=move_balance
 -- @result_contains=MANAGEABLE
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 9
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW move_balance WITH SYNC MODE;
 
 -- query 10
@@ -118,8 +115,7 @@ ORDER BY account;
 
 -- query 11
 -- @skip_result_check=true
-SET CATALOG mvsc_${uuid0};
-USE ns_${uuid0};
+USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW move_balance;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.moves FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};

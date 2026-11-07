@@ -72,7 +72,7 @@ ADMIN SET FRONTEND CONFIG ("enable_colocate_mv_index" = "true");
 
 -- query 13
 -- bitmap
-select * from user_tags_mv1 [_SYNC_MV_] order by user_id;
+select * from user_tags_mv1  order by user_id;
 
 -- query 14
 select user_id, count(distinct tag_id) from user_tags group by user_id order by user_id;
@@ -85,7 +85,7 @@ select user_id, bitmap_count(bitmap_union(to_bitmap(tag_id))) x from user_tags g
 
 -- query 17
 -- hll
-select * from user_tags_hll_mv1 [_SYNC_MV_] order by user_id;
+select * from user_tags_hll_mv1  order by user_id;
 
 -- query 18
 select user_id, approx_count_distinct(tag_id) x from user_tags group by user_id order by user_id;
@@ -100,7 +100,7 @@ select user_id, hll_union_agg(hll_hash(tag_id)) x from user_tags group by user_i
 select user_id, hll_cardinality(hll_union(hll_hash(tag_id))) x from user_tags group by user_id order by user_id;
 
 -- query 22
-select * from user_tags_percential_mv1 [_SYNC_MV_] order by user_id;
+select * from user_tags_percential_mv1  order by user_id;
 
 -- query 23
 -- percentile

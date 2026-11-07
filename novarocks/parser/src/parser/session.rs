@@ -20,14 +20,13 @@
 use crate::{
     ParseError, Span, Token, TokenKind,
     ast::{
-        Ident, KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
-        SetTarget, SetValue, SetWord, Statement, TransactionControlKind,
-        TransactionControlStatement, UseStatement, UserVariable,
+        KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
+        Statement, TransactionControlKind, TransactionControlStatement, UseStatement,
     },
-    token::{Keyword, Symbol},
+    token::Symbol,
 };
 
-use super::{StatementParser, pratt::PrattParser, query};
+use super::{StatementParser, pratt::PrattParser};
 
 pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
     if parser.current_is_word("SET") {
@@ -108,69 +107,14 @@ fn parse_set(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseErr
 
 fn parse_assignment(parser: &mut StatementParser<'_, '_>) -> Result<SetAssignment, ParseError> {
     let start = parser.current_span().start();
-    let mut scope = parse_optional_scope(parser);
-    let target = if parser.current_is_word("NAMES") {
-        let target_span = parser.consume_word("NAMES")?;
-        let mut words = vec![parse_set_word(parser)?];
-        if parser.current_is_word("COLLATE") {
-            let collate_span = parser.consume_word("COLLATE")?;
-            words.push(SetWord::Ident(Ident {
-                value: "COLLATE".to_owned(),
-                quoted: false,
-                quote_style: None,
-                span: collate_span,
-            }));
-            words.push(parse_set_word(parser)?);
-        }
-        return Ok(SetAssignment {
-            scope,
-            target: SetTarget::Names { span: target_span },
-            span: Span::new(
-                start,
-                words.last().expect("NAMES value is present").span().end(),
-            ),
-            value: SetValue::Words(words),
-        });
-    } else if parser.current_is_word("TRANSACTION") {
-        let target_span = parser.consume_word("TRANSACTION")?;
-        let words = parse_words_until_assignment_end(parser)?;
-        return Ok(SetAssignment {
-            scope,
-            target: SetTarget::Transaction { span: target_span },
-            span: Span::new(
-                start,
-                words
-                    .last()
-                    .expect("TRANSACTION value is present")
-                    .span()
-                    .end(),
-            ),
-            value: SetValue::Words(words),
-        });
-    } else if parser.current_is_word("CATALOG") {
-        let target_span = parser.consume_word("CATALOG")?;
-        let value = if parser.consume_if_symbol(Symbol::Eq) {
-            parse_assignment_value(parser)?
-        } else {
-            let value = parser.parse_contextual_ident()?;
-            SetValue::Words(vec![SetWord::Ident(value)])
-        };
-        return Ok(SetAssignment {
-            scope,
-            target: SetTarget::Catalog { span: target_span },
-            span: Span::new(start, value.span().end()),
-            value,
-        });
-    } else {
-        parse_variable_target(parser, &mut scope)?
-    };
-
+    let scope = parse_optional_scope(parser);
+    let name = parser.parse_contextual_ident()?;
     parser.consume_symbol(Symbol::Eq)?;
-    let value = parse_assignment_value(parser)?;
+    let value = parse_expression_until_assignment_end(parser)?;
     let end = value.span().end();
     Ok(SetAssignment {
         scope,
-        target,
+        name,
         value,
         span: Span::new(start, end),
     })
@@ -186,89 +130,6 @@ fn parse_optional_scope(parser: &mut StatementParser<'_, '_>) -> SetScope {
     } else {
         SetScope::Default
     }
-}
-
-fn parse_variable_target(
-    parser: &mut StatementParser<'_, '_>,
-    scope: &mut SetScope,
-) -> Result<SetTarget, ParseError> {
-    if matches!(
-        parser.current().map(|token| &token.kind),
-        Some(TokenKind::UserVariable)
-    ) {
-        let variable_span = parser.current_span();
-        let raw_variable = parser.source_slice(variable_span).to_owned();
-        parser.advance();
-        parser.skip_trivia();
-        if !raw_variable.starts_with("@@") {
-            return Ok(SetTarget::UserVariable(UserVariable {
-                value: raw_variable,
-                span: variable_span,
-            }));
-        }
-
-        let mut name = raw_variable.trim_start_matches("@@").to_owned();
-        let mut span = variable_span;
-        if parser.consume_if_symbol(Symbol::Dot) {
-            let suffix = parser.parse_contextual_ident()?;
-            span = Span::new(variable_span.start(), suffix.span.end());
-            let qualifier = name.to_ascii_lowercase();
-            if matches!(*scope, SetScope::Default) {
-                *scope = match qualifier.as_str() {
-                    "session" => SetScope::Session,
-                    "local" => SetScope::Local,
-                    "global" => SetScope::Global,
-                    _ => SetScope::Default,
-                };
-            }
-            name = if matches!(qualifier.as_str(), "session" | "local" | "global") {
-                suffix.value
-            } else {
-                format!("{name}.{}", suffix.value)
-            };
-        }
-        return Ok(SetTarget::SystemVariable(Ident {
-            value: name,
-            quoted: false,
-            quote_style: None,
-            span,
-        }));
-    }
-
-    Ok(SetTarget::SystemVariable(parser.parse_contextual_ident()?))
-}
-
-fn parse_assignment_value(parser: &mut StatementParser<'_, '_>) -> Result<SetValue, ParseError> {
-    if parser.current_is_word("ON") || parser.current_is_word("OFF") {
-        return parser
-            .parse_contextual_ident()
-            .map(|value| SetValue::Words(vec![SetWord::Ident(value)]));
-    }
-    if parenthesized_query_follows(parser) {
-        parser.consume_symbol(Symbol::LParen)?;
-        let query = query::parse_query(parser)?;
-        parser.consume_symbol(Symbol::RParen)?;
-        return Ok(SetValue::Query(Box::new(query)));
-    }
-    parse_expression_until_assignment_end(parser).map(SetValue::Expression)
-}
-
-fn parenthesized_query_follows(parser: &StatementParser<'_, '_>) -> bool {
-    if !parser.current_is_symbol(Symbol::LParen) {
-        return false;
-    }
-    parser
-        .tokens
-        .iter()
-        .skip(parser.position + 1)
-        .find(|token| !matches!(token.kind, TokenKind::Trivia(_)))
-        .is_some_and(|token| {
-            matches!(
-                token.kind,
-                TokenKind::Keyword(Keyword::Select | Keyword::Values | Keyword::With)
-                    | TokenKind::Symbol(Symbol::LParen)
-            )
-        })
 }
 
 fn parse_expression_until_assignment_end(
@@ -309,32 +170,6 @@ fn assignment_value_end(parser: &StatementParser<'_, '_>) -> usize {
         end += 1;
     }
     end
-}
-
-fn parse_words_until_assignment_end(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<SetWord>, ParseError> {
-    let mut words = Vec::new();
-    while !parser.is_end()
-        && !parser.current_is_symbol(Symbol::Comma)
-        && !parser.current_is_symbol(Symbol::Semicolon)
-    {
-        words.push(parse_set_word(parser)?);
-    }
-    if words.is_empty() {
-        return Err(parser.unexpected("transaction characteristics"));
-    }
-    Ok(words)
-}
-
-fn parse_set_word(parser: &mut StatementParser<'_, '_>) -> Result<SetWord, ParseError> {
-    if matches!(
-        parser.current().map(|token| &token.kind),
-        Some(TokenKind::String)
-    ) {
-        return parser.parse_literal().map(SetWord::Literal);
-    }
-    parser.parse_contextual_ident().map(SetWord::Ident)
 }
 
 fn parse_use(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
@@ -381,8 +216,8 @@ fn parse_kill(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
 mod tests {
     use crate::{
         ast::{
-            KillKind, SessionStatement, SetScope, SetTarget, SetValue, SetWord, Statement,
-            StatisticsStatement, TransactionControlKind,
+            KillKind, SessionStatement, SetScope, Statement, StatisticsStatement,
+            TransactionControlKind,
         },
         parser,
         printer::print_statement,
@@ -391,7 +226,7 @@ mod tests {
     #[test]
     fn parses_independently_scoped_set_assignments() {
         let statements = parser::parse(
-            "SET SESSION query_timeout = 1, GLOBAL pipeline_dop = 2, LOCAL @answer = '42'",
+            "SET SESSION query_timeout = 1, GLOBAL pipeline_dop = 2, LOCAL sql_mode = '42'",
         )
         .expect("SET assignments should parse");
         let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
@@ -401,53 +236,38 @@ mod tests {
         assert_eq!(set.assignments[0].scope, SetScope::Session);
         assert_eq!(set.assignments[1].scope, SetScope::Global);
         assert_eq!(set.assignments[2].scope, SetScope::Local);
-        assert!(matches!(
-            &set.assignments[2].target,
-            SetTarget::UserVariable(_)
-        ));
-        assert!(matches!(&set.assignments[2].value, SetValue::Expression(_)));
+        assert_eq!(set.assignments[2].name.value, "sql_mode");
     }
 
     #[test]
-    fn parses_qualified_variable_scope_and_special_set_forms() {
-        let statements = parser::parse(
-            "SET @@session.query_timeout = 1, @@global.pipeline_dop = 2; \
-             SET NAMES 'utf8' COLLATE 'utf8_general_ci'; \
-             SET TRANSACTION ISOLATION LEVEL READ COMMITTED; \
-             SET CATALOG warehouse; SET CATALOG = warehouse",
-        )
-        .expect("session forms should parse");
-        let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
-            panic!("expected SET statement");
-        };
-        assert_eq!(set.assignments[0].scope, SetScope::Session);
-        assert_eq!(set.assignments[1].scope, SetScope::Global);
-        assert!(matches!(
-            &set.assignments[0].target,
-            SetTarget::SystemVariable(_)
-        ));
-        for statement in &statements[1..] {
-            assert!(matches!(
-                statement,
-                Statement::Session(SessionStatement::Set(_))
-            ));
+    fn rejects_retired_session_syntax() {
+        for source in [
+            "SELECT @x",
+            "SELECT @@time_zone",
+            "SET @x = 1",
+            "SET NAMES utf8",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET CATALOG warehouse",
+            "SET SESSION TRANSACTION READ ONLY",
+            "SET pipeline_dop = on",
+        ] {
+            assert!(parser::parse(source).is_err(), "{source}");
         }
-        assert_eq!(
-            print_statement(&statements[1]),
-            "SET NAMES 'utf8' COLLATE 'utf8_general_ci'"
-        );
     }
 
     #[test]
-    fn parses_set_user_variable_query_use_and_all_kill_forms() {
+    fn parses_expression_assignment_use_and_all_kill_forms() {
         let statements = parser::parse(
-            "SET @answer = (SELECT 42); USE `catalog`.`analytics`; KILL 1; KILL QUERY 2; KILL CONNECTION 3",
+            "SET pipeline_dop = (SELECT 42); USE `catalog`.`analytics`; KILL 1; KILL QUERY 2; KILL CONNECTION 3",
         )
         .expect("session statements should parse");
         let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
             panic!("expected SET statement");
         };
-        assert!(matches!(&set.assignments[0].value, SetValue::Query(_)));
+        assert!(matches!(
+            &set.assignments[0].value,
+            crate::ast::Expr::Subquery(_)
+        ));
         let Statement::Session(SessionStatement::Use(use_statement)) = &statements[1] else {
             panic!("expected USE statement");
         };
@@ -498,28 +318,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_set_boolean_values_without_widening_expression_grammar() {
+    fn set_values_use_the_ordinary_expression_grammar() {
         let statements =
-            parser::parse("SET disable_function_fold_constants = on, enable_eliminate_agg = off")
-                .expect("SET boolean assignments should parse");
+            parser::parse("SET pipeline_dop = 1 + 2, enable_eliminate_agg = off").unwrap();
         let Statement::Session(SessionStatement::Set(set)) = &statements[0] else {
-            panic!("expected SET statement");
+            panic!("expected SET");
         };
         assert!(matches!(
-            set.assignments[0].value,
-            SetValue::Words(ref words)
-                if matches!(words.as_slice(), [SetWord::Ident(value)] if value.value.eq_ignore_ascii_case("on"))
+            &set.assignments[0].value,
+            crate::ast::Expr::Binary(_)
         ));
         assert!(matches!(
-            set.assignments[1].value,
-            SetValue::Words(ref words)
-                if matches!(words.as_slice(), [SetWord::Ident(value)] if value.value.eq_ignore_ascii_case("off"))
+            &set.assignments[1].value,
+            crate::ast::Expr::Identifier(_)
         ));
         assert_eq!(
             print_statement(&statements[0]),
-            "SET disable_function_fold_constants = on, enable_eliminate_agg = off"
+            "SET pipeline_dop = 1 + 2, enable_eliminate_agg = off"
         );
-        assert!(parser::parse("SELECT on").is_err());
+        assert!(parser::parse("SET pipeline_dop = on").is_err());
     }
 
     #[test]

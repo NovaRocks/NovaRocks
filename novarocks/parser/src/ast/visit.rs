@@ -92,10 +92,6 @@ pub trait Visit {
         walk_literal(self, literal);
     }
 
-    fn visit_user_variable(&mut self, variable: &UserVariable) {
-        walk_user_variable(self, variable);
-    }
-
     fn visit_expr(&mut self, expression: &Expr) {
         walk_expr(self, expression);
     }
@@ -209,8 +205,6 @@ pub fn walk_type_name<V: Visit + ?Sized>(visitor: &mut V, type_name: &TypeName) 
 }
 
 pub fn walk_literal<V: Visit + ?Sized>(_: &mut V, _: &Literal) {}
-
-pub fn walk_user_variable<V: Visit + ?Sized>(_: &mut V, _: &UserVariable) {}
 
 pub fn walk_explain_query<V: Visit + ?Sized>(visitor: &mut V, query: &ExplainQuery) {
     visitor.visit_query(&query.query);
@@ -359,7 +353,6 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
             metadata,
             alias,
             version,
-            hints,
             ..
         } => {
             visitor.visit_object_name(name);
@@ -372,49 +365,17 @@ pub fn walk_table_factor<V: Visit + ?Sized>(visitor: &mut V, factor: &TableFacto
             if let Some(version) = version {
                 visitor.visit_expr(&version.value);
             }
-            for hint in hints {
-                visitor.visit_ident(&hint.name);
-                for argument in &hint.arguments {
-                    visitor.visit_expr(argument);
-                }
-                if let Some(target) = &hint.target {
-                    visitor.visit_expr(target);
-                }
-            }
         }
         TableFactor::Derived {
-            subquery,
-            hints,
-            alias,
-            ..
+            subquery, alias, ..
         } => {
             visitor.visit_query(subquery);
-            for hint in hints {
-                visitor.visit_ident(&hint.name);
-                for argument in &hint.arguments {
-                    visitor.visit_expr(argument);
-                }
-                if let Some(target) = &hint.target {
-                    visitor.visit_expr(target);
-                }
-            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
         }
-        TableFactor::TableFunction {
-            expr, hints, alias, ..
-        } => {
+        TableFactor::TableFunction { expr, alias, .. } => {
             visitor.visit_expr(expr);
-            for hint in hints {
-                visitor.visit_ident(&hint.name);
-                for argument in &hint.arguments {
-                    visitor.visit_expr(argument);
-                }
-                if let Some(target) = &hint.target {
-                    visitor.visit_expr(target);
-                }
-            }
             if let Some(alias) = alias {
                 walk_table_alias(visitor, alias);
             }
@@ -493,7 +454,6 @@ pub fn walk_expr<V: Visit + ?Sized>(visitor: &mut V, expression: &Expr) {
                 visitor.visit_ident(part);
             }
         }
-        Expr::UserVariable(variable) => visitor.visit_user_variable(variable),
         Expr::Literal(literal) => visitor.visit_literal(literal),
         Expr::FunctionCall(call) => visitor.visit_function_call(call),
         Expr::Unary(expression) => visitor.visit_unary_expr(expression),
@@ -717,10 +677,6 @@ pub trait Fold {
         fold_literal(self, literal)
     }
 
-    fn fold_user_variable(&mut self, variable: UserVariable) -> UserVariable {
-        fold_user_variable(self, variable)
-    }
-
     fn fold_expr(&mut self, expression: Expr) -> Expr {
         fold_expr(self, expression)
     }
@@ -851,25 +807,8 @@ pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Se
     match statement {
         SessionStatement::Set(statement) => {
             for assignment in &statement.assignments {
-                match &assignment.target {
-                    SetTarget::UserVariable(variable) => visitor.visit_user_variable(variable),
-                    SetTarget::SystemVariable(variable) => visitor.visit_ident(variable),
-                    SetTarget::Names { .. }
-                    | SetTarget::Transaction { .. }
-                    | SetTarget::Catalog { .. } => {}
-                }
-                match &assignment.value {
-                    SetValue::Expression(value) => visitor.visit_expr(value),
-                    SetValue::Query(value) => visitor.visit_query(value),
-                    SetValue::Words(words) => {
-                        for word in words {
-                            match word {
-                                SetWord::Ident(word) => visitor.visit_ident(word),
-                                SetWord::Literal(word) => visitor.visit_literal(word),
-                            }
-                        }
-                    }
-                }
+                visitor.visit_ident(&assignment.name);
+                visitor.visit_expr(&assignment.value);
             }
         }
         SessionStatement::Use(statement) => visitor.visit_ident(&statement.database),
@@ -885,32 +824,8 @@ pub fn fold_session_statement<F: Fold + ?Sized>(
     match statement {
         SessionStatement::Set(mut statement) => {
             for assignment in &mut statement.assignments {
-                assignment.target = match assignment.target.clone() {
-                    SetTarget::UserVariable(variable) => {
-                        SetTarget::UserVariable(folder.fold_user_variable(variable))
-                    }
-                    SetTarget::SystemVariable(variable) => {
-                        SetTarget::SystemVariable(folder.fold_ident(variable))
-                    }
-                    target @ (SetTarget::Names { .. }
-                    | SetTarget::Transaction { .. }
-                    | SetTarget::Catalog { .. }) => target,
-                };
-                assignment.value = match assignment.value.clone() {
-                    SetValue::Expression(value) => SetValue::Expression(folder.fold_expr(value)),
-                    SetValue::Query(value) => SetValue::Query(Box::new(folder.fold_query(*value))),
-                    SetValue::Words(words) => SetValue::Words(
-                        words
-                            .into_iter()
-                            .map(|word| match word {
-                                SetWord::Ident(word) => SetWord::Ident(folder.fold_ident(word)),
-                                SetWord::Literal(word) => {
-                                    SetWord::Literal(folder.fold_literal(word))
-                                }
-                            })
-                            .collect(),
-                    ),
-                };
+                assignment.name = folder.fold_ident(assignment.name.clone());
+                assignment.value = folder.fold_expr(assignment.value.clone());
             }
             SessionStatement::Set(statement)
         }
@@ -965,10 +880,6 @@ pub fn fold_type_name<F: Fold + ?Sized>(folder: &mut F, mut type_name: TypeName)
 
 pub fn fold_literal<F: Fold + ?Sized>(_: &mut F, literal: Literal) -> Literal {
     literal
-}
-
-pub fn fold_user_variable<F: Fold + ?Sized>(_: &mut F, variable: UserVariable) -> UserVariable {
-    variable
 }
 
 pub fn fold_explain_query<F: Fold + ?Sized>(
@@ -1206,7 +1117,6 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
             metadata,
             alias,
             version,
-            hints,
             span,
         } => TableFactor::Table {
             name: folder.fold_object_name(name),
@@ -1216,43 +1126,16 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
                 version.value = folder.fold_expr(version.value);
                 version
             }),
-            hints: hints
-                .into_iter()
-                .map(|mut hint| {
-                    hint.name = folder.fold_ident(hint.name);
-                    hint.arguments = hint
-                        .arguments
-                        .into_iter()
-                        .map(|argument| folder.fold_expr(argument))
-                        .collect();
-                    hint.target = hint.target.map(|target| folder.fold_expr(target));
-                    hint
-                })
-                .collect(),
             span,
         },
         TableFactor::Derived {
             lateral,
             subquery,
-            hints,
             alias,
             span,
         } => TableFactor::Derived {
             lateral,
             subquery: Box::new(folder.fold_query(*subquery)),
-            hints: hints
-                .into_iter()
-                .map(|mut hint| {
-                    hint.name = folder.fold_ident(hint.name);
-                    hint.arguments = hint
-                        .arguments
-                        .into_iter()
-                        .map(|argument| folder.fold_expr(argument))
-                        .collect();
-                    hint.target = hint.target.map(|target| folder.fold_expr(target));
-                    hint
-                })
-                .collect(),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             span,
         },
@@ -1260,26 +1143,12 @@ pub fn fold_table_factor<F: Fold + ?Sized>(folder: &mut F, factor: TableFactor) 
             lateral,
             syntax,
             expr,
-            hints,
             alias,
             span,
         } => TableFactor::TableFunction {
             lateral,
             syntax,
             expr: folder.fold_expr(expr),
-            hints: hints
-                .into_iter()
-                .map(|mut hint| {
-                    hint.name = folder.fold_ident(hint.name);
-                    hint.arguments = hint
-                        .arguments
-                        .into_iter()
-                        .map(|argument| folder.fold_expr(argument))
-                        .collect();
-                    hint.target = hint.target.map(|target| folder.fold_expr(target));
-                    hint
-                })
-                .collect(),
             alias: alias.map(|alias| fold_table_alias(folder, alias)),
             span,
         },
@@ -1382,7 +1251,6 @@ pub fn fold_expr<F: Fold + ?Sized>(folder: &mut F, expression: Expr) -> Expr {
                 .collect();
             Expr::CompoundIdentifier(ident)
         }
-        Expr::UserVariable(variable) => Expr::UserVariable(folder.fold_user_variable(variable)),
         Expr::Literal(literal) => Expr::Literal(folder.fold_literal(literal)),
         Expr::FunctionCall(call) => Expr::FunctionCall(folder.fold_function_call(call)),
         Expr::Unary(expression) => Expr::Unary(folder.fold_unary_expr(expression)),

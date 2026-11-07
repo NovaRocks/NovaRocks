@@ -58,7 +58,7 @@ INSERT INTO ${case_db}.t0 VALUES (null, null, null, null);
 INSERT INTO ${case_db}.t1 SELECT * FROM ${case_db}.t0;
 
 -- query 6
-SELECT count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) FROM ${case_db}.t0 l JOIN [colocate] ${case_db}.t1 r ON l.c0 = r.c0 AND l.c1 = r.c1;
+SELECT count(l.c0), avg(l.c0), count(l.c1), count(l.c0), count(r.c1) FROM ${case_db}.t0 l JOIN  ${case_db}.t1 r ON l.c0 = r.c0 AND l.c1 = r.c1;
 
 -- Failpoint queries (hash_join_append_bad_alloc, hash_join_build_bad_alloc) removed:
 -- NovaRocks does not support C++ failpoint injection (ADMIN ENABLE/DISABLE FAILPOINT).

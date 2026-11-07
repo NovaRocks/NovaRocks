@@ -50,7 +50,6 @@ select bool_or(c0), boolor_agg(c1), bool_or(c2), bool_or(c3), bool_or(null) from
 -- query 6
 -- @skip_result_check=true
 USE ${case_db};
-set streaming_preaggregation_mode="force_streaming";
 
 -- query 7
 USE ${case_db};

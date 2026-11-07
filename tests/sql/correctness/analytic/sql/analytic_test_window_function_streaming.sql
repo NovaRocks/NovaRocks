@@ -138,7 +138,7 @@ SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT sum(v3) OVER (PARTITION 
 SELECT COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT avg(v3) OVER (PARTITION BY v2 ORDER BY v1) AS wv FROM ${case_db}.t1)a;
 
 -- query 16
-SELECT /*+ SET_VAR(pipeline_dop='1')*/ COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(cume_dist() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
 
 -- query 17
-SELECT /*+ SET_VAR(pipeline_dop='1')*/ COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;
+SELECT  COUNT(*), SUM(wv), MIN(wv), MAX(wv) FROM (SELECT CAST(percent_rank() OVER (PARTITION BY v2 ORDER BY v1) AS decimal64(18,5)) AS wv FROM ${case_db}.t1)a;

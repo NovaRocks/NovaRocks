@@ -34,7 +34,6 @@ SET pipeline_dop = 1;
 
 -- query 2
 -- @skip_result_check=true
-SET join_late_materialization = true;
 
 -- query 3
 -- @skip_result_check=true
@@ -135,25 +134,25 @@ INSERT INTO ${case_db}.lm_nullable_t2 VALUES
 -- query 15
 -- @order_sensitive=true
 -- inner join, output all columns
-SELECT * FROM ${case_db}.lm_t1 INNER JOIN [broadcast] ${case_db}.lm_t2
+SELECT * FROM ${case_db}.lm_t1 INNER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 16
 -- @order_sensitive=true
 -- inner join, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 INNER JOIN [broadcast] ${case_db}.lm_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 INNER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 17
 -- @order_sensitive=true
 -- inner join, empty result from other predicate
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 INNER JOIN [broadcast] ${case_db}.lm_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 INNER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 + 55 ORDER BY t1_c2;
 
 -- query 18
 -- @order_sensitive=true
 -- right outer join, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 RIGHT OUTER JOIN [shuffle] ${case_db}.lm_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 RIGHT OUTER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t2_c2;
 
 -- query 19
@@ -163,43 +162,43 @@ TRUNCATE TABLE ${case_db}.lm_t2;
 -- query 20
 -- @order_sensitive=true
 -- left outer join with empty build table, output all columns
-SELECT * FROM ${case_db}.lm_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_t2
+SELECT * FROM ${case_db}.lm_t1 LEFT OUTER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 21
 -- @order_sensitive=true
 -- left outer join with empty build table, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 LEFT OUTER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 22
 -- @order_sensitive=true
 -- left outer join with empty build table and other predicate offset
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_t1 LEFT OUTER JOIN  ${case_db}.lm_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 + 55 ORDER BY t1_c2;
 
 -- query 23
 -- @order_sensitive=true
 -- nullable inner join, output all columns
-SELECT * FROM ${case_db}.lm_nullable_t1 INNER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT * FROM ${case_db}.lm_nullable_t1 INNER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 24
 -- @order_sensitive=true
 -- nullable inner join, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 INNER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 INNER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 25
 -- @order_sensitive=true
 -- nullable inner join, empty result from other predicate
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 INNER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 INNER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 + 55 ORDER BY t1_c2;
 
 -- query 26
 -- @order_sensitive=true
 -- nullable right outer join, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 RIGHT OUTER JOIN [shuffle] ${case_db}.lm_nullable_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 RIGHT OUTER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t2_c2, t2_c1;
 
 -- query 27
@@ -209,19 +208,19 @@ TRUNCATE TABLE ${case_db}.lm_nullable_t2;
 -- query 28
 -- @order_sensitive=true
 -- nullable left outer join with empty build table, output all columns
-SELECT * FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT * FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 29
 -- @order_sensitive=true
 -- nullable left outer join with empty build table, output partial columns
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 ORDER BY t1_c2;
 
 -- query 30
 -- @order_sensitive=true
 -- nullable left outer join with empty build table and other predicate offset
-SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN [broadcast] ${case_db}.lm_nullable_t2
+SELECT t1_c3, t1_c4, t2_c3, t2_c4 FROM ${case_db}.lm_nullable_t1 LEFT OUTER JOIN  ${case_db}.lm_nullable_t2
   ON t1_c1 = t2_c1 AND t1_c2 > t2_c2 + 55 ORDER BY t1_c2;
 
 -- query 31
@@ -230,4 +229,3 @@ SET pipeline_dop = 0;
 
 -- query 32
 -- @skip_result_check=true
-SET join_late_materialization = false;

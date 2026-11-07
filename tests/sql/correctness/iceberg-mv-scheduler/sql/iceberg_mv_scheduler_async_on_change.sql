@@ -52,8 +52,7 @@ TBLPROPERTIES ("format-version" = "3",
 INSERT INTO ice_mv_sched_change_${uuid0}.ns_${uuid0}.orders VALUES
   (1, 10),
   (2, 20);
-SET CATALOG ice_mv_sched_change_${uuid0};
-USE ns_${uuid0};
+USE ice_mv_sched_change_${uuid0}.ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_change_mv_${uuid0}
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 REFRESH ASYNC ON CHANGE

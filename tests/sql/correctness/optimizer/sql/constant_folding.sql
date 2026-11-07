@@ -114,7 +114,7 @@ SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 --    assertions cannot accidentally match a parsed expression in a column label.
 -- ---------------------------------------------------------------------------
 SET disable_optimizer_rules = '';
-SET sql_mode = 32;
+SET sql_mode = '32';
 
 -- @explain_contains=['MIXED' AS folded_upper]
 SELECT upper('MiXeD') AS folded_upper;
@@ -261,5 +261,5 @@ EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 -- @expect_sql_code=query.execution.numeric_out_of_range
 SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
-SET sql_mode = 32;
+SET sql_mode = '32';
 SET disable_optimizer_rules = '';

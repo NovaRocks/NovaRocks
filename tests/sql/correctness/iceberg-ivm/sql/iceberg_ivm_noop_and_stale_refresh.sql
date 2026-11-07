@@ -57,8 +57,7 @@ INSERT INTO ice_ivm_noop_${uuid0}.ns_${uuid0}.orders VALUES
   (2, 20, 'west'),
   (3, 0, 'skip');
 
-SET CATALOG ice_ivm_noop_${uuid0};
-USE ns_${uuid0};
+USE ice_ivm_noop_${uuid0}.ns_${uuid0};
 
 CREATE MATERIALIZED VIEW orders_mv
 DISTRIBUTED BY HASH(order_id) BUCKETS 2

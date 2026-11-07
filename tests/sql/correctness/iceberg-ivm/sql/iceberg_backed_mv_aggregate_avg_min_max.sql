@@ -64,8 +64,7 @@ INSERT INTO mv_agg2_${uuid0}.ns_${uuid0}.measurements VALUES
   (1, 20,   200.0000, 'banana', '2024-02-01 00:00:00'),
   (1, NULL, NULL,     NULL,     NULL),
   (2, 5,    50.2500,  'cherry', '2024-03-15 12:00:00');
-SET CATALOG mv_agg2_${uuid0};
-USE ns_${uuid0};
+USE mv_agg2_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true

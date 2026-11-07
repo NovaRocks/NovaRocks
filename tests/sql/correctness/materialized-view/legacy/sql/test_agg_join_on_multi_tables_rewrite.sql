@@ -21,7 +21,7 @@
 -- Source: dev/test/sql/test_materialized_view/T/test_view_based_mv_rewrite
 
 -- query 1
-set enable_view_based_mv_rewrite = true;
+
 
 -- query 2
 CREATE TABLE `t1` (

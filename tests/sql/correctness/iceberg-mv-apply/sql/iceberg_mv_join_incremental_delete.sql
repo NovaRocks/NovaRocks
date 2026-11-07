@@ -56,8 +56,7 @@ CREATE TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
-SET CATALOG ice_mv_apply_${uuid0};
-USE ns_${uuid0};
+USE ice_mv_apply_${uuid0}.ns_${uuid0};
 
 -- query 2
 -- @skip_result_check=true
