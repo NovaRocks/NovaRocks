@@ -117,17 +117,17 @@ code-anchors:
 
 领域哲学：join 的行拓扑（key → 枚举该 key 全部 build 行 + gather 物化）与聚合状态不同，分别归原消费者；实例内键相等类、typed 读取与 bulk 构建共享唯一索引。速度来自算法与数据布局（直接寻址、合并列存、选择向量、membership 零枚举、整列直发），不来自手写 SIMD。受支持 join 类型、null-safe 等值与残差谓词的独立结果必须保留；尚未支持的准确拒绝及既有隔离分别记录，不能冒充成功或正式准入。
 
-- [ADR-0219](ADR-0219-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
+- [ADR-0220](ADR-0220-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
 - [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — SharedBuild 为何分开 E/F/Q/T、原 K 工作、准确需求与 data-only 发布，并以增量候选和独立 tail 维持正常退休（active；部分替代 ADR-0004 的单 Chunk/整批选择向量/拒绝增量 cursor，补充 ADR-0205 的推进与 assignment 交接）
-- [ADR-0205](ADR-0205-shared-local-key-index-and-consumer-row-topology.md) — 实例内键相等类为何共用唯一索引、bulk 工作与完成协议为何分开，而 join 行关系与聚合状态仍归原消费者（active；部分替代 ADR-0004 的索引分家裁决；推进结果、调用方唤醒和范围 assignment 由 ADR-0212 补充，内容政策与指纹由 ADR-0219 补充）
+- [ADR-0205](ADR-0205-shared-local-key-index-and-consumer-row-topology.md) — 实例内键相等类为何共用唯一索引、bulk 工作与完成协议为何分开，而 join 行关系与聚合状态仍归原消费者（active；部分替代 ADR-0004 的索引分家裁决；推进结果、调用方唤醒和范围 assignment 由 ADR-0212 补充，内容政策与指纹由 ADR-0220 补充）
 - ADR-0004 — hash join 执行核心为何保留专有行拓扑与 selection/gather，且不写显式 SIMD（active；索引分家与旧 method 前提由 ADR-0205 部分替代；单 Chunk、整批选择向量和拒绝增量 cursor 由 ADR-0212 部分替代，行拓扑与正确性要求保留）
 
 ### pipeline-execution
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
-- [ADR-0219](ADR-0219-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
-- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0220](ADR-0220-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
+- [ADR-0219](ADR-0219-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0214](ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md) — 在线数据为何在准备期冻结完整布局、只传独立标准批次，并分开物理NULL、逻辑requiredness、原预算与真实线程退出（active；补充ADR-0209，普通root IPC保持）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0212](ADR-0212-shared-join-stages-and-exact-demand-retirement.md) — 本地 join 为何以实际 E/F/Q/T 与原 K 分区分别推进、仅 T>0 安装 Handoff，并分开正常退休与 Task 原因（active）
@@ -245,7 +245,7 @@ code-anchors:
 
 资源沿用原 executor、Transport 和结果预算；普通 Full 是可取消背压。完整依赖事实约束来源与责任，不构成另一套工作类别或依赖域配额。计算位置、仍活数据和残留责任分别退出，超时不证明实际退出。公平推进以资源可用、依赖能够返回为条件；共享 worker 全部永久阻塞时，健康请求与结算也可能不可用，不据此承诺故障隔离或新增 worker 最低数。
 
-- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0219](ADR-0219-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）
@@ -439,7 +439,7 @@ StateStore 的全局单值限制保持公共契约，record owner 负责自己�
 Iceberg；Paimon 仅支持已声明的只读快照，StarRocks 已废弃且不能恢复内部表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
-- [ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
+- [ADR-0219](ADR-0219-typed-task-summaries-and-per-kind-completion.md) — summary 为何按封闭种类声明准确作者、先冻结贡献单位、逐种类公平归并并独立核对 Root 与 Task 完成（active；补充 ADR-0206/0208，原发布、严格消费与真实退出保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
 - [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
@@ -464,7 +464,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
-- [ADR-0219](ADR-0219-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
+- [ADR-0220](ADR-0220-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
 - [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active；单次准备与执行观察已接线，验证范围与验收资格另核）
 - [ADR-0110](ADR-0110-lake-publication-crash-only-contract.md) — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active；本地期限推导外部效果上界及无条件年龄窗回收由 ADR-0198 部分替代，target OCC、autocommit 与无持久接管规则保留）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）

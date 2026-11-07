@@ -49,7 +49,7 @@ pub(crate) enum NullPolicy {
 }
 /// Equality is selected for each signed column before entering its row loop.
 /// Content identity always includes the root NULL class.
-// Design: ADR-0219 (docs/adr/ADR-0219-result-content-identity-and-deterministic-fingerprints.md)
+// Design: ADR-0220 (docs/adr/ADR-0220-result-content-identity-and-deterministic-fingerprints.md)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyEquality {
     SqlGrouping(NullPolicy),

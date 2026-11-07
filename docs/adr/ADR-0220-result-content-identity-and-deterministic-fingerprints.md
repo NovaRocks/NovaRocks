@@ -1,5 +1,5 @@
 ---
-id: ADR-0219
+id: ADR-0220
 title: "Result content identity is explicit and fingerprints remain evidence"
 domain: [join-execution, pipeline-execution, frontend-mv]
 status: active
@@ -9,7 +9,7 @@ date: 2026-11-07
 related:
   - "ADR-0205-shared-local-key-index-and-consumer-row-topology.md"
   - "ADR-0195-public-value-access-and-construction.md"
-  - "ADR-0218-typed-task-summaries-and-per-kind-completion.md"
+  - "ADR-0219-typed-task-summaries-and-per-kind-completion.md"
 provenance:
   - "discussion: 2026-11-07 explicit result-content identity within admitted capabilities, first-admitted representatives and deterministic evidence"
 code-anchors:
@@ -59,7 +59,7 @@ Rust 的 [NaN 位模式规定](https://github.com/rust-lang/rust/blob/1.98.1/lib
 3. **首次接纳有准确范围。** 类代表是该索引实际首次接纳的输入值；已有类不因后续相等输入更换代表。compact 与 typed export 保留其原位。bulk partial 可以按就绪顺序合并，因此不承诺全局 capture、page、task 或 SQL 源序中的首个 NaN。
 4. **载体归一化归原作者。** byte 使用原 DecodedBytes，复杂值使用原 Hydrate/projection 和准确 row mapping；identity、representative 与 fingerprint 复用一个 walker。物理 byte marker 的指纹归一化不改变原存储 decoder 或分布式路由格式，不扩大支持类型或猜测逻辑域。
 5. **确定指纹只作证据。** `PreparedKeyBatch::content_fingerprint` 对完整内容元组按顺序编码，使用固定 seed `0x4e52434f4e54454e` 的 XXH3-128，NaN 已规范化，合法载体不影响编码。同一冻结列合同与 exact material island 内可比较证据；不承诺跨任意版本的持久 hash 协议，也不承诺跨类型无碰撞。准确相等始终由 `KeyIndex` 比较决定；实例随机 local hash 不能充作该证据。
-6. **适用性由准入拥有。** 当前内容政策本身不证明某条查询可安全增量维护。增量内容额度与删除核验消费者必须按其实际表达式、函数、类型与可观察能力完成资格判断，保留准确输入耗尽、来源覆盖和失败语义；`KeySpec` 或指纹不能代替该判断。[ADR-0218](ADR-0218-typed-task-summaries-and-per-kind-completion.md) 的 summary 只传递核验事实，不决定业务结果。
+6. **适用性由准入拥有。** 当前内容政策本身不证明某条查询可安全增量维护。增量内容额度与删除核验消费者必须按其实际表达式、函数、类型与可观察能力完成资格判断，保留准确输入耗尽、来源覆盖和失败语义；`KeySpec` 或指纹不能代替该判断。[ADR-0219](ADR-0219-typed-task-summaries-and-per-kind-completion.md) 的 summary 只传递核验事实，不决定业务结果。
 
 ## 接受的妥协（诚实记录）
 

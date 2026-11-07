@@ -18,7 +18,7 @@
 //! Deterministic evidence for one already-admitted content tuple.
 //! This is never an equality oracle or a routing identity.
 
-// Design: ADR-0219 (docs/adr/ADR-0219-result-content-identity-and-deterministic-fingerprints.md)
+// Design: ADR-0220 (docs/adr/ADR-0220-result-content-identity-and-deterministic-fingerprints.md)
 
 use super::{PreparedKeyBatch, invariant};
 use crate::{exec::hash_table::allocation::AggregateVec, runtime::task::ExecutionResult};

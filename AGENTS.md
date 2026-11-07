@@ -368,7 +368,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   各种类准确 source-bound summary 和原核心续体，不为同一 summary receiver 构建第二个 Source。
   核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
   冻结放置与装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)，
-  类型化种类、作者单位与逐种类完成见 [ADR-0218](docs/adr/ADR-0218-typed-task-summaries-and-per-kind-completion.md)。
+  类型化种类、作者单位与逐种类完成见 [ADR-0219](docs/adr/ADR-0219-typed-task-summaries-and-per-kind-completion.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.

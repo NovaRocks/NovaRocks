@@ -159,7 +159,7 @@ impl crate::OutboundFragmentCut {
     }
 }
 
-// Design: ADR-0218 (docs/adr/ADR-0218-typed-task-summaries-and-per-kind-completion.md)
+// Design: ADR-0219 (docs/adr/ADR-0219-typed-task-summaries-and-per-kind-completion.md)
 /// Static authorship, separate from fragment sink and live Task capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SummaryAuthor {

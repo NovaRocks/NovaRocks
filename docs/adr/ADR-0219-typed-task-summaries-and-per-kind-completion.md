@@ -1,5 +1,5 @@
 ---
-id: ADR-0218
+id: ADR-0219
 title: "Typed summaries freeze authors, contributor units and exact per-kind completion"
 domain: [pipeline-execution, distributed-query-lifecycle, frontend-dml]
 status: active

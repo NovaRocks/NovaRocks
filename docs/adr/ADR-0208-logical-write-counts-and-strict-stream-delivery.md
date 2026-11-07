@@ -8,7 +8,7 @@ superseded-by: null
 partially-superseded-by: [ADR-0209]
 date: 2026-10-23
 related:
-  - "ADR-0218-typed-task-summaries-and-per-kind-completion.md"
+  - "ADR-0219-typed-task-summaries-and-per-kind-completion.md"
   - "ADR-0217-sole-trino-entry-and-application-owned-completion.md (client completion projection supplements the logical count contract)"
 provenance:
   - "discussion: 2026-10-22 logical write summaries, independent routes and complete delivery"
