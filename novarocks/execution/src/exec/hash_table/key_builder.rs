@@ -745,8 +745,9 @@ pub(crate) fn append_canonical_nullable_tracked_observed(
 }
 
 /// Content identity and stored representatives share the original canonical
-/// framing and walker. Only floating bits differ; representatives retain the
-/// first value's unobservable NaN payload for exact typed export.
+/// framing and walker. Identity canonicalizes NaNs under the selected policy;
+/// representatives retain the first actually admitted value's raw NaN bits
+/// for exact typed export, without promising a global source order.
 pub(crate) fn append_content_nullable_tracked_observed<
     const REPRESENTATIVE: bool,
     const NEUTRAL_BYTES: bool,
