@@ -79,6 +79,7 @@ message Fragment {
   // Required even for a call-free fragment: absent is not an empty table.
   novarocks.call_request.FragmentCallRequests call_requests = 9;
   StagePlacementPolicy stage_placement = 10;
+  repeated SummaryOutput summaries = 11;
 }
 
 // Exact placement policy; edge distribution never supplies an implicit width.
@@ -243,6 +244,8 @@ message ValueDefinition {
   ValueOrigin origin = 3;
 }
 message ValueOrigin {
+  reserved 10;
+  reserved "logical_summary";
   oneof kind {
     ProviderFieldOrigin provider_field = 1;
     ExpressionOrigin expression = 2;
@@ -253,33 +256,45 @@ message ValueOrigin {
     ExchangeImportOrigin exchange_import = 7;
     CteImportOrigin cte_import = 8;
     WriterDerivedOrigin writer_derived = 9;
-    LogicalChangeCountField logical_summary = 10;
+    SummaryField summary = 12;
     uint32 join_mark_node_id = 11;
   }
 }
-enum LogicalChangeCountField {
-  LOGICAL_CHANGE_COUNT_FIELD_UNSPECIFIED = 0;
-  LOGICAL_CHANGE_COUNT_FIELD_INSERTED = 1;
-  LOGICAL_CHANGE_COUNT_FIELD_REPLACED = 2;
-  LOGICAL_CHANGE_COUNT_FIELD_DELETED = 3;
+enum SummaryKind {
+  SUMMARY_KIND_UNSPECIFIED = 0;
+  SUMMARY_KIND_WRITE_COUNTS = 1;
+  SUMMARY_KIND_DELETE_VERIFICATION = 2;
 }
-message LogicalSummaryColumns {
-  optional uint32 inserted_value_id = 1;
-  optional uint32 replaced_value_id = 2;
-  optional uint32 deleted_value_id = 3;
+message SummaryField {
+  SummaryKind kind = 1;
+  optional uint32 ordinal = 2;
 }
-message LogicalSummaryOutput {
+message SummaryColumns {
+  SummaryKind kind = 1;
+  repeated uint32 value_ids = 2;
+}
+message SummaryAuthor {
+  oneof kind {
+    novarocks.physical_control_v2.Empty router_sink = 1;
+    uint32 node_id = 2;
+  }
+}
+message SummaryOutput {
   optional uint32 edge_id = 1;
-  LogicalSummaryColumns columns = 2;
+  SummaryColumns columns = 2;
+  SummaryAuthor author = 3;
 }
-message LogicalSummaryCut {
-  LogicalSummaryColumns source = 1;
-  LogicalSummaryColumns destination = 2;
+message SummaryCut {
+  SummaryColumns source = 1;
+  SummaryColumns destination = 2;
 }
 enum FragmentOutputPort {
+  reserved 2;
+  reserved "FRAGMENT_OUTPUT_PORT_LOGICAL_SUMMARY";
   FRAGMENT_OUTPUT_PORT_UNSPECIFIED = 0;
   FRAGMENT_OUTPUT_PORT_ROOT = 1;
-  FRAGMENT_OUTPUT_PORT_LOGICAL_SUMMARY = 2;
+  FRAGMENT_OUTPUT_PORT_SUMMARY_WRITE_COUNTS = 3;
+  FRAGMENT_OUTPUT_PORT_SUMMARY_DELETE_VERIFICATION = 4;
 }
 enum DeliveryRequirement {
   DELIVERY_REQUIREMENT_UNSPECIFIED = 0;
@@ -950,8 +965,14 @@ message WriterFinish {
   WriterGroupedUnpivot grouped_unpivot = 5;
   FinishCountMode count_mode = 6;
   optional uint32 writer_results_input = 7;
-  optional uint32 logical_summary_input = 8;
-  LogicalSummaryColumns logical_summary = 9;
+  reserved 8, 9;
+  reserved "logical_summary_input", "logical_summary";
+  repeated SummaryFinishInput summaries = 10;
+}
+message SummaryFinishInput {
+  SummaryKind kind = 1;
+  optional uint32 input = 2;
+  SummaryColumns columns = 3;
 }
 message WriterGroupedUnpivot {
   repeated uint32 statistics_target_ordinals = 1;
@@ -983,7 +1004,8 @@ message MulticastSink { repeated uint32 edge_ids = 1; }
 message RouterSink {
   optional uint32 effect_value_id = 1;
   repeated ChangeStreamRoute routes = 2;
-  LogicalSummaryOutput summary = 3;
+  reserved 3;
+  reserved "summary";
 }
 message ChangeStreamRoute {
   bytes route_id = 1;
@@ -1118,6 +1140,8 @@ message WriterResultCut {
   repeated WriterResultCutField fields = 3;
 }
 message InboundFragmentCut {
+  reserved 11;
+  reserved "logical_summary";
   optional uint32 edge_id = 1;
   EdgeKind kind = 2;
   optional uint32 source_fragment_id = 3;
@@ -1128,12 +1152,14 @@ message InboundFragmentCut {
     ChangeStreamWriterCut change_stream_writer = 7;
     WriterResultCut writer_result = 8;
     novarocks.physical_control_v2.Empty relational = 10;
-    LogicalSummaryCut logical_summary = 11;
+    SummaryCut summary = 14;
   }
   DeliveryRequirement delivery = 12;
   FragmentOutputPort source_port = 13;
 }
 message OutboundFragmentCut {
+  reserved 12;
+  reserved "logical_summary";
   optional uint32 edge_id = 1;
   EdgeKind kind = 2;
   optional uint32 destination_fragment_id = 3;
@@ -1144,7 +1170,7 @@ message OutboundFragmentCut {
     ChangeStreamWriterCut change_stream_writer = 7;
     WriterResultCut writer_result = 8;
     novarocks.physical_control_v2.Empty relational = 11;
-    LogicalSummaryCut logical_summary = 12;
+    SummaryCut summary = 14;
   }
   FragmentOutputPort source_port = 10;
   DeliveryRequirement delivery = 13;

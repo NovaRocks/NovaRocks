@@ -164,6 +164,46 @@ class Selection(unittest.TestCase):
         self.assertEqual(chosen['rust_filterset'],'rdeps(=sql-owner)')
         self.assertTrue(any(reason['reason'].startswith('declared runtime input') for reason in chosen['reasons']))
 
+    def test_root_agent_guides_use_document_review_without_masking_unknown_inputs(self):
+        repository = Path(__file__).resolve().parents[3]
+        self.rules = json.loads((repository / 'tools/ci/verification/impact-rules.json').read_text())
+        for path in ('AGENTS.md', 'CLAUDE.md'):
+            with self.subTest(path=path):
+                chosen = self.choose([path])
+                self.assertFalse(chosen['broad'])
+                self.assertEqual(chosen['gaps'], [])
+                self.assertEqual(chosen['packages'], [])
+                self.assertEqual(self.names(chosen, 'sql_suites'), set())
+                self.assertEqual(self.names(chosen, 'system_scenarios'), set())
+        unknown = self.choose(['unregistered-root-guidance.md'])
+        self.assertTrue(unknown['broad'])
+        self.assertEqual(unknown['gaps'][0]['path'], 'unregistered-root-guidance.md')
+
+    def test_documented_agent_guide_still_selects_a_declared_executable_consumer(self):
+        repository = Path(__file__).resolve().parents[3]
+        self.rules = json.loads((repository / 'tools/ci/verification/impact-rules.json').read_text())
+        self.metadata['packages'][0]['metadata']['novarocks']['test']['runtime-inputs'] = ['AGENTS.md']
+        self.stages['stages'].append({'name':'guide-consumer','tier':'admission','domain':['AGENTS.md']})
+        chosen = self.choose(['AGENTS.md'])
+        self.assertFalse(chosen['broad'])
+        self.assertEqual(chosen['gaps'], [])
+        self.assertEqual(chosen['packages'], ['sql-owner'])
+        self.assertEqual(chosen['rust_filterset'], 'rdeps(=sql-owner)')
+        self.assertIn('guide-consumer', self.names(chosen, 'stages'))
+
+    def test_agent_navigation_does_not_narrow_shared_wire_contract_selection(self):
+        repository = Path(__file__).resolve().parents[3]
+        self.rules = json.loads((repository / 'tools/ci/verification/impact-rules.json').read_text())
+        for path in ('novarocks/spi/src/connector/write_stack/relation.rs',
+                     'novarocks/plan-codec/src/physical_summary_v2.rs'):
+            with self.subTest(path=path):
+                wire = self.choose([path])
+                combined = self.choose(['AGENTS.md', 'CLAUDE.md', path])
+                self.assertTrue(combined['broad'])
+                self.assertEqual(combined['gaps'], [])
+                for key in ('packages', 'rust_filterset', 'sql_suites', 'system_scenarios', 'stages'):
+                    self.assertEqual(combined[key], wire[key])
+
     def test_heavy_scope_declarations_preserve_native_identity_authority(self):
         self.metadata['packages'][0]['metadata']['novarocks']['test']['ignored'] += [
             {'filter':'test(=child_helper)','class':'helper','reason':'owned by outer test'},

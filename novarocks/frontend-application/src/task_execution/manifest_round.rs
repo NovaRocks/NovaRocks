@@ -140,10 +140,16 @@ pub(crate) fn assemble_manifest_round(
         .writer_cohorts()
         .map(|cohort| cohort.task())
         .collect::<std::collections::BTreeSet<_>>();
-    let summary_sources = manifest
-        .summary_sources()
-        .map(|(task, _)| task)
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut summary_sources = novarocks_result_contract::PerKind::empty();
+    for (kind, task, _) in manifest.summary_sources() {
+        if summary_sources.get(kind).is_none() {
+            summary_sources.insert(kind, std::collections::BTreeSet::new());
+        }
+        summary_sources
+            .get_mut(kind)
+            .expect("declared kind")
+            .insert(task);
+    }
     let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);

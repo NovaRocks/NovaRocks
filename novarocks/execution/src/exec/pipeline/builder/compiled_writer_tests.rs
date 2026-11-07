@@ -399,9 +399,9 @@ fn plan(rows: &[(Option<i64>, &str)]) -> (PhysicalPlan, NodeId) {
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1680,9 +1680,9 @@ mod statistics {
                     count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                     inputs: novarocks_physical_plan::FinishInputs {
                         writer_results: 0,
-                        logical_summary: None,
+                        summaries: Default::default(),
                     },
-                    logical_summary: None,
+                    summaries: Default::default(),
                     expected_target_ordinals: Box::from([ordinal]),
                     input_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -2497,6 +2497,10 @@ mod statistics {
                     rows.iter().map(|row| row.5.as_deref()).collect::<Vec<_>>(),
                 )),
                 Arc::new(maps),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::Int64, rows.len()),
+                arrow::array::new_null_array(&DataType::FixedSizeBinary(16), rows.len()),
             ],
         )
         .unwrap()
@@ -2511,7 +2515,7 @@ mod statistics {
         let sketches = expected_theta(rows);
         vec![
             expected_root_batch(&[(
-                RootRowKind::Summary.to_wire(),
+                RootRowKind::RowCount.to_wire(),
                 None,
                 Some(i64::try_from(rows.len()).unwrap()),
                 None,

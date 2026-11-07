@@ -113,28 +113,67 @@ fn nonprovider_cases() -> Vec<(physical::ValueOrigin, wire::ValueOrigin)> {
             wrap(wire::value_origin::Kind::JoinMarkNodeId(19)),
         ),
         (
-            physical::ValueOrigin::LogicalSummary {
-                field: physical::LogicalChangeCountField::Inserted,
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::Inserted,
             },
-            wrap(wire::value_origin::Kind::LogicalSummary(
-                wire::LogicalChangeCountField::Inserted as i32,
-            )),
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 1,
+                ordinal: Some(0),
+            })),
         ),
         (
-            physical::ValueOrigin::LogicalSummary {
-                field: physical::LogicalChangeCountField::Replaced,
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::Replaced,
             },
-            wrap(wire::value_origin::Kind::LogicalSummary(
-                wire::LogicalChangeCountField::Replaced as i32,
-            )),
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 1,
+                ordinal: Some(1),
+            })),
         ),
         (
-            physical::ValueOrigin::LogicalSummary {
-                field: physical::LogicalChangeCountField::Deleted,
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::Deleted,
             },
-            wrap(wire::value_origin::Kind::LogicalSummary(
-                wire::LogicalChangeCountField::Deleted as i32,
-            )),
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 1,
+                ordinal: Some(2),
+            })),
+        ),
+        (
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::Requested,
+            },
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 2,
+                ordinal: Some(0),
+            })),
+        ),
+        (
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::Matched,
+            },
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 2,
+                ordinal: Some(1),
+            })),
+        ),
+        (
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::InsufficientKeys,
+            },
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 2,
+                ordinal: Some(2),
+            })),
+        ),
+        (
+            physical::ValueOrigin::Summary {
+                field: physical::SummaryField::InsufficientFingerprint,
+            },
+            wrap(wire::value_origin::Kind::Summary(wire::SummaryField {
+                kind: 2,
+                ordinal: Some(3),
+            })),
         ),
         (
             physical::ValueOrigin::Expr {
@@ -532,8 +571,17 @@ fn value_origin_every_required_reference_kind_phase_and_writer_enum_refuses_with
             },
         )));
     }
-    for field in [0, -1, 4, i32::MAX] {
-        invalids.push(wrap(wire::value_origin::Kind::LogicalSummary(field)));
+    for (kind, ordinal) in [
+        (0, Some(0)),
+        (-1, Some(0)),
+        (3, Some(0)),
+        (1, None),
+        (1, Some(3)),
+        (2, Some(4)),
+    ] {
+        invalids.push(wrap(wire::value_origin::Kind::Summary(
+            wire::SummaryField { kind, ordinal },
+        )));
     }
     for invalid in invalids {
         assert!(decode_value_origin(&invalid, &namespace, SOURCE, limits()).is_err());

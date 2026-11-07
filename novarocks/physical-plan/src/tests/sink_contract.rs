@@ -22,23 +22,23 @@ use novarocks_connector_contract::{
 use super::*;
 
 /// These are fragment-owned sink counters, independent of the row root.
-fn add_router_summary(builder: &mut FragmentBuilder, edge: EdgeId) -> crate::LogicalSummaryOutput {
+fn add_router_summary(builder: &mut FragmentBuilder, edge: EdgeId) -> crate::SummaryOutput {
     let mut add = |field| {
         builder
-            .add_value(
-                ty(DataType::Int64, false),
-                ValueOrigin::LogicalSummary { field },
-            )
+            .add_value(ty(DataType::Int64, false), ValueOrigin::Summary { field })
             .unwrap()
     };
-    crate::LogicalSummaryOutput {
+    let summary = crate::SummaryOutput {
         edge,
-        columns: crate::LogicalSummaryColumns {
-            inserted: add(crate::LogicalChangeCountField::Inserted),
-            replaced: add(crate::LogicalChangeCountField::Replaced),
-            deleted: add(crate::LogicalChangeCountField::Deleted),
-        },
-    }
+        columns: crate::SummaryColumns::write_counts(
+            add(crate::SummaryField::Inserted),
+            add(crate::SummaryField::Replaced),
+            add(crate::SummaryField::Deleted),
+        ),
+        author: crate::SummaryAuthor::RouterSink,
+    };
+    builder.set_summaries(Box::new([summary]));
+    summary
 }
 
 fn literal_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
@@ -278,7 +278,6 @@ fn finish_router_writer_fixture(
         .finish_definition(
             source_root,
             FragmentSink::Router {
-                summary: source_summary,
                 effect,
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(9),
@@ -789,11 +788,11 @@ fn finish_router_writer_fixture(
             )
             .unwrap()
     };
-    let finish_summary = crate::LogicalSummaryColumns {
-        inserted: import_summary(source_summary.columns.inserted),
-        replaced: import_summary(source_summary.columns.replaced),
-        deleted: import_summary(source_summary.columns.deleted),
-    };
+    let finish_summary = crate::SummaryColumns::write_counts(
+        import_summary(source_summary.columns.values()[0]),
+        import_summary(source_summary.columns.values()[1]),
+        import_summary(source_summary.columns.values()[2]),
+    );
     finish_builder
         .insert_node_unchecked(PhysicalNode {
             id: summary_exchange,
@@ -809,8 +808,9 @@ fn finish_router_writer_fixture(
                 imports: source_summary
                     .columns
                     .values()
-                    .into_iter()
-                    .zip(finish_summary.values())
+                    .iter()
+                    .copied()
+                    .zip(finish_summary.values().iter().copied())
                     .collect(),
             },
         })
@@ -889,6 +889,34 @@ fn finish_router_writer_fixture(
             WriterRelationFieldRole::Auxiliary,
             WriterDerivedKind::RelationAuxiliary,
         ),
+        (
+            "requested",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "matched",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "insufficient_keys",
+            DataType::Int64,
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
+        (
+            "insufficient_fingerprint",
+            DataType::FixedSizeBinary(16),
+            true,
+            WriterRelationFieldRole::Auxiliary,
+            WriterDerivedKind::RelationAuxiliary,
+        ),
     ];
     let root_fields = root_specs
         .into_iter()
@@ -929,9 +957,15 @@ fn finish_router_writer_fixture(
                 count_mode: crate::FinishCountMode::LogicalChanges,
                 inputs: crate::FinishInputs {
                     writer_results: 0,
-                    logical_summary: Some(1),
+                    summaries: crate::PerKind {
+                        write_counts: Some(1),
+                        delete_verification: None,
+                    },
                 },
-                logical_summary: Some(finish_summary),
+                summaries: PerKind {
+                    write_counts: Some(finish_summary),
+                    delete_verification: None,
+                },
                 expected_target_ordinals,
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1016,12 +1050,12 @@ fn finish_router_writer_fixture(
     .unwrap();
     plan.add_edge(Edge {
         id: summary_edge,
-        role: crate::OutputRole::LogicalSummary,
+        role: crate::OutputRole::Summary(crate::SummaryKind::WriteCounts),
         delivery: crate::DeliveryRequirement::MustDrain,
         kind: EdgeKind::Stream,
         source: EdgeSource {
             fragment: FragmentId::new(721),
-            port: crate::FragmentOutputPort::LogicalSummary,
+            port: crate::FragmentOutputPort::Summary(crate::SummaryKind::WriteCounts),
             projection: Box::from(source_summary.columns.values()),
         },
         destination: EdgeDestination {
@@ -1030,8 +1064,9 @@ fn finish_router_writer_fixture(
             receive_mapping: source_summary
                 .columns
                 .values()
-                .into_iter()
-                .zip(finish_summary.values())
+                .iter()
+                .copied()
+                .zip(finish_summary.values().iter().copied())
                 .collect(),
         },
         partitioning: EdgePartitioning {
@@ -1200,12 +1235,11 @@ fn independent_finish_rejects_a_drifted_writer_result_proof() {
 fn router_data_inputs_exclude_the_generated_effect_value() {
     let edge = EdgeId::new(902);
     let (mut builder, root, effect, _) = change_event_root();
-    let summary = add_router_summary(&mut builder, EdgeId::new(907));
+    add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
-                summary,
                 effect,
                 routes: Box::from([route(
                     write_route_id(10),
@@ -1229,12 +1263,11 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
 fn router_allows_two_target_fields_to_read_one_value_identity() {
     let edge = EdgeId::new(903);
     let (mut builder, root, effect, input) = change_event_root();
-    let summary = add_router_summary(&mut builder, EdgeId::new(907));
+    add_router_summary(&mut builder, EdgeId::new(907));
     builder
         .finish_definition(
             root,
             FragmentSink::Router {
-                summary,
                 effect,
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(11),
@@ -1280,12 +1313,11 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
 #[test]
 fn independent_fragment_rejects_invalid_router_identity_and_layout() {
     let (mut builder, root, _, input) = literal_root();
-    let summary = add_router_summary(&mut builder, EdgeId::new(907));
+    add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
-                summary,
                 effect: ValueId::new(999_721),
                 routes: Box::from([ChangeStreamRoute {
                     route_id: write_route_id(0),
@@ -1338,12 +1370,11 @@ fn independent_fragment_rejects_invalid_router_identity_and_layout() {
 #[test]
 fn independent_fragment_rejects_duplicate_router_identity() {
     let (mut builder, root, effect, input) = change_event_root();
-    let summary = add_router_summary(&mut builder, EdgeId::new(907));
+    add_router_summary(&mut builder, EdgeId::new(907));
     let errors = builder
         .finish_definition(
             root,
             FragmentSink::Router {
-                summary,
                 effect,
                 routes: Box::from([
                     route(
@@ -1422,40 +1453,37 @@ fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
         let inserted = builder
             .add_value(
                 ty(data_type, nullable),
-                ValueOrigin::LogicalSummary {
-                    field: crate::LogicalChangeCountField::Inserted,
+                ValueOrigin::Summary {
+                    field: crate::SummaryField::Inserted,
                 },
             )
             .unwrap();
         let replaced = builder
             .add_value(
                 ty(DataType::Int64, false),
-                ValueOrigin::LogicalSummary {
-                    field: crate::LogicalChangeCountField::Replaced,
+                ValueOrigin::Summary {
+                    field: crate::SummaryField::Replaced,
                 },
             )
             .unwrap();
         let deleted = builder
             .add_value(
                 ty(DataType::Int64, false),
-                ValueOrigin::LogicalSummary {
-                    field: crate::LogicalChangeCountField::Deleted,
+                ValueOrigin::Summary {
+                    field: crate::SummaryField::Deleted,
                 },
             )
             .unwrap();
+        builder.set_summaries(Box::new([crate::SummaryOutput {
+            edge: EdgeId::new(907),
+            columns: crate::SummaryColumns::write_counts(inserted, replaced, deleted),
+            author: crate::SummaryAuthor::RouterSink,
+        }]));
         let errors = builder
             .finish_definition(
                 root,
                 FragmentSink::Router {
                     effect,
-                    summary: crate::LogicalSummaryOutput {
-                        edge: EdgeId::new(907),
-                        columns: crate::LogicalSummaryColumns {
-                            inserted,
-                            replaced,
-                            deleted,
-                        },
-                    },
                     routes: Box::from([ChangeStreamRoute {
                         route_id: write_route_id(9),
                         write_target_ordinal: write_target_ordinal(0),
@@ -1475,12 +1503,11 @@ fn logical_summary_origin_requires_nonnull_int64_and_its_exact_counter_role() {
                 crate::StagePlacementPolicy::Singleton,
             )
             .unwrap_err();
-        assert!(
-            errors
-                .errors()
-                .iter()
-                .any(|error| error.message().contains("logical summary"))
-        );
+        assert!(errors.errors().iter().any(|error| {
+            error
+                .message()
+                .contains("summary origin requires its exact declared non-null field type")
+        }));
     }
 }
 
@@ -1516,9 +1543,11 @@ fn placement_rejects_absent_scan_and_ambiguous_source_sets_before_scheduling() {
 fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let source = plan.fragments().get(&FragmentId::new(721)).unwrap();
-    let FragmentSink::Router { summary, .. } = source.sink() else {
-        unreachable!()
-    };
+    let summary = source
+        .summaries()
+        .iter()
+        .find(|summary| summary.kind() == crate::SummaryKind::WriteCounts)
+        .unwrap();
     let data = source.nodes()[&source.root()]
         .output
         .columns
@@ -1532,10 +1561,13 @@ fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() 
         .iter_mut()
         .find(|cut| cut.edge == summary.edge)
         .unwrap();
-    let crate::ExchangePayloadContract::LogicalSummary(proof) = &mut cut.payload else {
+    let crate::ExchangePayloadContract::Summary(proof) = &mut cut.payload else {
         unreachable!()
     };
-    proof.source.inserted = data;
+    let crate::SummaryColumns::WriteCounts(fields) = &mut proof.source else {
+        unreachable!()
+    };
+    fields[0] = data;
     cut.projection[0].value = data;
     cut.destination_imports[0].source.value = data;
     let errors = validate_fragment(source, &forged).unwrap_err();
@@ -1543,7 +1575,7 @@ fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() 
         errors
             .errors()
             .iter()
-            .any(|error| error.message().contains("router summary cut differs"))
+            .any(|error| error.message().contains("summary cut differs"))
     );
 
     let mut downgraded = fragment_cuts(&plan, source.id()).unwrap();
@@ -1584,6 +1616,103 @@ fn independently_validated_router_cannot_replace_or_downgrade_its_summary_cut() 
         errors
             .errors()
             .iter()
-            .any(|error| error.message().contains("router summary cut differs"))
+            .any(|error| error.message().contains("summary cut differs"))
+    );
+}
+
+#[test]
+fn summary_authors_are_closed_facts_and_kinds_cannot_borrow_a_router() {
+    for (kind, node_author, router_sink) in [
+        (crate::SummaryKind::WriteCounts, true, true),
+        (crate::SummaryKind::DeleteVerification, true, true),
+        (crate::SummaryKind::DeleteVerification, false, true),
+        (crate::SummaryKind::WriteCounts, false, false),
+    ] {
+        let (mut builder, root, effect, input) = change_event_root();
+        let mut values = Vec::new();
+        for &field in kind.fields() {
+            let data_type = match field.wire_type() {
+                crate::SummaryWireType::Int64 => DataType::Int64,
+                crate::SummaryWireType::FixedSizeBinary(width) => {
+                    DataType::FixedSizeBinary(i32::from(width))
+                }
+            };
+            values.push(
+                builder
+                    .add_value(ty(data_type, false), ValueOrigin::Summary { field })
+                    .unwrap(),
+            );
+        }
+        let columns = match kind {
+            crate::SummaryKind::WriteCounts => {
+                crate::SummaryColumns::write_counts(values[0], values[1], values[2])
+            }
+            crate::SummaryKind::DeleteVerification => crate::SummaryColumns::delete_verification(
+                values[0], values[1], values[2], values[3],
+            ),
+        };
+        builder.set_summaries(Box::new([crate::SummaryOutput {
+            edge: EdgeId::new(907),
+            columns,
+            author: if node_author {
+                crate::SummaryAuthor::Node(root)
+            } else {
+                crate::SummaryAuthor::RouterSink
+            },
+        }]));
+        let sink = if router_sink {
+            FragmentSink::Router {
+                effect,
+                routes: Box::new([route(
+                    write_route_id(9),
+                    write_target_ordinal(0),
+                    EdgeId::new(901),
+                    input,
+                )]),
+            }
+        } else {
+            FragmentSink::Noop
+        };
+        let errors = builder
+            .finish_definition(root, sink, dop(), crate::StagePlacementPolicy::Singleton)
+            .unwrap_err();
+        assert!(errors.errors().iter().any(
+            |error| error.message() == "summary kind has no exact legal author in its fragment"
+        ));
+    }
+}
+
+#[test]
+fn a_fragment_cannot_declare_two_outputs_of_the_same_summary_kind() {
+    let (mut builder, root, effect, input) = change_event_root();
+    let summary = add_router_summary(&mut builder, EdgeId::new(907));
+    builder.set_summaries(Box::new([
+        summary,
+        crate::SummaryOutput {
+            edge: EdgeId::new(908),
+            ..summary
+        },
+    ]));
+    let errors = builder
+        .finish_definition(
+            root,
+            FragmentSink::Router {
+                effect,
+                routes: Box::new([route(
+                    write_route_id(9),
+                    write_target_ordinal(0),
+                    EdgeId::new(901),
+                    input,
+                )]),
+            },
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap_err();
+    assert!(
+        errors
+            .errors()
+            .iter()
+            .any(|error| error.message() == "fragment declares a summary kind more than once")
     );
 }

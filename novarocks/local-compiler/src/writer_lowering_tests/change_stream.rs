@@ -244,19 +244,17 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
     );
     let mut counter = |field| {
         builder
-            .add_value(
-                ty(DataType::Int64, false),
-                ValueOrigin::LogicalSummary { field },
-            )
+            .add_value(ty(DataType::Int64, false), ValueOrigin::Summary { field })
             .unwrap()
     };
-    let summary = LogicalSummaryOutput {
+    let summary = SummaryOutput {
         edge: SUMMARY,
-        columns: LogicalSummaryColumns {
-            inserted: counter(LogicalChangeCountField::Inserted),
-            replaced: counter(LogicalChangeCountField::Replaced),
-            deleted: counter(LogicalChangeCountField::Deleted),
-        },
+        columns: SummaryColumns::write_counts(
+            counter(SummaryField::Inserted),
+            counter(SummaryField::Replaced),
+            counter(SummaryField::Deleted),
+        ),
+        author: SummaryAuthor::RouterSink,
     };
     let drafts = [
         draft_with_types([ty(DataType::Int64, false), ty(DataType::Int64, true)]),
@@ -300,14 +298,11 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             edge: ROUTES[index],
         })
         .collect();
+    builder.set_summaries(Box::new([summary]));
     let router = builder
         .finish_definition(
             root,
-            FragmentSink::Router {
-                effect,
-                routes,
-                summary,
-            },
+            FragmentSink::Router { effect, routes },
             dop_domain(),
             StagePlacementPolicy::Singleton,
         )
@@ -466,17 +461,20 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
     let summary_sources = summary
         .columns
         .values()
-        .map(|value| (value, ty(DataType::Int64, false)));
+        .iter()
+        .copied()
+        .map(|value| (value, ty(DataType::Int64, false)))
+        .collect::<Vec<_>>();
     let (summary_receiver, summary_values) =
         receive(&mut builder, SUMMARY, &summary_sources, |_| {
             Distribution::Singleton
         });
     edges.push(edge(
         SUMMARY,
-        OutputRole::LogicalSummary,
+        OutputRole::Summary(novarocks_physical_plan::SummaryKind::WriteCounts),
         ROUTER,
-        FragmentOutputPort::LogicalSummary,
-        &summary.columns.values(),
+        FragmentOutputPort::Summary(novarocks_physical_plan::SummaryKind::WriteCounts),
+        summary.columns.values(),
         FINISH,
         summary_receiver,
         &summary_values,
@@ -490,7 +488,10 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             vec![summary_receiver, union],
             FinishInputs {
                 writer_results: 1,
-                logical_summary: Some(0),
+                summaries: novarocks_physical_plan::PerKind {
+                    write_counts: Some(0),
+                    delete_verification: None,
+                },
             },
         )
     } else {
@@ -498,7 +499,10 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
             vec![union, summary_receiver],
             FinishInputs {
                 writer_results: 0,
-                logical_summary: Some(1),
+                summaries: novarocks_physical_plan::PerKind {
+                    write_counts: Some(1),
+                    delete_verification: None,
+                },
             },
         )
     };
@@ -510,11 +514,14 @@ fn packages(mode: Colocation, summary_first: bool) -> BTreeMap<FragmentId, Fragm
         NodeKind::TableFinish(WriterFinishSpec {
             count_mode: FinishCountMode::LogicalChanges,
             inputs: roles,
-            logical_summary: Some(LogicalSummaryColumns {
-                inserted: summary_values[0],
-                replaced: summary_values[1],
-                deleted: summary_values[2],
-            }),
+            summaries: PerKind {
+                write_counts: Some(SummaryColumns::write_counts(
+                    summary_values[0],
+                    summary_values[1],
+                    summary_values[2],
+                )),
+                delete_verification: None,
+            },
             expected_target_ordinals: Box::from(ordinals),
             input_schema: WriterRelationSchema {
                 revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -625,17 +632,23 @@ fn router_has_independent_summary_and_occurrence_preserving_provider_branches() 
         let Some(StaticSinkProgram::ChangeStreamRouter {
             branches,
             routes,
-            summary_branch,
-            summary_layout,
             effect_slot,
             arena,
         }) = graph.sink()
         else {
             panic!("router")
         };
-        assert_eq!(branches.len(), 3);
+        assert_eq!(branches.len(), 2);
+        let [summary] = graph.summaries() else {
+            panic!("one independent output")
+        };
+        assert_eq!(
+            summary.kind(),
+            novarocks_local_program::SummaryKind::WriteCounts
+        );
+        let summary_layout = summary.layout();
         assert_eq!(routes.len(), 2);
-        assert_eq!(*summary_branch, 2);
+        assert_eq!(graph.stream_branches().count(), 3);
         assert_eq!(summary_layout.schema().fields().len(), 3);
         assert!(
             summary_layout
@@ -764,7 +777,7 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
             input_roles,
             inputs,
             expected_targets,
-            logical_summary_layout,
+            summary_layouts,
             writer_multiplex_layout,
             ..
         } = graph.nodes()[graph.root().index()].kind()
@@ -777,7 +790,7 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
         );
         assert_eq!(expected_targets.len(), 2);
         assert_eq!(inputs.len(), 2);
-        let summary_index = input_roles.logical_summary.unwrap() as usize;
+        let summary_index = input_roles.summaries.write_counts.unwrap() as usize;
         let writer_index = input_roles.writer_results as usize;
         assert_eq!(summary_index, if summary_first { 0 } else { 1 });
         assert_ne!(summary_index, writer_index);
@@ -787,10 +800,13 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
             ProgramNodeKind::ExchangeSource { .. }
         ));
         let facts = &program.exchange_inputs()[&inputs[summary_index]];
-        assert_eq!(facts.role, ProgramOutputRole::LogicalSummary);
+        assert_eq!(
+            facts.role,
+            ProgramOutputRole::Summary(novarocks_local_program::SummaryKind::WriteCounts)
+        );
         assert_eq!(facts.delivery, ExchangeDeliveryRequirement::MustDrain);
         assert_eq!(
-            logical_summary_layout.as_ref().unwrap().slots(),
+            summary_layouts.write_counts.as_ref().unwrap().slots(),
             summary.output_layout().slots()
         );
         let multiplex = &graph.nodes()[inputs[writer_index].index()];

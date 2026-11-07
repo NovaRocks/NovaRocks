@@ -30,9 +30,9 @@
 //!
 //! | column | writer output | root result |
 //! |---|---|---|
-//! | `kind` | `1 = ROW_COUNT`, `2 = COMMIT_FRAGMENT` | `1 = SUMMARY`, `2 = PREPARED_FRAGMENT` |
-//! | `write_target_ordinal` | non-null, always this writer's target | null on `SUMMARY` |
-//! | `row_count` | non-null exactly on `ROW_COUNT` | non-null exactly on `SUMMARY` |
+//! | `kind` | `1 = ROW_COUNT`, `2 = COMMIT_FRAGMENT` | `1 = ROW_COUNT`, `2 = PREPARED_FRAGMENT` |
+//! | `write_target_ordinal` | non-null, always this writer's target | null on `ROW_COUNT` |
+//! | `row_count` | non-null exactly on `ROW_COUNT` | non-null exactly on `ROW_COUNT` |
 //! | `commit_fragment` | non-null exactly on `COMMIT_FRAGMENT` | non-null exactly on `PREPARED_FRAGMENT` |
 //!
 //! The fixed prefix uses the existing signed execution carriers — `Int8`,
@@ -54,8 +54,8 @@ use crate::connector::{ConnectorError, ConnectorErrorKind};
 
 pub const WRITE_RELATION_COLUMN_COUNT: usize = 4;
 pub const WRITER_MULTIPLEX_SCHEMA_VERSION: u32 = 1;
-pub const ROOT_WRITE_RESULT_SCHEMA_VERSION: u32 = 1;
-pub const ROOT_WRITE_RESULT_COLUMN_COUNT: usize = 8;
+pub const ROOT_WRITE_RESULT_SCHEMA_VERSION: u32 = 2;
+pub const ROOT_WRITE_RESULT_COLUMN_COUNT: usize = 12;
 /// The typed tail is intentionally wide, but still bounded before allocations
 /// at every plan boundary.
 pub const MAX_WRITER_AUXILIARY_CHANNELS: usize = 4_096;
@@ -116,6 +116,14 @@ pub const ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX: usize = 4;
 pub const ROOT_WRITE_RESULT_BLOB_TYPE_INDEX: usize = 5;
 pub const ROOT_WRITE_RESULT_BODY_INDEX: usize = 6;
 pub const ROOT_WRITE_RESULT_PROPERTIES_INDEX: usize = 7;
+pub const ROOT_WRITE_RESULT_REQUESTED_COLUMN: &str = "requested";
+pub const ROOT_WRITE_RESULT_MATCHED_COLUMN: &str = "matched";
+pub const ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_COLUMN: &str = "insufficient_keys";
+pub const ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_COLUMN: &str = "insufficient_fingerprint";
+pub const ROOT_WRITE_RESULT_REQUESTED_INDEX: usize = 8;
+pub const ROOT_WRITE_RESULT_MATCHED_INDEX: usize = 9;
+pub const ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_INDEX: usize = 10;
+pub const ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_INDEX: usize = 11;
 
 /// Root-result ids occupy a disjoint reserved range immediately below the
 /// writer prefix. Auxiliary ids are planner-owned and must not collide with
@@ -688,24 +696,28 @@ impl WriterRowKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootRowKind {
     /// The whole write's checked row count. Exactly one per complete set.
-    Summary,
+    RowCount,
     /// One staged provider artifact, tagged with its logical target.
     PreparedFragment,
     /// One generic artifact draft produced by ordinary expressions and
     /// Unpivot. Execution assigns no provider or statistics meaning to it.
     ArtifactDraft,
+    /// Checked deletion verification, only when frozen by the plan.
+    DeleteVerification,
 }
 
 impl RootRowKind {
-    pub const SUMMARY: i8 = 1;
+    pub const ROW_COUNT: i8 = 1;
     pub const PREPARED_FRAGMENT: i8 = 2;
     pub const ARTIFACT_DRAFT: i8 = 3;
+    pub const DELETE_VERIFICATION: i8 = 4;
 
     pub fn from_wire(kind: i8) -> Result<Self, ConnectorError> {
         match kind {
-            Self::SUMMARY => Ok(Self::Summary),
+            Self::ROW_COUNT => Ok(Self::RowCount),
             Self::PREPARED_FRAGMENT => Ok(Self::PreparedFragment),
             Self::ARTIFACT_DRAFT => Ok(Self::ArtifactDraft),
+            Self::DELETE_VERIFICATION => Ok(Self::DeleteVerification),
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "unknown connector write root row kind",
@@ -715,9 +727,10 @@ impl RootRowKind {
 
     pub const fn to_wire(self) -> i8 {
         match self {
-            Self::Summary => Self::SUMMARY,
+            Self::RowCount => Self::ROW_COUNT,
             Self::PreparedFragment => Self::PREPARED_FRAGMENT,
             Self::ArtifactDraft => Self::ARTIFACT_DRAFT,
+            Self::DeleteVerification => Self::DELETE_VERIFICATION,
         }
     }
 }
@@ -817,14 +830,14 @@ pub fn writer_output_schema() -> SchemaRef {
 }
 
 /// The schema the single `TableFinish` operator emits. `write_target_ordinal`
-/// is nullable because the one `SUMMARY` row belongs to no single target.
+/// is nullable because the one `ROW_COUNT` row belongs to no single target.
 pub fn root_output_schema() -> SchemaRef {
     relation_schema(true)
 }
 
-/// Fixed eight-column Root result relation introduced by NCP-8. The existing
-/// four-column `root_output_schema` remains the currently wired NCP-6 operator
-/// output until TableFinish is migrated in T11.
+/// Fixed Root result relation for row counts, prepared fragments, artifact
+/// drafts and optional delete verification. Prefix-only helpers remain
+/// separate from this exact result shape.
 enum RootColumnShape {
     Scalar(DataType),
     InputFields,
@@ -871,6 +884,26 @@ fn root_column_descriptors()
         (
             ROOT_WRITE_RESULT_PROPERTIES_COLUMN,
             RootColumnShape::Properties,
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_REQUESTED_COLUMN,
+            RootColumnShape::Scalar(DataType::Int64),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_MATCHED_COLUMN,
+            RootColumnShape::Scalar(DataType::Int64),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_INSUFFICIENT_KEYS_COLUMN,
+            RootColumnShape::Scalar(DataType::Int64),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_INSUFFICIENT_FINGERPRINT_COLUMN,
+            RootColumnShape::Scalar(DataType::FixedSizeBinary(16)),
             true,
         ),
     ]
@@ -1002,7 +1035,7 @@ pub fn validate_writer_multiplex_row(
     }
 }
 
-/// Check one root row's payload against its kind. A `SUMMARY` row carries no
+/// Check one root row's payload against its kind. A `ROW_COUNT` row carries no
 /// target ordinal precisely because it aggregates every target.
 pub fn validate_root_row(
     kind: RootRowKind,
@@ -1011,11 +1044,11 @@ pub fn validate_root_row(
     fragment_len: Option<usize>,
 ) -> Result<(), ConnectorError> {
     let consistent = match kind {
-        RootRowKind::Summary => target.is_none() && row_count.is_some() && fragment_len.is_none(),
+        RootRowKind::RowCount => target.is_none() && row_count.is_some() && fragment_len.is_none(),
         RootRowKind::PreparedFragment => {
             target.is_some() && row_count.is_none() && fragment_len.is_some()
         }
-        RootRowKind::ArtifactDraft => false,
+        RootRowKind::ArtifactDraft | RootRowKind::DeleteVerification => false,
     };
     if consistent {
         return Ok(());
@@ -1036,6 +1069,10 @@ pub struct RootWriteResultRowShape {
     pub blob_type_len: Option<usize>,
     pub body_len: Option<usize>,
     pub properties_len: Option<usize>,
+    pub requested: Option<i64>,
+    pub matched: Option<i64>,
+    pub insufficient_keys: Option<i64>,
+    pub insufficient_fingerprint_len: Option<usize>,
 }
 
 /// Validate the exact mutually-exclusive shape of a fixed Root result row.
@@ -1047,12 +1084,17 @@ pub fn validate_root_write_result_row(
         && shape.blob_type_len.is_none()
         && shape.body_len.is_none()
         && shape.properties_len.is_none();
+    let verification_all_null = shape.requested.is_none()
+        && shape.matched.is_none()
+        && shape.insufficient_keys.is_none()
+        && shape.insufficient_fingerprint_len.is_none();
     let consistent = match kind {
-        RootRowKind::Summary => {
+        RootRowKind::RowCount => {
             shape.target.is_none()
                 && shape.row_count.is_some_and(|count| count >= 0)
                 && shape.fragment_len.is_none()
                 && artifact_all_null
+                && verification_all_null
         }
         RootRowKind::PreparedFragment => {
             shape
@@ -1061,6 +1103,7 @@ pub fn validate_root_write_result_row(
                 && shape.row_count.is_none()
                 && shape.fragment_len.is_some()
                 && artifact_all_null
+                && verification_all_null
         }
         RootRowKind::ArtifactDraft => {
             shape
@@ -1072,6 +1115,17 @@ pub fn validate_root_write_result_row(
                 && shape.blob_type_len.is_some_and(|length| length > 0)
                 && shape.body_len.is_some()
                 && shape.properties_len.is_some()
+                && verification_all_null
+        }
+        RootRowKind::DeleteVerification => {
+            shape.target.is_none()
+                && shape.row_count.is_none()
+                && shape.fragment_len.is_none()
+                && artifact_all_null
+                && shape.requested.is_some_and(|count| count >= 0)
+                && shape.matched.is_some_and(|count| count >= 0)
+                && shape.insufficient_keys.is_some_and(|count| count >= 0)
+                && shape.insufficient_fingerprint_len == Some(16)
         }
     };
     if consistent {
@@ -1111,10 +1165,11 @@ pub fn validate_artifact_draft_nested_values(
     Ok(())
 }
 
-/// Stream-level validation that closes the `SUMMARY exactly once` invariant.
+/// Stream-level validation that closes the `ROW_COUNT exactly once` invariant.
 #[derive(Debug, Default)]
 pub struct RootWriteResultMembershipValidator {
-    summary_seen: bool,
+    row_count_seen: bool,
+    delete_verification_seen: bool,
 }
 
 impl RootWriteResultMembershipValidator {
@@ -1124,22 +1179,30 @@ impl RootWriteResultMembershipValidator {
         shape: RootWriteResultRowShape,
     ) -> Result<(), ConnectorError> {
         validate_root_write_result_row(kind, shape)?;
-        if kind == RootRowKind::Summary {
-            if self.summary_seen {
+        if kind == RootRowKind::RowCount {
+            if self.row_count_seen {
                 return Err(corrupt(
-                    "root write result contains more than one SUMMARY row",
+                    "root write result contains more than one ROW_COUNT row",
                 ));
             }
-            self.summary_seen = true;
+            self.row_count_seen = true;
+        }
+        if kind == RootRowKind::DeleteVerification {
+            if self.delete_verification_seen {
+                return Err(corrupt(
+                    "root write result contains more than one DELETE_VERIFICATION row",
+                ));
+            }
+            self.delete_verification_seen = true;
         }
         Ok(())
     }
 
     pub fn finish(self) -> Result<(), ConnectorError> {
-        if self.summary_seen {
+        if self.row_count_seen {
             Ok(())
         } else {
-            Err(corrupt("root write result is missing its SUMMARY row"))
+            Err(corrupt("root write result is missing its ROW_COUNT row"))
         }
     }
 }
@@ -1201,11 +1264,13 @@ mod tests {
 
     #[test]
     fn unknown_row_kinds_are_corrupt_data() {
-        for kind in [0_i8, 4, -1, i8::MAX] {
+        for kind in [0_i8, 4, 5, -1, i8::MAX] {
             assert_eq!(
                 WriterRowKind::from_wire(kind).expect_err("unknown").kind(),
                 ConnectorErrorKind::CorruptData
             );
+        }
+        for kind in [0_i8, 5, -1, i8::MAX] {
             assert_eq!(
                 RootRowKind::from_wire(kind).expect_err("unknown").kind(),
                 ConnectorErrorKind::CorruptData
@@ -1280,11 +1345,11 @@ mod tests {
 
     #[test]
     fn a_summary_row_carries_no_target_and_a_fragment_row_must() {
-        assert!(validate_root_row(RootRowKind::Summary, None, Some(7), None).is_ok());
+        assert!(validate_root_row(RootRowKind::RowCount, None, Some(7), None).is_ok());
         assert!(validate_root_row(RootRowKind::PreparedFragment, Some(0), None, Some(9)).is_ok());
-        assert!(validate_root_row(RootRowKind::Summary, Some(0), Some(7), None).is_err());
+        assert!(validate_root_row(RootRowKind::RowCount, Some(0), Some(7), None).is_err());
         assert!(validate_root_row(RootRowKind::PreparedFragment, None, None, Some(9)).is_err());
-        assert!(validate_root_row(RootRowKind::Summary, None, None, None).is_err());
+        assert!(validate_root_row(RootRowKind::RowCount, None, None, None).is_err());
         assert!(
             validate_root_row(RootRowKind::PreparedFragment, Some(0), Some(7), Some(9)).is_err()
         );
@@ -1663,7 +1728,7 @@ mod tests {
     fn root_write_result_rows_are_mutually_exclusive() {
         assert!(
             validate_root_write_result_row(
-                RootRowKind::Summary,
+                RootRowKind::RowCount,
                 RootWriteResultRowShape {
                     row_count: Some(7),
                     ..shape()
@@ -1712,7 +1777,7 @@ mod tests {
         );
         assert!(
             validate_root_write_result_row(
-                RootRowKind::Summary,
+                RootRowKind::RowCount,
                 RootWriteResultRowShape {
                     row_count: Some(-1),
                     ..shape()
@@ -1722,7 +1787,7 @@ mod tests {
         );
         assert!(
             validate_root_write_result_row(
-                RootRowKind::Summary,
+                RootRowKind::RowCount,
                 RootWriteResultRowShape {
                     row_count: Some(7),
                     body_len: Some(0),
@@ -1746,13 +1811,13 @@ mod tests {
             ..shape()
         };
         validator
-            .observe(RootRowKind::Summary, summary)
+            .observe(RootRowKind::RowCount, summary)
             .expect("first summary");
-        assert!(validator.observe(RootRowKind::Summary, summary).is_err());
+        assert!(validator.observe(RootRowKind::RowCount, summary).is_err());
 
         let mut validator = RootWriteResultMembershipValidator::default();
         validator
-            .observe(RootRowKind::Summary, summary)
+            .observe(RootRowKind::RowCount, summary)
             .expect("summary");
         validator.finish().expect("complete stream");
     }
@@ -1809,6 +1874,10 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("example-v1")])),
             Arc::new(BinaryArray::from(vec![Some(b"body".as_slice())])),
             Arc::new(properties.finish()),
+            arrow::array::new_null_array(&DataType::Int64, 1),
+            arrow::array::new_null_array(&DataType::Int64, 1),
+            arrow::array::new_null_array(&DataType::Int64, 1),
+            arrow::array::new_null_array(&DataType::FixedSizeBinary(16), 1),
         ];
         let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("artifact batch");
 
@@ -1988,5 +2057,111 @@ mod target_wire_boundary_tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod deletion_verification_tests {
+    use super::*;
+
+    fn verification() -> RootWriteResultRowShape {
+        RootWriteResultRowShape {
+            requested: Some(3),
+            matched: Some(2),
+            insufficient_keys: Some(1),
+            insufficient_fingerprint_len: Some(16),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn verification_has_its_own_exact_nullable_root_tail() {
+        let schema = root_write_result_schema();
+        assert_eq!(RootWriteResultSchema::new().contract_version(), 2);
+        assert_eq!(schema.fields().len(), 12);
+        for (index, name, ty) in [
+            (8, "requested", DataType::Int64),
+            (9, "matched", DataType::Int64),
+            (10, "insufficient_keys", DataType::Int64),
+            (
+                11,
+                "insufficient_fingerprint",
+                DataType::FixedSizeBinary(16),
+            ),
+        ] {
+            let field = schema.field(index);
+            assert_eq!(field.name(), name);
+            assert_eq!(field.data_type(), &ty);
+            assert!(field.is_nullable());
+        }
+        assert_eq!(RootRowKind::ROW_COUNT, 1);
+        assert_eq!(RootRowKind::DeleteVerification.to_wire(), 4);
+        assert_eq!(
+            RootRowKind::from_wire(4).unwrap(),
+            RootRowKind::DeleteVerification
+        );
+        validate_root_write_result_row(RootRowKind::DeleteVerification, verification()).unwrap();
+        for shape in [
+            RootWriteResultRowShape {
+                requested: None,
+                ..verification()
+            },
+            RootWriteResultRowShape {
+                matched: Some(-1),
+                ..verification()
+            },
+            RootWriteResultRowShape {
+                insufficient_fingerprint_len: Some(15),
+                ..verification()
+            },
+            RootWriteResultRowShape {
+                target: Some(0),
+                ..verification()
+            },
+            RootWriteResultRowShape {
+                row_count: Some(0),
+                ..verification()
+            },
+        ] {
+            assert!(
+                validate_root_write_result_row(RootRowKind::DeleteVerification, shape).is_err()
+            );
+        }
+        assert!(
+            validate_root_write_result_row(
+                RootRowKind::RowCount,
+                RootWriteResultRowShape {
+                    row_count: Some(0),
+                    ..verification()
+                }
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn verification_is_optional_but_never_replaces_or_duplicates_the_row_count() {
+        let mut membership = RootWriteResultMembershipValidator::default();
+        membership
+            .observe(RootRowKind::DeleteVerification, verification())
+            .unwrap();
+        assert!(membership.finish().is_err());
+        let mut membership = RootWriteResultMembershipValidator::default();
+        membership
+            .observe(
+                RootRowKind::RowCount,
+                RootWriteResultRowShape {
+                    row_count: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        membership
+            .observe(RootRowKind::DeleteVerification, verification())
+            .unwrap();
+        assert!(
+            membership
+                .observe(RootRowKind::DeleteVerification, verification())
+                .is_err()
+        );
+        membership.finish().unwrap();
     }
 }

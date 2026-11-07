@@ -247,12 +247,25 @@ fn finish_mode(value: i32) -> Result<p::FinishCountMode, Error> {
 fn finish_roles(
     mode: p::FinishCountMode,
     writer: u32,
-    summary: Option<u32>,
-    has_columns: bool,
+    inputs: &p::PerKind<u32>,
+    columns: &p::PerKind<p::SummaryColumns>,
 ) -> Result<(), Error> {
     let logical = matches!(mode, p::FinishCountMode::LogicalChanges);
-    if logical != summary.is_some() || logical != has_columns || summary == Some(writer) {
-        return Err(invalid("finish count mode and exact input roles disagree"));
+    if logical != inputs.write_counts.is_some() {
+        return Err(invalid("finish count mode and WriteCounts input disagree"));
+    }
+    for kind in p::SummaryKind::ALL {
+        if inputs.get(kind).is_some() != columns.get(kind).is_some()
+            || columns
+                .get(kind)
+                .is_some_and(|columns| columns.kind() != kind)
+            || inputs.get(kind) == Some(&writer)
+        {
+            return Err(invalid("finish exact summary input roles disagree"));
+        }
+    }
+    if inputs.write_counts.is_some() && inputs.write_counts == inputs.delete_verification {
+        return Err(invalid("finish summary input ports must be distinct"));
     }
     Ok(())
 }
@@ -260,48 +273,93 @@ fn physical_finish_references(value: &p::WriterFinishSpec) -> Result<usize, Erro
     finish_roles(
         value.count_mode,
         value.inputs.writer_results,
-        value.inputs.logical_summary,
-        value.logical_summary.is_some(),
+        &value.inputs.summaries,
+        &value.summaries,
     )?;
-    Ok(if value.logical_summary.is_some() {
-        3
-    } else {
-        0
-    })
+    Ok(value
+        .summaries
+        .iter()
+        .map(|(_, columns)| columns.values().len())
+        .sum())
 }
-/// Validate mandatory scalar/presence facts before any output allocation.
+/// The closed kind cardinality is a representation law, not a resource quota.
+/// At most two fixed-width entries are read before the original parent gate.
 fn wire_finish_columns(
     value: &wire::WriterFinish,
-) -> Result<Option<p::LogicalSummaryColumns>, Error> {
+) -> Result<(p::PerKind<u32>, p::PerKind<p::SummaryColumns>), Error> {
+    if value.summaries.len() > p::SummaryKind::ALL.len() {
+        return Err(invalid("finish repeats a closed summary kind"));
+    }
     let writer = value
         .writer_results_input
         .ok_or_else(|| invalid("finish writer input role is absent"))?;
-    finish_roles(
-        finish_mode(value.count_mode)?,
-        writer,
-        value.logical_summary_input,
-        value.logical_summary.is_some(),
-    )?;
-    value
-        .logical_summary
-        .as_ref()
-        .map(|v| {
-            Ok(p::LogicalSummaryColumns {
-                inserted: p::ValueId::new(
-                    v.inserted_value_id
-                        .ok_or_else(|| invalid("inserted summary field is absent"))?,
-                ),
-                replaced: p::ValueId::new(
-                    v.replaced_value_id
-                        .ok_or_else(|| invalid("replaced summary field is absent"))?,
-                ),
-                deleted: p::ValueId::new(
-                    v.deleted_value_id
-                        .ok_or_else(|| invalid("deleted summary field is absent"))?,
-                ),
-            })
-        })
-        .transpose()
+    let mut inputs = p::PerKind::empty();
+    let mut columns = p::PerKind::empty();
+    for entry in &value.summaries {
+        let kind = crate::physical_summary_v2::decode_kind(entry.kind).map_err(invalid)?;
+        let input = entry
+            .input
+            .ok_or_else(|| invalid("finish summary input is absent"))?;
+        let fields = entry
+            .columns
+            .as_ref()
+            .ok_or_else(|| invalid("finish summary columns are absent"))?;
+        let fields = crate::physical_summary_v2::decode_columns_shape(fields)?;
+        if fields.kind() != kind || inputs.get(kind).is_some() {
+            return Err(invalid("finish summary kinds differ or repeat"));
+        }
+        inputs.insert(kind, input);
+        columns.insert(kind, fields);
+    }
+    finish_roles(finish_mode(value.count_mode)?, writer, &inputs, &columns)?;
+    Ok((inputs, columns))
+}
+fn wire_finish_references(value: &wire::WriterFinish) -> Result<usize, Error> {
+    Ok(wire_finish_columns(value)?
+        .1
+        .iter()
+        .map(|(_, c)| c.values().len())
+        .sum())
+}
+fn wire_finish_backing(value: &wire::WriterFinish) -> Result<usize, Error> {
+    wire_finish_columns(value)?;
+    let mut known = bytes::<wire::SummaryFinishInput>(value.summaries.capacity())?;
+    for entry in &value.summaries {
+        known = add(
+            known,
+            bytes::<u32>(
+                entry
+                    .columns
+                    .as_ref()
+                    .expect("checked columns")
+                    .value_ids
+                    .capacity(),
+            )?,
+        )?;
+    }
+    Ok(known)
+}
+fn finish_encode_requests(value: &p::WriterFinishSpec, m: &mut Model) -> Result<(), Error> {
+    m.request::<wire::SummaryFinishInput>(value.summaries.iter().count(), 1)?;
+    for (_, columns) in value.summaries.iter() {
+        m.request::<u32>(columns.values().len(), 1)?;
+    }
+    Ok(())
+}
+fn encode_finish_summaries(
+    value: &p::WriterFinishSpec,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<wire::SummaryFinishInput>, Error> {
+    let mut out = reserve(value.summaries.iter().count(), w)?;
+    for (kind, columns) in value.summaries.iter() {
+        out.push(wire::SummaryFinishInput {
+            kind: crate::physical_summary_v2::encode_kind(kind),
+            input: value.inputs.summaries.get(kind).copied(),
+            columns: Some(crate::physical_summary_v2::encode_columns(*columns, w)?),
+        });
+        w.step()?;
+    }
+    Ok(out)
 }
 fn encode_model(n: &p::PhysicalNode, b: &Body<'_>) -> Result<(Model, usize), Error> {
     let c = calls(b).len();
@@ -325,7 +383,10 @@ fn encode_model(n: &p::PhysicalNode, b: &Body<'_>) -> Result<(Model, usize), Err
         ),
         Body::Finish(t) => (
             add(
-                add(t.expected_target_ordinals.len(), c)?,
+                add(
+                    add(t.expected_target_ordinals.len(), c)?,
+                    t.summaries.iter().count(),
+                )?,
                 physical_finish_references(t)?,
             )?,
             add(
@@ -410,23 +471,18 @@ fn decode_model(
             };
             (
                 add(
-                    add(t.expected_target_ordinals.len(), c)?,
-                    if wire_finish_columns(t)?.is_some() {
-                        3
-                    } else {
-                        0
-                    },
+                    add(add(t.expected_target_ordinals.len(), c)?, t.summaries.len())?,
+                    wire_finish_references(t)?,
                 )?,
                 add(
                     add(add(i.fields.len(), o.fields.len())?, mul(2, c)?)?,
-                    if wire_finish_columns(t)?.is_some() {
-                        3
-                    } else {
-                        0
-                    },
+                    wire_finish_references(t)?,
                 )?,
                 add(
-                    bytes::<u32>(t.expected_target_ordinals.capacity())?,
+                    add(
+                        bytes::<u32>(t.expected_target_ordinals.capacity())?,
+                        wire_finish_backing(t)?,
+                    )?,
                     add(
                         bytes::<wire::WriterRelationField>(i.fields.capacity())?,
                         add(
@@ -489,7 +545,10 @@ fn prepare_encode_core(
         m.request::<wire::WriterAggregateCall>(calls(&b).len(), 1)?;
         match b {
             Body::Writer(t) => m.request::<u32>(t.input.len(), 1)?,
-            Body::Finish(t) => m.request::<u32>(t.expected_target_ordinals.len(), 1)?,
+            Body::Finish(t) => {
+                m.request::<u32>(t.expected_target_ordinals.len(), 1)?;
+                finish_encode_requests(t, &mut m)?;
+            }
         }
         m.admit_in(source, values.count(), l.node, &mut **callback)?;
         Some((m, known))
@@ -535,6 +594,7 @@ fn prepare_encode_core(
             m.request::<u32>(t.input.len(), 1)?;
         } else if let Body::Finish(t) = &b {
             m.request::<u32>(t.expected_target_ordinals.len(), 1)?;
+            finish_encode_requests(t, &mut m)?;
         }
     }
     match admit.as_mut() {
@@ -743,7 +803,7 @@ fn prepare_encode_core(
             physical_distribution_refs(&t.required_distribution, values, w)?;
         }
         Body::Finish(t) => {
-            if let Some(columns) = t.logical_summary {
+            for (_, columns) in t.summaries.iter() {
                 for id in columns.values() {
                     reference(id.get(), values, w)?;
                     w.step()?;
@@ -1191,7 +1251,7 @@ fn prepare_decode_core(
             wire_distribution_refs(t.required_distribution.as_ref().unwrap(), e, w)?;
         }
         Raw::Finish(t) => {
-            if let Some(columns) = completed(wire_finish_columns(t), w)? {
+            for (_, columns) in completed(wire_finish_columns(t), w)?.1.iter() {
                 for id in columns.values() {
                     reference(id.get(), e.values(), w)?;
                     w.step()?;
@@ -1322,14 +1382,7 @@ fn emit_encode(
                     }
                 },
                 writer_results_input: Some(t.inputs.writer_results),
-                logical_summary_input: t.inputs.logical_summary,
-                logical_summary: t
-                    .logical_summary
-                    .map(|columns| wire::LogicalSummaryColumns {
-                        inserted_value_id: Some(columns.inserted.get()),
-                        replaced_value_id: Some(columns.replaced.get()),
-                        deleted_value_id: Some(columns.deleted.get()),
-                    }),
+                summaries: encode_finish_summaries(t, w)?,
                 expected_target_ordinals: ordinals,
                 input_schema: Some(schema::emit_schema(&t.input_schema, input_schema, w)?),
                 output_schema: Some(schema::emit_schema(&t.output_schema, output_schema, w)?),
@@ -1411,9 +1464,9 @@ fn emit_decode(
                 count_mode: completed(finish_mode(t.count_mode), w)?,
                 inputs: p::FinishInputs {
                     writer_results: required(t.writer_results_input, w)?,
-                    logical_summary: t.logical_summary_input,
+                    summaries: completed(wire_finish_columns(t), w)?.0,
                 },
-                logical_summary: completed(wire_finish_columns(t), w)?,
+                summaries: completed(wire_finish_columns(t), w)?.1,
                 expected_target_ordinals: boxed(ordinals, w)?,
                 input_schema: schema::read_schema(t.input_schema.as_ref().unwrap(), e.types(), w)?,
                 output_schema: schema::read_schema(

@@ -38,8 +38,117 @@ pub enum ProgramOutputRole {
     ProviderRoute {
         target: novarocks_connector_contract::WriteTargetOrdinal,
     },
-    LogicalSummary,
+    Summary(novarocks_result_contract::SummaryKind),
     WriterResults,
+}
+
+/// The pure identity of a summary author, independent of its future unit count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticSummaryAuthor {
+    RouterSink,
+    Node(crate::ProgramNodeId),
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticSummaryBranch {
+    kind: novarocks_result_contract::SummaryKind,
+    author: StaticSummaryAuthor,
+    branch: StaticStreamBranch,
+    layout: StaticLayout,
+}
+impl StaticSummaryBranch {
+    pub fn try_new(
+        kind: novarocks_result_contract::SummaryKind,
+        author: StaticSummaryAuthor,
+        branch: StaticStreamBranch,
+        layout: StaticLayout,
+    ) -> Result<Self, StaticSinkError> {
+        let value = Self {
+            kind,
+            author,
+            branch,
+            layout,
+        };
+        value.validate_core(&mut || Ok::<(), StaticSinkError>(()))?;
+        Ok(value)
+    }
+    pub const fn kind(&self) -> novarocks_result_contract::SummaryKind {
+        self.kind
+    }
+    pub const fn author(&self) -> StaticSummaryAuthor {
+        self.author
+    }
+    pub const fn branch(&self) -> &StaticStreamBranch {
+        &self.branch
+    }
+    pub const fn layout(&self) -> &StaticLayout {
+        &self.layout
+    }
+    pub(crate) fn validate_core<E: From<StaticSinkError>>(
+        &self,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let valid = self.branch.contract.role == ProgramOutputRole::Summary(self.kind)
+            && self.branch.contract.delivery
+                == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+            && self.branch.partition_type == DataStreamPartitionType::Unpartitioned
+            && matches!(self.branch.contract.routing, StaticStreamRouting::Ordinary)
+            && self.branch.partition_exprs.is_empty()
+            && self.branch.limit.is_none()
+            && self.branch.output_columns() == self.layout.slots();
+        observe()?;
+        if !valid {
+            return Err(StaticSinkError::InvalidSummaryLayout.into());
+        }
+        validate_summary_layout_core(self.kind, &self.layout, observe)
+    }
+}
+
+/// Check only the closed three/four-field contract, borrowing the exact bindings.
+/// This inspection grants neither allocation capacity nor author identity.
+pub fn validate_summary_layout(
+    kind: novarocks_result_contract::SummaryKind,
+    layout: &StaticLayout,
+) -> Result<(), StaticSinkError> {
+    validate_summary_layout_core(kind, layout, &mut || Ok::<(), StaticSinkError>(()))
+}
+
+pub(crate) fn validate_summary_layout_core<E: From<StaticSinkError>>(
+    kind: novarocks_result_contract::SummaryKind,
+    layout: &StaticLayout,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    use novarocks_result_contract::SummaryWireType;
+    let valid = layout.slots().len() == kind.fields().len()
+        && layout.schema().fields().len() == kind.fields().len();
+    observe()?;
+    if !valid {
+        return Err(StaticSinkError::InvalidSummaryLayout.into());
+    }
+    for (ordinal, (actual, expected)) in layout
+        .schema()
+        .fields()
+        .iter()
+        .zip(kind.fields())
+        .enumerate()
+    {
+        let ty = match expected.wire_type() {
+            SummaryWireType::Int64 => arrow_schema::DataType::Int64,
+            SummaryWireType::FixedSizeBinary(width) => {
+                arrow_schema::DataType::FixedSizeBinary(i32::from(width))
+            }
+        };
+        let valid = actual.data_type() == &ty && !actual.is_nullable()
+            && layout.value_binding_at(ordinal).is_some_and(|binding| {
+                !binding.value_type().nullable()
+                    && matches!(binding.value_type().kind(), novarocks_type_contract::ValueKind::Scalar(actual) if actual == &ty)
+            });
+        observe()?;
+        if !valid {
+            return Err(StaticSinkError::InvalidSummaryLayout.into());
+        }
+    }
+    Ok(())
 }
 
 /// Ordinary streams retain their frozen historic hash mapping. The two new
@@ -241,8 +350,6 @@ pub enum StaticSinkProgram {
         arena: Arc<ImmutableExpressions>,
         effect_slot: SlotId,
         routes: Arc<[StaticRouterRoute]>,
-        summary_branch: u32,
-        summary_layout: StaticLayout,
     },
     SplitDataStream {
         branches: Arc<[StaticStreamBranch]>,
@@ -287,17 +394,8 @@ impl StaticSinkProgram {
                 branches,
                 arena,
                 routes,
-                summary_branch,
-                summary_layout,
                 ..
-            } => validate_router_core(
-                branches,
-                arena,
-                routes,
-                *summary_branch,
-                summary_layout,
-                observe,
-            ),
+            } => validate_router_core(branches, arena, routes, observe),
             Self::SplitDataStream {
                 branches,
                 split_exprs,
@@ -348,24 +446,15 @@ impl StaticSinkProgram {
         arena: Arc<ImmutableExpressions>,
         effect_slot: SlotId,
         routes: Vec<StaticRouterRoute>,
-        summary_branch: u32,
-        summary_layout: StaticLayout,
     ) -> Result<Self, StaticSinkError> {
-        validate_router_core(
-            &branches,
-            &arena,
-            &routes,
-            summary_branch,
-            &summary_layout,
-            &mut || Ok::<(), StaticSinkError>(()),
-        )?;
+        validate_router_core(&branches, &arena, &routes, &mut || {
+            Ok::<(), StaticSinkError>(())
+        })?;
         Ok(Self::ChangeStreamRouter {
             branches: Arc::from(branches),
             arena,
             effect_slot,
             routes: Arc::from(routes),
-            summary_branch,
-            summary_layout,
         })
     }
 
@@ -405,43 +494,15 @@ fn validate_router_core<E: From<StaticSinkError>>(
     branches: &[StaticStreamBranch],
     arena: &ImmutableExpressions,
     routes: &[StaticRouterRoute],
-    summary_branch: u32,
-    summary_layout: &StaticLayout,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     validate_branches_core(branches, arena, observe)?;
-    let summary_index =
-        usize::try_from(summary_branch).map_err(|_| StaticSinkError::InvalidRouter)?;
-    let summary = branches
-        .get(summary_index)
-        .ok_or(StaticSinkError::InvalidRouter)?;
     observe()?;
-    if routes.is_empty()
-        || routes.len().checked_add(1) != Some(branches.len())
-        || summary.contract.role != ProgramOutputRole::LogicalSummary
-        || summary.contract.delivery
-            != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
-        || summary.partition_type != DataStreamPartitionType::Unpartitioned
-        || !matches!(summary.contract.routing, StaticStreamRouting::Ordinary)
-        || !summary.partition_exprs.is_empty()
-        || summary.limit.is_some()
-        || summary.output_columns() != summary_layout.slots()
-    {
+    if routes.is_empty() || routes.len() != branches.len() {
         return Err(StaticSinkError::InvalidRouter.into());
-    }
-    if summary_layout.slots().len() != 3 || summary_layout.schema().fields().len() != 3 {
-        return Err(StaticSinkError::InvalidSummaryLayout.into());
-    }
-    for field in summary_layout.schema().fields() {
-        let valid = field.data_type() == &arrow_schema::DataType::Int64 && !field.is_nullable();
-        observe()?;
-        if !valid {
-            return Err(StaticSinkError::InvalidSummaryLayout.into());
-        }
     }
     let mut covered = BTreeSet::new();
     let mut targets = BTreeSet::new();
-    covered.insert(summary_index);
     for route in routes {
         let index = usize::try_from(route.branch).map_err(|_| StaticSinkError::InvalidRouter)?;
         let branch = branches.get(index).ok_or(StaticSinkError::InvalidRouter)?;
@@ -923,52 +984,81 @@ mod router_contract_tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
     use novarocks_connector_contract::{ConnectorRowMutationEffect, WriteTargetOrdinal};
+    use novarocks_result_contract::SummaryKind;
     use std::collections::HashMap;
-
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    fn summary_layout(kind: SummaryKind) -> StaticLayout {
+        let fields = kind
+            .fields()
+            .iter()
+            .map(|field| {
+                let ty = match field.wire_type() {
+                    novarocks_result_contract::SummaryWireType::Int64 => DataType::Int64,
+                    novarocks_result_contract::SummaryWireType::FixedSizeBinary(width) => {
+                        DataType::FixedSizeBinary(i32::from(width))
+                    }
+                };
+                Field::new(field.name(), ty, false)
+            })
+            .collect::<Vec<_>>();
+        let bindings = fields
+            .iter()
+            .map(|field| {
+                (
+                    novarocks_type_contract::FunctionValueType::new(
+                        field.data_type().clone(),
+                        false,
+                    )
+                    .typed_binding()
+                    .clone(),
+                    None,
+                )
+            })
+            .collect();
+        StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(fields)),
+            (0..kind.fields().len())
+                .map(|i| SlotId::new(10 + i as u32))
+                .collect(),
+            bindings,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap()
+    }
+    fn branch(node: i32, columns: Vec<SlotId>, role: ProgramOutputRole) -> StaticStreamBranch {
+        StaticStreamBranch::try_new(
+            node,
+            DataStreamPartitionType::Unpartitioned,
+            vec![],
+            columns,
+            None,
+            StaticStreamContract {
+                role,
+                delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain,
+                routing: StaticStreamRouting::Ordinary,
+            },
+        )
+        .unwrap()
+    }
     fn fixture() -> (
         Vec<StaticStreamBranch>,
         Arc<ImmutableExpressions>,
         Vec<StaticRouterRoute>,
-        StaticLayout,
     ) {
-        let summary = StaticLayout::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("inserted", DataType::Int64, false),
-                Field::new("replaced", DataType::Int64, false),
-                Field::new("deleted", DataType::Int64, false),
-            ])),
-            Arc::from([SlotId::new(10), SlotId::new(11), SlotId::new(12)]),
-        )
-        .unwrap();
-        let branch = |node, columns, role| {
-            StaticStreamBranch::try_new(
-                node,
-                DataStreamPartitionType::Unpartitioned,
-                vec![],
-                columns,
-                None,
-                StaticStreamContract {
-                    role,
-                    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain,
-                    routing: StaticStreamRouting::Ordinary,
-                },
-            )
-            .unwrap()
-        };
-        let branches = vec![
-            branch(
-                1,
-                vec![SlotId::new(2)],
-                ProgramOutputRole::ProviderRoute {
-                    target: WriteTargetOrdinal::try_new(0).unwrap(),
-                },
-            ),
-            branch(
-                2,
-                summary.slots().to_vec(),
-                ProgramOutputRole::LogicalSummary,
-            ),
-        ];
+        let branches = vec![branch(
+            1,
+            vec![SlotId::new(2)],
+            ProgramOutputRole::ProviderRoute {
+                target: WriteTargetOrdinal::try_new(0).unwrap(),
+            },
+        )];
         let arena =
             Arc::new(ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap());
         let routes = vec![StaticRouterRoute {
@@ -976,33 +1066,24 @@ mod router_contract_tests {
             branch: 0,
             accepted_effects: Arc::from([ConnectorRowMutationEffect::Insert]),
         }];
-        (branches, arena, routes, summary)
+        (branches, arena, routes)
     }
     #[test]
-    fn router_keeps_a_separate_summary_layout_and_covers_branches_once() {
-        let (branches, arena, routes, summary) = fixture();
+    fn router_owns_only_provider_branches_and_does_not_imply_a_summary() {
+        let (branches, arena, routes) = fixture();
         let sink = StaticSinkProgram::try_change_stream_router(
             branches.clone(),
             arena.clone(),
             SlotId::new(1),
             routes.clone(),
-            1,
-            summary.clone(),
         )
         .unwrap();
-        assert_eq!(sink.branches()[1].output_columns(), summary.slots());
+        assert_eq!(sink.branches().len(), 1);
         let mut duplicate = routes;
         duplicate.push(duplicate[0].clone());
         assert!(
-            StaticSinkProgram::try_change_stream_router(
-                branches,
-                arena,
-                SlotId::new(1),
-                duplicate,
-                1,
-                summary
-            )
-            .is_err()
+            StaticSinkProgram::try_change_stream_router(branches, arena, SlotId::new(1), duplicate)
+                .is_err()
         );
     }
     #[test]
@@ -1015,55 +1096,69 @@ mod router_contract_tests {
             vec![SlotId::new(10)],
         ] {
             let valid = keys == vec![SlotId::new(2)];
-            let (branches, arena, mut routes, summary) = fixture();
+            let (branches, arena, mut routes) = fixture();
             routes[0].layout = ProgramWriteLayoutPreference::ClusterBy(Arc::from(keys));
-            let result = StaticSinkProgram::try_change_stream_router(
-                branches,
-                arena,
-                SlotId::new(1),
-                routes,
-                1,
-                summary,
+            assert_eq!(
+                StaticSinkProgram::try_change_stream_router(
+                    branches,
+                    arena,
+                    SlotId::new(1),
+                    routes
+                )
+                .is_ok(),
+                valid
             );
-            assert_eq!(result.is_ok(), valid);
         }
     }
     #[test]
-    fn summary_cannot_claim_a_provider_route_or_nullable_counters() {
-        let (mut branches, arena, routes, summary) = fixture();
-        branches[1].contract.role = ProgramOutputRole::Relational;
-        assert!(
-            StaticSinkProgram::try_change_stream_router(
-                branches,
-                arena,
-                SlotId::new(1),
-                routes,
-                1,
-                summary
+    fn each_summary_has_its_exact_non_null_typed_layout_and_role() {
+        for kind in SummaryKind::ALL {
+            let layout = summary_layout(kind);
+            let output = branch(2, layout.slots().to_vec(), ProgramOutputRole::Summary(kind));
+            StaticSummaryBranch::try_new(
+                kind,
+                StaticSummaryAuthor::RouterSink,
+                output.clone(),
+                layout.clone(),
             )
-            .is_err()
-        );
-        let (branches, arena, routes, _) = fixture();
-        let nullable = StaticLayout::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("a", DataType::Int64, true),
-                Field::new("b", DataType::Int64, false),
-                Field::new("c", DataType::Int64, false),
-            ])),
-            Arc::from([SlotId::new(10), SlotId::new(11), SlotId::new(12)]),
-        )
-        .unwrap();
-        assert!(
-            StaticSinkProgram::try_change_stream_router(
-                branches,
-                arena,
-                SlotId::new(1),
-                routes,
-                1,
-                nullable
-            )
-            .is_err()
-        );
+            .unwrap();
+            let mut wrong_role = output.clone();
+            wrong_role.contract.role = ProgramOutputRole::Relational;
+            assert!(
+                StaticSummaryBranch::try_new(
+                    kind,
+                    StaticSummaryAuthor::RouterSink,
+                    wrong_role,
+                    layout.clone()
+                )
+                .is_err()
+            );
+            let mut fields = layout
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            fields[0] = fields[0].clone().with_nullable(true);
+            let nullable =
+                StaticLayout::try_new(Arc::new(Schema::new(fields)), Arc::from(layout.slots()))
+                    .unwrap();
+            assert!(
+                StaticSummaryBranch::try_new(
+                    kind,
+                    StaticSummaryAuthor::RouterSink,
+                    output,
+                    nullable
+                )
+                .is_err()
+            );
+            let other = if kind == SummaryKind::WriteCounts {
+                SummaryKind::DeleteVerification
+            } else {
+                SummaryKind::WriteCounts
+            };
+            assert!(validate_summary_layout(other, &layout).is_err());
+        }
     }
 }
 

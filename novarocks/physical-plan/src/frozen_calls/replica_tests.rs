@@ -47,6 +47,7 @@ impl PureCompileControl for ReplicaControl {
 }
 fn edit_fragment(fragment: &Fragment, edit: impl FnOnce(&mut FragmentParts)) -> Fragment {
     let mut parts = FragmentParts {
+        summaries: Box::default(),
         stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),

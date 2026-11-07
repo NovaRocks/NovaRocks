@@ -262,9 +262,9 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
                     count_mode: crate::FinishCountMode::WriterReported,
                     inputs: crate::FinishInputs {
                         writer_results: 0,
-                        logical_summary: None,
+                        summaries: Default::default(),
                     },
-                    logical_summary: None,
+                    summaries: Default::default(),
                     expected_target_ordinals: Box::default(),
                     input_schema: schema(),
                     output_schema: schema(),
@@ -315,6 +315,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             .unwrap()
             .request_bytes_upper_bound;
     let fragment = Fragment::from(crate::plan::FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: FragmentId::new(7),
         root: NodeId::new(0),

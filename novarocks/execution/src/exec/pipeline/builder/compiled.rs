@@ -534,6 +534,7 @@ pub(crate) fn build_compiled_pipeline_graph(
         1,
         0,
     )
+    .map(|(graph, _preparation)| graph)
 }
 
 #[expect(
@@ -554,7 +555,10 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     ordered: Option<&CompiledOrderedFilterContext>,
     local_exchange_bytes_per_driver: usize,
     local_exchange_max_rows: i64,
-) -> ExecutionResult<PipelineGraph> {
+) -> ExecutionResult<(
+    PipelineGraph,
+    crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation,
+)> {
     let graph = program.graph();
     if graph
         .nodes()
@@ -577,6 +581,10 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
         exchange_bindings,
         scan_bindings,
         compiled_writers: writer_bindings,
+        summary_authors:
+            crate::exec::operators::logical_change_summary::SummaryAuthorAssemblyObligation::new(
+                graph.summaries(),
+            )?,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: 1,
@@ -613,7 +621,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     let root_id = build.pipeline.id;
     let mut pipelines = vec![build.pipeline];
     pipelines.append(&mut build.extra_pipelines);
-    Ok(PipelineGraph { pipelines, root_id })
+    Ok((PipelineGraph { pipelines, root_id }, ctx.summary_authors))
 }
 
 /// Keeps the compiler's physical diagnostic sources through driver creation.
@@ -665,6 +673,20 @@ fn build_node(
             format!("missing compiled program node {}", id.index()),
         )
     })?;
+    for kind in novarocks_result_contract::SummaryKind::ALL {
+        if ctx
+            .summary_authors
+            .declares(kind, novarocks_local_program::StaticSummaryAuthor::Node(id))
+        {
+            // Every currently admitted node family declares no authorship.
+            // A future family must take the exact obligation in its factory arm.
+            return Err(
+                crate::exec::operators::logical_change_summary::summary_failure(
+                    crate::exec::operators::logical_change_summary::SummaryFailure::Author(kind),
+                ),
+            );
+        }
+    }
     let node_id = display_id(id)?;
     let mut build = match node.kind() {
         ProgramNodeKind::Values { .. } => {

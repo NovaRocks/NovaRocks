@@ -333,7 +333,7 @@ fn walk(
             root.node,
             final_source.node().inputs[finish.inputs.writer_results as usize]
         );
-        if let Some(summary) = finish.inputs.logical_summary {
+        if let Some(summary) = finish.inputs.summaries.write_counts {
             assert_ne!(summary, finish.inputs.writer_results);
             assert_ne!(root.node, final_source.node().inputs[summary as usize]);
         }

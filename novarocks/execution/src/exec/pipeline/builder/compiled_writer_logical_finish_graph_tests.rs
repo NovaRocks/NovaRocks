@@ -42,11 +42,11 @@ mod logical_finish_graph {
                 .checked_add(1)
                 .unwrap(),
         );
-        let source = p::LogicalSummaryColumns {
-            inserted: p::ValueId::new(901),
-            replaced: p::ValueId::new(902),
-            deleted: p::ValueId::new(903),
-        };
+        let source = p::SummaryColumns::write_counts(
+            p::ValueId::new(901),
+            p::ValueId::new(902),
+            p::ValueId::new(903),
+        );
         let mut builder = p::FragmentBuilder::new(fragment.id());
         for value in fragment.values().values() {
             builder.insert_value(value.clone()).unwrap();
@@ -54,7 +54,7 @@ mod logical_finish_graph {
         for (_, expression) in fragment.expressions().iter() {
             builder.insert_expression(expression.clone()).unwrap();
         }
-        let imports = source.values().map(|source_value| {
+        let imports = source.values().iter().copied().map(|source_value| {
             builder
                 .add_value(
                     ty(DataType::Int64, false),
@@ -64,12 +64,8 @@ mod logical_finish_graph {
                     },
                 )
                 .unwrap()
-        });
-        let destination = p::LogicalSummaryColumns {
-            inserted: imports[0],
-            replaced: imports[1],
-            deleted: imports[2],
-        };
+        }).collect::<Vec<_>>();
+        let destination = p::SummaryColumns::write_counts(imports[0], imports[1], imports[2]);
         for node in fragment.nodes().values() {
             let mut node = node.clone();
             if node.id == fragment.root() {
@@ -77,8 +73,8 @@ mod logical_finish_graph {
                     panic!("the original statistics consumer root is TableFinish");
                 };
                 spec.count_mode = p::FinishCountMode::LogicalChanges;
-                spec.inputs.logical_summary = Some(node.inputs.len() as u32);
-                spec.logical_summary = Some(destination);
+                spec.inputs.summaries.write_counts = Some(node.inputs.len() as u32);
+                spec.summaries.write_counts = Some(destination);
                 let mut inputs = node.inputs.into_vec();
                 inputs.push(summary_node);
                 node.inputs = inputs.into();
@@ -93,9 +89,8 @@ mod logical_finish_graph {
                 summary_node,
                 SUMMARY_EDGE,
                 source
-                    .values()
-                    .into_iter()
-                    .zip(destination.values())
+                    .values().iter().copied()
+                    .zip(destination.values().iter().copied())
                     .collect(),
                 destination.values().into(),
                 Distribution::Singleton,
@@ -132,9 +127,8 @@ mod logical_finish_graph {
             source_fragment: p::FragmentId::new(77),
             destination_node: summary_node,
             imports: source
-                .values()
-                .into_iter()
-                .zip(destination.values())
+                .values().iter().copied()
+                .zip(destination.values().iter().copied())
                 .map(|(source, destination)| p::CutImport {
                     source: p::CutValue {
                         value: source,
@@ -149,8 +143,8 @@ mod logical_finish_graph {
                 source_multiplicity: RowMultiplicity::SingleCopy,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            source_port: p::FragmentOutputPort::LogicalSummary,
-            payload: p::ExchangePayloadContract::LogicalSummary(p::LogicalSummaryCut {
+            source_port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
+            payload: p::ExchangePayloadContract::Summary(p::SummaryCut {
                 source,
                 destination,
             }),
@@ -264,7 +258,7 @@ mod logical_finish_graph {
             .exchange_inputs()
             .iter()
             .find(|(_, input)| {
-                input.role == novarocks_local_program::ProgramOutputRole::LogicalSummary
+                input.role == novarocks_local_program::ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts)
             })
             .unwrap();
         let summary_node = i32::try_from(summary_input.receiver_node).unwrap();
@@ -419,7 +413,7 @@ mod logical_finish_graph {
         let send_summary = || {
             let counts = novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap();
             let chunk = crate::exec::operators::logical_change_summary::summary_chunk(
-                counts,
+                novarocks_result_contract::SummaryValue::WriteCounts(counts),
                 &summary_schema,
                 summary_creation.as_ref(),
             )
@@ -471,7 +465,7 @@ mod logical_finish_graph {
             .bind_finish(
                 root_of(&compiled.finish),
                 TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers))
-                    .with_logical_summary(summary_node, Arc::from([summary_stream.source()]))
+                    .with_summary(novarocks_result_contract::SummaryKind::WriteCounts, summary_node, Arc::from([summary_stream.source()]))
                     .unwrap(),
             )
             .unwrap();
@@ -556,7 +550,7 @@ mod logical_finish_graph {
                 .downcast_ref::<Int64Array>()
                 .unwrap();
             for row in 0..chunk.len() {
-                if kind.value(row) == RootRowKind::Summary.to_wire() {
+                if kind.value(row) == RootRowKind::RowCount.to_wire() {
                     counts.push(count.value(row));
                 }
                 if kind.value(row) == RootRowKind::PreparedFragment.to_wire() {

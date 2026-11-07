@@ -58,6 +58,7 @@ impl PureCompileControl for TraceControl {
 }
 fn with_nodes(fragment: &Fragment, nodes: BTreeMap<NodeId, PhysicalNode>) -> Fragment {
     FragmentParts {
+        summaries: Box::default(),
         stage_placement: fragment.stage_placement().clone(),
         id: fragment.id(),
         root: fragment.root(),
@@ -185,9 +186,9 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
                 count_mode: crate::FinishCountMode::WriterReported,
                 inputs: crate::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([WriteTargetOrdinal::try_new(0).unwrap()]),
                 input_schema: schema.clone(),
                 output_schema: schema,
@@ -213,6 +214,7 @@ fn all_sites() -> (Fragment, PhysicalRootUses) {
         );
     }
     let fragment: Fragment = FragmentParts {
+        summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,
         id: base.fragment.id(),
         root: base.fragment.root(),

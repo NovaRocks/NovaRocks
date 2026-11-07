@@ -23,18 +23,18 @@
 
 -- query 1
 -- @result_contains=TRINO_PUFFIN_PARENT_READY version=483
-shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" create-parent nr_statistics_${suite_uuid0} trino_puffin_${uuid0}
+shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" create-parent ${suite_uuid0} trino_puffin_${uuid0}
 
 -- query 2
 -- @skip_result_check=true
-ALTER TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.trino_puffin_${uuid0}
+ALTER TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0}
 SET TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true');
 
 -- query 3
 -- The duplicate parent value distinguishes a Theta union from row-counting:
 -- Trino measured {1,2}; Nova writes {2,3}; the current NDV must be 3.
 -- @skip_result_check=true
-INSERT INTO statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.trino_puffin_${uuid0}
+INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0}
 VALUES (2, 20), (3, 30);
 
 -- query 4
@@ -42,8 +42,8 @@ VALUES (2, 20), (3, 30);
 -- the current data and snapshot through the same REST/S3 connector and asserts
 -- four rows, three distinct ids, and the exact id range 1..3.
 -- @result_contains=TRINO_NOVA_CURRENT_PUFFIN_OK version=483
-shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" verify-current nr_statistics_${suite_uuid0} trino_puffin_${uuid0} id 4 3 1 3
+shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" verify-current ${suite_uuid0} trino_puffin_${uuid0} id 4 3 1 3
 
 -- query 5
 -- @skip_result_check=true
-DROP TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.trino_puffin_${uuid0} FORCE;
+DROP TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.trino_puffin_${uuid0} FORCE;

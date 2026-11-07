@@ -41,3 +41,23 @@ pub fn canonical_f32_bits(value: f32) -> u32 {
         value.to_bits()
     }
 }
+
+/// Result-content identity distinguishes signed zero and canonicalizes NaNs.
+/// The fixed IEEE bits are part of the deterministic content fingerprint input;
+/// Rust's NAN constants do not promise the same payload across targets.
+pub(crate) fn content_f64_bits(value: f64) -> u64 {
+    if value.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        value.to_bits()
+    }
+}
+
+/// See [`content_f64_bits`].
+pub(crate) fn content_f32_bits(value: f32) -> u32 {
+    if value.is_nan() {
+        0x7fc0_0000
+    } else {
+        value.to_bits()
+    }
+}

@@ -735,9 +735,9 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
             count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
             inputs: novarocks_physical_plan::FinishInputs {
                 writer_results: 0,
-                logical_summary: None,
+                summaries: Default::default(),
             },
-            logical_summary: None,
+            summaries: Default::default(),
             expected_target_ordinals: Box::default(),
             input_schema: p::WriterRelationSchema {
                 revision: 0,

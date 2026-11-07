@@ -1,5 +1,5 @@
 -- query 1
--- legacy
+-- types	bigint	bigint	varchar
 id	x	y
 1	1	a
 1	2	NULL

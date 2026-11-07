@@ -840,6 +840,7 @@ impl TaskManifestBinding {
         &self,
     ) -> impl Iterator<
         Item = (
+            novarocks_physical_plan::SummaryKind,
             TaskIdentity,
             crate::native::fragment_encoder::frozen::StaticSinkTarget,
         ),
@@ -982,17 +983,19 @@ fn bound_summary_sources<'a>(
     fragments: &'a crate::query_execution::native_fragment::NativeFragmentAttachment,
 ) -> impl Iterator<
     Item = (
+        novarocks_physical_plan::SummaryKind,
         TaskIdentity,
         crate::native::fragment_encoder::frozen::StaticSinkTarget,
     ),
 > + 'a {
-    tasks.iter().filter_map(move |task| {
+    tasks.iter().flat_map(move |task| {
         fragments
             .get(task.fragment_id)
             .expect("bound Task fragment belongs to its retained Native template")
             .facts()
-            .logical_summary_output()
-            .map(|output| (task.identity, output))
+            .summary_outputs()
+            .iter()
+            .map(move |(kind, output)| (kind, task.identity, *output))
     })
 }
 

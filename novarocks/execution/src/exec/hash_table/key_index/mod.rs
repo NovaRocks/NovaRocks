@@ -26,6 +26,7 @@ mod bulk_read;
 mod canonical_store;
 mod capture;
 mod compact;
+mod content_fingerprint;
 mod direct_int;
 mod export;
 mod fixed_store;
@@ -91,7 +92,9 @@ pub(crate) use local_hash::{LocalHashBatch, LocalHashPolicy, hash_batch};
     )
 )]
 pub(crate) use prepared::KeyStrategy;
-pub(crate) use prepared::{IndexPurpose, KeyId, KeyInput, KeySpec, NullPolicy, PreparedKeyBatch};
+pub(crate) use prepared::{
+    IndexPurpose, KeyEquality, KeyId, KeyInput, KeySpec, NullPolicy, PreparedKeyBatch,
+};
 #[expect(
     unused_imports,
     reason = "Frozen K typed read/export API; current join consumes lookup and assignments."

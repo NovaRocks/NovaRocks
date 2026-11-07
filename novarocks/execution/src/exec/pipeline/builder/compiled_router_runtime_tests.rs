@@ -154,14 +154,14 @@ mod router_runtime_tests {
             .unwrap();
         let mut counter = |field| {
             builder
-                .add_value(int64(), p::ValueOrigin::LogicalSummary { field })
+                .add_value(int64(), p::ValueOrigin::Summary { field })
                 .unwrap()
         };
-        let summary_columns = p::LogicalSummaryColumns {
-            inserted: counter(p::LogicalChangeCountField::Inserted),
-            replaced: counter(p::LogicalChangeCountField::Replaced),
-            deleted: counter(p::LogicalChangeCountField::Deleted),
-        };
+        let summary_columns = p::SummaryColumns::write_counts(
+            counter(p::SummaryField::Inserted),
+            counter(p::SummaryField::Replaced),
+            counter(p::SummaryField::Deleted),
+        );
         let summary_edge = p::EdgeId::new(73);
         let ordinals = [
             p::WriteTargetOrdinal::try_new(0).unwrap(),
@@ -227,14 +227,14 @@ mod router_runtime_tests {
                 }
             })
             .collect::<Vec<_>>();
-        let destinations = p::LogicalSummaryColumns {
-            inserted: p::ValueId::new(103),
-            replaced: p::ValueId::new(104),
-            deleted: p::ValueId::new(105),
-        };
+        let destinations = p::SummaryColumns::write_counts(
+            p::ValueId::new(103),
+            p::ValueId::new(104),
+            p::ValueId::new(105),
+        );
         let projection = summary_columns
-            .values()
-            .map(|value| p::CutValue { value, ty: int64() });
+            .values().iter().copied()
+            .map(|value| p::CutValue { value, ty: int64() }).collect::<Vec<_>>();
         outbound.push(p::OutboundFragmentCut {
             edge: summary_edge,
             kind: p::EdgeKind::Stream,
@@ -243,7 +243,7 @@ mod router_runtime_tests {
             projection: projection.clone().into(),
             destination_imports: projection
                 .into_iter()
-                .zip(destinations.values())
+                .zip(destinations.values().iter().copied())
                 .map(|(source, destination)| p::CutImport {
                     source,
                     destination,
@@ -255,23 +255,25 @@ mod router_runtime_tests {
                 source_multiplicity: multiplicity,
                 destination_multiplicity: multiplicity,
             },
-            source_port: p::FragmentOutputPort::LogicalSummary,
-            payload: p::ExchangePayloadContract::LogicalSummary(p::LogicalSummaryCut {
+            source_port: p::FragmentOutputPort::Summary(p::SummaryKind::WriteCounts),
+            payload: p::ExchangePayloadContract::Summary(p::SummaryCut {
                 source: summary_columns,
                 destination: destinations,
             }),
             delivery: p::DeliveryRequirement::MustDrain,
         });
+        builder.set_summaries(Box::new([p::SummaryOutput {
+                        edge: summary_edge,
+                        columns: summary_columns,
+                        author: p::SummaryAuthor::RouterSink,
+                    }]));
         let fragment = builder
             .finish_definition(
                 expand,
                 p::FragmentSink::Router {
                     effect,
                     routes: routes.into(),
-                    summary: p::LogicalSummaryOutput {
-                        edge: summary_edge,
-                        columns: summary_columns,
-                    },
+
                 },
                 p::PipelineDopDomain {
                     min: 1,
@@ -515,29 +517,27 @@ mod router_runtime_tests {
         }
         let Some(StaticSinkProgram::ChangeStreamRouter {
             branches,
-            summary_branch,
-            summary_layout,
             ..
         }) = program.graph().sink()
         else {
             panic!("the original compiler must lower the checked Router")
         };
-        assert_eq!(branches.len(), 3);
-        assert_eq!(
-            *summary_branch, 2,
-            "this compiler author keeps its independent summary last"
-        );
+        assert_eq!(branches.len(), 2);
+        let [summary] = program.graph().summaries() else { panic!("one independent summary") };
+        let summary_layout = summary.layout();
+        assert_eq!(summary.kind(), novarocks_result_contract::SummaryKind::WriteCounts);
+        let summary_branch = branches.len();
         let fixture = Fixture::new();
         let port = fixture.port.clone();
         let mut keys = Vec::new();
         let mut groups = Vec::new();
-        for (index, branch) in branches.iter().enumerate() {
+        for (index, branch) in program.graph().stream_branches().enumerate() {
             let instance = UniqueId::new(0x762, index as i64 + 1);
             let key = ExchangeReceiverKey {
                 task_key: instance,
                 node_id: branch.dest_node_id(),
             };
-            let layout = if index == *summary_branch as usize {
+            let layout = if index == summary_branch {
                 summary_layout.clone()
             } else {
                 receiver_projection(
@@ -654,7 +654,7 @@ mod router_runtime_tests {
         let prepared = prepare_compiled_program_with_sink_materializer(
             Arc::clone(&program),
             Duration::from_millis(10),
-            |actual| {
+            |actual, authors| {
                 assert_eq!(
                     observed_width.replace(Some(actual.get())),
                     None,
@@ -669,6 +669,7 @@ mod router_runtime_tests {
                     Some(gates),
                     actual,
                     state.mem_tracker(),
+                    authors,
                 )
             },
             bindings,

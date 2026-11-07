@@ -252,6 +252,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
     for (id, attached) in &attachments {
         let source = &checked.fragments()[&FragmentId::new(*id)];
         let parts = crate::plan::FragmentParts {
+            summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
             id: source.id(),
             root: source.root(),
@@ -313,6 +314,7 @@ fn plan_numbering_follows_each_fragments_own_attachment_order_and_endpoint_index
     detached.insert(
         source.id(),
         Fragment::from(crate::plan::FragmentParts {
+            summaries: Box::default(),
             stage_placement: crate::StagePlacementPolicy::Singleton,
             id: source.id(),
             root: source.root(),

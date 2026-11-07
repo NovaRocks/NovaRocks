@@ -29,16 +29,16 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-statistics-source-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_statistics_${suite_uuid0};
-DROP TABLE IF EXISTS ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
-CREATE TABLE ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0} (
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${suite_uuid0};
+DROP TABLE IF EXISTS ice_rest.${suite_uuid0}.puffin_spark_${uuid0};
+CREATE TABLE ice_rest.${suite_uuid0}.puffin_spark_${uuid0} (
   id BIGINT,
   value BIGINT
 ) USING iceberg
 TBLPROPERTIES ('format-version' = '3');
-INSERT INTO ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0} VALUES (1, 10);
-INSERT INTO ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0} VALUES (2, 20);
-INSERT INTO ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0} VALUES (3, 30);
+INSERT INTO ice_rest.${suite_uuid0}.puffin_spark_${uuid0} VALUES (1, 10);
+INSERT INTO ice_rest.${suite_uuid0}.puffin_spark_${uuid0} VALUES (2, 20);
+INSERT INTO ice_rest.${suite_uuid0}.puffin_spark_${uuid0} VALUES (3, 30);
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" >/dev/null
 printf 'SPARK_STATISTICS_SOURCE_READY\n'
@@ -48,7 +48,7 @@ printf 'SPARK_STATISTICS_SOURCE_READY\n'
 -- through this step's exact nomination; publication is checked separately below.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
+ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.puffin_spark_${uuid0};
 
 -- query 3
 -- Wait for this case's own job, not any SUCCEEDED job on the shared
@@ -56,7 +56,7 @@ ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=namespace=${suite_uuid0}
 -- @result_rows_where=table=puffin_spark_${uuid0}
 -- @result_rows_count=1
 -- @result_rows_expect=state=SUCCEEDED
@@ -75,7 +75,7 @@ import org.apache.iceberg.spark.Spark3Util
 
 val table = Spark3Util.loadIcebergTable(
   spark,
-  "ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0}"
+  "ice_rest.${suite_uuid0}.puffin_spark_${uuid0}"
 )
 val statisticsFiles = table.statisticsFiles().asScala.toSeq
 require(statisticsFiles.nonEmpty, "Spark did not observe an Iceberg StatisticsFile")
@@ -95,7 +95,7 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-statistics-drop-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-DROP TABLE ice_rest.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
+DROP TABLE ice_rest.${suite_uuid0}.puffin_spark_${uuid0};
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" >/dev/null
 printf 'SPARK_STATISTICS_SOURCE_DROPPED\n'

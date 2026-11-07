@@ -30,10 +30,6 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
-#[expect(
-    dead_code,
-    reason = "P07 dual-input kernels await P08 Task binding and P09 builder integration."
-)]
 pub(crate) mod logical_input;
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
@@ -380,6 +376,7 @@ impl TableFinishOperatorFactory {
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
             logical_rows: None,
+            delete_verification: None,
             ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             aggregate: None,
@@ -432,7 +429,8 @@ struct BufferedFragment {
 /// of the complete prepared write set. The summary is its own first batch;
 /// prepared fragments then move through bounded, byte-aware batches.
 struct PrefixOutputCursor {
-    summary_rows: Option<i64>,
+    row_count_rows: Option<i64>,
+    delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
     fragments: VecDeque<BufferedFragment>,
     root_schema: crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<Arc<MemTracker>>,
@@ -441,21 +439,23 @@ struct PrefixOutputCursor {
 impl PrefixOutputCursor {
     fn try_new(
         rows: u64,
+        delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
         fragments: Vec<BufferedFragment>,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
     ) -> ExecutionResult<Self> {
-        let summary_rows = row_count_to_wire(rows).map_err(finish_connector)?;
+        let row_count_rows = row_count_to_wire(rows).map_err(finish_connector)?;
         validate_root_write_result_row(
-            RootRowKind::Summary,
+            RootRowKind::RowCount,
             RootWriteResultRowShape {
-                row_count: Some(summary_rows),
+                row_count: Some(row_count_rows),
                 ..RootWriteResultRowShape::default()
             },
         )
         .map_err(finish_connector)?;
         Ok(Self {
-            summary_rows: Some(summary_rows),
+            row_count_rows: Some(row_count_rows),
+            delete_verification,
             fragments: fragments.into(),
             root_schema,
             tracker,
@@ -463,7 +463,9 @@ impl PrefixOutputCursor {
     }
 
     fn has_output(&self) -> bool {
-        self.summary_rows.is_some() || !self.fragments.is_empty()
+        self.row_count_rows.is_some()
+            || self.delete_verification.is_some()
+            || !self.fragments.is_empty()
     }
 
     fn is_finished(&self) -> bool {
@@ -471,22 +473,53 @@ impl PrefixOutputCursor {
     }
 
     fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
-        if let Some(summary_rows) = self.summary_rows.take() {
+        if let Some(row_count_rows) = self.row_count_rows.take() {
             let root_arrow = self.root_schema.arrow_schema_ref();
             let batch = RecordBatch::try_new(
                 root_arrow,
                 vec![
-                    Arc::new(Int8Array::from(vec![RootRowKind::Summary.to_wire()])) as ArrayRef,
+                    Arc::new(Int8Array::from(vec![RootRowKind::RowCount.to_wire()])) as ArrayRef,
                     new_null_array(self.root_schema.arrow_schema_ref().field(1).data_type(), 1),
-                    Arc::new(Int64Array::from(vec![Some(summary_rows)])),
+                    Arc::new(Int64Array::from(vec![Some(row_count_rows)])),
                     new_null_array(self.root_schema.arrow_schema_ref().field(3).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(4).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(5).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(6).data_type(), 1),
                     new_null_array(self.root_schema.arrow_schema_ref().field(7).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(8).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(9).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(10).data_type(), 1),
+                    new_null_array(self.root_schema.arrow_schema_ref().field(11).data_type(), 1),
                 ],
             )
-            .map_err(|error| finish_arrow(FinishArrowOperation::Summary, error))?;
+            .map_err(|error| finish_arrow(FinishArrowOperation::RowCount, error))?;
+            return self.track_batch(batch).map(Some);
+        }
+        if let Some(verification) = self.delete_verification.take() {
+            let (counts, fingerprint) = verification.into_wire();
+            let schema = self.root_schema.arrow_schema_ref();
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+            columns.extend((0..8).map(|ordinal| {
+                if ordinal == 0 {
+                    Arc::new(Int8Array::from(vec![
+                        RootRowKind::DeleteVerification.to_wire(),
+                    ])) as ArrayRef
+                } else {
+                    new_null_array(schema.field(ordinal).data_type(), 1)
+                }
+            }));
+            columns.extend(
+                counts
+                    .into_iter()
+                    .map(|count| Arc::new(Int64Array::from(vec![count])) as ArrayRef),
+            );
+            columns.push(Arc::new(arrow::array::FixedSizeBinaryArray::new(
+                16,
+                arrow::buffer::Buffer::from_vec(fingerprint.to_vec()),
+                None,
+            )));
+            let batch = RecordBatch::try_new(schema, columns)
+                .map_err(|error| finish_arrow(FinishArrowOperation::DeleteVerification, error))?;
             return self.track_batch(batch).map(Some);
         }
         if self.fragments.is_empty() {
@@ -595,6 +628,22 @@ impl PrefixOutputCursor {
                     self.root_schema.arrow_schema_ref().field(7).data_type(),
                     rows,
                 ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(8).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(9).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(10).data_type(),
+                    rows,
+                ),
+                new_null_array(
+                    self.root_schema.arrow_schema_ref().field(11).data_type(),
+                    rows,
+                ),
             ],
         )
         .map_err(|error| finish_arrow(FinishArrowOperation::Fragment, error))
@@ -654,6 +703,7 @@ struct TableFinishOperator {
     rows: WriteRowCountAccumulator,
     // Set only by the finish-owned logical input after both inputs reach EOS.
     logical_rows: Option<novarocks_local_program::LogicalChangeCounts>,
+    delete_verification: Option<novarocks_result_contract::DeleteVerificationCounts>,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
     aggregate: Option<ChildStep>,
@@ -971,6 +1021,7 @@ impl TableFinishOperator {
         self.prefix_output = Some(PrefixOutputCursor::try_new(
             self.logical_rows
                 .map_or(self.rows.get(), |counts| counts.affected_rows()),
+            self.delete_verification,
             std::mem::take(&mut self.fragments),
             Arc::clone(self.prepared_root_schema()?.chunk_schema()),
             self.output_tracker.as_ref().map(Arc::clone),
@@ -1202,7 +1253,10 @@ pub(crate) fn root_artifact_chunk_with_construction(
                         .map_err(|_| KernelFailure::ResourceExhausted)?,
                 )?,
                 RootArtifactStep::Columns => owner.request(
-                    Layout::array::<ArrayRef>(8).map_err(|_| KernelFailure::ResourceExhausted)?,
+                    Layout::array::<ArrayRef>(
+                        novarocks_spi::connector::write_stack::ROOT_WRITE_RESULT_COLUMN_COUNT,
+                    )
+                    .map_err(|_| KernelFailure::ResourceExhausted)?,
                 )?,
                 RootArtifactStep::KindWrapper => {
                     super::compiled_writer_statistics::grouped_primitive_adoption(
@@ -1426,6 +1480,10 @@ fn root_artifact_chunk_core(
         blob_type,
         body,
         properties,
+        null_array(8, rows)?,
+        null_array(9, rows)?,
+        null_array(10, rows)?,
+        null_array(11, rows)?,
     ];
     construct(artifact, columns, rows)
 }
@@ -2152,6 +2210,10 @@ mod tests {
                 None,
                 false,
             )),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::Int64, 1),
+            new_null_array(&DataType::FixedSizeBinary(16), 1),
         ];
         let upstream_schema =
             ChunkSchema::try_ref_from_schema_and_slot_ids(&upstream, root_schema.slot_ids())
@@ -2947,7 +3009,10 @@ mod tests {
             let (kinds, ordinals, row_counts, fragments) = finish_columns(output);
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("root row kind") {
-                    RootRowKind::Summary => {
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => {
                         summaries += 1;
                         assert!(ordinals.is_null(row));
                         assert_eq!(row_counts.value(row), 12);
@@ -2984,7 +3049,7 @@ mod tests {
         let output = &outputs[0];
         assert_eq!(output.len(), 1);
         let (kinds, _, row_counts, _) = finish_columns(output);
-        assert_eq!(kinds.value(0), RootRowKind::Summary.to_wire());
+        assert_eq!(kinds.value(0), RootRowKind::RowCount.to_wire());
         assert_eq!(row_counts.value(0), 0);
     }
 
@@ -3297,7 +3362,7 @@ mod tests {
                     .downcast_ref::<Int8Array>()
                     .expect("kind"))
                 .flat_map(|kinds| (0..kinds.len()).map(|row| kinds.value(row)))
-                .filter(|kind| *kind == RootRowKind::Summary.to_wire())
+                .filter(|kind| *kind == RootRowKind::RowCount.to_wire())
                 .count(),
             1
         );
@@ -3405,7 +3470,7 @@ mod tests {
                 .downcast_ref::<Int8Array>()
                 .unwrap()
                 .value(0),
-            RootRowKind::Summary.to_wire()
+            RootRowKind::RowCount.to_wire()
         );
         assert_eq!(
             summary.columns()[2]
@@ -3687,7 +3752,10 @@ mod tests {
                 .expect("kind");
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("root kind") {
-                    RootRowKind::Summary => {
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => {
                         summaries += 1;
                         let counts = output.columns()[2]
                             .as_any()
@@ -3831,7 +3899,10 @@ mod tests {
                 .expect("body");
             for row in 0..output.len() {
                 match RootRowKind::from_wire(kinds.value(row)).expect("kind") {
-                    RootRowKind::Summary => summaries += 1,
+                    RootRowKind::DeleteVerification => {
+                        panic!("write did not declare delete verification")
+                    }
+                    RootRowKind::RowCount => summaries += 1,
                     RootRowKind::PreparedFragment => panic!("unexpected fragment"),
                     RootRowKind::ArtifactDraft => {
                         assert!(
@@ -5702,9 +5773,9 @@ mod tests {
                         count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                         inputs: novarocks_physical_plan::FinishInputs {
                             writer_results: 0,
-                            logical_summary: None,
+                            summaries: Default::default(),
                         },
-                        logical_summary: None,
+                        summaries: Default::default(),
                         expected_target_ordinals: ordinals.clone(),
                         input_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -6168,6 +6239,193 @@ mod tests {
         operator.prepare().unwrap();
     }
     #[test]
+    fn typed_finish_cannot_replace_one_kinds_missing_source_with_another_complete_kind() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use novarocks_result_contract::{PerKind, SummaryKind, SummaryValue};
+        for missing in SummaryKind::ALL {
+            let state = IngressFixture::task_state(&RuntimeState::default());
+            let writers = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            writers
+                .push_chunk(None, writer_rows(vec![row_count_row(0, 0)]))
+                .unwrap();
+            writers.producer_finished();
+            let counts = IngressFixture::new(1, &state);
+            let verification = IngressFixture::new_kind(1, &state, SummaryKind::DeleteVerification);
+            let factory = factory(1).with_logical_input(
+                writers,
+                PerKind {
+                    write_counts: Some(counts.input()),
+                    delete_verification: Some(verification.input()),
+                },
+            );
+            let mut source = factory.create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            for (kind, input) in [
+                (SummaryKind::WriteCounts, &counts),
+                (SummaryKind::DeleteVerification, &verification),
+            ] {
+                input.send_value(
+                    0,
+                    1,
+                    (kind != missing).then_some(SummaryValue::zero(kind)),
+                    true,
+                );
+            }
+            let mut failure = None;
+            for _ in 0..100 {
+                match source.drive_for_test(&state) {
+                    Ok(step) => assert!(
+                        step.output.is_none(),
+                        "incomplete typed coverage never emits a Root record"
+                    ),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                failure
+                    .expect("normal End with missing source must fail")
+                    .to_string()
+                    .contains(&missing.to_string())
+            );
+            source.cancel();
+            source.close().unwrap();
+        }
+    }
+    #[test]
+    fn typed_finish_waits_for_every_kind_end_and_emits_exact_verification_after_row_count() {
+        use crate::exec::operators::{
+            logical_change_summary::tests::IngressFixture,
+            setop::union_all_shared::UnionAllSharedState,
+        };
+        use crate::exec::pipeline::driver_step::TurnWork;
+        use novarocks_result_contract::{
+            DeleteVerificationCounts, LogicalChangeCounts, PerKind, SummaryKind, SummaryValue,
+        };
+        for with_counts in [false, true] {
+            let state = IngressFixture::task_state(&RuntimeState::default());
+            let writers = UnionAllSharedState::new_with_limits(1, 901, 1, 1);
+            writers
+                .push_chunk(None, writer_rows(vec![row_count_row(0, 5)]))
+                .unwrap();
+            writers.producer_finished();
+            let counts = with_counts.then(|| IngressFixture::new(1, &state));
+            let verification = IngressFixture::new_kind(1, &state, SummaryKind::DeleteVerification);
+            let expected = DeleteVerificationCounts::try_new(9, 7, 2, u128::MAX - 17).unwrap();
+            let factory = factory(1).with_logical_input(
+                writers.clone(),
+                PerKind {
+                    write_counts: counts.as_ref().map(IngressFixture::input),
+                    delete_verification: Some(verification.input()),
+                },
+            );
+            let mut source = factory.create(1, 0);
+            prepare_logical_finish(source.as_mut(), &state);
+            if let Some(counts) = &counts {
+                counts.send(
+                    0,
+                    1,
+                    Some(LogicalChangeCounts::try_new(2, 3, 4).unwrap()),
+                    true,
+                );
+            }
+            verification.send_value(
+                0,
+                1,
+                Some(SummaryValue::DeleteVerification(expected)),
+                false,
+            );
+            let errors = state.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 1);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..120 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                assert!(
+                    step.output.is_none(),
+                    "coverage DATA and another kind's EOS cannot finalize verification"
+                );
+                assert!(!matches!(step.next, NextStep::Finished));
+            }
+            assert!(
+                writers.need_input(),
+                "writer input drains independently of verification End"
+            );
+            verification.send_value(0, 2, None, true);
+            let mut outputs = Vec::new();
+            let mut finished = false;
+            for _ in 0..240 {
+                work.begin_turn(1).unwrap();
+                let step = source
+                    .drive(&mut DriverStep::new(&errors, &mut work, &mut conversions))
+                    .unwrap();
+                outputs.extend(step.output);
+                if matches!(step.next, NextStep::Finished) {
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished);
+            assert_eq!(outputs.len(), 2);
+            let kinds = outputs
+                .iter()
+                .map(|output| {
+                    output.columns()[0]
+                        .as_any()
+                        .downcast_ref::<Int8Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                [
+                    RootRowKind::RowCount.to_wire(),
+                    RootRowKind::DeleteVerification.to_wire()
+                ]
+            );
+            assert_eq!(
+                outputs[0].columns()[2]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                if with_counts { 9 } else { 5 }
+            );
+            let verification = &outputs[1];
+            for column in &verification.columns()[1..8] {
+                assert!(column.is_null(0));
+            }
+            let (counts, fingerprint) = expected.into_wire();
+            for (column, count) in verification.columns()[8..11].iter().zip(counts) {
+                assert_eq!(
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    count
+                );
+            }
+            assert_eq!(
+                verification.columns()[11]
+                    .as_any()
+                    .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                    .unwrap()
+                    .value(0),
+                &fingerprint
+            );
+            source.close().unwrap();
+        }
+    }
+    #[test]
     fn logical_change_summary_finish_one_unit_turns_drain_writers_before_summary_end() {
         use crate::exec::operators::{
             logical_change_summary::tests::IngressFixture,
@@ -6186,7 +6444,13 @@ mod tests {
                 )
                 .unwrap();
             assert!(!shared.need_input());
-            let factory = factory(2).with_logical_input(shared.clone(), ingress.input());
+            let factory = factory(2).with_logical_input(
+                shared.clone(),
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            );
             let mut source = factory.create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let errors = state.error_state();
@@ -6318,9 +6582,13 @@ mod tests {
                 ],
             ),
         ];
-        let factory = fixture
-            .inner
-            .with_logical_input(shared.clone(), ingress.input());
+        let factory = fixture.inner.with_logical_input(
+            shared.clone(),
+            novarocks_result_contract::PerKind {
+                write_counts: Some(ingress.input()),
+                delete_verification: None,
+            },
+        );
         let mut source = factory.create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let output = ResultSinkBuffer::new();
@@ -6375,7 +6643,7 @@ mod tests {
         for chunk in &chunks {
             let (kinds, _, counts, _) = finish_columns(chunk);
             for row in 0..chunk.len() {
-                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                     summaries += 1;
                     assert_eq!(counts.value(row), 9);
                 } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
@@ -6408,7 +6676,13 @@ mod tests {
             }
             ingress.send(0, 1, None, true);
             let mut source = factory(1)
-                .with_logical_input(shared, ingress.input())
+                .with_logical_input(
+                    shared,
+                    novarocks_result_contract::PerKind {
+                        write_counts: Some(ingress.input()),
+                        delete_verification: None,
+                    },
+                )
                 .create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let mut calls = TestDriver::new(source.as_mut(), &state);
@@ -6429,7 +6703,13 @@ mod tests {
         shared.producer_finished();
         ingress.send(0, 1, None, true);
         let mut source = factory(1)
-            .with_logical_input(shared, ingress.input())
+            .with_logical_input(
+                shared,
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            )
             .create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let original = finish_contract(
@@ -6505,7 +6785,13 @@ mod tests {
         );
         let mut source = fixture
             .inner
-            .with_logical_input(shared, ingress.input())
+            .with_logical_input(
+                shared,
+                novarocks_result_contract::PerKind {
+                    write_counts: Some(ingress.input()),
+                    delete_verification: None,
+                },
+            )
             .create(1, 0);
         prepare_logical_finish(source.as_mut(), &state);
         let errors = state.error_state();
@@ -6540,7 +6826,7 @@ mod tests {
         for chunk in &chunks {
             let (kinds, _, counts, _) = finish_columns(chunk);
             for row in 0..chunk.len() {
-                if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                     summaries += 1;
                     assert_eq!(counts.value(row), 9);
                 } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {
@@ -6612,7 +6898,13 @@ mod tests {
             // Source preparation/subscription. No producer emits another wake below.
             let mut source = fixture
                 .inner
-                .with_logical_input(shared, ingress.input())
+                .with_logical_input(
+                    shared,
+                    novarocks_result_contract::PerKind {
+                        write_counts: Some(ingress.input()),
+                        delete_verification: None,
+                    },
+                )
                 .create(1, 0);
             prepare_logical_finish(source.as_mut(), &state);
             let errors = state.error_state();
@@ -6657,7 +6949,7 @@ mod tests {
             for chunk in &chunks {
                 let (kinds, _, counts, _) = finish_columns(chunk);
                 for row in 0..chunk.len() {
-                    if kinds.value(row) == RootRowKind::Summary.to_wire() {
+                    if kinds.value(row) == RootRowKind::RowCount.to_wire() {
                         summaries += 1;
                         assert_eq!(counts.value(row), 9);
                     } else if kinds.value(row) == RootRowKind::ArtifactDraft.to_wire() {

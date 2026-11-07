@@ -66,7 +66,8 @@ pub(super) fn finish_contract(
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FinishArrowOperation {
-    Summary,
+    RowCount,
+    DeleteVerification,
     Fragment,
     Encoding,
     Filter,

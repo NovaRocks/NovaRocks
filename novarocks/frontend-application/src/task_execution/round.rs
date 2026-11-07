@@ -364,7 +364,7 @@ impl TaskRound {
         &mut self,
         plan: novarocks_query_application::api::PlanSeal,
         writers: &BTreeSet<TaskIdentity>,
-        summary_sources: &BTreeSet<TaskIdentity>,
+        summary_sources: &novarocks_result_contract::PerKind<BTreeSet<TaskIdentity>>,
     ) -> Result<super::protocol_facts::AttemptProtocolFactsReceiver, TaskExecutionError> {
         if self.protocol_facts.is_some() || self.root_status_source.is_none() {
             return Err(TaskExecutionError::Schedule(

@@ -8,6 +8,7 @@ superseded-by: null
 partially-superseded-by: [ADR-0209]
 date: 2026-10-23
 related:
+  - "ADR-0222-typed-task-summaries-and-per-kind-completion.md"
   - "ADR-0217-sole-trino-entry-and-application-owned-completion.md (client completion projection supplements the logical count contract)"
 provenance:
   - "discussion: 2026-10-22 logical write summaries, independent routes and complete delivery"
@@ -16,7 +17,7 @@ code-anchors:
   - "novarocks/result-contract/src/write_counts.rs (FinishCountMode, LogicalChangeCounts)"
   - "novarocks/execution-contract/src/exchange_flow.rs (ExchangeStreamIdentity, ExchangeCloseDisposition)"
   - "novarocks/execution/src/exec/operators/compiled_change_router.rs (ChangeRouter)"
-  - "novarocks/execution/src/exec/operators/logical_change_summary.rs (LogicalSummaryState, SummaryCoverage)"
+  - "novarocks/execution/src/exec/operators/logical_change_summary.rs (TaskSummaryState, SummaryCoverage)"
   - "novarocks/execution/src/exec/operators/table_finish/logical_input.rs (LogicalFinish)"
 ---
 

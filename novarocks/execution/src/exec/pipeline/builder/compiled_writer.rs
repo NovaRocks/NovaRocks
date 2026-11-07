@@ -121,11 +121,11 @@ pub(super) fn build_table_finish(
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
     if let ProgramNodeKind::TableFinish {
-        count_mode: novarocks_local_program::FinishCountMode::LogicalChanges,
         input_roles,
-        logical_summary_layout: Some(layout),
+        summary_layouts,
         ..
     } = program.graph().nodes()[id.index()].kind()
+        && !input_roles.summaries.is_empty()
     {
         return build_logical_finish(
             program,
@@ -133,7 +133,7 @@ pub(super) fn build_table_finish(
             node_id,
             inputs,
             *input_roles,
-            layout,
+            summary_layouts,
             ctx,
             error,
             ordered,
@@ -171,7 +171,7 @@ fn build_logical_finish(
     node_id: i32,
     inputs: &[ProgramNodeId],
     roles: novarocks_result_contract::FinishInputs,
-    layout: &novarocks_local_program::StaticLayout,
+    layouts: &novarocks_result_contract::PerKind<Box<novarocks_local_program::StaticLayout>>,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
@@ -185,43 +185,47 @@ fn build_logical_finish(
     let writer = *inputs
         .get(roles.writer_results as usize)
         .ok_or_else(invalid)?;
-    let summary = *inputs
-        .get(roles.logical_summary.ok_or_else(invalid)? as usize)
-        .ok_or_else(invalid)?;
-    let binding = ctx
-        .compiled_writers
-        .finisher(id)
-        .and_then(|finish| finish.logical_summary.clone())
-        .ok_or_else(invalid)?;
-    let receiver = ctx
-        .exchange_bindings
-        .get(binding.receiver_node)
-        .ok_or_else(invalid)?;
-    if receiver.expected_senders != binding.sources.len() {
-        return Err(invalid());
+    let finish = ctx.compiled_writers.finisher(id).ok_or_else(invalid)?;
+    let mut summaries = novarocks_result_contract::PerKind::empty();
+    for (kind, port) in roles.summaries.iter() {
+        let summary = *inputs.get(*port as usize).ok_or_else(invalid)?;
+        let binding = finish.summaries.get(kind).ok_or_else(invalid)?;
+        let receiver = ctx
+            .exchange_bindings
+            .get(binding.receiver_node)
+            .ok_or_else(invalid)?;
+        let layout = layouts.get(kind).ok_or_else(invalid)?;
+        if receiver.expected_senders != binding.sources.len()
+            || !matches!(
+                program.graph().nodes()[summary.index()].kind(),
+                ProgramNodeKind::ExchangeSource { .. }
+            )
+        {
+            return Err(invalid());
+        }
+        let handle = receiver
+            .receiver_port
+            .receiver_pin(
+                crate::runtime::task::io::ExchangeReceiverKey {
+                    task_key: novarocks_types::identity::UniqueId::new(
+                        receiver.key.task_key_hi,
+                        receiver.key.task_key_lo,
+                    ),
+                    node_id: receiver.key.node_id,
+                },
+                receiver.expected_senders,
+            )
+            .map_err(|cause| cause.into_execution())?;
+        summaries.insert(
+            kind,
+            crate::exec::operators::logical_change_summary::SourceBoundSummaryInput::new(
+                kind,
+                handle,
+                binding.sources.clone(),
+                layout.as_ref().clone(),
+            )?,
+        );
     }
-    let ProgramNodeKind::ExchangeSource { .. } = program.graph().nodes()[summary.index()].kind()
-    else {
-        return Err(invalid());
-    };
-    let handle = receiver
-        .receiver_port
-        .receiver_pin(
-            crate::runtime::task::io::ExchangeReceiverKey {
-                task_key: novarocks_types::identity::UniqueId::new(
-                    receiver.key.task_key_hi,
-                    receiver.key.task_key_lo,
-                ),
-                node_id: receiver.key.node_id,
-            },
-            receiver.expected_senders,
-        )
-        .map_err(|cause| cause.into_execution())?;
-    let summary = crate::exec::operators::logical_change_summary::SourceBoundSummaryInput::new(
-        handle,
-        binding.sources,
-        layout.clone(),
-    )?;
     let mut child = build_node(program, writer, ctx, error, ordered)?;
     let producers = usize::try_from(child.pipeline.dop)
         .ok()
@@ -235,7 +239,7 @@ fn build_logical_finish(
     child.pipeline.needs_sink = false;
     let binding = ctx.compiled_writers.finisher(id).ok_or_else(invalid)?;
     let factory = crate::exec::operators::compiled_writer::compiled_logical_table_finish_factory(
-        program, id, node_id, binding, error, state, summary,
+        program, id, node_id, binding, error, state, summaries,
     )?;
     let pipeline = new_source_pipeline_with_dop(ctx, Box::new(factory), 1);
     let mut extra_pipelines = child.extra_pipelines;

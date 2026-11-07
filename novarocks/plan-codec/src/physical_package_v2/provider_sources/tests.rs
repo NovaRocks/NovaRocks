@@ -183,6 +183,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
     let value = p::ValueId::new(0);
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(71),
             root: scan,

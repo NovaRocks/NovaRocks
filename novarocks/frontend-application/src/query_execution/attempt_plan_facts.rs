@@ -124,13 +124,37 @@ pub(crate) enum AttemptPartitionKind {
     Hash,
 }
 
+pub(crate) struct WriteRootFacts {
+    targets: Box<[WriteTargetOrdinal]>,
+    summary_kinds: novarocks_result_contract::PerKind<()>,
+}
+
+impl WriteRootFacts {
+    /// Both facts come from the same completed publication-owning TableFinish.
+    pub(crate) fn new(
+        targets: Box<[WriteTargetOrdinal]>,
+        summary_kinds: novarocks_result_contract::PerKind<()>,
+    ) -> Self {
+        Self {
+            targets,
+            summary_kinds,
+        }
+    }
+    pub(crate) fn targets(&self) -> &[WriteTargetOrdinal] {
+        &self.targets
+    }
+    pub(crate) const fn summary_kinds(&self) -> &novarocks_result_contract::PerKind<()> {
+        &self.summary_kinds
+    }
+}
+
 pub(crate) struct AttemptPlanFacts {
     scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
     edges: Box<[AttemptEdgeFacts]>,
     scans: Box<[AttemptScanFacts]>,
     runtime_filters: AttemptRuntimeFilterFacts,
     submission: super::artifact::native_submission::SubmissionPlanFacts,
-    write_root_targets: Option<Box<[WriteTargetOrdinal]>>,
+    write_root: Option<WriteRootFacts>,
 }
 
 impl AttemptPlanFacts {
@@ -141,7 +165,7 @@ impl AttemptPlanFacts {
         scans: Vec<AttemptScanFacts>,
         submission: super::artifact::native_submission::SubmissionPlanFacts,
         runtime_filters: AttemptRuntimeFilterFacts,
-        write_root_targets: Option<Vec<WriteTargetOrdinal>>,
+        write_root: Option<WriteRootFacts>,
     ) -> Self {
         Self {
             scheduling,
@@ -149,7 +173,7 @@ impl AttemptPlanFacts {
             scans: scans.into_boxed_slice(),
             runtime_filters,
             submission,
-            write_root_targets: write_root_targets.map(Vec::into_boxed_slice),
+            write_root,
         }
     }
 
@@ -191,6 +215,14 @@ impl AttemptPlanFacts {
     }
 
     pub(crate) fn write_root_targets(&self) -> Option<&[WriteTargetOrdinal]> {
-        self.write_root_targets.as_deref()
+        self.write_root.as_ref().map(WriteRootFacts::targets)
+    }
+
+    /// Declared kinds from the same original TableFinish as its target set.
+    /// No observed record, task status or receive order can mint this fact.
+    pub(crate) fn write_root_summary_kinds(
+        &self,
+    ) -> Option<&novarocks_result_contract::PerKind<()>> {
+        self.write_root.as_ref().map(WriteRootFacts::summary_kinds)
     }
 }

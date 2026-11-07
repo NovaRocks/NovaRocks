@@ -86,6 +86,7 @@ fn package(annotations: Vec<p::PlanAnnotation>) -> p::FragmentPackage {
     let node = p::NodeId::new(u32::MAX);
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            summaries: Box::default(),
             stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(0),
             root: node,

@@ -606,8 +606,8 @@ pub(crate) enum ExecutionReason {
     PreparedDrainBeforeConclusion = 610,
     RootReadinessNotificationPanicked = 611,
     RootReadinessNotificationInvariant = 612,
-    LogicalChangeCount = 613,
-    LogicalSummaryContract = 614,
+    SummaryCount = 613,
+    SummaryContract = 614,
     FanoutRequiredBranchWithdrawn = 615,
     // Taskless completion is test-only; 639 and 640 remain reserved in production.
     #[cfg(test)]

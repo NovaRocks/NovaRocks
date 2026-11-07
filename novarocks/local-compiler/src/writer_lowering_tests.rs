@@ -223,6 +223,34 @@ fn relation_fields(
                 R::Auxiliary,
                 K::RelationAuxiliary,
             ),
+            (
+                "requested",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "matched",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "insufficient_keys",
+                DataType::Int64,
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
+            (
+                "insufficient_fingerprint",
+                DataType::FixedSizeBinary(16),
+                true,
+                R::Auxiliary,
+                K::RelationAuxiliary,
+            ),
         ]);
     }
     specs
@@ -429,9 +457,9 @@ fn fixture_with_types(
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -871,9 +899,17 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
         input_roles:
             novarocks_local_program::FinishInputs {
                 writer_results: 0,
-                logical_summary: None,
+                summaries:
+                    novarocks_physical_plan::PerKind {
+                        write_counts: None,
+                        delete_verification: None,
+                    },
             },
-        logical_summary_layout: None,
+        summary_layouts:
+            novarocks_local_program::PerKind {
+                write_counts: None,
+                delete_verification: None,
+            },
         inputs,
         expected_targets,
         writer_multiplex_layout,
@@ -914,7 +950,11 @@ fn finish_fragment_reads_the_writer_relation_and_publishes_the_root_relation() {
             "input_fields",
             "blob_type",
             "body",
-            "properties"
+            "properties",
+            "requested",
+            "matched",
+            "insufficient_keys",
+            "insufficient_fingerprint"
         ]
     );
     let properties = root_result_layout.schema().field(7);
@@ -1522,9 +1562,9 @@ fn statistics_fixture() -> StatisticsFixture {
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: WriterRelationSchema {
                     revision: WRITER_MULTIPLEX_SCHEMA_REVISION,

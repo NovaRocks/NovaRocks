@@ -206,14 +206,25 @@ fn lower_core_with_creation<H>(
             (None, None)
                 if matches!(
                     cut.payload,
-                    novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                    novarocks_physical_plan::ExchangePayloadContract::Summary(_)
                 ) =>
             {
-                let names = ["inserted", "replaced", "deleted"];
-                let name = names.get(ordinal).ok_or(FragmentCompileError::Invalid(
-                    "summary receiver width differs",
-                ))?;
-                crate::typed_layout::copy_name_with_creation(name, work, creation)?
+                let novarocks_physical_plan::ExchangePayloadContract::Summary(summary) =
+                    &cut.payload
+                else {
+                    return Err(
+                        FragmentCompileError::Invalid("summary receiver payload differs").into(),
+                    );
+                };
+                let field =
+                    summary
+                        .kind()
+                        .fields()
+                        .get(ordinal)
+                        .ok_or(FragmentCompileError::Invalid(
+                            "summary receiver width differs",
+                        ))?;
+                crate::typed_layout::copy_name_with_creation(field.name(), work, creation)?
             }
             (None, None) if cut.change_stream_writer().is_some() => {
                 let root = package
@@ -275,7 +286,7 @@ fn lower_core_with_creation<H>(
         layout,
         input: CompiledExchangeInput {
             wire_layout,
-            role: crate::stream_sink::cut_role(cut.payload.role()),
+            role: crate::stream_sink::cut_role(cut.payload.role())?,
             delivery: crate::stream_sink::cut_delivery(cut.delivery),
             routing: match &cut.partitioning.destination {
                 Distribution::Hash { scheme, .. } => {

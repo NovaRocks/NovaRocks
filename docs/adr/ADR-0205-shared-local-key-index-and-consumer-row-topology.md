@@ -7,11 +7,13 @@ supersedes: []
 superseded-by: null
 partially-supersedes: [ADR-0004]
 date: 2026-10-29
+related:
+  - "ADR-0223-result-content-identity-and-deterministic-fingerprints.md"
 provenance:
   - "discussion: 2026-10-26 instance-local typed key equality, bulk construction and consumer ownership"
 code-anchors:
   - "novarocks/execution/src/exec/hash_table/key_index/mod.rs (instance-local key index)"
-  - "novarocks/execution/src/exec/hash_table/key_index/bulk_tasks.rs (BulkTaskGraph)"
+  - "novarocks/execution/src/exec/hash_table/key_index/bulk_build.rs (BulkBuildGraph)"
   - "novarocks/execution/src/exec/operators/hashjoin/build_csr.rs (consumer-owned physical row topology)"
 ---
 

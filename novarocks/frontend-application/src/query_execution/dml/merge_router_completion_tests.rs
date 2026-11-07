@@ -262,9 +262,10 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                     ["_file", "_pos", "__nr_merge_action"].map(Box::<str>::from)
                 );
                 assert_eq!(keys.len(), 3);
+                // The generated CASE retains the original Int32 action tags.
                 for (key, data_type) in
                     keys.iter()
-                        .zip([DataType::Utf8, DataType::Int64, DataType::Int64])
+                        .zip([DataType::Utf8, DataType::Int64, DataType::Int32])
                 {
                     assert_eq!(fragment.values()[key].ty.data_type(), &data_type);
                 }
@@ -298,11 +299,12 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         })
         .unwrap();
     let novarocks_physical_plan::FragmentSink::Router {
-        routes, summary, ..
+        routes, ..
     } = router.sink()
     else {
         unreachable!()
     };
+    let summary = router.summaries().iter().find(|summary| summary.kind() == novarocks_physical_plan::SummaryKind::WriteCounts).unwrap();
     let sink_facts =
         crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
             router,
@@ -324,7 +326,9 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     assert_eq!(summary_fact.edge(), summary.edge);
     assert_eq!(
         summary_fact.role(),
-        novarocks_physical_plan::OutputRole::LogicalSummary
+        novarocks_physical_plan::OutputRole::Summary(
+            novarocks_physical_plan::SummaryKind::WriteCounts
+        )
     );
     assert_eq!(
         summary_fact.target_fragment_id(),
@@ -440,9 +444,11 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         encoded.access.iter().next().is_none(),
         "literal source has no external read capability"
     );
+    let declared = encoded.plan_facts.write_root_summary_kinds().unwrap();
+    assert_eq!(*declared, novarocks_result_contract::PerKind { write_counts: Some(()), delete_verification: None });
     let router_artifact = encoded.native.get(router_fragment).unwrap();
     assert_eq!(
-        router_artifact.facts().logical_summary_output(),
+        router_artifact.facts().summary_outputs().write_counts,
         Some(expected_summary)
     );
     assert_eq!(router_artifact.facts().sink_targets(), sink_facts.as_ref());
@@ -594,7 +600,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                 writer.output_layout().schema(),
                 writer_multiplex_layout.schema()
             );
-            let summary_port = input_roles.logical_summary.unwrap();
+            let summary_port = input_roles.summaries.write_counts.unwrap();
             assert_ne!(summary_port, input_roles.writer_results);
             let summary = inputs[summary_port as usize];
             assert!(matches!(
@@ -603,7 +609,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             ));
             assert_eq!(
                 program.exchange_inputs()[&summary].role,
-                ProgramOutputRole::LogicalSummary
+                ProgramOutputRole::Summary(novarocks_result_contract::SummaryKind::WriteCounts)
             );
             compiled_finishes += 1;
         }

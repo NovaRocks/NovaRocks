@@ -200,6 +200,7 @@ impl OwnedFixedColumn {
             None,
             page_rows,
             self.spec.nulls()[column],
+            self.spec.equalities()[column],
             output,
             checkpoint,
         )?;

@@ -1122,6 +1122,7 @@ fn owned_expression_arena_enters_actual_sparse_fragment_construction() {
         },
     };
     let input = p::FragmentStructureInput {
+        summaries: Box::default(),
         stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
         id: p::FragmentId::new(0),
         root: node,

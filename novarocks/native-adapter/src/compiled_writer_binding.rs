@@ -204,23 +204,21 @@ pub(crate) fn bind_compiled_writers(
             ProgramNodeKind::TableFinish {
                 inputs,
                 input_roles,
-                count_mode,
                 ..
             } => {
                 let mut finish = bind_compiled_finish(id, task)?;
-                if *count_mode == novarocks_local_program::FinishCountMode::LogicalChanges {
+                for (kind, ordinal) in input_roles.summaries.iter() {
                     let invalid = |detail| {
                         CompiledWriterBindingError::at_domain(
                             id,
                             WriterBindingContractFailure::SummaryBinding(detail),
                         )
                     };
-                    let receiver = input_roles
-                        .logical_summary
-                        .and_then(|ordinal| inputs.get(ordinal as usize))
+                    let receiver = inputs
+                        .get(*ordinal as usize)
                         .and_then(|input| program.exchange_inputs().get(input))
                         .ok_or_else(|| invalid("the logical role has no compiled receiver"))?;
-                    if receiver.role != novarocks_local_program::ProgramOutputRole::LogicalSummary
+                    if receiver.role != novarocks_local_program::ProgramOutputRole::Summary(kind)
                         || receiver.delivery
                             != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
                     {
@@ -250,7 +248,7 @@ pub(crate) fn bind_compiled_writers(
                         ));
                     }
                     finish = finish
-                        .with_logical_summary(receiver_node, Arc::from(inbound.sources()))
+                        .with_summary(kind, receiver_node, Arc::from(inbound.sources()))
                         .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
                 }
                 bindings

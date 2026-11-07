@@ -1503,13 +1503,16 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
 }
 
 /// Fixed Root write result rows: (target, fragment) pairs plus an optional
-/// SUMMARY, with the schema decoded through the Native layout like a BE task.
+/// ROW_COUNT, with the schema decoded through the Native layout like a BE task.
 fn write_chunk(fragments: &[(i32, &[u8])], summary: Option<i64>) -> Chunk {
     use arrow::array::{Int8Array, ListArray, MapArray, StructArray};
     use arrow::buffer::OffsetBuffer;
     use novarocks_spi::connector::write_stack::root_write_result_schema;
     let schema = root_write_result_schema();
-    let chunk_schema = decoded_fixture_schema(&schema, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let slots = (1..=schema.fields().len())
+        .map(|value| u32::try_from(value).unwrap())
+        .collect::<Vec<_>>();
+    let chunk_schema = decoded_fixture_schema(&schema, &slots);
     let decoded_schema = chunk_schema.arrow_schema_ref();
     let DataType::List(item) = decoded_schema.field(4).data_type() else {
         panic!("list");
@@ -1559,6 +1562,10 @@ fn write_chunk(fragments: &[(i32, &[u8])], summary: Option<i64>) -> Chunk {
             Some(vec![false; rows].into()),
             false,
         )),
+        arrow::array::new_null_array(decoded_schema.field(8).data_type(), rows),
+        arrow::array::new_null_array(decoded_schema.field(9).data_type(), rows),
+        arrow::array::new_null_array(decoded_schema.field(10).data_type(), rows),
+        arrow::array::new_null_array(decoded_schema.field(11).data_type(), rows),
     ];
     let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns).unwrap();
     Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap()
@@ -1626,7 +1633,7 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
         [
             RootRowKind::PreparedFragment,
             RootRowKind::PreparedFragment,
-            RootRowKind::Summary
+            RootRowKind::RowCount
         ]
     );
     shutdown(&fixture.pool).await;
@@ -1654,7 +1661,7 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
     fixture.session.finish_input().unwrap();
     await_whole_exit(&fixture.session).await;
     let RootProducerState::Failed(cause) = fixture.session.producer_state() else {
-        panic!("missing SUMMARY cannot publish normal End")
+        panic!("missing ROW_COUNT cannot publish normal End")
     };
     use novarocks_execution_contract::failure::FailureClass;
     assert_eq!(cause.fact().class(), FailureClass::Invariant);
@@ -1679,7 +1686,7 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
         if let Some(cause) = cause.downcast_ref::<novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError>() { original = Some(*cause); break; }
         source = cause.source();
     }
-    assert_eq!(original, Some(novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError::MissingSummary));
+    assert_eq!(original, Some(novarocks_native_adapter::root_write_commit_codec::WriteCommitCodecError::MissingRowCount));
     assert_eq!(fixture.session.channel().snapshot().end_sequence, None);
     shutdown(&fixture.pool).await;
 }

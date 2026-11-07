@@ -9097,7 +9097,14 @@ fn manifest_pending_release_fixture_with_writers(
     };
     let protocol = plan.map(|plan| {
         round
-            .install_protocol_facts(plan, &writers, &summary_sources)
+            .install_protocol_facts(
+                plan,
+                &writers,
+                &novarocks_result_contract::PerKind {
+                    write_counts: (!summary_sources.is_empty()).then(|| summary_sources.clone()),
+                    delete_verification: None,
+                },
+            )
             .expect("original protocol before root transfer")
     });
     let _root_source = round

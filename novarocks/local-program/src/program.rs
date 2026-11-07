@@ -636,7 +636,7 @@ pub enum ProgramNodeKind {
     TableFinish {
         count_mode: novarocks_result_contract::FinishCountMode,
         input_roles: novarocks_result_contract::FinishInputs,
-        logical_summary_layout: Option<StaticLayout>,
+        summary_layouts: novarocks_result_contract::PerKind<Box<StaticLayout>>,
         inputs: Vec<ProgramNodeId>,
         expected_targets: Vec<WriteTargetOrdinal>,
         writer_multiplex_layout: StaticLayout,
@@ -674,6 +674,10 @@ pub enum ProgramNodeKind {
 }
 
 impl ProgramNodeKind {
+    pub const fn summary_authorship(&self) -> Option<crate::SummaryKind> {
+        None
+    }
+
     fn try_for_each_child<E>(
         &self,
         mut visit: impl FnMut(ProgramNodeId) -> Result<(), E>,
@@ -1002,6 +1006,7 @@ pub struct LocalProgramGraph {
     profile: CompileProfile,
     requirements: BindingRequirements,
     sink: Option<StaticSinkProgram>,
+    summaries: Arc<[crate::StaticSummaryBranch]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1050,6 +1055,11 @@ pub enum ProgramCompileError {
 impl From<LocalProgramError> for ProgramCompileError {
     fn from(error: LocalProgramError) -> Self {
         Self::Program(error)
+    }
+}
+impl From<crate::StaticSinkError> for ProgramCompileError {
+    fn from(error: crate::StaticSinkError) -> Self {
+        Self::Program(LocalProgramError::Sink(error))
     }
 }
 impl From<CompileControlError> for ProgramCompileError {
@@ -1222,6 +1232,7 @@ impl LocalProgramGraph {
     ) -> Result<Self, LocalProgramError> {
         Self::try_new_with_sink(nodes, root, expressions, profile, requirements, None)
     }
+    /// Construct a graph with its root sink and no independent side outputs.
     pub fn try_new_with_sink(
         nodes: Vec<ProgramNode>,
         root: ProgramNodeId,
@@ -1230,6 +1241,25 @@ impl LocalProgramGraph {
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
     ) -> Result<Self, LocalProgramError> {
+        Self::try_new_with_outputs(
+            nodes,
+            root,
+            expressions,
+            profile,
+            requirements,
+            sink,
+            Vec::new(),
+        )
+    }
+    pub fn try_new_with_outputs(
+        nodes: Vec<ProgramNode>,
+        root: ProgramNodeId,
+        expressions: Arc<ImmutableExpressions>,
+        profile: CompileProfile,
+        requirements: BindingRequirements,
+        sink: Option<StaticSinkProgram>,
+        summaries: Vec<crate::StaticSummaryBranch>,
+    ) -> Result<Self, LocalProgramError> {
         match Self::try_new_core(
             nodes,
             root,
@@ -1237,6 +1267,7 @@ impl LocalProgramGraph {
             profile,
             requirements,
             sink,
+            summaries,
             &mut ProgramWork(None),
         ) {
             Ok(program) => Ok(program),
@@ -1273,6 +1304,27 @@ impl LocalProgramGraph {
         sink: Option<StaticSinkProgram>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramCompileError> {
+        Self::try_new_with_outputs_for_compile(
+            nodes,
+            root,
+            expressions,
+            profile,
+            requirements,
+            sink,
+            Vec::new(),
+            control,
+        )
+    }
+    pub fn try_new_with_outputs_for_compile(
+        nodes: Vec<ProgramNode>,
+        root: ProgramNodeId,
+        expressions: Arc<ImmutableExpressions>,
+        profile: CompileProfile,
+        requirements: BindingRequirements,
+        sink: Option<StaticSinkProgram>,
+        summaries: Vec<crate::StaticSummaryBranch>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCompileError> {
         let mut work = ProgramWork(Some(CompileCheckpoints::try_new(
             control,
             CompilePhase::LowerProgram,
@@ -1284,6 +1336,7 @@ impl LocalProgramGraph {
             profile,
             requirements,
             sink,
+            summaries,
             &mut work,
         );
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
@@ -1299,6 +1352,7 @@ impl LocalProgramGraph {
         profile: CompileProfile,
         requirements: BindingRequirements,
         sink: Option<StaticSinkProgram>,
+        summaries: Vec<crate::StaticSummaryBranch>,
         work: &mut ProgramWork<'_>,
     ) -> Result<Self, ProgramCompileError> {
         let bad_abi = profile.kernel_abi() != crate::KernelAbiVersion::CURRENT;
@@ -1465,8 +1519,8 @@ impl LocalProgramGraph {
                     {
                         return Err(LocalProgramError::InvalidRequirement.into());
                     }
-                    if *role == crate::ProgramOutputRole::LogicalSummary {
-                        summary_consumers.insert(*node, false);
+                    if let crate::ProgramOutputRole::Summary(kind) = role {
+                        summary_consumers.insert((*kind, *node), false);
                     }
                     required_exchanges.insert(node.index());
                     work.step()?;
@@ -1504,16 +1558,18 @@ impl LocalProgramGraph {
                 inputs,
                 ..
             } = &node.kind
-                && let Some(port) = input_roles.logical_summary
             {
-                let source = inputs
-                    .get(port as usize)
-                    .ok_or(LocalProgramError::InvalidRequirement)?;
-                let used = summary_consumers
-                    .get_mut(source)
-                    .ok_or(LocalProgramError::InvalidRequirement)?;
-                if std::mem::replace(used, true) {
-                    return Err(LocalProgramError::InvalidRequirement.into());
+                for (kind, port) in input_roles.summaries.iter() {
+                    let source = inputs
+                        .get(*port as usize)
+                        .ok_or(LocalProgramError::InvalidRequirement)?;
+                    let used = summary_consumers
+                        .get_mut(&(kind, *source))
+                        .ok_or(LocalProgramError::InvalidRequirement)?;
+                    if std::mem::replace(used, true) {
+                        return Err(LocalProgramError::InvalidRequirement.into());
+                    }
+                    work.step()?;
                 }
             }
             let required = match &node.kind {
@@ -1541,6 +1597,57 @@ impl LocalProgramGraph {
                 return Err(LocalProgramError::InvalidRequirement.into());
             }
         }
+        if sink.is_none() && !summaries.is_empty() {
+            return Err(LocalProgramError::InvalidSink.into());
+        }
+        if sink
+            .as_ref()
+            .map_or(0, |sink| sink.branches().len())
+            .checked_add(summaries.len())
+            .is_none_or(|count| count > crate::MAX_STATIC_SINK_BRANCHES)
+        {
+            return Err(LocalProgramError::Sink(crate::StaticSinkError::TooManyBranches).into());
+        }
+        let mut seen_summaries = novarocks_result_contract::PerKind::<()>::empty();
+        for summary in &summaries {
+            summary.validate_core(&mut || work.step())?;
+            if seen_summaries.insert(summary.kind(), ()).is_some() {
+                return Err(LocalProgramError::InvalidSink.into());
+            }
+            match summary.author() {
+                crate::StaticSummaryAuthor::RouterSink => {
+                    if summary.kind() != crate::SummaryKind::WriteCounts
+                        || !matches!(sink, Some(StaticSinkProgram::ChangeStreamRouter { .. }))
+                    {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                    let root_layout = &nodes[root.index()].output_layout;
+                    for slot in summary.layout().slots() {
+                        for root_slot in root_layout.slots() {
+                            if slot == root_slot {
+                                return Err(LocalProgramError::InvalidSink.into());
+                            }
+                            work.step()?;
+                        }
+                    }
+                }
+                crate::StaticSummaryAuthor::Node(id) => {
+                    let author = nodes
+                        .get(id.index())
+                        .ok_or(LocalProgramError::InvalidSink)?;
+                    if summary.kind() == crate::SummaryKind::WriteCounts
+                        || author.kind.summary_authorship() != Some(summary.kind())
+                        || !work.projection_matches(
+                            &author.output_layout,
+                            summary.branch().output_columns(),
+                            summary.layout(),
+                        )?
+                    {
+                        return Err(LocalProgramError::InvalidSink.into());
+                    }
+                }
+            }
+        }
         if let Some(sink) = &sink {
             work.sink(sink)?;
             let mut result_count = 0usize;
@@ -1557,32 +1664,31 @@ impl LocalProgramGraph {
                 }
                 work.step()?;
             }
-            match sink {
+            let is_result = matches!(
+                sink,
                 StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
-                    if result_count != 1 || !outputs.is_empty() =>
-                {
+            );
+            if result_count != usize::from(is_result) {
+                return Err(LocalProgramError::InvalidSink.into());
+            }
+            let mut expected = BTreeSet::new();
+            for index in 0..sink
+                .branches()
+                .len()
+                .checked_add(summaries.len())
+                .ok_or(LocalProgramError::InvalidSink)?
+            {
+                expected.insert(index);
+                work.step()?;
+            }
+            if !same_set(&outputs, &expected, work)? {
+                return Err(LocalProgramError::InvalidSink.into());
+            }
+            for branch in sink.branches() {
+                if matches!(branch.contract().role, crate::ProgramOutputRole::Summary(_)) {
                     return Err(LocalProgramError::InvalidSink.into());
                 }
-                StaticSinkProgram::Noop if result_count != 0 || !outputs.is_empty() => {
-                    return Err(LocalProgramError::InvalidSink.into());
-                }
-                StaticSinkProgram::DataStream { .. }
-                | StaticSinkProgram::MultiCastDataStream { .. }
-                | StaticSinkProgram::SplitDataStream { .. }
-                | StaticSinkProgram::ChangeStreamRouter { .. } => {
-                    if result_count != 0 {
-                        return Err(LocalProgramError::InvalidSink.into());
-                    }
-                    let mut expected = BTreeSet::new();
-                    for branch in 0..sink.branches().len() {
-                        expected.insert(branch);
-                        work.step()?;
-                    }
-                    if !same_set(&outputs, &expected, work)? {
-                        return Err(LocalProgramError::InvalidSink.into());
-                    }
-                }
-                _ => {}
+                work.step()?;
             }
             if let StaticSinkProgram::RootResult(contract) = sink {
                 contract
@@ -1639,12 +1745,7 @@ impl LocalProgramGraph {
                     return Err(LocalProgramError::InvalidSink.into());
                 }
             }
-            if let StaticSinkProgram::ChangeStreamRouter {
-                effect_slot,
-                summary_layout,
-                ..
-            } = sink
-            {
+            if let StaticSinkProgram::ChangeStreamRouter { effect_slot, .. } = sink {
                 let root_layout = &nodes[root.index()].output_layout;
                 let mut ordinal = None;
                 for (index, slot) in root_layout.slots().iter().enumerate() {
@@ -1674,16 +1775,6 @@ impl LocalProgramGraph {
                     }
                     work.step()?;
                 }
-                for slot in summary_layout.slots() {
-                    let mut independent = true;
-                    for root_slot in root_layout.slots() {
-                        independent &= root_slot != slot;
-                        work.step()?;
-                    }
-                    if !independent {
-                        return Err(LocalProgramError::InvalidSink.into());
-                    }
-                }
             }
             for requirement in requirements.entries() {
                 // Account the completed iteration before optional field work.
@@ -1696,28 +1787,23 @@ impl LocalProgramGraph {
                     ..
                 } = requirement
                 {
-                    let branch = sink.branches().get(*branch_index);
+                    let summary = branch_index
+                        .checked_sub(sink.branches().len())
+                        .and_then(|index| summaries.get(index));
+                    let branch = summary
+                        .map(|summary| summary.branch())
+                        .or_else(|| sink.branches().get(*branch_index));
                     work.step()?;
                     let branch = branch.ok_or(LocalProgramError::InvalidSink)?;
                     if branch.contract().role != *role || branch.contract().delivery != *delivery {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
-                    if *role == crate::ProgramOutputRole::LogicalSummary
-                        && !matches!(sink, StaticSinkProgram::ChangeStreamRouter { summary_branch, .. }
-                            if usize::try_from(*summary_branch).ok() == Some(*branch_index))
-                    {
+                    if matches!(role, crate::ProgramOutputRole::Summary(_)) != summary.is_some() {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
-                    let source_layout = match sink {
-                        StaticSinkProgram::ChangeStreamRouter {
-                            summary_branch,
-                            summary_layout,
-                            ..
-                        } if usize::try_from(*summary_branch).ok() == Some(*branch_index) => {
-                            summary_layout
-                        }
-                        _ => &nodes[root.index()].output_layout,
-                    };
+                    let source_layout = summary
+                        .map(|summary| summary.layout())
+                        .unwrap_or(&nodes[root.index()].output_layout);
                     if !work.projection_matches(source_layout, branch.output_columns(), layout)? {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
@@ -1725,6 +1811,7 @@ impl LocalProgramGraph {
             }
         }
         let nodes = work.opaque(|| Arc::from(nodes))?;
+        let summaries = work.opaque(|| Arc::from(summaries))?;
         Ok(Self {
             nodes,
             root,
@@ -1732,6 +1819,7 @@ impl LocalProgramGraph {
             profile,
             requirements,
             sink,
+            summaries,
         })
     }
 
@@ -1755,6 +1843,25 @@ impl LocalProgramGraph {
         &self.requirements
     }
 
+    pub fn summaries(&self) -> &[crate::StaticSummaryBranch] {
+        &self.summaries
+    }
+    pub fn stream_branches(&self) -> impl DoubleEndedIterator<Item = &crate::StaticStreamBranch> {
+        self.sink
+            .as_ref()
+            .map_or(&[][..], |sink| sink.branches())
+            .iter()
+            .chain(self.summaries.iter().map(|summary| summary.branch()))
+    }
+    pub fn stream_branch(&self, index: usize) -> Option<&crate::StaticStreamBranch> {
+        let root = self.sink.as_ref().map_or(&[][..], |sink| sink.branches());
+        root.get(index).or_else(|| {
+            index
+                .checked_sub(root.len())
+                .and_then(|ordinal| self.summaries.get(ordinal))
+                .map(|summary| summary.branch())
+        })
+    }
     pub const fn sink(&self) -> Option<&StaticSinkProgram> {
         self.sink.as_ref()
     }
@@ -1948,7 +2055,7 @@ fn validate_relationships(
         ProgramNodeKind::TableFinish {
             inputs,
             input_roles,
-            logical_summary_layout,
+            summary_layouts,
             writer_multiplex_layout,
             root_result_layout,
             ..
@@ -1956,12 +2063,15 @@ fn validate_relationships(
             for (ordinal, input) in inputs.iter().enumerate() {
                 let expected = if ordinal == input_roles.writer_results as usize {
                     writer_multiplex_layout
-                } else if Some(ordinal as u32) == input_roles.logical_summary {
-                    logical_summary_layout
-                        .as_ref()
-                        .ok_or(LocalProgramError::InvalidNodeShape)?
                 } else {
-                    return Err(LocalProgramError::InvalidNodeShape.into());
+                    let kind = input_roles
+                        .summaries
+                        .iter()
+                        .find_map(|(kind, port)| (*port as usize == ordinal).then_some(kind))
+                        .ok_or(LocalProgramError::InvalidNodeShape)?;
+                    summary_layouts
+                        .get(kind)
+                        .ok_or(LocalProgramError::InvalidNodeShape)?
                 };
                 let matches = layout_matches(nodes, *input, expected, work)?;
                 work.step()?;
@@ -2237,7 +2347,7 @@ fn validate_shape(
             inputs,
             count_mode,
             input_roles,
-            logical_summary_layout,
+            summary_layouts,
             expected_targets,
             final_aggregates,
             ..
@@ -2249,22 +2359,26 @@ fn validate_shape(
             }
             let logical = *count_mode == novarocks_result_contract::FinishCountMode::LogicalChanges;
             let roles_valid = input_roles.writer_results < inputs.len() as u32
-                && input_roles.logical_summary.is_some() == logical
-                && logical_summary_layout.is_some() == logical
-                && inputs.len() == if logical { 2 } else { 1 }
-                && input_roles.logical_summary.is_none_or(|port| {
-                    port < inputs.len() as u32 && port != input_roles.writer_results
+                && input_roles.summaries.write_counts.is_some() == logical
+                && inputs.len() == 1 + input_roles.summaries.iter().count()
+                && (input_roles.summaries.write_counts.is_none()
+                    || input_roles.summaries.write_counts
+                        != input_roles.summaries.delete_verification)
+                && crate::SummaryKind::ALL.into_iter().all(|kind| {
+                    let port = input_roles.summaries.get(kind);
+                    port.is_some() == summary_layouts.get(kind).is_some()
+                        && port.is_none_or(|port| {
+                            *port < inputs.len() as u32 && *port != input_roles.writer_results
+                        })
                 });
-            if let Some(summary) = logical_summary_layout {
-                let valid =
-                    summary.schema().fields().len() == 3
-                        && summary.schema().fields().iter().all(|field| {
-                            !field.is_nullable() && field.data_type() == &DataType::Int64
-                        });
-                work.step()?;
-                if !valid {
-                    return Err(LocalProgramError::InvalidNodeShape.into());
-                }
+            for (kind, layout) in summary_layouts.iter() {
+                crate::sink::validate_summary_layout_core(kind, layout, &mut || work.step())
+                    .map_err(|error: ProgramCompileError| match error {
+                        ProgramCompileError::Program(LocalProgramError::Sink(_)) => {
+                            LocalProgramError::InvalidNodeShape.into()
+                        }
+                        error => error,
+                    })?;
             }
             let bad = !roles_valid
                 || expected_targets.is_empty()
@@ -2414,9 +2528,9 @@ mod tests {
                             count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
                             input_roles: novarocks_result_contract::FinishInputs {
                                 writer_results: 0,
-                                logical_summary: None,
+                                summaries: Default::default(),
                             },
-                            logical_summary_layout: None,
+                            summary_layouts: novarocks_result_contract::PerKind::empty(),
                             inputs: vec![ProgramNodeId::new(0)],
                             expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
                             writer_multiplex_layout: layout.clone(),

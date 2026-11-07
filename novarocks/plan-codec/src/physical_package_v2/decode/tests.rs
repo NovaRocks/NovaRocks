@@ -344,12 +344,7 @@ fn change_stream_package_refuses_role_and_cut_downgrades() {
             ));
         }),
         ("missing independent summary", |dto| {
-            let Some(wire::fragment_sink::Kind::Router(router)) =
-                &mut dto.fragment.as_mut().unwrap().sink.as_mut().unwrap().kind
-            else {
-                panic!()
-            };
-            router.summary = None;
+            dto.fragment.as_mut().unwrap().summaries.clear();
         }),
         ("missing colocation declaration", |dto| {
             let Some(wire::fragment_sink::Kind::Router(router)) =
@@ -397,13 +392,13 @@ fn logical_finish_package_requires_both_distinct_role_inputs() {
                 })
                 .unwrap();
             match case {
-                0 => finish.logical_summary_input = None,
-                1 => finish.logical_summary_input = finish.writer_results_input,
-                2 => finish.logical_summary = None,
+                0 => finish.summaries[0].input = None,
+                1 => finish.summaries[0].input = finish.writer_results_input,
+                2 => finish.summaries[0].columns = None,
                 3 => finish.count_mode = wire::FinishCountMode::WriterReported as i32,
                 4 => {
-                    finish.logical_summary.as_mut().unwrap().deleted_value_id =
-                        finish.logical_summary.as_ref().unwrap().inserted_value_id
+                    let columns = finish.summaries[0].columns.as_mut().unwrap();
+                    columns.value_ids[2] = columns.value_ids[0];
                 }
                 _ => unreachable!(),
             }

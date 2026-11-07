@@ -194,7 +194,8 @@ pub(crate) fn admit_writer_family(
             if logical {
                 let summary = spec
                     .inputs
-                    .logical_summary
+                    .summaries
+                    .write_counts
                     .and_then(|port| node.inputs.get(port as usize))
                     .and_then(|id| fragment.nodes().get(id))
                     .ok_or(FragmentCompileError::Invalid(
@@ -206,7 +207,7 @@ pub(crate) fn admit_writer_family(
                         && cut.delivery == novarocks_physical_plan::DeliveryRequirement::MustDrain
                         && matches!(
                             cut.payload,
-                            novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
+                            novarocks_physical_plan::ExchangePayloadContract::Summary(_)
                         );
                     work.step()?;
                 }
@@ -757,7 +758,7 @@ pub(crate) struct LoweredFinish {
 pub(crate) struct FinishLoweringInput<'a> {
     pub child: ProgramNodeId,
     pub child_layout: &'a StaticLayout,
-    pub summary: Option<(ProgramNodeId, &'a StaticLayout)>,
+    pub summaries: novarocks_local_program::PerKind<(ProgramNodeId, &'a StaticLayout)>,
     /// Fresh slots of the Root relation, in field order.
     pub slots: &'a [SlotId],
     /// Fresh internal slots of the statistics: the grouped Unpivot's
@@ -848,20 +849,32 @@ pub(crate) fn lower_finish_with_creation<H>(
         }
         channels.extend(statistics.channels);
         work.flush()?;
+        // Optional layouts own separate fixed-size backing, so adding a kind
+        // does not enlarge every ProgramNodeKind (including ordinary reads).
+        let mut summary_layouts = novarocks_local_program::PerKind::empty();
+        for (kind, (_, layout)) in input.summaries.iter() {
+            work.flush()?;
+            creation
+                .request_layout(std::alloc::Layout::new::<StaticLayout>())
+                .map_err(crate::FragmentCreationError::Creator)?;
+            let layout = Box::new((*layout).clone());
+            work.flush()?;
+            summary_layouts.insert(kind, layout);
+        }
         Ok(LoweredFinish {
             kind: ProgramNodeKind::TableFinish {
                 count_mode: spec.count_mode,
                 input_roles: spec.inputs,
-                logical_summary_layout: input.summary.map(|(_, layout)| layout.clone()),
+                summary_layouts,
                 inputs: {
                     let mut inputs = vec![child; node.inputs.len()];
                     inputs[spec.inputs.writer_results as usize] = child;
-                    if let Some((summary, _)) = input.summary {
-                        inputs[spec
-                            .inputs
-                            .logical_summary
-                            .ok_or(FragmentCompileError::Invalid("summary input has no role"))?
-                            as usize] = summary;
+                    for (kind, (summary, _)) in input.summaries.iter() {
+                        let port =
+                            spec.inputs.summaries.get(kind).ok_or(
+                                FragmentCompileError::Invalid("summary input has no role"),
+                            )?;
+                        inputs[*port as usize] = *summary;
                     }
                     inputs
                 },

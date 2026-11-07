@@ -548,14 +548,10 @@ fn validate_exchange_inputs(
                 | CompiledExchangeRouting::BucketShuffle { algorithm } => Some(algorithm),
                 _ => None,
             };
-            if input.role == crate::ProgramOutputRole::LogicalSummary {
-                let mut valid = slots.len() == 3
-                    && matches!(input.routing, CompiledExchangeRouting::Unpartitioned);
-                for field in layout.schema().fields() {
-                    valid &=
-                        field.data_type() == &arrow_schema::DataType::Int64 && !field.is_nullable();
-                    work.step().map_err(LocalProgramCompileError::Control)?;
-                }
+            if let crate::ProgramOutputRole::Summary(kind) = input.role {
+                let valid = matches!(input.routing, CompiledExchangeRouting::Unpartitioned)
+                    && crate::validate_summary_layout(kind, layout).is_ok();
+                work.step().map_err(LocalProgramCompileError::Control)?;
                 if !valid {
                     return Err(LocalProgramCompileError::ExchangeInputMismatch(*id));
                 }

@@ -44,15 +44,17 @@ pub(crate) struct LoweredStreamSink {
     pub requirements: Vec<BindingRequirement>,
     pub flow: SinkFlow,
 }
-pub(crate) fn cut_role(role: novarocks_physical_plan::OutputRole) -> ProgramOutputRole {
-    match role {
+pub(crate) fn cut_role(
+    role: novarocks_physical_plan::OutputRole,
+) -> Result<ProgramOutputRole, FragmentCompileError> {
+    Ok(match role {
         novarocks_physical_plan::OutputRole::Relational => ProgramOutputRole::Relational,
         novarocks_physical_plan::OutputRole::ProviderRoute { target } => {
             ProgramOutputRole::ProviderRoute { target }
         }
-        novarocks_physical_plan::OutputRole::LogicalSummary => ProgramOutputRole::LogicalSummary,
+        novarocks_physical_plan::OutputRole::Summary(kind) => ProgramOutputRole::Summary(kind),
         novarocks_physical_plan::OutputRole::WriterResults => ProgramOutputRole::WriterResults,
-    }
+    })
 }
 pub(crate) fn cut_delivery(
     delivery: novarocks_physical_plan::DeliveryRequirement,
@@ -71,7 +73,6 @@ enum OutputSelection<'a> {
     Stream(&'a OutboundFragmentCut),
     Router {
         aliases: &'a BTreeMap<EdgeId, Arc<[SlotId]>>,
-        summary_slots: &'a [SlotId],
     },
 }
 pub(crate) fn lower_stream_sink_with_creation<
@@ -106,7 +107,6 @@ pub(crate) fn lower_router_sink_with_creation<
     root: ProgramNodeId,
     root_layout: &StaticLayout,
     aliases: &BTreeMap<EdgeId, Arc<[SlotId]>>,
-    summary_slots: &[SlotId],
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
@@ -114,10 +114,7 @@ pub(crate) fn lower_router_sink_with_creation<
 ) -> Result<LoweredStreamSink, crate::FragmentCreationError<H>> {
     lower_selected(
         package,
-        OutputSelection::Router {
-            aliases,
-            summary_slots,
-        },
+        OutputSelection::Router { aliases },
         root,
         root_layout,
         control,
@@ -197,22 +194,10 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             None
         }
         OutputSelection::Router { .. } => {
-            let FragmentSink::Router {
-                effect,
-                routes,
-                summary,
-            } = fragment.sink()
-            else {
+            let FragmentSink::Router { effect, routes } = fragment.sink() else {
                 return Err(FragmentCompileError::Invalid("router sink kind differs").into());
             };
-            reserve_vec(
-                &mut cuts,
-                routes
-                    .len()
-                    .checked_add(1)
-                    .ok_or(CompileControlError::ResourceExhausted)?,
-                work,
-            )?;
+            reserve_vec(&mut cuts, routes.len(), work)?;
             let mut by_edge = BTreeMap::new();
             for cut in package.cuts().outbound.iter() {
                 if by_edge.insert(cut.edge, cut).is_some() {
@@ -220,11 +205,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 }
                 work.step()?;
             }
-            for edge in routes
-                .iter()
-                .map(|route| route.edge)
-                .chain(std::iter::once(summary.edge))
-            {
+            for edge in routes.iter().map(|route| route.edge) {
                 cuts.push(
                     by_edge
                         .remove(&edge)
@@ -232,12 +213,14 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 );
                 work.step()?;
             }
-            if cuts.len() != package.cuts().outbound.len() {
+            if cuts.len().checked_add(fragment.summaries().len())
+                != Some(package.cuts().outbound.len())
+            {
                 return Err(
                     FragmentCompileError::Invalid("router output cut coverage differs").into(),
                 );
             }
-            Some((*effect, routes, *summary))
+            Some((*effect, routes))
         }
     };
     if cuts.len() > MAX_STATIC_SINK_BRANCHES {
@@ -267,14 +250,9 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     reserve_vec(&mut router_routes, cuts.len(), work)?;
     reserve_vec(&mut branches, cuts.len(), work)?;
     reserve_vec(&mut requirements, cuts.len(), work)?;
-    let mut summary_layout = None;
     for (branch_index, cut) in cuts.iter().enumerate() {
         let branch_id =
             u32::try_from(branch_index).map_err(|_| CompileControlError::ResourceExhausted)?;
-        let is_summary = matches!(
-            cut.payload,
-            novarocks_physical_plan::ExchangePayloadContract::LogicalSummary(_)
-        );
         let (partition_type, keys, routing) = match &cut.partitioning.source {
             Distribution::Singleton | Distribution::Broadcast => (
                 DataStreamPartitionType::Unpartitioned,
@@ -386,34 +364,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 work,
             )?);
         }
-        let (columns, layout) = if is_summary {
-            let OutputSelection::Router { summary_slots, .. } = &selection else {
-                return Err(
-                    FragmentCompileError::Invalid("summary output belongs to a router").into(),
-                );
-            };
-            let (_, _, summary) =
-                router.ok_or(FragmentCompileError::Invalid("missing summary owner"))?;
-            let mut typed =
-                crate::typed_layout::TypedLayoutBuilder::new_with_creation(3, work, creation)?;
-            for ((_, value), name) in summary
-                .columns
-                .fields()
-                .into_iter()
-                .zip(["inserted", "replaced", "deleted"])
-            {
-                let ty = &fragment
-                    .values()
-                    .get(&value)
-                    .ok_or(FragmentCompileError::Invalid("missing summary type"))?
-                    .ty;
-                let name = crate::typed_layout::copy_name_with_creation(name, work, creation)?;
-                typed.push_with_creation(ty, name, work, creation)?;
-            }
-            let layout = typed.finish_with_creation(summary_slots, work, creation)?;
-            summary_layout = Some(layout.clone());
-            (summary_slots.to_vec(), layout)
-        } else {
+        let (columns, layout) = {
             let columns = match &selection {
                 OutputSelection::Router { aliases, .. } => aliases
                     .get(&cut.edge)
@@ -434,7 +385,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )?;
             (columns, layout)
         };
-        let role = cut_role(cut.payload.role());
+        let role = cut_role(cut.payload.role())?;
         let delivery = cut_delivery(cut.delivery);
         let branch = StaticStreamBranch::try_new(
             i32::try_from(cut.destination_node.get()).map_err(|_| {
@@ -451,9 +402,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             },
         )
         .map_err(sink_error)?;
-        if let Some((_, routes, _)) = router
-            && !is_summary
-        {
+        if let Some((_, routes)) = router {
             let route = routes
                 .get(branch_index)
                 .ok_or(FragmentCompileError::Invalid(
@@ -531,26 +480,15 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         crate::creation::borrow_scope(&mut temporary),
         factory,
     )?;
-    let sink = if let Some((effect, _, _)) = router {
+    let sink = if let Some((effect, _)) = router {
         let ordinal = first_ordinal(root_values, effect, work)?.ok_or(
             FragmentCompileError::Invalid("router effect is outside root"),
         )?;
-        let summary_index = u32::try_from(
-            branches
-                .len()
-                .checked_sub(1)
-                .ok_or(FragmentCompileError::Invalid("router has no summary"))?,
-        )
-        .map_err(|_| CompileControlError::ResourceExhausted)?;
         StaticSinkProgram::try_change_stream_router(
             branches,
             arena,
             root_layout.slots()[ordinal],
             router_routes,
-            summary_index,
-            summary_layout.ok_or(FragmentCompileError::Invalid(
-                "router summary layout is absent",
-            ))?,
         )
         .map_err(sink_error)?
     } else {
@@ -775,4 +713,108 @@ fn sink_error(error: StaticSinkError) -> FragmentCompileError {
         phase: "stream sink",
         error: novarocks_failure_contract::SharedFailureCause::new(error),
     }
+}
+
+/// Lower side outputs independently of the relational sink. The declarations
+/// choose their exact author and columns; no writer or sink implies a kind.
+pub(crate) fn lower_summary_outputs_with_creation<H>(
+    package: &FragmentPackage,
+    slots: &novarocks_local_program::PerKind<Arc<[SlotId]>>,
+    local_ids: &BTreeMap<novarocks_physical_plan::NodeId, ProgramNodeId>,
+    first_branch: usize,
+    control: &dyn PureCompileControl,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(Vec<StaticSummaryBranch>, Vec<BindingRequirement>), crate::FragmentCreationError<H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let mut outputs = Vec::new();
+        let mut requirements = Vec::new();
+        let fragment = package.fragment();
+        reserve_vec(&mut outputs, fragment.summaries().len(), &mut work)?;
+        reserve_vec(&mut requirements, fragment.summaries().len(), &mut work)?;
+        for summary in fragment.summaries() {
+            let mut found = None;
+            for cut in package.cuts().outbound.iter() {
+                work.step()?;
+                if cut.edge == summary.edge && found.replace(cut).is_some() {
+                    return Err(
+                        FragmentCompileError::Invalid("duplicate summary output cut").into(),
+                    );
+                }
+            }
+            let cut = found.ok_or(FragmentCompileError::Invalid(
+                "summary output cut is absent",
+            ))?;
+            if cut.payload.role() != novarocks_physical_plan::OutputRole::Summary(summary.kind()) {
+                return Err(
+                    FragmentCompileError::Invalid("summary output cut kind differs").into(),
+                );
+            }
+            let slots = slots
+                .get(summary.kind())
+                .ok_or(FragmentCompileError::Invalid("summary slots are absent"))?;
+            let mut typed = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+                summary.columns.values().len(),
+                &mut work,
+                creation,
+            )?;
+            for (field, value) in summary.columns.fields() {
+                let ty = &fragment
+                    .values()
+                    .get(&value)
+                    .ok_or(FragmentCompileError::Invalid("summary type is absent"))?
+                    .ty;
+                let name = crate::typed_layout::copy_name_with_creation(
+                    field.name(),
+                    &mut work,
+                    creation,
+                )?;
+                typed.push_with_creation(ty, name, &mut work, creation)?;
+            }
+            let layout = typed.finish_with_creation(slots, &mut work, creation)?;
+            let author = match summary.author {
+                novarocks_physical_plan::SummaryAuthor::RouterSink => {
+                    StaticSummaryAuthor::RouterSink
+                }
+                novarocks_physical_plan::SummaryAuthor::Node(node) => StaticSummaryAuthor::Node(
+                    *local_ids
+                        .get(&node)
+                        .ok_or(FragmentCompileError::Invalid("summary author is absent"))?,
+                ),
+            };
+            let role = ProgramOutputRole::Summary(summary.kind());
+            let delivery = cut_delivery(cut.delivery);
+            let branch = StaticStreamBranch::try_new(
+                i32::try_from(cut.destination_node.get()).map_err(|_| {
+                    FragmentCompileError::Invalid("summary destination exceeds routing range")
+                })?,
+                DataStreamPartitionType::Unpartitioned,
+                Vec::new(),
+                slots.to_vec(),
+                None,
+                StaticStreamContract {
+                    role,
+                    delivery,
+                    routing: StaticStreamRouting::Ordinary,
+                },
+            )
+            .map_err(sink_error)?;
+            let branch_index = first_branch
+                .checked_add(outputs.len())
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            outputs.push(
+                StaticSummaryBranch::try_new(summary.kind(), author, branch, layout.clone())
+                    .map_err(sink_error)?,
+            );
+            requirements.push(BindingRequirement::ExchangeOutput {
+                branch: branch_index,
+                layout,
+                role,
+                delivery,
+            });
+            work.step()?;
+        }
+        Ok((outputs, requirements))
+    })();
+    crate::creation::finish_attempt(result, work)
 }

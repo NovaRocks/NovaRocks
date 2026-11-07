@@ -663,13 +663,23 @@ fn writer_state_input_node(node: &novarocks_physical_plan::PhysicalNode) -> Opti
         spec.count_mode,
         novarocks_physical_plan::FinishCountMode::LogicalChanges
     );
-    if node.inputs.len() != if logical { 2 } else { 1 }
-        || logical != spec.inputs.logical_summary.is_some()
-        || logical != spec.logical_summary.is_some()
-        || spec.inputs.logical_summary.is_some_and(|ordinal| {
-            ordinal == spec.inputs.writer_results
-                || usize::try_from(ordinal).map_or(true, |index| index >= node.inputs.len())
-        })
+    if node.inputs.len() != 1 + spec.inputs.summaries.iter().count()
+        || logical != spec.inputs.summaries.write_counts.is_some()
+        || novarocks_physical_plan::SummaryKind::ALL
+            .into_iter()
+            .any(|kind| {
+                let port = spec.inputs.summaries.get(kind);
+                let columns = spec.summaries.get(kind);
+                port.is_some() != columns.is_some()
+                    || columns.is_some_and(|columns| columns.kind() != kind)
+                    || port.is_some_and(|ordinal| {
+                        *ordinal == spec.inputs.writer_results
+                            || usize::try_from(*ordinal)
+                                .map_or(true, |index| index >= node.inputs.len())
+                    })
+            })
+        || spec.inputs.summaries.write_counts.is_some()
+            && spec.inputs.summaries.write_counts == spec.inputs.summaries.delete_verification
     {
         return None;
     }

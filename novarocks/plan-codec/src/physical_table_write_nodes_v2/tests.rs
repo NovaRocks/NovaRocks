@@ -440,9 +440,9 @@ fn finisher(grouped: bool) -> p::PhysicalNode {
         count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
         inputs: novarocks_physical_plan::FinishInputs {
             writer_results: 0,
-            logical_summary: None,
+            summaries: Default::default(),
         },
-        logical_summary: None,
+        summaries: Default::default(),
         expected_target_ordinals: Box::from([
             WriteTargetOrdinal::try_new(4095).unwrap(),
             WriteTargetOrdinal::try_new(0).unwrap(),
@@ -639,8 +639,7 @@ fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
             wire::physical_node::Kind::TableFinish(wire::WriterFinish {
                 count_mode: wire::FinishCountMode::WriterReported as i32,
                 writer_results_input: Some(0),
-                logical_summary_input: None,
-                logical_summary: None,
+                summaries: Vec::new(),
                 expected_target_ordinals: vec![4095, 0, 4095],
                 input_schema: Some(expected_schema()),
                 output_schema: Some(expected_schema()),
@@ -1892,12 +1891,12 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
     let mut logical = baseline.clone();
     let spec = finish_spec(&mut logical);
     spec.count_mode = p::FinishCountMode::LogicalChanges;
-    spec.inputs.logical_summary = Some(1);
-    spec.logical_summary = Some(p::LogicalSummaryColumns {
-        inserted: p::ValueId::new(0),
-        replaced: p::ValueId::new(7),
-        deleted: p::ValueId::new(u32::MAX),
-    });
+    spec.inputs.summaries.write_counts = Some(1);
+    spec.summaries.write_counts = Some(p::SummaryColumns::write_counts(
+        p::ValueId::new(0),
+        p::ValueId::new(7),
+        p::ValueId::new(u32::MAX),
+    ));
     // Each physical owner must use the original binding loans it authored.
     let base_ids = Ids::new(&baseline);
     let (base_raw, base) = f.with(&baseline, &c, |v, e, _, _| {
@@ -1910,14 +1909,16 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
         let (raw, facts) =
             encode_table_write_node(&logical, v, e, ids.view(), SOURCE, limits()).unwrap();
         assert_eq!(facts.value_reference_count, base.value_reference_count + 3);
-        assert_eq!(facts.list_item_count, base.list_item_count + 3);
+        assert_eq!(facts.list_item_count, base.list_item_count + 4);
         assert_eq!(
             facts.allocation_requests_upper_bound,
-            base.allocation_requests_upper_bound
+            base.allocation_requests_upper_bound + 2
         );
         assert_eq!(
             facts.allocation_request_bytes_upper_bound,
             base.allocation_request_bytes_upper_bound
+                + std::mem::size_of::<wire::SummaryFinishInput>()
+                + 3 * std::mem::size_of::<u32>()
         );
         let mut under = limits();
         under.node.max_value_references = base.value_reference_count;
@@ -1933,7 +1934,7 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
             received.value_reference_count,
             received_base.value_reference_count + 3
         );
-        assert_eq!(received.list_item_count, received_base.list_item_count + 3);
+        assert_eq!(received.list_item_count, received_base.list_item_count + 4);
         c.arm(None);
         assert!(decode_table_write_node(&raw, r, a, SOURCE, under).is_err());
         for fault in 0..9 {
@@ -1943,12 +1944,19 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
                 0 => finish.count_mode = 0,
                 1 => finish.count_mode = i32::MAX,
                 2 => finish.writer_results_input = None,
-                3 => finish.logical_summary_input = None,
-                4 => finish.logical_summary_input = finish.writer_results_input,
-                5 => finish.logical_summary = None,
-                6 => finish.logical_summary.as_mut().unwrap().inserted_value_id = None,
-                7 => finish.logical_summary.as_mut().unwrap().replaced_value_id = None,
-                _ => finish.logical_summary.as_mut().unwrap().deleted_value_id = None,
+                3 => finish.summaries[0].input = None,
+                4 => finish.summaries[0].input = finish.writer_results_input,
+                5 => finish.summaries[0].columns = None,
+                6 => finish.summaries[0].kind = 0,
+                7 => {
+                    finish.summaries[0]
+                        .columns
+                        .as_mut()
+                        .unwrap()
+                        .value_ids
+                        .pop();
+                }
+                _ => finish.summaries.push(finish.summaries[0].clone()),
             }
             c.arm(None);
             assert!(
@@ -1960,11 +1968,11 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
             );
         }
         let mut unknown = raw;
-        raw_finish(&mut unknown)
-            .logical_summary
+        raw_finish(&mut unknown).summaries[0]
+            .columns
             .as_mut()
             .unwrap()
-            .inserted_value_id = Some(404);
+            .value_ids[0] = 404;
         c.arm(None);
         assert!(decode_table_write_node(&unknown, r, a, SOURCE, limits()).is_err());
     });

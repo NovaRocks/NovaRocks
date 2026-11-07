@@ -423,9 +423,9 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
                 count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 inputs: novarocks_physical_plan::FinishInputs {
                     writer_results: 0,
-                    logical_summary: None,
+                    summaries: Default::default(),
                 },
-                logical_summary: None,
+                summaries: Default::default(),
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -913,8 +913,12 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
     };
     let ordinal = WriteTargetOrdinal::try_new(0).expect("ordinal");
     let mut decoder = RootWriteResultDecoder::for_test_local(
-        RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
-            .expect("decode contract"),
+        RootWriteDecodeContract::try_new(
+            &[ordinal],
+            session.write_targets(),
+            novarocks_result_contract::PerKind::empty(),
+        )
+        .expect("decode contract"),
     );
     decoder
         .apply_chunk(&root_chunk(
@@ -944,8 +948,12 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
     )
     .expect("drifted schema");
     let mut decoder = RootWriteResultDecoder::for_test_local(
-        RootWriteDecodeContract::try_new(&[ordinal], session.write_targets())
-            .expect("decode contract"),
+        RootWriteDecodeContract::try_new(
+            &[ordinal],
+            session.write_targets(),
+            novarocks_result_contract::PerKind::empty(),
+        )
+        .expect("decode contract"),
     );
     assert!(decoder.apply_chunk(&root_chunk(drifted)).is_err());
 }

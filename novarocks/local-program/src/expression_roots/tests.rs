@@ -491,9 +491,9 @@ fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgramGraph {
                     count_mode: novarocks_result_contract::FinishCountMode::WriterReported,
                     input_roles: novarocks_result_contract::FinishInputs {
                         writer_results: 0,
-                        logical_summary: None,
+                        summaries: Default::default(),
                     },
-                    logical_summary_layout: None,
+                    summary_layouts: novarocks_result_contract::PerKind::empty(),
                     inputs: vec![ProgramNodeId::new(0)],
                     expected_targets: vec![WriteTargetOrdinal::try_new(0).unwrap()],
                     writer_multiplex_layout: layout.clone(),

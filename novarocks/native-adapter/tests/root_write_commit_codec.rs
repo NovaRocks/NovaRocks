@@ -23,8 +23,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
-    StringArray, StructArray,
+    ArrayRef, BinaryArray, FixedSizeBinaryBuilder, Int8Array, Int32Array, Int64Array, ListArray,
+    MapArray, RecordBatch, StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -69,8 +69,9 @@ unsafe impl GlobalAlloc for Probe {
 static ALLOCATOR: Probe = Probe;
 
 #[derive(Clone)]
-enum Row {
-    Summary(i64),
+enum ExpectedRecord {
+    RowCount(i64),
+    DeleteVerification([i64; 3], [u8; 16]),
     Fragment(i32, Vec<u8>),
     Artifact {
         target: i32,
@@ -94,8 +95,8 @@ fn artifact(
     blob: &str,
     body: &[u8],
     properties: &[(&str, &str)],
-) -> Row {
-    Row::Artifact {
+) -> ExpectedRecord {
+    ExpectedRecord::Artifact {
         target,
         fields: fields.to_vec(),
         blob: blob.into(),
@@ -107,8 +108,12 @@ fn artifact(
     }
 }
 
-fn batch(rows: &[Row]) -> RecordBatch {
+fn batch(rows: &[ExpectedRecord]) -> RecordBatch {
     let schema = root_write_result_schema();
+    let mut requested = Vec::new();
+    let mut matched = Vec::new();
+    let mut insufficient = Vec::new();
+    let mut fingerprints = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
     let mut kinds = Vec::new();
     let mut targets = Vec::new();
     let mut counts = Vec::new();
@@ -123,10 +128,22 @@ fn batch(rows: &[Row]) -> RecordBatch {
     let mut values = Vec::new();
     let mut entry_valid = Vec::new();
     for row in rows {
+        if let ExpectedRecord::DeleteVerification(counts, fingerprint) = row {
+            requested.push(Some(counts[0]));
+            matched.push(Some(counts[1]));
+            insufficient.push(Some(counts[2]));
+            fingerprints.append_value(fingerprint).unwrap();
+        } else {
+            requested.push(None);
+            matched.push(None);
+            insufficient.push(None);
+            fingerprints.append_null();
+        }
         let (kind, target, count, fragment, artifact) = match row.clone() {
-            Row::Summary(count) => (1, None, Some(count), None, None),
-            Row::Fragment(target, bytes) => (2, Some(target), None, Some(bytes), None),
-            Row::Artifact {
+            ExpectedRecord::RowCount(count) => (1, None, Some(count), None, None),
+            ExpectedRecord::DeleteVerification(_, _) => (4, None, None, None, None),
+            ExpectedRecord::Fragment(target, bytes) => (2, Some(target), None, Some(bytes), None),
+            ExpectedRecord::Artifact {
                 target,
                 fields,
                 blob,
@@ -139,7 +156,7 @@ fn batch(rows: &[Row]) -> RecordBatch {
                 None,
                 Some((fields, blob, body, properties)),
             ),
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind,
                 target,
                 count,
@@ -210,6 +227,10 @@ fn batch(rows: &[Row]) -> RecordBatch {
             Some(entry_valid.into()),
             false,
         )),
+        Arc::new(Int64Array::from(requested)),
+        Arc::new(Int64Array::from(matched)),
+        Arc::new(Int64Array::from(insufficient)),
+        Arc::new(fingerprints.finish()),
     ];
     RecordBatch::try_new(schema, columns).unwrap()
 }
@@ -270,9 +291,9 @@ fn records(mut bytes: &[u8]) -> Vec<(WriteCommitRecordHeader, Vec<u8>)> {
 #[test]
 fn summary_fragment_and_artifact_records_are_exact() {
     let rows = [
-        Row::Fragment(2, b"frag".to_vec()),
+        ExpectedRecord::Fragment(2, b"frag".to_vec()),
         artifact(2, &[7, 3], "theta", &[0, 255], &[("k", "vv"), ("a", "")]),
-        Row::Summary(41),
+        ExpectedRecord::RowCount(41),
     ];
     let encoded = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     assert!(encoded.error.is_none());
@@ -305,10 +326,10 @@ fn summary_fragment_and_artifact_records_are_exact() {
         expected.extend_from_slice(value.as_bytes());
     }
     assert_eq!(payload, &expected);
-    assert_eq!(records[2].0.kind(), RootRowKind::Summary);
+    assert_eq!(records[2].0.kind(), RootRowKind::RowCount);
     assert_eq!(records[2].0.row_count(), 41);
     assert!(records[2].1.is_empty());
-    assert!(encoded.totals.summary_seen());
+    assert!(encoded.totals.row_count_seen());
     assert_eq!(encoded.totals.fragments(), 1);
     assert_eq!(encoded.totals.fragment_bytes(), 4);
     assert_eq!(encoded.totals.artifacts(), 1);
@@ -320,8 +341,8 @@ fn tiny_outputs_and_large_bodies_produce_identical_bytes_in_bounded_turns() {
     let body = vec![0x5a; 200 * 1024];
     let rows = [
         artifact(1, &[1], "b", &body, &[]),
-        Row::Fragment(1, vec![9; 70 * 1024]),
-        Row::Summary(0),
+        ExpectedRecord::Fragment(1, vec![9; 70 * 1024]),
+        ExpectedRecord::RowCount(0),
     ];
     let whole = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     let tiny = encode(batch(&rows), WriteCommitTotals::default(), 7);
@@ -333,32 +354,35 @@ fn tiny_outputs_and_large_bodies_produce_identical_bytes_in_bounded_turns() {
 #[test]
 fn a_second_summary_is_refused_before_its_header_and_across_batches() {
     let encoded = encode(
-        batch(&[Row::Summary(1), Row::Summary(2)]),
+        batch(&[ExpectedRecord::RowCount(1), ExpectedRecord::RowCount(2)]),
         WriteCommitTotals::default(),
         1 << 20,
     );
     // The failing turn's output is discarded by its owner; only the first
     // SUMMARY completed, and the second was refused at its preflight.
-    assert_eq!(encoded.error, Some(WriteCommitCodecError::DuplicateSummary));
-    assert!(encoded.totals.summary_seen());
+    assert_eq!(
+        encoded.error,
+        Some(WriteCommitCodecError::DuplicateRowCount)
+    );
+    assert!(encoded.totals.row_count_seen());
     let first = encode(
-        batch(&[Row::Summary(1)]),
+        batch(&[ExpectedRecord::RowCount(1)]),
         WriteCommitTotals::default(),
         1 << 20,
     );
-    let second = encode(batch(&[Row::Summary(1)]), first.totals, 1 << 20);
-    assert_eq!(second.error, Some(WriteCommitCodecError::DuplicateSummary));
+    let second = encode(batch(&[ExpectedRecord::RowCount(1)]), first.totals, 1 << 20);
+    assert_eq!(second.error, Some(WriteCommitCodecError::DuplicateRowCount));
     assert!(second.bytes.is_empty());
     assert_eq!(
         WriteCommitTotals::default().finish(),
-        Err(WriteCommitCodecError::MissingSummary)
+        Err(WriteCommitCodecError::MissingRowCount)
     );
 }
 
 #[test]
 fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
     let oversized = encode(
-        batch(&[Row::Fragment(
+        batch(&[ExpectedRecord::Fragment(
             1,
             vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1],
         )]),
@@ -368,7 +392,7 @@ fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
     assert_eq!(oversized.error, Some(WriteCommitCodecError::FragmentLimit));
     assert!(oversized.bytes.is_empty());
     let exact = encode(
-        batch(&[Row::Fragment(
+        batch(&[ExpectedRecord::Fragment(
             1,
             vec![0; MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES],
         )]),
@@ -376,7 +400,8 @@ fn fragment_single_value_and_entry_budgets_are_refused_before_emission() {
         1 << 20,
     );
     assert!(exact.error.is_none());
-    let many = vec![Row::Fragment(1, vec![1]); MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1];
+    let many =
+        vec![ExpectedRecord::Fragment(1, vec![1]); MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1];
     let entries = encode(batch(&many), WriteCommitTotals::default(), 1 << 20);
     assert_eq!(entries.error, Some(WriteCommitCodecError::FragmentLimit));
     assert_eq!(
@@ -390,7 +415,7 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
     let long_value = "v".repeat(MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES);
     let cases = [
         (
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind: 1,
                 target: Some(1),
                 count: Some(1),
@@ -399,7 +424,7 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
             WriteCommitCodecError::Shape,
         ),
         (
-            Row::Raw {
+            ExpectedRecord::Raw {
                 kind: 9,
                 target: None,
                 count: Some(1),
@@ -407,8 +432,14 @@ fn shapes_targets_and_artifact_values_are_refused_before_emission() {
             },
             WriteCommitCodecError::Kind,
         ),
-        (Row::Summary(-1), WriteCommitCodecError::RowCount),
-        (Row::Fragment(-3, vec![1]), WriteCommitCodecError::Target),
+        (
+            ExpectedRecord::RowCount(-1),
+            WriteCommitCodecError::RowCount,
+        ),
+        (
+            ExpectedRecord::Fragment(-3, vec![1]),
+            WriteCommitCodecError::Target,
+        ),
         (
             artifact(1, &[], "b", &[], &[]),
             WriteCommitCodecError::FieldIds,
@@ -451,7 +482,7 @@ fn foreign_schema_is_refused_at_construction() {
 #[test]
 fn header_parse_refuses_forged_declarations() {
     let encoded = encode(
-        batch(&[Row::Fragment(1, b"x".to_vec())]),
+        batch(&[ExpectedRecord::Fragment(1, b"x".to_vec())]),
         WriteCommitTotals::default(),
         1 << 20,
     );
@@ -486,9 +517,9 @@ fn header_parse_refuses_forged_declarations() {
 #[test]
 fn record_views_return_exactly_what_was_encoded() {
     let rows = [
-        Row::Fragment(3, b"fragment".to_vec()),
+        ExpectedRecord::Fragment(3, b"fragment".to_vec()),
         artifact(3, &[9, 4], "theta", b"body", &[("k", "v"), ("kk", "")]),
-        Row::Summary(12),
+        ExpectedRecord::RowCount(12),
     ];
     let encoded = encode(batch(&rows), WriteCommitTotals::default(), 1 << 20);
     let mut rest = encoded.bytes.as_slice();
@@ -517,4 +548,65 @@ fn record_views_return_exactly_what_was_encoded() {
     let last = forged.len() - 1;
     forged[last - 4] = 0xff; // corrupt the "kk" key's text
     assert!(WriteCommitRecordView::parse(&forged).is_err());
+}
+
+#[test]
+fn deletion_verification_roundtrips_fixed_little_endian_payload_across_one_byte_turns() {
+    let rows = [
+        ExpectedRecord::RowCount(7),
+        ExpectedRecord::DeleteVerification([3, 2, 1], [9; 16]),
+    ];
+    let output = encode(batch(&rows), WriteCommitTotals::default(), 1);
+    assert_eq!(output.error, None);
+    output.totals.finish().unwrap();
+    let first = WriteCommitRecordHeader::parse(&output.bytes)
+        .unwrap()
+        .record_bytes();
+    let record = &output.bytes[first..];
+    let view = WriteCommitRecordView::parse(record).unwrap();
+    assert_eq!(view.header().kind(), RootRowKind::DeleteVerification);
+    assert_eq!(record.len(), 48 + 40);
+    assert_eq!(&record[48..56], &[3, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&record[56..64], &[2, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&record[64..72], &[1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&record[72..88], &[9; 16]);
+    assert_eq!(
+        view.delete_verification().unwrap().into_wire(),
+        ([3, 2, 1], [9; 16])
+    );
+    let mut negative = record.to_vec();
+    negative[48..56].copy_from_slice(&(-1i64).to_le_bytes());
+    assert_eq!(
+        WriteCommitRecordView::parse(&negative).unwrap_err(),
+        WriteCommitCodecError::DeleteVerificationCount
+    );
+}
+
+#[test]
+fn duplicate_or_negative_verification_is_refused_before_its_header() {
+    let good = [
+        ExpectedRecord::RowCount(0),
+        ExpectedRecord::DeleteVerification([0; 3], [0; 16]),
+    ];
+    let prefix = encode(batch(&good), WriteCommitTotals::default(), 7);
+    let mut duplicate =
+        WriteCommitEncoder::try_new(batch(&[good[1].clone()]), prefix.totals).unwrap();
+    let mut untouched = [0xA5; 64];
+    assert_eq!(
+        duplicate.step(&mut untouched).unwrap_err(),
+        WriteCommitCodecError::DuplicateDeleteVerification
+    );
+    assert_eq!(untouched, [0xA5; 64]);
+    for counts in [[-1, 0, 0], [0, -1, 0], [0, 0, -1]] {
+        let output = encode(
+            batch(&[ExpectedRecord::DeleteVerification(counts, [0; 16])]),
+            WriteCommitTotals::default(),
+            1,
+        );
+        assert_eq!(
+            output.error,
+            Some(WriteCommitCodecError::DeleteVerificationCount)
+        );
+        assert!(output.bytes.is_empty());
+    }
 }

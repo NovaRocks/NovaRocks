@@ -842,6 +842,10 @@ mod tests {
                 ),
                 true,
             ),
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::new(DataType::FixedSizeBinary(16), true),
         ];
         let layout = |schema: arrow::datatypes::SchemaRef,
                       declarations: &[FunctionValueType],
