@@ -79,7 +79,7 @@ summary 是一个 Task 在特定种类上的完成事实。每种具有封闭的
 
 4. **严格耗尽与末尾领取检查规则。** 每个单位只领取一次，只在自身完整输入严格 EOS 后完成一次。零行输入也要沿正常耗尽完成零值；不能把未收到当作零。未完成即丢弃的单位把 `MissingContributor` 记入同一 Task 状态，禁止发行 summary。所有计算 pipeline 先实例化 driver，随后在图末尾创建独立 summary Source；Source 创建时检查全部单位已领取，运行时等待全部正常完成才恰好发一行。全部 driver 加入原 Task 的同一 DriverBatch、取消与真实退出 owner。
 
-5. **逐种类准确覆盖规则。** 每种输入使用冻结的完整 `ExchangeSource` 集合，身份从原接收队列取得，每源恰好一行。值的合并与覆盖分别保管；外来、重复或缺失来源、形状错误、负数及计数溢出均拒绝。其他种类完整不能掩盖本种类缺失，失败携带种类，原来源身份继续由原 receiver 与 coverage 保管，不保证错误文本包含具体来源。
+5. **逐种类准确覆盖规则。** 每种输入使用冻结的完整 `ExchangeSource` 集合，身份从原接收队列取得，每源恰好一行。值的合并与覆盖分别保管；外来、重复或缺失来源、形状错误、负数及计数溢出均拒绝。其他种类完整不能掩盖本种类缺失。接收或合并拒绝在原始错误构造处保留种类、原 receiver 实际来源和具体 typed cause；正常 End 的缺失以 expected 减 seen 给出首个缺失来源及剩余数。无来源 metadata 时明确记为缺失，不编造 Task；静态声明或 Task 内单位错误不冒充接收来源。该上下文进入原 BE 本地诊断，远端状态仍仅投影原中立 failure fact 和受限位置，不传递本地来源或领域文本。已有 Task、资源和接收控制失败沿原发生身份传播。
 
 6. **公平完成规则。** `LogicalFinish` 按 writer、声明的各种类输入、原 aggregate/unpivot 核心续体轮转。每轮先给予子项实际工作机会，再计父级协调；不能先等齐 summary 再消费 writer partial。writer 与全部声明种类均 End、覆盖核对完成且核心可收尾时，才能 finalize；同一 receiver 不再建立竞争消费的第二个普通 ExchangeSource。
 

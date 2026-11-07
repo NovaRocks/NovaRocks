@@ -108,6 +108,101 @@ impl novarocks_failure_contract::FailureProjection for SummaryFailure {
 pub(crate) fn summary_failure(cause: SummaryFailure) -> ExecutionFailure {
     ExecutionFailure::from_domain(cause)
 }
+
+/// Receiver-authored observations, not sender claims or inferred Task failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SummaryInputProvenance {
+    /// None means this DATA item had no receiver-authored source metadata.
+    Received(Option<ExchangeSource>),
+    /// The contribution being merged when the aggregate was refused.
+    Merging(ExchangeSource),
+    Missing {
+        first: Option<ExchangeSource>,
+        remaining: usize,
+    },
+    DuplicateDeclaration(ExchangeSource),
+}
+
+/// Local diagnostic context retains the original cause and its custody.
+/// Safe status projection continues to use only that cause's neutral fact.
+#[derive(Debug)]
+struct SummaryInputFailure {
+    kind: SummaryKind,
+    provenance: SummaryInputProvenance,
+    cause: SummaryFailure,
+}
+struct SummarySourceDiagnostic(ExchangeSource);
+impl std::fmt::Display for SummarySourceDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "task={} attempt={} key={} sender={}",
+            self.0.task(),
+            self.0.task().query_execution_id().attempt_id().get(),
+            self.0.task_key(),
+            self.0.sender_ordinal()
+        )
+    }
+}
+impl std::fmt::Display for SummaryInputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} summary ", self.kind)?;
+        match self.provenance {
+            SummaryInputProvenance::Received(Some(source)) => {
+                write!(f, "received source({}): ", SummarySourceDiagnostic(source))?;
+            }
+            SummaryInputProvenance::Received(None) => {
+                f.write_str("DATA has no receiver-authored source: ")?;
+            }
+            SummaryInputProvenance::Merging(source) => {
+                write!(
+                    f,
+                    "while merging contribution from source({}): ",
+                    SummarySourceDiagnostic(source)
+                )?;
+            }
+            SummaryInputProvenance::Missing { first, remaining } => {
+                write!(
+                    f,
+                    "missing contributions remaining={remaining} first_source="
+                )?;
+                match first {
+                    Some(source) => write!(f, "({}): ", SummarySourceDiagnostic(source))?,
+                    None => f.write_str("unavailable: ")?,
+                }
+            }
+            SummaryInputProvenance::DuplicateDeclaration(source) => {
+                write!(
+                    f,
+                    "duplicate declared source({}): ",
+                    SummarySourceDiagnostic(source)
+                )?;
+            }
+        }
+        std::fmt::Display::fmt(&self.cause, f)
+    }
+}
+impl std::error::Error for SummaryInputFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for SummaryInputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(&self.cause)
+    }
+}
+fn summary_input_failure(
+    kind: SummaryKind,
+    provenance: SummaryInputProvenance,
+    cause: SummaryFailure,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(SummaryInputFailure {
+        kind,
+        provenance,
+        cause,
+    })
+}
 fn add(left: SummaryValue, right: SummaryValue) -> ExecutionResult<SummaryValue> {
     left.checked_merge(right).map_err(|cause| {
         summary_failure(SummaryFailure::Count {
@@ -666,7 +761,11 @@ impl SummarySourceIndex {
                 factory.observe_input_work(256.min(sorted.len() - ordinal))?;
             }
             if pair[0] == pair[1] {
-                return Err(summary_failure(SummaryFailure::Source(kind)));
+                return Err(summary_input_failure(
+                    kind,
+                    SummaryInputProvenance::DuplicateDeclaration(pair[0]),
+                    SummaryFailure::Source(kind),
+                ));
             }
         }
         Ok(Arc::new(Self {
@@ -751,6 +850,37 @@ impl SourceBoundSummaryInput {
     pub(crate) fn ready(&self) -> bool {
         self.ended || self.receiver.has_output_or_finished(self.expected.len())
     }
+    fn read_summary(
+        &self,
+        received: Option<ExchangeSource>,
+        chunk: &Chunk,
+    ) -> ExecutionResult<SourceBoundSummary> {
+        let index = self
+            .index
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let source = received
+            .filter(|source| index.ordinal(source).is_some())
+            .ok_or_else(|| {
+                summary_input_failure(
+                    self.kind,
+                    SummaryInputProvenance::Received(received),
+                    SummaryFailure::Source(self.kind),
+                )
+            })?;
+        let schema = self
+            .schema
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let value = decode_summary_fields(self.kind, chunk, schema).map_err(|cause| {
+            summary_input_failure(
+                self.kind,
+                SummaryInputProvenance::Received(Some(source)),
+                cause,
+            )
+        })?;
+        Ok(SourceBoundSummary { source, value })
+    }
     pub(crate) fn poll(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<SummaryRead> {
         ctx.checkpoint()?;
         if self.ended {
@@ -765,28 +895,17 @@ impl SourceBoundSummaryInput {
         {
             Some(SourcedExchangePopResult::Chunk(item)) => {
                 let (source, chunk) = item.into_parts();
-                let index = self
-                    .index
-                    .as_ref()
-                    .ok_or(ConstructionFailure::MissingOwner)?;
-                let source = source
-                    .filter(|source| index.ordinal(source).is_some())
-                    .ok_or_else(|| summary_failure(SummaryFailure::Source(self.kind)))?;
-                let schema = self
-                    .schema
-                    .as_ref()
-                    .ok_or(ConstructionFailure::MissingOwner)?;
-                let value = decode_summary_value(self.kind, &chunk, schema)?;
+                let summary = self.read_summary(source, &chunk)?;
                 #[cfg(novarocks_dev_controls)]
                 if let Some(scope) = &self.diagnostics {
                     scope.emit("summary_input_handoff", || {
                         format!(
-                            "source={source:?} value={value:?} expected={:?}",
-                            self.expected
+                            "source={:?} value={:?} expected={:?}",
+                            summary.source, summary.value, self.expected
                         )
                     });
                 }
-                Ok(SummaryRead::Summary(SourceBoundSummary { source, value }))
+                Ok(SummaryRead::Summary(summary))
             }
             Some(SourcedExchangePopResult::Finished(_)) => {
                 self.receiver
@@ -821,13 +940,13 @@ impl SourceBoundSummaryInput {
         }
     }
 }
-fn decode_summary_value(
+fn decode_summary_fields(
     kind: SummaryKind,
     chunk: &Chunk,
     schema: &ChunkSchemaRef,
-) -> ExecutionResult<SummaryValue> {
+) -> Result<SummaryValue, SummaryFailure> {
     if chunk.len() != 1 || chunk.chunk_schema() != schema.as_ref() {
-        return Err(summary_failure(SummaryFailure::Schema(kind)));
+        return Err(SummaryFailure::Schema(kind));
     }
     let mut wire = [0; 3];
     for (ordinal, value) in wire.iter_mut().enumerate() {
@@ -835,16 +954,16 @@ fn decode_summary_value(
             .as_any()
             .downcast_ref::<Int64Array>()
             .filter(|a| a.null_count() == 0)
-            .ok_or_else(|| summary_failure(SummaryFailure::Schema(kind)))?;
+            .ok_or(SummaryFailure::Schema(kind))?;
         *value = a.value(0);
     }
     let value = match kind {
         SummaryKind::WriteCounts => SummaryValue::WriteCounts(
             LogicalChangeCounts::try_from_wire(wire[0], wire[1], wire[2]).map_err(|error| {
-                summary_failure(SummaryFailure::Count {
+                SummaryFailure::Count {
                     kind,
                     cause: SummaryMergeError::WriteCounts(error),
-                })
+                }
             })?,
         ),
         SummaryKind::DeleteVerification => {
@@ -852,23 +971,29 @@ fn decode_summary_value(
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .filter(|array| array.value_length() == 16 && array.null_count() == 0)
-                .ok_or_else(|| summary_failure(SummaryFailure::Schema(kind)))?;
+                .ok_or(SummaryFailure::Schema(kind))?;
             let fingerprint: [u8; 16] = fingerprint
                 .value(0)
                 .try_into()
-                .map_err(|_| summary_failure(SummaryFailure::Schema(kind)))?;
+                .map_err(|_| SummaryFailure::Schema(kind))?;
             SummaryValue::DeleteVerification(
                 DeleteVerificationCounts::try_from_wire(wire[0], wire[1], wire[2], fingerprint)
-                    .map_err(|error| {
-                        summary_failure(SummaryFailure::Count {
-                            kind,
-                            cause: SummaryMergeError::DeleteVerification(error),
-                        })
+                    .map_err(|error| SummaryFailure::Count {
+                        kind,
+                        cause: SummaryMergeError::DeleteVerification(error),
                     })?,
             )
         }
     };
     Ok(value)
+}
+#[cfg(test)]
+fn decode_summary_value(
+    kind: SummaryKind,
+    chunk: &Chunk,
+    schema: &ChunkSchemaRef,
+) -> ExecutionResult<SummaryValue> {
+    decode_summary_fields(kind, chunk, schema).map_err(summary_failure)
 }
 /// Finish-owned coverage, independent of writer target ordinals and profiles.
 pub(crate) struct SummaryCoverage {
@@ -894,16 +1019,30 @@ impl SummaryCoverage {
         })
     }
     pub(crate) fn accept(&mut self, summary: SourceBoundSummary) -> ExecutionResult<()> {
-        let ordinal = self
-            .expected
-            .ordinal(&summary.source)
-            .ok_or_else(|| summary_failure(SummaryFailure::Source(self.expected.kind)))?;
-        if self.seen[ordinal] {
-            return Err(summary_failure(SummaryFailure::DuplicateSource(
+        let ordinal = self.expected.ordinal(&summary.source).ok_or_else(|| {
+            summary_input_failure(
                 self.expected.kind,
-            )));
+                SummaryInputProvenance::Received(Some(summary.source)),
+                SummaryFailure::Source(self.expected.kind),
+            )
+        })?;
+        if self.seen[ordinal] {
+            return Err(summary_input_failure(
+                self.expected.kind,
+                SummaryInputProvenance::Received(Some(summary.source)),
+                SummaryFailure::DuplicateSource(self.expected.kind),
+            ));
         }
-        let next = add(self.value, summary.value)?;
+        let next = self.value.checked_merge(summary.value).map_err(|cause| {
+            summary_input_failure(
+                self.expected.kind,
+                SummaryInputProvenance::Merging(summary.source),
+                SummaryFailure::Count {
+                    kind: self.expected.kind,
+                    cause,
+                },
+            )
+        })?;
         self.value = next;
         self.seen[ordinal] = true;
         self.remaining -= 1;
@@ -911,9 +1050,20 @@ impl SummaryCoverage {
     }
     pub(crate) fn finish(&self) -> ExecutionResult<SummaryValue> {
         if self.remaining != 0 {
-            return Err(summary_failure(SummaryFailure::MissingSource(
+            let first = self
+                .expected
+                .sorted
+                .iter()
+                .zip(&self.seen)
+                .find_map(|(source, seen)| (!*seen).then_some(*source));
+            return Err(summary_input_failure(
                 self.expected.kind,
-            )));
+                SummaryInputProvenance::Missing {
+                    first,
+                    remaining: self.remaining,
+                },
+                SummaryFailure::MissingSource(self.expected.kind),
+            ));
         }
         Ok(self.value)
     }
@@ -1919,5 +2069,363 @@ pub(crate) mod tests {
             .is_err()
         );
         assert_eq!(limited.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod source_failure_tests {
+    use super::{tests::*, *};
+    use crate::{
+        exec::pipeline::driver_step::TurnWork,
+        runtime::{runtime_state::RuntimeState, task::ExecutionFailureCause},
+    };
+    use novarocks_failure_contract::FailureProjection;
+
+    fn context(error: &ExecutionFailure) -> &SummaryInputFailure {
+        match error.cause() {
+            ExecutionFailureCause::Domain(cause) => cause
+                .downcast_ref::<SummaryInputFailure>()
+                .expect("original summary input context"),
+            _ => panic!("summary input context remains a typed domain cause"),
+        }
+    }
+    fn original(error: &SummaryInputFailure) -> &SummaryFailure {
+        &error.cause
+    }
+    fn coverage(fixture: &IngressFixture, sources: &[ExchangeSource]) -> SummaryCoverage {
+        SummaryCoverage::new(
+            SummarySourceIndex::new(
+                fixture.input().kind(),
+                sources,
+                MemTracker::new_root("source failure index"),
+                fixture.factory.as_ref(),
+            )
+            .unwrap(),
+            MemTracker::new_root("source failure coverage"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn summary_input_provenance_retains_typed_cause_fact_and_safe_projection() {
+        use crate::runtime::task::PipelineOperation;
+        for kind in SummaryKind::ALL {
+            let cause = SummaryFailure::Schema(kind);
+            let fact = cause.failure_fact();
+            let failure =
+                summary_input_failure(kind, SummaryInputProvenance::Received(None), cause);
+            let input = context(&failure);
+            assert_eq!(input.kind, kind);
+            assert_eq!(input.provenance, SummaryInputProvenance::Received(None));
+            assert_eq!(failure.failure_fact(), fact);
+            let retained = std::error::Error::source(input)
+                .unwrap()
+                .downcast_ref::<SummaryFailure>()
+                .unwrap();
+            assert!(matches!(retained, SummaryFailure::Schema(actual) if *actual == kind));
+            let located = failure.clone().at_operator(7, PipelineOperation::Pull);
+            assert!(located.same_occurrence(&failure));
+            assert_eq!(located.failure_fact(), fact);
+            let plain = summary_failure(SummaryFailure::Schema(kind));
+            assert_eq!(failure.safe_detail().as_str(), plain.safe_detail().as_str());
+            let plain_located = plain.at_operator(7, PipelineOperation::Pull);
+            assert_eq!(located.site(), plain_located.site());
+            assert_eq!(
+                located.safe_detail().as_str(),
+                plain_located.safe_detail().as_str()
+            );
+            assert!(!failure.safe_detail().as_str().contains("receiver-authored"));
+            assert!(matches!(original(input), SummaryFailure::Schema(actual) if *actual == kind));
+        }
+    }
+
+    #[test]
+    fn summary_receiver_refusals_keep_actual_foreign_absent_and_bad_value_sources() {
+        for kind in SummaryKind::ALL {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let fixture = IngressFixture::new_kind(3, &runtime, kind);
+            let sources: Vec<_> = fixture
+                .streams
+                .iter()
+                .map(|stream| stream.source())
+                .collect();
+            let mut input = SourceBoundSummaryInput::new(
+                kind,
+                fixture.registry.get_receiver_pin(fixture.key, 3).unwrap(),
+                sources[..2].to_vec().into(),
+                fixture.layout.clone(),
+            )
+            .unwrap();
+            input
+                .prepare(
+                    fixture.factory.as_ref(),
+                    MemTracker::new_root("received sources"),
+                )
+                .unwrap();
+            let zero = summary_chunk(
+                SummaryValue::zero(kind),
+                &fixture.schema,
+                fixture.factory.as_ref(),
+            )
+            .unwrap();
+            // Exercise the same receiver-metadata boundary used by poll, without
+            // teaching the native receiver to admit an unauthorized stream.
+            for received in [Some(sources[2]), None] {
+                let error = input
+                    .read_summary(received, &zero)
+                    .err()
+                    .expect("source refusal");
+                let input_error = context(&error);
+                assert_eq!(input_error.kind, kind);
+                assert_eq!(
+                    input_error.provenance,
+                    SummaryInputProvenance::Received(received)
+                );
+                assert!(
+                    matches!(original(input_error), SummaryFailure::Source(actual) if *actual == kind)
+                );
+            }
+            let other_kind = if kind == SummaryKind::WriteCounts {
+                SummaryKind::DeleteVerification
+            } else {
+                SummaryKind::WriteCounts
+            };
+            let other_schema = fixture
+                .factory
+                .create_compiled_chunk_schema(&summary_layout_for(other_kind))
+                .unwrap();
+            let wrong_schema = summary_chunk(
+                SummaryValue::zero(other_kind),
+                &other_schema,
+                fixture.factory.as_ref(),
+            )
+            .unwrap();
+            let error = input
+                .read_summary(Some(sources[0]), &wrong_schema)
+                .err()
+                .expect("schema refusal");
+            assert_eq!(
+                context(&error).provenance,
+                SummaryInputProvenance::Received(Some(sources[0]))
+            );
+            assert!(
+                matches!(original(context(&error)), SummaryFailure::Schema(actual) if *actual == kind)
+            );
+            for ordinal in 0..3 {
+                let mut columns = zero.columns().to_vec();
+                columns[ordinal] = Arc::new(Int64Array::from(vec![-1]));
+                let negative =
+                    Chunk::try_new_with_columns(fixture.schema.clone(), columns).unwrap();
+                let error = input
+                    .read_summary(Some(sources[1]), &negative)
+                    .err()
+                    .expect("negative value refusal");
+                let input_error = context(&error);
+                assert_eq!(input_error.kind, kind);
+                assert_eq!(
+                    input_error.provenance,
+                    SummaryInputProvenance::Received(Some(sources[1]))
+                );
+                match original(input_error) {
+                    SummaryFailure::Count {
+                        kind: actual,
+                        cause,
+                    } => {
+                        assert_eq!(*actual, kind);
+                        assert!(matches!(
+                            cause,
+                            SummaryMergeError::WriteCounts(
+                                novarocks_result_contract::LogicalChangeCountError::Negative
+                            ) | SummaryMergeError::DeleteVerification(
+                                novarocks_result_contract::DeleteVerificationCountError::Negative
+                            )
+                        ));
+                    }
+                    _ => panic!("original negative count cause"),
+                }
+                assert_eq!(error.failure_fact(), input_error.cause.failure_fact());
+            }
+        }
+    }
+
+    #[test]
+    fn summary_coverage_refusals_identify_duplicate_foreign_and_merge_trigger_sources() {
+        for kind in SummaryKind::ALL {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let fixture = IngressFixture::new_kind(3, &runtime, kind);
+            let sources: Vec<_> = fixture
+                .streams
+                .iter()
+                .map(|stream| stream.source())
+                .collect();
+            let mut coverage = coverage(&fixture, &sources[..2]);
+            let large = match kind {
+                SummaryKind::WriteCounts => SummaryValue::WriteCounts(
+                    LogicalChangeCounts::try_new(i64::MAX as u64, 0, 0).unwrap(),
+                ),
+                SummaryKind::DeleteVerification => SummaryValue::DeleteVerification(
+                    DeleteVerificationCounts::try_new(i64::MAX as u64, 0, 0, 0).unwrap(),
+                ),
+            };
+            coverage
+                .accept(SourceBoundSummary {
+                    source: sources[0],
+                    value: large,
+                })
+                .unwrap();
+            let duplicate = coverage
+                .accept(SourceBoundSummary {
+                    source: sources[0],
+                    value: SummaryValue::zero(kind),
+                })
+                .unwrap_err();
+            assert_eq!(
+                context(&duplicate).provenance,
+                SummaryInputProvenance::Received(Some(sources[0]))
+            );
+            assert!(
+                matches!(original(context(&duplicate)), SummaryFailure::DuplicateSource(actual) if *actual == kind)
+            );
+            let foreign = coverage
+                .accept(SourceBoundSummary {
+                    source: sources[2],
+                    value: SummaryValue::zero(kind),
+                })
+                .unwrap_err();
+            assert_eq!(
+                context(&foreign).provenance,
+                SummaryInputProvenance::Received(Some(sources[2]))
+            );
+            assert!(
+                matches!(original(context(&foreign)), SummaryFailure::Source(actual) if *actual == kind)
+            );
+            let one = match kind {
+                SummaryKind::WriteCounts => {
+                    SummaryValue::WriteCounts(LogicalChangeCounts::try_new(1, 0, 0).unwrap())
+                }
+                SummaryKind::DeleteVerification => SummaryValue::DeleteVerification(
+                    DeleteVerificationCounts::try_new(1, 0, 0, 0).unwrap(),
+                ),
+            };
+            let merge = coverage
+                .accept(SourceBoundSummary {
+                    source: sources[1],
+                    value: one,
+                })
+                .unwrap_err();
+            assert_eq!(
+                context(&merge).provenance,
+                SummaryInputProvenance::Merging(sources[1])
+            );
+            assert!(
+                matches!(original(context(&merge)), SummaryFailure::Count { kind: actual, cause:
+                SummaryMergeError::WriteCounts(novarocks_result_contract::LogicalChangeCountError::Overflow)
+                | SummaryMergeError::DeleteVerification(novarocks_result_contract::DeleteVerificationCountError::Overflow)
+            } if *actual == kind)
+            );
+            assert_eq!(merge.failure_fact(), context(&merge).cause.failure_fact());
+            assert_eq!(
+                coverage.remaining, 1,
+                "failed merge must not accept its source"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_normal_end_missing_witness_is_expected_minus_seen_not_the_whole_roster() {
+        for kind in SummaryKind::ALL {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let fixture = IngressFixture::new_kind(2, &runtime, kind);
+            let mut input = fixture.input();
+            input
+                .prepare(
+                    fixture.factory.as_ref(),
+                    MemTracker::new_root("normal End input"),
+                )
+                .unwrap();
+            let sources: Vec<_> = fixture
+                .streams
+                .iter()
+                .map(|stream| stream.source())
+                .collect();
+            let mut coverage = coverage(&fixture, &sources);
+            let errors = runtime.error_state();
+            let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut ctx = DriverStep::new(&errors, &mut work, &mut conversions);
+            fixture.send_value(0, 1, Some(SummaryValue::zero(kind)), true);
+            let SummaryRead::Summary(summary) = input.poll(&mut ctx).unwrap() else {
+                panic!("actual first contribution")
+            };
+            coverage.accept(summary).unwrap();
+            assert!(matches!(
+                input.poll(&mut ctx).unwrap(),
+                SummaryRead::Pending(_)
+            ));
+            fixture.send_value(1, 1, None, true);
+            assert!(matches!(input.poll(&mut ctx).unwrap(), SummaryRead::End));
+            let missing = coverage.finish().unwrap_err();
+            assert_eq!(context(&missing).kind, kind);
+            assert_eq!(
+                context(&missing).provenance,
+                SummaryInputProvenance::Missing {
+                    first: Some(sources[1]),
+                    remaining: 1
+                }
+            );
+            assert!(
+                matches!(original(context(&missing)), SummaryFailure::MissingSource(actual) if *actual == kind)
+            );
+        }
+    }
+
+    #[test]
+    fn summary_source_configuration_and_task_local_units_do_not_invent_received_sources() {
+        for kind in SummaryKind::ALL {
+            let runtime = IngressFixture::task_state(&RuntimeState::default());
+            let fixture = IngressFixture::new_kind(1, &runtime, kind);
+            let source = fixture.streams[0].source();
+            let duplicate = SummarySourceIndex::new(
+                kind,
+                &[source, source],
+                MemTracker::new_root("duplicate declaration"),
+                fixture.factory.as_ref(),
+            )
+            .err()
+            .expect("duplicate declaration refusal");
+            assert_eq!(
+                context(&duplicate).provenance,
+                SummaryInputProvenance::DuplicateDeclaration(source)
+            );
+            let empty = SummarySourceIndex::new(
+                kind,
+                &[],
+                MemTracker::new_root("empty declaration"),
+                fixture.factory.as_ref(),
+            )
+            .err()
+            .expect("empty declaration refusal");
+            assert!(
+                matches!(empty.cause(), ExecutionFailureCause::Domain(cause) if cause.downcast_ref::<SummaryFailure>().is_some())
+            );
+            let state =
+                TaskSummaryState::new(kind, 1, MemTracker::new_root("local units")).unwrap();
+            let ordinal = state
+                .contributor(usize::MAX)
+                .err()
+                .expect("invalid unit ordinal");
+            assert!(
+                matches!(ordinal.cause(), ExecutionFailureCause::Domain(cause) if matches!(cause.downcast_ref::<SummaryFailure>(), Some(SummaryFailure::Contributors(actual)) if *actual == kind))
+            );
+            let bad_layout = if kind == SummaryKind::WriteCounts {
+                SummaryKind::DeleteVerification
+            } else {
+                SummaryKind::WriteCounts
+            };
+            let layout = validate_layout(kind, &summary_layout_for(bad_layout)).unwrap_err();
+            assert!(
+                matches!(layout.cause(), ExecutionFailureCause::Domain(cause) if matches!(cause.downcast_ref::<SummaryFailure>(), Some(SummaryFailure::Schema(actual)) if *actual == kind))
+            );
+        }
     }
 }
