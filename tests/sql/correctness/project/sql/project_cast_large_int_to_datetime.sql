@@ -22,7 +22,7 @@
 -- 3. These values cannot represent valid DATETIME and must return NULL.
 
 -- query 1
-select cast(-18446744073709551494 AS DATETIME);
+select cast(CAST('-18446744073709551494' AS LARGEINT) AS DATETIME);
 
 -- query 2
 select cast(0 AS DATETIME);
@@ -31,7 +31,7 @@ select cast(0 AS DATETIME);
 select cast(1 AS DATETIME);
 
 -- query 4
-select cast(18446744073709551615 AS DATETIME);
+select cast(CAST('18446744073709551615' AS LARGEINT) AS DATETIME);
 
 -- query 5
-select yearweek(-18446744073709551494);
+select yearweek(CAST('-18446744073709551494' AS LARGEINT));

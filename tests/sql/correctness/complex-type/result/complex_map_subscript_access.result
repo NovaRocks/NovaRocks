@@ -39,27 +39,27 @@ c1	c2
 
 -- query 8
 -- legacy
-map{'a':1,'b':2}['a']
+_col0
 1
 
 -- query 9
 -- legacy
-map{'a':1,'b':2}['a']
+_col0
 1
 
 -- query 10
 -- legacy
-map{'a':NULL,'b':2}['a']
+_col0
 NULL
 
 -- query 11
 -- legacy
-map{}['a']
+_col0
 NULL
 
 -- query 12
 -- legacy
-c2['key1']
+_col0
 1
 5
 2
@@ -68,7 +68,7 @@ c2['key1']
 
 -- query 13
 -- legacy
-map{1:'a',2:'b'}[c1]
+_col0
 a
 b
 NULL

@@ -1,1199 +1,1199 @@
 -- query 2
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75891200	6160.0	6160	6160
 
 -- query 3
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 31640808	2568.2474025974025	0	6160
 
 -- query 4
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 31579239	2563.249918831169	0	6154
 
 -- query 5
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 31702408	2573.2474025974025	0	6160
 
 -- query 6
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36933	2.9978084415584414	0	6
 
 -- query 7
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 67746	5.4988636363636365	0	11
 
 -- query 8
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36960	3.0	0	6
 
 -- query 9
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36946	2.9988636363636365	0	6
 
 -- query 10
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36960	3.0	0	6
 
 -- query 11
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 8778684	712.5555194805195	0	2001
 
 -- query 12
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 11833584	960.5181818181818	0	2001
 
 -- query 13
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 11876334	963.9881493506493	0	2001
 
 -- query 14
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 10341084	839.3737012987013	0	2001
 
 -- query 15
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 12326160	1000.5	0	2001
 
 -- query 16
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75891200	6160.0	6160	6160
 
 -- query 17
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 31640808	2568.2474025974025	0	6160
 
 -- query 18
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 19031128	1544.7344155844155	0	6160
 
 -- query 19
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 38238952	3103.811038961039	48	6160
 
 -- query 20
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 39119008	3175.244155844156	192	6160
 
 -- query 21
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75891200	6160.0	6160	6160
 
 -- query 22
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25231488	2048.0103896103897	4	2052
 
 -- query 23
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6310952	512.2525974025974	0	2052
 
 -- query 24
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6249547	507.2684253246753	0	2042
 
 -- query 25
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6372516	517.2496753246753	0	2052
 
 -- query 26
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36777	2.985146103896104	0	6
 
 -- query 27
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 67685	5.493912337662338	0	11
 
 -- query 28
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36924	2.997077922077922	0	6
 
 -- query 29
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36887	2.994074675324675	0	6
 
 -- query 30
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36958	2.9998376623376624	0	6
 
 -- query 31
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1657432	134.53181818181818	0	1052
 
 -- query 32
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 10808716	877.3308441558441	0	2001
 
 -- query 33
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 10956872	889.3564935064935	0	2001
 
 -- query 34
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6307172	511.94577922077923	0	2001
 
 -- query 35
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 12310204	999.2048701298701	0	2001
 
 -- query 36
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25231488	2048.0103896103897	4	2052
 
 -- query 37
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6310952	512.2525974025974	0	2052
 
 -- query 38
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 6310952	512.2525974025974	0	2052
 
 -- query 39
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 12713768	1031.9616883116882	0	2052
 
 -- query 40
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 13007912	1055.837012987013	0	2052
 
 -- query 41
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25231488	2048.0103896103897	4	2052
 
 -- query 42
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151782400	12320.0	12320	12320
 
 -- query 43
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75897360	6160.5	1	12320
 
 -- query 44
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75774205	6150.503652597403	0	12310
 
 -- query 45
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 76020505	6170.495535714285	11	12320
 
 -- query 46
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73875	5.996347402597403	0	6
 
 -- query 47
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 135490	10.997564935064934	6	11
 
 -- query 48
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73875	5.996347402597403	0	6
 
 -- query 49
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73905	5.998782467532467	1	6
 
 -- query 50
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73905	5.998782467532467	1	6
 
 -- query 51
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 20650320	1676.1623376623377	0	2001
 
 -- query 52
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 23651320	1919.75	1001	2001
 
 -- query 53
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 20650320	1676.1623376623377	0	2001
 
 -- query 54
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 22651320	1838.5811688311687	1	2001
 
 -- query 55
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 22651320	1838.5811688311687	1	2001
 
 -- query 56
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151782400	12320.0	12320	12320
 
 -- query 57
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75897360	6160.5	1	12320
 
 -- query 58
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 75909712	6161.5025974025975	5	12320
 
 -- query 59
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 76484112	6208.125974025974	96	12320
 
 -- query 60
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 78262848	6352.503896103896	384	12320
 
 -- query 61
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151782400	12320.0	12320	12320
 
 -- query 62
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 50462976	4096.020779220779	8	4104
 
 -- query 63
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25237648	2048.5103896103897	1	4104
 
 -- query 64
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25114671	2038.5284902597402	0	4094
 
 -- query 65
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25360579	2058.488555194805	8	4104
 
 -- query 66
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73701	5.982224025974026	0	6
 
 -- query 67
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 135370	10.987824675324676	6	11
 
 -- query 68
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73701	5.982224025974026	0	6
 
 -- query 69
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73845	5.993912337662338	1	6
 
 -- query 70
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 73845	5.993912337662338	1	6
 
 -- query 71
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 12614304	1023.8883116883117	0	2001
 
 -- query 72
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 21617432	1754.6616883116883	8	2001
 
 -- query 73
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 12614304	1023.8883116883117	0	2001
 
 -- query 74
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 18617376	1511.1506493506492	1	2001
 
 -- query 75
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 18617376	1511.1506493506492	1	2001
 
 -- query 76
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 50462976	4096.020779220779	8	4104
 
 -- query 77
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25237648	2048.5103896103897	1	4104
 
 -- query 78
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25237648	2048.5103896103897	1	4104
 
 -- query 79
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 25428624	2064.0116883116884	1	4104
 
 -- query 80
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 26019984	2112.0116883116884	1	4104
 
 -- query 81
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 50462976	4096.020779220779	8	4104
 
 -- query 82
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 83
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 84
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 85
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 86
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 87
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 88
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 89
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 90
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 91
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 92
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 93
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 94
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 95
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 96
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 97
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 98
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 99
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 100
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 101
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 102
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 103
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 104
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 105
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 106
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 107
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 108
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 109
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 110
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 111
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 112
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 113
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 114
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 115
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 116
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 117
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 118
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 119
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 120
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 121
 -- types	bigint	double	bigint	bigint
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 0	0.0	0	0
 
 -- query 122
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 311794560.00000	25308.00000000000	25308.00000	25308.00000
 
 -- query 123
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 118774418.00000	11567.43455395403	3.00000	25308.00000
 
 -- query 124
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 118524547.00000	11554.35240787678	3.00000	24690.00000
 
 -- query 125
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 119027498.00000	11580.80346370889	3.00000	25308.00000
 
 -- query 126
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 149058.00000	24.14676818403	1.00000	6670.00000
 
 -- query 127
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 276937.00000	44.71774584208	1.00000	6680.00000
 
 -- query 128
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151848.00000	24.55895196507	1.00000	6670.00000
 
 -- query 129
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 150397.00000	24.34396244739	1.00000	6670.00000
 
 -- query 130
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151848.00000	24.55895196507	1.00000	6670.00000
 
 -- query 131
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36357880.00000	3965.73734729494	1.00000	9687.00000
 
 -- query 132
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 47887302.00000	4287.90311604585	1.00000	9687.00000
 
 -- query 133
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 49291830.00000	4393.21122994652	1.00000	9687.00000
 
 -- query 134
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 41590582.00000	4090.34047993706	1.00000	9687.00000
 
 -- query 135
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 50641308.00000	4161.84319526627	1.00000	9687.00000
 
 -- query 136
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 311794560.00000	25308.00000000000	25308.00000	25308.00000
 
 -- query 137
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 118774418.00000	11567.43455395403	3.00000	25308.00000
 
 -- query 138
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 59051362.00000	4800.92373983740	204.00000	25308.00000
 
 -- query 139
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 193238610.00000	15684.95211038961	136.00000	25308.00000
 
 -- query 140
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 186964168.00000	15175.66298701299	544.00000	25308.00000
 
 -- query 141
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 311794560.00000	25308.00000000000	25308.00000	25308.00000
 
 -- query 142
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 100447968.00000	8153.24415584416	406.00000	9738.00000
 
 -- query 143
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16320114.00000	2649.36915584416	1.00000	9738.00000
 
 -- query 144
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16128782.00000	2634.56092780137	1.00000	7144.00000
 
 -- query 145
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16569508.00000	2673.36366569861	1.00000	9738.00000
 
 -- query 146
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 104142.00000	16.96952908587	1.00000	24.00000
 
 -- query 147
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 248240.00000	40.14879508329	1.00000	6680.00000
 
 -- query 148
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 148162.00000	24.00161995788	1.00000	6670.00000
 
 -- query 149
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 121904.00000	19.78961038961	1.00000	6670.00000
 
 -- query 150
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 151644.00000	24.52595827268	1.00000	6670.00000
 
 -- query 151
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 3865652.00000	1226.41243654822	1.00000	3184.00000
 
 -- query 152
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 36954408.00000	4030.80366492147	1.00000	9687.00000
 
 -- query 153
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 45840300.00000	4926.94539982803	4.00000	9687.00000
 
 -- query 154
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16311426.00000	2647.95876623377	1.00000	9687.00000
 
 -- query 155
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 49005822.00000	4027.43441814596	1.00000	9687.00000
 
 -- query 156
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 100447968.00000	8153.24415584416	406.00000	9738.00000
 
 -- query 157
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16320114.00000	2649.36915584416	1.00000	9738.00000
 
 -- query 158
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 16320114.00000	2649.36915584416	1.00000	9738.00000
 
 -- query 159
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 61702066.00000	5011.53882391163	24.00000	9738.00000
 
 -- query 160
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 59621746.00000	4842.57196231319	96.00000	9738.00000
 
 -- query 161
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 100447968.00000	8153.24415584416	406.00000	9738.00000
 
 -- query 162
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 2418366720.00000	196296.00000000000	196296.00000	196296.00000
 
 -- query 163
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1303833104.00000	105830.60909090909	19.00000	196296.00000
 
 -- query 164
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1301875202.00000	105757.53062550772	19.00000	195185.00000
 
 -- query 165
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1305795019.00000	105989.85543831169	209.00000	196296.00000
 
 -- query 166
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1172731.00000	95.22785221275	6.00000	24458.00000
 
 -- query 167
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 2157285.00000	175.10430194805	11.00000	24498.00000
 
 -- query 168
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1176921.00000	95.56808769793	6.00000	24458.00000
 
 -- query 169
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1176090.00000	95.46185064935	6.00000	24458.00000
 
 -- query 170
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1177491.00000	95.57556818182	6.00000	24458.00000
 
 -- query 171
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 340515160.00000	30080.84452296820	19.00000	43549.00000
 
 -- query 172
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 374763188.00000	30419.08993506494	6886.00000	43549.00000
 
 -- query 173
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 309523430.00000	27343.05918727915	114.00000	42386.00000
 
 -- query 174
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 364329920.00000	29572.23376623377	19.00000	43549.00000
 
 -- query 175
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 352123272.00000	28581.43441558442	114.00000	43549.00000
 
 -- query 176
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 2418366720.00000	196296.00000000000	196296.00000	196296.00000
 
 -- query 177
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1303833104.00000	105830.60909090909	19.00000	196296.00000
 
 -- query 178
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1115956648.00000	90580.89675324675	247.00000	196296.00000
 
 -- query 179
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1424538128.00000	115628.09480519481	1200.00000	196296.00000
 
 -- query 180
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1424828224.00000	115651.64155844156	4800.00000	196296.00000
 
 -- query 181
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 2418366720.00000	196296.00000000000	196296.00000	196296.00000
 
 -- query 182
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 798078528.00000	64779.10129870130	836.00000	84932.00000
 
 -- query 183
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 364949968.00000	29622.56233766234	3.00000	84932.00000
 
 -- query 184
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 363127858.00000	29585.12774971484	3.00000	84322.00000
 
 -- query 185
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 366899833.00000	29780.83060064935	33.00000	84932.00000
 
 -- query 186
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1071246.00000	87.12858885726	3.00000	24458.00000
 
 -- query 187
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 2085893.00000	169.30949675325	11.00000	24498.00000
 
 -- query 188
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1167183.00000	94.93151687678	6.00000	24458.00000
 
 -- query 189
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1108166.00000	89.94853896104	3.00000	24458.00000
 
 -- query 190
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 1174023.00000	95.29407467532	6.00000	24458.00000
 
 -- query 191
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 186356540.00000	20029.72269991402	3.00000	43549.00000
 
 -- query 192
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 335880928.00000	27263.06233766234	836.00000	43549.00000
 
 -- query 193
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 213142488.00000	22908.69389509888	14.00000	41600.00000
 
 -- query 194
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 281353332.00000	22837.12110389610	3.00000	43549.00000
 
 -- query 195
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 315351304.00000	25596.69675324675	14.00000	43549.00000
 
 -- query 196
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 798078528.00000	64779.10129870130	836.00000	84932.00000
 
 -- query 197
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 364949968.00000	29622.56233766234	3.00000	84932.00000
 
 -- query 198
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 364949968.00000	29622.56233766234	3.00000	84932.00000
 
 -- query 199
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 468828496.00000	38054.26103896104	103.00000	84932.00000
 
 -- query 200
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 468628432.00000	38038.02207792208	103.00000	84932.00000
 
 -- query 201
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 798078528.00000	64779.10129870130	836.00000	84932.00000
 
 -- query 202
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 203
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 204
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 205
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 206
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 207
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 208
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 209
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 210
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 211
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 212
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 213
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 214
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 215
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 216
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 217
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 218
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 219
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 220
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 221
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 222
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 223
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 224
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 225
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 226
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 227
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 228
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 229
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 230
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 231
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 232
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 233
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 234
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 235
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 236
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 237
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 238
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 239
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 240
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL
 
 -- query 241
 -- types	decimal(38, 5)	decimal(38, 11)	decimal(38, 5)	decimal(38, 5)
-sum(wv)	avg(wv)	min(wv)	max(wv)
+_col0	_col1	_col2	_col3
 NULL	NULL	NULL	NULL

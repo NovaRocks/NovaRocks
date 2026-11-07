@@ -1,5 +1,5 @@
 -- query 1
--- types	bigint	bigint	smallint	smallint	smallint
+-- types	integer	integer	smallint	smallint	smallint
 grp	ord	v	mn	mx
 1	1	10	10	10
 1	2	20	10	20

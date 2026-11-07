@@ -18,5 +18,5 @@ PAID	west	1
 
 -- query 5
 -- types	varchar	varchar
-min(status)	max(status)
+_col0	_col1
 CANCELLED	PAID

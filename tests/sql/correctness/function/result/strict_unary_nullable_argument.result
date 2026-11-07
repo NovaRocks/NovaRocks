@@ -1,21 +1,21 @@
 -- query 1
--- types	bigint	decimal(18, 9)	bigint
+-- types	integer	decimal(18, 9)	bigint
 seq	negative_key	inverted_integer
 1	-1.250000000	-2
 2	2.500000000	1
 3	NULL	NULL
 
 -- query 2
--- types	bigint	bigint	bigint
+-- types	integer	integer	bigint
 max_negative_key_value	min_negative_key_value	nonnull_keys
 11	22	2
 
 -- query 3
--- types	bigint
+-- types	integer
 null_key_winner
 NULL
 
 -- query 4
--- types	decimal(3, 2)	bigint
+-- types	decimal(3, 2)	integer
 negative_literal	inverted_literal
 -1.25	-2

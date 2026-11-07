@@ -416,7 +416,7 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
                             .unwrap();
                         assert!(matches!(
                             resolved
-                                .int64_observed(CompilePhase::Validate, &control)
+                                .signed_integer_observed(CompilePhase::Validate, &control)
                                 .unwrap(),
                             Some(7 | 9)
                         ));

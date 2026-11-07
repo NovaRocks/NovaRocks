@@ -141,6 +141,127 @@ fn native_negate_original_int64_error_retains_current_ordinal_and_full_message()
     ));
 }
 #[test]
+fn native_negate_each_signed_min_is_required_error_without_nullable_widening() {
+    let inputs: Vec<ArrayRef> = vec![
+        Arc::new(Int8Array::from(vec![i8::MIN, -2])),
+        Arc::new(Int16Array::from(vec![i16::MIN, -2])),
+        Arc::new(Int32Array::from(vec![i32::MIN, -2])),
+        Arc::new(Int64Array::from(vec![i64::MIN, -2])),
+    ];
+    for input in inputs {
+        let source =
+            FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), false);
+        let computed = native_negate_computed_result_type(&source, &Compile).unwrap();
+        assert_eq!(computed, source);
+        let recipe = PreparedNativeNegateRecipe::try_new(&source, &computed, &Compile).unwrap();
+        let NativeNegateRowResult::RowError(error) = recipe
+            .evaluate_row(EvaluatedArgument::Column(&input), 5, 0, &Control::default())
+            .unwrap()
+        else {
+            panic!("signed MIN cannot become a successful NULL")
+        };
+        assert_eq!(error.selected_ordinal(), 5);
+        assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
+        let NativeNegateRowResult::Value(value) = recipe
+            .evaluate_row(EvaluatedArgument::Column(&input), 0, 1, &Control::default())
+            .unwrap()
+        else {
+            panic!("valid signed negate must succeed")
+        };
+        assert_eq!(value.data_type(), input.data_type());
+        assert!(!value.is_null(0));
+        let actual = match value.data_type() {
+            DataType::Int8 => {
+                i64::from(value.as_any().downcast_ref::<Int8Array>().unwrap().value(0))
+            }
+            DataType::Int16 => i64::from(
+                value
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .unwrap()
+                    .value(0),
+            ),
+            DataType::Int32 => i64::from(
+                value
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+            ),
+            DataType::Int64 => value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            _ => panic!("exact signed output required"),
+        };
+        assert_eq!(actual, 2);
+    }
+}
+#[derive(Debug)]
+struct ForeignInt64(Int64Array);
+// SAFETY: Buffer, length and nullability access delegates to the same immutable
+// Int64Array. The wrapper retains its distinct Any identity through slicing.
+unsafe impl Array for ForeignInt64 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn to_data(&self) -> arrow_data::ArrayData {
+        self.0.to_data()
+    }
+    fn into_data(self) -> arrow_data::ArrayData {
+        self.0.into_data()
+    }
+    fn data_type(&self) -> &DataType {
+        self.0.data_type()
+    }
+    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+        Arc::new(Self(self.0.slice(offset, length)))
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn offset(&self) -> usize {
+        self.0.offset()
+    }
+    fn nulls(&self) -> Option<&arrow_buffer::NullBuffer> {
+        self.0.nulls()
+    }
+    fn get_buffer_memory_size(&self) -> usize {
+        self.0.get_buffer_memory_size()
+    }
+    fn get_array_memory_size(&self) -> usize {
+        self.0.get_array_memory_size()
+    }
+}
+#[test]
+fn native_negate_foreign_signed_array_retains_original_arithmetic_source() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let input: ArrayRef = Arc::new(ForeignInt64(Int64Array::from(vec![7])));
+    let error = recipe(DataType::Int64)
+        .evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control::default())
+        .unwrap_err();
+    assert!(matches!(error, KernelFailure::Source(_)));
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().domain(), domain::KERNEL.get());
+    assert_eq!(error.failure_fact().reason().code(), 231);
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut original_arithmetic = false;
+    while let Some(cause) = source {
+        if cause.is::<crate::legacy_arithmetic::ArithmeticFailure>() {
+            original_arithmetic = true;
+        }
+        source = cause.source();
+    }
+    assert!(
+        original_arithmetic,
+        "original arithmetic cause must survive the MIN precheck"
+    );
+}
+#[test]
 fn native_negate_original_control_every_seven_causes_keep_exact_prefix() {
     let input: ArrayRef = Arc::new(Float64Array::from(vec![Some(-101.9)]));
     let recipe = recipe(DataType::Float64);
@@ -323,11 +444,7 @@ fn native_negate_computed_domain_is_exact_for_every_original_full_carrier() {
                 nullable
                     || matches!(
                         dtype,
-                        DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Decimal128(_, _)
-                            | DataType::Decimal256(_, _)
+                        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
                     )
             );
             let recipe = PreparedNativeNegateRecipe::try_new(&source, &computed, &Compile).unwrap();
@@ -486,8 +603,10 @@ fn native_negate_real_row_data_keeps_its_successful_cooperative_completion() {
         "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808"
     );
     let trace = success.trace.lock().unwrap().clone();
-    assert!(trace.contains(&256));
-    // The actual final pending-work checkpoint follows the arithmetic row
+    assert!(trace.iter().any(|&units| units > 0));
+    assert!(trace.iter().all(|&units| units <= 256));
+    // The MIN precheck completes before the original Arrow loop. Its actual
+    // final pending-work checkpoint still follows the arithmetic row
     // result. Unlike an outer Err, that normal result must still observe it.
     let tail = trace.len().checked_sub(1).unwrap();
     for late in [

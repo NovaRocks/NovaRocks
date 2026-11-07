@@ -79,15 +79,27 @@ impl LiveParticipationCore {
         // This step flushes that same prefix once, never recurses into handle.
         self.flush(task, step)?;
         let record = self.tasks.get_mut(&task).expect("validated original Task");
-        if matches!(
+        let termination_generation = if matches!(
             observation.intent,
             TerminalIntent::FinishExistingTermination { .. }
         ) && !matches!(
             record.conclusion.accepted,
             Some(TaskConclusion::Terminated(_))
         ) {
-            return Err(CoreError::IllegalFact);
-        }
+            if record.conclusion.accepted.is_none()
+                && !record.state.is_terminal()
+                && self.closing.is_some()
+                && record.applied_close_generation < self.generation
+            {
+                // The same Abort already stopped new Business work. Its
+                // per-Task causal cut still owns the termination conclusion.
+                Some(self.generation)
+            } else {
+                return Err(CoreError::IllegalFact);
+            }
+        } else {
+            None
+        };
         if let Some(final_statistics) = observation.final_statistics
             && !record.state.is_terminal()
         {
@@ -97,6 +109,7 @@ impl LiveParticipationCore {
         record.statistics_sealed = true;
         record.terminal_observation_received = true;
         record.normal_close_validated = observation.normal_close_validated;
+        record.completion_termination_generation = termination_generation;
         if let Some(facts) = output {
             record.output = facts;
         }
@@ -105,7 +118,11 @@ impl LiveParticipationCore {
                 record.completion_success_pending = !record.state.is_terminal();
                 self.try_finish_completion_intent(task, step)?;
             }
-            TerminalIntent::FinishExistingTermination { .. } => self.finish_task(task, step)?,
+            TerminalIntent::FinishExistingTermination { .. } => {
+                if termination_generation.is_none() {
+                    self.finish_task(task, step)?;
+                }
+            }
         }
         if observation.output_released {
             let record = self.tasks.get_mut(&task).expect("original terminal Task");

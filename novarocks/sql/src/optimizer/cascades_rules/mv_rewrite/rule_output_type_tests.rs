@@ -101,6 +101,7 @@ fn output_type_rollup_fixture_with_shape(
     target_table.columns[value_index].nullable = mv_value.value_type.nullable();
     let candidate = MvRewriteCandidate {
         mv_name: "exact_output_mv".into(),
+        output_targets: (0..mv.outputs.len()).collect(),
         mv,
         mv_scalars,
         target_database: "ns".into(),
@@ -321,9 +322,10 @@ impl novarocks_type_contract::PureCompileControl for OutputTypeTrace {
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
         if let Some((at, cause)) = self.refuse.clone()
-            && trace.len() == at + 1 {
-                return Err(cause);
-            }
+            && trace.len() == at + 1
+        {
+            return Err(cause);
+        }
         Ok(())
     }
 }

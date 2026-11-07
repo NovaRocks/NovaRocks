@@ -111,17 +111,20 @@ fn prepare_mv_select_with_catalog_paths(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn finish_mv_analysis<T>(prepared: PreparedMvSelect, source: T) -> MvAnalysis
+pub(crate) fn finish_mv_analysis<T>(
+    prepared: PreparedMvSelect,
+    source: T,
+) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError>
 where
     T: SqlResolvedMvRefreshInputSource,
 {
-    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source);
+    let refresh_input = SqlResolvedMvRefreshInput::from_analysis(source)?;
     let output_columns = refresh_input.analysis_facts().output_columns;
-    MvAnalysis {
+    Ok(MvAnalysis {
         resolved_refs: prepared.resolved_refs,
         output_columns,
         refresh_input,
-    }
+    })
 }
 
 #[allow(
@@ -134,7 +137,7 @@ pub(crate) fn analyze_mv_select_with<Register, Analyze, T>(
     current_database: &str,
     register: Register,
     analyze: Analyze,
-) -> Result<MvAnalysis, String>
+) -> Result<MvAnalysis, novarocks_sql::compiler::SqlCompileError>
 where
     Register: FnOnce(&[ResolvedTableRef]) -> Result<(), String>,
     Analyze: FnOnce(&Query) -> Result<T, String>,
@@ -143,7 +146,7 @@ where
     let prepared = prepare_mv_select(query, current_catalog, current_database)?;
     register(prepared.resolved_refs())?;
     let source = analyze(prepared.query_for_analysis())?;
-    Ok(finish_mv_analysis(prepared, source))
+    finish_mv_analysis(prepared, source)
 }
 
 fn validate_mv_select_raw_query_clauses(query: &Query) -> Result<(), String> {

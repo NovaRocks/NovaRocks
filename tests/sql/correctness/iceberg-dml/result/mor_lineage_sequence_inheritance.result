@@ -6,14 +6,14 @@ id	v	sequence_number
 3	c	1
 
 -- query 4
--- legacy
+-- types	bigint	varchar	bigint
 id	v	sequence_number
 1	a	1
 2	bb	2
 3	c	1
 
 -- query 6
--- legacy
+-- types	bigint	varchar	bigint
 id	v	sequence_number
 1	a	1
 2	bbb	3
@@ -26,6 +26,6 @@ original_rows	preserved_row_ids
 3	3
 
 -- query 8
--- legacy
+-- types	bigint	bigint
 total_rows	distinct_row_ids
 4	4

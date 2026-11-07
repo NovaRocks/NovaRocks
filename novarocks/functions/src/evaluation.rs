@@ -275,6 +275,7 @@ enum RowDiagnostic {
 pub enum DataFailureReason {
     InvalidValue,
     NumericOutOfRange,
+    DivisionByZero,
     InvalidEncoding,
     /// Stable Data reason authored by a more specific value domain.
     Domain(novarocks_failure_contract::FailureReason),

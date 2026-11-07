@@ -231,6 +231,7 @@ fn actual_cv_rollup_keeps_selected_values_complete_type_and_last_exact_output() 
     );
 }
 
+// Keep this fixture on the exact residual path with a real non-containment counterexample.
 fn predicate(arena: &mut ScalarArena, number: i64, ordinal: u32, unused: i64) -> ScalarId {
     let column = arena
         .intern_observed(
@@ -249,7 +250,7 @@ fn predicate(arena: &mut ScalarArena, number: i64, ordinal: u32, unused: i64) ->
         .intern_observed(
             ScalarNode::BinaryOp {
                 left: column,
-                op: BinOp::Ge,
+                op: BinOp::Ne,
                 right: value,
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
@@ -298,7 +299,7 @@ impl ResidualFixture {
     }
 }
 #[test]
-fn actual_cv_residuals_preserve_compensation_order_without_numeric_range_inference() {
+fn actual_cv_residuals_preserve_compensation_order_and_selected_values() {
     let fixture = ResidualFixture::new(42);
     assert_eq!(
         fixture
@@ -311,7 +312,7 @@ fn actual_cv_residuals_preserve_compensation_order_without_numeric_range_inferen
     let mismatch = ResidualFixture::new(41);
     assert!(
         mismatch.check(&Control::good()).unwrap().is_none(),
-        "CV endpoint remains an exact residual; numeric widening is not inferred from its payload"
+        "a != 42 AND a != 43 does not imply a != 41; the selected CV value must remain exact"
     );
 }
 fn assert_cause(error: SqlCompileError, cause: CompileControlError) {

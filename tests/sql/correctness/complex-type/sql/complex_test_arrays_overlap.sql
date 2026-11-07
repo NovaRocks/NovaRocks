@@ -54,42 +54,42 @@ insert into array_test values
 (3, NULL, [1.0, 2.0, 3.0, 4.0, 10.0], NULL, [40.0, 10.0, 1.1, 2.1, 3.2, 4.3, -10, -10, 100, 10.0, 20.0, 3.0], [4.0, 10.0, 1.1, -10, 100, 1.0, 20.0, 3.0, 2.1, 3.2, 4.3, -1], [40.0, 20.1, 3.2, 10.0, 10.1, -10, 100, -1, 10.0, 2.0, 30.0, 4.3], [4.0, 2.1, 3.2, 10.0, 20.0, 3.0, 1.1, -10, -100, 100, 10.0, 4.3], NULL, NULL, [[1, 2, 30, 4], [50, 2, 6, 4], [100, -10, 92, 8], [66, 40, 32, -100]], [['1', '20', '3', '4'], ['-1', 'a00', '-100', '100'], ['a', 'b0', 'c']], NULL, NULL);
 
 -- query 4
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(s_1, 1) from array_test order by pk;
 
 -- query 5
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(d_1, 3) from array_test order by pk;
 
 -- query 6
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(as_1, 100) from array_test order by pk;
 
 -- query 7
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(aas_1, -10) from array_test order by pk;
 
 -- query 8
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(NULL, -1) from array_test order by pk;
 
 -- query 9
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap([1.0,2.1,3.2,4.3], 1) from array_test order by pk;
 
 -- query 10
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap(['a', 'b', 'c'], 1) from array_test order by pk;
 
 -- query 11
--- @expect_error=2-th input of arrays_overlap should be an array, rather than tinyint(4
+-- @expect_error=2-th input of arrays_overlap should be an array, rather than int(11
 USE ${case_db};
 select arrays_overlap([[1,2,3], [2,3,4]], 3) from array_test order by pk;
 

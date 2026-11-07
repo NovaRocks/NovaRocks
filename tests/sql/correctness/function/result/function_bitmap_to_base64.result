@@ -1,9 +1,9 @@
 -- query 1
 -- legacy
-bitmap_to_base64(NULL)
+_col0
 NULL
 
 -- query 2
 -- legacy
-bitmap_to_base64(bitmap_from_string('abc'))
+_col0
 NULL

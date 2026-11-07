@@ -61,6 +61,17 @@ HMS 的 `iceberg-hms` suite 以封闭的 `hms-read-only-compatibility-v1` case �
 
 LNP-3A/LNP-3D 与 `mv-storage-contract` 保留原 SQL、`.result` 和独立文档图，旧 CALL/directive 禁止扩展。当前 whole-family wipe 必须是显式 FE launch/family 授权、一次认领、隔离串行且 MV owner 停止 admission/实际 join 后台；普通裸 CALL 不授予擦除权。唯一后续迁移责任见 [correctness map](correctness/README.md#mv-受控过渡与后续迁移)，不在本次新增恢复或擦除 API。
 
+## Trino 错误断言
+
+```sql
+-- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
+CREATE TABLE ${case_db}.missing_name AS SELECT CAST(1 AS integer);
+```
+
+两项必填，去掉参数周围空白后，分别精确比较本次实际 Trino 错误的 `errorName` 与 `errorType`。每步只能有一条可执行 SQL；注释和引号内分号沿原词法 splitter 处理，负例 SQL 不在 runner 内做语义解析。空步骤、多语句、shell 和同一步其他报错指令均拒绝。该断言不进行外层重试或 transient commit 重试；成功、HTTP／transport／本地控制失败、额外错误和任一字段不符都失败，消息文本不能替代结构化错误。
+
+verify、record 与 conversion 共用同一判定和 `expected_error` oracle。执行调用返回本次所有 attempt／statement 的实际提交、完成、typed result 与失败；后续查询不改写前次事实。普通多语句 conversion 仍保留成功 suffix 与全部失败，基础设施失败停止普通后继；多个错误不能被首个匹配错误变成通过。解析与 HTTP 边界回归属于原 runner 常规 Rust 测试，复用其本地独占 peer 与退出 owner，不需额外 fixture。
+
 ## golden 格式
 
 golden 保存按 Trino 列类型解码后的规范值，不是 CLI 显示文本。格式与来源裁决见 [ADR-0210](../../docs/adr/ADR-0210-sql-golden-is-canonical-rendering-of-typed-trino-results.md)，实现由 runner 的 [golden 模块](runner/library/src/golden/mod.rs) 统一拥有。

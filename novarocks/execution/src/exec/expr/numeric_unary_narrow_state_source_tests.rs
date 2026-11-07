@@ -16,7 +16,7 @@
 // under the License.
 
 //! Public prepared Cast -> native typed-zero/Sub -> Cast stimulus, with
-//! independent narrow-boundary values and exact successful-NULL declarations.
+//! independent narrow-boundary values and required overflow attribution.
 use arrow::array::{Array, ArrayRef, Int8Array, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
@@ -44,14 +44,14 @@ impl KernelEvaluationControl for Control {
     }
 }
 #[test]
-fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() {
+fn numeric_unary_narrow_source_raw_cast_negate_required_error_and_recipe_metadata() {
     // These are explicit fixture declarations. They are never reconstructed
     // from the Arrow arrays' carrier types or their observed NULL counts.
     let source_type = FunctionValueType::new(DataType::Int64, false);
     let narrow_type = FunctionValueType::new(DataType::Int8, false);
     let computed = native_negate_computed_result_type(&narrow_type, &Control).unwrap();
     assert_eq!(computed.data_type().clone(), DataType::Int8);
-    assert!(computed.nullable());
+    assert!(!computed.nullable());
     let computed_wide = native_negate_computed_result_type(&source_type, &Control).unwrap();
     assert!(
         !computed_wide.nullable(),
@@ -59,7 +59,8 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
     );
 
     // -128 is representable in INT8. Its additive inverse +128 is not, so
-    // native typed-zero/Sub returns successful NULL at the INT8 output cast.
+    // the public NEGATE owner reports required NumericOutOfRange before any
+    // narrowing could turn that boundary into a successful NULL.
     let input: ArrayRef = Arc::new(Int8Array::from(vec![i8::MIN]));
     assert_eq!(input.data_type(), &DataType::Int8);
     assert!(!input.is_null(0), "the explicit narrow input is valid -128");
@@ -73,7 +74,12 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
             &Control,
         )
         .unwrap();
-    assert!(actual.errors().is_empty());
+    assert_eq!(actual.errors().len(), 1);
+    assert_eq!(actual.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        actual.errors()[0].reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
+    );
     assert_eq!(actual.values().data_type(), &DataType::Int8);
     assert_eq!(
         actual.values().to_data(),
@@ -118,7 +124,12 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
             &Control,
         )
         .unwrap();
-    assert!(negated.errors().is_empty());
+    assert_eq!(negated.errors().len(), 1);
+    assert_eq!(negated.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        negated.errors()[0].reason(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange
+    );
     assert_eq!(
         negated.values().to_data(),
         Int8Array::from(vec![None::<i8>]).to_data()
@@ -135,16 +146,32 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
     .unwrap();
     assert_eq!(widen_cast.source_type(), chain_negate.result_type());
     assert_eq!(widen_cast.result_type(), &widened_type);
+    // A scalar caller cannot discard the required child journal and feed its
+    // placeholder as a successful NULL into the next conversion.
+    assert!(matches!(
+        widen_cast.evaluate_row(EvaluatedArgument::SelectedColumn(&negated), 0, 0, &Control),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+
+    // The separate CAST contract still has successful NULL: narrowing the
+    // actual INT64 value 128 fails under OutputNull, then widening preserves it.
+    let outside_narrow: ArrayRef = Arc::new(Int64Array::from(vec![128]));
     assert_eq!(
-        widen_cast
-            .evaluate_row(EvaluatedArgument::Column(negated.values()), 0, 0, &Control)
+        narrow_cast
+            .evaluate_row(EvaluatedArgument::Column(&outside_narrow), 0, 0, &Control)
             .unwrap(),
         CastRowResult::Null,
-        "the real widening cast preserves the successful narrow NULL"
+    );
+    let cast_null: ArrayRef = Arc::new(Int8Array::from(vec![None::<i8>]));
+    assert_eq!(
+        widen_cast
+            .evaluate_row(EvaluatedArgument::Column(&cast_null), 0, 0, &Control)
+            .unwrap(),
+        CastRowResult::Null,
     );
 
-    // INT64 MIN differs: its inverse +2^63 is outside INT64, producing a
-    // required row error rather than an own successful-NULL result declaration.
+    // INT64 MIN follows the same checked rule: its inverse +2^63 is outside
+    // INT64 and retains its original required row attribution.
     let wide_recipe =
         PreparedNativeNegateRecipe::try_new(&source_type, &computed_wide, &Control).unwrap();
     let minimum: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN]));

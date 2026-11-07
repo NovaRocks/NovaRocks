@@ -451,6 +451,333 @@ fn close_parks_until_its_real_task_fact_then_drains_abort_waiters() {
     );
 }
 
+fn rollback_terminal_observation() -> TerminalObservation {
+    TerminalObservation {
+        intent: TerminalIntent::FinishExistingTermination { output: None },
+        normal_close_validated: false,
+        output_released: true,
+        final_statistics: None,
+    }
+}
+
+fn original_abort_cut(m: &mut Model, id: TaskIdentity) -> Generation {
+    m.fact(ParticipationInput::NextInternal)
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            ParticipationEffect::ApplyTaskClose {
+                task, generation, ..
+            } if *task == id => Some(*generation),
+            _ => None,
+        })
+        .expect("the original close scan schedules this Task's causal cut")
+}
+
+#[test]
+fn rollback_terminal_before_abort_cut_waits_without_selecting_success_in_both_exit_orders() {
+    for exit_before_close in [false, true] {
+        let mut m = Model::new();
+        let id = task(1);
+        m.accepted(id);
+        m.command(ParticipationCommand::Abort {
+            cause: AbortCause::QueryFailed,
+        });
+        let mut observation = rollback_terminal_observation();
+        if exit_before_close {
+            // Even an independently complete output cannot turn this
+            // termination-only observation into a success intent.
+            observation.intent = TerminalIntent::FinishExistingTermination {
+                output: Some(TaskOutputFacts::new(true)),
+            };
+        }
+        let observed = m.fact(ParticipationInput::TerminalObservation {
+            task: id,
+            observation,
+        });
+        let record = &m.core.tasks[&id];
+        assert!(record.accepted() && record.terminal_observation_received);
+        assert!(!record.installed && !record.state.is_terminal());
+        assert!(record.conclusion.accepted.is_none());
+        assert!(record.output_released && record.statistics_sealed);
+        assert_eq!(record.output.responsibility_complete(), exit_before_close);
+        assert!(!record.actual_stopped && !record.resources_converged);
+        assert!(!observed.effects.iter().any(|effect| matches!(
+            effect,
+            ParticipationEffect::PublishConclusion { .. }
+                | ParticipationEffect::FinalizeTaskExecution { .. }
+                | ParticipationEffect::RetireTask { .. }
+        )));
+        if exit_before_close {
+            m.fact(ParticipationInput::CompletionExited { task: id });
+            let record = &m.core.tasks[&id];
+            assert!(record.actual_stopped && record.resources_converged);
+            assert!(!record.state.is_terminal());
+            assert!(record.conclusion.accepted.is_none());
+        }
+        let generation = original_abort_cut(&mut m, id);
+        let finished = m.fact(ParticipationInput::ApplyTaskClose {
+            task: id,
+            generation,
+            intent: TaskCloseIntent::Abort(AbortCause::QueryFailed),
+        });
+        assert_eq!(m.core.tasks[&id].state, TaskState::Aborted);
+        assert_eq!(
+            m.core.tasks[&id].conclusion.accepted,
+            Some(TaskConclusion::Terminated(TerminationDetail::Aborted(
+                AbortCause::QueryFailed
+            )))
+        );
+        assert_eq!(m.core.tasks[&id].conclusion.source, None);
+        assert!(finished.effects.iter().any(|effect| matches!(effect,
+            ParticipationEffect::FinalizeTaskExecution { task, .. } if *task == id)));
+        assert!(
+            !finished
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ParticipationEffect::RetireTask { .. })),
+            "business completion cannot sign loader, preparation or Root exit"
+        );
+        if !exit_before_close {
+            assert!(!m.core.tasks[&id].actual_stopped);
+            m.fact(ParticipationInput::CompletionExited { task: id });
+        }
+        assert!(!m.core.tasks[&id].loader_exited);
+        assert!(!m.core.tasks[&id].preparation_exited);
+        assert!(!m.core.tasks[&id].physical_exit_ready());
+    }
+}
+
+#[test]
+fn rollback_terminal_pending_close_keeps_the_original_generation_and_release_verdict() {
+    for wrong_close in [true, false] {
+        let mut m = Model::new();
+        let id = task(1);
+        m.accepted(id);
+        m.command(ParticipationCommand::Abort {
+            cause: AbortCause::QueryFailed,
+        });
+        m.fact(ParticipationInput::TerminalObservation {
+            task: id,
+            observation: rollback_terminal_observation(),
+        });
+        let (_, release) = m.command(ParticipationCommand::Release);
+        assert!(matches!(
+            release.requests[0].body.as_ref(),
+            ParticipationReplyBody::Release {
+                release: novarocks_execution_contract::ReleaseOutcome::NotReady,
+                ..
+            }
+        ));
+        assert!(
+            !release
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
+        );
+        let generation = original_abort_cut(&mut m, id);
+        if wrong_close {
+            let wrong = m.core.handle(
+                at(m.now),
+                ParticipationInput::ApplyTaskClose {
+                    task: id,
+                    generation: generation.next().unwrap(),
+                    intent: TaskCloseIntent::Abort(AbortCause::QueryFailed),
+                },
+                &mut m.port,
+            );
+            assert_eq!(wrong.unwrap_err(), CoreError::WrongIdentity);
+            assert!(m.core.tasks[&id].conclusion.accepted.is_none());
+            // An illegal input ends this model branch. Normal convergence
+            // below uses a fresh Core, never a resumed failed owner.
+            continue;
+        }
+        m.fact(ParticipationInput::CompletionExited { task: id });
+        assert!(m.core.tasks[&id].conclusion.accepted.is_none());
+        m.fact(ParticipationInput::ApplyTaskClose {
+            task: id,
+            generation,
+            intent: TaskCloseIntent::Abort(AbortCause::QueryFailed),
+        });
+        assert_eq!(m.core.tasks[&id].state, TaskState::Aborted);
+        assert_eq!(m.core.tasks[&id].applied_close_generation, generation);
+    }
+}
+
+#[test]
+fn rollback_terminal_pending_close_preserves_the_original_termination_and_failure_source() {
+    use novarocks_execution_contract::failure::{
+        FailureClass, FailureEvidence, FailureFact, FailureReason, domain,
+    };
+    use novarocks_execution_contract::{SafeDetail, TaskFailure};
+    use std::num::NonZeroU16;
+    let failure = TaskConclusion::Terminated(TerminationDetail::Failed(TaskFailure::new(
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(domain::EXECUTION, NonZeroU16::new(51).unwrap()),
+        ),
+        SafeDetail::truncating("original preparation failure"),
+    )));
+    for original in [
+        TaskConclusion::Terminated(TerminationDetail::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        )),
+        failure,
+    ] {
+        let mut m = Model::new();
+        let id = task(1);
+        m.accepted(id);
+        m.command(ParticipationCommand::Abort {
+            cause: AbortCause::QueryFailed,
+        });
+        m.fact(ParticipationInput::TerminalObservation {
+            task: id,
+            observation: rollback_terminal_observation(),
+        });
+        let source = matches!(
+            &original,
+            TaskConclusion::Terminated(TerminationDetail::Failed(_))
+        )
+        .then_some(SourceId(41));
+        let mut summary = ProposalSummary::default();
+        summary.push(Proposal {
+            conclusion: original.clone(),
+            evidence: source.map(|_| FailureEvidence::Originating),
+            source,
+            diagnostic: None,
+        });
+        m.fact(ParticipationInput::Summary {
+            task: id,
+            generation: Generation::new(1).unwrap(),
+            cut: None,
+            summary,
+        });
+        assert_eq!(
+            m.core.tasks[&id].conclusion.accepted,
+            Some(original.clone())
+        );
+        assert!(!m.core.tasks[&id].state.is_terminal());
+        let generation = original_abort_cut(&mut m, id);
+        m.fact(ParticipationInput::ApplyTaskClose {
+            task: id,
+            generation,
+            intent: TaskCloseIntent::Abort(AbortCause::QueryFailed),
+        });
+        let record = &m.core.tasks[&id];
+        assert!(record.state.is_terminal());
+        assert_eq!(record.conclusion.accepted, Some(original));
+        assert_eq!(record.conclusion.source, source);
+        assert!(!record.actual_stopped && !record.resources_converged);
+    }
+}
+
+#[test]
+fn rollback_terminal_without_a_real_unapplied_abort_remains_illegal() {
+    for mode in 0..4 {
+        let mut m = Model::new();
+        let id = task(1);
+        m.accepted(id);
+        match mode {
+            0 => {}
+            1 => {
+                m.command(ParticipationCommand::Quiesce);
+            }
+            2 => {
+                m.command(ParticipationCommand::Abort {
+                    cause: AbortCause::QueryFailed,
+                });
+                // Isolate the guard with an already-applied generation and
+                // no conclusion. This is an invalid neutral model state,
+                // never an actual runtime close or exit observation.
+                m.core.tasks.get_mut(&id).unwrap().applied_close_generation = m.core.generation;
+            }
+            _ => {
+                m.fact(ParticipationInput::Installed { task: id });
+                m.fact(ParticipationInput::CompletionIntent {
+                    task: id,
+                    completed_output: Some(TaskOutputFacts::new(true)),
+                });
+                m.fact(ParticipationInput::CompletionExited { task: id });
+                assert_eq!(
+                    m.core.tasks[&id].conclusion.accepted,
+                    Some(TaskConclusion::Succeeded)
+                );
+                m.command(ParticipationCommand::Abort {
+                    cause: AbortCause::QueryFailed,
+                });
+            }
+        }
+        let before = m.core.tasks[&id].conclusion.clone();
+        let refused = m.core.handle(
+            at(m.now),
+            ParticipationInput::TerminalObservation {
+                task: id,
+                observation: rollback_terminal_observation(),
+            },
+            &mut m.port,
+        );
+        assert_eq!(refused.unwrap_err(), CoreError::IllegalFact);
+        assert!(!m.core.tasks[&id].terminal_observation_received);
+        assert_eq!(m.core.tasks[&id].conclusion, before);
+    }
+}
+
+#[test]
+fn rollback_terminal_keeps_original_acceptance_output_statistics_and_once_only_guards() {
+    for mode in 0..4 {
+        let mut m = Model::new();
+        let id = task(1);
+        if mode == 0 {
+            m.create(id);
+        } else {
+            m.accepted(id);
+        }
+        m.command(ParticipationCommand::Abort {
+            cause: AbortCause::QueryFailed,
+        });
+        let mut observation = rollback_terminal_observation();
+        match mode {
+            1 => {
+                observation.intent = TerminalIntent::FinishExistingTermination {
+                    output: Some(TaskOutputFacts::new(false)),
+                }
+            }
+            2 => {
+                observation.final_statistics = Some(TerminalStatistics {
+                    statistics: vec![
+                        OperatorStatistics::new(
+                            1,
+                            novarocks_execution_contract::SafeDetail::truncating(
+                                "original bounded sample"
+                            )
+                        );
+                        FINAL_TASK_INFO_MAX_OPERATORS + 1
+                    ],
+                    truncated: true,
+                })
+            }
+            3 => {
+                m.fact(ParticipationInput::TerminalObservation {
+                    task: id,
+                    observation: observation.clone(),
+                });
+            }
+            _ => {}
+        }
+        let refused = m.core.handle(
+            at(m.now),
+            ParticipationInput::TerminalObservation {
+                task: id,
+                observation,
+            },
+            &mut m.port,
+        );
+        assert_eq!(refused.unwrap_err(), CoreError::IllegalFact);
+        assert_eq!(m.core.tasks[&id].terminal_observation_received, mode == 3);
+        assert!(m.core.tasks[&id].conclusion.accepted.is_none());
+        assert!(!m.core.tasks[&id].actual_stopped && !m.core.tasks[&id].resources_converged);
+    }
+}
+
 #[test]
 fn maintenance_expires_one_original_request_and_the_lease_prelude_runs_once() {
     let mut m = Model::new();

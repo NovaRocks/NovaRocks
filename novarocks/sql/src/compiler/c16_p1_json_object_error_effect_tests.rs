@@ -216,18 +216,13 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                         "item", inner, true
                     )))
                 );
-                let ScalarNode::Cast { child, target, .. } = arena.node(access[1]) else {
-                    panic!("native SQL index cast");
-                };
-                assert_eq!(target, &DataType::Int32);
+                assert_eq!(arena.data_type(access[1]), &DataType::Int32);
                 assert!(arena.nullable(access[1]));
-                assert_eq!(arena.data_type(*child), &DataType::Int64);
-                assert!(arena.nullable(*child));
                 let ScalarNode::FunctionCall {
                     binding,
                     args: branches,
                     ..
-                } = arena.node(*child)
+                } = arena.node(access[1])
                 else {
                     panic!("primitive IF source");
                 };
@@ -235,7 +230,7 @@ fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_fo
                 assert_eq!(branches.len(), 3);
                 assert_eq!(arena.data_type(branches[0]), &DataType::Boolean);
                 for (branch, nullable) in branches[1..].iter().zip([true, false]) {
-                    assert_eq!(arena.data_type(*branch), &DataType::Int64);
+                    assert_eq!(arena.data_type(*branch), &DataType::Int32);
                     assert_eq!(arena.nullable(*branch), nullable);
                 }
                 count += 1;

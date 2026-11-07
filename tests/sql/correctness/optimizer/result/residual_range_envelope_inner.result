@@ -28,7 +28,7 @@ PLAN FRAGMENT 1
          TABLE: ${case_db}.residual_rng_r
          columns: k, score, payload
          min-max stats
-         predicates: CAST(r.score AS Int64) BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
+         predicates: r.score BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
     4:BROADCAST EXCHANGE stats={rows=8859}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -42,4 +42,4 @@ PLAN FRAGMENT 2
      TABLE: ${case_db}.residual_rng_l
      columns: k, score, payload
      min-max stats
-     predicates: CAST(l.score AS Int64) BETWEEN 10 AND 20 OR CAST(l.score AS Int64) BETWEEN 30 AND 40 AND CAST(l.score AS Int64) BETWEEN 10 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL
+     predicates: l.score BETWEEN 10 AND 20 OR l.score BETWEEN 30 AND 40 AND l.score BETWEEN 10 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL

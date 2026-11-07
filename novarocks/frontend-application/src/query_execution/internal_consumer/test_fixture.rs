@@ -72,7 +72,7 @@ pub(crate) async fn internal_profile_recovery_description(
             &self,
             _: &SqlNeedBatch,
             _: &ReadAccessSink<()>,
-        ) -> Result<SqlFactBatch, String> {
+        ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
             panic!("the literal Profile fixture requires no external facts")
         }
     }

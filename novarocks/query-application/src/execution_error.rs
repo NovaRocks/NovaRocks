@@ -209,6 +209,10 @@ impl ExecutionFailureInput {
                 == novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE
         {
             K::NumericOutOfRange
+        } else if self.fact.class() == FailureClass::Data
+            && self.fact.reason() == novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO
+        {
+            K::DivisionByZero
         } else {
             match self.fact.class() {
                 FailureClass::Unsupported if self.is_compiled_capability() => {
@@ -351,6 +355,7 @@ pub enum SqlExecutionErrorKind {
     Unsupported,
     ResourceExhausted,
     NumericOutOfRange,
+    DivisionByZero,
     Data,
     Representation,
     Dependency,
@@ -375,6 +380,7 @@ impl SqlExecutionErrorDescriptor {
             Unsupported => ("query.execution.unsupported", 1105, "HY000"),
             ResourceExhausted => ("query.execution.resource_exhausted", 1041, "HY000"),
             NumericOutOfRange => ("query.execution.numeric_out_of_range", 1690, "22003"),
+            DivisionByZero => ("query.execution.division_by_zero", 1365, "22012"),
             Data => ("query.execution.invalid_data", 1105, "HY000"),
             Representation => ("query.execution.representation", 1105, "HY000"),
             Dependency => ("query.execution.dependency", 1105, "HY000"),
@@ -408,6 +414,7 @@ pub const EXECUTION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Unsupported).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::ResourceExhausted).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::NumericOutOfRange).descriptor,
+    SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::DivisionByZero).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Data).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Representation).descriptor,
     SqlExecutionErrorDescriptor::for_kind(SqlExecutionErrorKind::Dependency).descriptor,
@@ -425,6 +432,7 @@ pub fn execution_descriptor_for_code(code: ErrorCodeId) -> Option<SqlExecutionEr
         Unsupported,
         ResourceExhausted,
         NumericOutOfRange,
+        DivisionByZero,
         Data,
         Representation,
         Dependency,
@@ -867,5 +875,49 @@ mod boundary_tests {
             ),
             (1105, "HY000")
         );
+    }
+
+    #[test]
+    fn division_by_zero_requires_the_kernel_data_reason() {
+        let reason = novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO;
+        for (class, detail, expected_code) in [
+            (
+                FailureClass::Data,
+                "numeric overflow",
+                "query.execution.division_by_zero",
+            ),
+            (
+                FailureClass::Representation,
+                "division by zero",
+                "query.execution.representation",
+            ),
+            (
+                FailureClass::Invariant,
+                "division by zero",
+                "query.execution.invariant",
+            ),
+        ] {
+            let input = ExecutionFailureInput::new(
+                FailureFact::new(class, reason),
+                SafeDetail::truncating(detail),
+                ExecutionFailureSite::Coordinator,
+            );
+            assert_eq!(input.descriptor().descriptor.code.as_str(), expected_code);
+            if class == FailureClass::Data {
+                assert_eq!(
+                    (input.descriptor().errno, input.descriptor().sqlstate),
+                    (1365, "22012")
+                );
+            }
+        }
+        let ordinary = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Data,
+                novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE,
+            ),
+            SafeDetail::truncating("division by zero"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(ordinary.descriptor().errno, 1690);
     }
 }

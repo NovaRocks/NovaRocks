@@ -57,12 +57,12 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 16
 -- legacy
-CAST((row(1, NULL)) AS struct<a INT, b ARRAY<INT>>)
+_col0
 {"a":1,"b":null}
 
 -- query 17
 -- legacy
-CAST((map{1:NULL}) AS MAP<INT,ARRAY<INT>>)
+_col0
 {1:null}
 
 -- query 19
@@ -113,7 +113,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 30
 -- legacy
-array1 = ([11, NULL, 31, 41])
+_col0
 NULL
 NULL
 0
@@ -127,7 +127,7 @@ NULL
 
 -- query 31
 -- legacy
-array1 = ([15, 25, 35, 45])
+_col0
 0
 0
 0
@@ -141,7 +141,7 @@ NULL
 
 -- query 32
 -- legacy
-array3 = ([named_struct('a', 21, 'b', 22), NULL])
+_col0
 0
 0
 NULL
@@ -155,7 +155,7 @@ NULL
 
 -- query 33
 -- legacy
-array3 = ([row(21, 22), NULL])
+_col0
 0
 0
 NULL
@@ -169,7 +169,7 @@ NULL
 
 -- query 34
 -- legacy
-array2 = ([map{999:550}, map{505:501}])
+_col0
 0
 0
 0
@@ -183,7 +183,7 @@ array2 = ([map{999:550}, map{505:501}])
 
 -- query 35
 -- legacy
-array2 = ([map{44:440}, map{404:401}])
+_col0
 0
 0
 0
@@ -197,7 +197,7 @@ array2 = ([map{44:440}, map{404:401}])
 
 -- query 36
 -- legacy
-map1 = NULL
+_col0
 NULL
 NULL
 NULL
@@ -211,7 +211,7 @@ NULL
 
 -- query 37
 -- legacy
-map1 = (map{14:41,999:11,12:31})
+_col0
 1
 0
 NULL
@@ -225,7 +225,7 @@ NULL
 
 -- query 38
 -- legacy
-map1 = (map{44:44,46:14,42:34})
+_col0
 0
 0
 NULL
@@ -239,7 +239,7 @@ NULL
 
 -- query 39
 -- legacy
-map1 = (map{34:43,36:13,32:NULL})
+_col0
 0
 0
 NULL
@@ -253,7 +253,7 @@ NULL
 
 -- query 40
 -- legacy
-map2 = (map{505:[5, 50, 51, 23]})
+_col0
 0
 0
 0
@@ -267,7 +267,7 @@ map2 = (map{505:[5, 50, 51, 23]})
 
 -- query 41
 -- legacy
-map2 = (map{999:NULL})
+_col0
 0
 0
 0
@@ -281,7 +281,7 @@ NULL
 
 -- query 42
 -- legacy
-map2 = (map{999:[4, NULL, 41, 23]})
+_col0
 0
 0
 0
@@ -295,7 +295,7 @@ NULL
 
 -- query 43
 -- legacy
-map2 = (map{101:[1, 10, 11, 23]})
+_col0
 1
 1
 0
@@ -309,7 +309,7 @@ map2 = (map{101:[1, 10, 11, 23]})
 
 -- query 44
 -- legacy
-map1 = (map{46:14,42:34,44:44})
+_col0
 0
 0
 NULL
@@ -323,7 +323,7 @@ NULL
 
 -- query 45
 -- legacy
-map1 = (map{54:45,56:15})
+_col0
 0
 0
 NULL
@@ -337,7 +337,7 @@ NULL
 
 -- query 46
 -- legacy
-map1 = (map{999:NULL,54:45,56:15})
+_col0
 0
 0
 NULL
@@ -351,7 +351,7 @@ NULL
 
 -- query 47
 -- legacy
-map3 = (map{505:row(NULL, 52)})
+_col0
 0
 0
 0
@@ -365,7 +365,7 @@ NULL
 
 -- query 48
 -- legacy
-st1 = (row(2, NULL, map{202:NULL}, row(222, 220)))
+_col0
 0
 0
 NULL
@@ -379,7 +379,7 @@ NULL
 
 -- query 49
 -- legacy
-st1 = (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
+_col0
 0
 0
 0
@@ -393,7 +393,7 @@ NULL
 
 -- query 50
 -- legacy
-array1 = NULL
+_col0
 NULL
 NULL
 NULL
@@ -407,7 +407,7 @@ NULL
 
 -- query 51
 -- legacy
-st1 = NULL
+_col0
 NULL
 NULL
 NULL
@@ -496,7 +496,7 @@ v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 68
 -- legacy
-array1 <=> ([11, NULL, 31, 41])
+_col0
 1
 0
 0
@@ -510,7 +510,7 @@ array1 <=> ([11, NULL, 31, 41])
 
 -- query 69
 -- legacy
-array1 <=> ([15, 25, 35, 45])
+_col0
 0
 0
 0
@@ -524,7 +524,7 @@ array1 <=> ([15, 25, 35, 45])
 
 -- query 70
 -- legacy
-array3 <=> ([named_struct('a', 21, 'b', 22), NULL])
+_col0
 0
 0
 1
@@ -538,7 +538,7 @@ array3 <=> ([named_struct('a', 21, 'b', 22), NULL])
 
 -- query 71
 -- legacy
-array3 <=> ([row(21, 22), NULL])
+_col0
 0
 0
 1
@@ -552,7 +552,7 @@ array3 <=> ([row(21, 22), NULL])
 
 -- query 72
 -- legacy
-array2 <=> ([map{999:550}, map{505:501}])
+_col0
 0
 0
 0
@@ -566,7 +566,7 @@ array2 <=> ([map{999:550}, map{505:501}])
 
 -- query 73
 -- legacy
-array2 <=> ([map{44:440}, map{404:401}])
+_col0
 0
 0
 0
@@ -580,7 +580,7 @@ array2 <=> ([map{44:440}, map{404:401}])
 
 -- query 74
 -- legacy
-map1 <=> NULL
+_col0
 0
 0
 1
@@ -594,7 +594,7 @@ map1 <=> NULL
 
 -- query 75
 -- legacy
-map1 <=> (map{14:41,999:11,12:31})
+_col0
 1
 0
 0
@@ -608,7 +608,7 @@ map1 <=> (map{14:41,999:11,12:31})
 
 -- query 76
 -- legacy
-map1 <=> (map{44:44,46:14,42:34})
+_col0
 0
 0
 0
@@ -622,7 +622,7 @@ map1 <=> (map{44:44,46:14,42:34})
 
 -- query 77
 -- legacy
-map1 <=> (map{34:43,36:13,32:NULL})
+_col0
 0
 0
 0
@@ -636,7 +636,7 @@ map1 <=> (map{34:43,36:13,32:NULL})
 
 -- query 78
 -- legacy
-map2 <=> (map{505:[5, 50, 51, 23]})
+_col0
 0
 0
 0
@@ -650,7 +650,7 @@ map2 <=> (map{505:[5, 50, 51, 23]})
 
 -- query 79
 -- legacy
-map2 <=> (map{999:NULL})
+_col0
 0
 0
 0
@@ -664,7 +664,7 @@ map2 <=> (map{999:NULL})
 
 -- query 80
 -- legacy
-map2 <=> (map{999:[4, NULL, 41, 23]})
+_col0
 0
 0
 0
@@ -678,7 +678,7 @@ map2 <=> (map{999:[4, NULL, 41, 23]})
 
 -- query 81
 -- legacy
-map2 <=> (map{101:[1, 10, 11, 23]})
+_col0
 1
 1
 0
@@ -692,7 +692,7 @@ map2 <=> (map{101:[1, 10, 11, 23]})
 
 -- query 82
 -- legacy
-map1 <=> (map{46:14,42:34,44:44})
+_col0
 0
 0
 0
@@ -706,7 +706,7 @@ map1 <=> (map{46:14,42:34,44:44})
 
 -- query 83
 -- legacy
-map1 <=> (map{54:45,56:15})
+_col0
 0
 0
 0
@@ -720,7 +720,7 @@ map1 <=> (map{54:45,56:15})
 
 -- query 84
 -- legacy
-map1 <=> (map{999:NULL,54:45,56:15})
+_col0
 0
 0
 0
@@ -734,7 +734,7 @@ map1 <=> (map{999:NULL,54:45,56:15})
 
 -- query 85
 -- legacy
-map3 <=> (map{505:row(NULL, 52)})
+_col0
 0
 0
 0
@@ -748,7 +748,7 @@ map3 <=> (map{505:row(NULL, 52)})
 
 -- query 86
 -- legacy
-st1 <=> (row(2, NULL, map{202:NULL}, row(222, 220)))
+_col0
 0
 0
 1
@@ -762,7 +762,7 @@ st1 <=> (row(2, NULL, map{202:NULL}, row(222, 220)))
 
 -- query 87
 -- legacy
-st1 <=> (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
+_col0
 0
 0
 0
@@ -776,7 +776,7 @@ st1 <=> (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 55
 
 -- query 88
 -- legacy
-array1 <=> NULL
+_col0
 0
 0
 0
@@ -790,7 +790,7 @@ array1 <=> NULL
 
 -- query 89
 -- legacy
-st1 <=> NULL
+_col0
 0
 0
 0
@@ -804,7 +804,7 @@ st1 <=> NULL
 
 -- query 90
 -- legacy
-array1 != ([11, NULL, 31, 41])
+_col0
 NULL
 NULL
 1
@@ -818,7 +818,7 @@ NULL
 
 -- query 91
 -- legacy
-array1 != ([15, 25, 35, 45])
+_col0
 1
 1
 1
@@ -832,7 +832,7 @@ NULL
 
 -- query 92
 -- legacy
-array3 != ([named_struct('a', 21, 'b', 22), NULL])
+_col0
 1
 1
 NULL
@@ -846,7 +846,7 @@ NULL
 
 -- query 93
 -- legacy
-array3 != ([row(21, 22), NULL])
+_col0
 1
 1
 NULL
@@ -860,7 +860,7 @@ NULL
 
 -- query 94
 -- legacy
-array2 != ([map{999:550}, map{505:501}])
+_col0
 1
 1
 1
@@ -874,7 +874,7 @@ array2 != ([map{999:550}, map{505:501}])
 
 -- query 95
 -- legacy
-array2 != ([map{44:440}, map{404:401}])
+_col0
 1
 1
 1
@@ -888,7 +888,7 @@ array2 != ([map{44:440}, map{404:401}])
 
 -- query 96
 -- legacy
-map1 != NULL
+_col0
 NULL
 NULL
 NULL
@@ -902,7 +902,7 @@ NULL
 
 -- query 97
 -- legacy
-map1 != (map{14:41,999:11,12:31})
+_col0
 0
 1
 NULL
@@ -916,7 +916,7 @@ NULL
 
 -- query 98
 -- legacy
-map1 != (map{44:44,46:14,42:34})
+_col0
 1
 1
 NULL
@@ -930,7 +930,7 @@ NULL
 
 -- query 99
 -- legacy
-map1 != (map{34:43,36:13,32:NULL})
+_col0
 1
 1
 NULL
@@ -944,7 +944,7 @@ NULL
 
 -- query 100
 -- legacy
-map2 != (map{505:[5, 50, 51, 23]})
+_col0
 1
 1
 1
@@ -958,7 +958,7 @@ map2 != (map{505:[5, 50, 51, 23]})
 
 -- query 101
 -- legacy
-map2 != (map{999:NULL})
+_col0
 1
 1
 1
@@ -972,7 +972,7 @@ NULL
 
 -- query 102
 -- legacy
-map2 != (map{999:[4, NULL, 41, 23]})
+_col0
 1
 1
 1
@@ -986,7 +986,7 @@ NULL
 
 -- query 103
 -- legacy
-map2 != (map{101:[1, 10, 11, 23]})
+_col0
 0
 0
 1
@@ -1000,7 +1000,7 @@ map2 != (map{101:[1, 10, 11, 23]})
 
 -- query 104
 -- legacy
-map1 != (map{46:14,42:34,44:44})
+_col0
 1
 1
 NULL
@@ -1014,7 +1014,7 @@ NULL
 
 -- query 105
 -- legacy
-map1 != (map{54:45,56:15})
+_col0
 1
 1
 NULL
@@ -1028,7 +1028,7 @@ NULL
 
 -- query 106
 -- legacy
-map1 != (map{999:NULL,54:45,56:15})
+_col0
 1
 1
 NULL
@@ -1042,7 +1042,7 @@ NULL
 
 -- query 107
 -- legacy
-map3 != (map{505:row(NULL, 52)})
+_col0
 1
 1
 1
@@ -1056,7 +1056,7 @@ NULL
 
 -- query 108
 -- legacy
-st1 != (row(2, NULL, map{202:NULL}, row(222, 220)))
+_col0
 1
 1
 NULL
@@ -1070,7 +1070,7 @@ NULL
 
 -- query 109
 -- legacy
-st1 != (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
+_col0
 1
 1
 1
@@ -1084,7 +1084,7 @@ NULL
 
 -- query 110
 -- legacy
-array1 != NULL
+_col0
 NULL
 NULL
 NULL
@@ -1098,7 +1098,7 @@ NULL
 
 -- query 111
 -- legacy
-st1 != NULL
+_col0
 NULL
 NULL
 NULL
@@ -1112,22 +1112,22 @@ NULL
 
 -- query 114
 -- legacy
-(map{1:1,999:2}) != (map{999:2,3:NULL})
+_col0
 1
 
 -- query 115
 -- legacy
-(map{1:1,999:2}) = (map{999:2,3:NULL})
+_col0
 0
 
 -- query 116
 -- legacy
-(map{1:1,999:2}) = (map{999:3,1:NULL})
+_col0
 0
 
 -- query 117
 -- legacy
-(map{1:1,999:2}) != (map{999:3,1:NULL})
+_col0
 1
 
 -- query 118

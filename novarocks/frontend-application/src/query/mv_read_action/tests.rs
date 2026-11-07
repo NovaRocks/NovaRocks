@@ -237,49 +237,62 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let input =
-            if let Some(level) = level {
-                let ports =
-                    if let Some(source) = &source {
-                        source.ports(readiness.clone(), entrance.clone())
-                    } else {
-                        let host =
-                            Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
-                        IcebergMvCorePorts::new_with_management_entrance(
-                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-                None,
-                host.clone(),
-                host,
-                readiness.clone(),
-                Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-                entrance.clone(),
-                crate::application::test_constant_policy(),
-            )
-                    };
-                ReadRequest::Explain(Box::new(MvExplainPreparationInput {
-                    ports,
-                    current_catalog: Some("ice".into()),
-                    current_database: if source.is_some() { "sales" } else { "db" }.into(),
-                    statement: crate::mv::domain::application::MvRefreshRequest {
-                        name_parts: vec![if source.is_some() { "mv" } else { "missing_mv" }.into()],
-                        full: false,
-                    },
-                    level,
-                    context: novarocks_spi::connector::ConnectorRequestContext::try_new(
-                        Instant::now() + Duration::from_secs(5),
-                        novarocks_spi::connector::ConnectorStopOwner::new().view(),
-                        4096,
-                        64 * 1024,
-                    )
-                    .unwrap(),
-                }))
+        let input = if let Some(level) = level {
+            let ports = if let Some(source) = &source {
+                source.ports(readiness.clone(), entrance.clone())
             } else {
-                ReadRequest::Show {
-                    catalog: Some("ice".into()),
-                    statement: MvShowStatement { database: None },
+                let host = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+                {
+                    let trc_catalog = Arc::new(
+                        crate::catalog_application::query_catalog::new_query_catalog_service(),
+                    );
+                    let trc_controls = host.clone();
+                    let trc_system_relations =
+                        crate::query_execution::kernels::test_system_relations(
+                            trc_catalog.clone(),
+                            trc_controls.clone(),
+                        );
+                    IcebergMvCorePorts::new_with_management_entrance(
+                        Arc::new(
+                            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                                .unwrap(),
+                        ),
+                        trc_catalog.clone(),
+                        None,
+                        trc_controls.clone(),
+                        host,
+                        readiness.clone(),
+                        Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+                        entrance.clone(),
+                        crate::application::test_constant_policy(),
+                        Arc::new(novarocks_query_application::view::QueryViewService::new()),
+                        trc_system_relations,
+                    )
                 }
             };
+            ReadRequest::Explain(Box::new(MvExplainPreparationInput {
+                ports,
+                current_catalog: Some("ice".into()),
+                current_database: if source.is_some() { "sales" } else { "db" }.into(),
+                statement: crate::mv::domain::application::MvRefreshRequest {
+                    name_parts: vec![if source.is_some() { "mv" } else { "missing_mv" }.into()],
+                    full: false,
+                },
+                level,
+                context: novarocks_spi::connector::ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(5),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    4096,
+                    64 * 1024,
+                )
+                .unwrap(),
+            }))
+        } else {
+            ReadRequest::Show {
+                catalog: Some("ice".into()),
+                statement: MvShowStatement { database: None },
+            }
+        };
         let mut state = State {
             family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {

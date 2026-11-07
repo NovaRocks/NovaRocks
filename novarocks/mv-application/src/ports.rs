@@ -43,7 +43,7 @@ pub struct MvProviderFailure {
     message: String,
     original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
-    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    analyze_error: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvProviderFailure {
@@ -53,7 +53,7 @@ impl MvProviderFailure {
             message: message.into(),
             original_failure: None,
             compile_control: None,
-            unavailable_implementation: None,
+            analyze_error: None,
         }
     }
 
@@ -80,8 +80,8 @@ impl MvProviderFailure {
         self.compile_control.clone()
     }
 
-    /// Retain only the typed missing-implementation cause, never diagnostic text.
-    pub fn with_unavailable_implementation(
+    /// Retain the original typed analysis cause, never classify diagnostic text.
+    pub fn with_analyze_error(
         mut self,
         error: Option<novarocks_sql::analyze_error::AnalyzeError>,
     ) -> Self {
@@ -90,20 +90,15 @@ impl MvProviderFailure {
             MvProviderFailureKind::CommitUnknown
                 | MvProviderFailureKind::KnownCommittedFinalizeFailed
         ) {
-            self.unavailable_implementation = None;
+            self.analyze_error = None;
             return self;
         }
-        self.unavailable_implementation = error.filter(|error| {
-            error.kind()
-                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-        });
+        self.analyze_error = error;
         self
     }
 
-    pub fn unavailable_implementation(
-        &self,
-    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
-        self.unavailable_implementation.as_ref()
+    pub fn analyze_error(&self) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.analyze_error.as_ref()
     }
 
     pub const fn kind(&self) -> MvProviderFailureKind {
@@ -130,7 +125,7 @@ impl MvProviderFailure {
         };
         let mut failure = MvProductError::new(kind, self.message)
             .with_compile_control(self.compile_control)
-            .with_unavailable_implementation(self.unavailable_implementation);
+            .with_analyze_error(self.analyze_error);
         if let Some(cause) = self.original_failure {
             failure = failure.with_original_failure(cause);
         }
@@ -377,6 +372,33 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_analysis_causes_keep_the_publication_disposition_fence() {
+        use novarocks_sql::analyze_error::AnalyzeError;
+        for original in [
+            AnalyzeError::missing_column_name("missing position 1", None),
+            AnalyzeError::duplicate_column_name("duplicate a", None),
+            AnalyzeError::mismatched_column_aliases("wrong width", None),
+        ] {
+            let ordinary =
+                MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, "admission")
+                    .with_analyze_error(Some(original.clone()))
+                    .into_product_error();
+            assert_eq!(ordinary.analyze_error(), Some(&original));
+            for kind in [
+                MvProviderFailureKind::CommitUnknown,
+                MvProviderFailureKind::KnownCommittedFinalizeFailed,
+            ] {
+                let product = MvProviderFailure::new(kind, "publication outcome")
+                    .with_analyze_error(Some(original.clone()))
+                    .into_product_error()
+                    .with_analyze_error(Some(original.clone()));
+                assert_eq!(product.analyze_error(), None);
+                assert_eq!(product.message(), "publication outcome");
+            }
+        }
+    }
+
+    #[test]
     fn pure_admission_identity_does_not_override_provider_commit_disposition() {
         use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
         use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
@@ -398,23 +420,24 @@ mod tests {
             ),
         ] {
             let provider = MvProviderFailure::new(provider_kind, "publication outcome")
-                .with_unavailable_implementation(Some(analyze.clone()));
-            assert_eq!(provider.unavailable_implementation(), None);
+                .with_analyze_error(Some(analyze.clone()));
+            assert_eq!(provider.analyze_error(), None);
             let product = provider
                 .into_product_error()
-                .with_unavailable_implementation(Some(analyze.clone()));
+                .with_analyze_error(Some(analyze.clone()));
             assert_eq!(product.kind(), product_kind);
             assert_eq!(product.message(), "publication outcome");
-            assert_eq!(product.unavailable_implementation(), None);
+            assert_eq!(product.analyze_error(), None);
         }
         let diagnostic =
             MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, "Unsupported")
-                .with_unavailable_implementation(Some(AnalyzeError::internal(
-                    "UnavailableImplementation",
-                )))
+                .with_analyze_error(Some(AnalyzeError::internal("UnavailableImplementation")))
                 .into_product_error();
         assert_eq!(diagnostic.kind(), MvProductErrorKind::InvalidRequest);
         assert_eq!(diagnostic.message(), "Unsupported");
-        assert_eq!(diagnostic.unavailable_implementation(), None);
+        assert_eq!(
+            diagnostic.analyze_error().unwrap().code().as_str(),
+            "sql.analyze.internal"
+        );
     }
 }

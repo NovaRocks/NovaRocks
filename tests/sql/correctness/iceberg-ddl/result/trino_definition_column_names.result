@@ -1,0 +1,34 @@
+-- query 15
+-- types	integer
+public_x
+1
+
+-- query 16
+-- types	integer
+outer_x
+1
+
+-- query 18
+-- types	integer
+public_x
+1
+
+-- query 20
+-- types	integer
+public_x
+1
+
+-- query 21
+-- types	integer
+outer_x
+1
+
+-- query 23
+-- types	integer
+public_x
+1
+
+-- query 25
+-- types	integer
+kk
+1

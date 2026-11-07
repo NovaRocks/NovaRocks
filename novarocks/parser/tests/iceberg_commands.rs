@@ -16,7 +16,8 @@
 // under the License.
 
 use novarocks_parser::{
-    ast::{DmlStatement, Ident, Literal, Statement, Visit},
+    ParseError, ParserError, Span,
+    ast::{DmlStatement, Ident, Literal, LiteralKind, Statement, Visit},
     parse,
     printer::print_statement,
 };
@@ -61,6 +62,56 @@ fn schema_default_preserves_negative_numeric_literal() {
         print_statement(&parsed),
         "ALTER TABLE ice.db.orders ADD COLUMN offset INT DEFAULT -7"
     );
+}
+
+#[test]
+fn schema_default_checks_the_complete_signed_i64_literal() {
+    struct Defaults(Vec<Literal>);
+    impl Visit for Defaults {
+        fn visit_literal(&mut self, literal: &Literal) {
+            self.0.push(literal.clone());
+        }
+    }
+    for (spelling, expected) in [
+        ("-9223372036854775808", "-9223372036854775808"),
+        ("9223372036854775807", "9223372036854775807"),
+        (
+            "- /* minimum */ 9223372036854775808",
+            "-9223372036854775808",
+        ),
+    ] {
+        let source = format!("ALTER TABLE t ADD COLUMN value BIGINT DEFAULT {spelling}");
+        let parsed = statement(&source);
+        let mut defaults = Defaults(Vec::new());
+        defaults.visit_statement(&parsed);
+        assert_eq!(defaults.0.len(), 1);
+        assert_eq!(defaults.0[0].kind, LiteralKind::Number(expected.to_owned()));
+        let start = source.find(spelling).unwrap();
+        assert_eq!(defaults.0[0].span, Span::new(start, source.len()));
+        let canonical = format!("ALTER TABLE t ADD COLUMN value BIGINT DEFAULT {expected}");
+        assert_eq!(print_statement(&parsed), canonical);
+        assert_eq!(print_statement(&statement(&canonical)), canonical);
+    }
+}
+
+#[test]
+fn schema_default_rejects_out_of_range_integer_with_original_span() {
+    for spelling in ["9223372036854775808", "-9223372036854775809"] {
+        let source = format!("ALTER TABLE t ADD COLUMN value BIGINT DEFAULT {spelling}");
+        let error = parse(&source).expect_err("ordinary integer must fit signed i64");
+        assert_eq!(
+            error,
+            ParserError::Parse(ParseError::UnexpectedToken {
+                expected: "signed 64-bit integer literal",
+                found: format!("`{spelling}`"),
+                span: Span::new(source.find(spelling).unwrap(), source.len()),
+            })
+        );
+        assert_eq!(
+            error.to_user_error(&source).code().as_str(),
+            "sql.parse.unexpected_token"
+        );
+    }
 }
 
 #[test]

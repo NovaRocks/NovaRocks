@@ -26,7 +26,7 @@ SET decimal_overflow_to_double=false;
 CREATE TABLE ${case_db}.decimal_error_policy (k INT,a DECIMAL(38,0),b DECIMAL(2,1))
 TBLPROPERTIES ("format-version"="3");
 INSERT INTO ${case_db}.decimal_error_policy VALUES
-(1,1,1.0),(2,99999999999999999999999999999999999999,0.1),(3,NULL,0.0),(4,0,0.0);
+(1,1,1.0),(2,CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)),0.1),(3,NULL,0.0),(4,0,0.0);
 
 -- query 2
 SELECT k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
@@ -40,7 +40,7 @@ SELECT k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 
 -- query 4
-SELECT -CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))-1 AS v;
+SELECT -CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))-1 AS v;
 
 -- query 5
 -- @skip_result_check=true
@@ -48,7 +48,7 @@ SELECT -CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))-1 AS v;
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ -CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))-1 AS v;
+SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ -CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))-1 AS v;
 
 -- query 6
 SELECT k,a*2 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
@@ -186,7 +186,7 @@ SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(1000 AS DECIMA
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.numeric_out_of_range]
-SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION',decimal_overflow_to_double=false) */ CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
+SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION',decimal_overflow_to_double=false) */ CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
 
 -- query 33
 -- @skip_result_check=true

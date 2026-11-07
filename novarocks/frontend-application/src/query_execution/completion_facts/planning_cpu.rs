@@ -151,7 +151,6 @@ struct ReadEncodedParts {
 }
 pub(crate) struct LogicalFinishInput {
     pub(crate) logical: SqlLogicalExplainCatalog,
-    pub(crate) facts: Vec<CatalogRelationFact>,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) evaluator: &'static dyn SqlConstantEvaluator,
     pub(crate) policy: novarocks_functions::ConstantPolicy,
@@ -163,7 +162,15 @@ struct LogicalCatalogInput {
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
+struct SystemRelationInput {
+    source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    need: novarocks_sql::compiler::CatalogRelationNeed,
+    facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
+    policy: novarocks_functions::ConstantPolicy,
+    control: SqlCompileControl,
+}
 enum PlanningCpuInput {
+    SystemRelation(Box<SystemRelationInput>),
     Start(Box<SqlFinalPlanCompileRequest>),
     Finish {
         compilation: SqlCompilation,
@@ -176,9 +183,16 @@ enum PlanningCpuInput {
     },
     Completed(CompletedReadCpuInput),
     LogicalCatalog(Box<LogicalCatalogInput>),
+    LogicalContinue {
+        logical: Box<SqlLogicalExplainCatalog>,
+        facts: Box<[CatalogRelationFact]>,
+    },
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    SystemRelation(
+        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+    ),
     Progress(Result<SqlCompileProgress, FinalPlanCompletionError>),
     Candidate(Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError>),
     Encoded(Box<Result<ReadEncodedParts, FrontendQueryCompilerError>>),
@@ -242,6 +256,11 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::SystemRelation(input) => PlanningCpuOutput::SystemRelation(
+                input
+                    .source
+                    .materialize(&input.need, input.facts, input.policy, &input.control),
+            ),
             PlanningCpuInput::Start(request) => {
                 PlanningCpuOutput::Progress(SqlCompletionPureSteps::start(*request))
             }
@@ -279,10 +298,13 @@ impl PlanningCpuOriginal {
                     query, session, control,
                 )))
             }
+            PlanningCpuInput::LogicalContinue { logical, facts } => {
+                PlanningCpuOutput::LogicalCatalog(Box::new(logical.continue_catalog(facts)))
+            }
             PlanningCpuInput::LogicalFinish(input) => {
                 let input = *input;
                 PlanningCpuOutput::LogicalLines(input.logical.finish(
-                    &input.facts,
+                    &[],
                     input.functions.as_ref(),
                     input.evaluator,
                     input.policy,
@@ -773,6 +795,31 @@ impl FrontendPlanningCpuSource {
         // The original candidate/access remain in this Source through its close.
         Ok(result)
     }
+    pub(crate) async fn system_relation(
+        &self,
+        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        need: novarocks_sql::compiler::CatalogRelationNeed,
+        facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
+        policy: novarocks_functions::ConstantPolicy,
+        control: SqlCompileControl,
+    ) -> Result<
+        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SystemRelation(Box::new(
+            SystemRelationInput {
+                source,
+                need,
+                facts,
+                policy,
+                control,
+            },
+        )));
+        let PlanningCpuOutput::SystemRelation(result) = self.receive().await? else {
+            panic!("system relation returned another CPU phase")
+        };
+        Ok(result)
+    }
     pub(crate) async fn logical_catalog(
         &self,
         query: novarocks_parser::ast::Query,
@@ -789,6 +836,21 @@ impl FrontendPlanningCpuSource {
         )));
         let PlanningCpuOutput::LogicalCatalog(result) = self.receive().await? else {
             panic!("logical catalog returned another phase")
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn logical_continue(
+        &self,
+        logical: SqlLogicalExplainCatalog,
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
+    {
+        self.install(PlanningCpuInput::LogicalContinue {
+            logical: Box::new(logical),
+            facts,
+        });
+        let PlanningCpuOutput::LogicalCatalog(result) = self.receive().await? else {
+            panic!("logical continuation returned another phase")
         };
         Ok(*result)
     }

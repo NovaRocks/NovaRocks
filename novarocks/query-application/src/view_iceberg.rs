@@ -19,14 +19,11 @@ use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQuery
 use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::{
-    ast::{CreateView, ObjectName},
-    printer,
-};
+use novarocks_parser::ast::{CreateView, ObjectName};
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
-use crate::view_service::{DEFAULT_CATALOG, build_query_result, parse_query};
+use crate::view_service::{DEFAULT_CATALOG, build_query_result};
 
 pub(crate) fn resolve_external_target_parts(
     _engine: &dyn ViewEngine,
@@ -70,52 +67,28 @@ pub(crate) fn create_external_view(
     target: ViewTarget,
     statement: &CreateView,
     context: ViewRequestContext<'_>,
-) -> Result<ViewStatementResult, String> {
+    local_views: &crate::view::LocalViewSnapshot,
+) -> Result<ViewStatementResult, crate::api::CommandError> {
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let definition = PersistedQueryDefinition::new(
-        printer::print_query(&statement.query),
+        statement.raw_query_source.clone(),
         PersistedQueryDialect::StarRocks,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
-    let mut analyzed_query = parse_query(&definition.raw_query_source)?.as_ref().clone();
-    crate::view_rewrite::expand_external_views(
-        engine,
-        &mut analyzed_query,
-        ViewRequestContext {
-            current_catalog: Some(&definition.resolution.default_catalog),
-            current_database: &definition.resolution.default_database,
-            connector_context: Some(connector_context),
+    let columns = engine.analyze_view_definition(
+        crate::view::ViewDefinitionAnalysisRequest {
+            catalog: &definition.resolution.default_catalog,
+            database: &definition.resolution.default_database,
+            target: &target,
+            query: &statement.query,
+            local_views,
         },
-        // External-view creation uses the same explicit default analysis
-        // policy as analyze_external_view below. This is a consumer policy,
-        // not an inferred semantic snapshot for the persisted definition.
-        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )?;
-    let mut columns = engine.analyze_external_view(
-        &definition.resolution.default_catalog,
-        &definition.resolution.default_database,
-        &analyzed_query,
         connector_context,
     )?;
-    if columns.is_empty() {
-        return Err("CREATE VIEW: SELECT produced no output columns".to_string());
-    }
-    if !statement.columns.is_empty() && statement.columns.len() != columns.len() {
-        return Err(format!(
-            "view column list has {} names but the SELECT produces {} columns",
-            statement.columns.len(),
-            columns.len()
-        ));
-    }
-    if !statement.columns.is_empty() {
-        for (column, alias) in columns.iter_mut().zip(&statement.columns) {
-            column.name = alias.value.clone();
-        }
-    }
     engine.create_external_view(
         CreateExternalViewRequest {
             target,
@@ -146,7 +119,7 @@ pub(crate) fn drop_external_view(
     target: &ViewTarget,
     if_exists: bool,
     context: ViewRequestContext<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::api::CommandError> {
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
@@ -165,14 +138,16 @@ pub(crate) fn show_create_view(
     engine: &dyn ViewEngine,
     name: &ObjectName,
     context: ViewRequestContext<'_>,
-) -> Result<ViewStatementResult, String> {
+) -> Result<ViewStatementResult, crate::api::CommandError> {
     let parts = name
         .parts
         .iter()
         .map(|part| part.value.clone())
         .collect::<Vec<_>>();
     let Some(target) = resolve_external_target_parts(engine, &parts, context)? else {
-        return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
+        return Err("SHOW CREATE VIEW only supports views in iceberg catalogs"
+            .to_string()
+            .into());
     };
     let connector_context = context
         .connector_context
@@ -185,15 +160,9 @@ pub(crate) fn show_create_view(
                 target.catalog, target.database, target.view
             )
         })?;
-    let columns = view
-        .column_names
-        .iter()
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut ddl = format!(
-        "CREATE VIEW `{}`.`{}`.`{}` ({})",
-        target.catalog, target.database, target.view, columns
+        "CREATE VIEW `{}`.`{}`.`{}`",
+        target.catalog, target.database, target.view
     );
     if let Some(comment) = &view.comment {
         ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));

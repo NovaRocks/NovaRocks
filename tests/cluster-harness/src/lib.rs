@@ -184,7 +184,7 @@ fn validate_statement_observation_binding(
     token: &str,
     target: &StatementObservationTarget,
     wire: &StatementLifecycleObservationWire,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     ensure!(
         wire.schema_version == 1 && wire.run_token == token,
         "statement observation returned a foreign token or schema"
@@ -224,7 +224,7 @@ fn validate_statement_observation_binding(
         }
         _ => bail!("statement observation returned incomplete execution attribution"),
     }
-    Ok(())
+    Ok((parts[2].parse()?, parts[3].parse()?))
 }
 
 /// Observe the original statement binding without consuming its journal or
@@ -5616,17 +5616,7 @@ impl TestClusterOwner for CrossProcessCluster {
             )?
             .context("statement token peek returned no document")?;
         let wire: StatementLifecycleObservationWire = serde_json::from_value(value)?;
-        validate_statement_observation_binding(&observation.token, &observation.target, &wire)?;
-        let work = wire
-            .work_id
-            .as_deref()
-            .context("original statement is not yet bound")?;
-        let parts = work.split(':').collect::<Vec<_>>();
-        ensure!(
-            parts.len() == 4,
-            "original statement token has invalid width"
-        );
-        Ok((parts[2].parse()?, parts[3].parse()?))
+        validate_statement_observation_binding(&observation.token, &observation.target, &wire)
     }
 
     fn await_query_lifecycle_statement_owned(
@@ -5710,6 +5700,7 @@ impl TestClusterOwner for CrossProcessCluster {
         let wire: StatementLifecycleObservationWire =
             serde_json::from_value(value).context("decode exact statement binding")?;
         validate_statement_observation_binding(&observation.token, &observation.target, &wire)
+            .map(|_| ())
     }
 
     fn drain_query_lifecycle_statement_observation(
@@ -7664,6 +7655,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn statement_token_is_extracted_only_from_the_exact_authenticated_binding() {
+        let query = "20261029_120000_00001_abcde";
+        let target = StatementObservationTarget::ClientQuery(query.into());
+        let mut value = statement_observation_json();
+        value["work_id"] = serde_json::json!(format!("client-query:{query}:1:5"));
+        let wire = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            validate_statement_observation_binding("query-on", &target, &wire).unwrap(),
+            (1, 5),
+        );
+        for (field, replacement) in [
+            ("run_token", serde_json::json!("foreign")),
+            (
+                "work_id",
+                serde_json::json!("client-query:20261029_120000_00002_abcde:1:5"),
+            ),
+            ("work_id", serde_json::json!("statement:7:1:5")),
+            (
+                "work_id",
+                serde_json::json!(format!("client-query:{query}:0:5")),
+            ),
+            (
+                "work_id",
+                serde_json::json!(format!("client-query:{query}:1:0")),
+            ),
+            (
+                "work_id",
+                serde_json::json!(format!("client-query:{query}:1:5:9")),
+            ),
+            ("work_id", serde_json::Value::Null),
+        ] {
+            let mut foreign = value.clone();
+            foreign[field] = replacement;
+            assert!(
+                validate_statement_observation_binding(
+                    "query-on",
+                    &target,
+                    &serde_json::from_value(foreign).unwrap(),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

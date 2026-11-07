@@ -126,7 +126,7 @@ fn dedup_project_item_output_ids(
             factory.create(None, item.output_name.clone(), item.expr.value_type.clone());
         if original_id != ColumnId::UNSET {
             factory
-                .transfer_value_provenance(original_id, item.output_column_id)
+                .transfer_value_occurrence(original_id, item.output_column_id)
                 .map_err(str::to_owned)?;
         }
         seen.insert(item.output_column_id);

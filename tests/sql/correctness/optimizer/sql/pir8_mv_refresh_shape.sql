@@ -77,7 +77,7 @@ INSERT INTO pir8_mv_cut_${uuid0}.ns_${uuid0}.orders VALUES (4, 7);
 -- query 4
 -- @skip_result_check=true
 -- @result_contains=LEFT OUTER JOIN
--- @result_contains=predicate: v2 > 0
+-- @result_contains=predicate: v2 > CAST(0 AS Int64)
 -- @result_contains=__nova_base_row_id
 -- @result_contains=source: IcebergDeltaTable
 -- @result_contains=source: IcebergMvTargetLocator

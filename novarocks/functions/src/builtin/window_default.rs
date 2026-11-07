@@ -116,7 +116,7 @@ fn default_profile(
     {
         Ok(DefaultProfile::Parse)
     } else if physical
-        && source.data_type() == &DataType::Int64
+        && matches!(source.data_type(), DataType::Int32 | DataType::Int64)
         && target.data_type() == &DataType::Utf8
     {
         Ok(DefaultProfile::Format)
@@ -281,17 +281,23 @@ impl DefaultValueRecipe {
                 output_layout(self.target.data_type(), rows, 0)?;
             }
             if matches!(self.conversion, Conversion::Format) {
-                let array = input
-                    .array()
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| invalid("window default I64 formatter has a foreign carrier"))?;
+                let i32_values = input.array().as_any().downcast_ref::<Int32Array>();
+                let i64_values = input.array().as_any().downcast_ref::<Int64Array>();
                 let mut bytes = 0usize;
                 for row in 0..rows {
                     let at = input.value_row(row, row);
-                    if !array.is_null(at) {
+                    if !input.array().is_null(at) {
+                        let value = match (i32_values, i64_values) {
+                            (Some(array), _) => i64::from(array.value(at)),
+                            (_, Some(array)) => array.value(at),
+                            _ => {
+                                return Err(invalid(
+                                    "window default formatter has a foreign carrier",
+                                ));
+                            }
+                        };
                         bytes = bytes
-                            .checked_add(decimal_bytes(array.value(at), &mut work)?)
+                            .checked_add(decimal_bytes(value, &mut work)?)
                             .ok_or(KernelFailure::ResourceExhausted)?;
                     }
                     work.step()?;

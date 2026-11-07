@@ -1,5 +1,5 @@
 -- query 2
--- types	bigint	varchar
+-- types	integer	varchar
 a	b
 NULL	NULL
 NULL	x

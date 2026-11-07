@@ -1213,6 +1213,9 @@ fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
 
 #[test]
 fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
+    // Computed GROUPING arguments remain the existing Nova grammar extension.
+    // Trino 483 requires qualifiedName here; that grammar flip belongs to 5e.
+    // The public width still follows the approved INTEGER/BIGINT rule.
     let plan = plan_test_query(
         "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
              FROM t GROUP BY ROLLUP(a + 1)",
@@ -1239,7 +1242,28 @@ fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
         "Aggregate output_columns prefix must match group_by physical output order"
     );
 
-    let g_id = column_ref_id(&project.items[0].expr);
+    let grouping = &project.items[0].expr;
+    assert_eq!(
+        grouping.value_type.data_type(),
+        &arrow::datatypes::DataType::Int32
+    );
+    assert!(
+        grouping.value_type.nullable(),
+        "original narrowing CAST NULL law"
+    );
+    let ExprKind::Cast {
+        expr: mask, target, ..
+    } = &grouping.kind
+    else {
+        panic!("public GROUPING needs a real typed INTEGER projection");
+    };
+    assert_eq!(target, &arrow::datatypes::DataType::Int32);
+    assert_eq!(
+        mask.value_type.data_type(),
+        &arrow::datatypes::DataType::Int64
+    );
+    assert!(!mask.value_type.nullable());
+    let g_id = column_ref_id(mask);
     let k_id = column_ref_id(&project.items[1].expr);
     assert_eq!(
         g_id, group_ids[1],
@@ -3290,7 +3314,11 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
         .iter()
         .map(|column| column.column_id)
         .collect();
-    check_complete(&resolved.output_columns, &expected, sql);
+    check_complete(
+        &crate::analysis::schema::planner_columns(&resolved.output_columns),
+        &expected,
+        sql,
+    );
     let witnesses: Vec<_> = original_ids
         .iter()
         .map(|id| factory.has_json_list_provenance(*id))
@@ -3428,8 +3456,16 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![],
         None,
     );
-    let plan =
-        super::window::build_window_and_project(input, select.projection, &mut factory).unwrap();
+    let plan = super::window::build_window_and_project(
+        input,
+        select
+            .projection
+            .into_iter()
+            .map(AnalyzedProjectItem::into_planner)
+            .collect(),
+        &mut factory,
+    )
+    .unwrap();
     let columns = plan_output_columns(&plan).unwrap();
     assert_eq!(columns[0].column_id, original);
     assert_ne!(columns[1].column_id, original);
@@ -3538,7 +3574,9 @@ fn flattened_union_spine_keeps_each_original_complete_declaration() {
     let mut original_layers = Vec::new();
     let mut query = &resolved;
     while let QueryBody::SetOperation(operation) = &query.body {
-        original_layers.push(query.output_columns.clone());
+        original_layers.push(crate::analysis::schema::planner_columns(
+            &query.output_columns,
+        ));
         query = &operation.left;
     }
     assert_eq!(original_layers.len(), 2);

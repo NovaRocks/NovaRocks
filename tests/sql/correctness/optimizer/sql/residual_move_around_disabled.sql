@@ -33,12 +33,12 @@ SET disable_optimizer_rules = 'PushDownPredicateJoin,JoinReorder,JoinCommutativi
 -- @skip_result_check=true
 -- @result_contains=INNER, eq: [k = b.k]
 -- @result_contains=INNER, eq: [b.k = c.k]
--- @result_contains=predicates: CAST(k AS Int64) = 7 AND k IS NOT NULL
+-- @result_contains=predicates: k = 7 AND k IS NOT NULL
 -- Positive control: a.k=b.k=c.k and a.k=7 imply both derived predicates
 -- while JoinPredicateMoveAround is enabled. The disabled control below
 -- continues to require their absence.
--- @result_contains=CAST(b.k AS Int64) = 7
--- @result_contains=CAST(c.k AS Int64) = 7
+-- @result_contains=7 = b.k
+-- @result_contains=7 = c.k
 EXPLAIN VERBOSE
 SELECT a.payload, b.payload, c.payload
 FROM (SELECT k, payload FROM ${case_db}.residual_mad_a WHERE k = 7) a
@@ -50,9 +50,13 @@ SET disable_optimizer_rules = 'JoinPredicateMoveAround,PushDownPredicateJoin,Joi
 -- @skip_result_check=true
 -- @result_contains=INNER, eq: [k = b.k]
 -- @result_contains=INNER, eq: [b.k = c.k]
--- @result_contains=predicates: CAST(k AS Int64) = 7 AND k IS NOT NULL
+-- @result_contains=predicates: k = 7 AND k IS NOT NULL
 -- @result_not_contains=CAST(b.k AS Int64) = 7
+-- @result_not_contains=7 = b.k
+-- @result_not_contains=b.k = 7
 -- @result_not_contains=CAST(c.k AS Int64) = 7
+-- @result_not_contains=7 = c.k
+-- @result_not_contains=c.k = 7
 EXPLAIN VERBOSE
 SELECT a.payload, b.payload, c.payload
 FROM (SELECT k, payload FROM ${case_db}.residual_mad_a WHERE k = 7) a

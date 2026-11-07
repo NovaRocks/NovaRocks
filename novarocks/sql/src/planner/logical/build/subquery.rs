@@ -244,7 +244,7 @@ pub(super) fn wrap_scalar_applies(
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(col_type, true),
                 },
-                output_column: spec.output_column,
+                output_column: spec.output_column.planner_column(),
                 correlation_column_ids: spec.correlation_column_ids,
                 correlation_conjuncts: Vec::new(),
                 residual_predicate: None,
@@ -320,7 +320,7 @@ pub(super) fn wrap_predicate_applies(
             LogicalPlanKind::apply(LogicalApplyNode {
                 kind,
                 subquery_expr,
-                output_column: spec.output_column,
+                output_column: spec.output_column.planner_column(),
                 inner_output_column_id,
                 correlation_column_ids: spec.correlation_column_ids,
                 correlation_conjuncts: Vec::new(),

@@ -20,7 +20,7 @@
 //! The registry stores all non-recursive CTE definitions analyzed for the
 //! current query. Lexical visibility is tracked separately by the analyzer.
 
-use super::{OutputColumn, ResolvedQuery};
+use super::{AnalyzedOutputField as OutputColumn, ResolvedQuery};
 
 /// Unique identifier for a CTE within a query.
 pub(crate) use crate::common::CteId;

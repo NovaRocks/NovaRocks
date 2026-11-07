@@ -34,6 +34,7 @@ bytes.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 novarocks-resource-contract.workspace = true

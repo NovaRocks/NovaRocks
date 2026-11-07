@@ -501,11 +501,12 @@ fn independent_progress(
                 .backend_task_execution_tasks_created(backend)
         })
         .collect::<Result<Vec<_>>>()?;
-    for (query, expected) in [
-        ("SELECT 1 AS value", 1),
+    for (query, expected, expected_type) in [
+        ("SELECT 1 AS value", 1, "integer"),
         (
             "SELECT SUM(generate_series) AS value FROM generate_series(1, 100)",
             5050,
+            "bigint",
         ),
     ] {
         let mut session = SqlSession::new(context.sql_user(), context.trino_port(), deadline)?;
@@ -513,7 +514,7 @@ fn independent_progress(
         ensure!(
             result.columns.len() == 1
                 && result.columns[0].name == "value"
-                && result.columns[0].type_signature.raw_type == "bigint"
+                && result.columns[0].type_signature.raw_type == expected_type
                 && result.columns[0].type_signature.arguments.is_empty()
                 && sql::single_integer(&result)? == expected,
             "independent query changed its declared typed integer result"

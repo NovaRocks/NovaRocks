@@ -998,7 +998,7 @@ fn product_error(error: MvProductError) -> QueryServiceError {
     if let Some(control) = error.compile_control_error() {
         return QueryServiceError::from_compile_control(control);
     }
-    if let Some(analyze) = error.unavailable_implementation() {
+    if let Some(analyze) = error.analyze_error() {
         return QueryServiceError::from_user_error(analyze.to_user_error(None));
     }
     QueryServiceError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
@@ -1222,7 +1222,7 @@ mod product_failure_tests {
             MvProductErrorKind::Unavailable,
             "pure implementation unavailable",
         )
-        .with_unavailable_implementation(Some(analyze));
+        .with_analyze_error(Some(analyze));
         let selected = product_error(product);
         assert_eq!(
             selected.user_error().unwrap().code().as_str(),
@@ -1660,7 +1660,7 @@ mod publication_migration_tests {
             let terminal = source::domain_error(application).domain.unwrap();
             assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
             assert_eq!(terminal.original_failure(), Some(&source));
-            assert_eq!(terminal.unavailable_implementation(), None);
+            assert_eq!(terminal.analyze_error(), None);
             let Some(CompileControlError::Source(carried)) = terminal.compile_control_error()
             else {
                 panic!("the provider/product bridge must retain the compile source");
@@ -1702,24 +1702,36 @@ mod publication_migration_tests {
     fn refresh_activation_refusal_survives_provider_product_and_frontend_bridges() {
         use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
         use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
-        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
-            FunctionOverloadId::try_new("fixture/mv/activation/missing-pure-v1").unwrap(),
-        ));
-        let SqlCompileError::Analyze(expected) = &compile else {
-            panic!("missing pure implementation must be typed analysis");
-        };
-        let application = MvApplicationError::from_compile(compile.clone());
-        let terminal = source::domain_error(application).domain.unwrap();
-        assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
-        assert_eq!(terminal.unavailable_implementation(), Some(expected));
-        assert_eq!(terminal.compile_control_error(), None);
+        for compile in [
+            SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+                FunctionOverloadId::try_new("fixture/mv/activation/missing-pure-v1").unwrap(),
+            )),
+            SqlCompileError::Analyze(AnalyzeError::missing_column_name(
+                "missing position 1",
+                None,
+            )),
+            SqlCompileError::Analyze(AnalyzeError::duplicate_column_name("duplicate a", None)),
+            SqlCompileError::Analyze(AnalyzeError::mismatched_column_aliases("wrong width", None)),
+        ] {
+            let SqlCompileError::Analyze(expected) = &compile else {
+                panic!("missing pure implementation must be typed analysis");
+            };
+            let application = MvApplicationError::from_compile(compile.clone());
+            let terminal = source::domain_error(application).domain.unwrap();
+            assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
+            assert_eq!(terminal.analyze_error(), Some(expected));
+            assert_eq!(terminal.compile_control_error(), None);
+        }
 
         let ordinary = MvApplicationError::from_compile(SqlCompileError::Analyze(
             AnalyzeError::internal("unsupported diagnostic: UnavailableImplementation"),
         ));
         let ordinary = source::domain_error(ordinary).domain.unwrap();
         assert_eq!(ordinary.kind(), MvApplicationErrorKind::InvalidRequest);
-        assert_eq!(ordinary.unavailable_implementation(), None);
+        assert_eq!(
+            ordinary.analyze_error().unwrap().code().as_str(),
+            "sql.analyze.internal"
+        );
         assert_eq!(
             ordinary.message(),
             "unsupported diagnostic: UnavailableImplementation"

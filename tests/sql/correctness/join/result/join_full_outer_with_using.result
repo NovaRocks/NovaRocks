@@ -606,7 +606,7 @@ NULL	4	4
 5	1	1
 
 -- query 63
--- types	bigint	bigint	bigint
+-- types	integer	integer	integer
 k1_coalesced	k2_coalesced	tables_present
 -1	-1	1
 -1	40	1
@@ -633,20 +633,20 @@ NULL	60	NULL	b4
 2	20	a2	NULL
 
 -- query 65
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 1	a	NULL
 2	NULL	b
 
 -- query 66
--- types	bigint	bigint	bigint	bigint	bigint
+-- types	integer	integer	integer	integer	integer
 y	x1	z1	x2	z2
 1	0	2	3	5
 4	NULL	NULL	0	2
 6	3	5	NULL	NULL
 
 -- query 67
--- types	bigint	bigint	bigint
+-- types	integer	integer	integer
 y	x1	x2
 NULL	3	NULL
 1	0	3
@@ -664,17 +664,17 @@ k	v1	v2
 1	a	b
 
 -- query 70
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 1	a	b
 
 -- query 71
--- types	bigint	varchar	integer	varchar
+-- types	integer	varchar	integer	varchar
 k1	val	k2	v1
 1	inline	10	a1
 
 -- query 72
--- types	bigint	bigint	varchar	varchar
+-- types	integer	integer	varchar	varchar
 k1	k2	v1	val
 NULL	NULL	a5	NULL
 NULL	40	a4	NULL
@@ -684,7 +684,7 @@ NULL	40	a4	NULL
 10	20	NULL	inline
 
 -- query 73
--- types	bigint	bigint	varchar	varchar	varchar
+-- types	integer	integer	varchar	varchar	varchar
 k1	k2	v1	val	v2
 NULL	NULL	a5	NULL	NULL
 NULL	40	a4	NULL	NULL
@@ -693,48 +693,48 @@ NULL	40	a4	NULL	NULL
 3	NULL	a3	NULL	NULL
 
 -- query 74
--- types	bigint	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar
 k	v1	v2	v3
 1	a	NULL	c
 2	NULL	b	NULL
 3	NULL	NULL	d
 
 -- query 75
--- types	bigint	bigint	bigint	bigint
+-- types	integer	bigint	bigint	bigint
 k	cnt	cnt_v1	cnt_v2
 1	2	2	2
 2	1	1	0
 3	1	0	1
 
 -- query 76
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 1	a	b
 2	NULL	c
 
 -- query 77
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 2	b	x
 3	c	y
 4	NULL	z
 
 -- query 78
--- types	bigint	bigint	varchar	varchar	varchar
+-- types	integer	integer	varchar	varchar	varchar
 k	k_scaled	k_str	v1	v2
 1	10	K1	a	NULL
 2	20	K2	b	x
 3	30	K3	NULL	y
 
 -- query 79
--- types	bigint	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar
 k	size_cat	v1_safe	v2_safe
 1	SMALL	a	NULL_V2
 2	LARGE	NULL_V1	b
 3	LARGE	c	d
 
 -- query 80
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 1	a	NULL
 2	b	NULL
@@ -745,7 +745,7 @@ k	v1	v2
 7	NULL	v
 
 -- query 81
--- types	bigint	varchar	varchar
+-- types	integer	varchar	varchar
 k	v1	v2
 NULL	NULL	y
 NULL	b	NULL
@@ -754,14 +754,14 @@ NULL	b	NULL
 3	NULL	z
 
 -- query 82
--- types	bigint	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar
 k	v1	v2	v3
 1	a	b	c
 2	NULL	bb	cc
 3	NULL	NULL	ccc
 
 -- query 83
--- types	bigint	varchar	bigint	varchar
+-- types	bigint	varchar	integer	varchar
 k1	v1	val	v2
 NULL	a4	NULL	NULL
 NULL	a5	NULL	NULL
@@ -771,13 +771,13 @@ NULL	a5	NULL	NULL
 5	NULL	500	b3
 
 -- query 84
--- types	bigint	bigint	bigint
+-- types	integer	integer	integer
 k	v1	v2
 2	20	100
 3	30	200
 
 -- query 85
--- types	bigint	varchar	varchar	bigint	bigint
+-- types	integer	varchar	varchar	integer	integer
 k	v1	v2	k_offset	k_safe
 1	a	NULL	101	1
 2	NULL	b	102	2
@@ -785,20 +785,20 @@ k	v1	v2	k_offset	k_safe
 4	NULL	e	104	4
 
 -- query 86
--- types	bigint
+-- types	integer
 k
 1
 2
 
 -- query 87
--- types	varchar	bigint	bigint
+-- types	varchar	integer	integer
 name	v1	v2
 apple	1	NULL
 banana	2	10
 cherry	NULL	20
 
 -- query 88
--- types	bigint	varchar	varchar	varchar	varchar
+-- types	integer	varchar	varchar	varchar	varchar
 k1	v1	val1	v2	val2
 NULL	a4	NULL	NULL	NULL
 NULL	a5	NULL	NULL	NULL
@@ -821,7 +821,7 @@ NULL	80	NULL	NULL	NULL	d4
 8	NULL	NULL	NULL	NULL	d3
 
 -- query 90
--- types	integer	integer	bigint	bigint	varchar	varchar
+-- types	integer	integer	integer	integer	varchar	varchar
 k1	k2	sum_k	product_k	v1	v2
 1	10	11	10	a1	b1
 2	20	22	40	a2	NULL

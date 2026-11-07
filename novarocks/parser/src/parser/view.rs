@@ -20,7 +20,6 @@
 use crate::{
     ParseError, Span,
     ast::{CreateView, DropView, ShowCreateView, ShowViews, Statement, ViewStatement},
-    token::Symbol,
 };
 
 use super::{StatementParser, query};
@@ -65,26 +64,31 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         return Err(parser.unexpected("CREATE OR REPLACE VIEW without IF NOT EXISTS"));
     }
     let name = parser.parse_object_name()?;
-    let columns = if parser.current_is_symbol(Symbol::LParen) {
-        parse_columns(parser)?
-    } else {
-        Vec::new()
-    };
     let comment = if parser.consume_if_word("COMMENT") {
         Some(parser.parse_literal()?)
     } else {
         None
     };
     parser.consume_word("AS")?;
+    let body_start = parser.current_offset();
     let query = query::parse_query(parser)?;
+    let body_end = parser.tokens[..parser.position]
+        .iter()
+        .rfind(|token| !matches!(token.kind, crate::TokenKind::Trivia(_)))
+        .expect("a parsed query consumed at least one significant token")
+        .span
+        .end();
+    let query_source_span = Span::new(body_start, body_end);
+    let raw_query_source = parser.source_slice(query_source_span).to_owned();
     let span = Span::new(start, query.span.end());
     Ok(Statement::View(ViewStatement::Create(CreateView {
         or_replace,
         if_not_exists,
         name,
-        columns,
         comment,
         query,
+        raw_query_source,
+        query_source_span,
         span,
     })))
 }
@@ -132,21 +136,6 @@ fn parse_show_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, 
     })))
 }
 
-fn parse_columns(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<crate::ast::Ident>, ParseError> {
-    parser.consume_symbol(Symbol::LParen)?;
-    let mut columns = Vec::new();
-    loop {
-        columns.push(parser.parse_ident()?);
-        if parser.consume_if_symbol(Symbol::RParen) {
-            break;
-        }
-        parser.consume_symbol(Symbol::Comma)?;
-    }
-    Ok(columns)
-}
-
 fn consume_if_not_exists(parser: &mut StatementParser<'_, '_>) -> Result<bool, ParseError> {
     if !parser.consume_if_word("IF") {
         return Ok(false);
@@ -162,4 +151,82 @@ fn consume_if_exists(parser: &mut StatementParser<'_, '_>) -> Result<bool, Parse
     }
     parser.consume_word("EXISTS")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn view_body_source_keeps_internal_trivia_spelling_and_statement_boundaries() {
+        let source = "CREATE VIEW v AS /* before */\nSELECT /* inside */ `MiXeD`  FROM t -- after\n; SELECT 9";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(
+            create.raw_query_source,
+            "SELECT /* inside */ `MiXeD`  FROM t"
+        );
+        assert_eq!(
+            source.get(create.query_source_span.start()..create.query_source_span.end()),
+            Some(create.raw_query_source.as_str())
+        );
+        assert_eq!(statements.len(), 2);
+    }
+
+    #[test]
+    fn view_body_source_at_eof_excludes_trivia_outside_its_token_range() {
+        let source = "CREATE VIEW v AS SELECT 1 /* tail */  ";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(create.raw_query_source, "SELECT 1");
+    }
+
+    #[test]
+    fn view_body_source_uses_consumed_tokens_including_parentheses_and_offset_rows() {
+        for body in [
+            "(SELECT 1 AS x)",
+            "SELECT 1 AS x OFFSET 0 ROWS",
+            "SELECT 1 AS x FETCH FIRST 2 ROWS ONLY",
+        ] {
+            let statements =
+                crate::parse(&format!("CREATE VIEW v AS /* before */ {body} -- after\n;")).unwrap();
+            let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+                panic!("view")
+            };
+            assert_eq!(create.raw_query_source, body);
+        }
+    }
+
+    #[test]
+    fn create_view_column_lists_fail_at_the_original_as_position() {
+        for source in [
+            "CREATE VIEW v(x) AS SELECT 1",
+            "CREATE OR REPLACE VIEW ice.db.v(x, y) AS SELECT 1, 2",
+            "CREATE VIEW `v` (`x`) AS SELECT 1",
+        ] {
+            let error = crate::parse(source).unwrap_err();
+            let crate::ParserError::Parse(ParseError::UnexpectedToken { span, .. }) = error else {
+                panic!("definition column lists must fail through the original syntax error")
+            };
+            assert_eq!(source.get(span.start()..span.end()), Some("("));
+        }
+    }
+
+    #[test]
+    fn create_view_natural_aliases_keep_cte_and_relation_column_lists() {
+        let source = "CREATE VIEW v AS WITH c(x) AS (VALUES (1)) SELECT y AS named FROM c AS r(y)";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(
+            create.raw_query_source,
+            "WITH c(x) AS (VALUES (1)) SELECT y AS named FROM c AS r(y)"
+        );
+        crate::parse(&crate::printer::print_statement(&statements[0])).unwrap();
+    }
 }

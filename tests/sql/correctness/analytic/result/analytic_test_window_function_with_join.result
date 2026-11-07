@@ -1,19 +1,19 @@
 -- query 2
 -- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
-sum(g1)	sum(g2)	sum(g3)	sum(g4)	sum(g5)	sum(g6)	sum(g7)	sum(g8)
+_col0	_col1	_col2	_col3	_col4	_col5	_col6	_col7
 134184960	134184960	-32768	134184960	134184960	134184960	-32768	134184960
 
 -- query 3
 -- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
-sum(g1)	sum(g2)	sum(g3)	sum(g4)	sum(g5)	sum(g6)	sum(g7)	sum(g8)
+_col0	_col1	_col2	_col3	_col4	_col5	_col6	_col7
 134184960	134184960	-32768	134184960	134184960	134184960	-32768	134184960
 
 -- query 4
 -- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
-sum(g1)	sum(g2)	sum(g3)	sum(g4)	sum(g5)	sum(g6)	sum(g7)	sum(g8)
+_col0	_col1	_col2	_col3	_col4	_col5	_col6	_col7
 134184960	134184960	-32768	134184960	134184960	134184960	-32768	134184960
 
 -- query 5
 -- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
-sum(g1)	sum(g2)	sum(g3)	sum(g4)	sum(g5)	sum(g6)	sum(g7)	sum(g8)
+_col0	_col1	_col2	_col3	_col4	_col5	_col6	_col7
 134184960	134184960	-32768	134184960	134184960	134184960	-32768	134184960

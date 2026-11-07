@@ -8,10 +8,10 @@
 
 -- query 5
 -- types	bigint
-count(*)
+_col0
 3
 
 -- query 6
 -- types	bigint
-count(*)
+_col0
 3

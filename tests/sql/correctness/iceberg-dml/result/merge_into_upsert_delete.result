@@ -4,24 +4,24 @@ snaps_before_merge
 1
 
 -- query 4
--- legacy
+-- types	bigint
 snaps_after_merge
 2
 
 -- query 5
--- legacy
+-- types	integer	integer	varchar
 city_id	population	city
 1	100	Beijing
 2	250	Shanghai-updated
 3	300	Shenzhen
 
 -- query 7
--- legacy
+-- types	bigint
 snaps_after_delete
 3
 
 -- query 8
--- legacy
+-- types	integer	integer	varchar
 city_id	population	city
 2	250	Shanghai-updated
 3	300	Shenzhen

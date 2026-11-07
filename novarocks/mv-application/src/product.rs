@@ -224,7 +224,7 @@ pub struct MvProductError {
     message: String,
     original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
-    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    analyze_error: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvProductError {
@@ -234,7 +234,7 @@ impl MvProductError {
             message: message.into(),
             original_failure: None,
             compile_control: None,
-            unavailable_implementation: None,
+            analyze_error: None,
         }
     }
 
@@ -261,8 +261,8 @@ impl MvProductError {
         self.compile_control.clone()
     }
 
-    /// Retain only the typed missing-implementation cause, never diagnostic text.
-    pub fn with_unavailable_implementation(
+    /// Retain the original typed analysis cause, never classify diagnostic text.
+    pub fn with_analyze_error(
         mut self,
         error: Option<novarocks_sql::analyze_error::AnalyzeError>,
     ) -> Self {
@@ -270,20 +270,15 @@ impl MvProductError {
             self.kind,
             MvProductErrorKind::CommitUnknown | MvProductErrorKind::KnownCommittedFinalizeFailed
         ) {
-            self.unavailable_implementation = None;
+            self.analyze_error = None;
             return self;
         }
-        self.unavailable_implementation = error.filter(|error| {
-            error.kind()
-                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-        });
+        self.analyze_error = error;
         self
     }
 
-    pub fn unavailable_implementation(
-        &self,
-    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
-        self.unavailable_implementation.as_ref()
+    pub fn analyze_error(&self) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.analyze_error.as_ref()
     }
 
     pub const fn kind(&self) -> MvProductErrorKind {

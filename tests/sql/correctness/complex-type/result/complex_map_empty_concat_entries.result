@@ -1,33 +1,33 @@
 -- query 2
 -- legacy
-map_concat(map{'a':1,'b':2}, c1)
+_col0
 {"a":1,"b":2}
 
 -- query 3
 -- legacy
-map_concat(c1, map{'a':1,'b':2})
+_col0
 {"a":1,"b":2}
 
 -- query 4
 -- legacy
-map_concat(c1, map{})
+_col0
 {}
 
 -- query 5
 -- legacy
-map_concat(c1, map{1:2})
+_col0
 {1:2}
 
 -- query 9
 -- legacy
-col_int	map_entries(col_map)
+col_int	_col1
 1	[{"key":"a","value":1},{"key":"b","value":2}]
 2	[{"key":"c","value":3}]
 3	[{"key":"d","value":4},{"key":"e","value":5}]
 
 -- query 10
 -- legacy
-col_int	map_entries(col_map)	unnest
+col_int	_col1	unnest
 1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"a","value":1}
 1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"b","value":2}
 2	[{"key":"c","value":3}]	{"key":"c","value":3}

@@ -125,7 +125,7 @@ fn check_array_source(
     field: Field,
     input_values: ArrayRef,
     expected_index_source: FunctionValueType,
-    expected_values: &[Option<i8>],
+    expected_values: &[Option<i32>],
 ) {
     {
         let sql = format!("SELECT [10,20][{index_expression}] AS picked FROM t");
@@ -138,7 +138,7 @@ fn check_array_source(
         assert_eq!(declaration.fields()[0].alias.as_deref(), Some("picked"));
         assert_eq!(
             declaration.fields()[0].ty,
-            FunctionValueType::new(DataType::Int8, true)
+            FunctionValueType::new(DataType::Int32, true)
         );
         let mut indexes = 0;
         for fragment in source.plan().fragments().values() {
@@ -311,11 +311,11 @@ fn check_array_source(
                 )
                 .unwrap();
             assert!(output.errors().is_empty());
-            assert_eq!(output.values().data_type(), &DataType::Int8);
+            assert_eq!(output.values().data_type(), &DataType::Int32);
             let values = output
                 .values()
                 .as_any()
-                .downcast_ref::<Int8Array>()
+                .downcast_ref::<Int32Array>()
                 .unwrap();
             assert_eq!(
                 values.iter().collect::<Vec<_>>(),
@@ -331,15 +331,23 @@ fn check_array_source(
 #[test]
 fn actual_primitive_if_index_retains_exact_type_and_overflow_is_successful_null() {
     let input: ArrayRef = Arc::new(Int32Array::from(vec![99, 1, 2, 3, 99]));
-    for (expression, expected) in [
-        ("IF(id=2,2,1)", vec![Some(10), Some(20), Some(10)]),
-        ("IF(id=2,2147483648,1)", vec![Some(10), None, Some(10)]),
+    for (expression, index_type, expected) in [
+        (
+            "IF(id=2,2,1)",
+            DataType::Int32,
+            vec![Some(10), Some(20), Some(10)],
+        ),
+        (
+            "IF(id=2,2147483648,1)",
+            DataType::Int64,
+            vec![Some(10), None, Some(10)],
+        ),
     ] {
         check_array_source(
             expression,
             Field::new("id", DataType::Int32, false),
             input.clone(),
-            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(index_type, false),
             &expected,
         );
     }

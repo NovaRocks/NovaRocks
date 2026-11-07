@@ -89,6 +89,10 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 15 gives signed integer arithmetic its declared width, checked
+/// overflow and integer division semantics. Epoch-14 peers interpret the same
+/// frozen integer program differently and must remain in another island.
+///
 /// Epoch 14 replaces Schema-bearing Exchange payloads with preparation-bound
 /// Arrow units and freezes root COW recipes independently of their records.
 /// Epoch-12 peers cannot interpret these payloads. Epoch 13 remains reserved
@@ -122,7 +126,7 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 14;
+pub const NATIVE_COMPAT_EPOCH: u64 = 15;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
@@ -679,7 +683,7 @@ mod tests {
         #[cfg(feature = "native-compatibility-test-fixture")]
         assert_eq!(NATIVE_COMPAT_EPOCH, 13);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 14);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 15);
     }
     #[test]
     fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {
@@ -717,6 +721,23 @@ mod tests {
         for previous in [12, 13] {
             assert_ne!(production.id(), at(previous).id());
         }
+    }
+
+    #[test]
+    fn checked_integer_programs_do_not_share_the_previous_integer_island() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        assert_ne!(at(15).id(), at(14).id());
+        assert_ne!(at(15).id(), at(13).id());
     }
 
     #[test]

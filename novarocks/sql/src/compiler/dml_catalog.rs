@@ -90,7 +90,8 @@ impl SqlDmlCatalogPreparation {
             &session.current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
-        )?;
+        )?
+        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         // Validate the producer's structural sites against the actual query
         // retained by the original prepass before requesting external facts.
         if let SqlStatementInputKind::MaterializedValuesQuery { source, .. } = &statement.kind {
@@ -105,6 +106,14 @@ impl SqlDmlCatalogPreparation {
             intent,
             root_output_declaration,
         })
+    }
+
+    pub fn continue_catalog(
+        mut self,
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Self, SqlCompileError> {
+        self.catalog.accept_facts(facts, &self.control)?;
+        Ok(self)
     }
 
     pub fn needs(&self) -> &[CatalogRelationNeed] {

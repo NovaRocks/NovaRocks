@@ -235,5 +235,5 @@ c1
 
 -- query 23
 -- types	bigint
-count(*)
+_col0
 2

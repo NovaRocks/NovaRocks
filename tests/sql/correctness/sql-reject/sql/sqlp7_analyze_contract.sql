@@ -42,8 +42,8 @@ SELECT sqlp7_not_a_function(1);
 SELECT substring('x', 1, 2, 3);
 
 -- @expect_error_tier=target
--- @expect_sql_code=sql.analyze.invalid_literal
--- @expect_sql_phase=Analyze
+-- @expect_sql_code=sql.parse.unexpected_token
+-- @expect_sql_phase=Parse
 -- @expect_error_at=1:19
 SELECT 1 GROUP BY 9999999999999999999999999999999999999999;
 

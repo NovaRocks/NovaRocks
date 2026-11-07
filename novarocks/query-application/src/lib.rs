@@ -82,7 +82,6 @@ pub mod system_catalog;
 pub mod system_catalog_rewrite;
 pub mod view;
 mod view_iceberg;
-mod view_rewrite;
 mod view_service;
 #[cfg(test)]
 mod view_tests;

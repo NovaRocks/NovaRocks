@@ -23,13 +23,13 @@
 
 use std::collections::HashMap;
 
-use novarocks_parser::ast::{Query, TypeName, ViewStatement};
+use novarocks_parser::ast::{Query, ViewStatement};
 use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 
 use crate::api::QueryResult;
 use crate::persisted_query_definition::PersistedQueryDefinition;
 
-pub use crate::view_service::QueryViewService;
+pub use crate::view_service::{LocalViewSnapshot, QueryViewService};
 
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
@@ -52,11 +52,14 @@ pub struct ViewTarget {
     pub view: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ViewColumnDefinition {
-    pub name: String,
-    pub data_type: TypeName,
-    pub nullable: bool,
+pub use novarocks_sql::planning::catalog::SqlViewColumn as ViewColumnDefinition;
+
+pub struct ViewDefinitionAnalysisRequest<'a> {
+    pub catalog: &'a str,
+    pub database: &'a str,
+    pub target: &'a ViewTarget,
+    pub query: &'a Query,
+    pub local_views: &'a LocalViewSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,16 +76,8 @@ pub struct CreateExternalViewRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedExternalView {
     pub definition: PersistedQueryDefinition,
-    pub column_names: Vec<String>,
     pub comment: Option<String>,
     pub properties: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExternalViewResolution {
-    Table,
-    View(ResolvedExternalView),
-    Missing,
 }
 
 /// Pure SHOW preparation, before any selected Provider is called.
@@ -106,8 +101,10 @@ impl PreparedShowViews {
     }
 }
 
-/// Query-application-owned view command and rewrite service.
+/// Query-application-owned view command and declaration service.
 pub trait ViewService: Send + Sync {
+    fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String>;
+
     fn prepare_show_views(
         &self,
         statement: &novarocks_parser::ast::ShowViews,
@@ -119,67 +116,33 @@ pub trait ViewService: Send + Sync {
         engine: &dyn ViewEngine,
         statement: &ViewStatement,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String>;
-
-    fn rewrite_query(
-        &self,
-        engine: &dyn ViewEngine,
-        query: &mut Query,
-        context: ViewRequestContext<'_>,
-        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<(), String>;
-
-    fn rewrite_query_async<'a>(
-        &'a self,
-        engine: &'a dyn ViewEngine,
-        query: &'a mut Query,
-        context: ViewRequestContext<'a>,
-        sql_semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    ) -> Result<ViewStatementResult, crate::api::CommandError>;
 
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String>;
 }
 
 /// Role-local external-view metadata and mutation adapter.
 pub trait ViewEngine: Send + Sync {
-    /// Resolve a table-or-view name through exactly one connector control
-    /// generation. Missing view metadata is not equivalent to an undeclared
-    /// view capability; the latter remains a typed Unsupported error.
-    fn resolve_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String>;
-    fn resolve_external_view_async<'a>(
-        &'a self,
-        target: &'a ViewTarget,
-        context: &'a ConnectorRequestContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
-    >;
-
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,
         context: &ConnectorRequestContext,
-    ) -> Result<(), String>;
+    ) -> Result<(), crate::api::CommandError>;
     fn drop_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
         policy: DropPolicy,
-    ) -> Result<(), String>;
+    ) -> Result<(), crate::api::CommandError>;
     fn load_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String>;
+    ) -> Result<Option<ResolvedExternalView>, crate::api::CommandError>;
 
-    fn analyze_external_view(
+    fn analyze_view_definition(
         &self,
-        catalog: &str,
-        database: &str,
-        query: &Query,
+        request: ViewDefinitionAnalysisRequest<'_>,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String>;
+    ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError>;
 }

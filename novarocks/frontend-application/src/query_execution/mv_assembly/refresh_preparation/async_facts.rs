@@ -35,7 +35,7 @@ impl PreparationError {
         let mut error =
             MvApplicationError::new(self.0.kind(), format!("{context}: {}", self.0.message()))
                 .with_compile_control(self.0.compile_control_error())
-                .with_unavailable_implementation(self.0.unavailable_implementation().cloned());
+                .with_analyze_error(self.0.analyze_error().cloned());
         if let Some(cause) = self.0.original_failure() {
             error = error.with_original_failure(cause.clone());
         }
@@ -94,7 +94,7 @@ impl From<crate::mv::domain::lifecycle::RefreshError> for PreparationError {
             e.message.clone(),
         )
         .with_compile_control(e.compile_control_error())
-        .with_unavailable_implementation(e.unavailable_implementation().cloned());
+        .with_analyze_error(e.analyze_error().cloned());
         Self(result)
     }
 }

@@ -425,56 +425,6 @@ pub(crate) fn context_for_planning_pin_typed(
     }
 }
 
-/// Resolve table existence through an admission-frozen planning pin.  A
-/// caller that performs a table-or-view decision must retain this lease for
-/// every metadata lookup in that decision.
-pub fn metadata_table_exists_with_planning_pin(
-    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
-    context: ConnectorRequestContext,
-    namespace: &str,
-    table: &str,
-) -> Result<bool, String> {
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_pin(&binding, context)?;
-    binding
-        .binding()
-        .metadata()
-        .table_exists(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context,
-        })
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn metadata_table_exists_with_planning_pin_async(
-    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
-    context: ConnectorRequestContext,
-    namespace: &str,
-    table: &str,
-) -> Result<bool, String> {
-    let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_pin(&binding, context)?;
-    binding
-        .binding()
-        .metadata()
-        .table_exists_async(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context,
-        })
-        .await
-        .map_err(|error| error.to_string())
-}
-
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
 /// expose their authoritative catalog facts. The provider refuses a listing

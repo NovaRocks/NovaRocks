@@ -1,19 +1,19 @@
 -- query 3
 -- legacy
-__iceberg_transform_truncate(c1, 50)
+_col0
 10.50
 
 -- query 4
 -- legacy
-__iceberg_transform_truncate(10.65, 50)
+_col0
 10.50
 
 -- query 5
 -- legacy
-__iceberg_transform_bucket(c1, 8)
+_col0
 4
 
 -- query 6
 -- legacy
-__iceberg_transform_bucket(10.65, 8)
+_col0
 4

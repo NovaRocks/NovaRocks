@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Stable reads cross hot admission closure only through the original R and
-//! the actual Task read seal. Its index owns no Work, request or source;
+//! Stable reads and post-close Cancel status requests cross hot admission
+//! closure only through the original R and the actual Task read seal.
+//! Its index owns no Work, request or source;
 //! shared neutral seal facts grant no execution or capacity authority.
 
 use super::*;

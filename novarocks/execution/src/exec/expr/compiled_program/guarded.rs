@@ -2242,8 +2242,8 @@ fn evaluate_arithmetic<'a>(
     work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     use arrow::array::{
-        Decimal128Array, Decimal256Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        builder::FixedSizeBinaryBuilder,
+        Decimal128Array, Decimal256Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, builder::FixedSizeBinaryBuilder,
     };
     use arrow_buffer::i256;
     use novarocks_functions::ArithmeticRowResult as R;
@@ -2270,6 +2270,7 @@ fn evaluate_arithmetic<'a>(
         .ok_or(KernelFailure::ResourceExhausted)?;
     work.flush()?;
     enum Output {
+        I8(Vec<Option<i8>>),
         I16(Vec<Option<i16>>),
         I32(Vec<Option<i32>>),
         I64(Vec<Option<i64>>),
@@ -2279,6 +2280,7 @@ fn evaluate_arithmetic<'a>(
         LargeInt(FixedSizeBinaryBuilder),
     }
     let mut output = match ty {
+        DataType::Int8 => Output::I8(Vec::new()),
         DataType::Int16 => Output::I16(Vec::new()),
         DataType::Int32 => Output::I32(Vec::new()),
         DataType::Int64 => Output::I64(Vec::new()),
@@ -2298,6 +2300,7 @@ fn evaluate_arithmetic<'a>(
         }
     };
     match &mut output {
+        Output::I8(values) => values.try_reserve_exact(selection.len()),
         Output::I16(values) => values.try_reserve_exact(selection.len()),
         Output::I32(values) => values.try_reserve_exact(selection.len()),
         Output::I64(values) => values.try_reserve_exact(selection.len()),
@@ -2353,8 +2356,21 @@ fn evaluate_arithmetic<'a>(
             result => result,
         };
         match (&mut output, result) {
-            (Output::I16(values), R::Signed(value)) => values.push(i16::try_from(value).ok()),
-            (Output::I32(values), R::Signed(value)) => values.push(i32::try_from(value).ok()),
+            (Output::I8(values), R::Signed(value)) => {
+                values.push(Some(i8::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int8")
+                })?))
+            }
+            (Output::I16(values), R::Signed(value)) => {
+                values.push(Some(i16::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int16")
+                })?))
+            }
+            (Output::I32(values), R::Signed(value)) => {
+                values.push(Some(i32::try_from(value).map_err(|_| {
+                    internal("checked signed arithmetic returned an out-of-range Int32")
+                })?))
+            }
             (Output::I64(values), R::Signed(value)) => values.push(Some(value)),
             (Output::Float(values), R::Float(value)) => values.push(Some(value)),
             (Output::Decimal128(values), R::Decimal128(value)) => values.push(Some(value)),
@@ -2362,6 +2378,7 @@ fn evaluate_arithmetic<'a>(
             (Output::LargeInt(values), R::LargeInt(value)) => values
                 .append_value(value.to_be_bytes())
                 .map_err(|_| internal("LargeInt result differs from its fixed carrier width"))?,
+            (Output::I8(values), R::Null) => values.push(None),
             (Output::I16(values), R::Null) => values.push(None),
             (Output::I32(values), R::Null) => values.push(None),
             (Output::I64(values), R::Null) => values.push(None),
@@ -2379,6 +2396,7 @@ fn evaluate_arithmetic<'a>(
     }
     work.flush()?;
     let array: ArrayRef = match (ty, output) {
+        (DataType::Int8, Output::I8(values)) => Arc::new(Int8Array::from(values)),
         (DataType::Int16, Output::I16(values)) => Arc::new(Int16Array::from(values)),
         (DataType::Int32, Output::I32(values)) => Arc::new(Int32Array::from(values)),
         (DataType::Int64, Output::I64(values)) => Arc::new(Int64Array::from(values)),

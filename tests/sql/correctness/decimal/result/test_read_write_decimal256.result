@@ -650,5 +650,5 @@ decimal_value
 
 -- query 89
 -- types	bigint	bigint	decimal(38, 10)	decimal(38, 10)
-count(*)	sum(regular_value)	min(decimal_value)	max(decimal_value)
+_col0	_col1	_col2	_col3
 6	14998	-9876543210987654321098765432.9876543210	9999999999999999999999999999.9999999999

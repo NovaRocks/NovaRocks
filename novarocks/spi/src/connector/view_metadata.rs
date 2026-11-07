@@ -38,10 +38,12 @@ pub struct ConnectorListViewsRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Design: ADR-0218 (docs/adr/ADR-0218-sql-output-declarations-and-stored-view-analysis.md)
 pub struct ConnectorViewMetadataValue {
     pub identity: ConnectorViewIdentity,
     pub definition: ConnectorViewDefinition,
-    pub column_names: Vec<Arc<str>>,
+    /// Immutable provider identity for the same observed definition/schema.
+    pub version: Arc<str>,
     pub comment: Option<Arc<str>>,
     pub properties: Vec<(Arc<str>, Arc<str>)>,
 }
@@ -50,28 +52,25 @@ impl ConnectorViewMetadataValue {
     pub fn try_new(
         identity: ConnectorViewIdentity,
         definition: ConnectorViewDefinition,
-        column_names: Vec<Arc<str>>,
+        version: Arc<str>,
         comment: Option<Arc<str>>,
         mut properties: Vec<(Arc<str>, Arc<str>)>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        if definition.raw_sql.is_empty()
+        definition
+            .validate_output_declaration()
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::CorruptData, message))?;
+        if version.is_empty()
+            || definition.raw_sql.is_empty()
             || definition.default_namespace.is_empty()
             || definition
                 .default_catalog
                 .as_ref()
                 .is_some_and(|catalog| catalog.is_empty())
-            || column_names.iter().any(|name| name.is_empty())
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
-                "connector view metadata contains an empty source field or column name",
-            ));
-        }
-        if definition.source_format.is_some() && definition.default_catalog.is_none() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "versioned connector view source is missing its default catalog",
+                "connector view metadata contains an empty definition source or context",
             ));
         }
         properties.sort_by(|left, right| left.0.cmp(&right.0));
@@ -84,20 +83,36 @@ impl ConnectorViewMetadataValue {
                 "connector view metadata contains duplicate property keys",
             ));
         }
-        let bytes = identity.namespace.len()
-            + identity.view.len()
-            + definition.raw_sql.len()
-            + definition
+        let bytes = [
+            identity.namespace.len(),
+            identity.view.len(),
+            version.len(),
+            definition.raw_sql.len(),
+            definition
                 .default_catalog
                 .as_ref()
-                .map_or(0, |value| value.len())
-            + definition.default_namespace.len()
-            + column_names.iter().map(|name| name.len()).sum::<usize>()
-            + comment.as_ref().map_or(0, |value| value.len())
-            + properties
-                .iter()
-                .map(|(key, value)| key.len() + value.len())
-                .sum::<usize>();
+                .map_or(0, |value| value.len()),
+            definition.default_namespace.len(),
+            definition
+                .columns
+                .len()
+                .saturating_mul(std::mem::size_of::<super::ConnectorViewColumn>()),
+            definition.columns.iter().fold(0usize, |bytes, column| {
+                bytes.saturating_add(column.name.len())
+            }),
+            comment.as_ref().map_or(0, |value| value.len()),
+            properties.iter().fold(0usize, |bytes, (key, value)| {
+                bytes.saturating_add(key.len()).saturating_add(value.len())
+            }),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add);
+        let bytes = definition.columns.iter().try_fold(bytes, |bytes, column| {
+            novarocks_type_contract::owned_resources::type_representation::function_value_type_retained_bytes(
+                &column.value_type,
+            ).and_then(|value| bytes.checked_add(value))
+        }).ok_or_else(|| ConnectorError::new(ConnectorErrorKind::ResourceExhausted,
+            "connector view type representation byte count overflow"))?;
         if bytes > context.max_total_payload_bytes() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
@@ -107,12 +122,62 @@ impl ConnectorViewMetadataValue {
         Ok(Self {
             identity,
             definition,
-            column_names,
+            version,
             comment,
             properties,
         })
     }
 }
+
+/// One completed view observation, fenced to its original control generation.
+/// No future, schema observer, callback, or capacity author crosses this value.
+pub struct ConnectorViewPreparation {
+    owner: ConnectorInstanceDescriptor,
+    incarnation: ProviderBindingEpoch,
+    facts: Box<dyn std::any::Any + Send + Sync>,
+}
+impl ConnectorViewPreparation {
+    pub fn new<T: std::any::Any + Send + Sync>(
+        owner: &ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        facts: T,
+    ) -> Self {
+        Self {
+            owner: owner.clone(),
+            incarnation,
+            facts: Box::new(facts),
+        }
+    }
+    pub fn into_facts<T: std::any::Any + Send + Sync>(
+        self,
+        owner: &ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+    ) -> Result<T, ConnectorError> {
+        if &self.owner != owner || self.incarnation != incarnation {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "view preparation belongs to another connector control generation",
+            ));
+        }
+        self.facts.downcast::<T>().map(|facts| *facts).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "view preparation belongs to another provider author",
+            )
+        })
+    }
+}
+impl std::fmt::Debug for ConnectorViewPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorViewPreparation")
+            .field("owner", &self.owner)
+            .field("incarnation", &self.incarnation)
+            .finish_non_exhaustive()
+    }
+}
+pub type ConnectorViewPreparationFuture<'a> =
+    futures::future::BoxFuture<'a, Result<ConnectorViewPreparation, ConnectorError>>;
 
 pub trait ConnectorViewMetadata: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
@@ -124,25 +189,38 @@ pub trait ConnectorViewMetadata: Send + Sync {
     fn load_view(
         &self,
         request: ConnectorViewRequest,
-    ) -> Result<ConnectorViewMetadataValue, ConnectorError>;
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    >;
 
-    fn load_view_async(
-        &self,
-        request: ConnectorViewRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ConnectorViewMetadataValue, ConnectorError>>
-                + Send
-                + '_,
-        >,
-    > {
+    /// Await only the original provider I/O. Synchronous creation observers
+    /// are borrowed after this completes, never across an await or sync fallback.
+    fn prepare_view(&self, request: ConnectorViewRequest) -> ConnectorViewPreparationFuture<'_> {
         Box::pin(async move {
             let _ = request;
             Err(ConnectorError::new(
-                super::ConnectorErrorKind::Unsupported,
-                "connector view metadata does not support asynchronous loading",
+                ConnectorErrorKind::Unsupported,
+                "connector view metadata does not support asynchronous preparation",
             ))
         })
+    }
+
+    fn create_prepared_view(
+        &self,
+        preparation: ConnectorViewPreparation,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let _ = (preparation, creation);
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector view metadata does not support prepared schema creation",
+        )
+        .into())
     }
 
     fn list_views(
@@ -187,9 +265,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::connector::{
-        ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect, ConnectorViewSourceFormat,
-    };
+    use crate::connector::{ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect};
 
     struct ViewCapability {
         descriptor: ConnectorInstanceDescriptor,
@@ -213,11 +289,12 @@ mod tests {
         fn load_view(
             &self,
             _: ConnectorViewRequest,
-        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "missing view",
-            ))
+            _: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorViewMetadataValue,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            Err(ConnectorError::new(ConnectorErrorKind::NotFound, "missing view").into())
         }
 
         fn list_views(
@@ -230,14 +307,14 @@ mod tests {
         }
     }
 
-    fn descriptor() -> ConnectorInstanceDescriptor {
+    pub(super) fn descriptor() -> ConnectorInstanceDescriptor {
         ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
             instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
         }
     }
 
-    fn context() -> ConnectorRequestContext {
+    pub(super) fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
             crate::connector::ConnectorStopOwner::new().view(),
@@ -247,7 +324,7 @@ mod tests {
         .expect("valid connector request context")
     }
 
-    fn identity() -> ConnectorViewIdentity {
+    pub(super) fn identity() -> ConnectorViewIdentity {
         ConnectorViewIdentity {
             instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
             namespace: Arc::from("db"),
@@ -255,13 +332,20 @@ mod tests {
         }
     }
 
-    fn definition() -> ConnectorViewDefinition {
+    pub(super) fn definition() -> ConnectorViewDefinition {
         ConnectorViewDefinition {
             dialect: ConnectorViewDialect::StarRocks,
-            raw_sql: Arc::from("SELECT 1"),
+            raw_sql: Arc::from("SELECT 1 AS c"),
             default_catalog: Some(Arc::from("catalog")),
             default_namespace: Arc::from("db"),
-            source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
+            columns: vec![crate::connector::ConnectorViewColumn {
+                name: "c".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            }]
+            .into(),
         }
     }
 
@@ -270,7 +354,7 @@ mod tests {
         let value = ConnectorViewMetadataValue::try_new(
             identity(),
             definition(),
-            vec![Arc::from("c")],
+            "same-observed-version".into(),
             Some(Arc::from("comment")),
             vec![
                 (Arc::from("z"), Arc::from("2")),
@@ -289,7 +373,7 @@ mod tests {
         let error = ConnectorViewMetadataValue::try_new(
             identity(),
             definition(),
-            Vec::new(),
+            "same-observed-version".into(),
             None,
             vec![
                 (Arc::from("a"), Arc::from("1")),
@@ -303,20 +387,20 @@ mod tests {
     }
 
     #[test]
-    fn spi5b_view_metadata_rejects_versioned_source_without_catalog() {
+    fn spi5b_view_metadata_keeps_an_omitted_standard_default_catalog() {
         let mut definition = definition();
         definition.default_catalog = None;
-        let error = ConnectorViewMetadataValue::try_new(
+        let value = ConnectorViewMetadataValue::try_new(
             identity(),
             definition,
-            Vec::new(),
+            "same-observed-version".into(),
             None,
             Vec::new(),
             &context(),
         )
-        .expect_err("versioned source requires a frozen catalog");
+        .expect("standard view metadata may omit its default catalog");
 
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(value.definition.default_catalog, None);
     }
 
     #[test]
@@ -386,6 +470,119 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the default must not call a synchronous provider or fabricate an empty listing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_type_contract::FunctionValueType;
+
+    fn metadata(
+        definition: ConnectorViewDefinition,
+        version: &str,
+    ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        ConnectorViewMetadataValue::try_new(
+            super::tests::identity(),
+            definition,
+            version.into(),
+            None,
+            Vec::new(),
+            &super::tests::context(),
+        )
+    }
+
+    #[test]
+    fn public_name_and_complete_type_have_one_declaration_author() {
+        let value = metadata(super::tests::definition(), "version-1").unwrap();
+        assert_eq!(value.version.as_ref(), "version-1");
+        assert_eq!(value.definition.columns[0].name.as_ref(), "c");
+        assert_eq!(
+            value.definition.columns[0].value_type,
+            FunctionValueType::new(DataType::Int64, true)
+        );
+    }
+
+    #[test]
+    fn malformed_version_or_declared_header_is_corrupt_without_a_schema_guess() {
+        assert_eq!(
+            metadata(super::tests::definition(), "").unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        let mut definition = super::tests::definition();
+        definition.columns = Vec::new().into();
+        assert_eq!(
+            metadata(definition, "v").unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        let mut definition = super::tests::definition();
+        let mut column = definition.columns[0].clone();
+        column.name = "".into();
+        definition.columns = vec![column].into();
+        assert_eq!(
+            metadata(definition, "v").unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        let mut definition = super::tests::definition();
+        let mut second = definition.columns[0].clone();
+        second.name = "C".into();
+        definition.columns = vec![definition.columns[0].clone(), second].into();
+        assert_eq!(
+            metadata(definition, "v").unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn original_payload_budget_includes_complete_nested_type_backing() {
+        let mut definition = super::tests::definition();
+        let value_type = FunctionValueType::new(
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "nested_field".repeat(64),
+                    DataType::Int32,
+                    true,
+                ))]
+                .into(),
+            ),
+            true,
+        );
+        definition.columns = vec![super::super::ConnectorViewColumn {
+            name: "c".into(),
+            value_type,
+        }]
+        .into();
+        assert_eq!(
+            metadata(definition, "v").unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn prepared_facts_cannot_cross_a_control_generation_or_provider_author() {
+        let owner = super::tests::descriptor();
+        let epoch = ProviderBindingEpoch::new();
+        assert_eq!(
+            ConnectorViewPreparation::new(&owner, epoch, 42_u64)
+                .into_facts::<u64>(&owner, epoch)
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            ConnectorViewPreparation::new(&owner, epoch, 42_u64)
+                .into_facts::<u64>(&owner, ProviderBindingEpoch::new())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            ConnectorViewPreparation::new(&owner, epoch, 42_u64)
+                .into_facts::<String>(&owner, epoch)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
         );
     }
 }

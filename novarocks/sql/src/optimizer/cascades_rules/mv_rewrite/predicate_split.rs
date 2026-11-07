@@ -71,7 +71,7 @@ fn classify(
     let mut residuals = Vec::new();
     let mut residual_ids = Vec::new();
     for c in conjuncts {
-        // The existing legacy-only range helpers retain their exact rules.
+        // The range model consumes literals and the shared exact signed fact.
         // Observe their opaque string/map operations at the same scope boundary.
         work.flush()?;
         let range = as_range_conjunct(arena, *c, base_names);
@@ -123,10 +123,13 @@ fn as_range_conjunct(
         base_names.get(column_id).cloned()
     };
     let lit_of = |x: ScalarId| -> Option<LiteralValue> {
-        let ScalarNode::Literal(HashableLiteral(value)) = arena.node(x) else {
-            return None;
-        };
-        Some(value.clone())
+        match arena.node(x) {
+            ScalarNode::Literal(HashableLiteral(value)) => Some(value.clone()),
+            // Observe the original exact signed value without evaluating or
+            // rewriting its CV/CAST source. Other CV domains remain residuals.
+            _ => crate::optimizer::scalar_expr::signed_integer_literal(arena, x)
+                .map(LiteralValue::Int),
+        }
     };
     match arena.node(expr) {
         ScalarNode::BinaryOp {
@@ -339,8 +342,8 @@ pub(crate) fn check_containment(
                 }
             }
         }
-        // CV residuals use exact selected-value/type identity. They never enter
-        // the legacy range inference path, and compensation order is unchanged.
+        // Other CV residuals keep exact selected-value/type identity. Signed
+        // range observations above preserve the original compensation order.
         for mn in &m.residuals {
             work.flush()?;
             if !norm_contains(&q.residuals, mn, control)? {

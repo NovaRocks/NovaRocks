@@ -2,12 +2,12 @@
 
 -- query 2
 -- types	bigint
-count(*)
+_col0
 3
 
 -- query 3
 -- types	bigint
-count(*)
+_col0
 1000000
 
 -- query 4

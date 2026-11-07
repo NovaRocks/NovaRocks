@@ -202,6 +202,7 @@ pub struct CommandError {
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     execution_failure: Option<crate::execution_error::ExecutionFailureInput>,
     user_error: Option<novarocks_user_error::UserError>,
+    analyze_error: Option<Box<novarocks_sql::analyze_error::AnalyzeError>>,
     external_effect_disposition: Option<StatementExternalEffectDisposition>,
 }
 
@@ -213,6 +214,7 @@ impl CommandError {
             compile_control: None,
             execution_failure: None,
             user_error: None,
+            analyze_error: None,
             external_effect_disposition: None,
             failure_cause: None,
         }
@@ -224,6 +226,13 @@ impl CommandError {
         mut self,
         disposition: Option<StatementExternalEffectDisposition>,
     ) -> Self {
+        if disposition.is_some_and(StatementExternalEffectDisposition::do_not_retry)
+            && self.analyze_error.take().is_some()
+        {
+            // An ambiguous or committed effect cannot be presented as a pure
+            // SQL admission refusal. Preserve its actual effect and message.
+            self.user_error = None;
+        }
         self.external_effect_disposition = disposition;
         self
     }
@@ -264,6 +273,23 @@ impl CommandError {
         self.user_error.as_ref()
     }
 
+    pub fn analyze_error(&self) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.analyze_error.as_deref()
+    }
+
+    /// Render an original statement analysis span only at the boundary that
+    /// still holds that statement's source. Stored-body coordinates must have
+    /// already been rebased by their SQL analysis owner.
+    pub fn with_analysis_source(mut self, source: &str) -> Self {
+        if self.compile_control.is_none()
+            && self.failure_cause.is_none()
+            && let Some(analyze) = self.analyze_error.as_deref()
+        {
+            self.user_error = Some(analyze.to_user_error(Some(source)));
+        }
+        self
+    }
+
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
         self.execution_failure.as_ref()
     }
@@ -294,6 +320,30 @@ impl CommandError {
     }
 }
 
+impl From<novarocks_sql::compiler::SqlCompileError> for CommandError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        use novarocks_sql::compiler::SqlCompileError as E;
+        use novarocks_type_contract::CompileControlError as C;
+        match error {
+            E::CompilationSource(source) => Self::from_failure_cause(source),
+            E::Cancelled => Self::from_compile_control(C::Cancelled),
+            E::DeadlineExceeded => Self::from_compile_control(C::DeadlineExceeded),
+            E::ResourceExhausted => Self::from_compile_control(C::ResourceExhausted),
+            E::Analyze(analyze) => {
+                let mut error = match analyze.control_error() {
+                    Some(control) => Self::from_compile_control(control),
+                    None => Self::from_user_error(analyze.to_user_error(None)),
+                };
+                error.analyze_error = Some(Box::new(analyze));
+                error
+            }
+            E::Compilation(message) | E::InvalidRequest(message) => {
+                Self::new(CommandErrorKind::Failed, message)
+            }
+        }
+    }
+}
+
 impl From<String> for CommandError {
     fn from(error: String) -> Self {
         Self::new(CommandErrorKind::Failed, error)
@@ -314,6 +364,11 @@ impl Error for CommandError {
             .or_else(|| {
                 self.compile_control
                     .as_ref()
+                    .map(|cause| cause as &dyn Error)
+            })
+            .or_else(|| {
+                self.analyze_error
+                    .as_deref()
                     .map(|cause| cause as &dyn Error)
             })
     }
@@ -657,5 +712,115 @@ mod compile_control_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sql_analysis_tests {
+    use super::*;
+    use novarocks_parser::Span;
+    use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+    use novarocks_type_contract::{
+        CompileControlError, owned_resources::layout::LayoutResourceError,
+    };
+
+    #[test]
+    fn statement_source_renders_original_utf8_byte_coordinates_without_reviving_a_committed_refusal()
+     {
+        let source = "CREATE VIEW v AS\nSELECT '中文', missing";
+        let start = source.find("missing").unwrap();
+        let original = AnalyzeError::invalid_view("definition", Span::new(start, start + 7));
+        let command = CommandError::from(SqlCompileError::Analyze(original.clone()));
+        assert!(command.user_error().unwrap().location().is_none());
+        let located = command.clone().with_analysis_source(source);
+        let location = located.user_error().unwrap().location().unwrap();
+        assert_eq!((location.line(), location.column()), (2, 18));
+        assert_eq!(located.analyze_error(), Some(&original));
+        let committed = command
+            .with_external_effect_disposition(Some(
+                StatementExternalEffectDisposition::CommitUnknown,
+            ))
+            .with_analysis_source(source);
+        assert!(committed.user_error().is_none());
+        assert!(committed.analyze_error().is_none());
+    }
+
+    #[test]
+    fn every_original_analysis_kind_survives_the_command_boundary_without_a_kind_whitelist() {
+        let span = Span::new(8, 11);
+        for original in [
+            AnalyzeError::missing_column_name("missing", span),
+            AnalyzeError::duplicate_column_name("duplicate", span),
+            AnalyzeError::mismatched_column_aliases("width", span),
+            AnalyzeError::invalid_view("invalid", span),
+            AnalyzeError::view_is_stale("stale", span),
+            AnalyzeError::view_is_recursive("recursive", span),
+            AnalyzeError::unknown_table("unknown", span),
+            AnalyzeError::unsupported_expression("capability", span),
+            AnalyzeError::internal("internal"),
+        ] {
+            let expected = original.to_user_error(None);
+            let error = CommandError::from(SqlCompileError::Analyze(original.clone()));
+            assert_eq!(error.analyze_error(), Some(&original));
+            assert_eq!(error.user_error(), Some(&expected));
+            assert_eq!(
+                error.source().unwrap().downcast_ref::<AnalyzeError>(),
+                Some(&original)
+            );
+            assert_eq!(error.clone(), error);
+            assert_eq!(
+                CommandError::from(original.to_string()).analyze_error(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_committed_effect_cannot_be_projected_as_a_pure_analysis_refusal() {
+        use StatementExternalEffectDisposition as D;
+        for disposition in [D::KnownUncommitted, D::CommitUnknown, D::KnownCommitted] {
+            let error = CommandError::from(SqlCompileError::Analyze(
+                AnalyzeError::missing_column_name("missing", None),
+            ))
+            .with_external_effect_disposition(Some(disposition));
+            assert_eq!(error.external_effect_disposition(), Some(disposition));
+            assert_eq!(
+                error.analyze_error().is_some(),
+                disposition == D::KnownUncommitted
+            );
+            assert_eq!(
+                error.user_error().is_some(),
+                disposition == D::KnownUncommitted
+            );
+        }
+    }
+
+    #[test]
+    fn compile_control_and_original_sources_keep_priority_over_analysis_projection() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(LayoutResourceError::SourceModel),
+        ] {
+            let original = AnalyzeError::control(control.clone());
+            let error = CommandError::from(SqlCompileError::Analyze(original.clone()));
+            assert_eq!(error.compile_control_error(), Some(control.clone()));
+            assert_eq!(error.analyze_error(), Some(&original));
+            assert!(error.user_error().is_none());
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&control)
+            );
+        }
+        let source =
+            novarocks_failure_contract::SharedFailureCause::new(LayoutResourceError::SourceModel);
+        let error = CommandError::from(SqlCompileError::CompilationSource(source.clone()));
+        assert_eq!(error.failure_cause(), Some(&source));
+        assert!(error.user_error().is_none());
+        assert!(error.analyze_error().is_none());
     }
 }

@@ -1,134 +1,134 @@
 -- query 2
 -- legacy
-array_sort([3, 2, 5, 1, 2], (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 5
 -- legacy
-array_sort(c0, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 6
 -- legacy
-array_sort(c1, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 7
 -- legacy
-array_sort(c2, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 8
 -- legacy
-array_sort(c3, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 9
 -- legacy
-array_sort(c4, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 10
 -- legacy
-array_sort(c5, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 11
 -- legacy
-array_sort(c6, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 12
 -- legacy
-array_sort(array_map(x -> CAST(x AS DECIMAL32(7,2)), c6), (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5.00,3.00,2.00,2.00,1.00]
 
 -- query 13
 -- legacy
-array_sort(array_map(x -> CAST(x AS DECIMAL128(19,5)), c6), (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5.00000,3.00000,2.00000,2.00000,1.00000]
 
 -- query 14
 -- legacy
-array_sort([3, 2, 5, 1, 2], (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 [5,3,2,2,1]
 
 -- query 15
 -- legacy
-array_sort([3, 2, 5, 1, 2], (x, y) -> if(x < y, -1, if(x = y, 0, 1)))
+_col0
 [1,2,2,3,5]
 
 -- query 16
 -- legacy
-array_sort([], (x, y) -> if(x < y, -1, if(x = y, 0, 1)))
+_col0
 []
 
 -- query 17
 -- legacy
-array_sort([5], (x, y) -> if(x < y, -1, if(x = y, 0, 1)))
+_col0
 [5]
 
 -- query 18
 -- legacy
-array_sort([1, 1, 1, 1], (x, y) -> if(x < y, -1, if(x = y, 0, 1)))
+_col0
 [1,1,1,1]
 
 -- query 29
 -- legacy
-array_sort(['bc', 'ab', 'dc'], (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 ["dc","bc","ab"]
 
 -- query 30
 -- legacy
-array_sort(['a', 'abcd', 'abc'], (x, y) -> if((length(x)) < (length(y)), -1, if((length(x)) = (length(y)), 0, 1)))
+_col0
 ["a","abc","abcd"]
 
 -- query 33
 -- legacy
-array_sort(['bc', 'ab', 'dc'], (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 ["dc","bc","ab"]
 
 -- query 34
 -- legacy
-array_sort(['a', 'abcd', 'abc'], (x, y) -> if((length(x)) < (length(y)), -1, if((length(x)) = (length(y)), 0, 1)))
+_col0
 ["a","abc","abcd"]
 
 -- query 35
 -- legacy
-array_sort(c0, (x, y) -> if(x < y, 1, if(x = y, 0, -1)))
+_col0
 ["dc","bc","ab"]
 
 -- query 36
 -- legacy
-array_sort(c1, (x, y) -> if((length(x)) < (length(y)), -1, if((length(x)) = (length(y)), 0, 1)))
+_col0
 ["a","abc","abcd"]
 
 -- query 39
 -- legacy
-array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
+_col0
 [5,3,2,2,1,null,null]
 
 -- query 43
 -- legacy
-array_sort([3, 2, NULL, 5, NULL, 1, 2], (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
+_col0
 [5,3,2,2,1,null,null]
 
 -- query 45
 -- legacy
-array_sort(c0, (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END)
+_col0
 [5,3,2,2,1,null,null]
 
 -- query 47
 -- legacy
-array_sort([[2, 3, 1], [4, 2, 1, 4], [1, 2]], (x, y) -> if((cardinality(x)) < (cardinality(y)), -1, if((cardinality(x)) = (cardinality(y)), 0, 1)))
+_col0
 [[1,2],[2,3,1],[4,2,1,4]]
 
 -- query 50
 -- legacy
-array_sort([[2, 3, 1], [4, 2, 1, 4], [1, 2]], (x, y) -> if((cardinality(x)) < (cardinality(y)), -1, if((cardinality(x)) = (cardinality(y)), 0, 1)))
+_col0
 [[1,2],[2,3,1],[4,2,1,4]]
 
 -- query 51
 -- legacy
-array_sort(c0, (x, y) -> if((cardinality(x)) < (cardinality(y)), -1, if((cardinality(x)) = (cardinality(y)), 0, 1)))
+_col0
 [[1,2],[2,3,1],[4,2,1,4]]

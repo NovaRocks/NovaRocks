@@ -1,6 +1,6 @@
 -- query 6
 -- legacy
-CASE i WHEN 1 THEN ai WHEN 3 THEN ass ELSE ai END
+_col0
 ["1","2"]
 ["1","2"]
 ["a","b"]
@@ -8,7 +8,7 @@ NULL
 
 -- query 7
 -- legacy
-CASE i WHEN 1 THEN ai WHEN 3 THEN ass END
+_col0
 ["1","2"]
 NULL
 ["a","b"]
@@ -16,7 +16,7 @@ NULL
 
 -- query 8
 -- legacy
-CASE i WHEN 1 THEN mi WHEN 3 THEN ms ELSE mi END
+_col0
 {1:"1"}
 {1:"1"}
 {1:null}
@@ -24,7 +24,7 @@ NULL
 
 -- query 9
 -- legacy
-CASE i WHEN 1 THEN mi WHEN 3 THEN ms END
+_col0
 {1:"1"}
 NULL
 {1:null}
@@ -32,7 +32,7 @@ NULL
 
 -- query 10
 -- legacy
-CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass END
+_col0
 ["1","2"]
 NULL
 ["a","b"]
@@ -40,7 +40,7 @@ NULL
 
 -- query 11
 -- legacy
-CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass ELSE ai END
+_col0
 ["1","2"]
 ["1","2"]
 ["a","b"]
@@ -48,7 +48,7 @@ NULL
 
 -- query 12
 -- legacy
-CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms END
+_col0
 {1:"1"}
 NULL
 {1:null}
@@ -56,7 +56,7 @@ NULL
 
 -- query 13
 -- legacy
-CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms ELSE ms END
+_col0
 {1:"1"}
 {1:"b"}
 {1:null}
@@ -64,7 +64,7 @@ NULL
 
 -- query 14
 -- legacy
-coalesce(ai, ass)
+_col0
 ["1","2"]
 ["1","2"]
 ["a","b"]
@@ -72,7 +72,7 @@ NULL
 
 -- query 15
 -- legacy
-coalesce(mi, ms)
+_col0
 {1:"1"}
 {1:"1"}
 {1:null}
@@ -80,7 +80,7 @@ NULL
 
 -- query 16
 -- legacy
-coalesce(NULL, ms, mi)
+_col0
 {1:"1"}
 {1:"b"}
 {1:null}
@@ -88,7 +88,7 @@ NULL
 
 -- query 17
 -- legacy
-ifnull(ms, mi)	ms	mi
+_col0	ms	mi
 {1:"1"}	NULL	{1:1}
 {1:"b"}	{1:"b"}	{1:1}
 {1:null}	{1:null}	NULL
@@ -96,7 +96,7 @@ NULL	NULL	NULL
 
 -- query 18
 -- legacy
-ifnull(ass, ai)	ass	ai
+_col0	ass	ai
 ["1","2"]	NULL	[1,2]
 ["a","b"]	["a","b"]	[1,2]
 ["a","b"]	["a","b"]	NULL
@@ -104,7 +104,7 @@ NULL	NULL	NULL
 
 -- query 19
 -- legacy
-ifnull(ai, NULL)
+_col0
 [1,2]
 [1,2]
 NULL
@@ -112,7 +112,7 @@ NULL
 
 -- query 20
 -- legacy
-if(i > 2, ms, mi)
+_col0
 {1:"1"}
 {1:"1"}
 {1:null}
@@ -120,7 +120,7 @@ NULL
 
 -- query 21
 -- legacy
-if(i > 2, ass, ai)
+_col0
 ["1","2"]
 ["1","2"]
 ["a","b"]
@@ -128,7 +128,7 @@ NULL
 
 -- query 22
 -- legacy
-if(ai IS NOT NULL, map_from_arrays(['a', 'b'], [1, 2]), NULL)
+_col0
 {"a":1,"b":2}
 {"a":1,"b":2}
 NULL
@@ -136,7 +136,7 @@ NULL
 
 -- query 23
 -- legacy
-nullif(ai, ass)	ai	ass
+_col0	ai	ass
 ["1","2"]	[1,2]	NULL
 ["1","2"]	[1,2]	["a","b"]
 NULL	NULL	["a","b"]
@@ -144,7 +144,7 @@ NULL	NULL	NULL
 
 -- query 24
 -- legacy
-nullif(ms, mi)	ms	mi
+_col0	ms	mi
 NULL	NULL	{1:1}
 {1:"b"}	{1:"b"}	{1:1}
 {1:null}	{1:null}	NULL
@@ -152,7 +152,7 @@ NULL	NULL	NULL
 
 -- query 25
 -- legacy
-if(i > 5, i, NULL)
+_col0
 NULL
 NULL
 NULL

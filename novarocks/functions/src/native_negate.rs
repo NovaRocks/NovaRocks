@@ -16,7 +16,7 @@
 // under the License.
 //! Prepared native NEGATE using the sole original typed-zero/Sub author.
 //! One-row invocations bound every owned original loop independently of output demand.
-use crate::arithmetic::ArithmeticPrepareError;
+use crate::arithmetic::{ArithmeticPrepareError, SignedWidth};
 use crate::kernel_control::invalid;
 use crate::legacy_literal::{LegacyLiteralValue, native_negate_zero};
 use crate::{
@@ -48,11 +48,7 @@ pub fn native_negate_computed_result_type(
                 result.nullable()
                     || matches!(
                         source.data_type(),
-                        DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Decimal128(_, _)
-                            | DataType::Decimal256(_, _)
+                        DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
                     ),
             )
             .map_err(|_| ArithmeticPrepareError::TypeMismatch)?;
@@ -102,18 +98,6 @@ impl PreparedNativeNegateRecipe {
             {
                 return Err(ArithmeticPrepareError::TypeMismatch);
             }
-            // Original narrow MIN produces a successful NULL on Arrow output
-            // cast. Its nonnullable physical result receipt is not truthful.
-            if !result.nullable()
-                && matches!(
-                    source.data_type(),
-                    DataType::Int8 | DataType::Int16 | DataType::Int32
-                )
-            {
-                return Err(ArithmeticPrepareError::Kernel(invalid(
-                    "native NEGATE narrow signed result requires its actual nullable output domain",
-                )));
-            }
             if !result.nullable()
                 && matches!(
                     source.data_type(),
@@ -143,7 +127,7 @@ impl PreparedNativeNegateRecipe {
         ScopedExpressionEffects::primitive(
             context,
             ExpressionEffects {
-                may_raise_row_error: self.source.data_type() == &DataType::Int64,
+                may_raise_row_error: SignedWidth::from_type(&self.source).is_some(),
                 ..ExpressionEffects::PURE_VALUE
             },
         )
@@ -248,7 +232,7 @@ impl PreparedNativeNegateRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
-            crate::arithmetic::checked_row(
+            let selected = crate::arithmetic::checked_row(
                 argument,
                 ordinal,
                 logical_row,
@@ -256,6 +240,23 @@ impl PreparedNativeNegateRecipe {
                 |_| Ok(()),
                 &mut work,
             )?;
+            if let (Some(width), Some(row)) = (SignedWidth::from_type(&self.source), selected)
+                && width.validate(argument.array().as_ref())
+            {
+                let value = width.read(argument.array().as_ref(), row)?;
+                work.step()?;
+                // Only canonical primitive inputs enter this numeric precheck.
+                // Foreign implementations still reach the original zero/Sub
+                // author's typed refusal. For real signed values, its later
+                // narrowing must never turn MIN into a successful NULL.
+                if value == width.minimum() {
+                    return Ok(NativeNegateRowResult::RowError(RowDataError::with_reason(
+                        ordinal,
+                        crate::DataFailureReason::NumericOutOfRange,
+                        &format!("Arithmetic overflow: Overflow happened on: 0 - {value}"),
+                    )));
+                }
+            }
             let row = argument.value_row(ordinal, logical_row);
             // Flush before slices and original builders. Memory authorization
             // remains the host's responsibility, independent of observation.

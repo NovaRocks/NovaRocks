@@ -24,8 +24,8 @@ use novarocks_parser::{
 
 #[test]
 fn create_view_owns_a_typed_embedded_query_and_span() {
-    let source = "  CREATE OR REPLACE VIEW analytics.orders_v (order_id, `order day`) \
-        COMMENT 'daily' AS /* outside query */ SELECT order_id /* inside */\nFROM orders  /* trailing */ ;";
+    let source = "  CREATE OR REPLACE VIEW analytics.orders_v \
+        COMMENT 'daily' AS /* outside query */ SELECT order_id /* inside */ AS order_id, order_day AS `order day`\nFROM orders  /* trailing */ ;";
     let statements = parse(source).expect("CREATE VIEW should parse");
     let [Statement::View(ViewStatement::Create(create))] = statements.as_slice() else {
         panic!("expected typed CREATE VIEW");
@@ -33,18 +33,21 @@ fn create_view_owns_a_typed_embedded_query_and_span() {
 
     assert!(create.or_replace);
     assert!(!create.if_not_exists);
-    assert_eq!(create.columns.len(), 2);
+    let novarocks_parser::ast::SetExpr::Select(select) = create.query.body.as_ref() else {
+        panic!("SELECT view definition")
+    };
+    assert_eq!(select.projection.len(), 2);
     assert_eq!(
         novarocks_parser::printer::print_query(&create.query),
-        "SELECT order_id FROM orders"
+        "SELECT order_id AS order_id, order_day AS `order day` FROM orders"
     );
     let query_start = source.find("SELECT").expect("query start");
     let query_end = source.find("  /* trailing */").expect("query end");
     assert_eq!(create.query.span, Span::new(query_start, query_end));
     assert_eq!(
         print_statements(&[Statement::View(ViewStatement::Create(create.clone()))]),
-        "CREATE OR REPLACE VIEW analytics.orders_v (order_id, `order day`) COMMENT 'daily' AS \
-         SELECT order_id FROM orders"
+        "CREATE OR REPLACE VIEW analytics.orders_v COMMENT 'daily' AS \
+         SELECT order_id AS order_id, order_day AS `order day` FROM orders"
     );
 }
 
@@ -108,7 +111,7 @@ fn view_visitor_and_folder_reach_query_and_nested_names() {
         }
     }
 
-    let [statement] = parse("CREATE VIEW orders_v (id) COMMENT 'v' AS SELECT id FROM orders")
+    let [statement] = parse("CREATE VIEW orders_v COMMENT 'v' AS SELECT id AS named FROM orders")
         .expect("view should parse")
         .try_into()
         .expect("one statement");
@@ -119,7 +122,7 @@ fn view_visitor_and_folder_reach_query_and_nested_names() {
     let renamed = Rename.fold_statement(statement);
     assert_eq!(
         print_statements(&[renamed]),
-        "CREATE VIEW renamed_v (id) COMMENT 'v' AS SELECT id FROM orders"
+        "CREATE VIEW renamed_v COMMENT 'v' AS SELECT id AS named FROM orders"
     );
 }
 

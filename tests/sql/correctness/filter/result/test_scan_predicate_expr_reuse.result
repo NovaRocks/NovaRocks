@@ -162,7 +162,7 @@ k
 
 -- query 21
 -- legacy
-k	v9 -> '$.b'
+k	_col1
 1	[1]
 
 -- query 22

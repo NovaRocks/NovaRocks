@@ -300,9 +300,9 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         assert_eq!(port.fields.len(), 1);
         assert_eq!(port.fields[0].alias.as_deref(), Some("original_negated"));
         assert_eq!(port.fields[0].ty.data_type().clone(), dtype);
-        // The required input remains required. Negating its minimum may yield
-        // NULL under the original checked arithmetic policy in either mode.
-        assert!(port.fields[0].ty.nullable());
+        // A required signed input retains its declaration: MIN raises a
+        // required row error rather than a successful own NULL.
+        assert!(!port.fields[0].ty.nullable());
         let mut actual_minus = 0;
         for fragment in source.plan().fragments().values() {
             for (_, expr) in fragment.expressions().iter() {
@@ -315,7 +315,7 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
                 ) {
                     actual_minus += 1;
                     assert_eq!(expr.ty.data_type().clone(), dtype);
-                    assert!(expr.ty.nullable());
+                    assert!(!expr.ty.nullable());
                     let ExprKind::Unary { expr: input, .. } = &expr.kind else {
                         unreachable!();
                     };
@@ -340,15 +340,14 @@ fn numeric_unary_original_nonnull_sql_baseline_ordered_labels_and_values_are_act
     let port = source.plan().result_port().unwrap();
     assert_original_same_owner(port, &source);
     assert_eq!(port.fields.len(), 3);
-    for (ordinal, (field, alias)) in port
-        .fields
-        .iter()
-        .zip(["first_alias", "original_source", "repeated_alias"])
-        .enumerate()
+    for (field, alias) in
+        port.fields
+            .iter()
+            .zip(["first_alias", "original_source", "repeated_alias"])
     {
         assert_eq!(field.alias.as_deref(), Some(alias));
         assert_eq!(field.ty.data_type().clone(), DataType::Int8);
-        assert_eq!(field.ty.nullable(), ordinal != 1);
+        assert!(!field.ty.nullable());
     }
     // Whether optimization reused an expression/ValueId is the actual plan's
     // choice. Each ordered output occurrence above is checked individually.

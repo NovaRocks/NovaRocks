@@ -35,3 +35,5 @@ pub mod vec;
 pub mod metadata_materialization;
 
 pub mod arrow_union;
+
+pub mod type_representation;

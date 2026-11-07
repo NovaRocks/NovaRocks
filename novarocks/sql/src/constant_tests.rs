@@ -918,3 +918,65 @@ fn first_literal_run_keeps_original_control_and_source_at_every_selected_prefix(
         }
     }
 }
+
+#[test]
+fn analyzed_ordinary_integers_reach_actual_scalar_and_run_constant_carriers() {
+    use crate::{
+        analysis::{ExprKind, QueryBody},
+        constant::admit_syntax_constant_run,
+    };
+    use novarocks_parser::ast::Statement;
+    let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+    for (sql, expected, value) in [
+        ("SELECT -2147483648", DataType::Int32, i64::from(i32::MIN)),
+        ("SELECT 2147483647", DataType::Int32, i64::from(i32::MAX)),
+        (
+            "SELECT 2147483648",
+            DataType::Int64,
+            i64::from(i32::MAX) + 1,
+        ),
+        ("SELECT -9223372036854775808", DataType::Int64, i64::MIN),
+    ] {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let Statement::Query(query) = &statements[0] else {
+            panic!("query");
+        };
+        let (resolved, _, _) = crate::analyzer::analyze(query, &catalog, "default").unwrap();
+        let QueryBody::Select(select) = resolved.body else {
+            panic!("select");
+        };
+        let expression = &select.projection[0].expr;
+        let ExprKind::Literal(literal) = &expression.kind else {
+            panic!("original literal");
+        };
+        assert_eq!(expression.value_type.data_type(), &expected);
+        let scalar = admit(literal.clone(), &expression.value_type);
+        assert_eq!(scalar.pool().array().data_type(), &expected);
+        assert_eq!(scalar.try_i64().unwrap(), Some(value));
+        let literals = [literal, literal];
+        let (run, count) = admit_syntax_constant_run(
+            &literals,
+            &expression.value_type,
+            policy(),
+            &Control::new(None),
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(run.array().data_type(), &expected);
+        if expected == DataType::Int32 {
+            let array = run
+                .array()
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            assert_eq!(array.values().as_ref(), &[value as i32, value as i32]);
+        } else {
+            let array = run
+                .array()
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            assert_eq!(array.values().as_ref(), &[value, value]);
+        }
+    }
+}

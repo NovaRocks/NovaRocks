@@ -83,6 +83,8 @@ pub(super) fn plan_scoped_query(
         local_cte_ids,
     } = resolved;
 
+    let output_columns = crate::analysis::schema::planner_columns(&output_columns);
+
     // Plan the query body first so we can stamp fresh set-op ColumnIds before
     // apply_query_modifiers consumes output_columns.
     let mut body_plan = plan_body_scoped(body, &output_columns, cte_registry, factory, control)?;
@@ -122,11 +124,14 @@ pub(super) fn plan_scoped_query(
             .ok_or_else(|| format!("missing CTE entry for id {cte_id}"))?;
         let produce_input =
             plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory, control)?;
-        let produce_input = adapt_plan_output(produce_input, &entry.output_columns)?;
+        let produce_input = adapt_plan_output(
+            produce_input,
+            &crate::analysis::schema::planner_columns(&entry.output_columns),
+        )?;
         let produce = LogicalPlanNode::new(
             LogicalPlanKind::CTEProduce(PlanCTEProduceNode {
                 cte_id: entry.id,
-                output_columns: entry.output_columns.clone(),
+                output_columns: crate::analysis::schema::planner_columns(&entry.output_columns),
             }),
             vec![produce_input],
             None,
@@ -144,9 +149,9 @@ pub(super) fn plan_scoped_query(
 struct NestedSubqueryLayer {
     select: ResolvedSelect,
     alias: String,
-    source_output_columns: Vec<OutputColumn>,
+    source_output_columns: Vec<AnalyzedOutputField>,
     order_by: Vec<SortItem>,
-    output_columns: Vec<OutputColumn>,
+    output_columns: Vec<AnalyzedOutputField>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -214,7 +219,7 @@ fn plan_nested_subquery_chain(
     while let Some(layer) = layers.pop() {
         let source = adapt_plan_output_with_qualifier(
             plan,
-            &layer.source_output_columns,
+            &crate::analysis::schema::planner_columns(&layer.source_output_columns),
             Some(&layer.alias),
         )?;
         let body = plan_select_scoped_with_source(
@@ -227,7 +232,7 @@ fn plan_nested_subquery_chain(
         plan = apply_query_modifiers(
             body,
             layer.order_by,
-            layer.output_columns,
+            crate::analysis::schema::planner_columns(&layer.output_columns),
             layer.limit,
             layer.offset,
             factory,

@@ -301,6 +301,58 @@ fn original_utf8_parse_and_i64_formatter_have_independent_complete_oracles() {
 }
 
 #[test]
+fn i32_formatter_preserves_bounds_nulls_scalar_and_original_constant_ordinal() {
+    let r = recipe(&ty(DataType::Int32, true), &ty(DataType::Utf8, true));
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![
+        Some(i32::MIN),
+        Some(i32::MAX),
+        None,
+        Some(0),
+    ]));
+    let out = r
+        .evaluate_complete(EvaluatedArgument::Column(&values), 4, &Control::default())
+        .unwrap();
+    assert_eq!(
+        strings(&out),
+        [Some("-2147483648"), Some("2147483647"), None, Some("0")]
+    );
+    assert!(out.get_array_memory_size() <= r.retained_upper_bound(4).unwrap());
+    let scalar: ArrayRef = Arc::new(Int32Array::from(vec![Some(6)]));
+    let pool: ArrayRef = Arc::new(Int32Array::from(vec![Some(31), Some(41), Some(-23)]));
+    let cv = constant(pool, 2);
+    for (input, expected) in [
+        (EvaluatedArgument::Scalar(&scalar), [Some("6"); 3]),
+        (EvaluatedArgument::Constant(&cv), [Some("-23"); 3]),
+    ] {
+        let out = r.evaluate_complete(input, 3, &Control::default()).unwrap();
+        assert_eq!(strings(&out), expected);
+    }
+    crate::kernel_control::test_contract::exact(
+        &r.evaluate_complete(EvaluatedArgument::Scalar(&values), 4, &Control::default())
+            .unwrap_err(),
+        crate::EvaluationContractError::ArgumentLength,
+    );
+    let baseline = Control::default();
+    r.evaluate_complete(EvaluatedArgument::Column(&values), 4, &baseline)
+        .unwrap();
+    let trace = baseline.trace.lock().unwrap().clone();
+    for stop in 0..trace.len() {
+        for cause in failures() {
+            let control = Control {
+                trace: Mutex::default(),
+                refusal: Some((stop, cause.clone())),
+            };
+            assert_eq!(
+                r.evaluate_complete(EvaluatedArgument::Column(&values), 4, &control)
+                    .unwrap_err(),
+                cause
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+        }
+    }
+}
+
+#[test]
 fn complete_defaults_gather_slices_scalar_compact_and_only_selected_pool_ordinal() {
     let backing: ArrayRef = Arc::new(StringArray::from(vec![
         "unused invalid",

@@ -215,6 +215,7 @@ mod scalar_domain_tests {
         control: &'a crate::compiler::SqlCompileControl,
     ) -> AnalyzerContext<'a> {
         AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             materialized_values: None,
             constant_policy: crate::constant::test_constant_policy(),
             control,
@@ -223,6 +224,7 @@ mod scalar_domain_tests {
             function_catalog: crate::functions::builtin_sql_function_catalog(),
             sql_semantics: Default::default(),
             factory,
+            view_stack: Default::default(),
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: Cell::new(0),

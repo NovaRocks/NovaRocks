@@ -31,6 +31,41 @@ use super::relation::plan_relation_scoped;
 use super::subquery::{wrap_predicate_applies, wrap_scalar_applies};
 use super::window::build_window_and_project;
 
+/// The planner consumes value labels after SQL has frozen presentation.
+pub(super) struct PlanningSelect {
+    pub from: Option<Relation>,
+    pub filter: Option<TypedExpr>,
+    pub group_by: Vec<TypedExpr>,
+    pub having: Option<TypedExpr>,
+    pub projection: Vec<ProjectItem>,
+    pub has_aggregation: bool,
+    pub distinct: bool,
+    pub repeat: Option<RepeatInfo>,
+    pub apply_specs: Vec<ApplyScalarSpec>,
+    pub predicate_apply_specs: Vec<ApplyPredicateSpec>,
+}
+
+impl From<ResolvedSelect> for PlanningSelect {
+    fn from(select: ResolvedSelect) -> Self {
+        Self {
+            from: select.from,
+            filter: select.filter,
+            group_by: select.group_by,
+            having: select.having,
+            projection: select
+                .projection
+                .into_iter()
+                .map(AnalyzedProjectItem::into_planner)
+                .collect(),
+            has_aggregation: select.has_aggregation,
+            distinct: select.distinct,
+            repeat: select.repeat,
+            apply_specs: select.apply_specs,
+            predicate_apply_specs: select.predicate_apply_specs,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
@@ -45,12 +80,13 @@ pub(super) fn plan_select_scoped(
 }
 
 pub(super) fn plan_select_scoped_with_source(
-    mut select: ResolvedSelect,
+    select: ResolvedSelect,
     source: Option<LogicalPlanNode>,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
     control: &dyn PureCompileControl,
 ) -> Result<LogicalPlanNode, SqlCompileError> {
+    let mut select = PlanningSelect::from(select);
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
     // Keep the analyzer-owned occurrence identities before Repeat/Aggregate
@@ -271,7 +307,7 @@ pub(super) fn plan_select_scoped_with_source(
             control,
         )?;
 
-        transfer_projection_provenance(&analyzed_projection_facts, &project_items, factory)?;
+        transfer_projection_provenance(&analyzed_projection_facts, &mut project_items, factory)?;
         current = build_window_and_project(current, project_items, factory)?;
     } else {
         // Projection placement (non-aggregated branch).
@@ -310,14 +346,14 @@ pub(super) fn plan_select_scoped_with_source(
 /// IDs are separated. Repeated symbols must agree even when one fact is None.
 fn transfer_projection_provenance(
     analyzed_facts: &[(ColumnId, novarocks_type_contract::FunctionValueType)],
-    rewritten: &[ProjectItem],
+    rewritten: &mut [ProjectItem],
     factory: &mut ColumnRefFactory,
 ) -> Result<(), String> {
     if analyzed_facts.len() != rewritten.len() {
         return Err("same-value projection rewrite changed its occurrence count".into());
     }
     let mut sources_by_target = std::collections::HashMap::new();
-    for ((source, value_type), item) in analyzed_facts.iter().zip(rewritten) {
+    for ((source, value_type), item) in analyzed_facts.iter().zip(rewritten.iter()) {
         let source = *source;
         if source == ColumnId::UNSET || item.output_column_id == ColumnId::UNSET {
             // Legacy construction tests may omit analyzer IDs; there is no
@@ -353,8 +389,15 @@ fn transfer_projection_provenance(
     for ((source, _), item) in analyzed_facts.iter().zip(rewritten) {
         let source = *source;
         if source != ColumnId::UNSET && item.output_column_id != ColumnId::UNSET {
+            if !factory.same_value_origin(source, item.output_column_id) {
+                // Repeat can materialize one group key for several distinct
+                // analyzed outputs. Keep each projected occurrence separate;
+                // its expression still reads the shared runtime group value.
+                item.output_column_id =
+                    factory.create(None, item.output_name.clone(), item.expr.value_type.clone());
+            }
             factory
-                .transfer_value_provenance(source, item.output_column_id)
+                .transfer_value_occurrence(source, item.output_column_id)
                 .map_err(str::to_owned)?;
         }
     }

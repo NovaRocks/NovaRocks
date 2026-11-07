@@ -1,5 +1,5 @@
 -- query 4
--- types	bigint
+-- types	integer
 value
 7
 
@@ -9,11 +9,11 @@ value
 a
 
 -- query 10
--- types	bigint
+-- types	integer
 value
 7
 
 -- query 13
--- types	bigint
+-- types	integer
 value
 7

@@ -321,6 +321,11 @@ pub(crate) struct SqlCatalogCompletionState {
     catalog: CatalogCompletionState,
     mv_definitions: Option<MvRewriteDefinitionIndex>,
 }
+impl SqlCatalogCompletionState {
+    pub(super) fn is_discovery_round(&self) -> bool {
+        self.catalog.is_discovery_round()
+    }
+}
 
 pub(crate) struct SqlStatisticsCompletionState {
     common: FinalPlanCommon,
@@ -487,12 +492,20 @@ pub(super) fn resume_materialized_view(
 }
 
 pub(super) fn resume_catalog(
-    state: SqlCatalogCompletionState,
+    mut state: SqlCatalogCompletionState,
     facts: Box<[CatalogRelationFact]>,
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     control.check()?;
-    let fact_catalog = state.catalog.fact_catalog(&facts)?;
+    state.catalog.accept_facts(facts, control)?;
+    if !state.catalog.needs().is_empty() {
+        let needs = state.catalog.needs().to_vec().into_boxed_slice();
+        return Ok(CompilerStep::need(
+            SqlNeedBatch::CatalogRelations(needs),
+            CompilerContinuation::catalog(state),
+        ));
+    }
+    let fact_catalog = state.catalog.completed_catalog()?;
     let analyzed = analyze_with_catalog(
         &state.common,
         state.catalog.query().clone(),
@@ -527,7 +540,7 @@ fn catalog_or_analyze_step(
         ));
     }
 
-    let fact_catalog = catalog.fact_catalog(&[])?;
+    let fact_catalog = catalog.completed_catalog()?;
     let analyzed = analyze_with_catalog(
         &common,
         catalog.query().clone(),
@@ -771,6 +784,7 @@ fn optimize_to_physical(
     control: &SqlCompileControl,
 ) -> Result<OptimizedPhysicalPlan, SqlCompileError> {
     let SqlAnalyzedQuery {
+        root_semantics,
         logical_plan,
         factory,
         intent,
@@ -784,12 +798,6 @@ fn optimize_to_physical(
         constant_policy,
     } = analyzed;
     control.check()?;
-    let root_semantics = super::root_output::RootOutputSemantics::capture(
-        &crate::planner::plan_output_columns(&logical_plan)
-            .map_err(SqlCompileError::Compilation)?,
-        &factory,
-    )
-    .map_err(SqlCompileError::Compilation)?;
     let mut scalar_arena =
         crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
@@ -4497,3 +4505,7 @@ mod package_semantics_tests;
 #[cfg(test)]
 #[path = "catalogue_retention_tests.rs"]
 mod catalogue_retention_tests;
+
+#[cfg(test)]
+#[path = "view_completion_tests.rs"]
+mod view_completion_tests;

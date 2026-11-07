@@ -1,21 +1,21 @@
 -- query 1
 -- types	tinyint
-CAST('-' AS TINYINT)
+_col0
 NULL
 
 -- query 2
 -- types	smallint
-CAST('-' AS SMALLINT)
+_col0
 NULL
 
 -- query 3
 -- types	integer
-CAST('-' AS INT)
+_col0
 NULL
 
 -- query 4
 -- types	bigint
-CAST('-' AS BIGINT)
+_col0
 NULL
 
 -- query 5
@@ -25,22 +25,22 @@ NULL
 
 -- query 6
 -- types	tinyint
-CAST('+' AS TINYINT)
+_col0
 NULL
 
 -- query 7
 -- types	smallint
-CAST('+' AS SMALLINT)
+_col0
 NULL
 
 -- query 8
 -- types	integer
-CAST('+' AS INT)
+_col0
 NULL
 
 -- query 9
 -- types	bigint
-CAST('+' AS BIGINT)
+_col0
 NULL
 
 -- query 10

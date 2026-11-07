@@ -1,5 +1,5 @@
 -- query 6
--- legacy
+-- types	bigint	integer
 id	value
 3	130
 4	40

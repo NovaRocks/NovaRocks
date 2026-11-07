@@ -81,6 +81,8 @@ impl fmt::Display for ColumnId {
 )]
 pub(crate) struct ColumnMeta {
     pub id: ColumnId,
+    /// Original value identity, changed only by explicit same-value handoff.
+    pub value_origin: ColumnId,
     pub name: String,
     pub qualifier: Option<String>,
     pub value_type: novarocks_type_contract::FunctionValueType,
@@ -124,6 +126,7 @@ impl ColumnRefFactory {
         self.next_id += 1;
         self.columns.push(Some(ColumnMeta {
             id,
+            value_origin: id,
             name,
             qualifier,
             json_list_provenance: false,
@@ -260,6 +263,26 @@ impl ColumnRefFactory {
         Ok(())
     }
 
+    /// Preserve a value occurrence only at an actual planner symbol replacement.
+    /// CTE consumes copy type provenance while retaining distinct row bindings.
+    pub(crate) fn transfer_value_occurrence(
+        &mut self,
+        source: ColumnId,
+        target: ColumnId,
+    ) -> Result<(), &'static str> {
+        self.transfer_value_provenance(source, target)?;
+        let origin = self.get(source).value_origin;
+        self.columns[(target.0 - 1) as usize]
+            .as_mut()
+            .expect("authored target")
+            .value_origin = origin;
+        Ok(())
+    }
+
+    pub(crate) fn same_value_origin(&self, source: ColumnId, target: ColumnId) -> bool {
+        self.get(source).value_origin == self.get(target).value_origin
+    }
+
     /// Return a human-readable display name for the column: `"qualifier.name"`
     /// or just `"name"`.
     #[allow(
@@ -339,6 +362,27 @@ mod tests {
         assert_eq!(next, ColumnId(5));
         assert_eq!(factory.column_name(next), "b");
     }
+    #[test]
+    fn type_provenance_does_not_merge_distinct_relation_occurrences() {
+        let mut factory = ColumnRefFactory::new();
+        let ty = novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            true,
+        );
+        let producer = factory.create(None, "x".into(), ty.clone());
+        let left = factory.create(Some("left".into()), "x".into(), ty.clone());
+        let right = factory.create(Some("right".into()), "x".into(), ty.clone());
+        factory.transfer_value_provenance(producer, left).unwrap();
+        factory.transfer_value_provenance(producer, right).unwrap();
+        assert!(!factory.same_value_origin(left, right));
+        let replacement = factory.create(None, "x".into(), ty);
+        factory
+            .transfer_value_occurrence(left, replacement)
+            .unwrap();
+        assert!(factory.same_value_origin(left, replacement));
+        assert!(!factory.same_value_origin(right, replacement));
+    }
+
     #[test]
     fn same_value_provenance_preserves_nested_domains_and_root_nullability_rules() {
         let mut factory = ColumnRefFactory::new();

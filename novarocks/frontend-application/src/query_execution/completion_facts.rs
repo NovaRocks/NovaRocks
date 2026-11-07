@@ -43,7 +43,7 @@ pub(crate) use provider_source::FrontendCompletionCustody;
 /// Borrow the original Provider and pure CPU sources for one completion.
 pub(crate) struct FrontendCompletionPorts<'a> {
     pub(crate) provider: &'a FrontendCompletionCustody,
-    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+    pub(crate) cpu: &'a Arc<FrontendPlanningCpuSource>,
 }
 
 use std::sync::Arc;
@@ -59,8 +59,8 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, MvStorageObservationPort, read_stack::ConnectorSession,
 };
 use novarocks_sql::compiler::{
-    CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact,
-    MaterializedViewNeed, StatisticsFact, StatisticsNeed,
+    CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
+    StatisticsFact, StatisticsNeed,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -85,6 +85,8 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 /// One value per process: nothing here is statement-scoped.
 #[derive(Clone)]
 pub(crate) struct CompletionFactOwners {
+    view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<ConnectorControlHost>,
@@ -95,6 +97,11 @@ pub(crate) struct CompletionFactOwners {
 }
 
 impl CompletionFactOwners {
+    pub(crate) fn system_relations(
+        &self,
+    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+        &self.system_relations
+    }
     pub(crate) const fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -103,8 +110,12 @@ impl CompletionFactOwners {
         materialized_views: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         blocking: ConnectorBlockingIoSupervisor,
+        view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     ) -> Self {
         Self {
+            view_service,
+            system_relations,
             catalog_service,
             catalog_application,
             connector_control,
@@ -129,10 +140,17 @@ pub(crate) struct StatementFactScope {
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
+    definition: Option<DefinitionFactInputs>,
     query_local_overlays:
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
+#[derive(Clone)]
+struct DefinitionFactInputs {
+    policy: novarocks_functions::ConstantPolicy,
+    control: novarocks_sql::compiler::SqlCompileControl,
+    cpu: Option<Arc<FrontendPlanningCpuSource>>,
+}
 #[derive(Clone)]
 enum StatementStateStore {
     Legacy,
@@ -156,6 +174,7 @@ impl StatementFactScope {
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
             capacity,
+            definition: None,
             query_local_overlays: Vec::new(),
         })
     }
@@ -207,6 +226,31 @@ impl StatementFactScope {
         scope.state_store = StatementStateStore::Governed(state_store);
         Ok(scope)
     }
+    pub(crate) fn with_definition_owned(
+        mut self,
+        policy: novarocks_functions::ConstantPolicy,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> Self {
+        self.definition = Some(DefinitionFactInputs {
+            policy,
+            control,
+            cpu: None,
+        });
+        self
+    }
+    pub(crate) fn with_definition_planning(
+        mut self,
+        policy: novarocks_functions::ConstantPolicy,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        cpu: Arc<FrontendPlanningCpuSource>,
+    ) -> Self {
+        self.definition = Some(DefinitionFactInputs {
+            policy,
+            control,
+            cpu: Some(cpu),
+        });
+        self
+    }
     pub(crate) fn with_query_local_overlays(
         mut self,
         overlays: Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
@@ -218,6 +262,10 @@ impl StatementFactScope {
 
 /// Answers relation lookups from the frontend catalog.
 pub(crate) struct FrontendCatalogFacts {
+    local_views: Result<
+        novarocks_query_application::view::LocalViewSnapshot,
+        novarocks_sql::compiler::SqlCompileError,
+    >,
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     // One original fact source serializes its own observation rounds. This
@@ -226,8 +274,12 @@ pub(crate) struct FrontendCatalogFacts {
 }
 
 impl FrontendCatalogFacts {
-    pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+    pub(crate) fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+        let local_views = scope
+            .bindings
+            .capture_local_views(|| owners.view_service.catalog_snapshot());
         Self {
+            local_views,
             owners,
             scope,
             resolving: tokio::sync::Mutex::const_new(()),
@@ -240,7 +292,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
     async fn resolve_relations(
         &self,
         needs: &[CatalogRelationNeed],
-    ) -> Result<Vec<CatalogRelationFact>, String> {
+    ) -> Result<Vec<CatalogRelationFact>, novarocks_sql::compiler::SqlCompileError> {
         let _round = self.resolving.lock().await;
         let loader = iceberg_table_binding_loader(
             self.owners.connector_control.as_ref(),
@@ -253,32 +305,39 @@ impl CatalogFactPort for FrontendCatalogFacts {
             loader,
             self.scope.query_local_overlays.clone(),
         )
-        .with_catalog_application(self.owners.catalog_application.as_deref());
+        .with_catalog_application(self.owners.catalog_application.as_deref())
+        .with_local_views(self.local_views.clone()?)
+        .with_system_relations(self.owners.system_relations().clone());
+        let materializer = if let Some(input) = self.scope.definition.as_ref() {
+            materializer.with_definition_inputs(
+                self.scope.connector_context.clone(),
+                input.policy,
+                input.control.clone(),
+            )
+        } else {
+            materializer
+        };
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
-            let relation = need.relation();
-            let resolved = match need.target() {
-                CatalogLookupTarget::Table { .. } => {
-                    materializer
-                        .resolve_table_for_analysis_async(
-                            Some(&relation.catalog),
-                            &relation.namespace,
-                            &relation.table,
-                        )
-                        .await
+            // Local views and generated overlays retain their precedence.
+            if let Some(fact) = materializer.local_view_fact(need) {
+                facts.push(fact?);
+                continue;
+            }
+            if let Some(input) = self.scope.definition.as_ref() {
+                let cpu = input.cpu.as_ref().ok_or_else(|| {
+                    novarocks_sql::compiler::SqlCompileError::Compilation(
+                        "definition CPU source is not installed in its original custody".into(),
+                    )
+                })?;
+                if let Some(result) = materializer.system_relation_fact_on_cpu(need, cpu).await
+                    && let Some(fact) = result?
+                {
+                    facts.push(fact);
+                    continue;
                 }
-                CatalogLookupTarget::IcebergMetadata { kind } => {
-                    materializer
-                        .resolve_metadata_table_async(
-                            Some(&relation.catalog),
-                            &relation.namespace,
-                            &relation.table,
-                            kind,
-                        )
-                        .await
-                }
-            };
-            facts.push(catalog_fact_from(need, resolved)?);
+            }
+            facts.push(materializer.resolve_relation_fact_async(need).await?);
         }
         Ok(facts)
     }
@@ -291,20 +350,24 @@ impl CatalogFactPort for FrontendCatalogFacts {
 /// query, while a catalog that could not say is a fact about this process. The
 /// second must not be flattened into the first, or a query over a healthy table
 /// would report that the table does not exist whenever the catalog is down.
-pub(super) fn catalog_fact_from(
+pub(crate) fn catalog_fact_from(
     need: &CatalogRelationNeed,
     resolved: CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable>,
-) -> Result<CatalogRelationFact, String> {
+) -> Result<CatalogRelationFact, novarocks_sql::compiler::SqlCompileError> {
     match resolved {
         Ok(table) => CatalogRelationFact::resolved(need, table),
         Err(CatalogResolutionError::Missing { reason }) => {
             CatalogRelationFact::missing(need, reason)
         }
         Err(error @ CatalogResolutionError::Failed { .. }) => {
-            return Err(error.into_message());
+            return Err(error.into_compile());
         }
     }
-    .map_err(|error| format!("build catalog completion fact: {error}"))
+    .map_err(|error| {
+        novarocks_sql::compiler::SqlCompileError::Compilation(format!(
+            "build catalog completion fact: {error}"
+        ))
+    })
 }
 
 /// Answers statistics questions from the one unified resolver.
@@ -408,6 +471,15 @@ pub(crate) fn install_frontend_fact_source(
     scope: StatementFactScope,
     session: ConnectorSession,
 ) -> Result<(), String> {
+    let mut scope = scope;
+    let owned_catalog_cpu = scope.definition.as_mut().and_then(|input| {
+        if input.cpu.is_some() {
+            return None;
+        }
+        let cpu = FrontendPlanningCpuSource::new(owners.blocking.clone());
+        input.cpu = Some(Arc::clone(&cpu));
+        Some(cpu)
+    });
     let provider = Arc::new(
         FrontendProviderReadFacts::binding_only(
             Arc::clone(&owners.connector_control),
@@ -420,12 +492,14 @@ pub(crate) fn install_frontend_fact_source(
         .with_creator_mode(scope.creator_mode),
     );
     let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
-    custody.install(facts, provider).map_err(|original| {
-        // No work can have been issued by this rejected new port. Destruction
-        // is outside the fixed custody lock; the old source remains unchanged.
-        drop(original);
-        "completion Provider source is already installed".to_owned()
-    })
+    custody
+        .install(facts, provider, owned_catalog_cpu)
+        .map_err(|original| {
+            // No work can have been issued by this rejected new port. Destruction
+            // is outside the fixed custody lock; the old source remains unchanged.
+            drop(original);
+            "completion Provider source is already installed".to_owned()
+        })
 }
 
 /// The one fact source one statement's completion is driven with.
@@ -492,7 +566,33 @@ mod tests {
             Err(CatalogResolutionError::failed("REST timeout")),
         )
         .expect_err("a catalog that could not say has answered nothing");
-        assert!(error.contains("REST timeout"), "{error}");
+        assert!(error.to_string().contains("REST timeout"), "{error}");
+    }
+
+    #[test]
+    fn a_provider_source_is_not_an_absent_relation_or_a_string_failure() {
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let original = CompileControlError::from_domain(LayoutResourceError::SourceModel);
+        let error = catalog_fact_from(
+            &a_need(),
+            Err(CatalogResolutionError::from_connector(
+                novarocks_spi::connector::ConnectorError::compile_interruption(original.clone()),
+            )),
+        )
+        .expect_err("the original provider refusal is not a catalog fact");
+        assert_eq!(
+            error,
+            novarocks_sql::compiler::SqlCompileError::from(original)
+        );
+        let novarocks_sql::compiler::SqlCompileError::CompilationSource(source) = error else {
+            panic!("original domain source");
+        };
+        assert_eq!(
+            source.downcast_ref::<LayoutResourceError>(),
+            Some(&LayoutResourceError::SourceModel)
+        );
     }
 }
 

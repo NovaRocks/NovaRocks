@@ -1,21 +1,21 @@
 -- query 6
--- legacy
+-- types	bigint	varchar
 id	v
 1	aa
 2	b
 
 -- query 8
--- legacy
+-- types	bigint
 snaps_before_merge
 2
 
 -- query 10
--- legacy
+-- types	bigint
 snaps_after_merge
 3
 
 -- query 11
--- legacy
+-- types	bigint	varchar
 id	v
 1	aa
 2	bb
