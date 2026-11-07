@@ -6,7 +6,7 @@ id	region	amount	category
 3	east	30	books
 
 -- query 5
--- legacy
+-- types	bigint	varchar	bigint	varchar
 id	region	amount	category
 2	west	20	games
 3	east	30	books
@@ -20,7 +20,7 @@ id	region	amount	category
 5	west	40	toys
 
 -- query 9
--- legacy
+-- types	bigint	varchar	bigint	varchar
 id	region	amount	category
 2	west	20	games
 5	west	40	toys

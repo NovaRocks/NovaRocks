@@ -55,7 +55,7 @@ c0	lead_result
 3	6
 
 -- query 11
--- legacy
+-- types	integer	varchar
 c0	lead_result
 1	2
 2	2
