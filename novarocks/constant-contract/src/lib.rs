@@ -1080,6 +1080,74 @@ impl ConstantPool {
     pub fn resource_facts(&self) -> ConstantResourceFacts {
         self.0.facts
     }
+    /// Protocol bytes from checked buffer facts, complete field/value types,
+    /// and Arrow-reported carrier/descriptor structure. Arrow does not report
+    /// every opaque container allocation; this is no heap/process upper bound
+    /// or MEM grant. Shared inputs may be counted by each retained pool.
+    pub fn exchange_resource_bytes_observed(
+        &self,
+        control: &dyn PureCompileControl,
+    ) -> Result<usize, ConstantError> {
+        let facts = self.resource_facts();
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        // These finite metadata traversals consume already checked type
+        // graphs. Their representation sizes also cover the repeated walk's
+        // structural work before entering canonical Arrow metadata methods.
+        let field_bytes = novarocks_type_contract::owned_resources::type_representation::arrow_field_retained_bytes(&self.0.field)
+            .ok_or(ConstantError::Limit("constant field representation byte count overflow"))?;
+        let type_bytes = novarocks_type_contract::owned_resources::type_representation::function_value_type_retained_bytes(&self.0.value_type)
+            .ok_or(ConstantError::Limit("constant type representation byte count overflow"))?;
+        let mut units = facts
+            .array_nodes
+            .checked_add(facts.buffer_count)
+            .and_then(|nodes| nodes.checked_mul(4))
+            .and_then(|units| units.checked_add(u64::try_from(field_bytes).ok()?))
+            .and_then(|units| units.checked_add(u64::try_from(type_bytes).ok()?))
+            .ok_or(ConstantError::Limit(
+                "constant representation work count overflow",
+            ))?;
+        while units != 0 {
+            let batch = units.min(u64::from(u32::MAX)) as u32;
+            control.checkpoint(CompilePhase::Validate, batch)?;
+            units -= u64::from(batch);
+        }
+        let array_structure = self
+            .0
+            .array
+            .get_array_memory_size()
+            .checked_sub(self.0.array.get_buffer_memory_size());
+        let data_structure = self
+            .0
+            .data
+            .get_array_memory_size()
+            .checked_sub(self.0.data.get_buffer_memory_size());
+        let retained = (|| {
+            let mut bytes = Self::backing_allocation_layout().size();
+            let array_layout = std::alloc::Layout::for_value(self.0.array.as_ref());
+            let array_arc_header =
+                novarocks_type_contract::owned_resources::layout::arc_layout(array_layout)
+                    .ok()?
+                    .size()
+                    .checked_sub(array_layout.size())?;
+            for value in [
+                array_arc_header,
+                array_structure?,
+                data_structure?,
+                field_bytes,
+                type_bytes,
+                usize::try_from(facts.retained_buffer_capacity_bytes).ok()?,
+                self.source_retained_bytes().unwrap_or(0),
+            ] {
+                bytes = bytes.checked_add(value)?;
+            }
+            Some(bytes)
+        })();
+        let retained = retained.ok_or(ConstantError::Limit(
+            "constant retained representation byte count overflow",
+        ))?;
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        Ok(retained)
+    }
     pub fn value(&self, ordinal: u32) -> Result<ConstantValue, ConstantError> {
         if u64::from(ordinal) >= self.0.facts.rows {
             return Err(ConstantError::Invalid(

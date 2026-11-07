@@ -5,7 +5,7 @@ NULL
 
 -- query 20
 -- types	varchar
-group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
+_col0
 NULL
 NULL
 22
@@ -16,7 +16,7 @@ NULL
 
 -- query 22
 -- types	varchar
-group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
+_col0
 NULL
 NULL
 22
@@ -27,17 +27,17 @@ NULL
 
 -- query 23
 -- types	varchar
-group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
+_col0
 22,78,80,90,98,98,99
 
 -- query 24
 -- types	varchar
-group_concat(name SEPARATOR ',')
+_col0
 Tom,Tom
 
 -- query 25
 -- types	varchar
-group_concat(DISTINCT name SEPARATOR ',')
+_col0
 Tom
 
 -- query 26

@@ -31,8 +31,8 @@ use super::constant_node::{
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-        Float32Array, Float64Array, Int8Array, Int64Array, StringArray, TimestampMicrosecondArray,
-        new_null_array,
+        Float32Array, Float64Array, Int8Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray, new_null_array,
     },
     datatypes::{DataType, Schema},
     record_batch::{RecordBatch, RecordBatchOptions},
@@ -519,7 +519,10 @@ fn assert_array(actual: &ArrayRef, expected: &ArrayRef) {
         }
     }
 }
-fn int(value: Option<i64>) -> ArrayRef {
+fn int(value: Option<i32>) -> ArrayRef {
+    Arc::new(Int32Array::from(vec![value]))
+}
+fn bigint(value: Option<i64>) -> ArrayRef {
     Arc::new(Int64Array::from(vec![value]))
 }
 fn boolean(value: Option<bool>) -> ArrayRef {
@@ -674,21 +677,21 @@ fn constant_entry_every_family_matches_real_noop_sql_constant_root() {
             "if(FALSE, CAST(NULL AS BIGINT), 22)",
             Family::Call("builtin.scalar/if/v1"),
             true,
-            vec![boolean(Some(false)), int(None), int(Some(22))],
-            int(Some(22)),
+            vec![boolean(Some(false)), bigint(None), bigint(Some(22))],
+            bigint(Some(22)),
         ),
         (
             "coalesce(CAST(NULL AS BIGINT), CAST(NULL AS BIGINT))",
             Family::Call("builtin.scalar/coalesce/v1"),
             true,
-            vec![int(None), int(None)],
-            int(None),
+            vec![bigint(None), bigint(None)],
+            bigint(None),
         ),
         (
             "CAST(NULL AS BIGINT) <=> CAST(NULL AS BIGINT)",
             Family::NullSafe,
             false,
-            vec![int(None), int(None)],
+            vec![bigint(None), bigint(None)],
             boolean(Some(true)),
         ),
         (
@@ -786,18 +789,16 @@ fn constant_entry_actual_largeint_conversion_then_carrier_tail_preserves_value_a
     // LARGEINT -> signed widths is a direct value conversion, so it cannot
     // honestly stand in for a conversion+tail. The actual SQL author explicitly
     // composes LARGEINT -> BIGINT -> DATETIME (see conversion_intermediate_type).
-    // Both integers exceed i64::MAX and are genuine LARGEINT literals. Their
-    // exact difference is 20200102030405, authored LargeInt by real arithmetic.
-    // F3 retains the nominal same-carrier CAST boundary (spec 1.3/5.6/6.4);
-    // introducing CAST(... AS LARGEINT) here would test that separate refusal,
-    // rather than the admitted value-conversion and DATETIME carrier tail.
+    // Both operands exceed i64::MAX, so explicit text -> LARGEINT supplies
+    // their original exact nominal domain. Their independently fixed difference
+    // remains 20200102030405; no ordinary out-of-range literal is admitted.
     for (expression, value, expected) in [
         (
-            "CAST(9223392236956806213 - 9223372036854775808 AS DATETIME)".to_owned(),
+            "CAST(CAST('9223392236956806213' AS LARGEINT) - CAST('9223372036854775808' AS LARGEINT) AS DATETIME)".to_owned(),
             20_200_102_030_405_i128,
             Some(1_577_934_245_000_000_i64),
         ),
-        (format!("CAST({} AS DATETIME)", i128::MAX), i128::MAX, None),
+        (format!("CAST(CAST('{}' AS LARGEINT) AS DATETIME)", i128::MAX), i128::MAX, None),
     ] {
         let fixture = Fixture::compile(&expression, Family::Carrier, "32", &functions);
         let (source, conversion) =

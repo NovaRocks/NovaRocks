@@ -137,7 +137,7 @@ SELECT
   CAST(trc2_output.c5 AS VARCHAR) AS c5,
   trc2_output.`sum(c1)`
 FROM (
-  select c5, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1
+  select c5, sum(c1) AS `sum(c1)` from all_t0 group by 1 order by 1, 2 limit 3, 1
 ) AS trc2_output
 ORDER BY trc2_output.c5, trc2_output.`sum(c1)`;
 
@@ -179,7 +179,7 @@ SELECT
   CAST(trc2_output.c17 AS VARCHAR) AS c17,
   trc2_output.`sum(c1)`
 FROM (
-  select c17, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1
+  select c17, sum(c1) AS `sum(c1)` from all_t0 group by 1 order by 1, 2 limit 3, 1
 ) AS trc2_output
 ORDER BY trc2_output.c17, trc2_output.`sum(c1)`;
 
@@ -209,7 +209,7 @@ SELECT
   CAST(trc2_output.c5 AS VARCHAR) AS c5,
   trc2_output.`sum(c1)`
 FROM (
-  select c5, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1
+  select c5, sum(c1) AS `sum(c1)` from all_t0 group by 1 order by 1 desc, 2 desc limit 1
 ) AS trc2_output
 ORDER BY trc2_output.c5 desc, trc2_output.`sum(c1)` desc;
 
@@ -251,7 +251,7 @@ SELECT
   CAST(trc2_output.c17 AS VARCHAR) AS c17,
   trc2_output.`sum(c1)`
 FROM (
-  select c17, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1
+  select c17, sum(c1) AS `sum(c1)` from all_t0 group by 1 order by 1 desc, 2 desc limit 1
 ) AS trc2_output
 ORDER BY trc2_output.c17 desc, trc2_output.`sum(c1)` desc;
 
@@ -274,7 +274,7 @@ SELECT
   CAST(trc2_output.c5 AS VARCHAR) AS c5,
   trc2_output.`sum(c1)`
 FROM (
-  select c3, c5, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1
+  select c3, c5, sum(c1) AS `sum(c1)` from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1
 ) AS trc2_output
 ORDER BY trc2_output.c3, trc2_output.c5, trc2_output.`sum(c1)`;
 
@@ -294,7 +294,7 @@ SELECT
   trc2_output.c8,
   trc2_output.`sum(c1)`
 FROM (
-  select c1,c2,c3,c4,c5,c6,c8,sum(c1) from all_t0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 30, 1
+  select c1,c2,c3,c4,c5,c6,c8,sum(c1) AS `sum(c1)` from all_t0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 30, 1
 ) AS trc2_output
 ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.`sum(c1)`;
 
@@ -314,7 +314,7 @@ SELECT
   trc2_output.c16,
   trc2_output.`sum(c1)`
 FROM (
-  select c1,c2,c3,c4,c5,c6,c8,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11 order by 1,2,3,4,5,6,7,8,9,10,11 limit 30, 1
+  select c1,c2,c3,c4,c5,c6,c8,c13,c14,c15,c16, sum(c1) AS `sum(c1)` from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11 order by 1,2,3,4,5,6,7,8,9,10,11 limit 30, 1
 ) AS trc2_output
 ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.c13, trc2_output.c14, trc2_output.c15, trc2_output.c16;
 
@@ -336,7 +336,7 @@ SELECT
   trc2_output.c16,
   trc2_output.`sum(c1)`
 FROM (
-  select c1,c2,c3,c4,c5,c6,c8,c11,c12,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11,12,13 order by 1,2,3,4,5,6,7,8,9,10,11,12,13 limit 30,1
+  select c1,c2,c3,c4,c5,c6,c8,c11,c12,c13,c14,c15,c16, sum(c1) AS `sum(c1)` from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11,12,13 order by 1,2,3,4,5,6,7,8,9,10,11,12,13 limit 30,1
 ) AS trc2_output
 ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.c11, trc2_output.c12, trc2_output.c13, trc2_output.c14, trc2_output.c15, trc2_output.c16;
 
@@ -352,7 +352,7 @@ SELECT
   trc2_output.c8,
   trc2_output.`sum(c1)`
 FROM (
-  select c1,c2,c3,c4,c5,c6,c8, sum(c1) from all_t0 where c10 > 0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 1
+  select c1,c2,c3,c4,c5,c6,c8, sum(c1) AS `sum(c1)` from all_t0 where c10 > 0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 1
 ) AS trc2_output
 ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.`sum(c1)`;
 
@@ -452,7 +452,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- query 67
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (-128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728, -128, -32768, -2147483648, -9223372036854775808, -170141183460469231731687303715884105728);
+insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (-128, -32768, -2147483648, -9223372036854775808, CAST('-170141183460469231731687303715884105728' AS LARGEINT), -128, -32768, -2147483648, -9223372036854775808, CAST('-170141183460469231731687303715884105728' AS LARGEINT));
 
 -- query 68
 -- @skip_result_check=true
@@ -649,7 +649,7 @@ ORDER BY trc2_output.c17, trc2_output.c16, trc2_output.c15, trc2_output.c14, trc
 -- query 92
 -- @skip_result_check=true
 USE ${case_db};
-insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727, 127, 32767, 2147483647, 9223372036854775807, 170141183460469231731687303715884105727);
+insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values (127, 32767, 2147483647, 9223372036854775807, CAST('170141183460469231731687303715884105727' AS LARGEINT), 127, 32767, 2147483647, 9223372036854775807, CAST('170141183460469231731687303715884105727' AS LARGEINT));
 
 -- query 93
 USE ${case_db};

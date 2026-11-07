@@ -1,117 +1,117 @@
 -- query 2
 -- types	varbinary
-to_binary('ab', 'HEX')
+_col0
 qw==
 
 -- query 3
 -- types	varbinary
-to_binary('ab', 'hex')
+_col0
 qw==
 
 -- query 4
 -- types	varbinary
-to_binary('qw==', 'ENCODE64')
+_col0
 qw==
 
 -- query 5
 -- types	varbinary
-to_binary('qw==', 'encode64')
+_col0
 qw==
 
 -- query 6
 -- types	varbinary
-to_binary('ab', 'utf8')
+_col0
 YWI=
 
 -- query 7
 -- types	varbinary
-to_binary('ab', 'UTF8')
+_col0
 YWI=
 
 -- query 8
 -- legacy
-from_binary(to_binary('ab', 'utf8'), 'utf8')
+_col0
 ab
 
 -- query 9
 -- legacy
-from_binary(to_binary('ab', 'hex'), 'hex')
+_col0
 AB
 
 -- query 10
 -- legacy
-from_binary(to_binary('ab', 'hex'), 'encode64')
+_col0
 qw==
 
 -- query 13
 -- types	varbinary
-to_binary('', 'encode64')
+_col0
 NULL
 
 -- query 14
 -- types	varbinary
-to_binary('1', 'hex')
+_col0
 NULL
 
 -- query 15
 -- types	varbinary
-to_binary('XY', 'hex')
+_col0
 NULL
 
 -- query 16
 -- types	varbinary
-to_binary('XYZ0', 'hex')
+_col0
 NULL
 
 -- query 17
 -- types	varbinary
-to_binary('1', 'encode64')
+_col0
 NULL
 
 -- query 18
 -- legacy
-from_binary(to_binary('X', 'hex'), 'hex')
+_col0
 NULL
 
 -- query 19
 -- legacy
-from_binary(to_binary('0X', 'hex'), 'hex')
+_col0
 NULL
 
 -- query 20
 -- legacy
-from_binary(to_binary('1', 'encode64'), 'hex')
+_col0
 NULL
 
 -- query 23
 -- legacy
-from_binary(c1, 'hex')	from_binary(to_binary(c2, 'hex'), 'hex')
+_col0	_col1
 AB01	AB01
 
 -- query 24
 -- legacy
-hex(from_binary(c1, 'utf8'))	from_binary(to_binary(c2, 'encode64'), 'hex')
+_col0	_col1
 AB01	69BD35
 
 -- query 25
 -- legacy
-from_binary(c1, 'encode64')	from_binary(to_binary(c2, 'utf8'), 'hex')
+_col0	_col1
 qwE=	61623031
 
 -- query 27
 -- legacy
-from_binary(c1, 'hex')	from_binary(to_binary(c2, 'hex'), 'hex')
+_col0	_col1
 AB01	AB01
 ABAB	ABAB
 
 -- query 28
 -- legacy
-hex(from_binary(c1, 'utf8'))	from_binary(to_binary(c2, 'encode64'), 'hex')
+_col0	_col1
 AB01	69BD35
 ABAB	69B69B
 
 -- query 29
 -- legacy
-from_binary(c1, 'encode64')	from_binary(to_binary(c2, 'utf8'), 'hex')
+_col0	_col1
 qwE=	61623031
 q6s=	61626162

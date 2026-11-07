@@ -39,9 +39,11 @@ impl ViewCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         if matches!(statement, novarocks_parser::ast::ViewStatement::Show(_)) {
-            return Err("SHOW VIEWS requires its original governed read source".to_string());
+            return Err("SHOW VIEWS requires its original governed read source"
+                .to_string()
+                .into());
         }
         self.kernel
             .view_service()

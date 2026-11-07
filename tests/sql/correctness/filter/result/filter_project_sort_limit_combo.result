@@ -1,5 +1,5 @@
 -- query 4
--- types	varchar	bigint
+-- types	varchar	integer
 name	revenue
 apple	24
 carrot	14

@@ -159,14 +159,14 @@ impl Error for ArithmeticPrepareError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SignedWidth {
+pub(crate) enum SignedWidth {
     I8,
     I16,
     I32,
     I64,
 }
 impl SignedWidth {
-    fn from_type(ty: &FunctionValueType) -> Option<Self> {
+    pub(crate) fn from_type(ty: &FunctionValueType) -> Option<Self> {
         if ty.logical_type() != ValueLogicalType::Physical {
             return None;
         }
@@ -181,7 +181,7 @@ impl SignedWidth {
             _ => return None,
         })
     }
-    fn validate(self, array: &dyn Array) -> bool {
+    pub(crate) fn validate(self, array: &dyn Array) -> bool {
         match self {
             Self::I8 => array.as_any().is::<Int8Array>(),
             Self::I16 => array.as_any().is::<Int16Array>(),
@@ -189,7 +189,23 @@ impl SignedWidth {
             Self::I64 => array.as_any().is::<Int64Array>(),
         }
     }
-    fn read(self, array: &dyn Array, row: usize) -> Result<i64, KernelFailure> {
+    pub(crate) fn minimum(self) -> i64 {
+        match self {
+            Self::I8 => i64::from(i8::MIN),
+            Self::I16 => i64::from(i16::MIN),
+            Self::I32 => i64::from(i32::MIN),
+            Self::I64 => i64::MIN,
+        }
+    }
+    fn contains(self, value: i64) -> bool {
+        match self {
+            Self::I8 => i8::try_from(value).is_ok(),
+            Self::I16 => i16::try_from(value).is_ok(),
+            Self::I32 => i32::try_from(value).is_ok(),
+            Self::I64 => true,
+        }
+    }
+    pub(crate) fn read(self, array: &dyn Array, row: usize) -> Result<i64, KernelFailure> {
         macro_rules! read {
             ($array:ty) => {
                 array
@@ -235,6 +251,7 @@ enum ArithmeticAlgorithm {
     Signed {
         left: SignedWidth,
         right: SignedWidth,
+        result: SignedWidth,
     },
     Decimal(decimal::DecimalArithmetic),
     LargeInt(largeint::LargeIntArithmetic),
@@ -243,7 +260,9 @@ enum ArithmeticAlgorithm {
 impl ArithmeticAlgorithm {
     fn validate(&self, array: &dyn Array, left: bool) -> Result<(), KernelFailure> {
         match self {
-            Self::Signed { left: l, right: r } => {
+            Self::Signed {
+                left: l, right: r, ..
+            } => {
                 if (if left { *l } else { *r }).validate(array) {
                     Ok(())
                 } else {
@@ -357,7 +376,12 @@ impl PreparedArithmeticRecipe {
             let algorithm = if let (Some(left), Some(right)) =
                 (SignedWidth::from_type(left), SignedWidth::from_type(right))
             {
-                ArithmeticAlgorithm::Signed { left, right }
+                ArithmeticAlgorithm::Signed {
+                    left,
+                    right,
+                    result: SignedWidth::from_carrier(&expected.0)
+                        .ok_or(ArithmeticPrepareError::TypeMismatch)?,
+                }
             } else if let Some(recipe) = float::FloatArithmetic::prepare(
                 operator,
                 left,
@@ -438,12 +462,8 @@ impl PreparedArithmeticRecipe {
     }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let effects = match &self.algorithm {
-            ArithmeticAlgorithm::Signed { left, right } => ExpressionEffects {
-                may_raise_row_error: match self.operator {
-                    ArithmeticOperator::Modulo => true,
-                    ArithmeticOperator::Divide => false,
-                    _ => *left == SignedWidth::I64 || *right == SignedWidth::I64,
-                },
+            ArithmeticAlgorithm::Signed { .. } => ExpressionEffects {
+                may_raise_row_error: true,
                 ..ExpressionEffects::PURE_VALUE
             },
             ArithmeticAlgorithm::Decimal(recipe) => recipe.own_effects(),
@@ -503,6 +523,7 @@ impl PreparedArithmeticRecipe {
                 ArithmeticAlgorithm::Signed {
                     left: left_width,
                     right: right_width,
+                    result: result_width,
                 } => {
                     let l = left_width.read(left.array().as_ref(), l)?;
                     work.step()?;
@@ -510,24 +531,27 @@ impl PreparedArithmeticRecipe {
                     work.step()?;
                     use ArithmeticOperator::*;
                     let output = match self.operator {
-                        Divide if r == 0 => ArithmeticRowResult::Null,
-                        Divide => ArithmeticRowResult::Float((l as f64) / (r as f64)),
-                        Modulo if r == 0 => ArithmeticRowResult::RowError(RowDataError::new(
-                            left_ordinal,
-                            "Divide by zero error",
-                        )),
+                        Divide | Modulo if r == 0 => {
+                            ArithmeticRowResult::RowError(RowDataError::with_reason(
+                                left_ordinal,
+                                crate::DataFailureReason::DivisionByZero,
+                                "Division by zero",
+                            ))
+                        }
                         Modulo => ArithmeticRowResult::Signed(l.wrapping_rem(r)),
-                        Add | Subtract | Multiply => {
+                        Add | Subtract | Multiply | Divide => {
                             let (value, symbol) = match self.operator {
                                 Add => (l.checked_add(r), '+'),
                                 Subtract => (l.checked_sub(r), '-'),
                                 Multiply => (l.checked_mul(r), '*'),
+                                Divide => (l.checked_div(r), '/'),
                                 _ => unreachable!("checked signed arithmetic operation"),
                             };
-                            match value {
+                            match value.filter(|value| result_width.contains(*value)) {
                                 Some(value) => ArithmeticRowResult::Signed(value),
-                                None => ArithmeticRowResult::RowError(RowDataError::new(
+                                None => ArithmeticRowResult::RowError(RowDataError::with_reason(
                                     left_ordinal,
+                                    crate::DataFailureReason::NumericOutOfRange,
                                     &format!(
                                         "Arithmetic overflow: Overflow happened on: {l:?} {symbol} {r:?}"
                                     ),

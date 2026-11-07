@@ -1053,6 +1053,58 @@ pub(crate) struct IcebergPreparedTableFacts {
     generation_owner: Arc<GenerationOwner>,
 }
 
+struct IcebergPreparedViewFacts {
+    request: novarocks_spi::connector::ConnectorViewRequest,
+    metadata: crate::iceberg::spec::ViewMetadata,
+    incarnation: ProviderBindingEpoch,
+    generation_owner: Arc<GenerationOwner>,
+}
+impl IcebergMetadata {
+    pub(crate) fn prepared_view_facts(
+        &self,
+        request: novarocks_spi::connector::ConnectorViewRequest,
+        metadata: crate::iceberg::spec::ViewMetadata,
+    ) -> novarocks_spi::connector::ConnectorViewPreparation {
+        novarocks_spi::connector::ConnectorViewPreparation::new(
+            &self.descriptor,
+            self.incarnation,
+            IcebergPreparedViewFacts {
+                request,
+                metadata,
+                incarnation: self.incarnation,
+                generation_owner: Arc::clone(&self.generation_owner),
+            },
+        )
+    }
+    pub(crate) fn create_prepared_view_metadata(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorViewPreparation,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let facts = preparation
+            .into_facts::<IcebergPreparedViewFacts>(&self.descriptor, self.incarnation)?;
+        if facts.incarnation != self.incarnation
+            || !Arc::ptr_eq(&facts.generation_owner, &self.generation_owner)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "prepared view belongs to another exact Iceberg generation",
+            )
+            .into());
+        }
+        pure_catalog_control(&facts.request.context)
+            .map_err(novarocks_connector_contract::PureProviderCompileError::Control)?;
+        crate::catalog_control::views::materialize_view_metadata(
+            facts.request,
+            &facts.metadata,
+            creation,
+        )
+    }
+}
+
 impl IcebergPreparedTableFacts {
     pub(crate) fn rewrite_physical_table(&self) -> &crate::iceberg::table::Table {
         &self.loaded.table

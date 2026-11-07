@@ -1,83 +1,83 @@
 -- query 4
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+_col0	_col1	_col2	_col3	_col4
 15	60	65	40	50
 
 -- query 5
 -- legacy
-sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+_col0	_col1	_col2
 150	450	500
 
 -- query 6
 -- legacy
-sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+_col0	_col1	_col2
 2	3.5	5.5
 
 -- query 7
 -- legacy
-c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+c1	_col1	_col2	_col3	_col4	_col5
 1	10	20	30	NULL	NULL
 2	5	15	NULL	40	NULL
 3	NULL	25	35	NULL	50
 
 -- query 8
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]
+_col0	_col1	_col2	_col3
 15	35	30	40
 
 -- query 10
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+_col0	_col1	_col2	_col3	_col4
 15	60	65	40	50
 
 -- query 12
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+_col0	_col1	_col2	_col3	_col4
 15	60	65	40	50
 
 -- query 13
 -- legacy
-sum_map(c2)[1]
+_col0
 15
 
 -- query 14
 -- legacy
-sum_map(c2)[2]
+_col0
 60
 
 -- query 15
 -- legacy
-sum_map(c2)[3]
+_col0
 65
 
 -- query 16
 -- legacy
-sum_map(c2)[4]
+_col0
 40
 
 -- query 17
 -- legacy
-sum_map(c2)[5]
+_col0
 50
 
 -- query 19
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+_col0	_col1	_col2	_col3	_col4
 15	60	65	40	50
 
 -- query 20
 -- legacy
-sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+_col0	_col1	_col2
 150	450	500
 
 -- query 21
 -- legacy
-sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+_col0	_col1	_col2
 2	3.5	5.5
 
 -- query 22
 -- legacy
-c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+c1	_col1	_col2	_col3	_col4	_col5
 1	10	20	30	NULL	NULL
 2	5	15	NULL	40	NULL
 3	NULL	25	35	NULL	50
@@ -86,22 +86,22 @@ c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
 
 -- query 24
 -- legacy
-sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+_col0	_col1	_col2	_col3	_col4
 15	60	65	40	50
 
 -- query 25
 -- legacy
-sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+_col0	_col1	_col2
 150	450	500
 
 -- query 26
 -- legacy
-sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+_col0	_col1	_col2
 2	3.5	5.5
 
 -- query 27
 -- legacy
-c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+c1	_col1	_col2	_col3	_col4	_col5
 1	10	20	30	NULL	NULL
 2	5	15	NULL	40	NULL
 3	NULL	25	35	NULL	50
@@ -110,132 +110,132 @@ c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
 
 -- query 31
 -- legacy
-sum_map(m_tinyint)[1]	sum_map(m_tinyint)[2]	sum_map(m_tinyint)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 32
 -- legacy
-sum_map(m_smallint)[1]	sum_map(m_smallint)[2]	sum_map(m_smallint)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 33
 -- legacy
-sum_map(m_int)[1]	sum_map(m_int)[2]	sum_map(m_int)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 34
 -- legacy
-sum_map(m_bigint)[1]	sum_map(m_bigint)[2]	sum_map(m_bigint)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 35
 -- legacy
-sum_map(m_largeint)[1]	sum_map(m_largeint)[2]	sum_map(m_largeint)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 36
 -- legacy
-sum_map(m_float)[1]	sum_map(m_float)[2]	sum_map(m_float)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 37
 -- legacy
-sum_map(m_double)[1]	sum_map(m_double)[2]	sum_map(m_double)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 40
 -- legacy
-sum_map(m_key_tinyint)[1]	sum_map(m_key_tinyint)[2]	sum_map(m_key_tinyint)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 41
 -- legacy
-sum_map(m_key_smallint)[1]	sum_map(m_key_smallint)[2]	sum_map(m_key_smallint)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 42
 -- legacy
-sum_map(m_key_int)[1]	sum_map(m_key_int)[2]	sum_map(m_key_int)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 43
 -- legacy
-sum_map(m_key_bigint)[1]	sum_map(m_key_bigint)[2]	sum_map(m_key_bigint)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 44
 -- legacy
-sum_map(m_key_largeint)[1]	sum_map(m_key_largeint)[2]	sum_map(m_key_largeint)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 45
 -- legacy
-sum_map(m_key_varchar)['a']	sum_map(m_key_varchar)['b']	sum_map(m_key_varchar)['c']
+_col0	_col1	_col2
 15	20	30
 
 -- query 46
 -- legacy
-sum_map(NULL)
+_col0
 NULL
 
 -- query 47
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 48
 -- legacy
-sum_map(m)
+_col0
 NULL
 
 -- query 51
 -- legacy
-sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[NULL]
+_col0	_col1	_col2	_col3
 15	20	30	NULL
 
 -- query 53
 -- legacy
-sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[NULL]
+_col0	_col1	_col2	_col3	_col4
 30	20	30	40	NULL
 
 -- query 55
 -- legacy
-sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[5]	sum_map(m_nullable)[6]	sum_map(m_nullable)[NULL]
+_col0	_col1	_col2	_col3	_col4	_col5	_col6
 30	20	30	40	NULL	60	NULL
 
 -- query 56
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]
+_col0	_col1
 10	20
 
 -- query 57
 -- legacy
-sum_map(m)
+_col0
 {}
 
 -- query 58
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]
+_col0	_col1
 15	20
 
 -- query 59
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[5]	sum_map(m)[10]
+_col0	_col1	_col2	_col3
 2	4	10	20
 
 -- query 60
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]	sum_map(m)[4]
+_col0	_col1	_col2	_col3
 -5	5	-30	40
 
 -- query 61
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]
+_col0	_col1
 5	10
 
 -- query 67
 -- legacy
-category	sum_map(metrics)['clicks']	sum_map(metrics)['views']	sum_map(metrics)['impressions']	count(*)
+category	_col1	_col2	_col3	_col4
 A	150	200	150	2
 B	75	400	250	2
 
@@ -247,270 +247,270 @@ B	75	400	250
 
 -- query 69
 -- legacy
-sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]
+_col0	_col1	_col2
 25	45	65
 
 -- query 72
 -- legacy
-sum_map(data)[1]	sum_map(data)[2]	sum_map(data)[3]
+_col0	_col1	_col2
 5050	10100	15150
 
 -- query 76
 -- legacy
-sum_map(m_ti_ti)[1]	sum_map(m_ti_ti)[2]	sum_map(m_ti_ti)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 77
 -- legacy
-sum_map(m_ti_si)[1]	sum_map(m_ti_si)[2]	sum_map(m_ti_si)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 78
 -- legacy
-sum_map(m_ti_i)[1]	sum_map(m_ti_i)[2]	sum_map(m_ti_i)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 79
 -- legacy
-sum_map(m_ti_bi)[1]	sum_map(m_ti_bi)[2]	sum_map(m_ti_bi)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 80
 -- legacy
-sum_map(m_ti_li)[1]	sum_map(m_ti_li)[2]	sum_map(m_ti_li)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 81
 -- legacy
-sum_map(m_ti_f)[1]	sum_map(m_ti_f)[2]	sum_map(m_ti_f)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 82
 -- legacy
-sum_map(m_ti_d)[1]	sum_map(m_ti_d)[2]	sum_map(m_ti_d)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 83
 -- legacy
-sum_map(m_si_ti)[1]	sum_map(m_si_ti)[2]	sum_map(m_si_ti)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 84
 -- legacy
-sum_map(m_si_si)[1]	sum_map(m_si_si)[2]	sum_map(m_si_si)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 85
 -- legacy
-sum_map(m_si_i)[1]	sum_map(m_si_i)[2]	sum_map(m_si_i)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 86
 -- legacy
-sum_map(m_si_bi)[1]	sum_map(m_si_bi)[2]	sum_map(m_si_bi)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 87
 -- legacy
-sum_map(m_si_li)[1]	sum_map(m_si_li)[2]	sum_map(m_si_li)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 88
 -- legacy
-sum_map(m_si_f)[1]	sum_map(m_si_f)[2]	sum_map(m_si_f)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 89
 -- legacy
-sum_map(m_si_d)[1]	sum_map(m_si_d)[2]	sum_map(m_si_d)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 90
 -- legacy
-sum_map(m_i_ti)[1]	sum_map(m_i_ti)[2]	sum_map(m_i_ti)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 91
 -- legacy
-sum_map(m_i_si)[1]	sum_map(m_i_si)[2]	sum_map(m_i_si)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 92
 -- legacy
-sum_map(m_i_i)[1]	sum_map(m_i_i)[2]	sum_map(m_i_i)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 93
 -- legacy
-sum_map(m_i_bi)[1]	sum_map(m_i_bi)[2]	sum_map(m_i_bi)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 94
 -- legacy
-sum_map(m_i_li)[1]	sum_map(m_i_li)[2]	sum_map(m_i_li)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 95
 -- legacy
-sum_map(m_i_f)[1]	sum_map(m_i_f)[2]	sum_map(m_i_f)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 96
 -- legacy
-sum_map(m_i_d)[1]	sum_map(m_i_d)[2]	sum_map(m_i_d)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 97
 -- legacy
-sum_map(m_bi_ti)[1]	sum_map(m_bi_ti)[2]	sum_map(m_bi_ti)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 98
 -- legacy
-sum_map(m_bi_si)[1]	sum_map(m_bi_si)[2]	sum_map(m_bi_si)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 99
 -- legacy
-sum_map(m_bi_i)[1]	sum_map(m_bi_i)[2]	sum_map(m_bi_i)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 100
 -- legacy
-sum_map(m_bi_bi)[1]	sum_map(m_bi_bi)[2]	sum_map(m_bi_bi)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 101
 -- legacy
-sum_map(m_bi_li)[1]	sum_map(m_bi_li)[2]	sum_map(m_bi_li)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 102
 -- legacy
-sum_map(m_bi_f)[1]	sum_map(m_bi_f)[2]	sum_map(m_bi_f)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 103
 -- legacy
-sum_map(m_bi_d)[1]	sum_map(m_bi_d)[2]	sum_map(m_bi_d)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 104
 -- legacy
-sum_map(m_li_ti)[1]	sum_map(m_li_ti)[2]	sum_map(m_li_ti)[3]
+_col0	_col1	_col2
 15	20	30
 
 -- query 105
 -- legacy
-sum_map(m_li_si)[1]	sum_map(m_li_si)[2]	sum_map(m_li_si)[3]
+_col0	_col1	_col2
 150	200	300
 
 -- query 106
 -- legacy
-sum_map(m_li_i)[1]	sum_map(m_li_i)[2]	sum_map(m_li_i)[3]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 107
 -- legacy
-sum_map(m_li_bi)[1]	sum_map(m_li_bi)[2]	sum_map(m_li_bi)[3]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 108
 -- legacy
-sum_map(m_li_li)[1]	sum_map(m_li_li)[2]	sum_map(m_li_li)[3]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 109
 -- legacy
-sum_map(m_li_f)[1]	sum_map(m_li_f)[2]	sum_map(m_li_f)[3]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 110
 -- legacy
-sum_map(m_li_d)[1]	sum_map(m_li_d)[2]	sum_map(m_li_d)[3]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 111
 -- legacy
-sum_map(m_f_ti)[1.0]	sum_map(m_f_ti)[2.0]	sum_map(m_f_ti)[3.0]
+_col0	_col1	_col2
 15	20	30
 
 -- query 112
 -- legacy
-sum_map(m_f_si)[1.0]	sum_map(m_f_si)[2.0]	sum_map(m_f_si)[3.0]
+_col0	_col1	_col2
 150	200	300
 
 -- query 113
 -- legacy
-sum_map(m_f_i)[1.0]	sum_map(m_f_i)[2.0]	sum_map(m_f_i)[3.0]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 114
 -- legacy
-sum_map(m_f_bi)[1.0]	sum_map(m_f_bi)[2.0]	sum_map(m_f_bi)[3.0]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 115
 -- legacy
-sum_map(m_f_li)[1.0]	sum_map(m_f_li)[2.0]	sum_map(m_f_li)[3.0]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 116
 -- legacy
-sum_map(m_f_f)[1.0]	sum_map(m_f_f)[2.0]	sum_map(m_f_f)[3.0]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 117
 -- legacy
-sum_map(m_f_d)[1.0]	sum_map(m_f_d)[2.0]	sum_map(m_f_d)[3.0]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 118
 -- legacy
-sum_map(m_d_ti)[1.0]	sum_map(m_d_ti)[2.0]	sum_map(m_d_ti)[3.0]
+_col0	_col1	_col2
 15	20	30
 
 -- query 119
 -- legacy
-sum_map(m_d_si)[1.0]	sum_map(m_d_si)[2.0]	sum_map(m_d_si)[3.0]
+_col0	_col1	_col2
 150	200	300
 
 -- query 120
 -- legacy
-sum_map(m_d_i)[1.0]	sum_map(m_d_i)[2.0]	sum_map(m_d_i)[3.0]
+_col0	_col1	_col2
 1500	2000	3000
 
 -- query 121
 -- legacy
-sum_map(m_d_bi)[1.0]	sum_map(m_d_bi)[2.0]	sum_map(m_d_bi)[3.0]
+_col0	_col1	_col2
 15000	20000	30000
 
 -- query 122
 -- legacy
-sum_map(m_d_li)[1.0]	sum_map(m_d_li)[2.0]	sum_map(m_d_li)[3.0]
+_col0	_col1	_col2
 150000	200000	300000
 
 -- query 123
 -- legacy
-sum_map(m_d_f)[1.0]	sum_map(m_d_f)[2.0]	sum_map(m_d_f)[3.0]
+_col0	_col1	_col2
 2	2.5	3.5
 
 -- query 124
 -- legacy
-sum_map(m_d_d)[1.0]	sum_map(m_d_d)[2.0]	sum_map(m_d_d)[3.0]
+_col0	_col1	_col2
 16	20.5	30.5
 
 -- query 125
 -- legacy
-sum_map(m_date_i)['2024-01-01']	sum_map(m_date_i)['2024-01-02']	sum_map(m_date_i)['2024-01-03']
+_col0	_col1	_col2
 150	200	300
 
 -- query 126
 -- legacy
-sum_map(m_dt_i)['2024-01-01 10:00:00']	sum_map(m_dt_i)['2024-01-01 11:00:00']	sum_map(m_dt_i)['2024-01-01 12:00:00']
+_col0	_col1	_col2
 150	200	300
 
 -- query 127
 -- legacy
-sum_map(m_str_i)['a']	sum_map(m_str_i)['b']	sum_map(m_str_i)['c']
+_col0	_col1	_col2
 150	200	300

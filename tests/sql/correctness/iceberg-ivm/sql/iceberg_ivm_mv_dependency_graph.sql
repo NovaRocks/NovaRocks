@@ -129,7 +129,7 @@ DROP MATERIALIZED VIEW mv_orders_${uuid0};
 -- @cleanup=true
 -- Drop downstream first, then upstream becomes droppable.
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW mv_region_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS mv_region_${uuid0};
 DROP MATERIALIZED VIEW mv_orders_${uuid0};
 DROP TABLE ice_ivm_dep_${uuid0}.dep_${uuid0}.orders_${uuid0} FORCE;
 DROP DATABASE ice_ivm_dep_${uuid0}.dep_${uuid0};

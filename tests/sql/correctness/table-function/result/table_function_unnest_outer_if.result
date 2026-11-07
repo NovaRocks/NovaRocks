@@ -1,5 +1,5 @@
 -- query 1
--- types	bigint	tinyint
+-- types	bigint	integer
 id	x
 1	10
 1	20

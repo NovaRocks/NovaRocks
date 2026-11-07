@@ -2749,7 +2749,25 @@ impl LiveParticipationCore {
         let record = self.tasks.get_mut(&task).ok_or(CoreError::UnknownTask)?;
         if record.state.is_terminal() {
             record.completion_success_pending = false;
+            record.completion_termination_generation = None;
             return Ok(());
+        }
+        if let Some(generation) = record.completion_termination_generation {
+            if generation != self.generation || self.closing.is_none() {
+                return Err(CoreError::WrongIdentity);
+            }
+            if record.applied_close_generation != generation {
+                return Ok(());
+            }
+            if !matches!(
+                record.conclusion.accepted,
+                Some(TaskConclusion::Terminated(_))
+            ) {
+                return Err(CoreError::IllegalFact);
+            }
+            // Only the original applied close can resume this observation.
+            // CompletionExited may arrive first, but grants no success intent.
+            return self.finish_task(task, step);
         }
         if !record.completion_success_pending || !record.actual_stopped {
             return Ok(());
@@ -2839,6 +2857,7 @@ impl LiveParticipationCore {
             );
         }
         record.completion_success_pending = false;
+        record.completion_termination_generation = None;
         self.retire_if_ready(task, step)
     }
     fn flush(&mut self, task: TaskIdentity, step: &mut ParticipationStep) -> Result<(), CoreError> {

@@ -101,7 +101,7 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
 /// Project provider metadata into the immutable facts required by SQL
 /// time-travel analysis.  This conversion is intentionally application-owned:
 /// the compiler never receives an Iceberg `TableMetadata` object.
-fn project_iceberg_ref_metadata(
+pub(crate) fn project_iceberg_ref_metadata(
     facts: &ConnectorReadReferenceFacts,
 ) -> Result<SqlTimeTravelReferenceMetadataFacts, String> {
     let refs = facts

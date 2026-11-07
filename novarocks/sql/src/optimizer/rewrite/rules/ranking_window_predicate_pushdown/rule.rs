@@ -19,14 +19,14 @@ use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
-use crate::common::{BinOp, LiteralValue};
+use crate::common::BinOp;
 use crate::optimizer::operator::{Operator, ScalarWindowSpec, SortOp, WindowOp};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
@@ -341,10 +341,7 @@ fn is_rank_col(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> bool 
 }
 
 fn int_lit(arena: &ScalarArena, expr: ScalarId) -> Option<i64> {
-    match arena.node(expr) {
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(v))) => Some(*v),
-        _ => None,
-    }
+    scalar_expr::signed_integer_literal(arena, expr)
 }
 
 fn conjunct_upper_bound(arena: &ScalarArena, expr: ScalarId, rank_col: ColumnId) -> Option<i64> {

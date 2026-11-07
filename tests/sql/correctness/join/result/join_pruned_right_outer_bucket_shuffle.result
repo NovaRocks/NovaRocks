@@ -1,9 +1,9 @@
 -- query 3
 -- types	bigint
-count(1)
+_col0
 10000
 
 -- query 4
 -- types	bigint
-count(1)
+_col0
 10000

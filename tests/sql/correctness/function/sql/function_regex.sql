@@ -294,23 +294,23 @@ SELECT regexp_position('行成于思str而毁123于随', '',  3, 2);
 -- query 60
 -- VALUES clause inputs
 USE ${case_db};
-SELECT regexp_position(column_0, 'T') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
+SELECT regexp_position(column_0, 'T') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 61
 USE ${case_db};
-SELECT regexp_position(column_0, '61') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
+SELECT regexp_position(column_0, '61') FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 62
 USE ${case_db};
-SELECT regexp_position(column_0, '0', 1, 3) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
+SELECT regexp_position(column_0, '0', 1, 3) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 63
 USE ${case_db};
-SELECT regexp_position(column_0, 'Z', 20) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
+SELECT regexp_position(column_0, 'Z', 20) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 64
 USE ${case_db};
-SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp;
+SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00')) AS tmp(column_0);
 
 -- query 65
 -- @expect_error_tier=target
@@ -318,12 +318,12 @@ SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
-SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ('oops')) AS tmp;
+SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ('oops')) AS tmp(column_0);
 
 -- query 66
 -- NULL input through VALUES
 USE ${case_db};
-SELECT regexp_position(column_0, 'x') FROM (VALUES (NULL)) AS tmp;
+SELECT regexp_position(column_0, 'x') FROM (VALUES (NULL)) AS tmp(column_0);
 
 -- query 67
 -- Setup: create table tsp_general for general-path regexp_position tests

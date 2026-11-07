@@ -388,7 +388,11 @@ impl ConnectorViewMetadata for OwnerViewMetadata {
     fn load_view(
         &self,
         _: ConnectorViewRequest,
-    ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        _: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         unreachable!("control binding construction must not resolve views")
     }
 

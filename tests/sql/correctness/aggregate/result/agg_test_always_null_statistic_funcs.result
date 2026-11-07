@@ -1,31 +1,31 @@
 -- query 6
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 7
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 8
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 9
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 10
 -- types	double
-round(var_samp(c1), 3)
+_col0
 1.0
 
 -- query 11
 -- types	double
-round(var_samp(c1), 3)
+_col0
 1.0
 
 -- query 12
@@ -58,72 +58,72 @@ k	val1	var_samp_val1
 
 -- query 14
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 15
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 16
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 17
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 18
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 19
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 20
 -- types	double
-round(var_samp(val1), 3)
+_col0
 9.167
 
 -- query 21
 -- types	double
-round(var_samp(val1), 3)
+_col0
 13.238
 
 -- query 22
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 23
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 24
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 25
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 26
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 1.0
 
 -- query 27
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 1.0
 
 -- query 28
@@ -156,72 +156,72 @@ k	val1	variance_samp_val1
 
 -- query 30
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 31
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 32
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 33
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 34
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 35
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 36
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 9.167
 
 -- query 37
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 13.238
 
 -- query 38
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 39
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 40
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 41
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 42
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 1.0
 
 -- query 43
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 1.0
 
 -- query 44
@@ -254,87 +254,87 @@ k	val1	stddev_samp_val1
 
 -- query 46
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 47
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 48
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 49
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 50
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 51
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 52
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 3.028
 
 -- query 53
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 3.638
 
 -- query 54
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 55
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 56
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 57
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 58
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 59
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 60
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 61
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 62
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 63
@@ -367,87 +367,87 @@ k	val1	val2	covar_samp_val1
 
 -- query 65
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 66
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 67
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 68
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 69
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 70
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 71
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 91.667
 
 -- query 72
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 155.0
 
 -- query 73
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 74
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 75
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 76
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 77
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 78
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 79
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 80
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 81
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 82
@@ -480,72 +480,72 @@ k	val1	val2	corr_val1
 
 -- query 84
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 85
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 86
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 87
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 88
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 89
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 90
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 1.0
 
 -- query 91
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 1.0
 
 -- query 92
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 93
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 94
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 95
 -- types	double
-round(var_samp(c1), 3)
+_col0
 NULL
 
 -- query 96
 -- types	double
-round(var_samp(c1), 3)
+_col0
 1.0
 
 -- query 97
 -- types	double
-round(var_samp(c1), 3)
+_col0
 1.0
 
 -- query 98
@@ -578,72 +578,72 @@ k	val1	var_samp_val1
 
 -- query 100
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 101
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 102
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 103
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 104
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 105
 -- types	double
-round(var_samp(val1), 3)
+_col0
 NULL
 
 -- query 106
 -- types	double
-round(var_samp(val1), 3)
+_col0
 9.167
 
 -- query 107
 -- types	double
-round(var_samp(val1), 3)
+_col0
 13.238
 
 -- query 108
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 109
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 110
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 111
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 NULL
 
 -- query 112
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 1.0
 
 -- query 113
 -- types	double
-round(variance_samp(c1), 3)
+_col0
 1.0
 
 -- query 114
@@ -676,72 +676,72 @@ k	val1	variance_samp_val1
 
 -- query 116
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 117
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 118
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 119
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 120
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 121
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 NULL
 
 -- query 122
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 9.167
 
 -- query 123
 -- types	double
-round(variance_samp(val1), 3)
+_col0
 13.238
 
 -- query 124
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 125
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 126
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 127
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 NULL
 
 -- query 128
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 1.0
 
 -- query 129
 -- types	double
-round(stddev_samp(c1), 3)
+_col0
 1.0
 
 -- query 130
@@ -774,87 +774,87 @@ k	val1	stddev_samp_val1
 
 -- query 132
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 133
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 134
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 135
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 136
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 137
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 NULL
 
 -- query 138
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 3.028
 
 -- query 139
 -- types	double
-round(stddev_samp(val1), 3)
+_col0
 3.638
 
 -- query 140
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 141
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 142
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 143
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 144
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 145
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 NULL
 
 -- query 146
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 147
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 148
 -- types	double
-round(covar_samp(c1, c2), 3)
+_col0
 10.0
 
 -- query 149
@@ -887,87 +887,87 @@ k	val1	val2	covar_samp_val1
 
 -- query 151
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 152
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 153
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 154
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 155
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 156
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 NULL
 
 -- query 157
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 91.667
 
 -- query 158
 -- types	double
-round(covar_samp(val1, val2), 3)
+_col0
 155.0
 
 -- query 159
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 160
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 161
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 162
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 163
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 164
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 NULL
 
 -- query 165
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 166
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 167
 -- types	double
-round(corr(c1, c2), 3)
+_col0
 1.0
 
 -- query 168
@@ -1000,40 +1000,40 @@ k	val1	val2	corr_val1
 
 -- query 170
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 171
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 172
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 173
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 174
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 175
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 NULL
 
 -- query 176
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 1.0
 
 -- query 177
 -- types	double
-round(corr(val1, val2), 3)
+_col0
 1.0

@@ -170,15 +170,7 @@ fn all_eighty_signed_profiles_preserve_frozen_result_width_and_independent_polic
                                 policy,
                                 allow,
                             );
-                            let expected_carrier = if op == Divide {
-                                DataType::Float64
-                            } else {
-                                match li.max(ri) {
-                                    0 => DataType::Int16,
-                                    1 => DataType::Int32,
-                                    _ => DataType::Int64,
-                                }
-                            };
+                            let expected_carrier = carriers[li.max(ri)].clone();
                             assert_eq!(recipe.result_type(), &ty(expected_carrier, true));
                             assert_eq!(recipe.operator(), op);
                             assert_eq!(recipe.left_type(), &ty(left.clone(), nullable[0]));
@@ -197,7 +189,7 @@ fn all_eighty_signed_profiles_preserve_frozen_result_width_and_independent_polic
                                     Add => ArithmeticRowResult::Signed(9),
                                     Subtract => ArithmeticRowResult::Signed(5),
                                     Multiply => ArithmeticRowResult::Signed(14),
-                                    Divide => ArithmeticRowResult::Float(3.5),
+                                    Divide => ArithmeticRowResult::Signed(3),
                                     Modulo => ArithmeticRowResult::Signed(1),
                                 }
                             );
@@ -210,102 +202,117 @@ fn all_eighty_signed_profiles_preserve_frozen_result_width_and_independent_polic
 }
 
 #[test]
-fn checked_i64_overflow_modulo_zero_and_fractional_division_are_distinct_from_successful_null() {
+fn checked_signed_boundaries_and_zero_errors_ignore_decimal_and_allow_policies() {
     use ArithmeticOperator::*;
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
+    for (carrier, min, max) in [
+        (DataType::Int8, i64::from(i8::MIN), i64::from(i8::MAX)),
+        (DataType::Int16, i64::from(i16::MIN), i64::from(i16::MAX)),
+        (DataType::Int32, i64::from(i32::MIN), i64::from(i32::MAX)),
+        (DataType::Int64, i64::MIN, i64::MAX),
     ] {
-        for allow in [false, true] {
-            for (op, left, right) in [
-                (Add, i64::MAX, 1),
-                (Subtract, i64::MIN, 1),
-                (Multiply, i64::MAX, 2),
-                (Modulo, 8, 0),
-            ] {
-                let recipe = prepare(
-                    op,
-                    ty(DataType::Int64, true),
-                    ty(DataType::Int64, true),
-                    policy,
-                    allow,
-                );
-                let ArithmeticRowResult::RowError(error) = eval(
-                    &recipe,
-                    &array(&DataType::Int64, &[Some(4), Some(left)]),
-                    &array(&DataType::Int64, &[Some(2), Some(right)]),
-                    1,
-                ) else {
-                    panic!("required data error disappeared")
-                };
-                assert_eq!(error.selected_ordinal(), 1);
-                assert_eq!(
-                    error.message(),
-                    match op {
-                        Add => "Arithmetic overflow: Overflow happened on: 9223372036854775807 + 1",
-                        Subtract =>
-                            "Arithmetic overflow: Overflow happened on: -9223372036854775808 - 1",
-                        Multiply =>
-                            "Arithmetic overflow: Overflow happened on: 9223372036854775807 * 2",
-                        Modulo => "Divide by zero error",
-                        _ => unreachable!(),
-                    }
-                );
-            }
-            let modulo = prepare(
-                Modulo,
-                ty(DataType::Int64, true),
-                ty(DataType::Int64, true),
-                policy,
-                allow,
-            );
-            assert_eq!(
-                eval(
-                    &modulo,
-                    &array(&DataType::Int64, &[Some(i64::MIN)]),
-                    &array(&DataType::Int64, &[Some(-1)]),
-                    0
-                ),
-                ArithmeticRowResult::Signed(0)
-            );
-            let divide = prepare(
-                Divide,
-                ty(DataType::Int64, true),
-                ty(DataType::Int64, true),
-                policy,
-                allow,
-            );
-            assert_eq!(
-                eval(
-                    &divide,
-                    &array(&DataType::Int64, &[Some(i64::MIN)]),
-                    &array(&DataType::Int64, &[Some(-1)]),
-                    0
-                ),
-                ArithmeticRowResult::Float(9223372036854775808.0)
-            );
-            for left in [Some(8), None] {
-                assert_eq!(
-                    eval(
-                        &divide,
-                        &array(&DataType::Int64, &[left]),
-                        &array(&DataType::Int64, &[Some(0)]),
-                        0
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for allow in [false, true] {
+                for (op, left, right, reason) in [
+                    (Add, max, 1, crate::DataFailureReason::NumericOutOfRange),
+                    (
+                        Subtract,
+                        min,
+                        1,
+                        crate::DataFailureReason::NumericOutOfRange,
                     ),
-                    ArithmeticRowResult::Null
-                );
+                    (
+                        Multiply,
+                        max,
+                        2,
+                        crate::DataFailureReason::NumericOutOfRange,
+                    ),
+                    (Divide, min, -1, crate::DataFailureReason::NumericOutOfRange),
+                    (Divide, 8, 0, crate::DataFailureReason::DivisionByZero),
+                    (Modulo, 8, 0, crate::DataFailureReason::DivisionByZero),
+                ] {
+                    let recipe = prepare(
+                        op,
+                        ty(carrier.clone(), true),
+                        ty(carrier.clone(), true),
+                        policy,
+                        allow,
+                    );
+                    let ArithmeticRowResult::RowError(error) = eval(
+                        &recipe,
+                        &array(&carrier, &[Some(4), Some(left)]),
+                        &array(&carrier, &[Some(2), Some(right)]),
+                        1,
+                    ) else {
+                        panic!("required signed data error disappeared")
+                    };
+                    assert_eq!(error.selected_ordinal(), 1);
+                    assert_eq!(error.reason(), reason);
+                    assert!(!error.message().is_empty());
+                }
+                for (op, left, right, expected) in [
+                    (Modulo, min, -1, 0),
+                    (Divide, -7, 3, -2),
+                    (Divide, 7, -3, -2),
+                    (Divide, -7, -3, 2),
+                ] {
+                    let recipe = prepare(
+                        op,
+                        ty(carrier.clone(), true),
+                        ty(carrier.clone(), true),
+                        policy,
+                        allow,
+                    );
+                    assert_eq!(
+                        eval(
+                            &recipe,
+                            &array(&carrier, &[Some(left)]),
+                            &array(&carrier, &[Some(right)]),
+                            0
+                        ),
+                        ArithmeticRowResult::Signed(expected)
+                    );
+                }
+                for op in [Divide, Modulo] {
+                    let recipe = prepare(
+                        op,
+                        ty(carrier.clone(), true),
+                        ty(carrier.clone(), true),
+                        policy,
+                        allow,
+                    );
+                    assert_eq!(
+                        eval(
+                            &recipe,
+                            &array(&carrier, &[None]),
+                            &array(&carrier, &[Some(0)]),
+                            0
+                        ),
+                        ArithmeticRowResult::Null
+                    );
+                }
             }
-            assert_eq!(
-                eval(
-                    &modulo,
-                    &array(&DataType::Int64, &[None]),
-                    &array(&DataType::Int64, &[Some(0)]),
-                    0
-                ),
-                ArithmeticRowResult::Null
-            );
         }
     }
+    // Overflow belongs to the shared result width, not either operand's narrower domain.
+    let recipe = prepare(
+        Divide,
+        ty(DataType::Int8, false),
+        ty(DataType::Int16, false),
+        DecimalOverflowPolicy::OutputNull,
+        false,
+    );
+    assert_eq!(
+        eval(
+            &recipe,
+            &array(&DataType::Int8, &[Some(-128)]),
+            &array(&DataType::Int16, &[Some(-1)]),
+            0
+        ),
+        ArithmeticRowResult::Signed(128)
+    );
 }
 
 #[test]
@@ -326,11 +333,7 @@ fn signed_effects_keep_actual_context_and_do_not_borrow_error_policy_as_a_safety
                 false,
             );
             let effects = recipe.own_effects(context()).for_use(context()).unwrap();
-            assert_eq!(
-                effects.may_raise_row_error,
-                op == ArithmeticOperator::Modulo
-                    || (op != ArithmeticOperator::Divide && carrier == DataType::Int64)
-            );
+            assert!(effects.may_raise_row_error);
             assert!(!effects.has_instance_state);
             assert_eq!(
                 effects.observable_effects,
@@ -591,7 +594,7 @@ fn preparation_refuses_other_domains_and_wrong_result_or_nonnullable_output() {
             ArithmeticOperator::Divide,
             &signed,
             &signed,
-            &ty(DataType::Int64, true),
+            &ty(DataType::Float64, true),
             DecimalOverflowPolicy::OutputNull,
             false,
             &CompileControl::default()

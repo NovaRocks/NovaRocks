@@ -99,32 +99,7 @@ impl FrontendQueryCompiler {
         )
         .map_err(|e| FrontendQueryCompilerError::Engine(e.to_string()))?;
         let connector_context = planning.request();
-        let current_catalog = context.session().current_catalog();
-        let current_database = context.session().current_database();
         let mut query = original.clone();
-        self.view
-            .view_service()
-            .rewrite_query_async(
-                &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
-                &mut query,
-                ViewRequestContext {
-                    current_catalog,
-                    current_database,
-                    connector_context: Some(connector_context),
-                },
-                context.execution().sql_semantics(),
-            )
-            .await?;
-        if has_time_travel_refs(&query) {
-            crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-                &self.query,
-                current_catalog,
-                current_database,
-                &mut query,
-                connector_context,
-            )
-            .await?;
-        }
         novarocks_query_application::system_catalog_rewrite::rewrite_query_async(
             self.system_tables.facts_port().as_ref(),
             self.system_tables.system_catalog().as_ref(),
@@ -215,7 +190,12 @@ impl FrontendQueryCompiler {
                     })?,
                     state_store,
                 )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+                .with_definition_planning(
+                    self.constant_policy(),
+                    sql_compile_control_from_execution(execution),
+                    Arc::clone(planning_cpu),
+                ),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
             )
@@ -250,7 +230,7 @@ impl FrontendQueryCompiler {
         };
         let encoding_control = request.control().clone();
         provider_source
-            .complete_in(request, scope, planning_cpu)
+            .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
         if let Some(error) = provider_source.completed_error() {
             return Ok(Err(FrontendQueryCompilerError::from_completion(&error)));

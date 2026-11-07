@@ -35,8 +35,8 @@ FROM (
 LEFT JOIN LATERAL UNNEST(
     IF(
         b.id = 1,
-        [1, 2, 3],
-        IF(b.id = 2, [4], CAST(NULL AS ARRAY<BIGINT>))
+        [CAST(1 AS BIGINT), 2, 3],
+        IF(b.id = 2, [CAST(4 AS BIGINT)], CAST(NULL AS ARRAY<BIGINT>))
     ),
     IF(
         b.id = 1,

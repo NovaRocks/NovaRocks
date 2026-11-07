@@ -1047,21 +1047,28 @@ fn cardinality_every_small_runtime_callback_keeps_seven_causes_and_failed_latch(
             assert_eq!(result.is_ok(), success);
             if !success {
                 use novarocks_failure_contract::FailureProjection;
-                use novarocks_value_arrays::{ValueError, ValueViolation};
-
-                let failure = result.unwrap_err();
-                assert_eq!(
-                    failure.failure_fact(),
-                    ValueError::Invariant(ValueViolation::Carrier).failure_fact()
-                );
+                let failure = result.as_ref().unwrap_err();
                 let KernelFailure::Source(source) = failure else {
-                    panic!("foreign collection must retain its original carrier source");
+                    panic!("foreign collection must retain the original carrier source");
                 };
+                let original = std::error::Error::source(source)
+                    .unwrap()
+                    .downcast_ref::<novarocks_value_arrays::ValueError>()
+                    .unwrap();
                 assert!(matches!(
-                    std::error::Error::source(&source)
-                        .and_then(|cause| cause.downcast_ref::<ValueError>()),
-                    Some(ValueError::Invariant(ValueViolation::Carrier))
+                    original,
+                    novarocks_value_arrays::ValueError::Invariant(
+                        novarocks_value_arrays::ValueViolation::Carrier
+                    )
                 ));
+                assert_eq!(failure.failure_fact(), original.failure_fact());
+                assert_eq!(
+                    original.failure_fact(),
+                    novarocks_value_arrays::ValueError::Invariant(
+                        novarocks_value_arrays::ValueViolation::Carrier
+                    )
+                    .failure_fact()
+                );
             }
             let trace = good.trace.lock().unwrap().clone();
             assert!(!trace.is_empty());

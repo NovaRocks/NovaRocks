@@ -232,12 +232,20 @@ pub struct ImvStatelessDirective {
     pub catalog: Option<String>,
 }
 
+/// Exact protocol fields from one submitted SQL statement, independent of its message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrinoErrorExpectation {
+    pub name: String,
+    pub error_type: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryMeta {
     pub order_sensitive: Option<bool>,
     pub float_epsilon: Option<f64>,
     pub db: Option<String>,
     pub expect_error: Option<String>,
+    pub expect_trino_error: Option<TrinoErrorExpectation>,
     pub expect_error_code: Option<String>,
     pub expect_sql_code: Option<String>,
     pub expect_sql_phase: Option<SqlErrorPhase>,
@@ -534,7 +542,8 @@ impl QueryMeta {
     }
 
     pub fn has_error_expectation(&self) -> bool {
-        self.expect_error.is_some()
+        self.expect_trino_error.is_some()
+            || self.expect_error.is_some()
             || self.expect_error_code.is_some()
             || self.has_sql_error_assertion()
     }
@@ -596,6 +605,117 @@ pub struct QueryExecution {
     pub rows: Vec<Vec<String>>,
     pub text_output: String,
     pub elapsed: Duration,
+}
+
+/// One invocation owns every actual attempt. The first three fields are its
+/// final summary; prior failures remain in the fourth field after a retry.
+#[derive(Debug, Clone)]
+pub struct SqlExecutionOutcome(
+    pub bool,
+    pub Option<QueryExecution>,
+    pub String,
+    pub Vec<SqlExecutionAttempt>,
+);
+
+#[derive(Debug, Clone)]
+pub struct SqlExecutionAttempt {
+    pub ordinal: usize,
+    pub statement_count: usize,
+    pub statements: Vec<SqlStatementOutcome>,
+    pub local_failures: Vec<String>,
+    pub execution: Option<QueryExecution>,
+    pub message: String,
+    pub succeeded: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlStatementOutcome {
+    pub ordinal: usize,
+    pub sql: String,
+    /// A POST was attempted; a missing query id does not prove no remote work.
+    pub submission_started: bool,
+    pub query_id: Option<String>,
+    pub completed: bool,
+    pub result: Option<novarocks_test_trino_client::StatementResult>,
+    pub failures: Vec<SqlExecutionFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum SqlExecutionFailure {
+    Client(novarocks_test_trino_client::StatementFailure),
+    Local(String),
+}
+
+impl SqlExecutionOutcome {
+    pub(crate) fn from_attempt(attempt: SqlExecutionAttempt) -> Self {
+        Self(
+            attempt.succeeded,
+            attempt.execution.clone(),
+            attempt.message.clone(),
+            vec![attempt],
+        )
+    }
+
+    pub(crate) fn into_summary(self) -> (bool, Option<QueryExecution>, String) {
+        (self.0, self.1, self.2)
+    }
+
+    pub(crate) fn summary(&self) -> (bool, Option<QueryExecution>, String) {
+        (self.0, self.1.clone(), self.2.clone())
+    }
+
+    pub(crate) fn final_failures(&self) -> Vec<&SqlExecutionFailure> {
+        self.3
+            .last()
+            .into_iter()
+            .flat_map(|attempt| &attempt.statements)
+            .flat_map(|statement| &statement.failures)
+            .collect()
+    }
+
+    pub(crate) fn failure_is_statement(&self) -> bool {
+        !self.0
+            && self
+                .3
+                .last()
+                .is_some_and(|attempt| attempt.local_failures.is_empty())
+            && !self.final_failures().is_empty()
+            && self.final_failures().iter().all(|failure| {
+                matches!(
+                    failure,
+                    SqlExecutionFailure::Client(
+                        novarocks_test_trino_client::StatementFailure::Trino(_)
+                    )
+                )
+            })
+    }
+
+    pub(crate) fn failure_is_only_transport(&self) -> bool {
+        !self.0
+            && self
+                .3
+                .last()
+                .is_some_and(|attempt| attempt.local_failures.is_empty())
+            && matches!(
+                self.final_failures().as_slice(),
+                [SqlExecutionFailure::Client(
+                    novarocks_test_trino_client::StatementFailure::Transport(_)
+                )]
+            )
+    }
+
+    pub(crate) fn evidence(&self) -> serde_json::Value {
+        use sha2::Digest;
+        serde_json::json!({"succeeded":self.0,"attempts":self.3.iter().map(|attempt| {
+            serde_json::json!({"ordinal":attempt.ordinal,"statement_count":attempt.statement_count,
+                "succeeded":attempt.succeeded,"local_failures":attempt.local_failures,
+                "statements":attempt.statements.iter().map(|statement| serde_json::json!({
+                    "ordinal":statement.ordinal,"statement_sha256":format!("{:x}", sha2::Sha256::digest(statement.sql.as_bytes())),
+                    "submission_started":statement.submission_started,"query_id":statement.query_id,
+                    "completed":statement.completed,"has_result":statement.result.is_some(),
+                    "failures":statement.failures})).collect::<Vec<_>>()})
+        }).collect::<Vec<_>>()})
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -55,6 +55,11 @@ const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const TOO_MANY_ARGUMENTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.too_many_arguments"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INVALID_QUERY_SHAPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.invalid_query_shape"),
     phase: ErrorPhase::Analyze,
@@ -75,6 +80,36 @@ const UNSUPPORTED_QUERY_SHAPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const MISSING_COLUMN_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.missing_column_name"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const DUPLICATE_COLUMN_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.duplicate_column_name"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const MISMATCHED_COLUMN_ALIASES: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.mismatched_column_aliases"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const INVALID_VIEW: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_view"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const VIEW_IS_STALE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.view_is_stale"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const VIEW_IS_RECURSIVE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.view_is_recursive"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INTERNAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.internal"),
     phase: ErrorPhase::Analyze,
@@ -90,10 +125,17 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
+    TOO_MANY_ARGUMENTS,
     INVALID_QUERY_SHAPE,
     UNSUPPORTED_EXPRESSION,
     UNAVAILABLE_IMPLEMENTATION,
     UNSUPPORTED_QUERY_SHAPE,
+    MISSING_COLUMN_NAME,
+    DUPLICATE_COLUMN_NAME,
+    MISMATCHED_COLUMN_ALIASES,
+    INVALID_VIEW,
+    VIEW_IS_STALE,
+    VIEW_IS_RECURSIVE,
     INTERNAL,
 ];
 
@@ -106,11 +148,18 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     InvalidLiteral,
     InvalidArgument,
+    TooManyArguments,
     InvalidQueryShape,
     UnsupportedExpression,
     /// A bound overload has no installed pure implementation.
     UnavailableImplementation,
     UnsupportedQueryShape,
+    MissingColumnName,
+    DuplicateColumnName,
+    MismatchedColumnAliases,
+    InvalidView,
+    ViewIsStale,
+    ViewIsRecursive,
     Internal,
 }
 
@@ -124,13 +173,26 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
+            Self::TooManyArguments => TOO_MANY_ARGUMENTS,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
             Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
             Self::UnavailableImplementation => UNAVAILABLE_IMPLEMENTATION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
+            Self::MissingColumnName => MISSING_COLUMN_NAME,
+            Self::DuplicateColumnName => DUPLICATE_COLUMN_NAME,
+            Self::MismatchedColumnAliases => MISMATCHED_COLUMN_ALIASES,
+            Self::InvalidView => INVALID_VIEW,
+            Self::ViewIsStale => VIEW_IS_STALE,
+            Self::ViewIsRecursive => VIEW_IS_RECURSIVE,
             Self::Internal => INTERNAL,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredViewAnalysisCause {
+    source_sql: std::sync::Arc<str>,
+    error: AnalyzeError,
 }
 
 /// A user-visible SQL analysis failure.
@@ -144,17 +206,129 @@ pub struct AnalyzeError {
     span: Option<Span>,
     control: Option<novarocks_type_contract::CompileControlError>,
     source: Option<novarocks_failure_contract::SharedFailureCause>,
+    view_cause: Option<Box<StoredViewAnalysisCause>>,
 }
 
 impl AnalyzeError {
     fn at(kind: AnalyzeErrorKind, message: impl Into<String>, span: Span) -> Self {
+        Self::at_optional(kind, message, Some(span))
+    }
+
+    fn at_optional(kind: AnalyzeErrorKind, message: impl Into<String>, span: Option<Span>) -> Self {
         Self {
             kind,
             message: message.into(),
-            span: Some(span),
+            span,
             control: None,
             source: None,
+            view_cause: None,
         }
+    }
+
+    pub fn missing_column_name(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::MissingColumnName,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub fn duplicate_column_name(
+        message: impl Into<String>,
+        span: impl Into<Option<Span>>,
+    ) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::DuplicateColumnName,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub fn mismatched_column_aliases(
+        message: impl Into<String>,
+        span: impl Into<Option<Span>>,
+    ) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::MismatchedColumnAliases,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub fn invalid_view(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::InvalidView,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub(crate) fn view_cast_preparation(error: novarocks_functions::CastPrepareError) -> Self {
+        if let Some(control) = error.control_error() {
+            return Self::control(control);
+        }
+        Self::control(novarocks_type_contract::CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(error),
+        ))
+    }
+
+    pub(crate) fn invalid_view_from_analysis(
+        view: &str,
+        cause: AnalyzeError,
+        source_sql: std::sync::Arc<str>,
+        span: Span,
+    ) -> Self {
+        let mut error = Self::invalid_view(
+            format!("Failed analyzing stored view '{view}': {cause}"),
+            span,
+        );
+        error.view_cause = Some(Box::new(StoredViewAnalysisCause {
+            source_sql,
+            error: cause,
+        }));
+        error
+    }
+
+    /// Rebase only public context; the complete original error and its actual
+    /// definition source remain together in the diagnostic cause chain.
+    pub(crate) fn at_view_reference(self, source_sql: std::sync::Arc<str>, span: Span) -> Self {
+        let mut outer = self.clone();
+        outer.span = (!span.is_empty()).then_some(span);
+        outer.view_cause = Some(Box::new(StoredViewAnalysisCause {
+            source_sql,
+            error: self,
+        }));
+        outer
+    }
+
+    pub fn stored_view_definition_source(&self) -> Option<&str> {
+        self.view_cause
+            .as_ref()
+            .map(|cause| cause.source_sql.as_ref())
+    }
+
+    /// A memoized pure catalog selection has one semantic verdict, while
+    /// each syntax occurrence owns its own coordinates (possibly in another
+    /// stored definition). Relocate only that occurrence, never its kind.
+    pub(crate) fn at_catalog_selection_reference(mut self, span: Span) -> Self {
+        self.span = (!span.is_empty()).then_some(span);
+        self
+    }
+
+    pub fn view_is_stale(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::ViewIsStale,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub fn view_is_recursive(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::ViewIsRecursive,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
@@ -195,13 +369,19 @@ impl AnalyzeError {
             + Sync
             + 'static,
     {
-        let source = novarocks_failure_contract::SharedFailureCause::new(cause);
+        Self::shared_domain_source(novarocks_failure_contract::SharedFailureCause::new(cause))
+    }
+
+    pub(crate) fn shared_domain_source(
+        source: novarocks_failure_contract::SharedFailureCause,
+    ) -> Self {
         Self {
             kind: AnalyzeErrorKind::Internal,
             message: source.detail().to_owned(),
             span: None,
             control: None,
             source: Some(source),
+            view_cause: None,
         }
     }
     pub fn source_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
@@ -225,6 +405,10 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::InvalidLiteral, message, span)
     }
 
+    pub fn too_many_arguments(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::TooManyArguments, message, span)
+    }
+
     pub fn invalid_argument(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidArgument, message, span)
     }
@@ -245,6 +429,7 @@ impl AnalyzeError {
             span: None,
             control: None,
             source: None,
+            view_cause: None,
         }
     }
 
@@ -261,6 +446,7 @@ impl AnalyzeError {
             span: None,
             control: None,
             source: None,
+            view_cause: None,
         }
     }
 
@@ -273,6 +459,7 @@ impl AnalyzeError {
             span: None,
             control: Some(error),
             source: None,
+            view_cause: None,
         }
     }
 
@@ -287,6 +474,7 @@ impl AnalyzeError {
                     span: None,
                     control: None,
                     source: Some(source),
+                    view_cause: None,
                 }
             }
             novarocks_functions::FunctionBindingError::VariantTargetType(source) => {
@@ -301,6 +489,7 @@ impl AnalyzeError {
                     span: None,
                     control: None,
                     source: None,
+                    view_cause: None,
                 }
             }
             error => Self::internal(error.to_string()),
@@ -405,7 +594,10 @@ impl fmt::Display for AnalyzeError {
 
 impl std::error::Error for AnalyzeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| self.view_cause.as_deref().map(|cause| &cause.error as _))
     }
 }
 
@@ -493,10 +685,17 @@ mod tests {
                 "sql.analyze.type_mismatch",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
+                "sql.analyze.too_many_arguments",
                 "sql.analyze.invalid_query_shape",
                 "sql.analyze.unsupported_expression",
                 "sql.analyze.unavailable_implementation",
                 "sql.analyze.unsupported_query_shape",
+                "sql.analyze.missing_column_name",
+                "sql.analyze.duplicate_column_name",
+                "sql.analyze.mismatched_column_aliases",
+                "sql.analyze.invalid_view",
+                "sql.analyze.view_is_stale",
+                "sql.analyze.view_is_recursive",
                 "sql.analyze.internal",
             ]
         );

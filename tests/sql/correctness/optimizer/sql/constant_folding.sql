@@ -90,10 +90,10 @@ EXPLAIN VERBOSE SELECT now();
 EXPLAIN VERBOSE SELECT from_unixtime(1577836800);
 
 -- ---------------------------------------------------------------------------
--- 7. Division by zero is a value, not an error, in this engine: folding
---    reproduces the runtime NULL instead of failing planning.
+-- 7. Integer division by zero is a typed error in folded and runtime paths.
+--    Constant folding must preserve the same DIVISION_BY_ZERO outcome.
 -- ---------------------------------------------------------------------------
--- @explain_contains=[NULL AS 1 / 0]
+-- @expect_trino_error=DIVISION_BY_ZERO,USER_ERROR
 SELECT 1 / 0;
 
 -- ---------------------------------------------------------------------------

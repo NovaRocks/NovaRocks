@@ -1,24 +1,24 @@
 -- query 1
 -- types	timestamp(6)
-CAST(-18446744073709551494 AS DATETIME)
+_col0
 NULL
 
 -- query 2
 -- types	timestamp(6)
-CAST(0 AS DATETIME)
+_col0
 NULL
 
 -- query 3
 -- types	timestamp(6)
-CAST(1 AS DATETIME)
+_col0
 NULL
 
 -- query 4
 -- types	timestamp(6)
-CAST(18446744073709551615 AS DATETIME)
+_col0
 NULL
 
 -- query 5
 -- types	integer
-yearweek(-18446744073709551494)
+_col0
 NULL

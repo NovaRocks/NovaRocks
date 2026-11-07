@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0218 (docs/adr/ADR-0218-schema-free-online-units-and-prepared-layout-recipes.md)
+// Design: ADR-0221 (docs/adr/ADR-0221-schema-free-online-units-and-prepared-layout-recipes.md)
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
 use arrow::{

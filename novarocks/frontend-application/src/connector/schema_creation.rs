@@ -112,6 +112,30 @@ pub(crate) async fn load_frontend_table_async(
     .map_err(connector_schema_error)
 }
 
+/// Load one view declaration under the caller's original schema control.
+pub(crate) fn load_frontend_view(
+    metadata: &dyn novarocks_spi::connector::ConnectorViewMetadata,
+    request: novarocks_spi::connector::ConnectorViewRequest,
+) -> Result<novarocks_spi::connector::ConnectorViewMetadataValue, ConnectorError> {
+    let control = request.context.original_operation_control();
+    with_original_control(control, |creation| metadata.load_view(request, creation))
+        .map_err(connector_schema_error)
+}
+
+/// View I/O completes before borrowing the synchronous type-creation observer.
+pub(crate) async fn load_frontend_view_async(
+    metadata: &dyn novarocks_spi::connector::ConnectorViewMetadata,
+    request: novarocks_spi::connector::ConnectorViewRequest,
+) -> Result<novarocks_spi::connector::ConnectorViewMetadataValue, ConnectorError> {
+    let control = request.context.original_operation_control();
+    observe_schema_control(&control).map_err(ConnectorError::compile_interruption)?;
+    let preparation = metadata.prepare_view(request).await?;
+    with_original_control(control, |creation| {
+        metadata.create_prepared_view(preparation, creation)
+    })
+    .map_err(connector_schema_error)
+}
+
 /// Project a typed preparation refusal at an existing ConnectorError boundary.
 /// Provider classifications and retry evidence survive unchanged.
 pub(crate) fn connector_schema_error(

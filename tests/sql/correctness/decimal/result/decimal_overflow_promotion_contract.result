@@ -61,7 +61,7 @@ promoted	checked	outer_checked
 1.5241578766956256E27	NULL	NULL
 
 -- query 16
--- types	bigint	double
+-- types	integer	double
 branch	product
 1	1.5241578766956256E27
 2	NULL

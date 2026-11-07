@@ -180,19 +180,19 @@ TRUNCATE TABLE ${case_db}.t2;
 
 -- query 29
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES (1, 1), (2, 1), (3, 1), (4, 18446744073709551620), (5, 18446744073709551620), (6, 3);
+INSERT INTO ${case_db}.t1(c_key, c_largeint) VALUES (1, 1), (2, 1), (3, 1), (4, CAST('18446744073709551620' AS LARGEINT)), (5, CAST('18446744073709551620' AS LARGEINT)), (6, 3);
 
 -- query 30
 -- @skip_result_check=true
-INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, 18446744073709551620), (3, 3);
+INSERT INTO ${case_db}.t2(c_key, c_largeint) VALUES (1, 1), (2, CAST('18446744073709551620' AS LARGEINT)), (3, 3);
 
 -- query 31
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_largeint(1,18446744073709551620,4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- query 32
 -- @order_sensitive=true
-SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_largeint(1,18446744073709551620,4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
+SELECT t1.c_key, t2.c_key FROM ${case_db}.t1 t1 LEFT JOIN [skew|t1.c_largeint(1,CAST('18446744073709551620' AS LARGEINT),4444)] ${case_db}.t2 t2 ON t1.c_largeint=t2.c_largeint ORDER BY t1.c_key, t2.c_key;
 
 -- ============================================================
 -- DOUBLE skew join

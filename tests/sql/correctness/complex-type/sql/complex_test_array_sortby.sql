@@ -372,7 +372,7 @@ with w1 as (select column_0 as source, column_1 as key1, column_2 as key2 from (
           ([1, 2], null, [1, 1]),
           ([3, 4], [40, 30], [1, 1]),
           ([5, 6], null, [1, 1])
-) t)
+) t(column_0, column_1, column_2))
 select array_sortby(source, key1, key2), source, key1, key2 from w1;
 
 -- name: test_array_sortby_all_type

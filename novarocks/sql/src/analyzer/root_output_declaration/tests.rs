@@ -17,7 +17,8 @@
 
 use super::*;
 use crate::analysis::{
-    ExprKind, LiteralValue, OutputColumn, ProjectItem, ResolvedSelect, TypedExpr,
+    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind,
+    LiteralValue, ResolvedSelect, TypedExpr,
 };
 fn ty(data: DataType, nullable: bool) -> FunctionValueType {
     FunctionValueType::new(data, nullable)
@@ -26,6 +27,7 @@ fn query(expr: TypedExpr) -> (ResolvedQuery, ColumnRefFactory) {
     let mut factory = ColumnRefFactory::new();
     let id = factory.create(None, "__nr_sel_0".into(), expr.value_type.clone());
     let output = OutputColumn {
+        field_name: Some("v".into()),
         column_id: id,
         name: "__nr_sel_0".into(),
         value_type: expr.value_type.clone(),
@@ -39,6 +41,7 @@ fn query(expr: TypedExpr) -> (ResolvedQuery, ColumnRefFactory) {
                 group_by: vec![],
                 having: None,
                 projection: vec![ProjectItem {
+                    field_name: Some("v".into()),
                     expr,
                     output_name: output.name.clone(),
                     output_column_id: id,

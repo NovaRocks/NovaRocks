@@ -1,9 +1,9 @@
 -- query 6
 -- types	bigint
-count(*)
+_col0
 1
 
 -- query 7
 -- types	bigint
-count(*)
+_col0
 1

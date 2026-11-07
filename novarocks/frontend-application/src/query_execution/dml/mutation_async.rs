@@ -371,27 +371,34 @@ impl PreparedMorMutationWrite {
         let control = crate::query_execution::planning::sql_compile_control_from_execution(
             self.facts.execution(),
         );
-        let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-            novarocks_sql::compiler::SqlSessionContext {
-                sql_semantics: self.facts.execution().sql_semantics().clone(),
-                // The old analyzer materializer supplied this effective catalog
-                // for unqualified mutation sources; freeze that same fact here.
-                current_catalog: Some(self.facts.target().catalog.clone()),
-                current_database: self.facts.target().namespace.clone(),
-                optimizer_settings: dml_change_stream_optimizer_settings(),
-            },
-            control.clone(),
-            novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-            None,
-        )
-        .map_err(DmlError::from_compile)?;
-        let catalog = provider
-            .resolve_catalog_relations(preparation.needs())
-            .await?;
+        let mut preparation =
+            novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
+                novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+                novarocks_sql::compiler::SqlSessionContext {
+                    sql_semantics: self.facts.execution().sql_semantics().clone(),
+                    // The old analyzer materializer supplied this effective catalog
+                    // for unqualified mutation sources; freeze that same fact here.
+                    current_catalog: Some(self.facts.target().catalog.clone()),
+                    current_database: self.facts.target().namespace.clone(),
+                    optimizer_settings: dml_change_stream_optimizer_settings(),
+                },
+                control.clone(),
+                novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+                None,
+            )
+            .map_err(DmlError::from_compile)?;
+        while !preparation.needs().is_empty() {
+            let facts = provider
+                .resolve_catalog_relations(preparation.needs())
+                .await
+                .map_err(DmlError::from_compile)?;
+            preparation = preparation
+                .continue_catalog(facts.into_boxed_slice())
+                .map_err(DmlError::from_compile)?;
+        }
         let analyzed = preparation
             .analyze(
-                &catalog,
+                &[],
                 self.state.function_catalog().as_ref(),
                 crate::query_execution::constant_eval::constant_evaluator(),
                 self.state.constant_policy(),
@@ -467,7 +474,10 @@ fn install_fact_source(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider,
         state.completion_fact_owners()?,
-        scope,
+        scope.with_definition_owned(
+            state.constant_policy(),
+            crate::query_execution::planning::sql_compile_control_from_execution(facts.execution()),
+        ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
 }
@@ -490,25 +500,34 @@ impl PreparedCowSelection {
         let control = crate::query_execution::planning::sql_compile_control_from_execution(
             self.facts.execution(),
         );
-        let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(self.query.clone())),
-            novarocks_sql::compiler::SqlSessionContext {
-                sql_semantics: self.facts.execution().sql_semantics().clone(),
-                current_catalog: Some(self.facts.target().catalog.clone()),
-                current_database: self.facts.target().namespace.clone(),
-                optimizer_settings: self.facts.execution().optimizer_settings().clone(),
-            },
-            control.clone(),
-            novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
-            Some(self.declarations.clone()),
-        )
-        .map_err(DmlError::from_compile)?;
-        let catalog = provider
-            .resolve_catalog_relations(preparation.needs())
-            .await?;
+        let mut preparation =
+            novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
+                novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(
+                    self.query.clone(),
+                )),
+                novarocks_sql::compiler::SqlSessionContext {
+                    sql_semantics: self.facts.execution().sql_semantics().clone(),
+                    current_catalog: Some(self.facts.target().catalog.clone()),
+                    current_database: self.facts.target().namespace.clone(),
+                    optimizer_settings: self.facts.execution().optimizer_settings().clone(),
+                },
+                control.clone(),
+                novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
+                Some(self.declarations.clone()),
+            )
+            .map_err(DmlError::from_compile)?;
+        while !preparation.needs().is_empty() {
+            let facts = provider
+                .resolve_catalog_relations(preparation.needs())
+                .await
+                .map_err(DmlError::from_compile)?;
+            preparation = preparation
+                .continue_catalog(facts.into_boxed_slice())
+                .map_err(DmlError::from_compile)?;
+        }
         let analyzed = preparation
             .analyze(
-                &catalog,
+                &[],
                 self.state.function_catalog().as_ref(),
                 crate::query_execution::constant_eval::constant_evaluator(),
                 self.state.constant_policy(),

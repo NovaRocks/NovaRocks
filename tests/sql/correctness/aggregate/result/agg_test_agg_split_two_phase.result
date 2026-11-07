@@ -5,5 +5,5 @@ NULL
 
 -- query 6
 -- types	varchar	bigint
-c1	count(*)
+c1	_col1
 NULL	1500

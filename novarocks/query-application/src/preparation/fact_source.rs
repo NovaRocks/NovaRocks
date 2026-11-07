@@ -33,7 +33,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
-    ProviderReadFact, ProviderReadNeed, SqlFactBatch, SqlNeedBatch, StatisticsFact, StatisticsNeed,
+    ProviderReadFact, ProviderReadNeed, SqlCompileError, SqlFactBatch, SqlNeedBatch,
+    StatisticsFact, StatisticsNeed,
 };
 
 use super::{final_plan::SqlCompletionFactSource, runtime_access::ReadAccessSink};
@@ -44,7 +45,7 @@ pub trait CatalogFactPort: Send + Sync {
     async fn resolve_relations(
         &self,
         needs: &[CatalogRelationNeed],
-    ) -> Result<Vec<CatalogRelationFact>, String>;
+    ) -> Result<Vec<CatalogRelationFact>, SqlCompileError>;
 }
 
 /// Reads the statistics the optimizer costs with.
@@ -137,31 +138,36 @@ impl<A: Send + Sync> SqlCompletionFactSource for QueryCompletionFactSource<A> {
         &self,
         needs: &SqlNeedBatch,
         taken: &ReadAccessSink<A>,
-    ) -> Result<SqlFactBatch, String> {
+    ) -> Result<SqlFactBatch, SqlCompileError> {
         match needs {
             SqlNeedBatch::CatalogRelations(needs) => self
                 .catalog
                 .resolve_relations(needs)
                 .await
-                .and_then(|facts| expect_one_answer_each("catalog", needs.len(), facts))
+                .and_then(|facts| {
+                    expect_one_answer_each("catalog", needs.len(), facts).map_err(Into::into)
+                })
                 .map(|facts| SqlFactBatch::CatalogRelations(facts.into_boxed_slice())),
             SqlNeedBatch::Statistics(needs) => self
                 .statistics
                 .resolve_statistics(needs)
                 .await
                 .and_then(|facts| expect_one_answer_each("statistics", needs.len(), facts))
+                .map_err(Into::into)
                 .map(|facts| SqlFactBatch::Statistics(facts.into_boxed_slice())),
             SqlNeedBatch::MaterializedViews(needs) => self
                 .materialized_views
                 .resolve_materialized_views(needs)
                 .await
                 .and_then(|facts| expect_one_answer_each("materialized view", needs.len(), facts))
+                .map_err(Into::into)
                 .map(|facts| SqlFactBatch::MaterializedViews(facts.into_boxed_slice())),
             SqlNeedBatch::ProviderReads(needs) => self
                 .provider_reads
                 .resolve_provider_reads(needs, taken)
                 .await
                 .and_then(|facts| expect_one_answer_each("provider read", needs.len(), facts))
+                .map_err(Into::into)
                 .map(|facts| SqlFactBatch::ProviderReads(facts.into_boxed_slice())),
         }
     }
@@ -171,6 +177,49 @@ impl<A: Send + Sync> SqlCompletionFactSource for QueryCompletionFactSource<A> {
 mod tests {
     use super::*;
 
+    struct RefusingCatalog(SqlCompileError);
+
+    #[async_trait]
+    impl CatalogFactPort for RefusingCatalog {
+        async fn resolve_relations(
+            &self,
+            _: &[CatalogRelationNeed],
+        ) -> Result<Vec<CatalogRelationFact>, SqlCompileError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_refusals_cross_the_aggregate_port_without_losing_the_original_fact() {
+        use novarocks_sql::analyze_error::AnalyzeError;
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        for original in [
+            SqlCompileError::Cancelled,
+            SqlCompileError::DeadlineExceeded,
+            SqlCompileError::ResourceExhausted,
+            SqlCompileError::from(CompileControlError::from_domain(
+                LayoutResourceError::SourceModel,
+            )),
+            SqlCompileError::Analyze(AnalyzeError::view_is_recursive("recursive", None)),
+        ] {
+            let source = QueryCompletionFactSource::new(
+                Arc::new(RefusingCatalog(original.clone())),
+                Arc::new(Silent),
+                Arc::new(Silent),
+                Arc::new(Silent),
+            );
+            let taken = ReadAccessSink::new();
+            let actual = source
+                .resolve(&SqlNeedBatch::CatalogRelations(Box::default()), &taken)
+                .await
+                .unwrap_err();
+            assert_eq!(actual, original);
+            assert!(taken.into_taken().is_empty());
+        }
+    }
+
     struct Silent;
 
     #[async_trait]
@@ -178,7 +227,7 @@ mod tests {
         async fn resolve_relations(
             &self,
             _: &[CatalogRelationNeed],
-        ) -> Result<Vec<CatalogRelationFact>, String> {
+        ) -> Result<Vec<CatalogRelationFact>, SqlCompileError> {
             Ok(Vec::new())
         }
     }

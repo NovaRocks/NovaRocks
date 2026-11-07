@@ -107,7 +107,7 @@ id	v1	v2	v3	v4	v5	v6	v7
 70	NULL	NULL	NULL	NULL	NULL	NULL	t7_70
 
 -- query 35
--- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	bigint
+-- types	bigint	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	integer
 id	v1	v2	v3	v4	v5	v6	v7	v8	table_count
 1	t1_1	t2_1	t3_1	NULL	t5_1	NULL	t7_1	NULL	5
 2	t1_2	t2_2	NULL	t4_2	NULL	t6_2	NULL	t8_2	5
@@ -203,7 +203,7 @@ id	v1	v2	v3	v4	v5	v6	v7	v8
 80	NULL	NULL	NULL	NULL	NULL	NULL	NULL	t8_80
 
 -- query 45
--- types	bigint	varchar	varchar	bigint
+-- types	bigint	varchar	varchar	integer
 final_id	final_combined	final_status	final_count
 1	t1_1-t2_1	HAS_T3	2
 4	-	NO_T3	1

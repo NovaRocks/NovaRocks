@@ -324,6 +324,16 @@ pub fn arithmetic_result_type_with_op(
     if !is_supported_arithmetic_type(left) || !is_supported_arithmetic_type(right) {
         return None;
     }
+    // Trino's signed operators preserve their common input width, including
+    // division. Other numeric domains retain their independent result rules.
+    if is_integer(left) && is_integer(right) {
+        return Some(match (left, right) {
+            (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
+            (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int32,
+            (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int16,
+            _ => DataType::Int8,
+        });
+    }
     let left_largeint = is_largeint_data_type(left);
     let right_largeint = is_largeint_data_type(right);
     let left_integral = left_largeint || is_integer(left);
@@ -351,10 +361,6 @@ pub fn arithmetic_result_type_with_op(
         | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
-        (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
-        (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
-        (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int32,
-        (DataType::Int8, _) | (_, DataType::Int8) => DataType::Int16,
         _ => return None,
     })
 }
@@ -393,6 +399,33 @@ fn is_supported_arithmetic_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_binary_operators_preserve_the_common_signed_width() {
+        for (left, right, expected) in [
+            (DataType::Int8, DataType::Int8, DataType::Int8),
+            (DataType::Int8, DataType::Int16, DataType::Int16),
+            (DataType::Int16, DataType::Int32, DataType::Int32),
+            (DataType::Int32, DataType::Int64, DataType::Int64),
+        ] {
+            for op in [
+                ArithmeticOperator::Add,
+                ArithmeticOperator::Subtract,
+                ArithmeticOperator::Multiply,
+                ArithmeticOperator::Divide,
+                ArithmeticOperator::Modulo,
+            ] {
+                assert_eq!(
+                    arithmetic_result_type_with_op(&left, &right, op),
+                    Some(expected.clone())
+                );
+                assert_eq!(
+                    arithmetic_result_type_with_op(&right, &left, op),
+                    Some(expected.clone())
+                );
+            }
+        }
+    }
 
     #[test]
     fn mixed_decimal_largeint_add_sub_have_exact_bounded_width() {

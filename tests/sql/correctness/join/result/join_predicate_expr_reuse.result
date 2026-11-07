@@ -1,81 +1,81 @@
 -- query 7
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 8
 -- types	bigint
-count(*)
+_col0
 1
 
 -- query 9
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 10
 -- types	bigint
-count(*)
+_col0
 1
 
 -- query 11
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 12
 -- types	bigint
-count(*)
+_col0
 6
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 14
 -- types	bigint
-count(*)
+_col0
 2
 
 -- query 15
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 16
 -- types	bigint
-count(*)
+_col0
 44
 
 -- query 17
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 18
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 19
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 20
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 21
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 22
 -- types	bigint	bigint
-count(*)	abs(${case_db}.pre_t0.v1)
+_col0	_col1
 1	6
 1	7
 1	8
@@ -83,4 +83,4 @@ count(*)	abs(${case_db}.pre_t0.v1)
 
 -- query 23
 -- types	bigint	bigint
-count(*)	abs(${case_db}.pre_t0.v1)
+_col0	_col1

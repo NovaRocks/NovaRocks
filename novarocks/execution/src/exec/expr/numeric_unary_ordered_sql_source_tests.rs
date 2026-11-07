@@ -110,8 +110,8 @@ fn check(sql: &str, group_concat: bool) {
                 };
                 assert_eq!(value_type.data_type().clone(), DataType::Int8);
                 assert!(
-                    value_type.nullable(),
-                    "both modes retain the checked -k NULL guarantee in their own ORDER request {sql} site {site:?}"
+                    !value_type.nullable(),
+                    "both modes retain required signed -k in their own ORDER request {sql} site {site:?}"
                 );
                 let FunctionArgumentType::Value(bound) =
                     &call.binding.function.argument_types[logical]

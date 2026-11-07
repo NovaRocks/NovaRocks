@@ -189,17 +189,17 @@ wv
 
 -- query 23
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 7698522700
 
 -- query 24
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 9489753355
 
 -- query 25
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 -2908793330
 
 -- query 26
@@ -744,17 +744,17 @@ NULL
 
 -- query 88
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 6158818160
 
 -- query 89
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 7591802684
 
 -- query 90
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 -2327034664
 
 -- query 91
@@ -1299,17 +1299,17 @@ NULL
 
 -- query 153
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 4619113620
 
 -- query 154
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 5693852013
 
 -- query 155
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 -1745275998
 
 -- query 156
@@ -1593,17 +1593,17 @@ NULL
 
 -- query 194
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 6158818160
 
 -- query 195
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 7591802684
 
 -- query 196
 -- legacy
-sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+_col0
 -2327034664
 
 -- query 197

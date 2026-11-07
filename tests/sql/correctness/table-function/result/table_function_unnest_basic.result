@@ -1,5 +1,5 @@
 -- query 1
--- types	tinyint
+-- types	integer
 x
 1
 2

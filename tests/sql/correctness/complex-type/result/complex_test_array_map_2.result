@@ -1,31 +1,31 @@
 -- query 4
 -- legacy
-count()
+_col0
 1
 
 -- query 5
 -- legacy
-count(array_length(array_map((x, y) -> (id + (length(x))) + y, arr_str, arr_largeint)))
+_col0
 1
 
 -- query 6
 -- legacy
-count()
+_col0
 0
 
 -- query 7
 -- legacy
-count(any_match(x -> any_match(x -> x < 10, arr_largeint), arr_largeint))
+_col0
 1
 
 -- query 8
 -- legacy
-count(array_map(x -> array_length(array_concat(arr_str, [])), arr_largeint))
+_col0
 1
 
 -- query 10
 -- legacy
-array_length(array_map((x, y) -> x > y, array_repeat('12345', 1000000), array_repeat('12345', 1000000)))
+_col0
 1000000
 1000000
 1000000
@@ -39,12 +39,12 @@ array_length(array_map((x, y) -> x > y, array_repeat('12345', 1000000), array_re
 
 -- query 11
 -- legacy
-count(*)
+_col0
 1
 
 -- query 15
 -- legacy
-array_map((x, y, z) -> (x + y) + z, arr_0, arr_1, arr_2)
+_col0
 [4,7]
 NULL
 NULL
@@ -52,7 +52,7 @@ NULL
 
 -- query 17
 -- legacy
-array_map((x, y, z) -> (x + y) + z, arr_0, arr_1, arr_2)
+_col0
 [4,7]
 NULL
 NULL
@@ -60,7 +60,7 @@ NULL
 
 -- query 18
 -- legacy
-array_map((x, y, z, d) -> ((x + y) + z) + d, arr_0, arr_1, arr_2, [1, 2])
+_col0
 [5,9]
 NULL
 NULL
@@ -68,7 +68,7 @@ NULL
 
 -- query 20
 -- legacy
-array_map(x -> x * x, arr_0)
+_col0
 [1,4]
 [1,4]
 [1,4]
@@ -106,7 +106,7 @@ k	col1	col2
 
 -- query 25
 -- legacy
-array_map(x -> x, arr_0)
+_col0
 [1,2]
 [1,2]
 [1,2]
@@ -114,7 +114,7 @@ array_map(x -> x, arr_0)
 
 -- query 26
 -- legacy
-array_map((x, y, z) -> 10, arr_0, arr_1, arr_2)
+_col0
 NULL
 NULL
 [10,10]
@@ -122,7 +122,7 @@ NULL
 
 -- query 27
 -- legacy
-array_map((x, y) -> k, arr_0, arr_1)
+_col0
 [1,1]
 NULL
 [3,3]
@@ -130,7 +130,7 @@ NULL
 
 -- query 28
 -- legacy
-array_map((x, y) -> k, [1, 2], [2, 3])
+_col0
 [1,1]
 [2,2]
 [3,3]
@@ -138,7 +138,7 @@ array_map((x, y) -> k, [1, 2], [2, 3])
 
 -- query 29
 -- legacy
-array_map((x, y, z) -> (x + y) + z, [1, 2], [2, 3], [3, 4])
+_col0
 [6,9]
 [6,9]
 [6,9]
@@ -146,7 +146,7 @@ array_map((x, y, z) -> (x + y) + z, [1, 2], [2, 3], [3, 4])
 
 -- query 30
 -- legacy
-array_map((x, y, z) -> (x + y) + z, [1, 2], [2, NULL], [3, 4])
+_col0
 [6,null]
 [6,null]
 [6,null]
@@ -154,7 +154,7 @@ array_map((x, y, z) -> (x + y) + z, [1, 2], [2, NULL], [3, 4])
 
 -- query 31
 -- legacy
-array_map((x, y, z) -> (x + y) + z, [1, 2], [2, NULL], NULL)
+_col0
 NULL
 NULL
 NULL
@@ -162,45 +162,45 @@ NULL
 
 -- query 32
 -- legacy
-array_map(x -> array_map(x -> x + 100, x), [[1, 2, 3]])
+_col0
 [[101,102,103]]
 
 -- query 33
 -- legacy
-array_map(x -> array_map(x -> x + 100, x), [[1, 2, 3], [NULL]])
+_col0
 [[101,102,103],[null]]
 
 -- query 34
 -- legacy
-array_map(x -> array_map(x -> array_map(x -> x + 100, x), x), [[[1, 2, 3]]])
+_col0
 [[[101,102,103]]]
 
 -- query 35
 -- legacy
-array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg1)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+_col0
 [[[[2,3]]]]
 
 -- query 36
 -- legacy
-array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg0)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+_col0
 [[[[2,3]]]]
 
 -- query 37
 -- legacy
-array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg2)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+_col0
 [[[[3,4]]]]
 
 -- query 38
 -- legacy
-array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_map(arg4 -> (array_length(arg2)) + arg4, arg3), arg2), arg1), arg0), [[[[[1, 2]]]]])
+_col0
 [[[[[2,3]]]]]
 
 -- query 40
 -- legacy
-array_sum(array_map(x -> array_contains(array_generate(1, 10000), x), array_generate(1, 100000)))
+_col0
 10000
 
 -- query 43
 -- legacy
-l	array_map(x -> concat(x, l), arr_str)
+l	_col1
 []	[["abcdefghasdasdasirnqwrq"],["abcdefghasdasdasirnqwrq"]]

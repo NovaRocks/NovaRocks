@@ -1,5 +1,5 @@
 -- query 8
--- types	integer	decimal(10, 2)	bigint
+-- types	integer	decimal(10, 2)	integer
 id	v	is_null_v
 1	99999999.99	0
 2	-99999999.99	0

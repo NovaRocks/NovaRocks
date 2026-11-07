@@ -7,6 +7,7 @@ query.execution.commit_unknown	Execution
 query.execution.control	Execution
 query.execution.deadline_exceeded	Execution
 query.execution.dependency	Execution
+query.execution.division_by_zero	Execution
 query.execution.invalid_data	Execution
 query.execution.invariant	Execution
 query.execution.merge_target_row_multiple_matches	Execution
@@ -28,10 +29,15 @@ sql.admit.persisted_definition_semantics_unsupported	Admit
 sql.admit.session_global_scope_unsupported	Admit
 sql.admit.session_transaction_unsupported	Admit
 sql.admit.update_unsupported_form	Admit
+sql.analyze.duplicate_column_name	Analyze
 sql.analyze.internal	Analyze
 sql.analyze.invalid_argument	Analyze
 sql.analyze.invalid_literal	Analyze
 sql.analyze.invalid_query_shape	Analyze
+sql.analyze.invalid_view	Analyze
+sql.analyze.mismatched_column_aliases	Analyze
+sql.analyze.missing_column_name	Analyze
+sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze
 sql.analyze.unavailable_implementation	Analyze
 sql.analyze.unknown_column	Analyze
@@ -39,6 +45,8 @@ sql.analyze.unknown_function	Analyze
 sql.analyze.unknown_table	Analyze
 sql.analyze.unsupported_expression	Analyze
 sql.analyze.unsupported_query_shape	Analyze
+sql.analyze.view_is_recursive	Analyze
+sql.analyze.view_is_stale	Analyze
 sql.lex.unexpected_character	Lex
 sql.lex.unterminated_comment	Lex
 sql.lex.unterminated_quoted_identifier	Lex

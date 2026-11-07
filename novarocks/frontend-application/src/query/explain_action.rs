@@ -162,7 +162,7 @@ async fn make_explain_preparation(
             &input.scope,
             ExplainPreparationPorts {
                 provider: &input.provider_source,
-                cpu: input.planning_cpu.as_ref(),
+                cpu: &input.planning_cpu,
                 io: input.io,
                 state_store: input.state_store,
             },

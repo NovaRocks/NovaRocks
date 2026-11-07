@@ -45,17 +45,17 @@ insert into ${case_db}.t_unnest select 5, null;
 -- sum(unnest) = 2 + sum(3..12280) + sum(4..20) = 2 + (3+12280)*12278/2 + (4+20)*17/2
 -- Standalone-server doesn't ship the `unnest_bitmap` table function;
 -- `unnest(bitmap_to_array(...))` exercises the same path.
-select sum(c1), sum(unnest) from ${case_db}.t_unnest, unnest(bitmap_to_array(c2));
+select sum(c1), sum(unnest) from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) AS u(unnest);
 
 -- query 4
 -- @order_sensitive=true
 -- First 5 rows ascending: smallest values from c1=2 (just 2), then c1=3 (3,4,5,6)
-select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) order by c1 asc, c3 asc limit 5;
+select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) AS u(unnest) order by c1 asc, c3 asc limit 5;
 
 -- query 5
 -- @order_sensitive=true
 -- Last 5 rows descending: from c1=4 (20,19,18,17,16)
-select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) order by c1 desc, c3 desc limit 5;
+select c1, unnest as c3 from ${case_db}.t_unnest, unnest(bitmap_to_array(c2)) AS u(unnest) order by c1 desc, c3 desc limit 5;
 
 -- query 6
 -- @skip_result_check=true
@@ -98,4 +98,4 @@ SELECT tag_name, bitmap_to_array(rb2) as row_id_ FROM all_tag order by 1, 2;
 WITH result AS (SELECT rb FROM ${case_db}.test_tags),
      page_result AS (SELECT sub_bitmap(bitmap_union(rb), 0, 20) rb FROM result),
      all_tag AS (SELECT tag_name, tag_value, c1, bitmap_and(t0.rb, t1.rb) rb2 FROM ${case_db}.test_tags t0 JOIN page_result t1 WHERE bitmap_has_any(t0.rb, t1.rb))
-SELECT tag_name, unnest as row_id_ FROM all_tag, unnest(bitmap_to_array(rb2)) order by 1, 2;
+SELECT tag_name, unnest as row_id_ FROM all_tag, unnest(bitmap_to_array(rb2)) AS u(unnest) order by 1, 2;

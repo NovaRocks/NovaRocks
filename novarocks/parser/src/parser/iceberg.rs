@@ -193,17 +193,24 @@ fn parse_default_literal(parser: &mut StatementParser<'_, '_>) -> Result<Literal
     if parser.current_is_symbol(Symbol::Minus) {
         let start = parser.current_span().start();
         parser.consume_symbol(Symbol::Minus)?;
-        let mut literal = parser.parse_literal()?;
-        let LiteralKind::Number(value) = &mut literal.kind else {
+        if !matches!(
+            parser.current().map(|token| &token.kind),
+            Some(TokenKind::Number)
+        ) {
+            let literal = parser.parse_literal()?;
             return Err(ParseError::UnexpectedToken {
                 expected: "numeric literal after `-` in DEFAULT",
                 found: "non-numeric literal".to_string(),
                 span: literal.span,
             });
-        };
-        value.insert(0, '-');
-        literal.span = Span::new(start, literal.span.end());
-        return Ok(literal);
+        }
+        let number_span = parser.current_span();
+        let span = Span::new(start, number_span.end());
+        let kind =
+            super::number_literal_kind(format!("-{}", parser.source_slice(number_span)), span)?;
+        parser.advance();
+        parser.skip_trivia();
+        return Ok(Literal { kind, span });
     }
     parser.parse_literal()
 }

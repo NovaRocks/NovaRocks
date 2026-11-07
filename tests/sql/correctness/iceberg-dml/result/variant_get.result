@@ -6,7 +6,7 @@ IRU9_FIXTURE_COMPLETE
 
 -- query 3
 -- legacy
-id	try_variant_get(v, '$.a', 'bigint')
+id	_col1
 1	1
 2	99
 3	NULL
@@ -16,7 +16,7 @@ id	try_variant_get(v, '$.a', 'bigint')
 
 -- query 4
 -- legacy
-id	variant_get(v, '$.a', 'bigint')
+id	_col1
 1	1
 2	99
 3	NULL
@@ -34,7 +34,7 @@ id
 
 -- query 10
 -- legacy
-id	variant_typeof(variant_get(v, '$.a'))
+id	_col1
 1	Int8
 2	Int8
 
@@ -45,7 +45,7 @@ id
 
 -- query 12
 -- legacy
-id	variant_get(v, '$.b', 'string')
+id	_col1
 1	x
 2	y
 3	no-a

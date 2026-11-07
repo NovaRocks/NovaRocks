@@ -34,10 +34,6 @@ pub struct TrinoCaseSession {
     operation_deadline: Option<Instant>,
     cancel_slot: crate::fault_injection::QueryCancelSlot,
     conversion_mode: bool,
-    last_failure: Option<StatementFailure>,
-    // Count every real failure in the current execution attempt, including
-    // local/render refusals, so a later transport cannot erase an earlier error.
-    last_failure_count: usize,
 }
 impl TrinoCaseSession {
     pub(crate) fn new_with_deadline(
@@ -76,8 +72,6 @@ impl TrinoCaseSession {
             operation_deadline: None,
             cancel_slot: crate::fault_injection::QueryCancelSlot::default(),
             conversion_mode: false,
-            last_failure: None,
-            last_failure_count: 0,
         })
     }
     fn client(conn: &ConnectionConfig) -> Result<TrinoClient> {
@@ -125,17 +119,6 @@ impl TrinoCaseSession {
     pub(crate) fn set_conversion_mode(&mut self, enabled: bool) {
         self.conversion_mode = enabled;
     }
-    /// Only an actual decoded Trino statement error permits conversion to continue.
-    /// Local controls and HTTP/transport failures remain infrastructure failures.
-    pub(crate) fn last_failure_is_statement(&self) -> bool {
-        matches!(self.last_failure, Some(StatementFailure::Trino(_)))
-    }
-    pub(crate) fn last_failure_is_transport(&self) -> bool {
-        matches!(self.last_failure, Some(StatementFailure::Transport(_)))
-    }
-    pub(crate) fn last_failure_is_only_transport(&self) -> bool {
-        self.last_failure_count == 1 && self.last_failure_is_transport()
-    }
     pub fn reconnect(&mut self) -> Result<()> {
         self.client = Self::client(&self.base_config)?;
         Ok(())
@@ -175,7 +158,7 @@ impl TrinoCaseSession {
         query_timeout: u64,
         sql: &str,
         db: Option<&str>,
-    ) -> (bool, Option<QueryExecution>, String) {
+    ) -> SqlExecutionOutcome {
         self.execute_query_with_before_execute(query_timeout, sql, db, true, |_, _, _, _, _| Ok(()))
     }
     /// POST obtains the query identity before controls are armed. The first GET
@@ -187,31 +170,40 @@ impl TrinoCaseSession {
         db: Option<&str>,
         allow_transient_commit_retries: bool,
         mut before: impl FnMut(usize, usize, &str, &str, CancelHandle) -> Result<()>,
-    ) -> (bool, Option<QueryExecution>, String) {
-        self.last_failure = None;
-        self.last_failure_count = 0;
-        for attempt in 0..2 {
-            let result = self.execute_query_once(
+    ) -> SqlExecutionOutcome {
+        let mut attempts = Vec::new();
+        for ordinal in 0..2 {
+            let attempt = self.execute_query_once(
+                ordinal,
                 query_timeout,
                 sql,
                 db,
                 |index, query_id, submitted, cancel| {
-                    before(attempt, index, query_id, submitted, cancel)
+                    before(ordinal, index, query_id, submitted, cancel)
                 },
             );
-            if result.0
-                || attempt == 1
-                || self.conversion_mode
-                || !allow_transient_commit_retries
-                || !self.last_failure_is_statement()
-                || !crate::runner::is_transient_iceberg_commit_error(&result.2)
-            {
-                return result;
+            let mut outcome = SqlExecutionOutcome::from_attempt(attempt);
+            let retry = !outcome.0
+                && ordinal == 0
+                && !self.conversion_mode
+                && allow_transient_commit_retries
+                && outcome.failure_is_statement()
+                && crate::runner::is_transient_iceberg_commit_error(&outcome.2);
+            attempts.append(&mut outcome.3);
+            outcome.3 = attempts;
+            if !retry {
+                return outcome;
             }
             if let Err(error) = self.before_operation() {
-                self.last_failure = None;
-                self.last_failure_count = self.last_failure_count.saturating_add(1);
-                return (false, None, format!("SQL retry deadline failed: {error:#}"));
+                let message = format!("SQL retry deadline failed: {error:#}");
+                outcome
+                    .3
+                    .last_mut()
+                    .unwrap()
+                    .local_failures
+                    .push(message.clone());
+                outcome.2 = format!("{}\n{message}", outcome.2);
+                return outcome;
             }
             let delay = self
                 .deadline
@@ -221,52 +213,67 @@ impl TrinoCaseSession {
                         .min(Duration::from_millis(300))
                 });
             std::thread::sleep(delay);
+            attempts = outcome.3;
         }
         unreachable!("finite retry loop always returns")
     }
     fn execute_query_once(
         &mut self,
+        ordinal: usize,
         query_timeout: u64,
         sql: &str,
         db: Option<&str>,
         mut before: impl FnMut(usize, &str, &str, CancelHandle) -> Result<()>,
-    ) -> (bool, Option<QueryExecution>, String) {
-        self.last_failure = None;
-        self.last_failure_count = 0;
+    ) -> SqlExecutionAttempt {
         let started = Instant::now();
+        let mut attempt = SqlExecutionAttempt {
+            ordinal,
+            statement_count: 0,
+            statements: Vec::new(),
+            local_failures: Vec::new(),
+            execution: None,
+            message: String::new(),
+            succeeded: false,
+        };
         let statements = match split_sql_statements(sql) {
-            Ok(s) => s,
-            Err(e) => {
-                self.last_failure_count = self.last_failure_count.saturating_add(1);
-                return (false, None, format!("ERROR (0.00s): {e:#}"));
+            Ok(statements) => statements,
+            Err(error) => {
+                attempt.message = format!("ERROR (0.00s): {error:#}");
+                attempt.local_failures.push(format!("{error:#}"));
+                return attempt;
             }
         };
+        attempt.statement_count = statements.len();
         if let Some(db) = db.filter(|value| !value.is_empty())
             && let Err(error) = Self::set_database_context(&mut self.state, db)
         {
-            self.last_failure_count = self.last_failure_count.saturating_add(1);
-            return (
-                false,
-                None,
-                format!("ERROR (runner database context): {error:#}"),
-            );
+            attempt.message = format!("ERROR (runner database context): {error:#}");
+            attempt.local_failures.push(format!("{error:#}"));
+            return attempt;
         }
         self.state
             .properties
             .insert("query_timeout".into(), query_timeout.to_string());
         self.sync_guard();
-        let mut results: Vec<StatementResult> = Vec::new();
+        let mut results = Vec::new();
         let mut result_statements = Vec::new();
-        let mut failures = Vec::new();
+        let mut messages = Vec::new();
         for (index, statement) in statements.iter().enumerate() {
-            let mut client_failed = false;
+            let mut facts = SqlStatementOutcome {
+                ordinal: index,
+                sql: statement.clone(),
+                submission_started: false,
+                query_id: None,
+                completed: false,
+                result: None,
+                failures: Vec::new(),
+            };
+            let mut client_error = None;
             let outcome = (|| -> Result<StatementResult> {
                 self.before_operation()?;
                 if let Some(guard) = &self.namespace_guard {
                     guard.before(statement)?;
                 }
-                // Existing runner owners bound client I/O. The Server owns
-                // query_timeout; only ownerless utilities need a local fallback.
                 let deadline = match self
                     .deadline
                     .into_iter()
@@ -279,12 +286,14 @@ impl TrinoCaseSession {
                         .context("SQL statement deadline overflow")?,
                 };
                 self.cancel_slot.clear().map_err(anyhow::Error::msg)?;
+                facts.submission_started = true;
                 let pending = self
                     .client
                     .submit_observed(&self.state, statement, deadline, emit_statement_trace)
-                    .inspect_err(|_| {
-                        client_failed = true;
+                    .inspect_err(|error| {
+                        client_error = Some(error.clone());
                     })?;
+                facts.query_id = Some(pending.query_id.clone());
                 let cancel = pending.cancel_handle();
                 if let Err(error) = self
                     .cancel_slot
@@ -296,15 +305,35 @@ impl TrinoCaseSession {
                 }
                 if let Err(error) = before(index, &pending.query_id, statement, cancel.clone()) {
                     emit_control_failure_trace(&pending, &error);
-                    let _ = cancel.delete(deadline);
-                    let _ = self.cancel_slot.clear();
-                    return Err(error.context("runner before-execute control failed"));
+                    let error = error.context("runner before-execute control failed");
+                    facts
+                        .failures
+                        .push(SqlExecutionFailure::Local(format!("{error:#}")));
+                    if let Err(error) = cancel.delete(deadline) {
+                        facts.failures.push(SqlExecutionFailure::Client(error));
+                    }
+                    if let Err(error) = self.cancel_slot.clear() {
+                        facts.failures.push(SqlExecutionFailure::Local(error));
+                    }
+                    return Err(error);
                 }
                 let outcome = pending.run_observed(deadline, emit_statement_trace);
-                self.cancel_slot.clear().map_err(anyhow::Error::msg)?;
-                let (result, effects) = outcome.inspect_err(|_| {
-                    client_failed = true;
-                })?;
+                match &outcome {
+                    Ok((result, _)) => {
+                        facts.completed = true;
+                        facts.result = Some(result.clone());
+                    }
+                    Err(error) => {
+                        client_error = Some(error.clone());
+                    }
+                }
+                if let Err(error) = self.cancel_slot.clear().map_err(anyhow::Error::msg) {
+                    facts
+                        .failures
+                        .push(SqlExecutionFailure::Local(format!("{error:#}")));
+                    return Err(error);
+                }
+                let (result, effects) = outcome?;
                 self.state.apply(&effects);
                 self.sync_guard();
                 if let Some(guard) = &mut self.namespace_guard {
@@ -319,34 +348,53 @@ impl TrinoCaseSession {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    self.last_failure_count = self.last_failure_count.saturating_add(1);
-                    let failure = client_failed
-                        .then(|| error.downcast_ref::<StatementFailure>().cloned())
-                        .flatten();
-                    let is_statement = matches!(failure, Some(StatementFailure::Trino(_)));
-                    // Retain the first domain failure. A later infrastructure
-                    // failure overrides the classifier while preserving all text.
-                    if self.last_failure.is_none() || !is_statement {
-                        self.last_failure = failure;
+                    if let Some(failure) = client_error {
+                        facts.completed |= matches!(failure, StatementFailure::Trino(_));
+                        facts
+                            .failures
+                            .insert(0, SqlExecutionFailure::Client(failure));
+                    } else if facts.failures.is_empty() {
+                        facts
+                            .failures
+                            .push(SqlExecutionFailure::Local(format!("{error:#}")));
                     }
-                    failures.push(format_statement_failure(
+                    let is_statement = facts.failures.iter().all(|failure| {
+                        matches!(
+                            failure,
+                            SqlExecutionFailure::Client(StatementFailure::Trino(_))
+                        )
+                    });
+                    let diagnostic = facts
+                        .failures
+                        .iter()
+                        .map(|failure| match failure {
+                            SqlExecutionFailure::Client(error) => error.to_string(),
+                            SqlExecutionFailure::Local(message) => message.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    messages.push(format_statement_failure(
                         started.elapsed(),
                         index,
                         statements.len(),
                         statement,
-                        &format!("{error:#}"),
+                        &diagnostic,
                     ));
+                    attempt.statements.push(facts);
                     if !self.conversion_mode {
-                        return (false, None, failures.join("\n"));
+                        attempt.message = messages.join("\n");
+                        return attempt;
                     }
                     if !is_statement {
                         break;
                     }
+                    continue;
                 }
             }
+            attempt.statements.push(facts);
         }
-        // Raw typed results remain owned even if canonical rendering fails.
-        // A failed conversion batch is evidence only and cannot be recorded.
+        // Per-statement facts retain raw typed results even when projection or
+        // a later statement fails. Conversion cannot bless this partial batch.
         let mut execution = QueryExecution {
             shell_result: None,
             header: Vec::new(),
@@ -369,16 +417,16 @@ impl TrinoCaseSession {
             Ok(())
         })();
         if let Err(error) = projection {
-            self.last_failure = None;
-            self.last_failure_count = self.last_failure_count.saturating_add(1);
-            failures.push(format!("FAIL ({error:#})"));
-            let partial = self.conversion_mode.then_some(execution);
-            return (false, partial, failures.join("\n"));
+            let message = format!("FAIL ({error:#})");
+            attempt.local_failures.push(message.clone());
+            messages.push(message);
+            attempt.execution = self.conversion_mode.then_some(execution);
+        } else {
+            attempt.execution = Some(execution);
         }
-        if !failures.is_empty() {
-            return (false, Some(execution), failures.join("\n"));
-        }
-        (true, Some(execution), String::new())
+        attempt.succeeded = messages.is_empty();
+        attempt.message = messages.join("\n");
+        attempt
     }
 }
 
@@ -606,7 +654,8 @@ pub(crate) fn run_trino_sql_scoped_until(
     if let Some(guard) = guard {
         session.set_namespace_guard(guard);
     }
-    let (ok, execution, message) = session.execute_query(query_timeout, sql, None);
+    let outcome = session.execute_query(query_timeout, sql, None);
+    let (ok, execution, message) = outcome.summary();
     let cleanup = session.finish();
     match (ok, cleanup) {
         (false, Err(cleanup)) => {
@@ -1065,7 +1114,8 @@ mod session_tests {
         config.catalog = Some("initial".into());
         config.db = Some("`selected`.`first_namespace`".into());
         let mut session = TrinoCaseSession::new_with_deadline(&config, None).unwrap();
-        let (ok, _, message) = session.execute_query(2, "SELECT 7", None);
+        let outcome = session.execute_query(2, "SELECT 7", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         let requests = peer.finish();
         assert_eq!(requests[0].headers["x-trino-catalog"], "selected");
@@ -1078,9 +1128,11 @@ mod session_tests {
             let peer = Peer::start(boundary_success_replies(2));
             let mut session = peer.session();
             session.state.catalog = Some("initial".into());
-            let (ok, _, message) = session.execute_query(2, "SELECT 7", Some(database));
+            let outcome = session.execute_query(2, "SELECT 7", Some(database));
+            let (ok, _, message) = outcome.summary();
             assert!(ok, "{message}");
-            let (ok, _, message) = session.execute_query(2, "SELECT 7", Some("second_namespace"));
+            let outcome = session.execute_query(2, "SELECT 7", Some("second_namespace"));
+            let (ok, _, message) = outcome.summary();
             assert!(ok, "{message}");
             let requests = peer.finish();
             assert_eq!(requests[0].headers["x-trino-catalog"], "selected");
@@ -1109,10 +1161,11 @@ mod session_tests {
         session.state.schema = Some("original_namespace".into());
         let properties = session.state.properties.clone();
         for database in ["a.b.c", "a; SELECT 1", "a; USE b", "`a.b`"] {
-            let (ok, execution, message) = session.execute_query(2, "SELECT 7", Some(database));
+            let outcome = session.execute_query(2, "SELECT 7", Some(database));
+            let (ok, execution, message) = outcome.summary();
             assert!(!ok, "{database}: {message}");
             assert!(execution.is_none());
-            assert!(!session.last_failure_is_statement());
+            assert!(!outcome.failure_is_statement());
             assert_eq!(session.state.catalog.as_deref(), Some("original_catalog"));
             assert_eq!(session.state.schema.as_deref(), Some("original_namespace"));
             assert_eq!(session.state.properties, properties);
@@ -1132,8 +1185,8 @@ mod session_tests {
             Reply::json("GET", "/select", &integer_result("v", 42)),
         ]);
         let mut session = peer.session();
-        let (ok, execution, message) =
-            session.execute_query(9, "SET pipeline_dop = 4; SELECT 42 AS v;", None);
+        let outcome = session.execute_query(9, "SET pipeline_dop = 4; SELECT 42 AS v;", None);
+        let (ok, execution, message) = outcome.summary();
         assert!(ok, "{message}");
         assert_eq!(execution.unwrap().typed_results.len(), 1);
         assert_eq!(session.state.properties["pipeline_dop"], "4");
@@ -1153,9 +1206,10 @@ mod session_tests {
             Reply::queued("/v1/statement", "/two"),
             Reply::json("GET", "/two", &integer_result("b", 2)),
         ]);
-        let (ok, execution, message) =
-            peer.session()
-                .execute_query(9, "SELECT 1 AS a; SELECT 2 AS b", None);
+        let outcome = peer
+            .session()
+            .execute_query(9, "SELECT 1 AS a; SELECT 2 AS b", None);
+        let (ok, execution, message) = outcome.summary();
         assert!(ok, "{message}");
         let execution = execution.unwrap();
         assert_eq!(execution.typed_results.len(), 2);
@@ -1177,7 +1231,7 @@ mod session_tests {
         ]);
         let requests = Arc::clone(&peer.requests);
         let mut observed = false;
-        let (ok, _, message) = peer.session().execute_query_with_before_execute(
+        let outcome = peer.session().execute_query_with_before_execute(
             9,
             "SELECT 1",
             None,
@@ -1193,6 +1247,7 @@ mod session_tests {
                 Ok(())
             },
         );
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         assert!(observed);
         assert_eq!(peer.finish()[1].method, "GET");
@@ -1202,13 +1257,14 @@ mod session_tests {
         let mut canceled = Reply::json("DELETE", "/one", "");
         canceled.status = 204;
         let peer = Peer::start(vec![Reply::queued("/v1/statement", "/one"), canceled]);
-        let (ok, execution, message) = peer.session().execute_query_with_before_execute(
+        let outcome = peer.session().execute_query_with_before_execute(
             9,
             "SELECT 1",
             None,
             true,
             |_, _, _, _, _| bail!("observation denied"),
         );
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok);
         assert!(execution.is_none());
         assert!(message.contains("runner before-execute control failed"));
@@ -1234,10 +1290,12 @@ mod session_tests {
             &defaults,
         )
         .unwrap();
-        let (ok, _, message) = session.execute_query(9, "SELECT 1", None);
+        let outcome = session.execute_query(9, "SELECT 1", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         session.reconnect().unwrap();
-        let (ok, _, message) = session.execute_query(9, "SELECT 2", None);
+        let outcome = session.execute_query(9, "SELECT 2", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         let requests = peer.finish();
         assert_eq!(requests.len(), 4);
@@ -1272,11 +1330,13 @@ mod session_tests {
             &defaults,
         )
         .unwrap();
-        let (ok, _, message) = session.execute_query(9, "SET pipeline_dop = 4", None);
+        let outcome = session.execute_query(9, "SET pipeline_dop = 4", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         assert_eq!(session.state.properties["pipeline_dop"], "4");
         session.reconnect().unwrap();
-        let (ok, _, message) = session.execute_query(9, "SELECT 2", None);
+        let outcome = session.execute_query(9, "SELECT 2", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         let requests = peer.finish();
         assert_eq!(requests.len(), 4);
@@ -1304,12 +1364,14 @@ mod session_tests {
             .state
             .properties
             .insert("pipeline_dop".into(), "4".into());
-        let (ok, _, message) = session.execute_query(9, "SELECT 1", Some("chosen"));
+        let outcome = session.execute_query(9, "SELECT 1", Some("chosen"));
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         let original = session.state.clone();
         session.reconnect().unwrap();
         assert_eq!(session.state, original);
-        let (ok, _, message) = session.execute_query(9, "SELECT 2", None);
+        let outcome = session.execute_query(9, "SELECT 2", None);
+        let (ok, _, message) = outcome.summary();
         assert!(ok, "{message}");
         let requests = peer.finish();
         assert_eq!(requests[0].connection, requests[1].connection);
@@ -1326,10 +1388,11 @@ mod session_tests {
             Reply::json("GET", "/one", &error.to_string()),
         ]);
         let mut session = peer.session();
-        let (ok, execution, message) = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let outcome = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok);
         assert!(execution.is_none());
-        assert!(session.last_failure_is_statement());
+        assert!(outcome.failure_is_statement());
         assert!(message.contains("statement 1/2"));
         assert!(message.ends_with('中'));
         assert_eq!(message.matches('中').count(), 1000);
@@ -1338,6 +1401,167 @@ mod session_tests {
     fn trino_error(message: &str) -> String {
         serde_json::json!({"id":"q","error":{"message":message,"errorCode":1,"errorName":"GENERIC_USER_ERROR","errorType":"USER_ERROR"}}).to_string()
     }
+    #[test]
+    fn returned_outcomes_retain_complete_attempts_without_ambient_session_state() {
+        let retry = "metadata file for version 1 is missing under /metadata";
+        let peer = Peer::start(vec![
+            Reply::queued("/v1/statement", "/first"),
+            Reply::json("GET", "/first", &trino_error(retry)),
+            Reply::queued("/v1/statement", "/second"),
+            Reply::json("GET", "/second", &integer_result("v", 7)),
+            Reply::queued("/v1/statement", "/third"),
+            Reply::json("GET", "/third", &trino_error("later failure")),
+            Reply::queued("/v1/statement", "/fourth"),
+            Reply::json("GET", "/fourth", &integer_result("v", 9)),
+        ]);
+        let mut session = peer.session();
+        let first = session.execute_query(9, "SELECT 7", None);
+        let original = first.evidence();
+        assert!(first.0);
+        assert_eq!(first.3.len(), 2);
+        assert!(matches!(
+            first.3[0].statements[0].failures.as_slice(),
+            [SqlExecutionFailure::Client(StatementFailure::Trino(_))]
+        ));
+        assert_eq!(
+            first.3[1].execution.as_ref().unwrap().typed_results.len(),
+            1
+        );
+        let later = session.execute_query(9, "SELECT missing", None);
+        assert!(later.failure_is_statement());
+        let retained_failure = later.evidence();
+        assert!(session.execute_query(9, "SELECT 9", None).0);
+        assert_eq!(later.evidence(), retained_failure);
+        assert_eq!(
+            crate::SqlStepOutcome::from_session(later).3,
+            Some(crate::ExecutionFailureOrigin::Statement)
+        );
+        assert_eq!(
+            first.evidence(),
+            original,
+            "later calls cannot rewrite an earlier outcome"
+        );
+        assert_eq!(peer.finish().len(), 8);
+    }
+
+    fn generic_user_expectation() -> QueryMeta {
+        QueryMeta {
+            expect_trino_error: Some(TrinoErrorExpectation {
+                name: "GENERIC_USER_ERROR".into(),
+                error_type: "USER_ERROR".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trino_error_expectation_consumes_one_real_complete_statement_outcome() {
+        let peer = Peer::start(vec![
+            Reply::queued("/v1/statement", "/bad"),
+            Reply::json("GET", "/bad", &trino_error("marker")),
+            Reply::queued("/v1/statement", "/second"),
+            Reply::json("GET", "/second", &trino_error("extra failure")),
+        ]);
+        let mut session = peer.session();
+        session.set_conversion_mode(true);
+        let outcome = session.execute_query(9, "SELECT bad; SELECT also_bad", None);
+        assert_eq!(outcome.3[0].statement_count, 2);
+        assert_eq!(outcome.final_failures().len(), 2);
+        assert!(
+            crate::evaluate_expected_error_outcome(
+                &generic_user_expectation(),
+                false,
+                &outcome.2,
+                Some(&outcome)
+            )
+            .unwrap()
+            .is_err()
+        );
+        let legacy = QueryMeta {
+            expect_error: Some("marker".into()),
+            ..Default::default()
+        };
+        assert!(
+            crate::evaluate_expected_error_outcome(&legacy, false, &outcome.2, Some(&outcome))
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(peer.finish().len(), 4);
+    }
+
+    #[test]
+    fn trino_error_expectation_never_retries_and_verify_record_share_typed_assertions() {
+        for (mode, convert) in [
+            (crate::Mode::Verify, false),
+            (crate::Mode::Record, false),
+            (crate::Mode::Record, true),
+        ] {
+            for kind in ["match", "name", "type", "success", "http", "socket"] {
+                let mut meta = generic_user_expectation();
+                meta.retry_count = Some(3);
+                meta.retry_interval_ms = Some(0);
+                let mut replies = match kind {
+                    "success" => boundary_success_replies(1),
+                    "http" => {
+                        let mut reply =
+                            Reply::json("POST", "/v1/statement", "GENERIC_USER_ERROR USER_ERROR");
+                        reply.status = 503;
+                        vec![reply]
+                    }
+                    "socket" => {
+                        let mut reply = Reply::json("POST", "/v1/statement", "");
+                        reply.drop_before_response = true;
+                        vec![reply]
+                    }
+                    _ => vec![
+                        Reply::queued("/v1/statement", "/bad"),
+                        Reply::json(
+                            "GET",
+                            "/bad",
+                            &trino_error("metadata file for version 1 is missing under /metadata"),
+                        ),
+                    ],
+                };
+                if kind == "name" {
+                    meta.expect_trino_error.as_mut().unwrap().name = "OTHER".into();
+                }
+                if kind == "type" {
+                    meta.expect_trino_error.as_mut().unwrap().error_type = "OTHER".into();
+                }
+                replies.extend(boundary_success_replies(1));
+                let peer = Peer::start(replies);
+                let temp = tempfile::TempDir::new().unwrap();
+                let steps = vec![boundary_step(1, "SELECT bad", meta), boundary_cleanup(2)];
+                let (case, evidence, _) = run_boundary_steps(
+                    &peer,
+                    &temp,
+                    mode,
+                    convert,
+                    steps,
+                    None,
+                    Box::new(BoundaryServer),
+                );
+                assert_eq!(
+                    matches!(case.status, crate::CaseStatus::Pass),
+                    kind == "match",
+                    "{mode:?} {kind}: {}",
+                    case.log
+                );
+                assert!(oracle_recorded(
+                    &evidence,
+                    1,
+                    "expected_error",
+                    if kind == "match" { "pass" } else { "fail" }
+                ));
+                assert_eq!(
+                    posted_requests(&peer.finish()),
+                    ["SELECT bad", "SELECT 99"],
+                    "no outer or transient retry"
+                );
+            }
+        }
+    }
+
     #[test]
     fn conversion_continues_after_domain_failure_with_unblessed_raw_results_and_success_effects_only()
      {
@@ -1352,9 +1576,10 @@ mod session_tests {
         ]);
         let mut session = peer.session();
         session.set_conversion_mode(true);
-        let (ok, execution, message) = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let outcome = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok, "a partial conversion batch cannot succeed");
-        assert!(session.last_failure_is_statement());
+        assert!(outcome.failure_is_statement());
         assert!(message.contains("ordinary statement failure"));
         assert!(message.contains("statement 1/2"));
         let execution = execution.expect("raw successful suffix is retained for evidence");
@@ -1389,14 +1614,15 @@ mod session_tests {
         ]);
         let mut session = peer.session();
         session.set_conversion_mode(true);
-        let (ok, execution, message) = session.execute_query(
+        let outcome = session.execute_query(
             9,
             "SELECT bad1; SELECT bad2; SELECT 7; SELECT unavailable; SELECT 9",
             None,
         );
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok);
         assert!(
-            !session.last_failure_is_statement(),
+            !outcome.failure_is_statement(),
             "HTTP failure overrides earlier domain errors"
         );
         let first = message.find("first domain failure").unwrap();
@@ -1425,9 +1651,10 @@ mod session_tests {
         let peer = Peer::start(vec![unavailable]);
         let mut session = peer.session();
         session.set_conversion_mode(true);
-        let (ok, execution, message) = session.execute_query(9, "SELECT 1; SELECT 7", None);
+        let outcome = session.execute_query(9, "SELECT 1; SELECT 7", None);
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok);
-        assert!(!session.last_failure_is_statement());
+        assert!(!outcome.failure_is_statement());
         assert!(execution.unwrap().typed_results.is_empty());
         assert!(message.contains("status=503"), "{message}");
         assert_eq!(peer.finish().len(), 1);
@@ -1451,9 +1678,10 @@ mod session_tests {
                 ),
             ]);
             let mut session = peer.session();
-            let (ok, execution, failure) = session.execute_query(9, "SELECT 7", None);
+            let outcome = session.execute_query(9, "SELECT 7", None);
+            let (ok, execution, failure) = outcome.summary();
             assert_eq!(ok, succeeds, "{failure}");
-            assert_eq!(session.last_failure_is_statement(), !succeeds);
+            assert_eq!(outcome.failure_is_statement(), !succeeds);
             assert_eq!(execution.is_some(), succeeds);
             assert_eq!(
                 peer.finish().len(),
@@ -1471,7 +1699,7 @@ mod session_tests {
         ]);
         let mut session = peer.session();
         let mut observations = Vec::new();
-        let (ok, _, failure) = session.execute_query_with_before_execute(
+        let outcome = session.execute_query_with_before_execute(
             9,
             "INSERT INTO t VALUES (1)",
             None,
@@ -1481,8 +1709,9 @@ mod session_tests {
                 Ok(())
             },
         );
+        let (ok, _, failure) = outcome.summary();
         assert!(!ok);
-        assert!(session.last_failure_is_statement(), "{failure}");
+        assert!(outcome.failure_is_statement(), "{failure}");
         assert!(failure.contains(message), "{failure}");
         assert_eq!(observations, vec![(0, 0)]);
         let requests = peer.finish();
@@ -1509,9 +1738,10 @@ mod session_tests {
         ]);
         let mut session = peer.session();
         session.set_conversion_mode(true);
-        let (ok, execution, _) = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let outcome = session.execute_query(9, "SELECT bad; SELECT 7", None);
+        let (ok, execution, _) = outcome.summary();
         assert!(!ok);
-        assert!(session.last_failure_is_statement());
+        assert!(outcome.failure_is_statement());
         assert_eq!(execution.unwrap().result_statements, vec!["SELECT 7"]);
         assert_eq!(peer.finish().len(), 4);
     }
@@ -1522,7 +1752,7 @@ mod session_tests {
         let peer = Peer::start(vec![Reply::queued("/v1/statement", "/one"), canceled]);
         let mut session = peer.session();
         session.set_conversion_mode(true);
-        let (ok, execution, message) = session.execute_query_with_before_execute(
+        let outcome = session.execute_query_with_before_execute(
             9,
             "SELECT 1; SELECT 7",
             None,
@@ -1539,10 +1769,21 @@ mod session_tests {
                 )
             },
         );
+        let (ok, execution, message) = outcome.summary();
         assert!(!ok);
-        assert!(!session.last_failure_is_statement());
+        assert!(!outcome.failure_is_statement());
         assert!(execution.unwrap().typed_results.is_empty());
         assert!(message.contains("runner before-execute control failed"));
+        assert!(
+            crate::evaluate_expected_error_outcome(
+                &generic_user_expectation(),
+                false,
+                &outcome.2,
+                Some(&outcome)
+            )
+            .unwrap()
+            .is_err()
+        );
         let requests = peer.finish();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].method, "DELETE");
@@ -3808,7 +4049,14 @@ mod session_tests {
             outcome.log
         );
         let diagnostic = publication_kill_diagnostic(&evidence);
-        assert_eq!(evidence.diagnostics.len(), 1);
+        assert_eq!(
+            evidence
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic["kind"] == "publication_kill_query_diagnostic")
+                .count(),
+            1
+        );
         assert!(
             evidence
                 .executed
@@ -3988,9 +4236,9 @@ mod session_tests {
         session.set_conversion_mode(true);
         let raw = session.execute_query(2, "SELECT transport", None);
         assert!(!raw.0 && raw.1.is_some());
-        assert!(session.last_failure_is_only_transport());
+        assert!(raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Transport)
         );
         let raw = session.execute_query_with_before_execute(
@@ -4000,34 +4248,34 @@ mod session_tests {
             true,
             |_, _, _, _, _| anyhow::bail!("original before-operation refusal"),
         );
-        assert!(!raw.0 && !session.last_failure_is_only_transport());
+        assert!(!raw.0 && !raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Infrastructure)
         );
         session.set_operation_deadline(Some(Instant::now()));
         let raw = session.execute_query(2, "SELECT expired", None);
-        assert!(!raw.0 && !session.last_failure_is_only_transport());
+        assert!(!raw.0 && !raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Infrastructure)
         );
         session.set_operation_deadline(None);
         let raw = session.execute_query(2, "SELECT 7", Some("a.b.c"));
-        assert!(!raw.0 && !session.last_failure_is_only_transport());
+        assert!(!raw.0 && !raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Infrastructure)
         );
         let raw = session.execute_query(2, "SELECT 'unterminated", None);
-        assert!(!raw.0 && !session.last_failure_is_only_transport());
+        assert!(!raw.0 && !raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Infrastructure)
         );
         let raw = session.execute_query(2, "SELECT 7", None);
-        assert!(raw.0 && !session.last_failure_is_only_transport());
-        assert_eq!(crate::SqlStepOutcome::from_session(raw, &session).3, None);
+        assert!(raw.0 && !raw.failure_is_only_transport());
+        assert_eq!(crate::SqlStepOutcome::from_session(raw).3, None);
         assert_eq!(
             posted_requests(&peer.finish()),
             ["SELECT transport", "SELECT local", "SELECT 7"]
@@ -4045,9 +4293,9 @@ mod session_tests {
         let raw = session.execute_query(2, "SELECT text", None);
         assert!(!raw.0 && raw.1.is_some());
         assert!(raw.2.contains("typed result rendering"), "{}", raw.2);
-        assert!(!session.last_failure_is_only_transport());
+        assert!(!raw.failure_is_only_transport());
         assert_eq!(
-            crate::SqlStepOutcome::from_session(raw, &session).3,
+            crate::SqlStepOutcome::from_session(raw).3,
             Some(crate::ExecutionFailureOrigin::Infrastructure)
         );
         peer.finish();
@@ -4277,14 +4525,14 @@ mod session_tests {
             assert!(!raw.0 && raw.1.is_some() == convert);
             assert!(started.elapsed() >= Duration::from_secs(1));
             assert!(
-                matches!(session.last_failure.as_ref(),Some(StatementFailure::Trino(e))
+                matches!(raw.final_failures().first().map(|failure| match failure { SqlExecutionFailure::Client(failure) => failure, SqlExecutionFailure::Local(_) => panic!("expected client failure") }),Some(StatementFailure::Trino(e))
                 if e.error_code==131075 && e.error_name=="EXCEEDED_TIME_LIMIT"
                 && e.error_type=="INSUFFICIENT_RESOURCES")
             );
-            assert!(session.last_failure_is_statement());
-            assert!(!session.last_failure_is_only_transport());
+            assert!(raw.failure_is_statement());
+            assert!(!raw.failure_is_only_transport());
             assert_eq!(
-                crate::SqlStepOutcome::from_session(raw, &session).3,
+                crate::SqlStepOutcome::from_session(raw).3,
                 Some(crate::ExecutionFailureOrigin::Statement)
             );
             assert_eq!(session.original_deadline(), Some(owner));
@@ -4329,14 +4577,15 @@ mod session_tests {
             let raw = session.execute_query(server_query_timeout, "SELECT client_timeout", None);
             assert!(!raw.0 && raw.1.is_some() == convert);
             assert!(matches!(
-                session.last_failure.as_ref(),
+                raw.final_failures().first().map(|failure| match failure {
+                    SqlExecutionFailure::Client(failure) => failure,
+                    SqlExecutionFailure::Local(_) => panic!("expected client failure"),
+                }),
                 Some(StatementFailure::Deadline)
             ));
-            assert!(
-                !session.last_failure_is_statement() && !session.last_failure_is_only_transport()
-            );
+            assert!(!raw.failure_is_statement() && !raw.failure_is_only_transport());
             assert_eq!(
-                crate::SqlStepOutcome::from_session(raw, &session).3,
+                crate::SqlStepOutcome::from_session(raw).3,
                 Some(crate::ExecutionFailureOrigin::Infrastructure)
             );
             assert_eq!(session.original_deadline(), original_deadline);

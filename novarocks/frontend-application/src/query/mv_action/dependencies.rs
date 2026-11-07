@@ -353,7 +353,7 @@ fn application_service_error(error: MvApplicationError) -> QueryServiceError {
     if let Some(control) = error.compile_control_error() {
         return QueryServiceError::from_compile_control(control);
     }
-    if let Some(analyze) = error.unavailable_implementation() {
+    if let Some(analyze) = error.analyze_error() {
         return QueryServiceError::from_user_error(analyze.to_user_error(None));
     }
     let kind = match error.kind() {

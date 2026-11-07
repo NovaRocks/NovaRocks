@@ -17,14 +17,13 @@
 
 //! Actual SQL/analyzer/optimizer regressions with semantic property oracles.
 use super::*;
-use crate::common::{BinOp, LiteralValue};
+use crate::common::BinOp;
 use crate::optimizer::{
     OptimizedOperatorNode,
     operator::Operator,
-    scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode},
+    scalar::{ScalarArena, ScalarId, ScalarNode},
 };
 use arrow::datatypes::DataType;
-use novarocks_type_contract::ValueLogicalType;
 
 fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
     let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
@@ -106,15 +105,7 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
 const ORIGINAL: &str = "(l.score=r.score AND l.score BETWEEN 10 AND 20) OR (l.score=r.score AND l.score BETWEEN 30 AND 40)";
 
 fn integer(arena: &ScalarArena, id: ScalarId) -> Option<i64> {
-    match arena.node(id) {
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))) => Some(*value),
-        ScalarNode::Constant(value)
-            if value.value_type().logical_type() == ValueLogicalType::Physical =>
-        {
-            value.try_i64().ok().flatten()
-        }
-        _ => None,
-    }
+    crate::optimizer::scalar_expr::signed_integer_literal(arena, id)
 }
 fn unwrap_nested(arena: &ScalarArena, mut id: ScalarId) -> ScalarId {
     while let ScalarNode::Nested(inner) = arena.node(id) {
@@ -300,7 +291,7 @@ fn retains_score_join_equality(tree: &OptimizedOperatorNode) -> bool {
     found
 }
 #[test]
-fn real_int32_sql_keeps_original_or_and_both_exact_widened_range_envelopes() {
+fn real_int32_sql_keeps_original_or_and_both_exact_same_domain_range_envelopes() {
     {
         let output = compile(DataType::Int32, ORIGINAL);
         let tree = &output.optimized_tree;
@@ -314,11 +305,8 @@ fn real_int32_sql_keeps_original_or_and_both_exact_widened_range_envelopes() {
         );
         assert_eq!(
             scan_envelopes(tree),
-            vec![
-                ("l".into(), vec![(DataType::Int32, DataType::Int64)]),
-                ("r".into(), vec![(DataType::Int32, DataType::Int64)]),
-            ],
-            "both axes need necessary 10..40 predicates, retaining the exact comparison cast"
+            vec![("l".into(), vec![]), ("r".into(), vec![]),],
+            "both axes need necessary 10..40 predicates in the original INTEGER domain"
         );
     }
 }

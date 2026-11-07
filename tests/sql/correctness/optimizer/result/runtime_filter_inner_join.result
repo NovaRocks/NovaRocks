@@ -1,4 +1,4 @@
 -- query 7
 -- types	bigint
-count(*)
+_col0
 3

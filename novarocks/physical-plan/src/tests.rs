@@ -1817,7 +1817,7 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
 }
 
 #[test]
-fn integer_division_keeps_its_resolved_float_result() {
+fn integer_division_keeps_its_resolved_signed_result() {
     let mut builder = FragmentBuilder::new(FragmentId::new(23));
     let node = builder.reserve_node_id().unwrap();
     let left = builder
@@ -1837,7 +1837,7 @@ fn integer_division_keeps_its_resolved_float_result() {
     let divide = builder
         .add_expression(
             node,
-            ty(DataType::Float64, false),
+            ty(DataType::Int64, false),
             ExprKind::Binary {
                 allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
                     id: novarocks_type_contract::SemanticParameterId::new(0),
@@ -1853,7 +1853,7 @@ fn integer_division_keeps_its_resolved_float_result() {
         .unwrap();
     let output = builder
         .add_value(
-            ty(DataType::Float64, false),
+            ty(DataType::Int64, false),
             ValueOrigin::NodeOutput {
                 node,
                 output_ordinal: 0,

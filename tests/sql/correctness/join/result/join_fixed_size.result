@@ -1,114 +1,114 @@
 -- query 9
 -- types	bigint
-count(1)
+_col0
 256
 
 -- query 10
 -- types	bigint
-count(1)
+_col0
 36
 
 -- query 11
 -- types	bigint
-count(1)
+_col0
 3076
 
 -- query 12
 -- types	bigint
-count(1)
+_col0
 3076
 
 -- query 13
 -- types	bigint
-count(1)
+_col0
 76924
 
 -- query 14
 -- types	bigint
-count(1)
+_col0
 476
 
 -- query 15
 -- types	bigint
-count(1)
+_col0
 36
 
 -- query 16
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 17
 -- types	bigint
-count(1)
+_col0
 2857
 
 -- query 18
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 19
 -- types	bigint
-count(1)
+_col0
 0
 
 -- query 20
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 21
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 22
 -- types	bigint
-count(1)
+_col0
 3739
 
 -- query 23
 -- types	bigint
-count(1)
+_col0
 256
 
 -- query 24
 -- types	bigint
-count(1)
+_col0
 79744
 
 -- query 25
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 26
 -- types	bigint
-count(1)
+_col0
 2500
 
 -- query 27
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 28
 -- types	bigint
-count(1)
+_col0
 40000
 
 -- query 29
 -- types	bigint
-count(1)
+_col0
 2666
 
 -- query 30
 -- types	bigint
-count(1)
+_col0
 2666
 
 -- query 31
 -- types	bigint
-count(1)
+_col0
 3739

@@ -588,6 +588,8 @@ impl OwnedNodeRuntime {
             .and_then(ParticipationExecutors::handles)
             .expect("complete original Participation pools");
         let ports = TaskIoPorts {
+            #[cfg(test)]
+            close_handoff_gate: None,
             protocol_events: Some(state.config.execution_ports.clone()),
             observation: Some(state.config.observation),
             execution: Some(state.config.execution.clone()),

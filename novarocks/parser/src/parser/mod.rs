@@ -312,7 +312,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
             TokenKind::Keyword(Keyword::Null) => LiteralKind::Null,
             TokenKind::Keyword(Keyword::True) => LiteralKind::Boolean(true),
             TokenKind::Keyword(Keyword::False) => LiteralKind::Boolean(false),
-            TokenKind::Number => LiteralKind::Number(source.to_owned()),
+            TokenKind::Number => number_literal_kind(source.to_owned(), span)?,
             TokenKind::HexNumber => LiteralKind::HexString(
                 source
                     .strip_prefix("0x")
@@ -393,6 +393,22 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
 type FamilyParser = for<'source, 'tokens> fn(
     &mut StatementParser<'source, 'tokens>,
 ) -> Result<Option<Statement>, ParseError>;
+
+fn is_integer_number(value: &str) -> bool {
+    !value.contains(['.', 'e', 'E'])
+}
+
+/// Check the complete signed spelling before rejecting its positive magnitude.
+fn number_literal_kind(value: String, span: Span) -> Result<LiteralKind, ParseError> {
+    if is_integer_number(&value) && value.parse::<i64>().is_err() {
+        return Err(ParseError::UnexpectedToken {
+            expected: "signed 64-bit integer literal",
+            found: format!("`{value}`"),
+            span,
+        });
+    }
+    Ok(LiteralKind::Number(value))
+}
 
 fn unquote_string(source: &str) -> String {
     let body = &source[1..source.len() - 1];

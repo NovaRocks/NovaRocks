@@ -1,106 +1,106 @@
 -- query 9
 -- types	integer
-percentile_disc_lc(score, 0)
+_col0
 90
 
 -- query 10
 -- types	integer
-percentile_disc_lc(score, 0.25)
+_col0
 91
 
 -- query 11
 -- types	integer
-percentile_disc_lc(score, 0.5)
+_col0
 92
 
 -- query 12
 -- types	integer
-percentile_disc_lc(score, 0.75)
+_col0
 93
 
 -- query 13
 -- types	integer
-percentile_disc_lc(score, 1)
+_col0
 94
 
 -- query 14
 -- types	date
-percentile_disc_lc(date, 0)
+_col0
 2018-01-01
 
 -- query 15
 -- types	date
-percentile_disc_lc(date, 0.25)
+_col0
 2019-01-01
 
 -- query 16
 -- types	date
-percentile_disc_lc(date, 0.5)
+_col0
 2020-01-01
 
 -- query 17
 -- types	date
-percentile_disc_lc(date, 0.75)
+_col0
 2021-01-01
 
 -- query 18
 -- types	date
-percentile_disc_lc(date, 1)
+_col0
 2022-01-01
 
 -- query 19
 -- types	timestamp(6)
-percentile_disc_lc(datetime, 0)
+_col0
 2018-01-01 00:00:01.000000
 
 -- query 20
 -- types	timestamp(6)
-percentile_disc_lc(datetime, 0.25)
+_col0
 2019-01-01 00:00:01.000000
 
 -- query 21
 -- types	timestamp(6)
-percentile_disc_lc(datetime, 0.5)
+_col0
 2020-01-01 00:00:01.000000
 
 -- query 22
 -- types	timestamp(6)
-percentile_disc_lc(datetime, 0.75)
+_col0
 2021-01-01 00:00:01.000000
 
 -- query 23
 -- types	timestamp(6)
-percentile_disc_lc(datetime, 1)
+_col0
 2022-01-01 00:00:01.000000
 
 -- query 24
 -- types	double
-percentile_disc_lc(db, 0)
+_col0
 11.1
 
 -- query 25
 -- types	double
-percentile_disc_lc(db, 0.25)
+_col0
 11.2
 
 -- query 26
 -- types	double
-percentile_disc_lc(db, 0.5)
+_col0
 11.3
 
 -- query 27
 -- types	double
-percentile_disc_lc(db, 0.75)
+_col0
 11.4
 
 -- query 28
 -- types	double
-percentile_disc_lc(db, 1)
+_col0
 11.5
 
 -- query 31
 -- types	date	integer
-date	percentile_disc_lc(score, 0)
+date	_col1
 NULL	NULL
 2018-01-01	90
 2019-01-01	91
@@ -110,7 +110,7 @@ NULL	NULL
 
 -- query 33
 -- types	date	integer
-date	percentile_disc_lc(score, 0)
+date	_col1
 NULL	NULL
 2018-01-01	90
 2019-01-01	91

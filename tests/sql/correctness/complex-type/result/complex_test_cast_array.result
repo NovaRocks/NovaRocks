@@ -5,25 +5,25 @@ fifth_length
 
 -- query 7
 -- types	bigint
-count(*)
+_col0
 100
 
 -- query 8
 -- types	bigint
-count(*)
+_col0
 100
 
 -- query 9
 -- legacy
-count(*)	array_length(array_agg(arr))
+_col0	_col1
 10	10
 
 -- query 10
 -- legacy
-array_length(array_agg(arr))
+_col0
 100
 
 -- query 11
 -- legacy
-array_agg(arr)[1]
+_col0
 [[1,2,3],[1,2,3]]

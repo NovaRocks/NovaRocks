@@ -1,5 +1,5 @@
 -- query 1
--- types	bigint	double
+-- types	integer	double
 id	d
 1	NULL
 2	NULL

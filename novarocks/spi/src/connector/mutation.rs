@@ -314,14 +314,11 @@ pub enum ConnectorViewDialect {
     StarRocks,
 }
 
-/// The durable source contract used by an engine-created connector view.
-///
-/// `None` is reserved for third-party provider metadata. It is not a legacy
-/// NovaRocks representation: a NovaRocks writer must always supply the exact
-/// format it wrote.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorViewSourceFormat {
-    EffectiveUserSourceV1,
+/// One public named column and its complete view type declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorViewColumn {
+    pub name: Arc<str>,
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,9 +333,29 @@ pub struct ConnectorViewDefinition {
     /// The namespace used to resolve unqualified names when the definition was
     /// created.
     pub default_namespace: Arc<str>,
-    /// NovaRocks-owned source provenance. Third-party provider metadata has no
-    /// obligation to supply a NovaRocks format.
-    pub source_format: Option<ConnectorViewSourceFormat>,
+    /// Ordered output from the original SQL/provider type author. There is no
+    /// independent names-only schema that can diverge from these values.
+    pub columns: Arc<[ConnectorViewColumn]>,
+}
+
+impl ConnectorViewDefinition {
+    /// Validate only the declaration's structure. Callers distinguish invalid
+    /// mutation input from corrupt persisted metadata without parsing messages.
+    pub fn validate_output_declaration(&self) -> Result<(), &'static str> {
+        if self.columns.is_empty() {
+            return Err("view output declaration is empty");
+        }
+        let mut names = std::collections::HashSet::new();
+        for column in self.columns.iter() {
+            if column.name.is_empty() {
+                return Err("view output declaration has an empty public field name");
+            }
+            if !names.insert(column.name.to_lowercase()) {
+                return Err("view output declaration has duplicate public column names");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -599,7 +616,6 @@ pub enum ConnectorCatalogMutationOperation {
     },
     CreateView {
         view: ConnectorViewIdentity,
-        columns: Vec<ConnectorColumnDefinition>,
         definition: ConnectorViewDefinition,
         comment: Option<Arc<str>>,
         properties: Vec<(Arc<str>, Arc<str>)>,

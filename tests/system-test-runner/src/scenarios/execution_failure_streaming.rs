@@ -436,45 +436,51 @@ fn await_original_visible_page(
     }
 }
 
+// This marker proves only that the finite FE handoff action observed its
+// original failure watch. The Task snapshot remains the acceptance authority.
+fn handoff_terminal_marker_matches(log: &str, token: &str, expected: (u64, u64)) -> Result<bool> {
+    const MARKER: &str = novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED;
+    let token = format!("token={token}");
+    let matches = log
+        .lines()
+        .filter(|line| {
+            line.split_whitespace().next() == Some(MARKER)
+                && line.split_whitespace().any(|field| field == token)
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(false);
+    }
+    ensure!(
+        matches.len() == 1,
+        "expected one original before-schema handoff hit"
+    );
+    let statement = matches[0]
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("statement="))
+        .context("original handoff omitted actual statement token")?;
+    ensure!(
+        expected.0 > 0 && expected.1 > 0 && statement == format!("{}:{}", expected.0, expected.1),
+        "handoff does not name the exact public-query observer's original statement"
+    );
+    Ok(true)
+}
+
 fn assert_trino_handoff_marker(
     context: &mut ScenarioContext,
     token: &str,
     expected: (u64, u64),
 ) -> Result<()> {
-    const MARKER: &str = novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED;
-    let token = format!("token={token}");
     loop {
         let log = context.handle().fe_log_contents()?;
-        let matches = log
-            .lines()
-            .filter(|line| {
-                line.split_whitespace().next() == Some(MARKER)
-                    && line.split_whitespace().any(|field| field == token)
-            })
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            std::thread::sleep(
-                context
-                    .remaining("observe exact FE handoff action")?
-                    .min(Duration::from_millis(20)),
-            );
-            continue;
+        if handoff_terminal_marker_matches(&log, token, expected)? {
+            return Ok(());
         }
-        ensure!(
-            matches.len() == 1,
-            "expected one original before-schema handoff hit"
+        std::thread::sleep(
+            context
+                .remaining("observe exact FE handoff action")?
+                .min(Duration::from_millis(20)),
         );
-        let statement = matches[0]
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("statement="))
-            .context("original handoff omitted actual statement token")?;
-        ensure!(
-            expected.0 > 0
-                && expected.1 > 0
-                && statement == format!("{}:{}", expected.0, expected.1),
-            "handoff does not name the exact public-query observer's original statement"
-        );
-        return Ok(());
     }
 }
 
@@ -705,4 +711,47 @@ fn snapshot_evidence(snapshot: &QueryLifecycleStructuredSnapshot) -> Value {
         "failure_fact":format!("{:?}",snapshot.failure_fact),
         "failure_detail":snapshot.failure_detail,"failure_site":format!("{:?}",snapshot.failure_site),
         "worker_participations_converged":snapshot.worker_participations_converged})
+}
+
+#[cfg(test)]
+mod handoff_marker_tests {
+    use super::*;
+    #[test]
+    fn marker_requires_the_authenticated_session_generation_and_one_selected_hit() {
+        let expected = (1, 5);
+        const MARKER: &str =
+            novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED;
+        let marker = |statement: &str| format!("{MARKER} token=selected statement={statement}\n");
+        assert!(handoff_terminal_marker_matches(&marker("1:5"), "selected", expected).unwrap());
+        for foreign in [
+            "2:5", "1:6", "7:1:5", "0:5", "1:0", "invalid", "01:5", "1:05", "+1:5",
+        ] {
+            assert!(
+                handoff_terminal_marker_matches(&marker(foreign), "selected", expected).is_err()
+            );
+        }
+        assert!(
+            handoff_terminal_marker_matches(
+                &(marker("1:5") + &marker("1:5")),
+                "selected",
+                expected,
+            )
+            .is_err()
+        );
+        assert!(!handoff_terminal_marker_matches(&marker("1:5"), "other", expected).unwrap());
+        assert!(
+            !handoff_terminal_marker_matches(
+                &format!("{MARKER}_LOOKALIKE token=selected statement=1:5\n"),
+                "selected",
+                expected,
+            )
+            .unwrap()
+        );
+        for invalid_expected in [(0, 5), (1, 0)] {
+            assert!(
+                handoff_terminal_marker_matches(&marker("1:5"), "selected", invalid_expected)
+                    .is_err()
+            );
+        }
+    }
 }

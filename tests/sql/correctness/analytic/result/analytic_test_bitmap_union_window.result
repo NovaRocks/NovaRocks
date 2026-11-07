@@ -1,6 +1,6 @@
 -- query 2
 -- legacy
-c1	bitmap_to_string(bitmap_union(c2) OVER ())
+c1	_col1
 1	11,22,55
 2	11,22,55
 3	11,22,55
@@ -9,7 +9,7 @@ c1	bitmap_to_string(bitmap_union(c2) OVER ())
 
 -- query 3
 -- legacy
-c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 ))
+c1	_col1
 1	11
 2	22
 3	NULL
@@ -18,7 +18,7 @@ c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 ))
 
 -- query 4
 -- legacy
-c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 % 2 ))
+c1	_col1
 1	11,55
 2	22
 3	11,55
@@ -27,7 +27,7 @@ c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 % 2 ))
 
 -- query 5
 -- legacy
-c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 % 2 ORDER BY c1 ASC ))
+c1	_col1
 1	11
 2	22
 3	11

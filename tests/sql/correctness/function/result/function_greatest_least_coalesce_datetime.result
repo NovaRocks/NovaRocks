@@ -1,54 +1,54 @@
 -- query 1
 -- types	date
-date(greatest(date('2026-01-14'), timestamp('2026-01-11 00:00:00')))
+_col0
 2026-01-14
 
 -- query 2
 -- types	timestamp(6)
-greatest(date('2026-01-11'), timestamp('2026-01-14 00:00:00'))
+_col0
 2026-01-14 00:00:00.000000
 
 -- query 3
 -- types	varchar
-typeof(greatest(date('2026-01-11'), timestamp('2026-01-14 00:00:00')))
+_col0
 datetime
 
 -- query 4
 -- types	timestamp(6)
-least(date('2026-01-14'), timestamp('2026-01-11 00:00:00'))
+_col0
 2026-01-11 00:00:00.000000
 
 -- query 5
 -- types	varchar
-typeof(least(date('2026-01-14'), timestamp('2026-01-11 00:00:00')))
+_col0
 datetime
 
 -- query 6
 -- types	timestamp(6)
-coalesce(NULL, date('2026-01-11'), timestamp('2026-01-14 00:00:00'))
+_col0
 2026-01-11 00:00:00.000000
 
 -- query 7
 -- types	varchar
-typeof(coalesce(NULL, date('2026-01-11'), timestamp('2026-01-14 00:00:00')))
+_col0
 datetime
 
 -- query 8
 -- types	timestamp(6)
-greatest(date('2026-01-11'), date('2026-01-14'), date('2026-01-09'))
+_col0
 2026-01-14 00:00:00.000000
 
 -- query 9
 -- types	varchar
-typeof(greatest(date('2026-01-11'), date('2026-01-14'), date('2026-01-09')))
+_col0
 datetime
 
 -- query 10
 -- types	varchar
-typeof(greatest(CAST(100 AS INT), CAST(200 AS bigint)))
+_col0
 bigint
 
 -- query 11
 -- types	varchar
-typeof(greatest(20260114, 20260115))
+_col0
 int

@@ -1,61 +1,61 @@
 -- query 3
 -- types	double
-corr(k, v)
+_col0
 NULL
 
 -- query 5
 -- types	double
-corr(k, v)
+_col0
 NULL
 
 -- query 6
 -- types	double
-corr(k, v) OVER (PARTITION BY no )
+_col0
 NULL
 
 -- query 8
 -- types	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+_col0
 true
 
 -- query 9
 -- types	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+_col0
 true
 
 -- query 10
 -- types	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+_col0
 true
 
 -- query 11
 -- types	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+_col0
 true
 
 -- query 12
 -- types	boolean	boolean
-co IS NULL	total = 1
+_col0	_col1
 true	true
 
 -- query 13
 -- types	boolean	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 14
 -- types	boolean	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 15
 -- types	boolean
-co IS NULL
+_col0
 true
 
 -- query 16
 -- types	boolean
-((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+_col0
 true
 true
 true
@@ -73,52 +73,52 @@ NULL
 
 -- query 21
 -- types	double
-covar_pop(k, v) OVER (PARTITION BY no )
+_col0
 NULL
 
 -- query 23
 -- types	boolean
-((abs(co - 80)) / 80) < 0.00001
+_col0
 true
 
 -- query 24
 -- types	boolean
-((abs(co - 80)) / 80) < 0.00001
+_col0
 true
 
 -- query 25
 -- types	boolean
-((abs(co - 80)) / 80) < 0.00001
+_col0
 true
 
 -- query 26
 -- types	boolean
-((abs(co - 80)) / 80) < 0.00001
+_col0
 true
 
 -- query 27
 -- types	boolean	boolean
-co IS NULL	total = 1
+_col0	_col1
 true	true
 
 -- query 28
 -- types	boolean	boolean
-((abs(co - 80)) / 80) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 29
 -- types	boolean	boolean
-((abs(co - 80)) / 80) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 30
 -- types	boolean
-co IS NULL
+_col0
 true
 
 -- query 31
 -- types	boolean
-((abs(co - 80)) / 80) < 0.00001
+_col0
 true
 true
 true
@@ -136,52 +136,52 @@ NULL
 
 -- query 36
 -- types	double
-covar_samp(k, v) OVER (PARTITION BY no )
+_col0
 NULL
 
 -- query 38
 -- types	boolean
-((abs(co - 120)) / 120) < 0.00001
+_col0
 true
 
 -- query 39
 -- types	boolean
-((abs(co - 120)) / 120) < 0.00001
+_col0
 true
 
 -- query 40
 -- types	boolean
-((abs(co - 120)) / 120) < 0.00001
+_col0
 true
 
 -- query 41
 -- types	boolean
-((abs(co - 120)) / 120) < 0.00001
+_col0
 true
 
 -- query 42
 -- types	boolean	boolean
-co IS NULL	total = 1
+_col0	_col1
 true	true
 
 -- query 43
 -- types	boolean	boolean
-((abs(co - 120)) / 120) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 44
 -- types	boolean	boolean
-((abs(co - 120)) / 120) < 0.00001	total = 4
+_col0	_col1
 true	true
 
 -- query 45
 -- types	boolean
-co IS NULL
+_col0
 true
 
 -- query 46
 -- types	boolean
-((abs(co - 120)) / 120) < 0.00001
+_col0
 true
 true
 true

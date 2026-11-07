@@ -20,7 +20,7 @@ use crate::engine_error_codes::EngineErrorCode;
 use crate::production_sql_error_descriptors;
 use crate::sql_error_codes::{SqlErrorDescriptor, SqlErrorPhase, lookup_sql_error_descriptor};
 use crate::types::*;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use novarocks_failpoint::{
     cleanup_fault_directive_names, parse_cleanup_fault_directive, parse_runner_rfo_kind,
     runner_rfo_kind_names,
@@ -83,10 +83,14 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
                 .strip_prefix("--")?
                 .trim_start()
                 .strip_prefix('@')?;
+            if body.trim().eq_ignore_ascii_case("expect_trino_error") {
+                return Some(("expect_trino_error".into(), String::new()));
+            }
             let (key, value) = body.split_once('=')?;
             return (matches!(
                 key.trim().to_ascii_lowercase().as_str(),
-                "native_observation_attempts"
+                "expect_trino_error"
+                    | "native_observation_attempts"
                     | "publication_catalog_fault_target"
                     | "publication_catalog_fault_timing"
                     | "be_log_contains"
@@ -516,6 +520,19 @@ fn parse_meta_with_name_binding(
             "db" => {
                 meta.db = Some(raw_value);
             }
+            "expect_trino_error" => {
+                let parts = raw_value.split(',').map(str::trim).collect::<Vec<_>>();
+                let [name, error_type] = parts.as_slice() else {
+                    bail!("@expect_trino_error requires exactly <errorName>,<errorType>");
+                };
+                if name.is_empty() || error_type.is_empty() {
+                    bail!("@expect_trino_error requires nonempty errorName and errorType");
+                }
+                meta.expect_trino_error = Some(TrinoErrorExpectation {
+                    name: (*name).to_string(),
+                    error_type: (*error_type).to_string(),
+                });
+            }
             "expect_error" => {
                 meta.expect_error = Some(raw_value);
             }
@@ -930,6 +947,7 @@ fn parse_meta_with_name_binding(
             ),
         }
     }
+    validate_trino_error_expectation(&meta, None)?;
     Ok(meta)
 }
 
@@ -973,6 +991,30 @@ fn validate_result_rows_assertion(meta: &QueryMeta) -> Result<()> {
                 bail!("@{directive} names column {column:?} more than once");
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_trino_error_expectation(meta: &QueryMeta, sql: Option<&str>) -> Result<()> {
+    if meta.expect_trino_error.is_none() {
+        return Ok(());
+    }
+    ensure!(
+        meta.expect_error.is_none()
+            && meta.expect_error_code.is_none()
+            && !meta.has_sql_error_assertion()
+            && meta.expect_error_tier.is_none(),
+        "@expect_trino_error cannot be combined with another error expectation"
+    );
+    if let Some(sql) = sql {
+        ensure!(
+            !crate::shell::is_shell_step(sql),
+            "@expect_trino_error requires one SQL statement, not shell"
+        );
+        ensure!(
+            crate::session::split_sql_statements(sql)?.len() == 1,
+            "@expect_trino_error requires exactly one executable SQL statement"
+        );
     }
     Ok(())
 }
@@ -1048,6 +1090,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .expect_error
             .clone()
             .or_else(|| base.expect_error.clone()),
+        expect_trino_error: override_meta
+            .expect_trino_error
+            .clone()
+            .or_else(|| base.expect_trino_error.clone()),
         expect_error_code: override_meta
             .expect_error_code
             .clone()
@@ -1468,6 +1514,8 @@ fn load_sql_case_from_file_with_variables(
             )?;
 
         if sql.is_empty() {
+            let meta = merge_meta(&file_meta, &section_meta);
+            validate_trino_error_expectation(&meta, Some(&sql))?;
             continue;
         }
         let sql = crate::fixture_context::rewrite_metadata_filters(&sql, &namespace_rewrites);
@@ -1475,7 +1523,8 @@ fn load_sql_case_from_file_with_variables(
         let mut merged_meta = merge_meta(&file_meta, &section_meta);
         catalogs.rewrite_meta(&mut merged_meta, &sql)?;
         if let Some(contract) = &merged_meta.query_stats_contract {
-            if merged_meta.expect_error.is_some()
+            if merged_meta.expect_trino_error.is_some()
+                || merged_meta.expect_error.is_some()
                 || merged_meta.expect_error_code.is_some()
                 || merged_meta.expect_sql_code.is_some()
                 || merged_meta.expect_sql_phase.is_some()
@@ -1496,6 +1545,7 @@ fn load_sql_case_from_file_with_variables(
                 )
             })?;
         }
+        validate_trino_error_expectation(&merged_meta, Some(&sql))?;
         validate_sql_error_expectations(&merged_meta, production_sql_error_descriptors())
             .with_context(|| {
                 format!(
@@ -1635,6 +1685,66 @@ mod opt5_directive_tests {
     fn meta_re() -> Regex {
         // Same regex used by the runner — see tests/sql/runner/src/main.rs:1600.
         Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap()
+    }
+
+    // Runner correctness belongs at the parser/returned HTTP outcome boundary;
+    // these pure tests need no native cluster and run with the regular owner.
+    #[test]
+    fn trino_error_expectation_requires_two_exact_fields_and_rejects_conflicts() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &["-- @expect_trino_error= MISSING_COLUMN_NAME , USER_ERROR ".into()],
+            &re,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.expect_trino_error,
+            Some(TrinoErrorExpectation {
+                name: "MISSING_COLUMN_NAME".into(),
+                error_type: "USER_ERROR".into(),
+            })
+        );
+        for value in [
+            "",
+            "MISSING_COLUMN_NAME",
+            ",USER_ERROR",
+            "MISSING_COLUMN_NAME,",
+            "A,B,C",
+        ] {
+            assert!(
+                parse_meta(&[format!("-- @expect_trino_error={value}")], &re).is_err(),
+                "{value}"
+            );
+        }
+        assert!(parse_meta(&["-- @expect_trino_error".into()], &re).is_err());
+        let legacy = QueryMeta {
+            expect_error: Some("marker".into()),
+            ..Default::default()
+        };
+        assert!(
+            validate_trino_error_expectation(&merge_meta(&legacy, &meta), Some("SELECT x"))
+                .is_err()
+        );
+        let valid = [
+            "SELECT ';'",
+            "-- leading comment\nSELECT absent; -- trailing",
+            "INVALID SQL",
+        ];
+        for sql in valid {
+            validate_trino_error_expectation(&meta, Some(sql)).unwrap();
+        }
+        for sql in [
+            "",
+            "-- comment only",
+            "SELECT 1; SELECT 2",
+            "shell: echo marker",
+        ] {
+            assert!(
+                validate_trino_error_expectation(&meta, Some(sql)).is_err(),
+                "{sql}"
+            );
+        }
+        assert!(meta.has_error_expectation());
     }
 
     #[test]

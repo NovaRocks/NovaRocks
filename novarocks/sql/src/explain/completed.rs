@@ -4477,7 +4477,7 @@ mod tests {
         assert!(rendered.contains("RESULT PORT"), "{rendered}");
         assert!(rendered.contains("PHYSICAL PLAN version="), "{rendered}");
         assert!(rendered.contains("contract-revision="), "{rendered}");
-        assert!(rendered.contains("type=Int64, NOT NULL"), "{rendered}");
+        assert!(rendered.contains("type=Int32, NOT NULL"), "{rendered}");
         assert!(rendered.contains("VALUE DEFINITIONS"), "{rendered}");
         assert!(rendered.contains("origin="), "{rendered}");
         assert!(rendered.contains("required-input["), "{rendered}");

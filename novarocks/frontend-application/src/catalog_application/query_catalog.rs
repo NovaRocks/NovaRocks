@@ -38,6 +38,7 @@ use novarocks_types::schema::CatalogTable;
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 
 mod registry;
+pub(crate) mod relation;
 mod schema_cache;
 mod service;
 #[cfg(test)]
@@ -54,8 +55,19 @@ pub use service::QueryCatalogService;
 /// making an unavailable or inconsistent catalog look like a missing table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogResolutionError {
-    Missing { reason: String },
-    Failed { message: String },
+    Missing {
+        reason: String,
+    },
+    Failed {
+        message: String,
+        error: novarocks_sql::compiler::SqlCompileError,
+        original_provider: Option<
+            Box<(
+                novarocks_spi::connector::ConnectorError,
+                novarocks_failure_contract::SharedFailureCause,
+            )>,
+        >,
+    },
 }
 
 impl CatalogResolutionError {
@@ -66,22 +78,95 @@ impl CatalogResolutionError {
     }
 
     pub fn failed(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self::Failed {
-            message: message.into(),
+            error: novarocks_sql::compiler::SqlCompileError::Compilation(message.clone()),
+            original_provider: None,
+            message,
+        }
+    }
+
+    /// Retain the producer's selected cause across statement memoization and
+    /// SQL completion. A message never selects a failure classification.
+    pub fn from_connector(error: novarocks_spi::connector::ConnectorError) -> Self {
+        use novarocks_spi::connector::ConnectorErrorKind;
+        use novarocks_sql::compiler::SqlCompileError;
+        let message = error.to_string();
+        let source = std::error::Error::source(&error)
+            .and_then(|source| {
+                source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            })
+            .cloned();
+        let original_source = source
+            .clone()
+            .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error.clone()));
+        let original_provider = Some(Box::new((error.clone(), original_source.clone())));
+        let error = if let Some(source) = source {
+            match source.downcast_ref::<novarocks_type_contract::CompileControlError>() {
+                Some(control) => SqlCompileError::from(control.clone()),
+                None => SqlCompileError::CompilationSource(source),
+            }
+        } else {
+            match error.kind() {
+                ConnectorErrorKind::Cancelled => SqlCompileError::Cancelled,
+                ConnectorErrorKind::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
+                ConnectorErrorKind::ResourceExhausted => SqlCompileError::ResourceExhausted,
+                _ => SqlCompileError::CompilationSource(original_source),
+            }
+        };
+        Self::Failed {
+            message,
+            error,
+            original_provider,
+        }
+    }
+
+    pub(crate) fn original_provider(
+        &self,
+    ) -> Option<(
+        &novarocks_spi::connector::ConnectorError,
+        &novarocks_failure_contract::SharedFailureCause,
+    )> {
+        match self {
+            Self::Failed {
+                original_provider, ..
+            } => original_provider
+                .as_deref()
+                .map(|(error, source)| (error, source)),
+            Self::Missing { .. } => None,
+        }
+    }
+
+    pub fn into_compile(self) -> novarocks_sql::compiler::SqlCompileError {
+        match self {
+            Self::Missing { reason } => {
+                novarocks_sql::compiler::SqlCompileError::Compilation(reason)
+            }
+            Self::Failed { error, .. } => error,
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
             Self::Missing { reason } => reason,
-            Self::Failed { message } => message,
+            Self::Failed { message, .. } => message,
         }
     }
 
     pub fn into_message(self) -> String {
         match self {
             Self::Missing { reason } => reason,
-            Self::Failed { message } => message,
+            Self::Failed { message, .. } => message,
+        }
+    }
+}
+
+impl From<novarocks_sql::compiler::SqlCompileError> for CatalogResolutionError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        Self::Failed {
+            message: error.to_string(),
+            error,
+            original_provider: None,
         }
     }
 }
@@ -92,7 +177,14 @@ impl std::fmt::Display for CatalogResolutionError {
     }
 }
 
-impl std::error::Error for CatalogResolutionError {}
+impl std::error::Error for CatalogResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::Failed { error, .. } => Some(error),
+        }
+    }
+}
 
 pub type CatalogResolutionResult<T> = Result<T, CatalogResolutionError>;
 
@@ -184,7 +276,7 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     let planning_pin = controls
         .acquire_current(&instance_id)
-        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
+        .map_err(CatalogResolutionError::from_connector)?;
     // The query-wide collector is attached at admitted query preparation, but
     // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
@@ -195,7 +287,7 @@ pub(crate) fn load_connector_table_materialization_with_resolution_typed(
                 planning_pin
                     .binding()
                     .catalog_properties()
-                    .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
+                    .map_err(CatalogResolutionError::from_connector)?
                     .clone(),
             )
             .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
@@ -238,7 +330,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
         .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     let planning_pin = controls
         .acquire_current(&instance_id)
-        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
+        .map_err(CatalogResolutionError::from_connector)?;
     // The query-wide collector is attached at admitted query preparation, but
     // only this exact planning pin knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
@@ -249,7 +341,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
                 planning_pin
                     .binding()
                     .catalog_properties()
-                    .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
+                    .map_err(CatalogResolutionError::from_connector)?
                     .clone(),
             )
             .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
@@ -277,7 +369,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
         .map_err(CatalogResolutionError::failed)
 }
 
-fn connector_table_resolution_error(
+pub(super) fn connector_table_resolution_error(
     error: novarocks_spi::connector::ConnectorError,
     namespace: &str,
     table: &str,
@@ -286,7 +378,7 @@ fn connector_table_resolution_error(
         novarocks_spi::connector::ConnectorErrorKind::NotFound => {
             CatalogResolutionError::missing(format!("unknown table: {namespace}.{table}"))
         }
-        _ => CatalogResolutionError::failed(error.to_string()),
+        _ => CatalogResolutionError::from_connector(error),
     }
 }
 
@@ -571,6 +663,31 @@ mod typed_resolution_tests {
     use super::{CatalogResolutionError, connector_table_resolution_error};
 
     #[test]
+    fn catalog_memo_preserves_original_controls_and_domain_causes() {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(LayoutResourceError::SourceModel),
+        ] {
+            let error = CatalogResolutionError::from_connector(
+                ConnectorError::compile_interruption(control.clone()),
+            );
+            assert_eq!(error.clone().into_compile(), SqlCompileError::from(control));
+        }
+        let provider = ConnectorError::new(ConnectorErrorKind::Unsupported, "unknown table: db.t");
+        let error = connector_table_resolution_error(provider.clone(), "db", "t");
+        let SqlCompileError::CompilationSource(source) = error.into_compile() else {
+            panic!("message text cannot turn a real capability refusal into absence");
+        };
+        assert_eq!(source.downcast_ref::<ConnectorError>(), Some(&provider));
+    }
+
+    #[test]
     fn connector_not_found_is_the_only_missing_resolution() {
         let missing = connector_table_resolution_error(
             ConnectorError::new(ConnectorErrorKind::NotFound, "provider-specific absence"),
@@ -593,10 +710,17 @@ mod typed_resolution_tests {
             }
         );
         assert_eq!(
-            unavailable,
-            CatalogResolutionError::Failed {
-                message: "Unavailable: catalog service unavailable".to_string(),
-            }
+            unavailable.message(),
+            "Unavailable: catalog service unavailable"
+        );
+        let novarocks_sql::compiler::SqlCompileError::CompilationSource(source) =
+            unavailable.into_compile()
+        else {
+            panic!("an unavailable provider must retain its original cause");
+        };
+        assert_eq!(
+            source.downcast_ref::<ConnectorError>().unwrap().kind(),
+            ConnectorErrorKind::Unavailable,
         );
     }
 }

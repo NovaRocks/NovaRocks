@@ -112,7 +112,8 @@ pub use novarocks_functions::array_projection::ARROW_BUFFER_OWNER_METADATA_BOUND
 
 /// Sum full allocation capacities reported by upstream Arrow, including
 /// sliced-away backing and complete dictionary values. A fixed identity cache
-/// counts shared payload backing once; uncached aliases remain conservative.
+/// counts the union of same-base declared prefixes; uncached aliases remain
+/// conservative. This does not infer a custom allocation's complete owner.
 /// Every buffer's owner metadata is still charged. No growable table, Arrow
 /// to_data(), hydration, or allocation is used. Variable DataType/Field/schema
 /// allocations are excluded and require a separate construction-origin proof.
@@ -195,7 +196,8 @@ struct Inspection<'a> {
     nodes: usize,
     // All inspected buffers remain borrowed and alive throughout inspection,
     // so a nonempty allocation cannot be freed/reused under this identity.
-    // Cache overflow only increases the upper bound; it never skips capacity.
+    // Each entry is one exact base and its largest charged declared prefix,
+    // not an allocation-owner identity. Overflow never skips capacity.
     backing: [Option<(usize, usize)>; 64],
 }
 
@@ -214,11 +216,24 @@ impl Inspection<'_> {
         // sliced away by this view. A custom allocation (for example an IPC
         // slice of a received message) reports its declared region; the
         // complete message backing is accounted by the owner that received it.
-        let identity = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
-        if !self.backing.contains(&Some(identity)) {
-            self.charge(identity.1)?;
+        let base = buffer.data_ptr().as_ptr() as usize;
+        let capacity = buffer.capacity();
+        if let Some(index) = self
+            .backing
+            .iter()
+            .position(|entry| entry.is_some_and(|(known, _)| known == base))
+        {
+            let (_, charged) = self.backing[index].expect("matched declared prefix");
+            if capacity > charged {
+                // Same-base regions are nested prefixes. A later larger view
+                // extends their union; charge before publishing its new bound.
+                self.charge(capacity - charged)?;
+                self.backing[index] = Some((base, capacity));
+            }
+        } else {
+            self.charge(capacity)?;
             if let Some(slot) = self.backing.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(identity);
+                *slot = Some((base, capacity));
             }
         }
         self.charge(ARROW_BUFFER_OWNER_METADATA_BOUND)

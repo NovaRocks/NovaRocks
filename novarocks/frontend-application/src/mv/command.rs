@@ -310,7 +310,7 @@ fn mv_compile_error(
 ) -> novarocks_sql::compiler::SqlCompileError {
     match error.compile_control_error() {
         Some(error) => error.into(),
-        None => match error.unavailable_implementation() {
+        None => match error.analyze_error() {
             Some(analyze) => novarocks_sql::compiler::SqlCompileError::Analyze(analyze.clone()),
             None => novarocks_sql::compiler::SqlCompileError::Compilation(error.to_string()),
         },
@@ -381,16 +381,8 @@ fn mv_command_error(
             Some(error) => {
                 novarocks_query_application::api::CommandError::from_compile_control(error)
             }
-            None if error.kind()
-                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
-            {
-                novarocks_query_application::api::CommandError::from_user_error(
-                    error.to_user_error(None),
-                )
-            }
-            None => novarocks_query_application::api::CommandError::new(
-                novarocks_query_application::api::CommandErrorKind::Failed,
-                error.to_string(),
+            None => novarocks_query_application::api::CommandError::from_user_error(
+                error.to_user_error(None),
             ),
         },
         error => novarocks_query_application::api::CommandError::new(
@@ -990,7 +982,7 @@ mod refresh_refusal_projection_tests {
         let expected_user = expected.to_user_error(None).to_string();
         let failure = prepare_failure(compile.clone());
         let analyze = failure
-            .unavailable_implementation()
+            .analyze_error()
             .expect("preparation must keep the typed analysis cause");
         assert_eq!(analyze, expected);
         assert_eq!(analyze.kind(), AnalyzeErrorKind::UnavailableImplementation);
@@ -1005,6 +997,38 @@ mod refresh_refusal_projection_tests {
     }
 
     #[test]
+    fn definition_errors_retain_original_identity_through_refresh_and_product_bridges() {
+        use novarocks_mv_application::ports::{MvProviderFailure, MvProviderFailureKind};
+        for original in [
+            AnalyzeError::missing_column_name("missing position 1", None),
+            AnalyzeError::duplicate_column_name("duplicate a", None),
+            AnalyzeError::mismatched_column_aliases("wrong width", None),
+            AnalyzeError::invalid_view("invalid stored body", None),
+            AnalyzeError::view_is_stale("changed header", None),
+            AnalyzeError::view_is_recursive("recursive body", None),
+        ] {
+            let refresh = crate::mv::domain::lifecycle::RefreshError::from(
+                SqlCompileError::Analyze(original.clone()),
+            );
+            let prepared = PreparationError::from(refresh)
+                .with_context("refresh preparation")
+                .0;
+            assert_eq!(prepared.analyze_error(), Some(&original));
+            let product =
+                MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, prepared.message())
+                    .with_analyze_error(prepared.analyze_error().cloned())
+                    .into_product_error();
+            let application =
+                crate::mv::domain::application::MvApplicationError::from_refresh_product(&product);
+            assert_eq!(application.analyze_error(), Some(&original));
+            let command = mv_application_command_error(application);
+            let expected = original.to_user_error(None);
+            assert_eq!(command.user_error(), Some(&expected));
+            assert_eq!(command.compile_control_error(), None);
+        }
+    }
+
+    #[test]
     fn refresh_prepare_step_source_reaches_command_without_reauthoring() {
         use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
         for original in [
@@ -1014,7 +1038,7 @@ mod refresh_refusal_projection_tests {
             let source = SharedFailureCause::new(original);
             let fact = source.failure_fact();
             let failure = prepare_failure(SqlCompileError::CompilationSource(source.clone()));
-            assert_eq!(failure.unavailable_implementation(), None);
+            assert_eq!(failure.analyze_error(), None);
             assert_eq!(failure.original_failure(), Some(&source));
             let actual = mv_application_command_error(failure.clone());
             assert_eq!(actual.kind(), CommandErrorKind::Failed);
@@ -1039,15 +1063,28 @@ mod refresh_refusal_projection_tests {
             SqlCompileError::Analyze(AnalyzeError::internal(message)),
             SqlCompileError::Compilation(message.into()),
         ] {
+            let expected = match &compile {
+                SqlCompileError::Analyze(error) => Some(error.clone()),
+                _ => None,
+            };
             let failure = prepare_failure(compile);
-            assert_eq!(failure.unavailable_implementation(), None);
+            assert_eq!(failure.analyze_error(), expected.as_ref());
             let user = mv_application_command_error(failure);
             assert_eq!(user.failure_cause(), None);
             assert_eq!(user.execution_failure(), None);
-            assert_eq!(user.user_error(), None);
+            assert_eq!(
+                user.user_error().map(|error| error.code().as_str()),
+                expected.as_ref().map(|error| error.code().as_str())
+            );
             assert_eq!(user.kind(), CommandErrorKind::Failed);
             assert_eq!(user.compile_control_error(), None);
-            assert_eq!(user.to_string(), message);
+            assert_eq!(
+                user.to_string(),
+                expected.map_or_else(
+                    || message.to_string(),
+                    |error| error.to_user_error(None).to_string()
+                )
+            );
         }
     }
 
@@ -1062,9 +1099,13 @@ mod refresh_refusal_projection_tests {
                 SqlCompileError::from(control.clone()),
                 SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
+                let expected = match &compile {
+                    SqlCompileError::Analyze(error) => Some(error.clone()),
+                    _ => None,
+                };
                 let failure = prepare_failure(compile);
                 assert_eq!(failure.compile_control_error(), Some(control.clone()));
-                assert_eq!(failure.unavailable_implementation(), None);
+                assert_eq!(failure.analyze_error(), expected.as_ref());
                 let user = mv_application_command_error(failure);
                 assert_eq!(user.compile_control_error(), Some(control.clone()));
                 assert_eq!(user.to_string(), control.to_string());
@@ -1081,7 +1122,7 @@ mod refresh_refusal_projection_tests {
                 FunctionOverloadId::try_new("fixture/mv/controlled/missing-pure-v1").unwrap(),
             ));
             let failure = prepare_failure(missing).with_compile_control(Some(control.clone()));
-            assert!(failure.unavailable_implementation().is_some());
+            assert!(failure.analyze_error().is_some());
             let user = mv_application_command_error(failure);
             assert_eq!(user.compile_control_error(), Some(control.clone()));
             assert_eq!(user.to_string(), control.to_string());

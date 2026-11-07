@@ -1,69 +1,69 @@
 -- query 12
 -- legacy
-count(tt1.k1)
+_col0
 40000
 
 -- query 13
 -- legacy
-count(tt1.k1)
+_col0
 20000
 
 -- query 14
 -- legacy
-count(tt1.k1)
+_col0
 13333
 
 -- query 15
 -- legacy
-count(tt1.k1)
+_col0
 8000
 
 -- query 16
 -- legacy
-count(tt1.k1)
+_col0
 4000
 
 -- query 17
 -- legacy
-count(tt1.k1)
+_col0
 400
 
 -- query 18
 -- legacy
-count(tt1.c_string)
+_col0
 40000
 
 -- query 19
 -- legacy
-count(tt1.c_string)
+_col0
 20000
 
 -- query 20
 -- legacy
-count(tt1.c_string)
+_col0
 4000
 
 -- query 21
 -- legacy
-count(tt1.c_string)
+_col0
 400
 
 -- query 22
 -- legacy
-count(tt2.c_string)
+_col0
 40000
 
 -- query 23
 -- legacy
-count(tt2.c_string)
+_col0
 20000
 
 -- query 24
 -- legacy
-count(tt2.c_string)
+_col0
 4000
 
 -- query 25
 -- legacy
-count(tt2.c_string)
+_col0
 400

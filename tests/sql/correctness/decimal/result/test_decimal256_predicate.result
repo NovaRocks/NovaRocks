@@ -1113,7 +1113,7 @@ id	big_decimal	huge_decimal	max_decimal
 
 -- query 83
 -- types	bigint
-count(*)
+_col0
 16
 
 -- query 84
