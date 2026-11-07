@@ -125,7 +125,7 @@ impl RequiredConstantInterpreter {
         let control = prepared.control();
         let source = prepared.source();
         let semantics = author_fragment_package_semantics(source, self.policy, control)
-            .map_err(SqlConstantEvaluationError::from_domain)?;
+            .map_err(package_semantics_error)?;
         let mut uses = BTreeMap::new();
         let mut calls = BTreeMap::new();
         let mut pruning = BTreeMap::new();
@@ -138,7 +138,9 @@ impl RequiredConstantInterpreter {
                     || call.effects.instance_state != FunctionInstanceState::None
                     || !call.effects.observable_effects.is_empty()
                 {
-                    return Err(SqlConstantEvaluationError::from_domain(PackageSemanticsError::UnsupportedCapability("required constants do not execute volatile, stateful or effectful calls".into())));
+                    return Err(SqlConstantEvaluationError::from_domain(
+                        RequiredConstantEligibilityFailure::new(),
+                    ));
                 }
             }
             uses.insert(fragment, authored.expression_uses);
@@ -385,6 +387,43 @@ impl RequiredConstantInterpreter {
         .map_err(constant_creation_error)?;
         work.finish()?;
         pool.value(0).map_err(Into::into)
+    }
+}
+
+/// This exact required-computation eligibility decision is distinct from an
+/// installed primitive's capability refusal. Only the original effects gate
+/// creates this production error; it grants no new calculation capability.
+#[derive(Debug)]
+pub(crate) struct RequiredConstantEligibilityFailure(PackageSemanticsError);
+impl RequiredConstantEligibilityFailure {
+    pub(crate) fn new() -> Self {
+        Self(PackageSemanticsError::UnsupportedCapability(
+            "required constants do not execute volatile, stateful or effectful calls".into(),
+        ))
+    }
+}
+impl fmt::Display for RequiredConstantEligibilityFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for RequiredConstantEligibilityFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl FailureProjection for RequiredConstantEligibilityFailure {
+    fn failure_fact(&self) -> FailureFact {
+        self.0.failure_fact()
+    }
+}
+
+fn package_semantics_error(error: PackageSemanticsError) -> SqlConstantEvaluationError {
+    match error {
+        PackageSemanticsError::Control(cause) => SqlConstantEvaluationError::Control(cause),
+        // Package preparation is an outer author. Even a genuine Data fact
+        // here is not a selected row journal from the required invocation.
+        other => SqlConstantEvaluationError::outer_domain(other),
     }
 }
 

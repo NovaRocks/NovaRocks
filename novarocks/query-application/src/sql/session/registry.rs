@@ -100,6 +100,7 @@ impl SessionPropertyValue {
 pub enum SessionPropertyError {
     UnknownProperty { name: String },
     InvalidValue { name: String, detail: String },
+    NullValue { name: String },
     CatalogNotFound { catalog: String },
     DuplicateProperty { name: String },
     DuplicateProvider { provider: String },
@@ -117,6 +118,9 @@ impl fmt::Display for SessionPropertyError {
             Self::UnknownProperty { name } => write!(f, "Session property '{name}' does not exist"),
             Self::InvalidValue { name, detail } => {
                 write!(f, "Session property '{name}' is invalid: {detail}")
+            }
+            Self::NullValue { name } => {
+                write!(f, "Session property '{name}' value must not be null")
             }
             Self::CatalogNotFound { catalog } => write!(f, "Catalog '{catalog}' not found"),
             Self::DuplicateProperty { name } => write!(f, "Duplicate session property '{name}'"),

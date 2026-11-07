@@ -84,7 +84,7 @@ impl SessionPropertyCpuInput {
                     version: crate::query_execution::physical_encoding::mint_plan_version(),
                 })
             }
-            .map_err(|e| compile_error(e, &self.source, span))?;
+            .map_err(compile_error)?;
             let value = self
                 .interpreter
                 .evaluate(prepared, &self.scope, &self.window)
@@ -112,7 +112,7 @@ fn property_error_at(error: SessionPropertyError, source: &str, span: Span) -> Q
         other => session_property_error(other),
     }
 }
-fn compile_error(error: SqlCompileError, source: &str, span: Span) -> QueryServiceError {
+fn compile_error(error: SqlCompileError) -> QueryServiceError {
     use novarocks_type_contract::CompileControlError as C;
     match error {
         SqlCompileError::Cancelled => QueryServiceError::from_compile_control(C::Cancelled),
@@ -133,12 +133,13 @@ fn compile_error(error: SqlCompileError, source: &str, span: Span) -> QueryServi
             if error.kind() == novarocks_sql::analyze_error::AnalyzeErrorKind::Internal {
                 return super::internal_error(error.to_string());
             }
+            if error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+            {
+                return QueryServiceError::from_user_error(error.to_user_error(None));
+            }
             QueryServiceError::from_user_error(
-                SessionAdmitError::InvalidSessionProperty.to_user_error(
-                    source,
-                    span,
-                    error.to_string(),
-                ),
+                SessionAdmitError::InvalidSessionProperty.without_location(error.to_string()),
             )
         }
         other => super::internal_error(other.to_string()),
@@ -154,11 +155,18 @@ fn evaluation_error(error: SqlConstantEvaluationError, name: &str) -> QueryServi
         }
         SqlConstantEvaluationError::Outer(cause) => QueryServiceError::from_failure_cause(cause),
         SqlConstantEvaluationError::Source(cause) => {
-            let selected_data = cause.failure_fact().class() == FailureClass::Data;
-            let required_capability = matches!(
-                cause.downcast_ref::<novarocks_sql::compiler::PackageSemanticsError>(),
-                Some(novarocks_sql::compiler::PackageSemanticsError::UnsupportedCapability(_))
-            );
+            let selected_data = cause.failure_fact().class() == FailureClass::Data
+                && cause
+                    .downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error.cause(),
+                            novarocks_execution::runtime::task::ExecutionFailureCause::RequiredRow(
+                                _
+                            )
+                        )
+                    });
+            let required_capability = cause.downcast_ref::<crate::query_execution::required_constant_eval::RequiredConstantEligibilityFailure>().is_some();
             if selected_data || required_capability {
                 QueryServiceError::from_user_error_with_cause(
                     SessionAdmitError::InvalidSessionProperty.without_location(format!(
@@ -290,6 +298,66 @@ mod tests {
         drop(error);
         fixture.close();
     }
+    #[test]
+    fn property_locations_distinguish_lookup_validation_and_required_evaluation() {
+        let fixture = Fixture::new();
+        for (sql, location) in [
+            ("SET trc_unknown = 1", true),
+            ("SET query_timeout = -1", true),
+            ("SET pipeline_dop = 1.5", false),
+            ("SET pipeline_dop = NULL", false),
+            ("SET pipeline_dop = missing_column", false),
+            ("SET pipeline_dop = (SELECT 1)", false),
+            ("SET pipeline_dop = 1 / 0", false),
+        ] {
+            let error = fixture
+                .input(sql, SessionSqlState::default())
+                .run()
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must fail"));
+            let user = error.user_error().unwrap();
+            assert_eq!(
+                user.code().as_str(),
+                "sql.admit.invalid_session_property",
+                "{sql}"
+            );
+            assert_eq!(user.location().is_some(), location, "{sql}");
+        }
+        fixture.close();
+    }
+
+    #[test]
+    fn declared_required_ineligibility_is_distinct_from_missing_execution_capability() {
+        let original = SharedFailureCause::new(
+            novarocks_sql::compiler::PackageSemanticsError::UnsupportedCapability(
+                "an uninstalled execution capability".into(),
+            ),
+        );
+        let error = evaluation_error(
+            SqlConstantEvaluationError::Source(original.clone()),
+            "pipeline_dop",
+        );
+        assert_eq!(error.failure_cause(), Some(&original));
+        assert!(
+            error
+                .user_error()
+                .is_none_or(|error| error.code().as_str() != "sql.admit.invalid_session_property")
+        );
+        let eligibility = SharedFailureCause::new(
+            crate::query_execution::required_constant_eval::RequiredConstantEligibilityFailure::new(
+            ),
+        );
+        let error = evaluation_error(
+            SqlConstantEvaluationError::Source(eligibility.clone()),
+            "pipeline_dop",
+        );
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.admit.invalid_session_property"
+        );
+        assert_eq!(error.failure_cause(), Some(&eligibility));
+    }
+
     #[derive(Debug)]
     struct OriginalData;
     impl std::fmt::Display for OriginalData {
@@ -306,15 +374,23 @@ mod tests {
     #[test]
     fn property_business_boundary_preserves_outer_and_control_source_identity() {
         let source = SharedFailureCause::new(OriginalData);
-        let business = evaluation_error(
+        let source_error = evaluation_error(
             SqlConstantEvaluationError::Source(source.clone()),
             "pipeline_dop",
         );
-        assert_eq!(
-            business.user_error().unwrap().code().as_str(),
-            "sql.admit.invalid_session_property"
+        assert_eq!(source_error.failure_cause(), Some(&source));
+        assert!(
+            source_error
+                .user_error()
+                .is_none_or(|error| error.code().as_str() != "sql.admit.invalid_session_property")
         );
-        assert_eq!(business.failure_cause(), Some(&source));
+        let compile = compile_error(SqlCompileError::CompilationSource(source.clone()));
+        assert_eq!(compile.failure_cause(), Some(&source));
+        assert!(
+            compile
+                .user_error()
+                .is_none_or(|error| error.code().as_str() != "sql.admit.invalid_session_property")
+        );
         let outer = evaluation_error(
             SqlConstantEvaluationError::Outer(source.clone()),
             "pipeline_dop",

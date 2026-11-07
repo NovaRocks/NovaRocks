@@ -694,7 +694,7 @@ fn checked_sql_constants_reject_actual_null_and_nominal_lookalikes() {
         FunctionValueType::new(DataType::Int32, true),
     );
     assert!(
-        matches!(registry.prepare_sql_constant("pipeline_dop", &pool.value(1).unwrap(), &ConstantControl(None)), Err(SessionPropertyError::InvalidValue { detail, .. }) if detail == "Session property value must not be null")
+        matches!(registry.prepare_sql_constant("pipeline_dop", &pool.value(1).unwrap(), &ConstantControl(None)), Err(SessionPropertyError::NullValue { name }) if name == "pipeline_dop")
     );
     // A nullable declaration does not make a selected non-NULL value NULL.
     assert_eq!(

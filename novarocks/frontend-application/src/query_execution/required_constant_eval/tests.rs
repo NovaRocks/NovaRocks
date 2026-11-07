@@ -335,3 +335,91 @@ fn required_unchanged_materialized_input_keeps_original_nonzero_selected_value()
     drop(pool);
     fixture.close();
 }
+
+#[test]
+fn required_package_author_data_and_control_keep_their_distinct_ports() {
+    use novarocks_failure_contract::SharedFailureCause;
+    let original = SharedFailureCause::new(novarocks_functions::RowDataError::with_reason(
+        0,
+        novarocks_functions::DataFailureReason::DivisionByZero,
+        "original package author Data",
+    ));
+    let error = package_semantics_error(PackageSemanticsError::PrimitiveSource {
+        source: original.clone(),
+        cast: None,
+    });
+    let SqlConstantEvaluationError::Outer(outer) = error else {
+        panic!("preparation Data must stay on the outer port");
+    };
+    assert_eq!(outer.failure_fact(), original.failure_fact());
+    let Some(PackageSemanticsError::PrimitiveSource { source, .. }) =
+        outer.downcast_ref::<PackageSemanticsError>()
+    else {
+        panic!("the original package source owner");
+    };
+    assert_eq!(source, &original);
+    assert!(
+        outer
+            .downcast_ref::<RequiredConstantEligibilityFailure>()
+            .is_none()
+    );
+    let control = CompileControlError::Source(original);
+    assert!(
+        matches!(package_semantics_error(PackageSemanticsError::Control(control.clone())), SqlConstantEvaluationError::Control(actual) if actual == control)
+    );
+}
+
+#[test]
+fn required_real_primitive_capability_refusal_is_not_constant_eligibility() {
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_functions::{CastOperation, CastPrepareError, PreparedCastRecipe};
+    let control = SqlCompileControl::unbounded();
+    // This exact installed cast author explicitly refuses DATE -> narrow int.
+    // No function name or diagnostic text determines the refusal category.
+    let source_type = FunctionValueType::new(DataType::Date32, false);
+    let target_type = FunctionValueType::new(DataType::Int8, true);
+    let refusal = PreparedCastRecipe::try_new(
+        CastOperation::Carrier,
+        &source_type,
+        &target_type,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        false,
+        &control,
+    )
+    .unwrap_err();
+    assert_eq!(refusal, CastPrepareError::Unsupported);
+    let original = SharedFailureCause::new(refusal);
+    let error = package_semantics_error(PackageSemanticsError::PrimitiveSource {
+        source: original.clone(),
+        cast: Some((DataType::Date32, DataType::Int8)),
+    });
+    let SqlConstantEvaluationError::Outer(outer) = error else {
+        panic!("real installed capability remains an outer refusal");
+    };
+    assert_eq!(outer.failure_fact(), original.failure_fact());
+    let Some(PackageSemanticsError::PrimitiveSource { source, .. }) =
+        outer.downcast_ref::<PackageSemanticsError>()
+    else {
+        panic!("original installed cast cause retained");
+    };
+    assert_eq!(source, &original);
+    assert!(
+        outer
+            .downcast_ref::<RequiredConstantEligibilityFailure>()
+            .is_none()
+    );
+    let eligibility = RequiredConstantEligibilityFailure::new();
+    assert_eq!(
+        eligibility.failure_fact().class(),
+        FailureClass::Unsupported
+    );
+    assert!(
+        std::error::Error::source(&eligibility)
+            .unwrap()
+            .downcast_ref::<PackageSemanticsError>()
+            .is_some()
+    );
+    assert!(
+        matches!(SqlConstantEvaluationError::from_domain(eligibility), SqlConstantEvaluationError::Source(source) if source.downcast_ref::<RequiredConstantEligibilityFailure>().is_some())
+    );
+}

@@ -23,7 +23,8 @@ use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCa
 pub fn session_property_error(error: SessionPropertyError) -> QueryServiceError {
     match error {
         error @ (SessionPropertyError::UnknownProperty { .. }
-        | SessionPropertyError::InvalidValue { .. }) => QueryServiceError::from_user_error(
+        | SessionPropertyError::InvalidValue { .. }
+        | SessionPropertyError::NullValue { .. }) => QueryServiceError::from_user_error(
             SessionAdmitError::InvalidSessionProperty.without_location(error.to_string()),
         ),
         error @ SessionPropertyError::CatalogNotFound { .. } => QueryServiceError::from_user_error(

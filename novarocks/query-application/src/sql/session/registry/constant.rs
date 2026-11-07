@@ -61,9 +61,8 @@ impl PropertyDeclaration {
             .is_null_observed(phase, control)
             .map_err(SessionPropertyError::Constant)?
         {
-            return Err(SessionPropertyError::InvalidValue {
+            return Err(SessionPropertyError::NullValue {
                 name: self.name.clone(),
-                detail: "Session property value must not be null".into(),
             });
         }
         let missing = || SessionPropertyError::ProjectionInvariant;
