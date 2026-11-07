@@ -65,6 +65,19 @@ paths = [
     "novarocks/frontend-application/src/coordinator/execution.rs",
     "novarocks/frontend-application/src/coordinator/statement_native_attempt.rs",
     "novarocks/frontend-application/src/query_execution/internal_result_cpu.rs",
+    "novarocks/result-contract/**",
+    "novarocks/execution/src/exec/operators/logical_change_summary.rs",
+    "novarocks/execution/src/exec/operators/compiled_change_router.rs",
+    "novarocks/execution/src/exec/operators/table_finish.rs",
+    "novarocks/execution/src/exec/operators/table_finish/**",
+    "novarocks/execution/src/runtime/task/sink.rs",
+    "novarocks/spi/src/connector/write_stack/**",
+    "novarocks/native-adapter/src/root_write_commit_codec.rs",
+    "novarocks/native-adapter/src/compiled_writer_binding.rs",
+    "novarocks/frontend-application/src/query_execution/write_result.rs",
+    "novarocks/frontend-application/src/task_execution/completion.rs",
+    "novarocks/frontend-application/src/task_execution/protocol_facts.rs",
+    "novarocks/frontend-application/src/task_execution/manifest_round.rs",
 ]
 
 [reuse]
