@@ -256,7 +256,10 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             ) = &node.kind
             {
                 assertions += 1;
-                assert_eq!(*declared_violation, Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES));
+                assert_eq!(
+                    *declared_violation,
+                    Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES)
+                );
                 assert_eq!(
                     labels.as_ref(),
                     ["_file", "_pos", "__nr_merge_action"].map(Box::<str>::from)
@@ -264,7 +267,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                 assert_eq!(keys.len(), 3);
                 for (key, data_type) in
                     keys.iter()
-                        .zip([DataType::Utf8, DataType::Int64, DataType::Int64])
+                        .zip([DataType::Utf8, DataType::Int64, DataType::Int32])
                 {
                     assert_eq!(fragment.values()[key].ty.data_type(), &data_type);
                 }
@@ -475,8 +478,17 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         .unwrap();
         assert_eq!(package.fragment().id().get(), fragment);
         for node in package.fragment().nodes().values() {
-            if let novarocks_physical_plan::NodeKind::AssertOneRow(novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne { declared_violation, .. }) = &node.kind {
-                assert_eq!(*declared_violation, Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES));
+            if let novarocks_physical_plan::NodeKind::AssertOneRow(
+                novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne {
+                    declared_violation,
+                    ..
+                },
+            ) = &node.kind
+            {
+                assert_eq!(
+                    *declared_violation,
+                    Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES)
+                );
                 decoded_assertions += 1;
             }
         }
@@ -613,7 +625,10 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         "the actual SQL author emits one finish"
     );
     assert_eq!(actual_writers, expected_writers.iter().copied().collect());
-    assert_eq!(decoded_assertions, 1, "the real FE-authored package retains its declared assertion identity");
+    assert_eq!(
+        decoded_assertions, 1,
+        "the real FE-authored package retains its declared assertion identity"
+    );
     crate::query_execution::artifact::TaskManifestBinding::assert_completed_router_placements_for_test(
         encoded, router_fragment, expected_summary, &expected_writers,
     );

@@ -1696,7 +1696,14 @@ mod tests {
                 builtin_function_catalog(),
                 crate::application::test_constant_policy(),
             )
-            .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
+            .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore)
+            .with_session_property_registry_for_test(Arc::new(
+                novarocks_query_application::sql::session::registry::SessionPropertyRegistry::with_catalog_factories(vec![Arc::new(
+                    novarocks_query_application::sql::session::registry::EmptyCatalogPropertyDeclarationFactory::new(
+                        novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+                    ),
+                )]).unwrap(),
+            )),
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlRoleFactory)],
             tokio::runtime::Handle::current(),
@@ -1750,30 +1757,42 @@ mod tests {
         ));
         session.close();
         drop(session);
-        let session = session_factory
-            .open_statement_session(test_statement_request(
-                &products.query_control,
+        let property_probe = || {
+            StatementSessionRequest::new(
+                products.query_control.mint_client_query_id(),
                 "cp2-cutover",
-            ))
-            .expect("open fresh statement session");
-        // This control fixture admits the catalog but intentionally has no
-        // namespace capability. Qualified USE must reach that original refusal.
-        let result = session
-            .execute_statement("USE warehouse.admission_probe")
-            .await
-            .expect("the admitted catalog reaches its original namespace capability");
-        let (result, terminal) = result.into_parts();
-        let StatementResult::GovernedError(result) = result else {
-            panic!("the test-only namespace capability must refuse the lookup");
+                novarocks_query_application::session_value::SessionValue::try_new(
+                    None,
+                    None,
+                    vec![("warehouse.trc5c_missing_property".into(), "1".into())],
+                    None,
+                    novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                        novarocks_result_contract::TrinoJsonFacts::default(),
+                    ),
+                )
+                .unwrap(),
+            )
         };
-        let (error, mut protocol) = result.into_parts();
-        assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
-        assert!(error.message().contains("test-only control capability"));
-        let _ = protocol.fail();
-        terminal.complete();
+        // Header admission observes the committed attachment without inventing
+        // a namespace capability for this catalog-only control fixture.
+        let error = session_factory
+            .open_statement_session(property_probe())
+            .err()
+            .expect("an admitted catalog with no such property must reject the property");
+        let novarocks_query_application::session_value::StatementSessionError::Service(error) =
+            error
+        else {
+            panic!("catalog property admission keeps its typed service error");
+        };
+        assert_eq!(
+            error
+                .user_error()
+                .unwrap_or_else(|| panic!("catalog admission must retain a descriptor: {error:?}"))
+                .code()
+                .as_str(),
+            "sql.admit.invalid_session_property"
+        );
 
-        session.close();
-        drop(session);
         let session = session_factory
             .open_statement_session(test_statement_request(
                 &products.query_control,
@@ -1799,31 +1818,28 @@ mod tests {
         ));
         session.close();
         drop(session);
-        let session = session_factory
-            .open_statement_session(test_statement_request(
-                &products.query_control,
-                "cp2-cutover",
-            ))
-            .expect("open fresh statement session");
-        let result = session
-            .execute_statement("USE warehouse.admission_probe")
-            .await
-            .expect("admission error is retained until the protocol terminal error");
-        let (result, terminal) = result.into_parts();
-        let StatementResult::GovernedError(result) = result else {
-            panic!("a dropped catalog must produce a governed terminal error");
+        let error = session_factory
+            .open_statement_session(property_probe())
+            .err()
+            .expect("a dropped catalog must be absent at session admission");
+        let novarocks_query_application::session_value::StatementSessionError::Service(error) =
+            error
+        else {
+            panic!("missing catalog admission keeps its typed service error");
         };
-        let (error, mut protocol) = result.into_parts();
-        assert_eq!(error.kind(), QueryServiceErrorKind::BadDatabase);
-        let _ = protocol.fail();
-        terminal.complete();
+        assert_eq!(
+            error
+                .user_error()
+                .unwrap_or_else(|| panic!("catalog admission must retain a descriptor: {error:?}"))
+                .code()
+                .as_str(),
+            "sql.admit.session_catalog_not_found"
+        );
 
         // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
         drop(attachments);
         drop(store);
-        session.close();
-        drop(session);
         drop(session_factory);
         shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
             .await

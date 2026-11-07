@@ -58,8 +58,6 @@ pub mod dml_admission;
 /// Read-only Catalog facts consumed by session SQL admission.
 pub mod catalog;
 
-/// Query-result scalar conversion used by SQL session user variables.
-
 /// Role-local route for the statement families intentionally outside the
 /// closed product-command vocabulary.
 ///

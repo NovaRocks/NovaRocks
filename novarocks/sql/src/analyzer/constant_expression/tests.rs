@@ -79,10 +79,32 @@ fn required_constant_implicit_targets_do_not_use_general_cast_admission() {
         ("1.0", Integer),
         ("1", Varchar),
         ("CAST('1' AS largeint)", Bigint),
-        ("CAST('1' AS json)", Varchar),
     ] {
         assert!(syntax(sql, target).is_err(), "{sql}");
     }
+    for sql in ["JSON '1'", "parse_json('1')", "CAST(NULL AS json)"] {
+        let Err(SqlCompileError::Analyze(error)) = syntax(sql, Varchar) else {
+            panic!("{sql}: expected nominal JSON implicit type refusal");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnsupportedExpression,
+            "{sql}: a missing function or capability is not a nominal type refusal"
+        );
+        assert_eq!(
+            error.message(),
+            "required constant cannot be implicitly converted to the declared property type",
+            "{sql}: preserve the actual implicit target gate"
+        );
+        assert_eq!(error.span(), Some(Span::new(0, sql.len())), "{sql}");
+    }
+    // A declared JSON cast alone does not validate text or author a nominal
+    // JSON value. Preserve the ordinary analyzer's String result here.
+    let text = syntax("CAST('1' AS json)", Varchar).unwrap();
+    assert!(matches!(
+        text.value_type().value_type().kind(),
+        ValueKind::String
+    ));
 }
 
 #[test]

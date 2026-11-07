@@ -76,20 +76,20 @@ WHERE b.table_name = 'user_tags_mv1'
 
 -- query 12
 -- @skip_result_check=true
-set @task_name = (
+CREATE TABLE trc5c_snapshot_task AS
+SELECT (
     SELECT TASK_NAME
     FROM information_schema.materialized_views
     WHERE TABLE_SCHEMA = 'db_${uuid0}'
       AND TABLE_NAME = 'user_tags_mv1'
-);
+) AS task_name;
 
 -- query 13
 -- @skip_result_check=true
-set @refresh_count1 = (
-    SELECT count(1)
-    FROM information_schema.task_runs
-    WHERE TASK_NAME = @task_name
-);
+CREATE TABLE trc5c_snapshot_before_count AS
+SELECT count(1) AS value
+FROM information_schema.task_runs
+WHERE TASK_NAME = (SELECT task_name FROM trc5c_snapshot_task);
 
 -- query 14
 refresh materialized view user_tags_mv1 with sync mode;
@@ -115,14 +115,18 @@ WHERE b.table_name = 'user_tags_mv1'
 
 -- query 17
 -- @skip_result_check=true
-set @refresh_count2 = (
-    SELECT count(1)
-    FROM information_schema.task_runs
-    WHERE TASK_NAME = @task_name
-);
+CREATE TABLE trc5c_snapshot_after_count AS
+SELECT count(1) AS value
+FROM information_schema.task_runs
+WHERE TASK_NAME = (SELECT task_name FROM trc5c_snapshot_task);
 
 -- query 18
-SELECT @refresh_count1 = @refresh_count2;
+SELECT a.value = b.value AS `(@refresh_count1) = (@refresh_count2)`
+FROM trc5c_snapshot_before_count a
+CROSS JOIN trc5c_snapshot_after_count b;
 
 -- query 19
+DROP TABLE trc5c_snapshot_after_count;
+DROP TABLE trc5c_snapshot_before_count;
+DROP TABLE trc5c_snapshot_task;
 drop database db_${uuid0} force;

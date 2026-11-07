@@ -30,10 +30,11 @@ fn key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-/// Preserve byte offsets while excluding runner shell blocks from the SQL lexer.
+/// Preserve source offsets while excluding shell blocks and explicitly expected,
+/// actually rejected syntax payloads from catalog ownership analysis.
 pub(crate) fn sql_source(source: &str) -> String {
     let mut shell = false;
-    source
+    let mut masked: String = source
         .split_inclusive('\n')
         .map(|line| {
             let t = line.trim_start();
@@ -54,7 +55,41 @@ pub(crate) fn sql_source(source: &str) -> String {
                 line.to_string()
             }
         })
-        .collect()
+        .collect();
+    static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("native marker regex")
+    });
+    static META: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").expect("native metadata regex")
+    });
+    let Ok(frames) = crate::parser::frame_case_source(source, &MARKER) else {
+        return masked;
+    };
+    for (_, range) in frames.sections {
+        let lines = source[range.clone()]
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let Ok((meta, sql)) = crate::parser::extract_meta_and_sql(&lines, &META) else {
+            continue;
+        };
+        let syntax_negative = meta.expect_trino_error.as_ref().is_some_and(|expected| {
+            expected.name == "SYNTAX_ERROR" && expected.error_type == "USER_ERROR"
+        });
+        if syntax_negative
+            && crate::parser::validate_trino_error_expectation(&meta, Some(&sql)).is_ok()
+            && novarocks_parser::parse(&sql).is_err()
+        {
+            // Only the analysis copy is masked. The original rejected SQL is
+            // still submitted unchanged, and cannot declare an owned catalog.
+            let blank = source[range.clone()]
+                .bytes()
+                .map(|byte| if byte == b'\n' { b'\n' } else { b' ' })
+                .collect::<Vec<_>>();
+            masked.replace_range(range, std::str::from_utf8(&blank).unwrap());
+        }
+    }
+    masked
 }
 pub(crate) fn ranges(sql: &str) -> Result<Vec<std::ops::Range<usize>>> {
     let mut start = 0;
@@ -1002,6 +1037,73 @@ mod tests {
             vec![format!("{name}.ns.t"), "literal owned".into()]
         );
     }
+    #[test]
+    fn syntax_negative_catalog_analysis_keeps_payloads_and_later_owned_spans() {
+        let symbols = symbols();
+        let negative =
+            "-- query 1\r\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\r\nSELECT @x;\r\n";
+        let source = format!(
+            "-- Unicode source: café\n{negative}-- query 2\nCREATE TABLE owned.ns.t (id INT);\n"
+        );
+        let masked = sql_source(&source);
+        assert_eq!(masked.len(), source.len());
+        assert_eq!(
+            source
+                .match_indices('\n')
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>(),
+            masked
+                .match_indices('\n')
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>()
+        );
+        assert!(ranges(&masked).is_ok());
+        let rewritten = symbols.rewrite_source(&source).unwrap();
+        assert!(rewritten.contains(negative));
+        assert!(rewritten.contains(&format!(
+            "CREATE TABLE {}.ns.t (id INT);",
+            symbols.lookup("owned").unwrap()
+        )));
+
+        let invalid = format!("invalid_{RUN}");
+        let valid = format!("valid_{RUN}");
+        let declarations = format!(
+            "-- query 1\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE EXTERNAL CATALOG {invalid} PROPERTIES ('type'=@x);\n-- query 2\nCREATE EXTERNAL CATALOG {valid} PROPERTIES ('type'='iceberg');\n"
+        );
+        let sealed = CatalogSymbols::seal(RUN, &[declarations]).unwrap();
+        assert!(sealed.lookup(&invalid).is_none());
+        assert!(sealed.lookup(&valid).is_some());
+        assert_eq!(sealed.0.len(), 1);
+    }
+
+    #[test]
+    fn syntax_negative_catalog_mask_requires_local_exact_rejected_single_payload() {
+        let symbols = symbols();
+        for source in [
+            "SELECT @x;",
+            "-- @expect_trino_error=INVALID_SESSION_PROPERTY,USER_ERROR\nSELECT @x;",
+            "-- @expect_trino_error=SYNTAX_ERROR,INTERNAL_ERROR\nSELECT @x;",
+            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x; SELECT 1;",
+            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\n-- @expect_error=legacy\nSELECT @x;",
+            "SELECT @x; -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR",
+            "-- query 1\n-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x;\n-- query 2\nSELECT @y;",
+            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nSELECT @x;\nSELECT @y;\n",
+        ] {
+            assert!(symbols.rewrite_source(source).is_err(), "{source}");
+        }
+        // An expectation cannot hide a valid declaration or erase its owner.
+        let valid = format!(
+            "-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR\nCREATE EXTERNAL CATALOG valid_{RUN} PROPERTIES ('type'='iceberg');"
+        );
+        assert_eq!(sql_source(&valid), valid);
+        assert!(
+            CatalogSymbols::seal(RUN, &[valid])
+                .unwrap()
+                .lookup(&format!("valid_{RUN}"))
+                .is_some()
+        );
+    }
+
     #[test]
     fn source_shell_owner_and_negative_product_rejections_are_preserved() {
         let s = symbols();

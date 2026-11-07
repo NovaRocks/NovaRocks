@@ -1171,6 +1171,15 @@ impl FrontendExecutionConfig {
         Ok(self)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_session_property_registry_for_test(
+        mut self,
+        registry: Arc<novarocks_query_application::sql::session::registry::SessionPropertyRegistry>,
+    ) -> Self {
+        self.session_properties = registry;
+        self
+    }
+
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
     }

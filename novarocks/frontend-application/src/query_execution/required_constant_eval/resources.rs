@@ -336,21 +336,21 @@ impl RuntimeScalarOperationScope for RootResources<'_> {
         _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<SelectedValues<'a>, RuntimeScalarEvaluationFailure> {
-        if !instance.is_failed() {
-            if let Some(profile) = instance.invocation_resource_profile() {
-                self.operation(profile.preparation_prefix().bytes())?;
-                let facts = profile
-                    .requests_for(instance, selection, arguments, activation, control)
-                    .map_err(RuntimeScalarEvaluationFailure::from)?;
-                if facts.requires_host_callback() {
-                    return Err(RuntimeScalarEvaluationFailure::Source(
-                        ScalarResourceError::SourceModel(
-                            "required constant host has no original whole-invocation callback request source",
-                        ),
-                    ));
-                }
-                self.operation(facts.bytes())?;
+        if !instance.is_failed()
+            && let Some(profile) = instance.invocation_resource_profile()
+        {
+            self.operation(profile.preparation_prefix().bytes())?;
+            let facts = profile
+                .requests_for(instance, selection, arguments, activation, control)
+                .map_err(RuntimeScalarEvaluationFailure::from)?;
+            if facts.requires_host_callback() {
+                return Err(RuntimeScalarEvaluationFailure::Source(
+                    ScalarResourceError::SourceModel(
+                        "required constant host has no original whole-invocation callback request source",
+                    ),
+                ));
             }
+            self.operation(facts.bytes())?;
         }
         instance
             .evaluate(selection, arguments, activation, control)

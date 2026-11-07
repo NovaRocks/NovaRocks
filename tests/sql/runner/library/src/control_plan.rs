@@ -24,7 +24,7 @@ use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
 };
 use novarocks_failpoint::session::DomainGrant;
-use novarocks_parser::ast::{LiteralKind, MaterializedViewStatement, SessionStatement, Statement};
+use novarocks_parser::ast::{MaterializedViewStatement, SessionStatement, Statement};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -233,14 +233,11 @@ impl SqlContext {
             return;
         };
         for statement in statements {
-            match statement {
-                Statement::Session(SessionStatement::Use(value)) => {
-                    if let Some(catalog) = value.catalog {
-                        self.catalog = Some(catalog.value);
-                    }
-                    self.namespace = Some(value.database.value);
+            if let Statement::Session(SessionStatement::Use(value)) = statement {
+                if let Some(catalog) = value.catalog {
+                    self.catalog = Some(catalog.value);
                 }
-                _ => {}
+                self.namespace = Some(value.database.value);
             }
         }
     }
