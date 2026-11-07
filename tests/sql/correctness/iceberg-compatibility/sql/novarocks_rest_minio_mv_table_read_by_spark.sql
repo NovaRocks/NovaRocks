@@ -106,5 +106,6 @@ printf 'SPARK_MV_SCHEMA_OK\n'
 -- query 9
 -- @cleanup=true
 -- @skip_result_check=true
+USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_nr_interop_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} FORCE;

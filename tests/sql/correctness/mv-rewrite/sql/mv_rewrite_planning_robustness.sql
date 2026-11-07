@@ -198,7 +198,8 @@ SELECT region, SUM(amount) AS s FROM part_sales GROUP BY region ORDER BY region;
 -- query 25
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.part_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.part_mv;
 
 -- query 26
 -- @skip_result_check=true
@@ -207,7 +208,8 @@ USE ns2_${uuid0};
 -- query 27
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns2_${uuid0}.xns_mv;
+USE mvrw_${uuid0}.ns2_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns2_${uuid0}.xns_mv;
 
 -- query 28
 -- @skip_result_check=true
@@ -216,7 +218,8 @@ USE ns_${uuid0};
 -- query 29
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.sales_full_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.sales_full_mv;
 
 -- query 30
 -- @cleanup=true

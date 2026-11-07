@@ -141,12 +141,14 @@ SELECT region, day, SUM(amount) FROM orders GROUP BY region, day;
 -- query 16
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.agg_mv_d1;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv_d1;
 
 -- query 17
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.agg_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 18
 -- @cleanup=true

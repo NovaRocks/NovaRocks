@@ -159,7 +159,8 @@ SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id > 2 GROUP BY use
 -- query 24
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.cnt_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.cnt_mv;
 
 -- query 25
 -- @cleanup=true

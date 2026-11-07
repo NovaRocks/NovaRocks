@@ -103,7 +103,8 @@ EXPLAIN REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.join_agg_mv_${uuid0};
+USE imv_jagg_cut_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.join_agg_mv_${uuid0};
 DROP TABLE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP TABLE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0}.dim FORCE;
 DROP DATABASE IF EXISTS imv_jagg_cut_${uuid0}.ns_${uuid0};

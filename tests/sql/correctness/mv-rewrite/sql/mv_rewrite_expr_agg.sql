@@ -205,8 +205,9 @@ SELECT k1, AVG(k9) AS a FROM t1 GROUP BY k1 ORDER BY k1;
 -- query 29
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.mv_cond;
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.mv_plain;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_cond;
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.mv_plain;
 
 -- query 30
 -- @cleanup=true

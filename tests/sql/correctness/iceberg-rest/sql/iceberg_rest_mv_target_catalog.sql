@@ -95,8 +95,9 @@ SELECT COUNT(*) FROM analytics_${uuid0}.mv_orders_${uuid0};
 -- query 12
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_orders_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0};
+USE iceberg_rest_${suite_uuid0}.analytics_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_orders_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0};
 DROP TABLE IF EXISTS iceberg_rest_${suite_uuid0}.sales_${uuid0}.orders_${uuid0};
 DROP DATABASE IF EXISTS iceberg_rest_${suite_uuid0}.analytics_${uuid0};

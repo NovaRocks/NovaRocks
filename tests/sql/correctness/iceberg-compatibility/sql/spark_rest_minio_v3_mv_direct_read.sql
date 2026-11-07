@@ -87,5 +87,6 @@ printf 'SPARK_SQL_OK\n'
 -- query 3
 -- @cleanup=true
 -- @skip_result_check=true
+USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_direct_read_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;

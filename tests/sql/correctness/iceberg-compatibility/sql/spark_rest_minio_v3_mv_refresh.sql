@@ -92,5 +92,6 @@ ORDER BY id;
 -- query 8
 -- @cleanup=true
 -- @skip_result_check=true
+USE iceberg_compat_${suite_uuid0}.${case_db};
 DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_spark_refresh_${uuid0};
 DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_mv_base_${uuid0} FORCE;

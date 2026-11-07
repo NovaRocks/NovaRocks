@@ -226,10 +226,11 @@ ALTER MATERIALIZED VIEW unsupported_repart_mv_${uuid0} REPARTITION BY (truncate(
 -- query 19
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.unsupported_repart_mv_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.join_repart_mv_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.agg_repart_mv_${uuid0};
-DROP MATERIALIZED VIEW IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.pf_repart_mv_${uuid0};
+USE ice_ivm_repart_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.unsupported_repart_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.join_repart_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_repart_mv_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.pf_repart_mv_${uuid0};
 DROP TABLE IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.join_orders;
 DROP TABLE IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.customers;
 DROP TABLE IF EXISTS ice_ivm_repart_${uuid0}.ns_${uuid0}.orders_extra;

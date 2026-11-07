@@ -167,7 +167,8 @@ FROM t1 WHERE k2 = 'a' GROUP BY k3, substring(k4, 1, 7) ORDER BY k3, month;
 -- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.month_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.month_mv;
 
 -- query 22
 -- @cleanup=true

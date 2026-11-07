@@ -148,7 +148,8 @@ SELECT * FROM test_mv1 ORDER BY 1, 2;
 -- query 13
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.test_mv1;
+USE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS mv_ice_db_${uuid0}.test_mv1;
 
 -- query 14
 -- @cleanup=true

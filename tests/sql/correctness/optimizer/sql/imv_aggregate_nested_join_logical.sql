@@ -118,7 +118,8 @@ EXPLAIN REFRESH MATERIALIZED VIEW agg_nested_join_mv_${uuid0};
 -- query 5
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.agg_nested_join_mv_${uuid0};
+USE imv_anj_cut_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_nested_join_mv_${uuid0};
 DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim FORCE;
 DROP TABLE IF EXISTS imv_anj_cut_${uuid0}.ns_${uuid0}.dim2 FORCE;

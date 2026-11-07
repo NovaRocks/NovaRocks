@@ -129,7 +129,8 @@ SELECT region, SUM(amount) AS s FROM orders GROUP BY region ORDER BY region;
 -- query 16
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW IF EXISTS mvrw_${uuid0}.ns_${uuid0}.agg_mv;
+USE mvrw_${uuid0}.ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 17
 -- @cleanup=true
