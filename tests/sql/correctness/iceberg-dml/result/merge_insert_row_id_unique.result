@@ -1,5 +1,5 @@
 -- query 2
--- legacy
+-- types	varchar	bigint	bigint	bigint
 mode	total_rows	unique_row_ids	null_row_ids
 copy-on-write	7	7	0
 merge-on-read	7	7	0
@@ -15,7 +15,7 @@ source_rows	preserved_row_ids
 3	3
 
 -- query 5
--- legacy
+-- types	bigint	varchar
 id	v
 1	a
 2	bb
@@ -26,7 +26,7 @@ id	v
 7	g
 
 -- query 6
--- legacy
+-- types	bigint	varchar
 id	v
 1	a
 2	bb

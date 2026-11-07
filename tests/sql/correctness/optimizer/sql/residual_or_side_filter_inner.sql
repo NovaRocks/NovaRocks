@@ -26,7 +26,7 @@ CREATE TABLE ${case_db}.residual_or_r (k INT, payload INT);
 
 -- @skip_result_check=true
 -- @result_contains=INNER, eq:
--- @result_contains=predicates: CAST(l.k AS Int64) = 1 OR CAST(l.k AS Int64) = 2
+-- @result_contains=predicates: l.k = 1 OR l.k = 2
 -- @result_contains=r.k IS NOT NULL
 -- @result_not_contains=UNION ALL
 -- @result_not_contains=NEST LOOP JOIN

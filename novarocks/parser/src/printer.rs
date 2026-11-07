@@ -1080,8 +1080,12 @@ impl Printer {
             UnaryOperator::Minus => self.output.push('-'),
             UnaryOperator::BitwiseNot => self.output.push('~'),
         }
-        let requires_separator = matches!(expression.expression.as_ref(), Expr::Unary(_))
-            && !matches!(expression.operator, UnaryOperator::Not);
+        let requires_separator = (matches!(expression.expression.as_ref(), Expr::Unary(_))
+            && !matches!(expression.operator, UnaryOperator::Not))
+            || (expression.operator == UnaryOperator::Minus
+                && matches!(expression.expression.as_ref(), Expr::Literal(Literal {
+                    kind: LiteralKind::Number(value), ..
+                }) if value.starts_with('-')));
         if requires_separator {
             self.output.push(' ');
         }
@@ -1736,5 +1740,18 @@ mod tests {
             print_statements(&[show.clone(), show]),
             "SHOW BACKENDS; SHOW BACKENDS"
         );
+    }
+
+    #[test]
+    fn unary_minus_of_signed_literal_round_trips_without_starting_a_comment() {
+        for source in ["- -1", "- -9223372036854775808"] {
+            let tokens = crate::lex(source).unwrap();
+            let expression = crate::parser::parse_expression(source, &tokens).unwrap();
+            let canonical = print_expr(&expression);
+            assert_eq!(canonical, source);
+            let tokens = crate::lex(&canonical).unwrap();
+            let reparsed = crate::parser::parse_expression(&canonical, &tokens).unwrap();
+            assert_eq!(reparsed, expression);
+        }
     }
 }

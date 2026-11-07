@@ -1,21 +1,21 @@
 -- query 4
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint)
+_col0
 [[1,10],[2,9],[3,8],[4,7],[5,6]]
 
 -- query 5
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint)
+_col0
 [[11,10],[22,9],[33,8],[44,7],[55,6]]
 
 -- query 6
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int)
+_col0
 [[111,10],[222,9],[333,8],[444,7],[555,6]]
 
 -- query 7
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint)
+_col0
 [[1111,10],[2222,9],[3333,8],[4444,7],[5555,6]]
 
 -- query 8
@@ -25,57 +25,57 @@ approx_top_k(c_largeint)
 
 -- query 9
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float)
+_col0
 [[1.1,10],[2.2,9],[3.3,8],[4.4,7],[5.5,6]]
 
 -- query 10
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double)
+_col0
 [[11.11,10],[22.22,9],[33.33,8],[44.44,7],[55.55,6]]
 
 -- query 11
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char)
+_col0
 [["char1",10],["char2",9],["char3",8],["char4",7],["char5",6]]
 
 -- query 12
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar)
+_col0
 [["varchar1",10],["varchar2",9],["varchar3",8],["varchar4",7],["varchar5",6]]
 
 -- query 13
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date)
+_col0
 [["2021-01-01",10],["2021-01-02",9],["2021-01-03",8],["2021-01-04",7],["2021-01-05",6]]
 
 -- query 14
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime)
+_col0
 [["2021-01-01 00:00:00.000000",10],["2021-01-02 00:00:00.000000",9],["2021-01-03 00:00:00.000000",8],["2021-01-04 00:00:00.000000",7],["2021-01-05 00:00:00.000000",6]]
 
 -- query 15
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal)
+_col0
 [["111.110",10],["222.220",9],["333.330",8],["444.440",7],["555.550",6]]
 
 -- query 16
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint, 3)
+_col0
 [[1,10],[2,9],[3,8]]
 
 -- query 17
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint, 3)
+_col0
 [[11,10],[22,9],[33,8]]
 
 -- query 18
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int, 3)
+_col0
 [[111,10],[222,9],[333,8]]
 
 -- query 19
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint, 3)
+_col0
 [[1111,10],[2222,9],[3333,8]]
 
 -- query 20
@@ -85,57 +85,57 @@ approx_top_k(c_largeint, 3)
 
 -- query 21
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float, 3)
+_col0
 [[1.1,10],[2.2,9],[3.3,8]]
 
 -- query 22
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double, 3)
+_col0
 [[11.11,10],[22.22,9],[33.33,8]]
 
 -- query 23
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char, 3)
+_col0
 [["char1",10],["char2",9],["char3",8]]
 
 -- query 24
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar, 3)
+_col0
 [["varchar1",10],["varchar2",9],["varchar3",8]]
 
 -- query 25
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date, 3)
+_col0
 [["2021-01-01",10],["2021-01-02",9],["2021-01-03",8]]
 
 -- query 26
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime, 3)
+_col0
 [["2021-01-01 00:00:00.000000",10],["2021-01-02 00:00:00.000000",9],["2021-01-03 00:00:00.000000",8]]
 
 -- query 27
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal, 3)
+_col0
 [["111.110",10],["222.220",9],["333.330",8]]
 
 -- query 28
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint, 3, 10)
+_col0
 [[1,10],[2,9],[3,8]]
 
 -- query 29
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint, 3, 10)
+_col0
 [[11,10],[22,9],[33,8]]
 
 -- query 30
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int, 3, 10)
+_col0
 [[111,10],[222,9],[333,8]]
 
 -- query 31
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint, 3, 10)
+_col0
 [[1111,10],[2222,9],[3333,8]]
 
 -- query 32
@@ -145,42 +145,42 @@ approx_top_k(c_largeint, 3, 10)
 
 -- query 33
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float, 3, 10)
+_col0
 [[1.1,10],[2.2,9],[3.3,8]]
 
 -- query 34
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double, 3, 10)
+_col0
 [[11.11,10],[22.22,9],[33.33,8]]
 
 -- query 35
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char, 3, 10)
+_col0
 [["char1",10],["char2",9],["char3",8]]
 
 -- query 36
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar, 3, 10)
+_col0
 [["varchar1",10],["varchar2",9],["varchar3",8]]
 
 -- query 37
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date, 3, 10)
+_col0
 [["2021-01-01",10],["2021-01-02",9],["2021-01-03",8]]
 
 -- query 38
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime, 3, 10)
+_col0
 [["2021-01-01 00:00:00.000000",10],["2021-01-02 00:00:00.000000",9],["2021-01-03 00:00:00.000000",8]]
 
 -- query 39
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal, 3, 10)
+_col0
 [["111.110",10],["222.220",9],["333.330",8]]
 
 -- query 40
 -- legacy
-c_id	approx_top_k(c_tinyint) OVER ()
+c_id	_col1
 71	[{"item":8,"count":3},{"item":9,"count":2}]
 72	[{"item":8,"count":3},{"item":9,"count":2}]
 73	[{"item":8,"count":3},{"item":9,"count":2}]
@@ -189,7 +189,7 @@ c_id	approx_top_k(c_tinyint) OVER ()
 
 -- query 41
 -- legacy
-c_id	approx_top_k(c_smallint) OVER ()
+c_id	_col1
 71	[{"item":88,"count":3},{"item":99,"count":2}]
 72	[{"item":88,"count":3},{"item":99,"count":2}]
 73	[{"item":88,"count":3},{"item":99,"count":2}]
@@ -198,7 +198,7 @@ c_id	approx_top_k(c_smallint) OVER ()
 
 -- query 42
 -- legacy
-c_id	approx_top_k(c_int) OVER ()
+c_id	_col1
 71	[{"item":888,"count":3},{"item":999,"count":2}]
 72	[{"item":888,"count":3},{"item":999,"count":2}]
 73	[{"item":888,"count":3},{"item":999,"count":2}]
@@ -207,7 +207,7 @@ c_id	approx_top_k(c_int) OVER ()
 
 -- query 43
 -- legacy
-c_id	approx_top_k(c_bigint) OVER ()
+c_id	_col1
 71	[{"item":8888,"count":3},{"item":9999,"count":2}]
 72	[{"item":8888,"count":3},{"item":9999,"count":2}]
 73	[{"item":8888,"count":3},{"item":9999,"count":2}]
@@ -216,7 +216,7 @@ c_id	approx_top_k(c_bigint) OVER ()
 
 -- query 44
 -- legacy
-c_id	approx_top_k(c_largeint) OVER ()
+c_id	_col1
 71	[{"item":88888,"count":3},{"item":99999,"count":2}]
 72	[{"item":88888,"count":3},{"item":99999,"count":2}]
 73	[{"item":88888,"count":3},{"item":99999,"count":2}]
@@ -225,7 +225,7 @@ c_id	approx_top_k(c_largeint) OVER ()
 
 -- query 45
 -- legacy
-c_id	approx_top_k(c_float) OVER ()
+c_id	_col1
 71	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
 72	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
 73	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
@@ -234,7 +234,7 @@ c_id	approx_top_k(c_float) OVER ()
 
 -- query 46
 -- legacy
-c_id	approx_top_k(c_double) OVER ()
+c_id	_col1
 71	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
 72	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
 73	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
@@ -243,7 +243,7 @@ c_id	approx_top_k(c_double) OVER ()
 
 -- query 47
 -- legacy
-c_id	approx_top_k(c_char) OVER ()
+c_id	_col1
 71	[{"item":"char8","count":3},{"item":"char9","count":2}]
 72	[{"item":"char8","count":3},{"item":"char9","count":2}]
 73	[{"item":"char8","count":3},{"item":"char9","count":2}]
@@ -252,7 +252,7 @@ c_id	approx_top_k(c_char) OVER ()
 
 -- query 48
 -- legacy
-c_id	approx_top_k(c_varchar) OVER ()
+c_id	_col1
 71	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
 72	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
 73	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
@@ -261,7 +261,7 @@ c_id	approx_top_k(c_varchar) OVER ()
 
 -- query 49
 -- legacy
-c_id	approx_top_k(c_date) OVER ()
+c_id	_col1
 71	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
 72	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
 73	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
@@ -270,7 +270,7 @@ c_id	approx_top_k(c_date) OVER ()
 
 -- query 50
 -- legacy
-c_id	approx_top_k(c_datetime) OVER ()
+c_id	_col1
 71	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
 72	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
 73	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
@@ -279,7 +279,7 @@ c_id	approx_top_k(c_datetime) OVER ()
 
 -- query 51
 -- legacy
-c_id	approx_top_k(c_decimal) OVER ()
+c_id	_col1
 71	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
 72	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
 73	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
@@ -288,207 +288,207 @@ c_id	approx_top_k(c_decimal) OVER ()
 
 -- query 54
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint)
+_col0
 [[null,12],[1,9],[2,8],[3,7],[4,6]]
 
 -- query 55
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint)
+_col0
 [[null,12],[11,9],[22,8],[33,7],[44,6]]
 
 -- query 56
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int)
+_col0
 [[null,12],[111,9],[222,8],[333,7],[444,6]]
 
 -- query 57
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint)
+_col0
 [[null,12],[1111,9],[2222,8],[3333,7],[4444,6]]
 
 -- query 58
 -- legacy
-approx_top_k(c_largeint)
+_col0
 [{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8},{"item":33333,"count":7},{"item":44444,"count":6}]
 
 -- query 59
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float)
+_col0
 [[null,12],[1.1,9],[2.2,8],[3.3,7],[4.4,6]]
 
 -- query 60
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double)
+_col0
 [[null,12],[11.11,9],[22.22,8],[33.33,7],[44.44,6]]
 
 -- query 61
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char)
+_col0
 [[null,12],["char1",9],["char2",8],["char3",7],["char4",6]]
 
 -- query 62
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar)
+_col0
 [[null,12],["varchar1",9],["varchar2",8],["varchar3",7],["varchar4",6]]
 
 -- query 63
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date)
+_col0
 [[null,12],["2021-01-01",9],["2021-01-02",8],["2021-01-03",7],["2021-01-04",6]]
 
 -- query 64
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime)
+_col0
 [[null,12],["2021-01-01 00:00:00.000000",9],["2021-01-02 00:00:00.000000",8],["2021-01-03 00:00:00.000000",7],["2021-01-04 00:00:00.000000",6]]
 
 -- query 65
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal)
+_col0
 [[null,12],["111.110",9],["222.220",8],["333.330",7],["444.440",6]]
 
 -- query 66
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint, 3)
+_col0
 [[null,12],[1,9],[2,8]]
 
 -- query 67
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint, 3)
+_col0
 [[null,12],[11,9],[22,8]]
 
 -- query 68
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int, 3)
+_col0
 [[null,12],[111,9],[222,8]]
 
 -- query 69
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint, 3)
+_col0
 [[null,12],[1111,9],[2222,8]]
 
 -- query 70
 -- legacy
-approx_top_k(c_largeint, 3)
+_col0
 [{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8}]
 
 -- query 71
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float, 3)
+_col0
 [[null,12],[1.1,9],[2.2,8]]
 
 -- query 72
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double, 3)
+_col0
 [[null,12],[11.11,9],[22.22,8]]
 
 -- query 73
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char, 3)
+_col0
 [[null,12],["char1",9],["char2",8]]
 
 -- query 74
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar, 3)
+_col0
 [[null,12],["varchar1",9],["varchar2",8]]
 
 -- query 75
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date, 3)
+_col0
 [[null,12],["2021-01-01",9],["2021-01-02",8]]
 
 -- query 76
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime, 3)
+_col0
 [[null,12],["2021-01-01 00:00:00.000000",9],["2021-01-02 00:00:00.000000",8]]
 
 -- query 77
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal, 3)
+_col0
 [[null,12],["111.110",9],["222.220",8]]
 
 -- query 78
 -- types	array(row(item tinyint, count bigint))
-approx_top_k(c_tinyint, 3, 10)
+_col0
 [[null,12],[1,9],[2,8]]
 
 -- query 79
 -- types	array(row(item smallint, count bigint))
-approx_top_k(c_smallint, 3, 10)
+_col0
 [[null,12],[11,9],[22,8]]
 
 -- query 80
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int, 3, 10)
+_col0
 [[null,12],[111,9],[222,8]]
 
 -- query 81
 -- types	array(row(item bigint, count bigint))
-approx_top_k(c_bigint, 3, 10)
+_col0
 [[null,12],[1111,9],[2222,8]]
 
 -- query 82
 -- legacy
-approx_top_k(c_largeint, 3, 10)
+_col0
 [{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8}]
 
 -- query 83
 -- types	array(row(item real, count bigint))
-approx_top_k(c_float, 3, 10)
+_col0
 [[null,12],[1.1,9],[2.2,8]]
 
 -- query 84
 -- types	array(row(item double, count bigint))
-approx_top_k(c_double, 3, 10)
+_col0
 [[null,12],[11.11,9],[22.22,8]]
 
 -- query 85
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_char, 3, 10)
+_col0
 [[null,12],["char1",9],["char2",8]]
 
 -- query 86
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar, 3, 10)
+_col0
 [[null,12],["varchar1",9],["varchar2",8]]
 
 -- query 87
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date, 3, 10)
+_col0
 [[null,12],["2021-01-01",9],["2021-01-02",8]]
 
 -- query 88
 -- types	array(row(item timestamp(6), count bigint))
-approx_top_k(c_datetime, 3, 10)
+_col0
 [[null,12],["2021-01-01 00:00:00.000000",9],["2021-01-02 00:00:00.000000",8]]
 
 -- query 89
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal, 3, 10)
+_col0
 [[null,12],["111.110",9],["222.220",8]]
 
 -- query 90
 -- types	array(row(item integer, count bigint))
-approx_top_k(c_int)
+_col0
 [[null,3]]
 
 -- query 91
 -- types	array(row(item varchar, count bigint))
-approx_top_k(c_varchar, 3)
+_col0
 [[null,3]]
 
 -- query 92
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal, 3, 10)
+_col0
 [[null,3]]
 
 -- query 93
 -- types	array(row(item date, count bigint))
-approx_top_k(c_date, 1)
+_col0
 [[null,3]]
 
 -- query 94
 -- legacy
-c_id	approx_top_k(c_tinyint) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
 72	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
 73	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
@@ -497,7 +497,7 @@ c_id	approx_top_k(c_tinyint) OVER ()
 
 -- query 95
 -- legacy
-c_id	approx_top_k(c_smallint) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
 72	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
 73	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
@@ -506,7 +506,7 @@ c_id	approx_top_k(c_smallint) OVER ()
 
 -- query 96
 -- legacy
-c_id	approx_top_k(c_int) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
 72	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
 73	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
@@ -515,7 +515,7 @@ c_id	approx_top_k(c_int) OVER ()
 
 -- query 97
 -- legacy
-c_id	approx_top_k(c_bigint) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
 72	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
 73	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
@@ -524,7 +524,7 @@ c_id	approx_top_k(c_bigint) OVER ()
 
 -- query 98
 -- legacy
-c_id	approx_top_k(c_largeint) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
 72	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
 73	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
@@ -533,7 +533,7 @@ c_id	approx_top_k(c_largeint) OVER ()
 
 -- query 99
 -- legacy
-c_id	approx_top_k(c_float) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
 72	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
 73	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
@@ -542,7 +542,7 @@ c_id	approx_top_k(c_float) OVER ()
 
 -- query 100
 -- legacy
-c_id	approx_top_k(c_double) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
 72	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
 73	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
@@ -551,7 +551,7 @@ c_id	approx_top_k(c_double) OVER ()
 
 -- query 101
 -- legacy
-c_id	approx_top_k(c_char) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
 72	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
 73	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
@@ -560,7 +560,7 @@ c_id	approx_top_k(c_char) OVER ()
 
 -- query 102
 -- legacy
-c_id	approx_top_k(c_varchar) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
 72	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
 73	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
@@ -569,7 +569,7 @@ c_id	approx_top_k(c_varchar) OVER ()
 
 -- query 103
 -- legacy
-c_id	approx_top_k(c_date) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
 72	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
 73	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
@@ -578,7 +578,7 @@ c_id	approx_top_k(c_date) OVER ()
 
 -- query 104
 -- legacy
-c_id	approx_top_k(c_datetime) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
 72	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
 73	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
@@ -587,7 +587,7 @@ c_id	approx_top_k(c_datetime) OVER ()
 
 -- query 105
 -- legacy
-c_id	approx_top_k(c_decimal) OVER ()
+c_id	_col1
 71	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
 72	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
 73	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
@@ -596,343 +596,343 @@ c_id	approx_top_k(c_decimal) OVER ()
 
 -- query 106
 -- legacy
-c_id	approx_top_k(c_tinyint) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 107
 -- legacy
-c_id	approx_top_k(c_smallint) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 108
 -- legacy
-c_id	approx_top_k(c_int) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 109
 -- legacy
-c_id	approx_top_k(c_bigint) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 110
 -- legacy
-c_id	approx_top_k(c_largeint) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 111
 -- legacy
-c_id	approx_top_k(c_float) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 112
 -- legacy
-c_id	approx_top_k(c_double) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 113
 -- legacy
-c_id	approx_top_k(c_char) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 114
 -- legacy
-c_id	approx_top_k(c_varchar) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 115
 -- legacy
-c_id	approx_top_k(c_date) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 116
 -- legacy
-c_id	approx_top_k(c_datetime) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 117
 -- legacy
-c_id	approx_top_k(c_decimal) OVER ()
+c_id	_col1
 101	[{"item":null,"count":3}]
 102	[{"item":null,"count":3}]
 103	[{"item":null,"count":3}]
 
 -- query 120
 -- types	integer	array(row(item tinyint, count bigint))
-c_partition	approx_top_k(c_tinyint)
+c_partition	_col1
 1	[[null,6],[1,5],[2,4],[3,3],[4,2]]
 2	[[1,5],[2,4],[3,3],[4,2],[5,1]]
 3	[[null,5]]
 
 -- query 121
 -- types	integer	array(row(item smallint, count bigint))
-c_partition	approx_top_k(c_smallint)
+c_partition	_col1
 1	[[null,6],[11,5],[22,4],[33,3],[44,2]]
 2	[[11,5],[22,4],[33,3],[44,2],[55,1]]
 3	[[null,5]]
 
 -- query 122
 -- types	integer	array(row(item integer, count bigint))
-c_partition	approx_top_k(c_int)
+c_partition	_col1
 1	[[null,6],[111,5],[222,4],[333,3],[444,2]]
 2	[[111,5],[222,4],[333,3],[444,2],[555,1]]
 3	[[null,5]]
 
 -- query 123
 -- types	integer	array(row(item bigint, count bigint))
-c_partition	approx_top_k(c_bigint)
+c_partition	_col1
 1	[[null,6],[1111,5],[2222,4],[3333,3],[4444,2]]
 2	[[1111,5],[2222,4],[3333,3],[4444,2],[5555,1]]
 3	[[null,5]]
 
 -- query 124
 -- legacy
-c_partition	approx_top_k(c_largeint)
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2}]
 2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
 3	[{"item":null,"count":5}]
 
 -- query 125
 -- types	integer	array(row(item real, count bigint))
-c_partition	approx_top_k(c_float)
+c_partition	_col1
 1	[[null,6],[1.1,5],[2.2,4],[3.3,3],[4.4,2]]
 2	[[1.1,5],[2.2,4],[3.3,3],[4.4,2],[5.5,1]]
 3	[[null,5]]
 
 -- query 126
 -- types	integer	array(row(item double, count bigint))
-c_partition	approx_top_k(c_double)
+c_partition	_col1
 1	[[null,6],[11.11,5],[22.22,4],[33.33,3],[44.44,2]]
 2	[[11.11,5],[22.22,4],[33.33,3],[44.44,2],[55.55,1]]
 3	[[null,5]]
 
 -- query 127
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_char)
+c_partition	_col1
 1	[[null,6],["char1",5],["char2",4],["char3",3],["char4",2]]
 2	[["char1",5],["char2",4],["char3",3],["char4",2],["char5",1]]
 3	[[null,5]]
 
 -- query 128
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_varchar)
+c_partition	_col1
 1	[[null,6],["varchar1",5],["varchar2",4],["varchar3",3],["varchar4",2]]
 2	[["varchar1",5],["varchar2",4],["varchar3",3],["varchar4",2],["varchar5",1]]
 3	[[null,5]]
 
 -- query 129
 -- types	integer	array(row(item date, count bigint))
-c_partition	approx_top_k(c_date)
+c_partition	_col1
 1	[[null,6],["2021-01-01",5],["2021-01-02",4],["2021-01-03",3],["2021-01-04",2]]
 2	[["2021-01-01",5],["2021-01-02",4],["2021-01-03",3],["2021-01-04",2],["2021-01-05",1]]
 3	[[null,5]]
 
 -- query 130
 -- types	integer	array(row(item timestamp(6), count bigint))
-c_partition	approx_top_k(c_datetime)
+c_partition	_col1
 1	[[null,6],["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4],["2021-01-03 00:00:00.000000",3],["2021-01-04 00:00:00.000000",2]]
 2	[["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4],["2021-01-03 00:00:00.000000",3],["2021-01-04 00:00:00.000000",2],["2021-01-05 00:00:00.000000",1]]
 3	[[null,5]]
 
 -- query 131
 -- types	integer	array(row(item decimal(9, 3), count bigint))
-c_partition	approx_top_k(c_decimal)
+c_partition	_col1
 1	[[null,6],["111.110",5],["222.220",4],["333.330",3],["444.440",2]]
 2	[["111.110",5],["222.220",4],["333.330",3],["444.440",2],["555.550",1]]
 3	[[null,5]]
 
 -- query 132
 -- types	integer	array(row(item tinyint, count bigint))
-c_partition	approx_top_k(c_tinyint, 10)
+c_partition	_col1
 1	[[null,6],[1,5],[2,4],[3,3],[4,2],[5,1]]
 2	[[1,5],[2,4],[3,3],[4,2],[5,1]]
 3	[[null,5]]
 
 -- query 133
 -- types	integer	array(row(item smallint, count bigint))
-c_partition	approx_top_k(c_smallint, 10)
+c_partition	_col1
 1	[[null,6],[11,5],[22,4],[33,3],[44,2],[55,1]]
 2	[[11,5],[22,4],[33,3],[44,2],[55,1]]
 3	[[null,5]]
 
 -- query 134
 -- types	integer	array(row(item integer, count bigint))
-c_partition	approx_top_k(c_int, 10)
+c_partition	_col1
 1	[[null,6],[111,5],[222,4],[333,3],[444,2],[555,1]]
 2	[[111,5],[222,4],[333,3],[444,2],[555,1]]
 3	[[null,5]]
 
 -- query 135
 -- types	integer	array(row(item bigint, count bigint))
-c_partition	approx_top_k(c_bigint, 10)
+c_partition	_col1
 1	[[null,6],[1111,5],[2222,4],[3333,3],[4444,2],[5555,1]]
 2	[[1111,5],[2222,4],[3333,3],[4444,2],[5555,1]]
 3	[[null,5]]
 
 -- query 136
 -- legacy
-c_partition	approx_top_k(c_largeint, 10)
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
 2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
 3	[{"item":null,"count":5}]
 
 -- query 137
 -- types	integer	array(row(item real, count bigint))
-c_partition	approx_top_k(c_float, 10)
+c_partition	_col1
 1	[[null,6],[1.1,5],[2.2,4],[3.3,3],[4.4,2],[5.5,1]]
 2	[[1.1,5],[2.2,4],[3.3,3],[4.4,2],[5.5,1]]
 3	[[null,5]]
 
 -- query 138
 -- types	integer	array(row(item double, count bigint))
-c_partition	approx_top_k(c_double, 10)
+c_partition	_col1
 1	[[null,6],[11.11,5],[22.22,4],[33.33,3],[44.44,2],[55.55,1]]
 2	[[11.11,5],[22.22,4],[33.33,3],[44.44,2],[55.55,1]]
 3	[[null,5]]
 
 -- query 139
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_char, 10)
+c_partition	_col1
 1	[[null,6],["char1",5],["char2",4],["char3",3],["char4",2],["char5",1]]
 2	[["char1",5],["char2",4],["char3",3],["char4",2],["char5",1]]
 3	[[null,5]]
 
 -- query 140
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_varchar, 10)
+c_partition	_col1
 1	[[null,6],["varchar1",5],["varchar2",4],["varchar3",3],["varchar4",2],["varchar5",1]]
 2	[["varchar1",5],["varchar2",4],["varchar3",3],["varchar4",2],["varchar5",1]]
 3	[[null,5]]
 
 -- query 141
 -- types	integer	array(row(item date, count bigint))
-c_partition	approx_top_k(c_date, 10)
+c_partition	_col1
 1	[[null,6],["2021-01-01",5],["2021-01-02",4],["2021-01-03",3],["2021-01-04",2],["2021-01-05",1]]
 2	[["2021-01-01",5],["2021-01-02",4],["2021-01-03",3],["2021-01-04",2],["2021-01-05",1]]
 3	[[null,5]]
 
 -- query 142
 -- types	integer	array(row(item timestamp(6), count bigint))
-c_partition	approx_top_k(c_datetime, 10)
+c_partition	_col1
 1	[[null,6],["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4],["2021-01-03 00:00:00.000000",3],["2021-01-04 00:00:00.000000",2],["2021-01-05 00:00:00.000000",1]]
 2	[["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4],["2021-01-03 00:00:00.000000",3],["2021-01-04 00:00:00.000000",2],["2021-01-05 00:00:00.000000",1]]
 3	[[null,5]]
 
 -- query 143
 -- types	integer	array(row(item decimal(9, 3), count bigint))
-c_partition	approx_top_k(c_decimal, 10)
+c_partition	_col1
 1	[[null,6],["111.110",5],["222.220",4],["333.330",3],["444.440",2],["555.550",1]]
 2	[["111.110",5],["222.220",4],["333.330",3],["444.440",2],["555.550",1]]
 3	[[null,5]]
 
 -- query 144
 -- types	integer	array(row(item tinyint, count bigint))
-c_partition	approx_top_k(c_tinyint, 3, 10)
+c_partition	_col1
 1	[[null,6],[1,5],[2,4]]
 2	[[1,5],[2,4],[3,3]]
 3	[[null,5]]
 
 -- query 145
 -- types	integer	array(row(item smallint, count bigint))
-c_partition	approx_top_k(c_smallint, 3, 10)
+c_partition	_col1
 1	[[null,6],[11,5],[22,4]]
 2	[[11,5],[22,4],[33,3]]
 3	[[null,5]]
 
 -- query 146
 -- types	integer	array(row(item integer, count bigint))
-c_partition	approx_top_k(c_int, 3, 10)
+c_partition	_col1
 1	[[null,6],[111,5],[222,4]]
 2	[[111,5],[222,4],[333,3]]
 3	[[null,5]]
 
 -- query 147
 -- types	integer	array(row(item bigint, count bigint))
-c_partition	approx_top_k(c_bigint, 3, 10)
+c_partition	_col1
 1	[[null,6],[1111,5],[2222,4]]
 2	[[1111,5],[2222,4],[3333,3]]
 3	[[null,5]]
 
 -- query 148
 -- legacy
-c_partition	approx_top_k(c_largeint, 3, 10)
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4}]
 2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3}]
 3	[{"item":null,"count":5}]
 
 -- query 149
 -- types	integer	array(row(item real, count bigint))
-c_partition	approx_top_k(c_float, 3, 10)
+c_partition	_col1
 1	[[null,6],[1.1,5],[2.2,4]]
 2	[[1.1,5],[2.2,4],[3.3,3]]
 3	[[null,5]]
 
 -- query 150
 -- types	integer	array(row(item double, count bigint))
-c_partition	approx_top_k(c_double, 3, 10)
+c_partition	_col1
 1	[[null,6],[11.11,5],[22.22,4]]
 2	[[11.11,5],[22.22,4],[33.33,3]]
 3	[[null,5]]
 
 -- query 151
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_char, 3, 10)
+c_partition	_col1
 1	[[null,6],["char1",5],["char2",4]]
 2	[["char1",5],["char2",4],["char3",3]]
 3	[[null,5]]
 
 -- query 152
 -- types	integer	array(row(item varchar, count bigint))
-c_partition	approx_top_k(c_varchar, 3, 10)
+c_partition	_col1
 1	[[null,6],["varchar1",5],["varchar2",4]]
 2	[["varchar1",5],["varchar2",4],["varchar3",3]]
 3	[[null,5]]
 
 -- query 153
 -- types	integer	array(row(item date, count bigint))
-c_partition	approx_top_k(c_date, 3, 10)
+c_partition	_col1
 1	[[null,6],["2021-01-01",5],["2021-01-02",4]]
 2	[["2021-01-01",5],["2021-01-02",4],["2021-01-03",3]]
 3	[[null,5]]
 
 -- query 154
 -- types	integer	array(row(item timestamp(6), count bigint))
-c_partition	approx_top_k(c_datetime, 3, 10)
+c_partition	_col1
 1	[[null,6],["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4]]
 2	[["2021-01-01 00:00:00.000000",5],["2021-01-02 00:00:00.000000",4],["2021-01-03 00:00:00.000000",3]]
 3	[[null,5]]
 
 -- query 155
 -- types	integer	array(row(item decimal(9, 3), count bigint))
-c_partition	approx_top_k(c_decimal, 3, 10)
+c_partition	_col1
 1	[[null,6],["111.110",5],["222.220",4]]
 2	[["111.110",5],["222.220",4],["333.330",3]]
 3	[[null,5]]
 
 -- query 156
 -- legacy
-c_partition	approx_top_k(c_int) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
 1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
 1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
@@ -977,7 +977,7 @@ c_partition	approx_top_k(c_int) OVER (PARTITION BY c_partition )
 
 -- query 157
 -- legacy
-c_partition	approx_top_k(c_varchar, 10) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
 1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
 1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
@@ -1022,7 +1022,7 @@ c_partition	approx_top_k(c_varchar, 10) OVER (PARTITION BY c_partition )
 
 -- query 158
 -- legacy
-c_partition	approx_top_k(c_datetime, 3, 10) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
 1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
 1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
@@ -1067,7 +1067,7 @@ c_partition	approx_top_k(c_datetime, 3, 10) OVER (PARTITION BY c_partition )
 
 -- query 159
 -- legacy
-c_partition	approx_top_k(c_decimal, 1) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":null,"count":6}]
 1	[{"item":null,"count":6}]
 1	[{"item":null,"count":6}]
@@ -1112,56 +1112,56 @@ c_partition	approx_top_k(c_decimal, 1) OVER (PARTITION BY c_partition )
 
 -- query 160
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal)
+_col0
 []
 
 -- query 161
 -- types	array(row(item decimal(9, 3), count bigint))
-approx_top_k(c_decimal)
+_col0
 
 -- query 162
 -- legacy
-approx_top_k(c_decimal) OVER ()
+_col0
 
 -- query 165
 -- types	array(row(item boolean, count bigint))
-approx_top_k(c_bool)
+_col0
 [[true,10],[false,8],[null,7]]
 
 -- query 166
 -- types	array(row(item boolean, count bigint))
-approx_top_k(c_bool, 1)
+_col0
 [[true,10]]
 
 -- query 167
 -- types	array(row(item boolean, count bigint))
-approx_top_k(c_bool, 3, 100)
+_col0
 [[true,10],[false,8],[null,7]]
 
 -- query 168
 -- types	integer	array(row(item boolean, count bigint))
-c_partition	approx_top_k(c_bool)
+c_partition	_col1
 1	[[true,5],[false,4],[null,2]]
 2	[[true,5],[false,4]]
 3	[[null,5]]
 
 -- query 169
 -- types	integer	array(row(item boolean, count bigint))
-c_partition	approx_top_k(c_bool, 1)
+c_partition	_col1
 1	[[true,5]]
 2	[[true,5]]
 3	[[null,5]]
 
 -- query 170
 -- types	integer	array(row(item boolean, count bigint))
-c_partition	approx_top_k(c_bool, 3, 100)
+c_partition	_col1
 1	[[true,5],[false,4],[null,2]]
 2	[[true,5],[false,4]]
 3	[[null,5]]
 
 -- query 171
 -- legacy
-c_id	approx_top_k(c_bool) OVER ()
+c_id	_col1
 1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
@@ -1190,7 +1190,7 @@ c_id	approx_top_k(c_bool) OVER ()
 
 -- query 172
 -- legacy
-c_id	approx_top_k(c_bool, 10) OVER ()
+c_id	_col1
 1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
@@ -1219,7 +1219,7 @@ c_id	approx_top_k(c_bool, 10) OVER ()
 
 -- query 173
 -- legacy
-c_id	approx_top_k(c_bool, 3, 10) OVER ()
+c_id	_col1
 1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
 3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
@@ -1248,7 +1248,7 @@ c_id	approx_top_k(c_bool, 3, 10) OVER ()
 
 -- query 174
 -- legacy
-c_partition	approx_top_k(c_bool) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
@@ -1277,7 +1277,7 @@ c_partition	approx_top_k(c_bool) OVER (PARTITION BY c_partition )
 
 -- query 175
 -- legacy
-c_partition	approx_top_k(c_bool, 10) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
@@ -1306,7 +1306,7 @@ c_partition	approx_top_k(c_bool, 10) OVER (PARTITION BY c_partition )
 
 -- query 176
 -- legacy
-c_partition	approx_top_k(c_bool, 3, 10) OVER (PARTITION BY c_partition )
+c_partition	_col1
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
 1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
@@ -1335,51 +1335,51 @@ c_partition	approx_top_k(c_bool, 3, 10) OVER (PARTITION BY c_partition )
 
 -- query 178
 -- types	array(row(item integer, count bigint))
-approx_top_k(L_LINENUMBER)
+_col0
 [[1,36],[2,31],[3,26],[4,21],[5,16]]
 
 -- query 179
 -- types	array(row(item integer, count bigint))
-approx_top_k(L_LINENUMBER, 1)
+_col0
 [[1,36]]
 
 -- query 180
 -- types	array(row(item integer, count bigint))
-approx_top_k(L_LINENUMBER, 10)
+_col0
 [[1,36],[2,31],[3,26],[4,21],[5,16],[6,11],[7,6]]
 
 -- query 181
 -- types	varchar	array(row(item integer, count bigint))
-l_returnflag	approx_top_k(L_LINENUMBER)
+L_RETURNFLAG	_col1
 A	[[1,9],[2,8],[3,7],[4,6],[5,5]]
 N	[[1,15],[2,13],[3,11],[4,9],[5,7]]
 R	[[1,12],[2,10],[3,8],[4,6],[5,4]]
 
 -- query 182
 -- types	varchar	array(row(item integer, count bigint))
-l_returnflag	approx_top_k(L_LINENUMBER, 2)
+L_RETURNFLAG	_col1
 A	[[1,9],[2,8]]
 N	[[1,15],[2,13]]
 R	[[1,12],[2,10]]
 
 -- query 183
 -- types	varchar	array(row(item integer, count bigint))
-l_returnflag	approx_top_k(L_LINENUMBER, 20)
+L_RETURNFLAG	_col1
 A	[[1,9],[2,8],[3,7],[4,6],[5,5],[6,4],[7,3]]
 N	[[1,15],[2,13],[3,11],[4,9],[5,7],[6,5],[7,3]]
 R	[[1,12],[2,10],[3,8],[4,6],[5,4],[6,2]]
 
 -- query 184
 -- types	array(row(item bigint, count bigint))
-approx_top_k(col1)
+_col0
 [[1,1]]
 
 -- query 185
 -- types	array(row(item bigint, count bigint))
-approx_top_k(col1)
+_col0
 [[1,6]]
 
 -- query 186
 -- types	array(row(item bigint, count bigint))
-approx_top_k(1)
+_col0
 [[1,1]]

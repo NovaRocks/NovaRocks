@@ -58,14 +58,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_repart_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW pf_repart_mv_${uuid0}
-PARTITION BY bucket(id, 4)
-DISTRIBUTED BY HASH(id) BUCKETS 2
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT id, region, amount, category
-FROM ice_ivm_repart_${uuid0}.ns_${uuid0}.orders
-WHERE amount >= 10;
 
 -- query 2
 -- @skip_result_check=true
@@ -74,6 +66,14 @@ INSERT INTO ice_ivm_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (2, 'west', 20, 'games'),
   (3, 'east', 30, 'books'),
   (4, 'north', 5, 'games');
+CREATE MATERIALIZED VIEW pf_repart_mv_${uuid0}
+PARTITION BY bucket(id, 4)
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT id, region, amount, category
+FROM ice_ivm_repart_${uuid0}.ns_${uuid0}.orders
+WHERE amount >= 10;
 REFRESH MATERIALIZED VIEW pf_repart_mv_${uuid0};
 
 -- query 3

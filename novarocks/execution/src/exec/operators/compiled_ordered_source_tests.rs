@@ -903,9 +903,12 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
     );
     assert_eq!(required.batch_row(), 0);
     assert_eq!(required.error().selected_ordinal(), 0);
-    // Original signed arithmetic oracle: arithmetic_tests.rs pins this full
-    // message for Modulo by zero under both overflow policies and ALLOW values.
-    assert_eq!(required.error().message(), "Divide by zero error");
+    // Signed modulo by zero retains its exact Data reason before any snapshot I/O.
+    assert_eq!(required.error().message(), "Division by zero");
+    assert_eq!(
+        required.error().reason(),
+        novarocks_functions::DataFailureReason::DivisionByZero
+    );
     assert_eq!(query.calls.load(Ordering::SeqCst), 0);
     assert!(
         source

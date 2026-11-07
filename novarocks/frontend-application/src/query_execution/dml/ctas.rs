@@ -141,26 +141,13 @@ impl CtasCommand {
                     format!("CTAS only supports format-version=3, got '{value}'"),
                 ));
             }
-            if (key.eq_ignore_ascii_case("row-lineage")
-                || key.eq_ignore_ascii_case("write.row-lineage"))
-                && !value.eq_ignore_ascii_case("true")
-            {
-                return Err(unsupported(
-                    property.span,
-                    format!("CTAS requires row-lineage=true, got '{value}'"),
-                ));
-            }
             properties.insert(Arc::from(key), Arc::from(value));
         }
         if let Some(comment) = &table.comment {
             properties.insert(Arc::from("comment"), Arc::from(literal_text(comment)?));
         }
-        properties.retain(|key, _| {
-            !key.eq_ignore_ascii_case("format-version")
-                && !key.eq_ignore_ascii_case("write.row-lineage")
-        });
+        properties.retain(|key, _| !key.eq_ignore_ascii_case("format-version"));
         properties.insert(Arc::from("format-version"), Arc::from("3"));
-        properties.insert(Arc::from("write.row-lineage"), Arc::from("true"));
 
         Ok(Self {
             target_parts: table
@@ -1175,13 +1162,16 @@ async fn plan_query_for_ctas_source_async(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners().map_err(internal_failure)?,
-        scope,
+        scope.with_definition_owned(
+            state.constant_policy(),
+            crate::query_execution::planning::sql_compile_control_from_execution(execution),
+        ),
         crate::query_execution::compiler::typed_connector_session().map_err(internal_failure)?,
     )
     .map_err(internal_failure)?;
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
+    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlSessionContext {
             sql_semantics: execution.sql_semantics().clone(),
@@ -1193,13 +1183,18 @@ async fn plan_query_for_ctas_source_async(
         novarocks_sql::compiler::RootDistributionRequirement::Any,
     )
     .map_err(CtasFailure::from_compile)?;
-    let catalog_facts = provider_source
-        .resolve_catalog_relations(preparation.needs())
-        .await
-        .map_err(internal_failure)?;
+    while !preparation.needs().is_empty() {
+        let facts = provider_source
+            .resolve_catalog_relations(preparation.needs())
+            .await
+            .map_err(CtasFailure::from_compile)?;
+        preparation = preparation
+            .continue_catalog(facts.into_boxed_slice())
+            .map_err(CtasFailure::from_compile)?;
+    }
     let analyzed = preparation
         .analyze(
-            &catalog_facts,
+            &[],
             state.function_catalog().as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             state.constant_policy(),
@@ -2032,6 +2027,46 @@ impl PreparedGovernedCtasWrite {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+
+    fn admitted_ctas(sql: &str) -> CtasCommand {
+        use novarocks_parser::ast::{DmlStatement, Statement};
+        let parsed = novarocks_parser::parse(sql).expect("CTAS parser");
+        let [Statement::Dml(DmlStatement::CreateTableAsSelect(statement))] = parsed.as_slice()
+        else {
+            panic!("expected one CTAS statement");
+        };
+        CtasCommand::from_typed(statement, sql).expect("CTAS admission")
+    }
+
+    #[test]
+    fn ctas_defaults_to_v3_without_inventing_lineage_properties() {
+        let command = admitted_ctas("CREATE TABLE target AS SELECT 1 AS id");
+        assert_eq!(command.properties.len(), 1);
+        assert_eq!(
+            command.properties.get("format-version").map(AsRef::as_ref),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn ctas_preserves_explicit_lineage_properties_as_ordinary_values() {
+        for (key, value) in [
+            ("write.row-lineage", "false"),
+            ("write.row-lineage", "true"),
+            ("row-lineage", "false"),
+            ("WRITE.ROW-LINEAGE", "false"),
+        ] {
+            let command = admitted_ctas(&format!(
+                "CREATE TABLE target TBLPROPERTIES ('{key}'='{value}') AS SELECT 1 AS id"
+            ));
+            assert_eq!(command.properties.len(), 2);
+            assert_eq!(command.properties.get(key).map(AsRef::as_ref), Some(value));
+            assert_eq!(
+                command.properties.get("format-version").map(AsRef::as_ref),
+                Some("3")
+            );
+        }
+    }
 
     #[test]
     fn runtime_refusal_marks_write_unknown_and_keeps_uncommitted_publication_fact() {

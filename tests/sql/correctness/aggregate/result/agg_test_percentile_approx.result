@@ -1,75 +1,75 @@
 -- query 5
 -- types	integer
-CAST((percentile_approx(c2, 0.5)) AS INT)
+_col0
 25000
 
 -- query 6
 -- types	integer
-CAST((percentile_approx(c2, 0.9)) AS INT)
+_col0
 45000
 
 -- query 7
 -- types	integer
-CAST((percentile_approx(c2, 0.9, 2048)) AS INT)
+_col0
 45000
 
 -- query 8
 -- types	integer
-CAST((percentile_approx(c2, 0.9, 5000)) AS INT)
+_col0
 45000
 
 -- query 9
 -- types	integer
-CAST((percentile_approx(c2, 0.9, 10000)) AS INT)
+_col0
 45000
 
 -- query 10
 -- types	integer
-CAST((percentile_approx(c2, v1)) AS INT)
+_col0
 25000
 
 -- query 11
 -- types	integer
-CAST((percentile_approx(c2, v1, v2 + 1)) AS INT)
+_col0
 25000
 
 -- query 12
 -- types	array(double)
-percentile_approx(c2, [0.25, 0.5, 0.75])
+_col0
 [12499.75,25000.0,37500.25]
 
 -- query 13
 -- types	array(double)
-percentile_approx(c2, [0.0, 0.5, 1.0])
+_col0
 [1.0,25000.0,49999.0]
 
 -- query 14
 -- types	array(double)
-percentile_approx(c2, [0.1, 0.25, 0.5, 0.75, 0.9])
+_col0
 [4999.6005859375,12499.75,25000.0,37500.25,45000.3984375]
 
 -- query 15
 -- types	array(double)
-percentile_approx(c2, [0.25, 0.5, 0.75], 2048)
+_col0
 [12499.75,25000.0,37500.25]
 
 -- query 16
 -- types	array(double)
-percentile_approx(c2, [0.5, 0.9], 5000)
+_col0
 [25000.0,45000.39453125]
 
 -- query 17
 -- types	array(double)
-percentile_approx(c2, [0.1, 0.5, 0.9], 10000)
+_col0
 [4999.6005859375,25000.0,45000.3984375]
 
 -- query 20
 -- types	array(double)
-percentile_approx(value, [0.5, 0.9], 5000)
+_col0
 [3.5,6.0]
 [5.5,8.0]
 
 -- query 25
 -- types	array(double)
-percentile_approx(v2, [0.1, 0.5, 0.9], 5000)
+_col0
 [2.0,5.0,8.0]

@@ -870,6 +870,8 @@ message PerKeyRowCountAssertion {
   repeated string labels = 2;
   string message = 3;
   AssertionApplicability applicability = 4;
+  // SQL-owned reason code, validated against the closed declared vocabulary.
+  optional uint32 declared_sql_violation = 5;
 }
 message ChangeEventExpandNode {
   repeated ChangeEvent events = 1;

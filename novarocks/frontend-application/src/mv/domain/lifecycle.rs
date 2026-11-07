@@ -145,7 +145,7 @@ pub struct RefreshError {
     pub kind: RefreshErrorKind,
     pub message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
-    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    analyze_error: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl RefreshError {
@@ -154,7 +154,7 @@ impl RefreshError {
             kind,
             message: message.into(),
             compile_control: None,
-            unavailable_implementation: None,
+            analyze_error: None,
         }
     }
 
@@ -162,10 +162,8 @@ impl RefreshError {
         self.compile_control.clone()
     }
 
-    pub fn unavailable_implementation(
-        &self,
-    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
-        self.unavailable_implementation.as_ref()
+    pub fn analyze_error(&self) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.analyze_error.as_ref()
     }
 
     pub fn user(message: impl Into<String>) -> Self {
@@ -185,20 +183,15 @@ impl From<novarocks_sql::compiler::SqlCompileError> for RefreshError {
             E::CompilationSource(source) => Some(C::Source(source.clone())),
             _ => None,
         };
-        let unavailable_implementation = match &error {
-            novarocks_sql::compiler::SqlCompileError::Analyze(error)
-                if error.kind()
-                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
-            {
-                Some(error.clone())
-            }
+        let analyze_error = match &error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Some(error.clone()),
             _ => None,
         };
         // Public SQL codes are rendered only at the final typed command boundary.
         let message = error.to_string();
         let mut failure = Self::user(message);
         failure.compile_control = control;
-        failure.unavailable_implementation = unavailable_implementation;
+        failure.analyze_error = analyze_error;
         failure
     }
 }
@@ -256,7 +249,7 @@ mod tests {
         );
     }
     #[test]
-    fn refresh_compile_projection_preserves_only_the_missing_implementation_sql_code() {
+    fn refresh_compile_projection_preserves_the_original_analysis_code() {
         use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
         use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
 
@@ -270,10 +263,7 @@ mod tests {
         let expected_analyze = analyze.clone();
         let failure = RefreshError::from(compile);
         assert_eq!(failure.message, expected);
-        assert_eq!(
-            failure.unavailable_implementation(),
-            Some(&expected_analyze)
-        );
+        assert_eq!(failure.analyze_error(), Some(&expected_analyze));
         assert!(
             !failure
                 .message
@@ -289,7 +279,10 @@ mod tests {
         let ordinary = RefreshError::from(ordinary);
         assert_eq!(ordinary.message, expected);
         assert_eq!(ordinary.kind, RefreshErrorKind::UserError);
-        assert_eq!(ordinary.unavailable_implementation(), None);
+        assert_eq!(
+            ordinary.analyze_error().unwrap().code().as_str(),
+            "sql.analyze.internal"
+        );
         assert_eq!(ordinary.compile_control_error(), None);
     }
 
@@ -306,7 +299,7 @@ mod tests {
             let error = RefreshError::from(compile);
             assert_eq!(error.message, expected);
             assert_eq!(error.compile_control_error(), Some(control));
-            assert_eq!(error.unavailable_implementation(), None);
+            assert_eq!(error.analyze_error(), None);
             assert_eq!(error.kind, RefreshErrorKind::UserError);
             assert_eq!(
                 RefreshError::user(error.message.clone()).compile_control_error(),

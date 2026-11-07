@@ -46,75 +46,75 @@ NULL	NULL	NULL
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 7192
 
 -- query 14
 -- types	bigint
-count(*)
+_col0
 7192
 
 -- query 19
 -- types	bigint
-count(*)
+_col0
 4093
 
 -- query 20
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 21
 -- types	bigint
-count(*)
+_col0
 4096
 
 -- query 22
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 23
 -- types	bigint
-count(*)
+_col0
 3
 
 -- query 24
 -- types	bigint
-count(*)
+_col0
 4096
 
 -- query 27
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 28
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 29
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 30
 -- types	bigint
-count(*)
+_col0
 4095
 
 -- query 31
 -- types	bigint
-count(*)
+_col0
 3
 
 -- query 32
 -- types	bigint
-count(*)
+_col0
 4095
 
 -- query 33
 -- types	bigint
-count(*)
+_col0
 3

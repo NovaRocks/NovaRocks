@@ -109,8 +109,8 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
         depth: 64,
     };
     // The original count(*) - count(DISTINCT _row_id) corpus, including both
-    // NULL sides, is unchanged. SQL's integral division is explicit Float64;
-    // CAST authors the separate integral public result on this fixed corpus.
+    // NULL sides, is unchanged. Signed division retains BIGINT and truncates
+    // toward zero; the independent Float64 input keeps fractional division.
     let cases = [
         ("+", 12, 12, 12.0, 12.0),
         ("-", 0, 2, 0.0, 2.0),
@@ -118,11 +118,8 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
         ("/", 1, 1, 1.0, 1.4),
         ("%", 0, 2, 0.0, 2.0),
     ];
-    for mode in 0..3 {
+    for mode in 0..2 {
         for (operation, first_int, last_int, first_float, last_float) in cases {
-            if mode == 2 && operation != "/" {
-                continue;
-            }
             let input_type = if mode == 1 {
                 DataType::Float64
             } else {
@@ -134,11 +131,6 @@ fn numeric_arithmetic_project_preserves_concrete_carriers_through_the_root_bound
                 DataType::Float64
             };
             let expression = format!("count_all {operation} count_distinct");
-            let expression = if mode == 0 && operation == "/" {
-                format!("CAST({expression} AS BIGINT)")
-            } else {
-                expression
-            };
             let fields = [
                 Field::new("count_all", input_type.clone(), true),
                 Field::new("count_distinct", input_type, true),

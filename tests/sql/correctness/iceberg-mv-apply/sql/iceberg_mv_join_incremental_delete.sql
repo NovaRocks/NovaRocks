@@ -58,14 +58,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_mv_apply_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW join_apply_mv_${uuid0}
-DISTRIBUTED BY HASH(id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT f.id, f.amount, d.label
-FROM fact_${uuid0} AS f
-JOIN dim_${uuid0} AS d ON f.dim_id = d.id
-WHERE f.amount >= 100;
 
 -- query 2
 -- @skip_result_check=true
@@ -75,6 +67,14 @@ INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.dim_${uuid0} VALUES
 INSERT INTO ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} VALUES
   (1, 10, 100),
   (2, 20, 200);
+CREATE MATERIALIZED VIEW join_apply_mv_${uuid0}
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT f.id, f.amount, d.label
+FROM fact_${uuid0} AS f
+JOIN dim_${uuid0} AS d ON f.dim_id = d.id
+WHERE f.amount >= 100;
 REFRESH MATERIALIZED VIEW join_apply_mv_${uuid0};
 
 -- query 3

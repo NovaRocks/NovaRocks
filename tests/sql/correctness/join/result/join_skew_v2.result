@@ -150,12 +150,12 @@ c_key	c_key
 
 -- query 55
 -- types	bigint
-count(*)
+_col0
 4
 
 -- query 56
 -- types	bigint
-count(*)
+_col0
 4
 
 -- query 61
@@ -266,120 +266,120 @@ NULL	4
 
 -- query 75
 -- types	bigint	bigint
-sum(t1.c_key)	c_bigint
+_col0	c_bigint
 6	1
 
 -- query 76
 -- types	bigint	bigint
-sum(t2.c_key)	c_bigint
+_col0	c_bigint
 10	NULL
 
 -- query 77
 -- types	bigint	bigint
-sum(t1.c_key)	c_bigint
+_col0	c_bigint
 6	1
 
 -- query 78
 -- types	bigint	bigint
-sum(t1.c_key)	c_bigint
+_col0	c_bigint
 21	NULL
 
 -- query 79
 -- types	bigint	bigint
-sum(t1.c_key)	c_bigint
+_col0	c_bigint
 28	NULL
 
 -- query 86
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 87
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 88
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 89
 -- types	bigint
-count(1)
+_col0
 132750
 
 -- query 90
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 91
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 92
 -- types	bigint
-count(1)
+_col0
 16380
 
 -- query 93
 -- types	bigint
-count(1)
+_col0
 8190
 
 -- query 94
 -- types	bigint
-count(1)
+_col0
 16380
 
 -- query 95
 -- types	bigint
-count(1)
+_col0
 16380
 
 -- query 96
 -- types	bigint
-count(1)
+_col0
 16380
 
 -- query 115
 -- types	bigint
-count(*)
+_col0
 74985
 
 -- query 116
 -- types	bigint
-count(*)
+_col0
 74985
 
 -- query 118
 -- types	bigint
-count(*)
+_col0
 74985
 
 -- query 121
 -- types	bigint
-count(*)
+_col0
 74985
 
 -- query 124
 -- types	bigint
-count(*)
+_col0
 74985
 
 -- query 137
 -- types	bigint
-count(*)
+_col0
 20000
 
 -- query 138
 -- types	bigint
-count(*)
+_col0
 21998
 
 -- query 153
 -- types	bigint
-count(*)
+_col0
 22000

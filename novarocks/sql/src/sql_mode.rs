@@ -530,21 +530,55 @@ pub fn validate_persisted_query_semantics(
     query: &ast::Query,
     caller: &SqlSemanticSettings,
 ) -> Result<(), String> {
+    check_persisted_query_semantics(query, caller).map_err(|error| match error {
+        PersistedSemanticsError::Analyze(error) => error.to_string(),
+        PersistedSemanticsError::Uncaptured(message) => format!("Unsupported: {message}"),
+    })
+}
+
+pub(crate) fn validate_persisted_query_semantics_typed(
+    query: &ast::Query,
+    caller: &SqlSemanticSettings,
+) -> Result<(), crate::analyze_error::AnalyzeError> {
+    check_persisted_query_semantics(query, caller).map_err(|error| match error {
+        PersistedSemanticsError::Analyze(error) => error,
+        PersistedSemanticsError::Uncaptured(message) => {
+            crate::analyze_error::AnalyzeError::unsupported_expression_without_span(message)
+        }
+    })
+}
+
+enum PersistedSemanticsError {
+    Analyze(crate::analyze_error::AnalyzeError),
+    Uncaptured(&'static str),
+}
+
+fn check_persisted_query_semantics(
+    query: &ast::Query,
+    caller: &SqlSemanticSettings,
+) -> Result<(), PersistedSemanticsError> {
     if caller.sql_mode().group_concat_legacy()
-        || query_uses_group_concat_legacy(caller, query).map_err(|error| error.to_string())?
+        || query_uses_group_concat_legacy(caller, query)
+            .map_err(PersistedSemanticsError::Analyze)?
     {
-        return Err("Unsupported: GROUP_CONCAT_LEGACY is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
+        return Err(PersistedSemanticsError::Uncaptured(
+            "GROUP_CONCAT_LEGACY is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
+        ));
     }
     if caller.decimal_overflow_to_double()
         || query_uses_decimal_overflow_to_double(caller, query)
-            .map_err(|error| error.to_string())?
+            .map_err(PersistedSemanticsError::Analyze)?
     {
-        return Err("Unsupported: decimal_overflow_to_double=true is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
+        return Err(PersistedSemanticsError::Uncaptured(
+            "decimal_overflow_to_double=true is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
+        ));
     }
     if caller.sql_mode().error_if_overflow()
-        || query_uses_error_if_overflow(caller, query).map_err(|error| error.to_string())?
+        || query_uses_error_if_overflow(caller, query).map_err(PersistedSemanticsError::Analyze)?
     {
-        return Err("Unsupported: ERROR_IF_OVERFLOW is not captured for persisted VIEW or MATERIALIZED VIEW definition replay".to_string());
+        return Err(PersistedSemanticsError::Uncaptured(
+            "ERROR_IF_OVERFLOW is not captured for persisted VIEW or MATERIALIZED VIEW definition replay",
+        ));
     }
     Ok(())
 }

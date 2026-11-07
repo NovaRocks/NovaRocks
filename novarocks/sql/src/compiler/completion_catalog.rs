@@ -25,7 +25,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier, resolve_catal
 use super::SqlCompileError;
 use super::completion::{
     CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, CatalogRelationOutcome,
-    CompileNeedId,
+    CatalogTableSelection, CompileNeedId,
 };
 use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
@@ -43,6 +43,14 @@ pub(super) struct CatalogCompletionState {
     current_database: Box<str>,
     lookup_mode: TableLookupMode,
     needs: Box<[CatalogRelationNeed]>,
+    all_needs: Vec<CatalogRelationNeed>,
+    keys: HashSet<CatalogFactKey>,
+    facts: Vec<CatalogRelationFact>,
+    discovered_views: HashMap<TableIdentity, std::sync::Arc<crate::catalog::SqlViewDefinition>>,
+    root_local_view_shadow: bool,
+    definition_target: Option<TableIdentity>,
+    discovery_round: bool,
+    exchange_budget: Option<super::completion::CatalogExchangeBudget>,
     next_need_ordinal: u32,
 }
 
@@ -102,12 +110,20 @@ impl CatalogCompletionState {
                 CatalogLookupTarget::Table { mode: lookup_mode },
             )?;
         }
-        let (needs, next_need_ordinal) = collector.finish();
+        let (needs, next_need_ordinal) = collector.finish()?;
         Ok(Self {
             query: Box::new(query),
             current_catalog,
             current_database,
             lookup_mode,
+            keys: needs.iter().map(CatalogFactKey::from_need).collect(),
+            all_needs: needs.to_vec(),
+            facts: Vec::new(),
+            discovered_views: HashMap::new(),
+            root_local_view_shadow: true,
+            definition_target: None,
+            discovery_round: false,
+            exchange_budget: None,
             needs,
             next_need_ordinal,
         })
@@ -125,18 +141,252 @@ impl CatalogCompletionState {
         self.next_need_ordinal
     }
 
-    pub(super) fn fact_catalog(
-        &self,
-        facts: &[CatalogRelationFact],
-    ) -> Result<FactBackedCatalog, SqlCompileError> {
+    pub(super) fn definition_database(&self) -> Result<&str, SqlCompileError> {
+        if self.root_local_view_shadow {
+            return Err(SqlCompileError::InvalidRequest(
+                "view definition analysis requires its frozen exact catalog context".into(),
+            ));
+        }
+        Ok(&self.current_database)
+    }
+
+    pub(super) fn with_exchange_budget(
+        mut self,
+        limits: super::CompletionLimits,
+    ) -> Result<Self, SqlCompileError> {
+        let mut budget = super::completion::CatalogExchangeBudget::new(limits);
+        budget.reserve(&self.needs, false)?;
+        self.exchange_budget = Some(budget);
+        Ok(self)
+    }
+
+    pub(super) fn with_definition_context(
+        mut self,
+        target: Option<TableIdentity>,
+        control: &super::SqlCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        if !self.facts.is_empty() || self.exchange_budget.is_some() {
+            return Err(SqlCompileError::InvalidRequest(
+                "definition context must be frozen before catalog needs are published".into(),
+            ));
+        }
+        let first = self
+            .all_needs
+            .first()
+            .map_or(self.next_need_ordinal, |need| need.id().get());
+        let mut collector = CatalogNeedCollector::new(
+            self.current_catalog.as_deref(),
+            &self.current_database,
+            self.lookup_mode,
+            first,
+        )
+        .observed(control)?;
+        collector.exact_catalog = true;
+        collector.collect_query(&self.query, &CteScope::default())?;
+        let (needs, next) = collector.finish()?;
+        self.keys = needs.iter().map(CatalogFactKey::from_need).collect();
+        self.all_needs = needs.to_vec();
+        self.needs = needs;
+        self.next_need_ordinal = next;
+        self.root_local_view_shadow = false;
+        self.definition_target = target;
+        Ok(self)
+    }
+
+    pub(super) const fn is_discovery_round(&self) -> bool {
+        self.discovery_round
+    }
+
+    pub(super) fn accept_facts(
+        &mut self,
+        facts: Box<[CatalogRelationFact]>,
+        control: &super::SqlCompileControl,
+    ) -> Result<(), SqlCompileError> {
+        control.check()?;
+        if self.needs.is_empty() {
+            return Err(SqlCompileError::InvalidRequest(
+                "catalog continuation has no outstanding needs".into(),
+            ));
+        }
+        let facts = match &mut self.exchange_budget {
+            Some(budget) => budget.receive(&self.needs, facts)?,
+            None => facts,
+        };
+        // Validate only the outstanding batch before retaining any of it.
         FactBackedCatalog::try_new(
             self.current_catalog.as_deref(),
             &self.current_database,
             self.lookup_mode,
             &self.needs,
-            facts,
+            &facts,
+        )?;
+        let mut collector = CatalogNeedCollector::new(
+            self.current_catalog.as_deref(),
+            &self.current_database,
+            self.lookup_mode,
+            self.next_need_ordinal,
         )
+        .observed(control)?;
+        collector.keys = std::mem::take(&mut self.keys);
+        for fact in facts.iter() {
+            let CatalogRelationOutcome::View(view) = fact.outcome() else {
+                continue;
+            };
+            control.check()?;
+            let key = view.identity.clone();
+            if let Some(previous) = self.discovered_views.get(&key) {
+                if previous.version != view.version {
+                    return Err(SqlCompileError::Compilation(
+                        "one statement observed different versions of the same stored view".into(),
+                    ));
+                }
+                if !same_view_version(previous, view, control)? {
+                    return Err(SqlCompileError::Compilation(
+                        "one stored-view version returned conflicting definition facts".into(),
+                    ));
+                }
+                continue;
+            }
+            self.discovered_views.insert(key, view.clone());
+            if self.definition_target.as_ref() == Some(&view.identity) {
+                continue;
+            }
+            // Invalid stored syntax belongs to the actual view-reference
+            // analysis boundary, where its caller span is still available.
+            let Ok(statements) = novarocks_parser::parse(&view.raw_sql) else {
+                continue;
+            };
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                continue;
+            };
+            let Ok(query) = crate::analyzer::query_prepass::preanalyze(query.clone()) else {
+                continue;
+            };
+            let mut child = CatalogNeedCollector::new(
+                Some(&view.default_catalog),
+                &view.default_database,
+                self.lookup_mode,
+                collector.next_need_ordinal,
+            )
+            .observed(control)?;
+            child.exact_catalog = true;
+            child.keys = std::mem::take(&mut collector.keys);
+            // Invalid saved syntax is diagnosed by the view analyzer. The
+            // same collector still captures every other legal dependency.
+            child.defer_semantic_refusals = true;
+            child.collect_query(&query, &CteScope::default())?;
+            let keys = std::mem::take(&mut child.keys);
+            let (needs, next) = child.finish()?;
+            collector.keys = keys;
+            collector.next_need_ordinal = next;
+            collector.needs.extend(needs);
+        }
+        let keys = std::mem::take(&mut collector.keys);
+        let (needs, next) = collector.finish()?;
+        self.keys = keys;
+        self.facts.extend(facts);
+        self.discovery_round = !needs.is_empty();
+        self.all_needs.extend(needs.iter().cloned());
+        self.needs = needs;
+        if let Some(budget) = &mut self.exchange_budget {
+            budget.reserve(&self.needs, self.discovery_round)?;
+        }
+        self.next_need_ordinal = next;
+        control.check()?;
+        Ok(())
     }
+
+    pub(super) fn completed_catalog(&self) -> Result<FactBackedCatalog, SqlCompileError> {
+        if !self.needs.is_empty() {
+            return Err(SqlCompileError::InvalidRequest(
+                "catalog dependency closure still has unanswered exact needs".into(),
+            ));
+        }
+        let mut catalog = FactBackedCatalog::try_new(
+            self.current_catalog.as_deref(),
+            &self.current_database,
+            self.lookup_mode,
+            &self.all_needs,
+            &self.facts,
+        )?;
+        catalog.root_local_view_shadow = self.root_local_view_shadow;
+        catalog.definition_target = self.definition_target.clone();
+        Ok(catalog)
+    }
+
+    pub(super) fn fact_catalog(
+        &self,
+        facts: &[CatalogRelationFact],
+    ) -> Result<FactBackedCatalog, SqlCompileError> {
+        if !self.facts.is_empty() || self.needs.is_empty() {
+            if !facts.is_empty() {
+                return Err(SqlCompileError::InvalidRequest(
+                    "catalog facts were supplied after the closure response was retained".into(),
+                ));
+            }
+            return self.completed_catalog();
+        }
+        if let Some(budget) = &self.exchange_budget {
+            budget.validate_borrowed_bytes(facts)?;
+        }
+        // Legacy one-round callers cannot silently analyze an incomplete view
+        // closure. Their application owners are migrated to accept_facts.
+        let mut catalog = FactBackedCatalog::try_new(
+            self.current_catalog.as_deref(),
+            &self.current_database,
+            self.lookup_mode,
+            &self.needs,
+            facts,
+        )?;
+        catalog.root_local_view_shadow = self.root_local_view_shadow;
+        catalog.definition_target = self.definition_target.clone();
+        if facts
+            .iter()
+            .any(|fact| matches!(fact.outcome(), CatalogRelationOutcome::View(_)))
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "stored-view facts require the catalog dependency closure protocol".into(),
+            ));
+        }
+        Ok(catalog)
+    }
+}
+
+fn same_view_version(
+    left: &crate::catalog::SqlViewDefinition,
+    right: &crate::catalog::SqlViewDefinition,
+    control: &super::SqlCompileControl,
+) -> Result<bool, SqlCompileError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    work.flush()?;
+    if left.raw_sql != right.raw_sql
+        || left.default_catalog != right.default_catalog
+        || left.default_database != right.default_database
+        || left.columns.len() != right.columns.len()
+    {
+        return Ok(false);
+    }
+    for (left, right) in left.columns.iter().zip(right.columns.iter()) {
+        work.step()?;
+        if left.name != right.name {
+            return Ok(false);
+        }
+        let equal = left
+            .value_type
+            .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                &right.value_type,
+                || {
+                    work.step()
+                        .map_err(novarocks_functions::FunctionBindingError::from)
+                },
+            )?;
+        if !equal {
+            return Ok(false);
+        }
+    }
+    work.finish()?;
+    Ok(true)
 }
 
 #[derive(Clone, Default)]
@@ -149,6 +399,9 @@ struct CatalogNeedCollector<'a> {
     current_catalog: Option<&'a str>,
     current_database: &'a str,
     lookup_mode: TableLookupMode,
+    exact_catalog: bool,
+    defer_semantic_refusals: bool,
+    work: Option<novarocks_type_contract::CompileCheckpoints<'a>>,
     next_need_ordinal: u32,
     keys: HashSet<CatalogFactKey>,
     needs: Vec<CatalogRelationNeed>,
@@ -165,14 +418,33 @@ impl<'a> CatalogNeedCollector<'a> {
             current_catalog,
             current_database,
             lookup_mode,
+            exact_catalog: false,
+            defer_semantic_refusals: false,
+            work: None,
             next_need_ordinal: first_need_ordinal,
             keys: HashSet::new(),
             needs: Vec::new(),
         }
     }
 
-    fn finish(self) -> (Box<[CatalogRelationNeed]>, u32) {
-        (self.needs.into_boxed_slice(), self.next_need_ordinal)
+    fn observed(mut self, control: &'a super::SqlCompileControl) -> Result<Self, SqlCompileError> {
+        self.work = Some(novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::Validate,
+        )?);
+        Ok(self)
+    }
+    fn step(&mut self) -> Result<(), SqlCompileError> {
+        if let Some(work) = &mut self.work {
+            work.step()?;
+        }
+        Ok(())
+    }
+    fn finish(self) -> Result<(Box<[CatalogRelationNeed]>, u32), SqlCompileError> {
+        if let Some(work) = self.work {
+            work.finish()?;
+        }
+        Ok((self.needs.into_boxed_slice(), self.next_need_ordinal))
     }
 
     fn collect_query(
@@ -180,6 +452,7 @@ impl<'a> CatalogNeedCollector<'a> {
         query: &ast::Query,
         outer_scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
+        self.step()?;
         let mut body_scope = outer_scope.clone();
         if let Some(with) = &query.with {
             let local_names = with
@@ -223,6 +496,7 @@ impl<'a> CatalogNeedCollector<'a> {
         expression: &ast::SetExpr,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
+        self.step()?;
         match expression {
             ast::SetExpr::Select(select) => self.collect_select(select, scope),
             ast::SetExpr::Values(values) => {
@@ -246,6 +520,7 @@ impl<'a> CatalogNeedCollector<'a> {
         select: &ast::Select,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
+        self.step()?;
         for hint in &select.hints {
             match &hint.value {
                 ast::SelectHintValue::Bare => {}
@@ -374,6 +649,7 @@ impl<'a> CatalogNeedCollector<'a> {
         factor: &ast::TableFactor,
         scope: &CteScope,
     ) -> Result<(), SqlCompileError> {
+        self.step()?;
         match factor {
             ast::TableFactor::Table {
                 name,
@@ -385,6 +661,9 @@ impl<'a> CatalogNeedCollector<'a> {
                 if metadata.is_none() && name.parts.len() == 1 {
                     let name = name.parts[0].value.to_ascii_lowercase();
                     if scope.pending.contains(&name) {
+                        if self.defer_semantic_refusals {
+                            return Ok(());
+                        }
                         return Err(SqlCompileError::Compilation(format!(
                             "forward CTE reference is not supported: {name}"
                         )));
@@ -394,11 +673,26 @@ impl<'a> CatalogNeedCollector<'a> {
                         return Ok(());
                     }
                 }
-                let relation = self.resolve_name(name)?;
+                let relation = match self.resolve_name(name) {
+                    Ok(relation) => relation,
+                    Err(SqlCompileError::Compilation(_)) if self.defer_semantic_refusals => {
+                        return self.collect_table_decorations(version.as_ref(), hints, scope);
+                    }
+                    Err(error) => return Err(error),
+                };
                 let target = match metadata {
                     Some(metadata) => {
-                        let kind = SqlMetadataTableKind::parse(&metadata.value)
-                            .map_err(SqlCompileError::Compilation)?;
+                        let kind = match SqlMetadataTableKind::parse(&metadata.value) {
+                            Ok(kind) => kind,
+                            Err(_) if self.defer_semantic_refusals => {
+                                return self.collect_table_decorations(
+                                    version.as_ref(),
+                                    hints,
+                                    scope,
+                                );
+                            }
+                            Err(error) => return Err(SqlCompileError::Compilation(error)),
+                        };
                         // The analyzer expands the partitions view over this exact
                         // Files fact; it must not request a provider Partitions read.
                         CatalogLookupTarget::IcebergMetadata {
@@ -412,7 +706,37 @@ impl<'a> CatalogNeedCollector<'a> {
                         mode: self.lookup_mode,
                     },
                 };
-                self.add_need(relation, target)?;
+                let selection = match version {
+                    Some(version) if metadata.is_some() => {
+                        if self.defer_semantic_refusals {
+                            return self.collect_table_decorations(Some(version), hints, scope);
+                        }
+                        return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                            "time travel is not supported on metadata relations",
+                            version.span,
+                        )
+                        .into());
+                    }
+                    Some(version) => {
+                        match CatalogTableSelection::try_new(version.clone(), &relation) {
+                            Ok(selection) => Some(selection),
+                            Err(_) if self.defer_semantic_refusals => {
+                                return self.collect_table_decorations(Some(version), hints, scope);
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    None => None,
+                };
+                self.add_need_qualified(
+                    relation,
+                    target,
+                    !self.exact_catalog
+                        && metadata.is_none()
+                        && version.is_none()
+                        && name.parts.len() < 3,
+                    selection,
+                )?;
                 self.collect_table_decorations(version.as_ref(), hints, scope)
             }
             ast::TableFactor::Derived {
@@ -507,12 +831,15 @@ impl<'a> CatalogNeedCollector<'a> {
             .split('.')
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        let relation = resolve_catalog_table_name(
+        let relation = match resolve_catalog_table_name(
             &parts,
             Some(novarocks_types::naming::DEFAULT_CATALOG),
             self.current_database,
-        )
-        .map_err(SqlCompileError::Compilation)?;
+        ) {
+            Ok(relation) => relation,
+            Err(_) if self.defer_semantic_refusals => return Ok(()),
+            Err(error) => return Err(SqlCompileError::Compilation(error)),
+        };
         self.add_need(
             relation,
             CatalogLookupTarget::Table {
@@ -547,17 +874,42 @@ impl<'a> CatalogNeedCollector<'a> {
         relation: TableIdentity,
         target: CatalogLookupTarget,
     ) -> Result<(), SqlCompileError> {
-        let key = CatalogFactKey::new(relation.clone(), target);
+        self.add_need_qualified(relation, target, false, None)
+    }
+
+    fn add_need_qualified(
+        &mut self,
+        relation: TableIdentity,
+        target: CatalogLookupTarget,
+        local_view_shadow: bool,
+        selection: Option<CatalogTableSelection>,
+    ) -> Result<(), SqlCompileError> {
+        self.step()?;
+        let mut key = CatalogFactKey::new(relation.clone(), target);
+        key.local_view_shadow = local_view_shadow;
+        key.definition_context =
+            self.exact_catalog && matches!(target, CatalogLookupTarget::Table { .. });
+        key.selection = selection.as_ref().map(|selection| selection.key().clone());
         if !self.keys.insert(key) {
             return Ok(());
         }
         let id = CompileNeedId::new(self.next_need_ordinal);
         self.next_need_ordinal = self.next_need_ordinal.checked_add(1).ok_or_else(|| {
-            SqlCompileError::Compilation("catalog completion need identity overflow".to_string())
+            SqlCompileError::InvalidRequest("catalog completion need identity overflow".to_string())
         })?;
         let need = CatalogRelationNeed::try_new(id, relation, target)
-            .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-        self.needs.push(need);
+            .map_err(|error| SqlCompileError::InvalidRequest(error.to_string()))?
+            .with_selection(selection);
+        let need = if self.exact_catalog {
+            need.in_definition_context()
+        } else {
+            need
+        };
+        self.needs.push(if local_view_shadow {
+            need.with_local_view_shadow()
+        } else {
+            need
+        });
         Ok(())
     }
 }
@@ -569,6 +921,17 @@ struct ExpressionQueryCollector<'collector, 'scope, 'context> {
 }
 
 impl Visit for ExpressionQueryCollector<'_, '_, '_> {
+    fn visit_expr(&mut self, expression: &ast::Expr) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(error) = self.collector.step() {
+            self.error = Some(error);
+            return;
+        }
+        ast::walk_expr(self, expression);
+    }
+
     fn visit_query(&mut self, query: &ast::Query) {
         if self.error.is_none()
             && let Err(error) = self.collector.collect_query(query, self.scope)
@@ -582,13 +945,34 @@ impl Visit for ExpressionQueryCollector<'_, '_, '_> {
 struct CatalogFactKey {
     relation: TableIdentity,
     target: CatalogTargetKey,
+    local_view_shadow: bool,
+    definition_context: bool,
+    selection: Option<crate::planning::catalog::SqlTimeTravelSelection>,
 }
 
 impl CatalogFactKey {
+    fn from_need(need: &CatalogRelationNeed) -> Self {
+        let mut key = Self::new(need.relation().clone(), need.target());
+        key.local_view_shadow = need.allows_local_view_shadow();
+        key.definition_context = need.is_definition_context();
+        key.selection = need.selection_key().cloned();
+        key
+    }
+    fn from_fact(fact: &CatalogRelationFact) -> Self {
+        let mut key = Self::new(fact.relation().clone(), fact.target());
+        key.local_view_shadow = fact.allows_local_view_shadow();
+        key.definition_context = fact.is_definition_context();
+        key.selection = fact.selection_key().cloned();
+        key
+    }
+
     fn new(relation: TableIdentity, target: CatalogLookupTarget) -> Self {
         Self {
             relation,
             target: CatalogTargetKey::from(target),
+            local_view_shadow: false,
+            definition_context: false,
+            selection: None,
         }
     }
 }
@@ -615,8 +999,11 @@ impl From<CatalogLookupTarget> for CatalogTargetKey {
 }
 
 enum CatalogEntry {
+    Inline(std::sync::Arc<crate::catalog::SqlInlineRelation>),
     Resolved(Box<ResolvedAnalyzerTable>),
+    View(std::sync::Arc<crate::catalog::SqlViewDefinition>),
     Missing(Box<str>),
+    SelectionRefused(Box<crate::analyze_error::AnalyzeError>),
 }
 
 /// Analyzer catalog backed solely by one exact completion answer batch.
@@ -624,6 +1011,8 @@ pub(super) struct FactBackedCatalog {
     current_catalog: Option<Box<str>>,
     current_database: Box<str>,
     lookup_mode: TableLookupMode,
+    root_local_view_shadow: bool,
+    definition_target: Option<TableIdentity>,
     entries: HashMap<CatalogFactKey, CatalogEntry>,
 }
 
@@ -647,19 +1036,29 @@ impl FactBackedCatalog {
                     fact.id().get()
                 ))
             })?;
-            if fact.relation() != need.relation() || fact.target() != need.target() {
+            if fact.relation() != need.relation()
+                || fact.target() != need.target()
+                || fact.allows_local_view_shadow() != need.allows_local_view_shadow()
+                || fact.is_definition_context() != need.is_definition_context()
+                || fact.selection_key() != need.selection_key()
+            {
                 return Err(SqlCompileError::Compilation(format!(
                     "catalog completion fact {} does not match its exact request",
                     fact.id().get()
                 )));
             }
-            let key = CatalogFactKey::new(fact.relation().clone(), fact.target());
+            let key = CatalogFactKey::from_fact(fact);
             let entry = match fact.outcome() {
+                CatalogRelationOutcome::Inline(relation) => CatalogEntry::Inline(relation.clone()),
                 CatalogRelationOutcome::Resolved(table) => {
                     validate_resolved_target(fact, table)?;
                     CatalogEntry::Resolved(table.clone())
                 }
+                CatalogRelationOutcome::View(view) => CatalogEntry::View(view.clone()),
                 CatalogRelationOutcome::Missing { reason } => CatalogEntry::Missing(reason.clone()),
+                CatalogRelationOutcome::SelectionRefused(error) => {
+                    CatalogEntry::SelectionRefused(error.clone())
+                }
             };
             if entries.insert(key, entry).is_some() {
                 return Err(SqlCompileError::Compilation(format!(
@@ -677,17 +1076,21 @@ impl FactBackedCatalog {
             current_catalog: current_catalog.map(Into::into),
             current_database: current_database.into(),
             lookup_mode,
+            root_local_view_shadow: true,
+            definition_target: None,
             entries,
         })
     }
 
-    fn resolve(
+    fn entry_selected_in_context(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
         target: CatalogLookupTarget,
-    ) -> Result<ResolvedAnalyzerTable, String> {
+        selection: Option<&crate::planning::catalog::SqlTimeTravelSelection>,
+        definition_context: bool,
+    ) -> Result<&CatalogEntry, String> {
         let parts = match catalog {
             Some(catalog) => vec![catalog.to_string(), database.to_string(), table.to_string()],
             None => vec![database.to_string(), table.to_string()],
@@ -704,22 +1107,197 @@ impl FactBackedCatalog {
             ),
             &self.current_database,
         )?;
-        let key = CatalogFactKey::new(identity.clone(), target);
-        match self.entries.get(&key) {
-            Some(CatalogEntry::Resolved(table)) => Ok(table.as_ref().clone()),
-            Some(CatalogEntry::Missing(reason)) => Err(format!(
-                "catalog relation `{}` is missing: {reason}",
+        let mut key = CatalogFactKey::new(identity.clone(), target);
+        key.local_view_shadow = !definition_context
+            && self.root_local_view_shadow
+            && catalog.is_none()
+            && selection.is_none()
+            && matches!(target, CatalogLookupTarget::Table { .. });
+        key.definition_context =
+            definition_context && matches!(target, CatalogLookupTarget::Table { .. });
+        key.selection = selection.cloned();
+        self.entries.get(&key).ok_or_else(|| {
+            format!(
+                "catalog relation '{}' was not requested for {target:?}",
                 identity.fqn()
+            )
+        })
+    }
+
+    fn resolve(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        target: CatalogLookupTarget,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        self.resolve_in_context(
+            catalog,
+            database,
+            table,
+            target,
+            !self.root_local_view_shadow,
+        )
+    }
+
+    fn resolve_in_context(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        target: CatalogLookupTarget,
+        definition_context: bool,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        match self.entry_selected_in_context(
+            catalog,
+            database,
+            table,
+            target,
+            None,
+            definition_context,
+        )? {
+            CatalogEntry::Resolved(table) => Ok(table.as_ref().clone()),
+            CatalogEntry::Missing(reason) => {
+                Err(format!("catalog relation '{table}' is missing: {reason}"))
+            }
+            CatalogEntry::View(_) => Err(format!(
+                "catalog relation '{table}' requires stored-view declaration analysis"
             )),
-            None => Err(format!(
-                "catalog relation `{}` was not requested for {target:?}",
-                identity.fqn()
+            CatalogEntry::Inline(_) => Err(format!(
+                "catalog relation '{table}' requires inline value analysis"
             )),
+            CatalogEntry::SelectionRefused(_) => {
+                Err("historical selection cannot answer a Current lookup".into())
+            }
         }
+    }
+    fn resolve_table_version_for_analysis_in_context(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        version: &ast::TableVersion,
+        definition_context: bool,
+    ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
+        use crate::analyze_error::AnalyzeError;
+        let selection = crate::planning::catalog::parse_time_travel_selection(version, table)?;
+        for name in catalog.into_iter().chain([database, table]) {
+            normalize_identifier(name)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
+        }
+        match self
+            .entry_selected_in_context(
+                catalog,
+                database,
+                table,
+                CatalogLookupTarget::Table {
+                    mode: self.lookup_mode,
+                },
+                Some(&selection),
+                definition_context,
+            )
+            .map_err(AnalyzeError::internal)?
+        {
+            CatalogEntry::Resolved(table) => Ok(table.as_ref().clone()),
+            CatalogEntry::Missing(reason) => Err(AnalyzeError::unknown_table(
+                reason.to_string(),
+                version.span,
+            )),
+            CatalogEntry::View(_) | CatalogEntry::Inline(_) => {
+                Err(AnalyzeError::unsupported_query_shape(
+                    "time travel is not supported on a stored view",
+                    version.span,
+                ))
+            }
+            CatalogEntry::SelectionRefused(error) => Err(error
+                .as_ref()
+                .clone()
+                .at_catalog_selection_reference(version.value.span())),
+        }
+    }
+
+    fn resolve_view_for_analysis_in_context(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        view: &str,
+        definition_context: bool,
+    ) -> Result<Option<&crate::catalog::SqlViewDefinition>, crate::analyze_error::AnalyzeError>
+    {
+        // These names came from SQL syntax, unlike an absent fact for a
+        // valid need. Preserve the naming author's capability refusal rather
+        // than turning an unsupported quoted identifier into a protocol bug.
+        for name in catalog.into_iter().chain([database, view]) {
+            normalize_identifier(name)
+                .map_err(crate::analyze_error::AnalyzeError::unsupported_expression_without_span)?;
+        }
+        let entry = self
+            .entry_selected_in_context(
+                catalog,
+                database,
+                view,
+                CatalogLookupTarget::Table {
+                    mode: self.lookup_mode,
+                },
+                None,
+                definition_context,
+            )
+            .map_err(crate::analyze_error::AnalyzeError::internal)?;
+        Ok(match entry {
+            CatalogEntry::View(view) => Some(view.as_ref()),
+            CatalogEntry::Resolved(_) | CatalogEntry::Missing(_) | CatalogEntry::Inline(_) => None,
+            CatalogEntry::SelectionRefused(_) => {
+                return Err(crate::analyze_error::AnalyzeError::internal(
+                    "historical selection cannot answer a Current view lookup",
+                ));
+            }
+        })
+    }
+
+    fn inline_in_context(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        definition_context: bool,
+    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
+    {
+        let entry = self
+            .entry_selected_in_context(
+                catalog,
+                database,
+                table,
+                CatalogLookupTarget::Table {
+                    mode: self.lookup_mode,
+                },
+                None,
+                definition_context,
+            )
+            .map_err(crate::analyze_error::AnalyzeError::internal)?;
+        Ok(match entry {
+            CatalogEntry::Inline(values) => Some(values.as_ref()),
+            _ => None,
+        })
     }
 }
 
 impl PlannerTableProvider for FactBackedCatalog {
+    fn resolve_table_version_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        version: &ast::TableVersion,
+    ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
+        self.resolve_table_version_for_analysis_in_context(
+            catalog,
+            database,
+            table,
+            version,
+            !self.root_local_view_shadow,
+        )
+    }
+
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,
@@ -736,6 +1314,77 @@ impl PlannerTableProvider for FactBackedCatalog {
         )
     }
 
+    fn view_definition_target(&self) -> Option<&TableIdentity> {
+        self.definition_target.as_ref()
+    }
+
+    fn resolve_view_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        view: &str,
+    ) -> Result<Option<&crate::catalog::SqlViewDefinition>, crate::analyze_error::AnalyzeError>
+    {
+        self.resolve_view_for_analysis_in_context(
+            catalog,
+            database,
+            view,
+            !self.root_local_view_shadow,
+        )
+    }
+
+    fn resolve_definition_table_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        self.resolve_in_context(
+            catalog,
+            database,
+            table,
+            CatalogLookupTarget::Table {
+                mode: self.lookup_mode,
+            },
+            true,
+        )
+    }
+    fn resolve_definition_table_version_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        version: &ast::TableVersion,
+    ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
+        self.resolve_table_version_for_analysis_in_context(catalog, database, table, version, true)
+    }
+    fn resolve_definition_view_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        view: &str,
+    ) -> Result<Option<&crate::catalog::SqlViewDefinition>, crate::analyze_error::AnalyzeError>
+    {
+        self.resolve_view_for_analysis_in_context(catalog, database, view, true)
+    }
+    fn resolve_inline_relation_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
+    {
+        self.inline_in_context(catalog, database, table, !self.root_local_view_shadow)
+    }
+    fn resolve_definition_inline_relation_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
+    {
+        self.inline_in_context(catalog, database, table, true)
+    }
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         Some(self)
     }
@@ -773,6 +1422,17 @@ fn validate_resolved_target(
         )));
     }
     let ScanSource::Sql(source) = &table.planner.source;
+    if let Some(expected) = fact.selected_snapshot()
+        && !matches!(&source.kind, SqlScanKind::Data {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(actual), ..
+        } | SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(actual), ..
+        } if *actual == expected)
+    {
+        return Err(SqlCompileError::Compilation(
+            "catalog selected fact carries another snapshot or Current".into(),
+        ));
+    }
     if source.table.catalog != fact.relation().catalog
         || source.table.namespace != fact.relation().namespace
         || source.table.table != fact.relation().table
@@ -832,7 +1492,7 @@ mod tests {
         state
             .needs()
             .iter()
-            .map(|need| CatalogFactKey::new(need.relation().clone(), need.target()))
+            .map(CatalogFactKey::from_need)
             .collect()
     }
 
@@ -843,6 +1503,17 @@ mod tests {
         target: CatalogLookupTarget,
     ) -> CatalogFactKey {
         CatalogFactKey::new(TableIdentity::new(catalog, namespace, table), target)
+    }
+
+    fn implicit_key(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        target: CatalogLookupTarget,
+    ) -> CatalogFactKey {
+        let mut key = key(catalog, namespace, table, target);
+        key.local_view_shadow = true;
+        key
     }
 
     fn resolved_table(identity: &TableIdentity, kind: SqlScanKind) -> ResolvedAnalyzerTable {
@@ -872,7 +1543,7 @@ mod tests {
              JOIN remote_catalog.sales.orders r ON o.id = r.id",
         );
         let expected = HashSet::from([
-            key(
+            implicit_key(
                 "session_catalog",
                 "session_db",
                 "local_table",
@@ -880,7 +1551,7 @@ mod tests {
                     mode: TableLookupMode::SchemaOnly,
                 },
             ),
-            key(
+            implicit_key(
                 "session_catalog",
                 "other_db",
                 "orders",

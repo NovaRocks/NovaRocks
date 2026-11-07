@@ -35,7 +35,10 @@ use crate::{
         loading::TaskCreatePayload,
         loading_host_job::LoadingHostJob,
         node::WorkerNodeHost,
-        participation_host::{TaskIoPorts, task_io::TaskIoHostJob},
+        participation_host::{
+            TaskIoPorts,
+            task_io::{TaskCloseHandoffGate, TaskIoHostJob},
+        },
     },
 };
 use novarocks_connector_contract::PureProviderProgramCatalog;
@@ -634,8 +637,16 @@ impl Drop for ReleasePreparationGate {
         self.0.release();
     }
 }
+struct ReleaseTaskCloseGate(Arc<TaskCloseHandoffGate>);
+impl Drop for ReleaseTaskCloseGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
 struct BundleFixture {
     stopped_before_host: bool,
+    abort_before_task_close: std::sync::atomic::AtomicBool,
+    close: Arc<TaskCloseHandoffGate>,
     prepare: Arc<PreparationGate>,
     adoption: Arc<PreparationGate>,
     original: Mutex<Option<(Weak<WorkerNodeHost>, ParticipationRef)>>,
@@ -649,6 +660,8 @@ impl BundleFixture {
     fn new(stopped_before_host: bool) -> Self {
         Self {
             stopped_before_host,
+            abort_before_task_close: std::sync::atomic::AtomicBool::new(false),
+            close: Arc::new(TaskCloseHandoffGate::default()),
             prepare: Arc::new(PreparationGate::default()),
             adoption: Arc::new(PreparationGate::default()),
             original: Mutex::new(None),
@@ -1127,6 +1140,7 @@ pub(super) struct TaskResources {
     preparation: HostExecutor<TaskIoHostJob, PreparationRunner>,
     lifecycle: HostExecutor<TaskIoHostJob, PreparationRunner>,
     _async_runtime: tokio::runtime::Runtime,
+    abort_regression: Option<std::thread::JoinHandle<()>>,
 }
 fn observation_projection() -> crate::ObservationProjection {
     use novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -1200,10 +1214,24 @@ fn start_tasks_with_lifecycle_gate(
             Err(original) => return Err(Box::new(original)),
         };
     let original_bundle = bundle.clone();
+    let observed = Arc::new(Observations::default());
+    let preparation_observed = observed.clone();
     let runner: PreparationRunner = Box::new(move |job| {
-        if matches!(&job, TaskIoHostJob::Prepare { .. })
+        if let TaskIoHostJob::Prepare { reporter, .. } = &job
             && let Some(bundle) = &original_bundle
         {
+            if bundle.abort_before_task_close.load(Ordering::Acquire) {
+                // Borrow the original job's neutral read binding before its
+                // Business start. Cloning it creates no lifecycle authority.
+                assert!(
+                    preparation_observed
+                        .reporter
+                        .lock()
+                        .unwrap()
+                        .replace(reporter.clone())
+                        .is_none()
+                );
+            }
             bundle.prepare.wait();
         }
         job.run_on_host();
@@ -1252,13 +1280,14 @@ fn start_tasks_with_lifecycle_gate(
         execution: execution_runtime(),
         completion,
         tasks: Mutex::new(BTreeMap::new()),
-        observed: Arc::new(Observations::default()),
+        observed,
         result_budget,
         result_limits,
         bundle,
         completion_contract: Mutex::new(None),
     });
     let ports = TaskIoPorts {
+        close_handoff_gate: host.bundle.as_ref().map(|bundle| bundle.close.clone()),
         protocol_events: Some(crate::TaskExecutionPorts::new(
             host.observed.clone(),
             host.observed.clone(),
@@ -1281,6 +1310,7 @@ fn start_tasks_with_lifecycle_gate(
             preparation,
             lifecycle,
             _async_runtime: async_runtime,
+            abort_regression: None,
         },
     ))
 }
@@ -1355,7 +1385,7 @@ fn exercise_root_with_preparing_read_hook(
         TaskId::new(1).unwrap(),
         participation.backend_process_id(),
     );
-    let _prepare_release = resources
+    let mut prepare_release_guard = resources
         .host
         .bundle
         .as_ref()
@@ -1373,6 +1403,9 @@ fn exercise_root_with_preparing_read_hook(
         .map(|window| ReleasePreparationGate(window.body_gate()));
     if let Some(bundle) = &resources.host.bundle {
         *bundle.original.lock().unwrap() = Some((Arc::downgrade(&scene.node), participation));
+        if bundle.abort_before_task_close.load(Ordering::Acquire) {
+            bundle.close.arm(task);
+        }
     }
     *scene.diagnostic_task.lock().unwrap() = Some((participation, task));
     let descriptor = TaskDescriptor::try_new(
@@ -1550,6 +1583,123 @@ fn exercise_root_with_preparing_read_hook(
                 )));
             }
             preparing_read = Some((delivery, saved.0));
+        }
+        if bundle.abort_before_task_close.load(Ordering::Acquire) {
+            let node = scene.node.clone();
+            let ledger = scene.ledger.clone();
+            let host = resources.host.clone();
+            let bundle = bundle.clone();
+            let prepare_release = prepare_release_guard
+                .take()
+                .expect("same original preparation gate guard");
+            resources.abort_regression = Some(std::thread::spawn(move || {
+                // These guards release the same original gates on every
+                // assertion/timeout panic, so the real Abort can still settle.
+                let _prepare_release = prepare_release;
+                let _close_release = ReleaseTaskCloseGate(bundle.close.clone());
+                let reporter = host
+                    .observed
+                    .reporter
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the original Prepare job supplied its neutral reporter");
+                assert_eq!(reporter.identity(), task);
+                assert!(
+                    wait_until(|| {
+                        bundle.close.held().is_some()
+                            && node
+                                .preparation_fixture_inventory(participation, task)
+                                .is_some_and(|inventory| inventory.scope.stopped)
+                    }),
+                    "the original Abort must stop Business and retain its real Task close ticket"
+                );
+                let (held_task, _, intent) = bundle.close.held().unwrap();
+                assert_eq!(held_task, task);
+                assert_eq!(
+                    intent,
+                    novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
+                        AbortCause::QueryFailed
+                    )
+                );
+                let inventory = bundle.inventory(task);
+                assert!(
+                    !inventory.stopped,
+                    "the held Task close cut has not selected a conclusion or Stop"
+                );
+                assert!(!inventory.body_exited);
+                let before_close = reporter.current().unwrap();
+                assert!(!before_close.is_terminal());
+                assert_eq!(before_close.termination(), None);
+                assert_eq!(ledger.used(Dimension::PreparingTasks.id()), 1);
+                assert_eq!(ledger.used(Dimension::PreparingBytes.id()), held_bytes);
+                assert_eq!(bundle.host_entries.load(Ordering::SeqCst), 0);
+                bundle.prepare.release();
+                assert!(
+                    wait_until(|| {
+                        node.preparation_fixture_inventory(participation, task).is_some_and(|inventory| {
+                        inventory.body_exited && inventory.host_borrowers_exited
+                            && inventory.lifecycle_ids.iter().any(|(kind, _, _, phase)| {
+                                *kind == crate::control_runtime_policy::TaskLifecycleInputKind::TerminalObservation
+                                    && *phase == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Retired
+                            })
+                    })
+                    }),
+                    "the original refused preparation must roll back and its real terminal input must be consumed"
+                );
+                // Retired custody includes both real body/capture exit and
+                // the original Core event report consumer, not merely Exited.
+                assert_eq!(bundle.host_entries.load(Ordering::SeqCst), 0);
+                assert_eq!(bundle.transfers.load(Ordering::SeqCst), 0);
+                assert_eq!(host.observed.activated.load(Ordering::SeqCst), 0);
+                assert_eq!(host.observed.completed.load(Ordering::SeqCst), 0);
+                assert!(host.tasks.lock().unwrap().is_empty());
+                let pending_close = reporter.current().unwrap();
+                assert!(!pending_close.is_terminal());
+                assert_eq!(pending_close.termination(), None);
+                assert_eq!(
+                    ledger.used(Dimension::ActiveTasks.id()),
+                    1,
+                    "physical rollback cannot retire the Task before its real close conclusion"
+                );
+                assert!(!host.observed.protocol_events.lock().unwrap().iter().any(|event| {
+                    matches!(event, crate::TaskProtocolEvent::TaskTerminalRetained { identity, .. } if *identity == task)
+                }), "FinishExisting must wait instead of inventing terminal success");
+                bundle.close.release();
+                assert!(
+                    wait_until(|| {
+                        let events = host.observed.protocol_events.lock().unwrap();
+                        events.iter().any(|event| {
+                            matches!(event,
+                        crate::TaskProtocolEvent::TaskTerminalRetained { identity, state }
+                            if *identity == task && *state == TaskState::Aborted)
+                        })
+                    }),
+                    "the original close must retain Aborted"
+                );
+                // This same original read binding supplies either its live
+                // neutral projection or its actual sealed retirement image.
+                // The independent physical-exit assertions remain above and
+                // in the surrounding original Node lifecycle.
+                let final_status = reporter.current().unwrap();
+                assert_eq!(final_status.identity(), task);
+                assert_eq!(final_status.state(), TaskState::Aborted);
+                assert_eq!(
+                    final_status.termination(),
+                    Some(&novarocks_execution_contract::TerminationDetail::Aborted(
+                        AbortCause::QueryFailed
+                    ))
+                );
+                assert!(!host.observed.protocol_events.lock().unwrap().iter().any(
+                    |event| matches!(event,
+                    crate::TaskProtocolEvent::TaskTerminalRetained { identity, state }
+                        if *identity == task && *state == TaskState::Finished)
+                ));
+            }));
+            // The surrounding original Node lifecycle now submits Abort. Its
+            // real RPC, retention, physical drain and shutdown remain intact.
+            // Transfer gate custody to the bounded observer before returning.
+            return Ok(None);
         }
         if bundle.stopped_before_host {
             trace_original_preparation_stage(
@@ -2047,7 +2197,20 @@ pub(super) fn shutdown(resources: TaskResources) -> Result<(), Failure> {
         preparation,
         lifecycle,
         _async_runtime,
+        abort_regression,
     } = resources;
+    if let Some(observer) = abort_regression
+        && let Err(original) = observer.join()
+    {
+        return Err(Box::new((
+            original,
+            host,
+            loading,
+            preparation,
+            lifecycle,
+            _async_runtime,
+        )));
+    }
     if let Err(original) = loading.shutdown() {
         return Err(Box::new((
             host,
@@ -2297,6 +2460,27 @@ fn stopped_preparation_really_drops_its_unused_bundle_without_entering_the_host(
         NodeClose::Release,
         compiled_task_geometry(),
         |root| start_tasks_with_bundle(root, Some(true)),
+        exercise,
+        shutdown,
+    );
+}
+#[test]
+fn aborted_queued_preparation_returns_its_real_terminal_before_the_task_close_cut() {
+    run_node_lifecycle_with_task(
+        1,
+        NodeClose::Abort,
+        compiled_task_geometry(),
+        |root| {
+            let (ports, resources) = start_tasks_with_bundle(root, Some(true))?;
+            resources
+                .host
+                .bundle
+                .as_ref()
+                .unwrap()
+                .abort_before_task_close
+                .store(true, Ordering::Release);
+            Ok((ports, resources))
+        },
         exercise,
         shutdown,
     );

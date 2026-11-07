@@ -226,6 +226,12 @@ fn expected_error_location_result(
 
 fn expected_error_expectation_label(meta: &QueryMeta) -> String {
     let mut labels = Vec::new();
+    if let Some(expected) = &meta.expect_trino_error {
+        labels.push(format!(
+            "trino_error={},{}",
+            expected.name, expected.error_type
+        ));
+    }
     if let Some(code) = meta.expect_error_code.as_deref() {
         labels.push(format!("engine_error_code={code}"));
     }
@@ -244,6 +250,63 @@ fn expected_error_expectation_label(meta: &QueryMeta) -> String {
         labels.push(format!("error_contains={expected:?}"));
     }
     labels.join(", ")
+}
+
+fn evaluate_expected_error_outcome(
+    meta: &QueryMeta,
+    ok: bool,
+    err_msg: &str,
+    outcome: Option<&SqlExecutionOutcome>,
+) -> Option<Result<(), String>> {
+    if let Some(expected) = &meta.expect_trino_error {
+        let actual = outcome.and_then(|outcome| {
+            if ok || outcome.0 || outcome.3.len() != 1 {
+                return None;
+            }
+            let attempt = &outcome.3[0];
+            if attempt.statement_count != 1
+                || attempt.statements.len() != 1
+                || !attempt.local_failures.is_empty()
+            {
+                return None;
+            }
+            let statement = &attempt.statements[0];
+            if statement.ordinal != 0 || !statement.submission_started || !statement.completed {
+                return None;
+            }
+            match statement.failures.as_slice() {
+                [
+                    SqlExecutionFailure::Client(
+                        novarocks_test_trino_client::StatementFailure::Trino(error),
+                    ),
+                ] => Some(error),
+                _ => None,
+            }
+        });
+        return Some(match actual {
+            Some(error)
+                if error.error_name == expected.name && error.error_type == expected.error_type =>
+            {
+                Ok(())
+            }
+            Some(error) => Err(format!(
+                "expected Trino error {},{}, got {},{}: {}",
+                expected.name, expected.error_type, error.error_name, error.error_type, err_msg
+            )),
+            None => Err(format!(
+                "expected one actual Trino statement error {},{}, got success, multiple outcomes, or an infrastructure/local failure: {}",
+                expected.name, expected.error_type, err_msg
+            )),
+        });
+    }
+    if meta.has_error_expectation()
+        && outcome.is_some_and(|outcome| outcome.final_failures().len() > 1)
+    {
+        return Some(Err(format!(
+            "one expected error cannot accept multiple statement failures: {err_msg}"
+        )));
+    }
+    evaluate_expected_error_branch(meta, ok, err_msg)
 }
 
 fn evaluate_expected_error_branch(
@@ -787,7 +850,7 @@ fn execute_wait_alter(
     query_timeout: u64,
     request: WaitAlterRequest<'_>,
     log: &mut String,
-) -> (bool, Duration) {
+) -> (bool, Duration, Vec<SqlExecutionOutcome>) {
     let WaitAlterRequest {
         db_name,
         table_name,
@@ -816,8 +879,11 @@ fn execute_wait_alter(
         )
     };
     let mut total_elapsed = Duration::ZERO;
+    let mut polls = Vec::new();
     for attempt in 0..max_retries {
-        let (ok, execution, _err) = session.execute_query(query_timeout, &show_sql, None);
+        let outcome = session.execute_query(query_timeout, &show_sql, None);
+        let (ok, execution, _err) = outcome.summary();
+        polls.push(outcome);
         if let Some(ref exec) = execution {
             total_elapsed += exec.elapsed;
         }
@@ -832,7 +898,7 @@ fn execute_wait_alter(
                         attempt + 1,
                         max_retries,
                     );
-                    return (true, total_elapsed);
+                    return (true, total_elapsed, polls);
                 }
                 AlterJobPollState::Failed(message) => {
                     let _ = writeln!(
@@ -844,7 +910,7 @@ fn execute_wait_alter(
                         max_retries,
                         message,
                     );
-                    return (false, total_elapsed);
+                    return (false, total_elapsed, polls);
                 }
                 AlterJobPollState::Pending => {}
             }
@@ -871,17 +937,18 @@ fn execute_wait_alter(
         table_name,
         max_retries,
     );
-    (false, total_elapsed)
+    (false, total_elapsed, polls)
 }
 
-/// Run all wait_alter annotations on a step.  Returns (ok, extra_elapsed).
+/// Retain every actual polling invocation alongside its original summary.
 fn run_step_wait_alters(
     step: &SqlStep,
     session: &mut TrinoCaseSession,
     query_timeout: u64,
     log: &mut String,
-) -> (bool, Duration) {
+) -> (bool, Duration, Vec<SqlExecutionOutcome>) {
     let mut total = Duration::ZERO;
+    let mut polls = Vec::new();
     let db = step.meta.db.as_deref().unwrap_or("");
     for (table, kind, default_retries) in [
         (&step.meta.wait_alter_column, "COLUMN", 60usize),
@@ -889,7 +956,7 @@ fn run_step_wait_alters(
         (&step.meta.wait_alter_optimize, "OPTIMIZE", 300usize),
     ] {
         if let Some(table_name) = table {
-            let (ok, elapsed) = execute_wait_alter(
+            let (ok, elapsed, mut actual) = execute_wait_alter(
                 session,
                 query_timeout,
                 WaitAlterRequest {
@@ -902,12 +969,13 @@ fn run_step_wait_alters(
                 log,
             );
             total += elapsed;
+            polls.append(&mut actual);
             if !ok {
-                return (false, total);
+                return (false, total, polls);
             }
         }
     }
-    (true, total)
+    (true, total, polls)
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1016,7 @@ struct DomainOracleFailure {
     failure_origin: Option<ExecutionFailureOrigin>,
     execution: Option<Box<QueryExecution>>,
     sql: Option<String>,
+    sql_outcome: Option<Box<SqlExecutionOutcome>>,
 }
 
 impl DomainOracleFailure {
@@ -955,14 +1024,15 @@ impl DomainOracleFailure {
         message: String,
         execution: Option<QueryExecution>,
         sql: &str,
-        session: &TrinoCaseSession,
+        outcome: SqlExecutionOutcome,
     ) -> Self {
-        let failure_origin = SqlStepOutcome::from_session((false, None, String::new()), session).3;
+        let failure_origin = SqlStepOutcome::failure_origin(&outcome);
         Self {
             message,
             failure_origin,
             execution: execution.map(Box::new),
             sql: Some(sql.to_string()),
+            sql_outcome: Some(Box::new(outcome)),
         }
     }
 }
@@ -974,6 +1044,7 @@ impl From<String> for DomainOracleFailure {
             failure_origin: None,
             execution: None,
             sql: None,
+            sql_outcome: None,
         }
     }
 }
@@ -989,13 +1060,14 @@ fn execute_required_oracle_query(
     query_timeout: u64,
     sql: &str,
 ) -> Result<QueryExecution, DomainOracleFailure> {
-    let (ok, execution, msg) = session.execute_query(query_timeout, sql, None);
+    let outcome = session.execute_query(query_timeout, sql, None);
+    let (ok, execution, msg) = outcome.summary();
     if !ok {
         return Err(DomainOracleFailure::from_execution(
             format!("query failed: {sql}\n{msg}"),
             execution,
             sql,
-            session,
+            outcome,
         ));
     }
     execution.ok_or_else(|| format!("query returned no result: {sql}").into())
@@ -1022,13 +1094,14 @@ fn run_imv_equivalence_check(
         log,
         "    @imv_equivalence_check: capturing incremental contents of {fqn}"
     );
-    let (ok, inc, msg) = session.execute_query(query_timeout, &select, None);
+    let outcome = session.execute_query(query_timeout, &select, None);
+    let (ok, inc, msg) = outcome.summary();
     if !ok {
         return Err(DomainOracleFailure::from_execution(
             format!("@imv_equivalence_check: incremental SELECT failed: {msg}"),
             inc,
             &select,
-            session,
+            outcome,
         ));
     }
     let inc = inc.ok_or_else(|| {
@@ -1044,14 +1117,14 @@ fn run_imv_equivalence_check(
         log,
         "    @imv_equivalence_check: deriving full recompute via SelectText"
     );
-    let (ok, show_result, msg) =
-        session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
+    let outcome = session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
+    let (ok, show_result, msg) = outcome.summary();
     if !ok {
         return Err(DomainOracleFailure::from_execution(
             format!("@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"),
             show_result,
             "SHOW MATERIALIZED VIEWS",
-            session,
+            outcome,
         ));
     }
     let show_result = show_result.ok_or_else(|| {
@@ -1133,13 +1206,14 @@ fn run_imv_equivalence_check(
 
     // SelectText is the canonical persisted, re-parseable CREATE-MV query body.
     // The native parser re-admits it on every refresh, so it is safe to re-run.
-    let (ok, full, msg) = session.execute_query(query_timeout, &select_sql, None);
+    let outcome = session.execute_query(query_timeout, &select_sql, None);
+    let (ok, full, msg) = outcome.summary();
     if !ok {
         return Err(DomainOracleFailure::from_execution(
             format!("@imv_equivalence_check: full-recompute SELECT failed: {msg}"),
             full,
             &select_sql,
-            session,
+            outcome,
         ));
     }
     let full = full.ok_or_else(|| {
@@ -1166,15 +1240,15 @@ fn stateless_level_satisfies(available: ImvStatelessLevel, required: ImvStateles
     available >= required
 }
 
-/// Run `sql` and unwrap the `(bool, Option<QueryExecution>, String)` triple
-/// returned by `TrinoCaseSession::execute_query` into a single `Result`, so
+/// Consume this SQL invocation's returned outcome as a single `Result`, so
 /// `@imv_stateless_rebuild` call sites can use `?`.
 fn execute_required_query(
     session: &mut crate::session::TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
 ) -> Result<crate::types::QueryExecution, String> {
-    let (ok, execution, msg) = session.execute_query(query_timeout, sql, None);
+    let outcome = session.execute_query(query_timeout, sql, None);
+    let (ok, execution, msg) = outcome.summary();
     if !ok {
         return Err(format!("query failed: {sql}\n{msg}"));
     }
@@ -1342,7 +1416,8 @@ fn run_explain_directive_checks(
     }
     let explain_sql = format!("EXPLAIN VERBOSE {}", body);
     let _ = writeln!(log, "    @explain directives: running EXPLAIN VERBOSE");
-    let (ok, exec, msg) = session.execute_query(query_timeout, &explain_sql, None);
+    let outcome = session.execute_query(query_timeout, &explain_sql, None);
+    let (ok, exec, msg) = outcome.into_summary();
     if !ok {
         return Err(format!(
             "@explain directives: EXPLAIN VERBOSE failed.\n  error: {}",
@@ -1635,18 +1710,24 @@ struct SqlStepOutcome(
     Option<QueryExecution>,
     String,
     Option<ExecutionFailureOrigin>,
+    Option<SqlExecutionOutcome>,
 );
 
 impl SqlStepOutcome {
-    fn from_session(raw: RawExecution, session: &TrinoCaseSession) -> Self {
-        let origin = (!raw.0).then_some(if session.last_failure_is_statement() {
+    fn failure_origin(raw: &SqlExecutionOutcome) -> Option<ExecutionFailureOrigin> {
+        (!raw.0).then_some(if raw.failure_is_statement() {
             ExecutionFailureOrigin::Statement
-        } else if session.last_failure_is_only_transport() {
+        } else if raw.failure_is_only_transport() {
             ExecutionFailureOrigin::Transport
         } else {
             ExecutionFailureOrigin::Infrastructure
-        });
-        Self(raw.0, raw.1, raw.2, origin)
+        })
+    }
+
+    fn from_session(raw: SqlExecutionOutcome) -> Self {
+        let origin = Self::failure_origin(&raw);
+        let (ok, execution, message) = raw.summary();
+        Self(ok, execution, message, origin, Some(raw))
     }
 
     fn infrastructure(raw: RawExecution) -> Self {
@@ -1656,12 +1737,13 @@ impl SqlStepOutcome {
             raw.1,
             raw.2,
             Some(ExecutionFailureOrigin::Infrastructure),
+            None,
         )
     }
 
     fn control_success(raw: RawExecution) -> Self {
         debug_assert!(raw.0);
-        Self(raw.0, raw.1, raw.2, None)
+        Self(raw.0, raw.1, raw.2, None, None)
     }
 
     fn from_shell(raw: RawExecution) -> Self {
@@ -1674,7 +1756,7 @@ impl SqlStepOutcome {
         });
         // A real command failure is not a remote-writer exit proof. The shell
         // owner keeps its existing fixture_writers_settled policy independently.
-        Self(raw.0, raw.1, raw.2, origin)
+        Self(raw.0, raw.1, raw.2, origin, None)
     }
 }
 
@@ -1715,6 +1797,7 @@ fn execute_target_query_with_selected_control(
     let cancel_slot = session.cancel_slot();
     let query_timeout = bounded_fault_query_timeout(query_timeout, fault_deadline);
     let mut transport_failure = false;
+    let mut original_outcome = None;
     let fault_result = fault_injection::execute_with_post_fragment_start_fault(
         meta,
         cluster_owner,
@@ -1725,7 +1808,8 @@ fn execute_target_query_with_selected_control(
                 query_timeout,
                 sql,
                 db,
-                !fault_injection::has_client_query_cancellation(meta),
+                !fault_injection::has_client_query_cancellation(meta)
+                    && meta.expect_trino_error.is_none(),
                 |transient, statement_index, client_query_id, submitted, _cancel| {
                     let Some((control, outer, deadline)) = selected else {
                         return Ok(());
@@ -1762,7 +1846,8 @@ fn execute_target_query_with_selected_control(
                     Ok(())
                 },
             );
-            let result = SqlStepOutcome::from_session(result, session);
+            original_outcome = Some(result.clone());
+            let result = SqlStepOutcome::from_session(result);
             transport_failure = !result.0 && result.3 == Some(ExecutionFailureOrigin::Transport);
             if fault_injection::has_fault(meta) && !result.0 {
                 eprintln!(
@@ -1775,11 +1860,13 @@ fn execute_target_query_with_selected_control(
     );
     let fault_completed = fault_result.is_ok();
     let mut result = fault_result.unwrap_or_else(|error| {
-        SqlStepOutcome::infrastructure((
+        let mut failed = SqlStepOutcome::infrastructure((
             false,
             None,
             format!("FAIL (runner fault injection): {error:#}"),
-        ))
+        ));
+        failed.4 = original_outcome;
+        failed
     });
     session.set_operation_deadline(None);
     if meta.kill_fe_after_mv_known_committed_before_projector_cas
@@ -1860,7 +1947,7 @@ fn retain_publication_kill_query(
 ) -> Result<(), String> {
     let mut artifact = None;
     let mut artifact_error = None;
-    if let Some(SqlStepOutcome(ok, Some(execution), _, _)) = query {
+    if let Some(SqlStepOutcome(ok, Some(execution), _, _, _)) = query {
         let retained = if *ok {
             ctx.failure_artifacts.persist_case_actual_result(
                 &ctx.suite_name,
@@ -1895,6 +1982,7 @@ fn retain_publication_kill_query(
         "details":{
         "original_query_observed":query.is_some(),
         "original_query_ok":query.map(|q| q.0),
+        "original_sql_outcome":query.and_then(|q| q.4.as_ref()).map(SqlExecutionOutcome::evidence),
         "original_failure_origin":query.and_then(|q| q.3).map(|origin| match origin {
             ExecutionFailureOrigin::Transport => "transport",
             ExecutionFailureOrigin::Infrastructure => "infrastructure",
@@ -2176,7 +2264,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
         let primary = match query_thread.join() {
-            Ok(SqlStepOutcome(_, _, message, _)) => message,
+            Ok(SqlStepOutcome(_, _, message, _, _)) => message,
             Err(_) => "query thread panicked".to_string(),
         };
         return SqlStepOutcome::infrastructure((
@@ -2449,7 +2537,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     if let Err(error) = fault_guard.wait_until_entered(deadline) {
         let _ = fault_guard.release();
         let primary = match query_thread.join() {
-            Ok(SqlStepOutcome(_, _, message, _)) => format!("; primary query: {message}"),
+            Ok(SqlStepOutcome(_, _, message, _, _)) => format!("; primary query: {message}"),
             Err(_) => "; primary query thread panicked".to_string(),
         };
         return SqlStepOutcome::infrastructure((
@@ -2812,6 +2900,7 @@ fn retain_domain_oracle_failure(
         "authoring_stopped":execution_failure_is_infrastructure(failure.failure_origin),
         "original_error":failure.to_string(),
         "original_sql":failure.sql,
+        "sql_outcome":failure.sql_outcome.as_deref().map(SqlExecutionOutcome::evidence),
         "has_original_partial":failure.execution.is_some(),
         "partial_artifact":artifact,
     }));
@@ -3519,7 +3608,8 @@ fn run_case_observed(
         &mut target_session,
         &ctx.target_session_sql,
         |session, statement| {
-            let (ok, _, message) = session.execute_query(ctx.query_timeout, statement, None);
+            let outcome = session.execute_query(ctx.query_timeout, statement, None);
+            let (ok, _, message) = outcome.into_summary();
             if ok { Ok(()) } else { Err(message) }
         },
     ) {
@@ -3866,7 +3956,7 @@ fn run_case_observed(
 
                 for attempt in 0..retry_count {
                     evidence.begin_attempt();
-                    let SqlStepOutcome(ok, execution, err_msg, failure_origin) =
+                    let SqlStepOutcome(ok, execution, err_msg, failure_origin, sql_outcome) =
                         execute_case_step(CaseStepDispatch {
                             ctx,
                             case,
@@ -3884,6 +3974,12 @@ fn run_case_observed(
                             structured_lifecycle_observation: &mut structured_lifecycle_observation,
                             log: &mut log,
                         });
+                    if let Some(outcome) = &sql_outcome {
+                        evidence.diagnostics.push(serde_json::json!({
+                            "step":step.query_number,"outer_attempt":attempt,"kind":"sql_execution_outcome",
+                            "details":outcome.evidence(),
+                        }));
+                    }
                     let elapsed = execution
                         .as_ref()
                         .map(|result| result.elapsed)
@@ -3918,7 +4014,7 @@ fn run_case_observed(
                                 step,
                                 "expected_error",
                                 false,
-                                serde_json::json!({"failure_origin":"infrastructure"}),
+                                serde_json::json!({"failure_origin":"infrastructure", "sql_outcome":sql_outcome.as_ref().map(SqlExecutionOutcome::evidence)}),
                             );
                         }
                         // No retry or ordinary successor may turn this original
@@ -3926,14 +4022,17 @@ fn run_case_observed(
                         break;
                     }
 
-                    if let Some(expected_result) =
-                        evaluate_expected_error_branch(&step.meta, ok, &err_msg)
-                    {
+                    if let Some(expected_result) = evaluate_expected_error_outcome(
+                        &step.meta,
+                        ok,
+                        &err_msg,
+                        sql_outcome.as_ref(),
+                    ) {
                         evidence.record(
                             step,
                             "expected_error",
                             expected_result.is_ok(),
-                            serde_json::json!({}),
+                            serde_json::json!({"sql_outcome":sql_outcome.as_ref().map(SqlExecutionOutcome::evidence)}),
                         );
                         if expected_result.is_err() {
                             evidence.record_failure(
@@ -4183,7 +4282,7 @@ fn run_case_observed(
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
-                    let (wait_ok, wait_elapsed) = run_step_wait_alters(
+                    let (wait_ok, wait_elapsed, wait_outcomes) = run_step_wait_alters(
                         step,
                         &mut target_session,
                         ctx.query_timeout,
@@ -4191,7 +4290,7 @@ fn run_case_observed(
                     );
                     case_elapsed += wait_elapsed;
                     if results_record::required(step).contains(&"wait_alter") {
-                        evidence.record(step, "wait_alter", wait_ok, serde_json::json!({}));
+                        evidence.record(step, "wait_alter", wait_ok, serde_json::json!({"polls":wait_outcomes.iter().map(SqlExecutionOutcome::evidence).collect::<Vec<_>>()}));
                     }
                     if !wait_ok {
                         case_failed = true;
@@ -4403,7 +4502,7 @@ fn run_case_observed(
 
                 for attempt in 0..retry_count {
                     evidence.begin_attempt();
-                    let SqlStepOutcome(ok, execution, err_msg, failure_origin) =
+                    let SqlStepOutcome(ok, execution, err_msg, failure_origin, sql_outcome) =
                         execute_case_step(CaseStepDispatch {
                             ctx,
                             case,
@@ -4421,6 +4520,12 @@ fn run_case_observed(
                             structured_lifecycle_observation: &mut structured_lifecycle_observation,
                             log: &mut log,
                         });
+                    if let Some(outcome) = &sql_outcome {
+                        evidence.diagnostics.push(serde_json::json!({
+                            "step":step.query_number,"outer_attempt":attempt,"kind":"sql_execution_outcome",
+                            "details":outcome.evidence(),
+                        }));
+                    }
                     if ctx.convert_legacy
                         && !ok
                         && let Some(partial) = execution.as_ref()
@@ -4477,7 +4582,7 @@ fn run_case_observed(
                                 step,
                                 "expected_error",
                                 false,
-                                serde_json::json!({"failure_origin":"infrastructure"}),
+                                serde_json::json!({"failure_origin":"infrastructure", "sql_outcome":sql_outcome.as_ref().map(SqlExecutionOutcome::evidence)}),
                             );
                         }
                         // No retry or ordinary successor may turn this original
@@ -4485,14 +4590,17 @@ fn run_case_observed(
                         break;
                     }
 
-                    if let Some(expected_result) =
-                        evaluate_expected_error_branch(&step.meta, ok, &err_msg)
-                    {
+                    if let Some(expected_result) = evaluate_expected_error_outcome(
+                        &step.meta,
+                        ok,
+                        &err_msg,
+                        sql_outcome.as_ref(),
+                    ) {
                         evidence.record(
                             step,
                             "expected_error",
                             expected_result.is_ok(),
-                            serde_json::json!({}),
+                            serde_json::json!({"sql_outcome":sql_outcome.as_ref().map(SqlExecutionOutcome::evidence)}),
                         );
                         if expected_result.is_err() {
                             evidence.record_failure(
@@ -4734,7 +4842,7 @@ fn run_case_observed(
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
-                    let (wait_ok, wait_elapsed) = run_step_wait_alters(
+                    let (wait_ok, wait_elapsed, wait_outcomes) = run_step_wait_alters(
                         step,
                         &mut target_session,
                         ctx.query_timeout,
@@ -4743,7 +4851,7 @@ fn run_case_observed(
                     case_elapsed += wait_elapsed;
                     if !wait_ok {
                         case_failed = true;
-                        evidence.record(step, "wait_alter", false, serde_json::json!({}));
+                        evidence.record(step, "wait_alter", false, serde_json::json!({"polls":wait_outcomes.iter().map(SqlExecutionOutcome::evidence).collect::<Vec<_>>()}));
                     } else {
                         let be_log_ok = {
                             match run_be_log_directives_for_successful_step(

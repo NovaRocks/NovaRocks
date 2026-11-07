@@ -1,0 +1,173 @@
+-- query 1
+-- types	integer	boolean	varchar
+_col0	_col1	_col2
+1	false	x
+
+-- query 2
+-- types	integer	boolean	integer
+x	_col1	y
+1	false	1
+
+-- query 3
+-- types	integer
+x
+1
+
+-- query 4
+-- types	integer
+X
+1
+
+-- query 5
+-- types	integer
+MixedAlias
+1
+
+-- query 6
+-- types	integer
+x
+1
+
+-- query 7
+-- types	bigint
+_col0
+1
+
+-- query 8
+-- types	bigint	bigint
+_col0	_col1
+1	1
+
+-- query 9
+-- types	bigint
+_col0
+1
+
+-- query 10
+-- types	integer
+_col0
+1
+
+-- query 11
+-- types	integer	integer
+_col1	_col1
+1	2
+
+-- query 12
+-- types	integer	integer
+a	a
+1	2
+
+-- query 13
+-- types	integer
+_col0
+1
+
+-- query 14
+-- types	integer	integer
+_col0	b
+1	2
+
+-- query 15
+-- types	integer
+_col0
+1
+
+-- query 16
+-- types	integer
+a
+1
+
+-- query 17
+-- types	integer
+_col0
+1
+
+-- query 18
+-- types	integer
+_col0
+1
+
+-- query 19
+-- types	integer
+_col0
+1
+2
+
+-- query 20
+-- types	integer
+a
+2
+1
+
+-- query 21
+-- types	integer
+_col0
+2
+1
+
+-- query 22
+-- types	integer
+_col0
+1
+
+-- query 23
+-- types	integer
+a
+1
+
+-- query 24
+-- types	integer	integer	integer
+x	x	_col2
+1	1	2
+
+-- query 31
+-- types	integer
+_col0
+0
+1
+
+-- query 32
+-- types	integer
+X
+1
+
+-- query 33
+-- types	integer
+k
+1
+
+-- query 34
+-- types	integer
+y
+1
+
+-- query 35
+-- types	integer
+_col0
+2
+
+-- query 36
+-- types	integer
+a
+1
+
+-- query 37
+-- types	integer
+_col0
+1
+
+-- query 38
+-- types	integer
+a
+1
+
+-- query 39
+-- types	bigint
+_col0
+1
+
+-- query 40
+-- types	integer
+A
+1

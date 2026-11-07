@@ -701,6 +701,6 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	10	10	10
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	2	6	3
 
 -- query 60
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 511	511	511	511	511	511	511	511	511	511	511	511

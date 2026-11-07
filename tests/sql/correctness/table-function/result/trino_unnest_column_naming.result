@@ -1,0 +1,9 @@
+-- query 1
+-- types	array(integer)	integer
+a	_col1
+[1]	1
+
+-- query 2
+-- types	integer
+x
+1

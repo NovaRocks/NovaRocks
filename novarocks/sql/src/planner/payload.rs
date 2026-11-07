@@ -909,6 +909,7 @@ pub enum PlanRowCountAssertion {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct PlanAssertOneRowNode {
+    pub declared_violation: Option<novarocks_failure_contract::FailureReason>,
     pub subquery_text: String,
     pub desired_num_rows: Option<i64>,
     pub assertion: PlanRowCountAssertion,
@@ -920,8 +921,16 @@ pub(crate) struct PlanAssertOneRowNode {
 }
 
 impl PlanAssertOneRowNode {
+    pub(crate) fn with_declared_violation(
+        mut self,
+        reason: Option<novarocks_failure_contract::FailureReason>,
+    ) -> Self {
+        self.declared_violation = reason;
+        self
+    }
     pub(crate) fn global_at_most_one(subquery_text: impl Into<String>) -> Self {
         Self {
+            declared_violation: None,
             subquery_text: subquery_text.into(),
             desired_num_rows: Some(1),
             assertion: PlanRowCountAssertion::Le,
@@ -940,6 +949,7 @@ impl PlanAssertOneRowNode {
         applicability_column_id: Option<ColumnId>,
     ) -> Self {
         Self {
+            declared_violation: None,
             subquery_text: subquery_text.into(),
             desired_num_rows: Some(1),
             assertion: PlanRowCountAssertion::Le,

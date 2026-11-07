@@ -271,6 +271,7 @@ fn global(comparison: p::RowCountAssertion, desired_rows: u64) -> p::PhysicalNod
 }
 fn keyed() -> p::PhysicalNode {
     source(p::RowCountAssertionSpec::PerKeyAtMostOne {
+        declared_violation: None,
         applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
         keys: Box::from([
             p::ValueId::new(u32::MAX),
@@ -303,6 +304,7 @@ fn expected(kind: wire::row_count_assertion_node::Kind) -> wire::PhysicalNode {
 fn expected_keyed() -> wire::PhysicalNode {
     expected(wire::row_count_assertion_node::Kind::PerKeyAtMostOne(
         wire::PerKeyRowCountAssertion {
+            declared_sql_violation: None,
             applicability: Some(wire::AssertionApplicability {
                 kind: Some(wire::assertion_applicability::Kind::AllRows(
                     novarocks_proto_models::physical_control_v2::Empty {},
@@ -792,6 +794,7 @@ fn wide_ordered_keys_and_utf8_copy_reach_actual_quantum_without_after_refusal() 
     with_namespaces(&definitions(), &control, |encoded, decoded| {
         let mut original = keyed();
         if let p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
             keys,
             labels,
@@ -900,5 +903,42 @@ fn applicability_is_one_original_reference_without_a_new_buffer() {
         assert_eq!(received.list_item_count, all_received.list_item_count + 1);
         control.arm(None);
         assert!(decode_assert_rows_node(&raw, decoded, SOURCE, below).is_err());
+    });
+}
+
+#[test]
+fn declared_sql_assertion_reason_round_trips_and_unknown_identity_refuses() {
+    use novarocks_failure_contract::sql_reason;
+    let control = Control::default();
+    with_namespaces(&definitions(), &control, |encoded, decoded| {
+        for reason in [
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+        ] {
+            let mut original = keyed();
+            let p::NodeKind::AssertOneRow(p::RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation,
+                ..
+            }) = &mut original.kind
+            else {
+                unreachable!()
+            };
+            *declared_violation = Some(reason);
+            let (wire, _) = encode_assert_rows_node(&original, encoded, SOURCE, limits()).unwrap();
+            assert_eq!(
+                decode_assert_rows_node(&wire, decoded, SOURCE, limits())
+                    .unwrap()
+                    .0,
+                original
+            );
+        }
+        let mut wire = expected_keyed();
+        let Some(wire::row_count_assertion_node::Kind::PerKeyAtMostOne(spec)) =
+            &mut assertion_mut(&mut wire).kind
+        else {
+            unreachable!()
+        };
+        spec.declared_sql_violation = Some(14);
+        assert!(decode_assert_rows_node(&wire, decoded, SOURCE, limits()).is_err());
     });
 }

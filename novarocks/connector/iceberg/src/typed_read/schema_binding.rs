@@ -109,8 +109,8 @@ pub const ALWAYS_BOUND_METADATA_COLUMNS: [IcebergMetadataColumn; 2] = [
 /// order.
 ///
 /// They are absent from a table without row lineage rather than bound and
-/// empty: `_row_id` is `first_row_id + position`, and a table that stores no
-/// `first_row_id` has no value to report.
+/// empty. A v3 file without `first_row_id` produces NULL for these columns;
+/// otherwise `_row_id` inherits `first_row_id + position`.
 pub const ROW_LINEAGE_METADATA_COLUMNS: [IcebergMetadataColumn; 2] = [
     IcebergMetadataColumn::RowId,
     IcebergMetadataColumn::LastUpdatedSequenceNumber,
@@ -161,12 +161,12 @@ impl IcebergMetadataColumn {
     /// mints the published handle with it, so the type a scan is planned with
     /// and the type its frozen read publishes are one exact type. The reader
     /// never yields NULL for a required column: `_file` and `_pos` are facts of
-    /// every row's split and position, and a row that cannot answer `_row_id`
-    /// is refused rather than answered with NULL.
+    /// every row's split and position. Both lineage columns may be NULL for
+    /// files that predate the first v3 row-ID allocation.
     pub const fn nullable(self) -> bool {
         match self {
-            Self::Path | Self::RowPosition | Self::RowId | Self::IsDeleted => false,
-            Self::LastUpdatedSequenceNumber => true,
+            Self::Path | Self::RowPosition | Self::IsDeleted => false,
+            Self::RowId | Self::LastUpdatedSequenceNumber => true,
         }
     }
 
@@ -1347,12 +1347,15 @@ fn row_lineage_column(
     let row_count = batch.num_rows();
     let values = match column {
         IcebergRowLineageColumn::RowId => {
-            let positions = require_absolute_positions(
-                absolute_positions,
-                IcebergMetadataColumn::RowId,
-                facts,
-            )?;
-            let positions = absolute_positions_as_i64(positions)?;
+            let positions = if facts.file_first_row_id.is_some() {
+                absolute_positions_as_i64(require_absolute_positions(
+                    absolute_positions,
+                    IcebergMetadataColumn::RowId,
+                    facts,
+                )?)?
+            } else {
+                Vec::new()
+            };
             synthesize_row_id(
                 &schema,
                 batch.columns(),
@@ -1366,6 +1369,7 @@ fn row_lineage_column(
                 &schema,
                 batch.columns(),
                 row_count,
+                facts.file_first_row_id,
                 facts.data_sequence_number,
             )
         }
@@ -2006,11 +2010,34 @@ mod tests {
     }
 
     #[test]
-    fn row_lineage_without_a_frozen_fact_fails_closed() {
-        let target = Field::new("_last_updated_sequence_number", DataType::Int64, false);
+    fn pre_v3_files_publish_nullable_lineage_without_row_positions() {
+        let facts = IcebergSplitFacts {
+            path: "pre-v3.parquet",
+            file_first_row_id: None,
+            data_sequence_number: Some(3),
+        };
+        for metadata in ROW_LINEAGE_METADATA_COLUMNS {
+            assert!(metadata.nullable());
+            let target = Field::new(metadata.column_name(), DataType::Int64, metadata.nullable());
+            let array = metadata_column(
+                metadata,
+                &target,
+                &rows_without_stored_lineage(2),
+                None,
+                &facts,
+            )
+            .expect("pre-v3 file lineage is null");
+            assert_eq!(array.len(), 2);
+            assert_eq!(array.null_count(), 2);
+        }
+    }
+
+    #[test]
+    fn allocated_file_without_required_sequence_fails_closed() {
+        let target = Field::new("_last_updated_sequence_number", DataType::Int64, true);
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            file_first_row_id: None,
+            file_first_row_id: Some(100),
             data_sequence_number: None,
         };
         assert!(

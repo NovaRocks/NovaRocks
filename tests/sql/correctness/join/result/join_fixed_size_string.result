@@ -1,59 +1,59 @@
 -- query 17
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+_col0	_col1	_col2
 31968	-309676175680	-309676175680
 
 -- query 18
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+_col0	_col1	_col2
 31969	-309676175680	-309676175680
 
 -- query 19
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+_col0	_col1	_col2
 31968	-309676175680	-309676175680
 
 -- query 20
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+_col0	_col1	_col2
 31968	1335706074848	1335706074848
 
 -- query 21
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+_col0	_col1	_col2
 31969	1335706074848	1335706074848
 
 -- query 22
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+_col0	_col1	_col2
 31968	1335706074848	1335706074848
 
 -- query 23
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+_col0	_col1	_col2
 31968	-2082175970080	-2082175970080
 
 -- query 24
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+_col0	_col1	_col2
 31969	-2082175970080	-2082175970080
 
 -- query 25
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+_col0	_col1	_col2
 31968	-2082175970080	-2082175970080
 
 -- query 26
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str32))	sum(murmur_hash3_32(t2.c_str32))
+_col0	_col1	_col2
 31968	88656487264	88656487264
 
 -- query 28
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+_col0	_col1	_col2
 31969	1335706074848	1335706074848
 
 -- query 30
 -- types	bigint	bigint	bigint
-count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+_col0	_col1	_col2
 31970	1337460871883	1337460871883

@@ -4,27 +4,27 @@ c0	c1
 
 -- query 4
 -- legacy
-length(c0)	length(c1)
+_col0	_col1
 1000000	1000000
 
 -- query 5
 -- legacy
-length(c0)	max(length(c1))	max(length(c2))
+_col0	_col1	_col2
 1000000	1000000	1000000
 
 -- query 7
 -- types	integer	integer
-max(length(c0))	max(length(c1))
+_col0	_col1
 4	4
 
 -- query 8
 -- legacy
-max(length(c0))	max(length(c1))
+_col0	_col1
 1000000	1000000
 
 -- query 9
 -- legacy
-length(c0)	max(length(c1))	max(length(c2))
+_col0	_col1	_col2
 1	4	1
 1	4	1
 1	4	1

@@ -245,7 +245,7 @@ pub(crate) fn apply_root_output_declaration(
     Ok(())
 }
 
-fn widen_declaration(
+pub(super) fn widen_declaration(
     value: &FunctionValueType,
     control: &SqlCompileControl,
 ) -> Result<FunctionValueType, SqlCompileError> {
@@ -275,6 +275,20 @@ fn widen(
             (
                 ValueKind::List(v),
                 DataType::LargeList(relabel(field, t, true)),
+            )
+        }
+        (ValueKind::List(child), DataType::ListView(field)) => {
+            let (v, t) = widen(child, field.data_type(), true, c)?;
+            (
+                ValueKind::List(v),
+                DataType::ListView(relabel(field, t, true)),
+            )
+        }
+        (ValueKind::List(child), DataType::LargeListView(field)) => {
+            let (v, t) = widen(child, field.data_type(), true, c)?;
+            (
+                ValueKind::List(v),
+                DataType::LargeListView(relabel(field, t, true)),
             )
         }
         (ValueKind::FixedSizeList { item, length }, DataType::FixedSizeList(field, width))

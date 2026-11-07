@@ -175,7 +175,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                     requirements: Vec::new(),
                 })
                 .collect(),
-            pre_expand_keyed_assert: mor_merge_pre_expand_assertion(true),
+            pre_expand_keyed_assert: Some(mor_merge_pre_expand_assertion()),
             shape: DmlWritePlanShape::Dataflow,
         },
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -237,7 +237,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     );
     // A generated source must not force one global window to invent identities.
     // Exact target identity remains nullable for unmatched source rows; only
-    // selected matched actions enter the real keyed assertion.
+    // matched rows enter the real keyed assertion, even when no WHEN applies.
     let mut assertions = 0;
     for fragment in finalized.physical_plan().fragments().values() {
         for node in fragment.nodes().values() {
@@ -250,22 +250,33 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                     applicability,
                     keys,
                     labels,
+                    declared_violation,
                     ..
                 },
             ) = &node.kind
             {
                 assertions += 1;
-                assert_eq!(labels.as_ref(), [Box::<str>::from("_row_id")]);
-                assert_eq!(keys.len(), 1);
-                assert_eq!(fragment.values()[&keys[0]].ty.data_type(), &DataType::Int64);
+                assert_eq!(*declared_violation, Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES));
+                assert_eq!(
+                    labels.as_ref(),
+                    ["_file", "_pos", "__nr_merge_action"].map(Box::<str>::from)
+                );
+                assert_eq!(keys.len(), 3);
+                for (key, data_type) in
+                    keys.iter()
+                        .zip([DataType::Utf8, DataType::Int64, DataType::Int64])
+                {
+                    assert_eq!(fragment.values()[key].ty.data_type(), &data_type);
+                }
                 assert!(fragment.values()[&keys[0]].ty.nullable());
+                assert!(fragment.values()[&keys[1]].ty.nullable());
                 let novarocks_physical_plan::AssertionApplicability::WhenTrue(mask) = applicability
                 else {
-                    panic!("only selected matched actions own a target-key obligation")
+                    panic!("every matched target owns a key obligation")
                 };
                 assert_eq!(fragment.values()[mask].ty.data_type(), &DataType::Boolean);
                 // WhenTrue admits the compiler's actual nullable Boolean
-                // declaration; FALSE and NULL both bypass target identity.
+                // declaration; only unmatched source rows bypass the target locator.
             }
         }
     }
@@ -447,6 +458,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             .unwrap();
     let mut actual_writers = std::collections::BTreeSet::new();
     let mut compiled_finishes = 0;
+    let mut decoded_assertions = 0;
     for fragment in encoded.native.fragment_ids() {
         let artifact = encoded.native.get(fragment).unwrap();
         let carried = novarocks_task_codec::creation::decode_static_package(
@@ -462,6 +474,12 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         )
         .unwrap();
         assert_eq!(package.fragment().id().get(), fragment);
+        for node in package.fragment().nodes().values() {
+            if let novarocks_physical_plan::NodeKind::AssertOneRow(novarocks_physical_plan::RowCountAssertionSpec::PerKeyAtMostOne { declared_violation, .. }) = &node.kind {
+                assert_eq!(*declared_violation, Some(novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES));
+                decoded_assertions += 1;
+            }
+        }
         for (&node, recipe) in package.writes() {
             let novarocks_physical_plan::NodeKind::TableWriter { target } =
                 &package.fragment().nodes()[&node].kind
@@ -595,6 +613,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         "the actual SQL author emits one finish"
     );
     assert_eq!(actual_writers, expected_writers.iter().copied().collect());
+    assert_eq!(decoded_assertions, 1, "the real FE-authored package retains its declared assertion identity");
     crate::query_execution::artifact::TaskManifestBinding::assert_completed_router_placements_for_test(
         encoded, router_fragment, expected_summary, &expected_writers,
     );

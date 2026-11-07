@@ -96,25 +96,34 @@ impl Fixture {
         )
         .unwrap();
         control.mark_ready().unwrap();
-        let kernel = ViewExecutionKernel::new(
-            Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-            provider
+        let kernel = {
+            let trc_catalog = provider
                 .map(|p| p.catalog_service.clone())
                 .unwrap_or_else(|| {
                     Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service())
-                }),
-            None,
-            provider
+                });
+            let trc_controls = provider
                 .map(|p| {
                     p.registry.clone()
                         as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
                 })
                 .unwrap_or_else(|| {
                     Arc::new(novarocks_catalog_application::ConnectorControlHost::new())
-                }),
-            Arc::new(QueryViewService::new()),
-            crate::application::test_constant_policy(),
-        );
+                });
+            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+                trc_catalog.clone(),
+                trc_controls.clone(),
+            );
+            ViewExecutionKernel::new(
+                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
+                trc_catalog.clone(),
+                None,
+                trc_controls.clone(),
+                Arc::new(QueryViewService::new()),
+                crate::application::test_constant_policy(),
+                trc_system_relations,
+            )
+        };
         let deadline = root_deadline.then(|| Instant::now() + Duration::from_secs(1));
         let (root, local) = control
             .root_admission()

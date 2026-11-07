@@ -26,8 +26,8 @@ CREATE TABLE ${case_db}.residual_outer_r (k INT, payload INT);
 
 -- @skip_result_check=true
 -- @result_contains=LEFT OUTER, eq: [l.k = r.k]
--- @result_contains=other: CAST(l.flag AS Int64) = 1
--- @result_not_contains=predicates: CAST(l.flag AS Int64) = 1
+-- @result_contains=other: l.flag = 1
+-- @result_not_contains=predicates: l.flag = 1
 EXPLAIN VERBOSE
 SELECT l.k, r.k
 FROM ${case_db}.residual_outer_l l

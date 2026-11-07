@@ -796,11 +796,11 @@ fn provider_failure(error: &CreatePhaseFailure) -> MvProviderFailure {
         .unwrap_or_else(|| error.service.message());
     let mut failure = MvProviderFailure::new(kind, message)
         .with_compile_control(error.service.compile_control_error())
-        .with_unavailable_implementation(
+        .with_analyze_error(
             error
                 .domain
                 .as_ref()
-                .and_then(|error| error.unavailable_implementation().cloned()),
+                .and_then(|error| error.analyze_error().cloned()),
         );
     if let Some(cause) = error.service.failure_cause() {
         failure = failure.with_original_failure(cause.clone());
@@ -1065,32 +1065,46 @@ mod create_contract_tests {
 
     #[test]
     fn create_analysis_refusal_survives_provider_product_and_frontend_bridges() {
-        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
-            FunctionOverloadId::try_new("fixture/mv/create/missing-pure-v1").unwrap(),
-        ));
-        let SqlCompileError::Analyze(expected) = &compile else {
-            panic!("missing pure implementation must be typed analysis");
-        };
-        let failure = CreatePhaseFailure::from(MvApplicationError::from_compile(compile.clone()));
-        assert_eq!(
-            failure
-                .domain
-                .as_ref()
-                .unwrap()
-                .unavailable_implementation(),
-            Some(expected)
-        );
-        let product = provider_failure(&failure).into_product_error();
-        let selected = select_product_result(&Err(product), &None).unwrap_err();
-        assert_eq!(
-            selected
-                .domain
-                .as_ref()
-                .unwrap()
-                .unavailable_implementation(),
-            Some(expected)
-        );
-        assert_eq!(selected.service.compile_control_error(), None);
+        for compile in [
+            SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+                FunctionOverloadId::try_new("fixture/mv/create/missing-pure-v1").unwrap(),
+            )),
+            SqlCompileError::Analyze(
+                novarocks_sql::analyze_error::AnalyzeError::missing_column_name(
+                    "missing position 1",
+                    None,
+                ),
+            ),
+            SqlCompileError::Analyze(
+                novarocks_sql::analyze_error::AnalyzeError::duplicate_column_name(
+                    "duplicate a",
+                    None,
+                ),
+            ),
+            SqlCompileError::Analyze(
+                novarocks_sql::analyze_error::AnalyzeError::mismatched_column_aliases(
+                    "wrong width",
+                    None,
+                ),
+            ),
+        ] {
+            let SqlCompileError::Analyze(expected) = &compile else {
+                panic!("missing pure implementation must be typed analysis");
+            };
+            let failure =
+                CreatePhaseFailure::from(MvApplicationError::from_compile(compile.clone()));
+            assert_eq!(
+                failure.domain.as_ref().unwrap().analyze_error(),
+                Some(expected)
+            );
+            let product = provider_failure(&failure).into_product_error();
+            let selected = select_product_result(&Err(product), &None).unwrap_err();
+            assert_eq!(
+                selected.domain.as_ref().unwrap().analyze_error(),
+                Some(expected)
+            );
+            assert_eq!(selected.service.compile_control_error(), None);
+        }
     }
 
     /// Product ordering fixture, using the current phase projection and result
@@ -1258,10 +1272,7 @@ mod create_contract_tests {
                     MvProductErrorKind::InvalidRequest
                 }
             );
-            assert_eq!(
-                failure.unavailable_implementation().is_some(),
-                !finalize && !abort_fails
-            );
+            assert_eq!(failure.analyze_error().is_some(), !finalize && !abort_fails);
             let selected = select_product_result(transition.result().unwrap(), &effects.primary)
                 .expect_err("the current CREATE selection must preserve the real product result");
             let completion = super::super::MvCommandCompletionReceiving::default();
@@ -1462,7 +1473,7 @@ mod create_contract_tests {
         assert_eq!(observed.kind(), MvApplicationErrorKind::Engine);
         assert_eq!(observed.message(), product.message());
         assert_eq!(observed.original_failure(), None);
-        assert_eq!(observed.unavailable_implementation(), None);
+        assert_eq!(observed.analyze_error(), None);
         assert!(completion.observed().is_none());
     }
 }

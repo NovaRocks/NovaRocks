@@ -55,16 +55,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_ts_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW ts_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(event_ts) AS mn,
-       MAX(event_ts) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -77,6 +67,16 @@ INSERT INTO ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events VALUES
   (3, 'east', '2026-06-30 12:00:00'),
   (4, 'east', '2026-09-10 23:59:59.999999'),
   (5, 'east', '2026-12-25 00:00:01.000001');
+CREATE MATERIALIZED VIEW ts_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(event_ts) AS mn,
+       MAX(event_ts) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_minmax_ts_db_${uuid0}.ns_${uuid0}.events
+GROUP BY region;
 REFRESH MATERIALIZED VIEW ts_mv_${uuid0};
 
 -- query 3

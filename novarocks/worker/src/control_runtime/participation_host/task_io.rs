@@ -46,6 +46,8 @@ use std::{
 /// opened; an absent port rejects capture rather than fabricating a host call.
 #[derive(Clone, Default)]
 pub(crate) struct TaskIoPorts {
+    #[cfg(test)]
+    pub close_handoff_gate: Option<Arc<TaskCloseHandoffGate>>,
     pub protocol_events: Option<crate::TaskExecutionPorts>,
     pub observation: Option<super::observation::ObservationProjection>,
     pub execution: Option<Arc<dyn crate::TaskExecutionHost>>,
@@ -54,6 +56,71 @@ pub(crate) struct TaskIoPorts {
     pub lifecycle: Option<HostExecutorHandle<TaskIoHostJob>>,
     pub cadence: Duration,
     pub capacity: Option<crate::control_runtime::task_capacity::TaskCapacitySignal>,
+}
+/// Test custody never owns a ticket: the original paid actor-effect slot does.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TaskCloseHandoffGate {
+    target: Mutex<Option<TaskIdentity>>,
+    held: Mutex<
+        Option<(
+            TaskIdentity,
+            novarocks_control_runtime_core::identity::Generation,
+            novarocks_worker_protocol::participation::TaskCloseIntent,
+        )>,
+    >,
+    released: std::sync::atomic::AtomicBool,
+    notice: Mutex<Option<crate::control_runtime::participation_ready::ParticipationReadyNotice>>,
+}
+#[cfg(test)]
+impl TaskCloseHandoffGate {
+    pub(crate) fn arm(&self, task: TaskIdentity) {
+        assert!(self.target.lock().unwrap().replace(task).is_none());
+    }
+    pub(crate) fn hold(
+        &self,
+        task: TaskIdentity,
+        generation: novarocks_control_runtime_core::identity::Generation,
+        intent: novarocks_worker_protocol::participation::TaskCloseIntent,
+        notice: &crate::control_runtime::participation_ready::ParticipationReadyNotice,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if *self.target.lock().unwrap() != Some(task) {
+            return false;
+        }
+        // Serialize notice installation with release, so release cannot miss
+        // the original host wake while its exact ticket remains parked.
+        let mut wake = self.notice.lock().unwrap();
+        if self.released.load(Ordering::Acquire) {
+            return false;
+        }
+        *wake = Some(notice.clone());
+        let mut held = self.held.lock().unwrap();
+        let actual = (task, generation, intent);
+        if let Some(previous) = *held {
+            assert_eq!(previous, actual);
+        } else {
+            *held = Some(actual);
+        }
+        true
+    }
+    pub(crate) fn held(
+        &self,
+    ) -> Option<(
+        TaskIdentity,
+        novarocks_control_runtime_core::identity::Generation,
+        novarocks_worker_protocol::participation::TaskCloseIntent,
+    )> {
+        *self.held.lock().unwrap()
+    }
+    pub(crate) fn release(&self) {
+        use std::sync::atomic::Ordering;
+        let wake = self.notice.lock().unwrap();
+        self.released.store(true, Ordering::Release);
+        if let Some(notice) = wake.as_ref() {
+            notice.notify();
+        }
+    }
 }
 impl TaskIoPorts {
     pub(crate) fn intake_open(&self) -> bool {

@@ -58,14 +58,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_xjoin_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW xjoin_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
-FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
-CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
-GROUP BY r.region;
 
 -- query 2
 -- @skip_result_check=true
@@ -75,6 +67,14 @@ INSERT INTO ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions VALUES
 INSERT INTO ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts VALUES
   (10, 10),
   (20, 20);
+CREATE MATERIALIZED VIEW xjoin_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT r.region, COUNT(*) AS c, SUM(a.amount) AS s
+FROM ice_ivm_xjoin_${uuid0}.ns_${uuid0}.regions AS r
+CROSS JOIN ice_ivm_xjoin_${uuid0}.ns_${uuid0}.amounts AS a
+GROUP BY r.region;
 REFRESH MATERIALIZED VIEW xjoin_mv_${uuid0};
 
 -- query 3

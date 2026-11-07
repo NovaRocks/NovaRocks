@@ -652,6 +652,7 @@ fn write_number(
 /// Normalize one logically JSON value on its original allocation/control host.
 /// No input-size, node-count or depth quota is introduced. The iterative arena
 /// and writer drop without recursive user-depth destructors.
+// Design: ADR-0220 (docs/adr/ADR-0220-canonical-json-membership-and-utc-variant-timestamps.md)
 pub fn normalize_json_key(
     input: &str,
     host: Arc<dyn AggregateStateAllocator>,

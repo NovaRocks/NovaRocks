@@ -1524,6 +1524,7 @@ mod is_known_rule_name_tests {
         .expect("mv descriptor");
         let candidate = cascades_rules::mv_rewrite::MvRewriteCandidate {
             mv_name: "or_mv".to_string(),
+            output_targets: (0..mv_desc.outputs.len()).collect(),
             mv: mv_desc,
             mv_scalars,
             target_database: "ns".to_string(),

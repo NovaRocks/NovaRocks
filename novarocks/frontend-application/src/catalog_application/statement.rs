@@ -949,14 +949,17 @@ fn external_view_exists(
         return Ok(false);
     };
     let instance_id = binding.descriptor().instance_id.clone();
-    match view_metadata.load_view(ConnectorViewRequest {
-        view: ConnectorViewIdentity {
-            instance_id,
-            namespace: Arc::from(namespace),
-            view: Arc::from(view),
+    match crate::connector::schema_creation::load_frontend_view(
+        view_metadata.as_ref(),
+        ConnectorViewRequest {
+            view: ConnectorViewIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                view: Arc::from(view),
+            },
+            context: connector_context.clone(),
         },
-        context: connector_context.clone(),
-    }) {
+    ) {
         Ok(_) => Ok(true),
         Err(error)
             if matches!(
@@ -1343,126 +1346,6 @@ pub(crate) enum IcebergSchemaChange {
     },
 }
 
-/// Lower a parser-owned syntax type directly to the catalog's semantic type.
-/// This is intentionally recursive so ARRAY/MAP/STRUCT never fall back to a
-/// SQL text round-trip.
-pub(crate) fn lower_typed_sql_type(
-    type_name: &novarocks_parser::ast::TypeName,
-) -> Result<SqlType, String> {
-    use novarocks_parser::ast::TypeNameArgument;
-
-    let name = type_name
-        .name
-        .parts
-        .last()
-        .ok_or_else(|| "type name is empty".to_string())?
-        .value
-        .to_ascii_lowercase();
-    if type_name.name.parts.len() != 1 {
-        return Err(format!("qualified type name `{name}` is not supported"));
-    }
-
-    match name.as_str() {
-        "array" => Ok(SqlType::Array(Box::new(lower_array_element_type(
-            type_name,
-        )?))),
-        "map" => {
-            let (key, value) = lower_map_types(type_name)?;
-            Ok(SqlType::Map(Box::new(key), Box::new(value)))
-        }
-        "struct" => Ok(SqlType::Struct(
-            type_name
-                .arguments
-                .iter()
-                .map(|argument| match argument {
-                    TypeNameArgument::Field(field) => Ok((
-                        field.name.value.clone(),
-                        lower_typed_sql_type(&field.data_type)?,
-                    )),
-                    _ => Err("STRUCT type requires named fields".to_string()),
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        )),
-        "decimal" | "dec" | "numeric" | "decimal32" | "decimal64" | "decimal128" => {
-            let (precision, scale) = lower_decimal_arguments(type_name)?;
-            Ok(SqlType::Decimal { precision, scale })
-        }
-        "tinyint" | "int8" => Ok(SqlType::TinyInt),
-        "smallint" | "int16" => Ok(SqlType::SmallInt),
-        "int" | "integer" | "int32" => Ok(SqlType::Int),
-        "bigint" | "int64" => Ok(SqlType::BigInt),
-        "largeint" | "int128" => Ok(SqlType::LargeInt),
-        "float" | "float32" => Ok(SqlType::Float),
-        "double" | "float64" | "double precision" => Ok(SqlType::Double),
-        "boolean" | "bool" => Ok(SqlType::Boolean),
-        "string" | "varchar" | "char" | "character" | "text" => Ok(SqlType::String),
-        "date" => Ok(SqlType::Date),
-        "datetime" | "timestamp" => Ok(SqlType::DateTime),
-        "timestamp_ns" | "timestamptz_ns" | "datetime_ns" => Ok(SqlType::DateTimeNs),
-        "time" => Ok(SqlType::Time),
-        "binary" | "varbinary" => Ok(SqlType::Binary),
-        "json" | "jsonb" => Ok(SqlType::Json),
-        "bitmap" => Ok(SqlType::Bitmap),
-        "hll" => Ok(SqlType::Hll),
-        "variant" => Ok(SqlType::Variant),
-        _ => Err(format!("unsupported Iceberg schema type `{name}`")),
-    }
-}
-
-fn lower_array_element_type(
-    type_name: &novarocks_parser::ast::TypeName,
-) -> Result<SqlType, String> {
-    use novarocks_parser::ast::TypeNameArgument;
-
-    let [TypeNameArgument::Type(element)] = type_name.arguments.as_slice() else {
-        return Err("ARRAY type requires one element type".to_string());
-    };
-    lower_typed_sql_type(element)
-}
-
-fn lower_map_types(
-    type_name: &novarocks_parser::ast::TypeName,
-) -> Result<(SqlType, SqlType), String> {
-    use novarocks_parser::ast::TypeNameArgument;
-
-    let [TypeNameArgument::Type(key), TypeNameArgument::Type(value)] =
-        type_name.arguments.as_slice()
-    else {
-        return Err("MAP type requires key and value types".to_string());
-    };
-    Ok((lower_typed_sql_type(key)?, lower_typed_sql_type(value)?))
-}
-
-fn lower_decimal_arguments(
-    type_name: &novarocks_parser::ast::TypeName,
-) -> Result<(u8, i8), String> {
-    use novarocks_parser::ast::{LiteralKind, TypeNameArgument};
-
-    if type_name.arguments.len() > 2 {
-        return Err("DECIMAL type accepts at most precision and scale".to_string());
-    }
-    let mut values = type_name.arguments.iter().map(|argument| match argument {
-        TypeNameArgument::Literal(literal) => match &literal.kind {
-            LiteralKind::Number(value) => Ok(value.as_str()),
-            _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
-        },
-        _ => Err("DECIMAL precision and scale must be numeric literals".to_string()),
-    });
-    let precision = match values.next() {
-        Some(value) => value?
-            .parse::<u8>()
-            .map_err(|_| "DECIMAL precision must fit u8".to_string())?,
-        None => 38,
-    };
-    let scale = match values.next() {
-        Some(value) => value?
-            .parse::<i8>()
-            .map_err(|_| "DECIMAL scale must fit i8".to_string())?,
-        None => 0,
-    };
-    Ok((precision, scale))
-}
-
 fn lower_typed_numeric_default(text: &str, data_type: &SqlType) -> Result<DefaultLiteral, String> {
     match data_type {
         SqlType::TinyInt | SqlType::SmallInt | SqlType::Int | SqlType::BigInt => {
@@ -1804,7 +1687,11 @@ mod force_drop_admission_tests {
         fn load_view(
             &self,
             _: ConnectorViewRequest,
-        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+            _: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorViewMetadataValue,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             panic!("unexpected view lookup")
         }
         fn list_views(
@@ -2644,7 +2531,11 @@ pub(crate) mod external_listing_tests {
         fn load_view(
             &self,
             _: ConnectorViewRequest,
-        ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+            _: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorViewMetadataValue,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             unreachable!("listing must not load a view")
         }
     }

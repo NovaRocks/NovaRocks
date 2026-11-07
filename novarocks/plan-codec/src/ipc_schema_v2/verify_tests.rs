@@ -85,6 +85,166 @@ fn verifier() -> VerifierOptions {
 fn verify(bytes: &[u8], expected: &Field, control: &Control) -> Result<(), TypeCodecError> {
     verify_single_field_schema_message(bytes, expected, envelope(), &verifier(), control)
 }
+fn verify_reader_requests(
+    bytes: &[u8],
+    expected: &Field,
+    control: &Control,
+    admit: &mut SchemaAdmit<'_>,
+) -> Result<(), TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = verify_single_field_schema_in(
+        bytes,
+        expected,
+        envelope(),
+        &verifier(),
+        1024 * 1024,
+        usize::MAX,
+        admit,
+        &mut work,
+    );
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+#[expect(
+    deprecated,
+    reason = "Explicit dictionary identity exercises the reader's encoding edges."
+)]
+fn reader_topologies() -> [(Field, usize); 4] {
+    [
+        (
+            Field::new(
+                "list",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            5,
+        ),
+        (
+            Field::new(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            5,
+        ),
+        (
+            Field::new_dict(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+                -7,
+                false,
+            ),
+            5,
+        ),
+        (
+            Field::new(
+                "four_children",
+                DataType::Struct(
+                    (0..4)
+                        .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::Int32, true)))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                true,
+            ),
+            13,
+        ),
+    ]
+}
+
+#[test]
+fn reader_requests_cover_actual_map_and_dictionary_type_edges() {
+    let frame = std::alloc::Layout::new::<novarocks_type_contract::TypeTraversalFrame<'_>>().size();
+    for (expected, capacities) in reader_topologies() {
+        let bytes = encode_single_field_schema(&expected, envelope(), &Control::good()).unwrap();
+        let maximum = capacities * frame;
+        let mut observed = Vec::new();
+        verify_reader_requests(&bytes, &expected, &Control::good(), &mut |facts| {
+            assert!(facts.request_bytes <= maximum);
+            observed.push(*facts);
+            Ok(())
+        })
+        .unwrap();
+        // The sole Vec starts at one, grows to four, then doubles. These
+        // capacities cover 2 List, 4 Map, 3 Dictionary and 5 Struct nodes;
+        // IPC field counts alone would miss the dictionary encoding edges.
+        assert_eq!(observed.last().unwrap().request_bytes, maximum);
+        assert_eq!(observed.first().unwrap().request_bytes, frame);
+        let mut refused = false;
+        assert!(matches!(
+            verify_reader_requests(&bytes, &expected, &Control::good(), &mut |facts| {
+                assert!(!refused, "parent callback after request refusal");
+                if facts.request_bytes >= maximum {
+                    refused = true;
+                    Err(CompileControlError::ResourceExhausted)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        assert!(refused);
+    }
+}
+
+#[test]
+fn reader_observed_topology_preserves_parent_and_checkpoint_refusals() {
+    let (expected, _) = reader_topologies().into_iter().nth(1).unwrap();
+    let bytes = encode_single_field_schema(&expected, envelope(), &Control::good()).unwrap();
+    let good = Control::good();
+    let mut admissions = Vec::new();
+    verify_reader_requests(&bytes, &expected, &good, &mut |facts| {
+        admissions.push(*facts);
+        Ok(())
+    })
+    .unwrap();
+    for at in 0..admissions.len() {
+        for cause in CAUSES {
+            let mut seen = Vec::new();
+            let result =
+                verify_reader_requests(&bytes, &expected, &Control::good(), &mut |facts| {
+                    assert!(seen.len() <= at, "parent callback after primary refusal");
+                    seen.push(*facts);
+                    if seen.len() == at + 1 {
+                        Err(cause.clone())
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(matches!(result, Err(TypeCodecError::Control(actual)) if actual == cause));
+            assert_eq!(seen, admissions[..=at]);
+        }
+    }
+    let baseline = good.trace();
+    for at in 0..baseline.len() {
+        for cause in CAUSES {
+            let control = Control::refusing(at, cause.clone());
+            let result = verify_reader_requests(&bytes, &expected, &control, &mut |_| Ok(()));
+            assert!(matches!(result, Err(TypeCodecError::Control(actual)) if actual == cause));
+            assert_eq!(control.trace(), baseline[..=at]);
+        }
+    }
+}
 fn assert_rejection(bytes: &[u8], expected: &Field) {
     let control = Control::good();
     let error = verify(bytes, expected, &control).unwrap_err();

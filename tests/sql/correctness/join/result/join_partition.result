@@ -1,14 +1,14 @@
 -- query 5
 -- types	bigint	bigint	bigint	bigint
-count(l1)	count(l2)	count(l3)	count(l4)
+_col0	_col1	_col2	_col3
 100000	100000	100000	100000
 
 -- query 7
 -- types	bigint	bigint	bigint	bigint
-count(l1)	count(l2)	count(l3)	count(l4)
+_col0	_col1	_col2	_col3
 100000	100000	100000	100000
 
 -- query 8
 -- types	bigint	bigint	bigint	bigint
-count(l1)	count(l2)	count(l3)	count(l4)
+_col0	_col1	_col2	_col3
 100000	100000	100000	100000

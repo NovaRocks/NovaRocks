@@ -1,6 +1,6 @@
 -- query 4
 -- legacy
-array_filter(arr_0, arr_2)
+_col0
 [2]
 [1,2]
 []
@@ -9,7 +9,7 @@ array_filter(arr_0, arr_2)
 
 -- query 5
 -- legacy
-array_filter(arr_1, arr_2)
+_col0
 [2]
 NULL
 []
@@ -18,7 +18,7 @@ NULL
 
 -- query 6
 -- legacy
-array_filter(arr_0, [0, 0, 0, 1])
+_col0
 []
 []
 []
@@ -27,7 +27,7 @@ array_filter(arr_0, [0, 0, 0, 1])
 
 -- query 7
 -- legacy
-array_filter(arr_0, [1, 0, 1])
+_col0
 [1]
 [1]
 [1]
@@ -36,7 +36,7 @@ array_filter(arr_0, [1, 0, 1])
 
 -- query 8
 -- legacy
-array_filter(arr_0, NULL)
+_col0
 []
 []
 []
@@ -45,7 +45,7 @@ array_filter(arr_0, NULL)
 
 -- query 9
 -- legacy
-array_filter(arr_1, NULL)
+_col0
 []
 NULL
 []
@@ -54,7 +54,7 @@ NULL
 
 -- query 10
 -- legacy
-array_filter([1, 2, 3, 4], arr_2)
+_col0
 [2]
 [1,2]
 []
@@ -63,7 +63,7 @@ array_filter([1, 2, 3, 4], arr_2)
 
 -- query 11
 -- legacy
-array_filter(NULL, arr_2)
+_col0
 NULL
 NULL
 NULL
@@ -72,7 +72,7 @@ NULL
 
 -- query 12
 -- legacy
-array_filter([1, 2, 3, 4], [0, 0, 1, 1])
+_col0
 [3,4]
 [3,4]
 [3,4]
@@ -81,7 +81,7 @@ array_filter([1, 2, 3, 4], [0, 0, 1, 1])
 
 -- query 13
 -- legacy
-array_filter(NULL, NULL)
+_col0
 NULL
 NULL
 NULL
@@ -90,7 +90,7 @@ NULL
 
 -- query 14
 -- legacy
-array_filter([1, 2, 3, 4], NULL)
+_col0
 []
 []
 []
@@ -99,7 +99,7 @@ array_filter([1, 2, 3, 4], NULL)
 
 -- query 15
 -- legacy
-array_filter(NULL, [1, 0, 1, NULL])
+_col0
 NULL
 NULL
 NULL

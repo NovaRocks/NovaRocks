@@ -1,9 +1,9 @@
 -- query 4
 -- types	bigint
-count(DISTINCT tinyint_col_1)
+_col0
 4
 
 -- query 5
 -- types	bigint
-count(DISTINCT tinyint_col_2)
+_col0
 4

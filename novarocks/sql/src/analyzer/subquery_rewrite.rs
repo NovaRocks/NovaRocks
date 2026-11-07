@@ -33,6 +33,7 @@ use novarocks_parser::ast;
 use novarocks_parser::printer;
 
 use crate::analysis::*;
+use crate::analysis::{AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem};
 use crate::analyze_error::AnalyzeError;
 
 use super::AnalyzerContext;
@@ -108,6 +109,7 @@ fn value_form_marker_query(
 ) -> ResolvedQuery {
     let marker_dtype = DataType::Int32;
     let marker_output = OutputColumn {
+        field_name: Some(marker_col_name.clone()),
         column_id: marker_col_id,
         name: marker_col_name.clone(),
         value_type: novarocks_type_contract::FunctionValueType::new(marker_dtype.clone(), true),
@@ -126,6 +128,7 @@ fn value_form_marker_query(
             group_by: Vec::new(),
             having: None,
             projection: vec![ProjectItem {
+                field_name: Some(marker_col_name.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "max".to_string(),
@@ -318,7 +321,7 @@ impl<'a> AnalyzerContext<'a> {
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
     ) -> Result<bool, AnalyzeError> {
-        use crate::analysis::{ApplyScalarSpec, OutputColumn};
+        use crate::analysis::ApplyScalarSpec;
 
         // 1. Determine which clause the placeholder lives in.
         let clause = match locate_scalar_placeholder_clause(select, sq_info.id) {
@@ -362,6 +365,7 @@ impl<'a> AnalyzerContext<'a> {
             super::helpers::with_nullability(inner_out.value_type.clone(), true),
         );
         let output_column = OutputColumn {
+            field_name: Some(output_name.clone()),
             column_id: output_id,
             name: output_name.clone(),
             value_type: (inner_out.value_type.clone())
@@ -416,7 +420,7 @@ impl<'a> AnalyzerContext<'a> {
         scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
     ) -> Result<bool, AnalyzeError> {
-        use crate::analysis::{ApplyClause, ApplyPredicateSpec, OutputColumn};
+        use crate::analysis::{ApplyClause, ApplyPredicateSpec};
 
         let top_level_where_conjunct = select
             .filter
@@ -525,6 +529,7 @@ impl<'a> AnalyzerContext<'a> {
             novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let output_column = OutputColumn {
+            field_name: Some(output_name.clone()),
             column_id: output_id,
             name: output_name,
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
@@ -632,6 +637,7 @@ impl<'a> AnalyzerContext<'a> {
             query: Box::new(marker_query),
             alias: relation_alias,
             output_columns: vec![OutputColumn {
+                field_name: Some(marker_col_name.clone()),
                 column_id: marker_col_id,
                 name: marker_col_name,
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
@@ -1115,6 +1121,7 @@ impl<'a> AnalyzerContext<'a> {
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
+                field_name: Some(match_col.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1127,6 +1134,7 @@ impl<'a> AnalyzerContext<'a> {
             });
         }
         modified_sub.output_columns.push(OutputColumn {
+            field_name: Some(match_col.clone()),
             column_id: match_col_id,
             name: match_col.clone(),
             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1296,6 +1304,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.distinct = false;
             sel.projection.clear();
             sel.projection.push(ProjectItem {
+                field_name: Some(match_col.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1309,6 +1318,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.has_aggregation = false;
         }
         modified_sub.output_columns = vec![OutputColumn {
+            field_name: Some(match_col.clone()),
             column_id: exists_col_id,
             name: match_col.clone(),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -1714,6 +1724,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.distinct = false;
             sel.projection.clear();
             sel.projection.push(ProjectItem {
+                field_name: Some(match_col.clone()),
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1727,6 +1738,7 @@ impl<'a> AnalyzerContext<'a> {
             sel.has_aggregation = false;
         }
         resolved_sub.output_columns = vec![OutputColumn {
+            field_name: Some(match_col.clone()),
             column_id: exists_col_id,
             name: match_col.clone(),
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -1739,6 +1751,7 @@ impl<'a> AnalyzerContext<'a> {
             query: Box::new(resolved_sub),
             alias: sq_alias.clone(),
             output_columns: vec![OutputColumn {
+                field_name: Some(match_col.clone()),
                 column_id: exists_col_id,
                 name: match_col.clone(),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
@@ -1978,7 +1991,13 @@ impl<'a> AnalyzerContext<'a> {
                 mark_key_bindings,
                 subquery_id: sq_info.id,
                 clause,
-                output_column: output,
+                output_column: crate::analysis::AnalyzedOutputField {
+                    column_id: output.column_id,
+                    field_name: Some(output.name.clone()),
+                    name: output.name,
+                    value_type: output.value_type,
+                    is_internal: true,
+                },
                 inner: resolved_sub,
                 correlation_column_ids: Vec::new(),
                 need_check_max_rows: false,
@@ -2225,6 +2244,7 @@ impl<'a> AnalyzerContext<'a> {
                 sel.distinct = true;
             }
             modified_sub.output_columns.push(OutputColumn {
+                field_name: Some(match_col_name.clone()),
                 column_id: in_match_col_id,
                 name: match_col_name.clone(),
                 value_type: (sub_output_col.value_type.clone())
@@ -2235,6 +2255,7 @@ impl<'a> AnalyzerContext<'a> {
             });
             if let QueryBody::Select(ref mut sel) = modified_sub.body {
                 sel.projection.push(ProjectItem {
+                    field_name: Some(match_col_name.clone()),
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
                             column_id: sub_output_col.column_id,
@@ -2447,6 +2468,7 @@ impl<'a> AnalyzerContext<'a> {
             super::helpers::with_nullability(result.clone(), true),
         );
         let collection_output = OutputColumn {
+            field_name: Some(name.clone()),
             column_id,
             name: name.clone(),
             value_type: (result.clone())
@@ -2589,6 +2611,7 @@ impl<'a> AnalyzerContext<'a> {
                 group_by: vec![],
                 having: None,
                 projection: vec![ProjectItem {
+                    field_name: Some(name.clone()),
                     expr: TypedExpr {
                         kind: ExprKind::AggregateCall {
                             name: "array_agg".to_string(),
@@ -2991,6 +3014,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            grouping_scope: std::cell::RefCell::new(None),
             materialized_values: self.materialized_values,
             control: self.control,
             constant_policy: self.constant_policy,
@@ -2999,6 +3023,7 @@ impl<'a> AnalyzerContext<'a> {
             function_catalog: self.function_catalog,
             sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
+            view_stack: self.view_stack.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
@@ -3057,13 +3082,20 @@ impl<'a> AnalyzerContext<'a> {
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         let body = query.body.as_ref();
-        let result = match body {
+        let select = match body {
+            ast::SetExpr::Select(select) => Some(select.as_ref()),
+            _ => None,
+        };
+        let result = ctx.with_grouping_scope(select, |ctx| match body {
             ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
                 let body = QueryBody::Select(sel);
 
                 let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                if let QueryBody::Select(select) = &body {
+                    ctx.validate_grouping_calls(&select.group_by)?;
+                }
                 let limit = super::helpers::extract_limit(query)?;
                 let offset = super::helpers::extract_offset(query)?;
 
@@ -3097,7 +3129,7 @@ impl<'a> AnalyzerContext<'a> {
                     self.new_scope(),
                 ))
             }
-        };
+        });
 
         if let Some(child_ctx) = maybe_child_ctx {
             self.absorb_semantic_scope(&child_ctx);
@@ -3168,6 +3200,10 @@ impl<'a> AnalyzerContext<'a> {
             None => None,
         };
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            *state.from_scope.borrow_mut() = Some(merged_scope.clone());
+            state.enabled.set(true);
+        }
         // --- SELECT list ---
         // Use inner_scope for wildcard expansion (SELECT * should only produce
         // the subquery's own columns, not outer scope columns) but use
@@ -3184,6 +3220,9 @@ impl<'a> AnalyzerContext<'a> {
                 qualify_inner_shadowing_column_refs(item.expr.clone(), &inner_scope, outer_scope);
         }
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(false);
+        }
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
             ast::GroupBy::None => Vec::new(),
@@ -3232,6 +3271,9 @@ impl<'a> AnalyzerContext<'a> {
         let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
         let has_aggregation = !group_by.is_empty() || has_agg_in_select;
 
+        if let Some(state) = self.grouping_scope.borrow().as_ref() {
+            state.enabled.set(true);
+        }
         // --- HAVING ---
         let having = match &select.having {
             Some(expr) => {
@@ -3265,6 +3307,8 @@ impl<'a> AnalyzerContext<'a> {
             }
             None => None,
         };
+
+        self.validate_grouping_calls(&group_by)?;
 
         let distinct = matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. });
 
@@ -3326,6 +3370,7 @@ impl<'a> AnalyzerContext<'a> {
                 _ => self.alloc_column_id(None, col_name.clone(), inner_col.value_type.clone()),
             };
             extra_output.push(OutputColumn {
+                field_name: Some(col_name.clone()),
                 column_id: corr_col_id,
                 name: col_name.clone(),
                 value_type: inner_col.value_type.clone(),
@@ -3333,6 +3378,7 @@ impl<'a> AnalyzerContext<'a> {
                 is_internal: false,
             });
             extra_projection.push(ProjectItem {
+                field_name: Some(col_name.clone()),
                 expr: inner_col.clone(),
                 output_name: col_name.clone(),
                 output_column_id: corr_col_id,
@@ -4593,6 +4639,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
                 value_type: scope.factory().borrow().value_type(col_id)?.clone(),
@@ -4604,6 +4651,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
                 value_type: scope.factory().borrow().value_type(col_id)?.clone(),
@@ -4615,6 +4663,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
             let col_def = s.table.columns.first()?;
             let col_id = s.column_ids.first().copied()?;
             Some(OutputColumn {
+                field_name: Some(col_def.name.clone()),
                 column_id: col_id,
                 name: col_def.name.clone(),
                 value_type: scope.factory().borrow().value_type(col_id)?.clone(),
@@ -4628,6 +4677,7 @@ fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option
                 None
             } else {
                 Some(OutputColumn {
+                    field_name: Some(g.column_name.clone()),
                     column_id: g.output_column_id,
                     name: g.column_name.clone(),
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -6028,6 +6078,7 @@ mod tests {
                 group_by: Vec::new(),
                 having: None,
                 projection: vec![ProjectItem {
+                    field_name: Some("x".to_string()),
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
                         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -6048,6 +6099,7 @@ mod tests {
             limit: None,
             offset: None,
             output_columns: vec![OutputColumn {
+                field_name: Some("x".to_string()),
                 column_id: crate::column_id::ColumnId(1),
                 name: "x".to_string(),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),

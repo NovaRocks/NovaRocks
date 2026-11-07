@@ -1,59 +1,59 @@
 -- query 7
 -- types	bigint
-count(*)
+_col0
 65
 
 -- query 8
 -- types	bigint
-count(*)
+_col0
 62
 
 -- query 9
 -- types	bigint
-count(*)
+_col0
 63
 
 -- query 10
 -- types	bigint
-count(*)
+_col0
 54
 
 -- query 11
 -- types	bigint
-count(*)
+_col0
 81
 
 -- query 12
 -- types	bigint
-count(*)
+_col0
 62
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 54
 
 -- query 14
 -- types	bigint
-count(*)
+_col0
 63
 
 -- query 15
 -- types	bigint
-count(*)
+_col0
 63
 
 -- query 16
 -- types	bigint
-count(*)
+_col0
 24
 
 -- query 17
 -- types	bigint
-count(*)
+_col0
 81
 
 -- query 18
 -- types	bigint
-count(*)
+_col0
 33

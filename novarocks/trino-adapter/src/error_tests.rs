@@ -37,6 +37,8 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("PERMISSION_DENIED", 4, "USER_ERROR"),
     ("NOT_FOUND", 5, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
+    ("DIVISION_BY_ZERO", 8, "USER_ERROR"),
+    ("INVALID_VIEW", 11, "USER_ERROR"),
     ("ALREADY_EXISTS", 12, "USER_ERROR"),
     ("NOT_SUPPORTED", 13, "USER_ERROR"),
     ("INVALID_SESSION_PROPERTY", 14, "USER_ERROR"),
@@ -48,10 +50,17 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
     ("COLUMN_NOT_FOUND", 47, "USER_ERROR"),
     ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
+    ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
+    ("MISSING_COLUMN_NAME", 55, "USER_ERROR"),
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
+    ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
+    ("TOO_MANY_ARGUMENTS", 77, "USER_ERROR"),
+    ("VIEW_IS_STALE", 81, "USER_ERROR"),
+    ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
+    ("MERGE_TARGET_ROW_MULTIPLE_MATCHES", 119, "USER_ERROR"),
     ("GENERIC_INTERNAL_ERROR", 65536, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_ERROR", 65539, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_TIMEOUT", 65540, "INTERNAL_ERROR"),
@@ -107,10 +116,21 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
+        "sql.analyze.missing_column_name" => "MISSING_COLUMN_NAME",
+        "sql.analyze.duplicate_column_name" => "DUPLICATE_COLUMN_NAME",
+        "sql.analyze.mismatched_column_aliases" => "MISMATCHED_COLUMN_ALIASES",
+        "sql.analyze.invalid_view" => "INVALID_VIEW",
+        "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
+        "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
+        "query.execution.merge_target_row_multiple_matches"
+        | "query.execution.update_target_row_multiple_matches" => {
+            "MERGE_TARGET_ROW_MULTIPLE_MATCHES"
+        }
         "sql.parse.unsupported_statement"
         | "sql.analyze.unsupported_expression"
         | "sql.analyze.unsupported_query_shape"
@@ -135,6 +155,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         | "query.execution.control"
         | "query.execution.commit_unknown" => "GENERIC_INTERNAL_ERROR",
         "query.execution.numeric_out_of_range" => "NUMERIC_VALUE_OUT_OF_RANGE",
+        "query.execution.division_by_zero" => "DIVISION_BY_ZERO",
         "query.execution.cancelled" => "USER_CANCELED",
         "query.execution.deadline_exceeded" => "EXCEEDED_TIME_LIMIT",
         "query.execution.resource_exhausted" | "query.execution.representation" => {
@@ -144,6 +165,59 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         _ => {
             panic!("new descriptor {code} requires an explicit Trino mapping and expected contract")
         }
+    }
+}
+
+#[test]
+fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
+    use novarocks_parser::Span;
+    use novarocks_sql::analyze_error::AnalyzeError;
+
+    let sql = "SELECT 1";
+    let span = Span::new(0, 6);
+    let detail = "arbitrary domain detail";
+    for (analysis, name) in [
+        (
+            AnalyzeError::missing_column_name(detail, span),
+            "MISSING_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::duplicate_column_name(detail, span),
+            "DUPLICATE_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::mismatched_column_aliases(detail, span),
+            "MISMATCHED_COLUMN_ALIASES",
+        ),
+        (AnalyzeError::invalid_view(detail, span), "INVALID_VIEW"),
+        (AnalyzeError::view_is_stale(detail, span), "VIEW_IS_STALE"),
+        (
+            AnalyzeError::view_is_recursive(detail, span),
+            "VIEW_IS_RECURSIVE",
+        ),
+        (
+            AnalyzeError::too_many_arguments(detail, span),
+            "TOO_MANY_ARGUMENTS",
+        ),
+    ] {
+        let service = QueryServiceError::from_user_error(analysis.to_user_error(Some(sql)));
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        });
+        assert_wire(&wire, name);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["errorName"], name);
+        assert_eq!(json["errorCode"], wire.error_code);
+        assert_eq!(json["errorType"], "USER_ERROR");
+        assert_eq!(
+            json["errorLocation"],
+            serde_json::json!({"lineNumber": 1, "columnNumber": 1})
+        );
+        assert_eq!(
+            wire.message,
+            format!("[{}] {detail} at line 1 column 1", analysis.code())
+        );
     }
 }
 
@@ -180,10 +254,18 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
             descriptor.code
         );
         assert_wire(&wire, expected_descriptor_name(descriptor.code.as_str()));
-        assert_eq!(
-            wire.message,
-            format!("[{}] original domain detail", descriptor.code)
-        );
+        // Trino standard row-match errors deliberately use the standard text
+        // without a NovaRocks descriptor prefix or publication suffix.
+        let expected = match descriptor.code.as_str() {
+            "query.execution.merge_target_row_multiple_matches" => {
+                "One MERGE target table row matched more than one source row".to_owned()
+            }
+            "query.execution.update_target_row_multiple_matches" => {
+                "One UPDATE target table row matched more than one source row".to_owned()
+            }
+            _ => format!("[{}] original domain detail", descriptor.code),
+        };
+        assert_eq!(wire.message, expected);
     }
 }
 
@@ -446,6 +528,38 @@ fn already_exists_requires_the_original_connector_data_fact() {
             wire
         );
         assert_eq!(service.execution_failure(), Some(&input));
+    }
+}
+
+#[test]
+fn integer_data_reasons_survive_execution_and_service_projection() {
+    use novarocks_execution_contract::failure::{FailureReason, domain};
+    use std::num::NonZeroU16;
+
+    // Stable function facts, independently paired with the Trino 483 oracle.
+    for (reason, expected) in [(41, "NUMERIC_VALUE_OUT_OF_RANGE"), (43, "DIVISION_BY_ZERO")] {
+        let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::KERNEL, NonZeroU16::new(reason).unwrap()),
+            ),
+            SafeDetail::truncating("unrelated safe detail"),
+            ExecutionFailureSite::Coordinator,
+        ));
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &error,
+            sql: "SELECT 1 / 0",
+        });
+        assert_wire(&wire, expected);
+        let service =
+            QueryServiceError::from_execution_failure(error.execution_failure().unwrap().clone());
+        assert_eq!(
+            wire,
+            query_error(TrinoErrorSource::Service {
+                error: &service,
+                sql: "SELECT 1 / 0"
+            })
+        );
     }
 }
 
@@ -845,5 +959,74 @@ fn originating_connector_mutation_cause_reaches_the_service_mapping_with_its_eff
         );
         assert!(mapped.message.contains(message));
         assert!(!mapped.message.contains("do_not_retry=true"));
+    }
+}
+
+#[test]
+fn declared_row_match_identity_controls_standard_error_without_reclassifying_other_assertions() {
+    use novarocks_failure_contract::{execution_reason, sql_reason};
+    for (reason, message) in [
+        (
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One MERGE target table row matched more than one source row",
+        ),
+        (
+            sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One UPDATE target table row matched more than one source row",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(FailureClass::Data, reason),
+            SafeDetail::truncating("keyed assertion (reason 7:317): private physical key detail"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryServiceError::from_execution_failure(input.clone())
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+        assert!(wire.sql_state.is_none());
+        assert!(wire.error_location.is_none());
+        assert_eq!(error.execution_failure(), Some(&input));
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        let execution = QueryExecutionError::from_execution(input);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &execution,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+    }
+    for (class, reason, name) in [
+        (
+            FailureClass::Data,
+            execution_reason::ASSERT_ROWS_DUPLICATE_KEY,
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Invariant,
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(class, reason),
+            SafeDetail::truncating("One MERGE target table row matched more than one source row"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryExecutionError::from_execution(input);
+        assert_wire(
+            &query_error(TrinoErrorSource::Execution {
+                error: &error,
+                sql: "MERGE",
+            }),
+            name,
+        );
     }
 }

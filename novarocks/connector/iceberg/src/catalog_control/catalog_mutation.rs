@@ -2256,7 +2256,6 @@ fn execute_view_publication(
                 let seed = receipt(provider, request.operation_id, request.operation.kind())?;
                 let publication = match &request.operation {
                     ConnectorCatalogMutationOperation::CreateView {
-                        columns,
                         definition,
                         comment,
                         properties,
@@ -2278,12 +2277,11 @@ fn execute_view_publication(
                             }
                         }
                         let (definition, properties) = super::views::prepare_definition(
-                            columns,
                             definition,
                             comment.as_deref(),
                             &view_properties(properties)?,
-                        )
-                        .map_err(invalid)?;
+                            &request.context,
+                        )?;
                         if exists {
                             let current = super::views::load_view_metadata_for_request(
                                 provider.runtime(),
@@ -3792,13 +3790,12 @@ mod tests {
             operations.push((
                 ConnectorCatalogMutationOperation::CreateView {
                     view: view.clone(),
-                    columns: Vec::new(),
                     definition: ConnectorViewDefinition {
                         dialect: ConnectorViewDialect::StarRocks,
                         raw_sql: "SELECT 1".into(),
                         default_catalog: None,
                         default_namespace: table.namespace.clone(),
-                        source_format: None,
+                        columns: Vec::new().into(),
                     },
                     comment: None,
                     properties: Vec::new(),
@@ -4430,15 +4427,30 @@ mod tests {
                     policy: DropPolicy::FailIfMissing,
                 }
             } else {
-                ConnectorCatalogMutationOperation::CreateView { view,
-                columns: vec![ConnectorColumnDefinition { name: "a".into(), data_type: ConnectorDataType::Int, nullable: true, aggregation: None, default: None }],
-                definition: novarocks_spi::connector::ConnectorViewDefinition {
-                    dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
-                    raw_sql: "select 1 as a".into(), default_catalog: Some("source".into()), default_namespace: "source_db".into(),
-                    source_format: Some(novarocks_spi::connector::ConnectorViewSourceFormat::EffectiveUserSourceV1),
-                }, comment: None, properties: vec![],
-                policy: if mode == "replace" { CreateOrReplacePolicy::ReplaceIfExists } else { CreateOrReplacePolicy::FailIfExists },
-            }
+                ConnectorCatalogMutationOperation::CreateView {
+                    view,
+                    definition: novarocks_spi::connector::ConnectorViewDefinition {
+                        dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
+                        raw_sql: "select 1 as a".into(),
+                        default_catalog: Some("source".into()),
+                        default_namespace: "source_db".into(),
+                        columns: vec![novarocks_spi::connector::ConnectorViewColumn {
+                            name: "a".into(),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                arrow::datatypes::DataType::Int32,
+                                true,
+                            ),
+                        }]
+                        .into(),
+                    },
+                    comment: None,
+                    properties: vec![],
+                    policy: if mode == "replace" {
+                        CreateOrReplacePolicy::ReplaceIfExists
+                    } else {
+                        CreateOrReplacePolicy::FailIfExists
+                    },
+                }
             },
             context: context(),
         }
@@ -4453,6 +4465,60 @@ mod tests {
             "version-log":[{"version-id":1, "timestamp-ms":1600000000000_i64}],
             "schemas":[{"type":"struct", "schema-id":0, "fields":[{"id":1, "name":"a", "required":false, "type":"int"}]}], "properties":{}
         }})
+    }
+
+    #[test]
+    fn unsupported_view_types_are_typed_and_never_dispatch_create_or_replace() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for mode in ["create", "replace"] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if mode == "create" { 404 } else { 200 }),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &complete_view_response()),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(&provider, mode);
+            let ConnectorCatalogMutationOperation::CreateView { definition, .. } =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            definition.raw_sql = "SELECT CAST(1 AS tinyint) AS a".into();
+            definition.columns = vec![novarocks_spi::connector::ConnectorViewColumn {
+                name: "a".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int8,
+                    false,
+                ),
+            }]
+            .into();
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } =
+                provider.execute(request).unwrap()
+            else {
+                panic!("unsupported view declaration must fail before publication")
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.method != "POST")
+            );
+        }
     }
 
     #[test]
@@ -4872,7 +4938,9 @@ mod tests {
                         let error = if action == "exists" {
                             novarocks_spi::connector::ConnectorViewMetadata::view_exists(&provider, request).unwrap_err()
                         } else {
-                            novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request).unwrap_err()
+                            crate::metadata::with_pure_schema_creation(&request.context.clone(), |creation|
+                                novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request, creation)
+                                    .map_err(crate::metadata::metadata_creation_error)).unwrap_err()
                         };
                         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
                     }

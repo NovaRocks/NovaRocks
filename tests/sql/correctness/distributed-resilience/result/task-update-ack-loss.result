@@ -30,5 +30,5 @@ total
 
 -- query 13
 -- types	bigint
-count(*)
+_col0
 9

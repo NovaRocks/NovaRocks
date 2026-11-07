@@ -69,7 +69,6 @@ pub struct IcebergStorageTargetObservation {
     pub table_uuid: String,
     pub schema_id: i32,
     pub format_v3: bool,
-    pub explicit_row_lineage_enabled: bool,
     pub fields: Vec<IcebergStorageTargetField>,
     pub partition: IcebergStoragePartitionContract,
 }
@@ -90,7 +89,8 @@ pub struct IcebergStorageSourceSchemaObservation {
     pub object_id: ConnectorTableObjectId,
     pub schema_version: Bytes,
     pub format_v3: bool,
-    pub stored_row_lineage_enabled: bool,
+    pub selected_snapshot_id: Option<i64>,
+    pub selected_snapshot_has_row_range: bool,
     pub fields: Vec<IcebergStorageSourceField>,
 }
 
@@ -109,7 +109,6 @@ pub struct IcebergStorageExactSchemaObservation {
     pub schema_version: Bytes,
     pub partition_spec_version: Bytes,
     pub format_v3: bool,
-    pub explicit_row_lineage_enabled: bool,
     pub fields: Vec<(u32, IcebergStorageSourceField)>,
     pub partition_fields: Vec<MvExactPartitionField>,
 }
@@ -576,10 +575,6 @@ fn target_observation(
         table_uuid,
         schema_id: table.current_schema_id(),
         format_v3: matches!(table.format_version(), FormatVersion::V3),
-        explicit_row_lineage_enabled: table
-            .properties()
-            .get("write.row-lineage")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
         fields,
         partition: IcebergStoragePartitionContract {
             target_spec_id: spec.spec_id(),
@@ -609,7 +604,10 @@ fn create_source_observation(
         object_id,
         schema_version,
         format_v3: target.format_v3,
-        stored_row_lineage_enabled: target.explicit_row_lineage_enabled,
+        selected_snapshot_id: table.current_snapshot_id(),
+        selected_snapshot_has_row_range: table
+            .current_snapshot()
+            .is_some_and(|snapshot| snapshot.row_range().is_some()),
         fields,
     })
 }
@@ -659,7 +657,7 @@ pub(crate) fn source_schema_observation(
         TableMetadataProjection::Current => return create_source_observation(table, context),
         TableMetadataProjection::SnapshotTo(snapshot) => {
             let schema = frozen_snapshot_schema(table, snapshot, table.current_schema_id())?;
-            selected_source_schema_observation(table, &schema, admitted, context)?
+            selected_source_schema_observation(table, &schema, snapshot, admitted, context)?
         }
     };
     if admitted.version.as_ref() != Some(&observed.schema_version) {
@@ -673,6 +671,7 @@ pub(crate) fn source_schema_observation(
 fn selected_source_schema_observation(
     table: &TableMetadata,
     schema: &crate::iceberg::spec::Schema,
+    selected_snapshot_id: i64,
     admitted: &ConnectorTableMetadata,
     context: &ConnectorRequestContext,
 ) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
@@ -746,10 +745,12 @@ fn selected_source_schema_observation(
         object_id: iceberg_object_id_from_uuid(uuid)?,
         schema_version: exact_schema_version(schema.schema_id()),
         format_v3: matches!(table.format_version(), FormatVersion::V3),
-        stored_row_lineage_enabled: table
-            .properties()
-            .get("write.row-lineage")
-            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        selected_snapshot_id: Some(selected_snapshot_id),
+        selected_snapshot_has_row_range: table
+            .snapshot_by_id(selected_snapshot_id)
+            .ok_or_else(|| corrupt("selected MV source snapshot is absent"))?
+            .row_range()
+            .is_some(),
         fields,
     })
 }
@@ -813,7 +814,6 @@ fn exact_schema_observation(
         schema_version,
         partition_spec_version,
         format_v3: target.format_v3,
-        explicit_row_lineage_enabled: target.explicit_row_lineage_enabled,
         fields,
         partition_fields,
     })
@@ -1082,7 +1082,6 @@ mod tests {
         assert!(observed.fields[1].nullable);
         assert!(observed.partition.fields.is_empty());
         assert!(!observed.format_v3);
-        assert!(!observed.explicit_row_lineage_enabled);
     }
 
     #[test]
@@ -1213,24 +1212,36 @@ mod tests {
     }
 
     #[test]
-    fn schema_validation_projection_requires_explicit_row_lineage_property() {
-        let implicit = target_observation(
-            &metadata_with_format(FormatVersion::V3, HashMap::new()),
-            &context(4096),
-        )
-        .expect("implicit row lineage observation");
-        assert!(implicit.format_v3);
-        assert!(!implicit.explicit_row_lineage_enabled);
+    fn target_format_is_independent_of_row_lineage_property() {
+        for properties in [
+            HashMap::new(),
+            HashMap::from([("write.row-lineage".to_string(), "false".to_string())]),
+        ] {
+            let observed = target_observation(
+                &metadata_with_format(FormatVersion::V3, properties),
+                &context(4096),
+            )
+            .expect("v3 target observation");
+            assert!(observed.format_v3);
+        }
+    }
 
-        let explicit = target_observation(
-            &metadata_with_format(
-                FormatVersion::V3,
-                HashMap::from([("write.row-lineage".to_string(), "TRUE".to_string())]),
-            ),
-            &context(4096),
+    #[test]
+    fn upgraded_source_retains_the_pre_v3_snapshot_without_a_row_range() {
+        let table = maintenance_metadata(
+            vec![SnapshotFixture::new(11, 1_700_000_001_000).on_main()],
+            HashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
         )
-        .expect("explicit row lineage observation");
-        assert!(explicit.explicit_row_lineage_enabled);
+        .into_builder(None)
+        .upgrade_format_version(FormatVersion::V3)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let observation = create_source_observation(&table, &context(4096)).unwrap();
+        assert!(observation.format_v3);
+        assert_eq!(observation.selected_snapshot_id, Some(11));
+        assert!(!observation.selected_snapshot_has_row_range);
     }
 
     #[test]

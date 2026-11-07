@@ -38,7 +38,7 @@ pub(super) fn expr_column_id(
 
 pub(super) fn prepare_repeat_input(
     current: &mut LogicalPlanNode,
-    select: &mut ResolvedSelect,
+    select: &mut super::select::PlanningSelect,
     repeat_info: &mut crate::analysis::RepeatInfo,
     repeat_group_qualifier: &str,
     factory: &mut ColumnRefFactory,

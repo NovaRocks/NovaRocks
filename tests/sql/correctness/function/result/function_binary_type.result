@@ -1,17 +1,17 @@
 -- query 3
 -- types	varchar	varchar	varchar	varchar
-hex(c1)	hex(c2)	hex(c3)	hex(c4)
+_col0	_col1	_col2	_col3
 AB01	ABAB	ABAC	61623031
 
 -- query 5
 -- types	varchar	varchar	varchar	varchar
-hex(c1)	hex(c2)	hex(c3)	hex(c4)
+_col0	_col1	_col2	_col3
 AB01	ABAB	ABAC	61623031
 AB01	ABAB	ABAC	61623031
 
 -- query 8
 -- types	varchar	varchar	varchar	varchar
-hex(c1)	hex(c2)	hex(c3)	hex(c4)
+_col0	_col1	_col2	_col3
 AB01	ABAB	ABAC	61623031
 AB01	ABAB	ABAC	61623031
 

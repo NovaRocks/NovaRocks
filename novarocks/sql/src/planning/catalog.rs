@@ -40,7 +40,8 @@ use novarocks_types::schema::{CatalogTable, ColumnDef};
 pub use crate::analyzer::iceberg_metadata::{MetadataColumn, metadata_table_schema};
 pub use crate::catalog::memory::PlannerMemoryCatalog;
 pub use crate::catalog::{
-    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
+    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, SqlInlineColumn,
+    SqlInlineRelation, SqlViewColumn, SqlViewDefinition, TableLookupMode,
 };
 /// SQL metadata-relation vocabulary needed by application catalog admission.
 /// This is a value-only DTO; it carries neither a table definition nor a
@@ -220,20 +221,32 @@ impl SqlTimeTravelReferenceMetadataFacts {
     }
 }
 
+pub use crate::analyzer::iceberg_ref::{SqlTimeTravelSelection, parse_time_travel_selection};
+
 /// Sealed result of resolving one parsed time-travel clause against validated
 /// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
 /// needed for query-local rewrite; ref metadata remains internal.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlTimeTravelSnapshotBindingFacts {
     snapshot_id: i64,
+    selection: SqlTimeTravelSelection,
+    relation_fqn: Box<str>,
 }
 
 impl SqlTimeTravelSnapshotBindingFacts {
+    pub fn relation_fqn(&self) -> &str {
+        &self.relation_fqn
+    }
+    pub const fn selection(&self) -> &SqlTimeTravelSelection {
+        &self.selection
+    }
+
     pub const fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
 }
 
-/// Resolve a parsed `FOR VERSION/TIMESTAMP AS OF` clause from copied,
+/// Resolve a parsed `FOR VERSION/SYSTEM_TIME AS OF` clause from copied,
 /// validated snapshot-reference facts.  Unknown requested snapshots and refs
 /// fail closed in SQL before Core creates a synthetic table identity.
 pub fn resolve_time_travel_snapshot_binding(
@@ -249,6 +262,8 @@ pub fn resolve_time_travel_snapshot_binding(
     )?;
     Ok(SqlTimeTravelSnapshotBindingFacts {
         snapshot_id: binding.snapshot_id,
+        selection: parse_time_travel_selection(version, fully_qualified_name)?,
+        relation_fqn: fully_qualified_name.into(),
     })
 }
 
@@ -531,6 +546,44 @@ pub fn project_query_local_overlay_name(
     // retains the unchanged original materialization behind this same token.
     source.table.catalog = "default_catalog".to_string();
     materialization.catalog.identity.catalog = "default_catalog".to_string();
+    Ok(materialization)
+}
+
+/// Project one application-verified alias of the same frozen snapshot. The
+/// original binding remains the physical/read authority; only this need's SQL
+/// identity changes. Applications must first verify the canonical input key.
+pub fn project_frozen_snapshot_sql_name(
+    mut materialization: crate::catalog::ResolvedAnalyzerTable,
+    target: &TableIdentity,
+    snapshot: i64,
+) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+    use crate::planner::table::{ScanSource, SqlScanKind, SqlTableVersionSelector};
+    for name in [&target.catalog, &target.namespace, &target.table] {
+        if novarocks_types::naming::normalize_identifier(name)? != *name {
+            return Err("snapshot SQL alias requires canonical catalog identifiers".into());
+        }
+    }
+    let original = &materialization.catalog.identity;
+    if original.catalog != target.catalog || original.namespace != target.namespace {
+        return Err("snapshot SQL alias cannot change the captured catalog or namespace".into());
+    }
+    let ScanSource::Sql(source) = &mut materialization.planner.source;
+    if source.table.catalog != original.catalog
+        || source.table.namespace != original.namespace
+        || source.table.table != original.table
+        || materialization.planner.name != original.table
+    {
+        return Err("snapshot SQL alias has inconsistent original identity carriers".into());
+    }
+    if !matches!(source.kind,
+        SqlScanKind::FrozenInputSet { version: SqlTableVersionSelector::Snapshot(actual) }
+        | SqlScanKind::Data { version: SqlTableVersionSelector::Snapshot(actual) } if actual == snapshot)
+    {
+        return Err("snapshot SQL alias cannot change the captured input selector".into());
+    }
+    source.table.table = target.table.clone();
+    materialization.planner.name = target.table.clone();
+    materialization.catalog.identity = target.clone();
     Ok(materialization)
 }
 
@@ -1177,6 +1230,10 @@ mod tests {
         )
         .expect("known snapshot resolves");
         assert_eq!(snapshot.snapshot_id(), 10);
+        assert_eq!(
+            snapshot.selection(),
+            &SqlTimeTravelSelection::SnapshotId(10)
+        );
 
         let named_ref = resolve_time_travel_snapshot_binding(
             &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 'dev'"),
@@ -1185,6 +1242,10 @@ mod tests {
         )
         .expect("known named reference resolves");
         assert_eq!(named_ref.snapshot_id(), 20);
+        assert_eq!(
+            named_ref.selection(),
+            &SqlTimeTravelSelection::NamedReference("dev".into())
+        );
 
         let timestamp = resolve_time_travel_snapshot_binding(
             &parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000500"),
@@ -1193,6 +1254,24 @@ mod tests {
         )
         .expect("snapshot log resolves timestamp");
         assert_eq!(timestamp.snapshot_id(), 10);
+        assert_eq!(
+            timestamp.selection(),
+            &SqlTimeTravelSelection::TimestampMillis(1700000000500)
+        );
+    }
+
+    #[test]
+    fn time_travel_request_identity_reuses_the_original_literal_parser_without_syntax_spans() {
+        let number =
+            parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000000");
+        let text = parsed_time_travel_clause(
+            "SELECT id FROM ice.analytics.t FOR SYSTEM_TIME AS OF '2023-11-14 22:13:20'",
+        );
+        assert_ne!(number.span, text.span);
+        assert_eq!(
+            parse_time_travel_selection(&number, "t").unwrap(),
+            parse_time_travel_selection(&text, "ice.analytics.t").unwrap()
+        );
     }
 
     #[test]

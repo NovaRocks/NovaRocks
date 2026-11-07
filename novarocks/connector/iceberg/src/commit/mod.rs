@@ -90,15 +90,15 @@ pub use snapshot_lifecycle_helpers::{
     is_puffin_path, puffin_half_reference_protection,
 };
 pub use types::{
-    CommitOpKind, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
-    NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
+    CommitOpKind, IcebergUpdateMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
+    NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
 };
 pub use validation::{
-    classify_iceberg_write_mode, ensure_column_id_not_regressed,
-    ensure_default_sort_order_resolvable, ensure_equality_delete_single_partition_spec,
-    ensure_iceberg_write_supported, ensure_iceberg_write_supported_from_metadata,
-    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
-    ensure_partition_id_not_regressed, ensure_single_partition_spec, match_select_schema_to_table,
+    ensure_column_id_not_regressed, ensure_default_sort_order_resolvable,
+    ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,
+    ensure_iceberg_write_supported_from_metadata, ensure_no_equality_deletes,
+    ensure_overwrite_single_partition_spec, ensure_partition_id_not_regressed,
+    ensure_single_partition_spec, match_select_schema_to_table,
     row_mutation_strategy_from_metadata,
 };
 pub use write_control::IcebergWriteControl;

@@ -9640,7 +9640,7 @@ pub(crate) mod tests {
         // already-authorized DATA path. The old empty-EOS coverage remains.
         #[test]
         fn compiled_receiver_nonempty_data_remains_authorized_after_normal_quiesce() {
-            let (package, receiver) = sql_fragment("SELECT 1", false, true);
+            let (package, receiver) = sql_fragment("SELECT CAST(1 AS BIGINT)", false, true);
             for (ordinal, stop) in [ReceiverStop::Success, ReceiverStop::Quiesce]
                 .into_iter()
                 .enumerate()
@@ -9679,7 +9679,7 @@ pub(crate) mod tests {
 
         #[test]
         fn compiled_receiver_nonempty_data_stops_on_true_abort() {
-            let (package, receiver) = sql_fragment("SELECT 1", false, true);
+            let (package, receiver) = sql_fragment("SELECT CAST(1 AS BIGINT)", false, true);
             for (ordinal, stop) in [ReceiverStop::Abort, ReceiverStop::QuiesceThenAbort]
                 .into_iter()
                 .enumerate()
@@ -9957,7 +9957,7 @@ pub(crate) mod tests {
             use crate::native_type_construction::{NativeTypeConstruction, NativeTypeScope};
             use novarocks_execution::runtime::mem_tracker::MemTracker;
             use novarocks_type_contract::{ValueKind, ValueSchemaCreation, ValueTypeRef};
-            let (bytes, _) = select_one_producer();
+            let (bytes, _) = select_sql_producer("SELECT CAST(1 AS BIGINT)");
             let tracker = MemTracker::new_root("compiled logical late leaf");
             let actual =
                 NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
@@ -9983,7 +9983,7 @@ pub(crate) mod tests {
                 .nodes()
                 .iter()
                 .find_map(|node| node.output_layout().value_binding_at(0))
-                .expect("SELECT 1 has a frozen output binding")
+                .expect("the BIGINT constant query has a frozen output binding")
                 .value_type()
                 .clone();
             assert!(matches!(
@@ -10019,7 +10019,8 @@ pub(crate) mod tests {
             use crate::native_type_construction::NativeTypeConstruction;
             use novarocks_execution::runtime::mem_tracker::MemTracker;
             use novarocks_type_contract::ValueSchemaCreation;
-            let (bytes, _) = select_one_producer();
+            // This literal preserves the original non-null BIGINT custody promise.
+            let (bytes, _) = select_sql_producer("SELECT 2147483648");
             let tracker = MemTracker::new_root("compiled complete binding late reference");
             let actual =
                 NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
@@ -10051,7 +10052,7 @@ pub(crate) mod tests {
                 .nodes()
                 .iter()
                 .find_map(|node| node.output_layout().value_binding_at(0))
-                .expect("SELECT 1 has a complete frozen binding")
+                .expect("the BIGINT literal has a complete frozen binding")
                 .clone();
             drop(compiled);
             drop(creation);

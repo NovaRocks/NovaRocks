@@ -52,6 +52,10 @@ CREATE TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders (
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 
+-- Keep the source logically empty while giving lineage admission a real v3 snapshot.
+INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('__rwm5_lineage_seed', 0);
+DELETE FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders WHERE region = '__rwm5_lineage_seed';
+
 -- query 2
 -- @expect_error=application-document management requires an Iceberg REST catalog
 SET CATALOG ice_ivm_hadoop_${uuid0};

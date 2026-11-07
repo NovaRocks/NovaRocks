@@ -532,21 +532,21 @@ fn decimal_value(value: &ConstantValue) -> i128 {
 fn folds_int32_addition_without_an_integer_carrier_roundtrip() {
     // Reusing one immutable source mirrors SQL's equal-constant interning;
     // the two arguments still assert their exact original checked backing.
-    let request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int64);
+    let request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int32);
     assert!(
         request
             .args
             .iter()
             .all(|arg| arg.value_type.data_type() == &DataType::Int32)
     );
-    assert_eq!(request.result_type.data_type(), &DataType::Int64);
+    assert_eq!(request.result_type.data_type(), &DataType::Int32);
     let output = evaluate(&request);
     assert_eq!(
         output
             .pool()
             .array()
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<Int32Array>()
             .unwrap()
             .value(0),
         2
@@ -697,12 +697,26 @@ fn assert_invalid_arithmetic(result: &Result<Option<ConstantValue>, SqlConstantE
     ));
 }
 #[test]
-fn division_by_zero_is_typed_null_and_forged_nonnullable_arithmetic_is_invalid() {
-    let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
-    assert!(
-        evaluate(&request)
-            .is_null_observed(CompilePhase::FunctionSpecialization, &TestControl)
+fn division_by_zero_keeps_its_data_reason_and_forged_nonnullable_arithmetic_is_invalid() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Int32);
+    let Err(SqlConstantEvaluationError::Source(source)) =
+        constant_evaluator().eval_scalar(&request, &TestControl)
+    else {
+        panic!("integer division by zero must retain its original data error")
+    };
+    assert_eq!(source.failure_fact().class(), FailureClass::Data);
+    assert_eq!(
+        source.failure_fact().reason().domain(),
+        domain::KERNEL.get()
+    );
+    assert_eq!(source.failure_fact().reason().code(), 43);
+    assert_eq!(
+        source
+            .downcast_ref::<novarocks_functions::RowDataError>()
             .unwrap()
+            .reason(),
+        novarocks_functions::DataFailureReason::DivisionByZero
     );
     request.result_type = request.result_type.with_nullable(false).unwrap();
     assert_invalid_arithmetic(&constant_evaluator().eval_scalar(&request, &TestControl));
@@ -1108,7 +1122,7 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
     request.result_type = complete;
     assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
     assert_all_callbacks(
-        &binary(BinOp::Add, vec![i32(1); 2], DataType::Int64),
+        &binary(BinOp::Add, vec![i32(1); 2], DataType::Int32),
         |result| assert!(matches!(result, Ok(Some(_)))),
     );
 }
@@ -1129,7 +1143,7 @@ fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion()
             if novarocks_execution_contract::failure::FailureProjection::failure_fact(source).class() == novarocks_execution_contract::failure::FailureClass::Data
         ))
     });
-    let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
+    let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Int32);
     request.result_type = request.result_type.with_nullable(false).unwrap();
     assert_all_callbacks(&request, assert_invalid_arithmetic);
 }
@@ -1174,7 +1188,7 @@ fn source_annotations_do_not_mint_a_type_resource_refusal() {
 }
 #[test]
 fn explicit_result_policy_refusal_is_typed_preparation_and_has_no_later_callback() {
-    let mut request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int64);
+    let mut request = binary(BinOp::Add, vec![i32(1); 2], DataType::Int32);
     request.constant_policy.max_rows = 0;
     let good = Control::default();
     assert!(matches!(

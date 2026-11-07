@@ -93,6 +93,12 @@ impl FailureProjection for crate::DataFailureReason {
                     novarocks_function_contract::kernel_failure::NUMERIC_OUT_OF_RANGE,
                 );
             }
+            Self::DivisionByZero => {
+                return FailureFact::new(
+                    FailureClass::Data,
+                    novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO,
+                );
+            }
             Self::InvalidEncoding => 42,
             Self::Domain(reason) => return FailureFact::new(FailureClass::Data, *reason),
         };
@@ -124,6 +130,22 @@ impl FailureProjection for crate::WindowInvocationData {
 #[cfg(test)]
 mod row_reason_tests {
     use super::*;
+    #[test]
+    fn division_by_zero_is_the_original_data_reason_after_ordinal_remapping() {
+        let error = crate::RowDataError::with_reason(
+            2,
+            crate::DataFailureReason::DivisionByZero,
+            "numeric overflow",
+        );
+        let remapped = error.with_selected_ordinal(19);
+        assert_eq!(remapped.selected_ordinal(), 19);
+        assert_eq!(remapped.failure_fact().class(), FailureClass::Data);
+        assert_eq!(
+            remapped.failure_fact().reason(),
+            novarocks_function_contract::kernel_failure::DIVISION_BY_ZERO
+        );
+        assert_eq!(error.failure_fact(), remapped.failure_fact());
+    }
     #[test]
     fn row_reason_survives_remapping_and_does_not_follow_diagnostic_text() {
         let numeric = crate::RowDataError::with_reason(

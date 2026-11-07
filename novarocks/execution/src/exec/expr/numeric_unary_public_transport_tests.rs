@@ -172,7 +172,7 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         {
             assert_eq!(before, public, "same original ordered declaration at {n}");
             assert_eq!(public.ty.data_type().clone(), dt);
-            assert_eq!(public.ty.nullable(), n != 1);
+            assert!(!public.ty.nullable());
             assert_eq!(public.ty.nullable(), computed.fields[n].ty.nullable());
             assert_eq!(public.value, computed.fields[n].value);
             assert_eq!(public.alias, computed.fields[n].alias);
@@ -183,9 +183,9 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             );
             assert_eq!(public.ty.data_type(), computed.fields[n].ty.data_type());
         }
-        assert!(computed.fields[0].ty.nullable());
+        assert!(!computed.fields[0].ty.nullable());
         assert!(!computed.fields[1].ty.nullable());
-        assert!(computed.fields[2].ty.nullable());
+        assert!(!computed.fields[2].ty.nullable());
         let original_candidate = freeze_root_purpose(
             CompletedPhysicalPlanCandidate::for_sql_program(
                 original,
@@ -230,8 +230,8 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         )
         .unwrap();
         let mut wrong_columns = render.columns().to_vec();
-        wrong_columns[0].field.nullable = false;
-        wrong_columns[2].field.nullable = false;
+        wrong_columns[0].field.nullable = true;
+        wrong_columns[2].field.nullable = true;
         let wrong_render = novarocks_result_contract::ClientRenderSchema::try_new(
             novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
@@ -264,15 +264,15 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate).unwrap();
         assert_eq!(output.fields().len(), 3);
         assert_eq!(output.fields(), original_output.fields());
-        for (ordinal, (field, label)) in output
-            .fields()
-            .iter()
-            .zip(["original_negated", "original_source", "repeated_alias"])
-            .enumerate()
+        for (field, label) in
+            output
+                .fields()
+                .iter()
+                .zip(["original_negated", "original_source", "repeated_alias"])
         {
             assert_eq!(field.name(), label);
             assert_eq!(field.data_type(), &dt);
-            assert_eq!(field.nullable(), ordinal != 1);
+            assert!(!field.nullable());
         }
         let from_plan =
             OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
@@ -285,7 +285,7 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
                 .map(|field| {
                     novarocks_query_application::api::ResultField::new(
                         field.name(),
-                        field.value_type().with_nullable(false).unwrap(),
+                        field.value_type().with_nullable(true).unwrap(),
                     )
                 })
                 .collect::<Vec<_>>()

@@ -55,14 +55,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_pday_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW pday_mv_${uuid0}
-PARTITION BY day(ts)
-DISTRIBUTED BY HASH(ts) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT ts, COUNT(*) AS c, SUM(amount) AS s
-FROM ice_ivm_pday_${uuid0}.ns_${uuid0}.orders
-GROUP BY ts;
 
 -- query 2
 -- @skip_result_check=true
@@ -71,6 +63,14 @@ INSERT INTO ice_ivm_pday_${uuid0}.ns_${uuid0}.orders VALUES
   ('2026-01-10', 20),
   ('2026-01-11', 5),
   ('2026-01-12', 15);
+CREATE MATERIALIZED VIEW pday_mv_${uuid0}
+PARTITION BY day(ts)
+DISTRIBUTED BY HASH(ts) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT ts, COUNT(*) AS c, SUM(amount) AS s
+FROM ice_ivm_pday_${uuid0}.ns_${uuid0}.orders
+GROUP BY ts;
 REFRESH MATERIALIZED VIEW pday_mv_${uuid0};
 
 -- query 3

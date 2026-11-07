@@ -299,10 +299,10 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
         ),
         (None, None),
     ] {
-        // Numeric literals exercise full-width authoring independently of the
-        // explicit Utf8 -> LargeInt conversion covered below.
+        // Explicit text conversion preserves the original full-width LARGEINT
+        // domain; ordinary integer literals are bounded by signed i64.
         let operand = match value {
-            Some(value) => value.to_string(),
+            Some(value) => format!("CAST('{value}' AS LARGEINT)"),
             None => "CAST(NULL AS LARGEINT)".to_owned(),
         };
         let outputs = constant_outputs(&format!("SELECT ~{operand} AS original_inverted"));

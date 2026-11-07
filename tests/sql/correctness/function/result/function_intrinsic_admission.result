@@ -4,7 +4,7 @@ lowercase	caught_parse
 a	true
 
 -- query 2
--- types	boolean	bigint
+-- types	boolean	integer
 all_true	winning_value
 true	1
 

@@ -61,16 +61,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_float_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW float_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(reading) AS mn,
-       MAX(reading) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -84,6 +74,16 @@ INSERT INTO ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements VALUES
   (4, 'north', 30.0),
   (5, 'north', 50.5),
   (6, 'north', NULL);
+CREATE MATERIALIZED VIEW float_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(reading) AS mn,
+       MAX(reading) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements
+GROUP BY region;
 REFRESH MATERIALIZED VIEW float_mv_${uuid0};
 
 -- query 3

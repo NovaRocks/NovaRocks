@@ -180,7 +180,7 @@ impl Scenario for ResponseDeadline {
             ensure!(
                 actual == 1
                     && result.columns.len() == 1
-                    && result.columns[0].type_signature.raw_type == "bigint",
+                    && result.columns[0].type_signature.raw_type == "integer",
                 "ordinary query after the deadline response changed its typed value"
             );
             health = json!({"query_id":result.query_id,"pages":result.pages,"columns":result.columns,"value":actual,"observed_us":epoch.elapsed().as_micros()});

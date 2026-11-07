@@ -37,10 +37,10 @@ INSERT INTO t0(id, a, b) VALUES (0, "hello", "world"), (1, "hello", "starrocks")
 -- xx_hash3_128 on individual columns, extracting high and low 64 bits
 USE ${case_db};
 SELECT CAST(bit_shift_right(xx_hash3_128(a), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(a), 64)`,
-    CAST(bitand(xx_hash3_128(a), 18446744073709551615) AS VARCHAR) AS `bitand(xx_hash3_128(a), 18446744073709551615)`,
+    CAST(bitand(xx_hash3_128(a), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(a), 18446744073709551615)`,
     a,
     CAST(bit_shift_right(xx_hash3_128(b), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(b), 64)`,
-    CAST(bitand(xx_hash3_128(b), 18446744073709551615) AS VARCHAR) AS `bitand(xx_hash3_128(b), 18446744073709551615)`,
+    CAST(bitand(xx_hash3_128(b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(b), 18446744073709551615)`,
     b
 FROM t0 WHERE id = 1;
 
@@ -48,5 +48,5 @@ FROM t0 WHERE id = 1;
 -- xx_hash3_128 on multiple columns combined
 USE ${case_db};
 SELECT CAST(bit_shift_right(xx_hash3_128(a,b), 64) AS VARCHAR) AS `bit_shift_right(xx_hash3_128(a, b), 64)`,
-    CAST(bitand(xx_hash3_128(a,b), 18446744073709551615) AS VARCHAR) AS `bitand(xx_hash3_128(a, b), 18446744073709551615)`,
+    CAST(bitand(xx_hash3_128(a,b), CAST('18446744073709551615' AS LARGEINT)) AS VARCHAR) AS `bitand(xx_hash3_128(a, b), 18446744073709551615)`,
     concat(a, b) FROM t0 ORDER BY id;

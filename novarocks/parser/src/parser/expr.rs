@@ -109,6 +109,165 @@ mod tests {
     }
 
     #[test]
+    fn signed_integer_literals_keep_i64_boundaries_and_spans() {
+        for source in [
+            "0",
+            "2147483647",
+            "2147483648",
+            "9223372036854775807",
+            "-2147483648",
+            "-2147483649",
+            "-9223372036854775808",
+            "-0",
+            "0000000000000000000000000000001",
+        ] {
+            let Expr::Literal(literal) = parse(source) else {
+                panic!("expected signed integer literal: {source}");
+            };
+            assert_eq!(literal.kind, LiteralKind::Number(source.to_owned()));
+            assert_eq!(literal.span, Span::new(0, source.len()));
+        }
+    }
+
+    #[test]
+    fn direct_negative_literals_and_parenthesized_unary_stay_distinct() {
+        let Expr::Literal(direct) = parse("-2147483648") else {
+            panic!("expected direct signed literal");
+        };
+        assert_eq!(direct.kind, LiteralKind::Number("-2147483648".to_owned()));
+
+        let source = "-(2147483648)";
+        let Expr::Unary(unary) = parse(source) else {
+            panic!("expected genuine unary minus");
+        };
+        assert_eq!(unary.operator, UnaryOperator::Minus);
+        assert_eq!(unary.span, Span::new(0, source.len()));
+        let Expr::Nested(nested) = *unary.expression else {
+            panic!("expected original parentheses");
+        };
+        assert_eq!(nested.span, Span::new(1, source.len()));
+        let Expr::Literal(positive) = *nested.expression else {
+            panic!("expected positive inner literal");
+        };
+        assert_eq!(positive.kind, LiteralKind::Number("2147483648".to_owned()));
+
+        let Expr::Unary(outer) = parse("-(-9223372036854775808)") else {
+            panic!("expected outer unary, without parser evaluation");
+        };
+        let Expr::Nested(nested) = *outer.expression else {
+            panic!("expected nested signed minimum");
+        };
+        let Expr::Literal(minimum) = *nested.expression else {
+            panic!("expected legal signed minimum");
+        };
+        assert_eq!(
+            minimum.kind,
+            LiteralKind::Number("-9223372036854775808".to_owned())
+        );
+    }
+
+    #[test]
+    fn signed_integer_syntax_errors_retain_original_ranges() {
+        for (source, rejected) in [
+            ("9223372036854775808", "9223372036854775808"),
+            ("-9223372036854775809", "-9223372036854775809"),
+            ("-(9223372036854775808)", "9223372036854775808"),
+            ("+9223372036854775808", "9223372036854775808"),
+            (
+                "CAST(9223372036854775808 AS LARGEINT)",
+                "9223372036854775808",
+            ),
+            (
+                "CAST(1 AS DECIMAL(9223372036854775808, 0))",
+                "9223372036854775808",
+            ),
+            ("[9223372036854775808]", "9223372036854775808"),
+        ] {
+            let tokens = lex(source).expect("existing numeric spelling must lex");
+            let error = parse_expression(source, &tokens).expect_err("integer must be rejected");
+            let start = source.find(rejected).unwrap();
+            assert_eq!(
+                error,
+                ParseError::UnexpectedToken {
+                    expected: "signed 64-bit integer literal",
+                    found: format!("`{rejected}`"),
+                    span: Span::new(start, start + rejected.len()),
+                },
+                "{source}"
+            );
+            assert_eq!(
+                ParserError::from(error)
+                    .to_user_error(source)
+                    .code()
+                    .as_str(),
+                "sql.parse.unexpected_token"
+            );
+        }
+
+        let Expr::Cast(cast) = parse("CAST('9223372036854775808' AS LARGEINT)") else {
+            panic!("expected original explicit string cast");
+        };
+        let Expr::Literal(text) = *cast.expr else {
+            panic!("expected original text literal");
+        };
+        assert_eq!(
+            text.kind,
+            LiteralKind::String("9223372036854775808".to_owned())
+        );
+    }
+
+    #[test]
+    fn signed_integer_trivia_is_part_of_the_original_span() {
+        let source = "- /* 界 */\n 9223372036854775808";
+        let Expr::Literal(literal) = parse(source) else {
+            panic!("expected direct signed literal across trivia");
+        };
+        assert_eq!(
+            literal.kind,
+            LiteralKind::Number("-9223372036854775808".to_owned())
+        );
+        assert_eq!(literal.span, Span::new(0, source.len()));
+
+        let source = "- /* 界 */\n 9223372036854775809";
+        let tokens = lex(source).unwrap();
+        assert_eq!(
+            parse_expression(source, &tokens).unwrap_err(),
+            ParseError::UnexpectedToken {
+                expected: "signed 64-bit integer literal",
+                found: "`-9223372036854775809`".to_owned(),
+                span: Span::new(0, source.len()),
+            }
+        );
+        assert!(matches!(
+            parse("- /* nested */ (2147483648)"),
+            Expr::Unary(_)
+        ));
+    }
+
+    #[test]
+    fn negative_non_integer_spelling_keeps_existing_unary_nodes() {
+        for source in ["-9223372036854775808.0", "-1e20", "-0x8000000000000000"] {
+            let Expr::Unary(unary) = parse(source) else {
+                panic!("expected original unary expression: {source}");
+            };
+            assert_eq!(unary.operator, UnaryOperator::Minus);
+            assert!(matches!(*unary.expression, Expr::Literal(_)));
+        }
+        let Expr::Binary(subtract) = parse("1 - -2 * 3") else {
+            panic!("expected subtraction");
+        };
+        assert_eq!(subtract.operator, BinaryOperator::Subtract);
+        let Expr::Binary(multiply) = *subtract.right else {
+            panic!("expected original multiplication precedence");
+        };
+        assert_eq!(multiply.operator, BinaryOperator::Multiply);
+        let Expr::Literal(negative) = *multiply.left else {
+            panic!("expected direct negative multiplicand");
+        };
+        assert_eq!(negative.kind, LiteralKind::Number("-2".to_owned()));
+    }
+
+    #[test]
     fn malformed_expressions_return_typed_code_and_found_token_span() {
         let source = "1 + * 2";
         let tokens = lex(source).expect("test source must lex");

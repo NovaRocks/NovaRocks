@@ -26,9 +26,7 @@ use crate::iceberg::table::Table;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::commit::{
-    IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
-};
+use crate::commit::{IcebergUpdateMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW};
 
 /// A data-file writer cannot encode these logical types, regardless of their
 /// physical Arrow carrier or depth in the target schema.
@@ -159,34 +157,8 @@ pub(crate) fn deny_variant_column_definition(
     Ok(())
 }
 
-pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
-    props
-        .get("write.row-lineage")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-pub fn classify_iceberg_write_mode(table: &Table) -> IcebergWriteMode {
-    classify_iceberg_write_mode_from_metadata(
-        table.metadata().format_version(),
-        table.metadata().properties(),
-    )
-}
-
-fn classify_iceberg_write_mode_from_metadata(
-    format_version: FormatVersion,
-    props: &HashMap<String, String>,
-) -> IcebergWriteMode {
-    if format_version == FormatVersion::V3 || row_lineage_property_enabled(props) {
-        IcebergWriteMode::RowLineageV3
-    } else {
-        IcebergWriteMode::LegacyPositionDeletes
-    }
-}
-
-/// Returns the write mode selected from Iceberg table metadata after rejecting
-/// table schemas that the current writer cannot encode.
-pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode, String> {
+/// Reject table schemas that the current writer cannot encode.
+pub fn ensure_iceberg_write_supported(table: &Table) -> Result<(), String> {
     ensure_iceberg_write_supported_from_metadata(table.metadata())
 }
 
@@ -195,14 +167,11 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
 /// from an already-admitted table payload.
 pub fn ensure_iceberg_write_supported_from_metadata(
     metadata: &TableMetadata,
-) -> Result<IcebergWriteMode, String> {
+) -> Result<(), String> {
     ensure_default_sort_order_resolvable_from_metadata(metadata)?;
     ensure_no_variant_in_partition_spec_from_metadata(metadata)?;
     ensure_no_variant_in_sort_order_from_metadata(metadata)?;
-    Ok(classify_iceberg_write_mode_from_metadata(
-        metadata.format_version(),
-        metadata.properties(),
-    ))
+    Ok(())
 }
 
 // Wired in by later tasks (insert/overwrite/update/delete planning).
@@ -349,6 +318,7 @@ pub fn row_mutation_strategy_from_metadata(
             }
         }
         ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
+            ensure_row_mutation_format_v3(metadata.format_version()).map_err(invalid)?;
             deny_unwritable_data_files(metadata.current_schema(), table)?;
             // An insert-only MERGE rewrites nothing: no live row is matched, so
             // there is no copy-on-write rewrite to express and the mutation is
@@ -380,7 +350,7 @@ fn select_update_mode_from_properties(
     format_version: FormatVersion,
     props: &HashMap<String, String>,
 ) -> Result<IcebergUpdateMode, String> {
-    ensure_update_properties_require_v3_row_lineage(format_version, props)?;
+    ensure_row_mutation_format_v3(format_version)?;
     let value = props
         .get(NOVAROCKS_UPDATE_MODE)
         .map(|s| s.to_ascii_lowercase())
@@ -390,12 +360,9 @@ fn select_update_mode_from_properties(
     })
 }
 
-fn ensure_update_properties_require_v3_row_lineage(
-    format_version: FormatVersion,
-    props: &HashMap<String, String>,
-) -> Result<(), String> {
-    if format_version != FormatVersion::V3 || !row_lineage_property_enabled(props) {
-        return Err("UPDATE requires an Iceberg v3 table with write.row-lineage=true".to_string());
+fn ensure_row_mutation_format_v3(format_version: FormatVersion) -> Result<(), String> {
+    if format_version != FormatVersion::V3 {
+        return Err("UPDATE and MERGE require an Iceberg v3 table".to_string());
     }
     Ok(())
 }
@@ -614,41 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn row_lineage_property_parser_accepts_true_case_insensitive() {
-        let mut props = std::collections::HashMap::new();
-        props.insert("write.row-lineage".to_string(), "TrUe".to_string());
-        assert!(row_lineage_property_enabled(&props));
-    }
-
-    #[test]
-    fn row_lineage_property_parser_treats_missing_or_false_as_legacy() {
-        let props = std::collections::HashMap::<String, String>::new();
-        assert!(!row_lineage_property_enabled(&props));
-
-        let mut props = std::collections::HashMap::new();
-        props.insert("write.row-lineage".to_string(), "false".to_string());
-        assert!(!row_lineage_property_enabled(&props));
-    }
-
-    #[test]
-    fn write_mode_classifies_v3_without_property_as_row_lineage() {
-        let props = std::collections::HashMap::<String, String>::new();
-        assert_eq!(
-            classify_iceberg_write_mode_from_metadata(FormatVersion::V3, &props),
-            IcebergWriteMode::RowLineageV3
-        );
-    }
-
-    #[test]
-    fn write_mode_classifies_v2_without_property_as_legacy() {
-        let props = std::collections::HashMap::<String, String>::new();
-        assert_eq!(
-            classify_iceberg_write_mode_from_metadata(FormatVersion::V2, &props),
-            IcebergWriteMode::LegacyPositionDeletes
-        );
-    }
-
-    #[test]
     fn update_mode_defaults_to_copy_on_write() {
         let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
         assert_eq!(
@@ -673,11 +605,20 @@ mod tests {
     }
 
     #[test]
-    fn update_mode_rejects_v3_without_row_lineage() {
-        let props = HashMap::new();
-        let err =
-            select_update_mode_from_properties(FormatVersion::V3, &props).expect_err("must fail");
-        assert!(err.contains("write.row-lineage=true"), "{err}");
+    fn update_mode_ignores_row_lineage_property() {
+        for props in [
+            HashMap::new(),
+            HashMap::from([("write.row-lineage".to_string(), "false".to_string())]),
+        ] {
+            assert_eq!(
+                select_update_mode_from_properties(FormatVersion::V3, &props).unwrap(),
+                IcebergUpdateMode::CopyOnWrite
+            );
+        }
+        let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
+        let error = select_update_mode_from_properties(FormatVersion::V2, &props)
+            .expect_err("a property cannot grant v3 semantics");
+        assert_eq!(error, "UPDATE and MERGE require an Iceberg v3 table");
     }
 
     #[test]
@@ -1021,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn spi5h_update_strategy_follows_the_table_mode_and_requires_v3_row_lineage() {
+    fn update_strategy_follows_the_table_mode_and_requires_v3() {
         use crate::iceberg::spec::FormatVersion;
         use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorRowMutationStrategy};
 
@@ -1053,19 +994,20 @@ mod tests {
             &ConnectorRowMutationIntent::Update,
             "ice.db.t",
         )
-        .expect_err("UPDATE needs v3 row lineage");
-        assert!(v2.message().contains("row-lineage"), "{v2}");
+        .expect_err("UPDATE needs v3");
+        assert_eq!(v2.message(), "UPDATE and MERGE require an Iceberg v3 table");
 
-        let v3_without_row_lineage = row_mutation_strategy_from_metadata(
-            &strategy_metadata(FormatVersion::V3, &[]),
-            &ConnectorRowMutationIntent::Update,
-            "ice.db.t",
-        )
-        .expect_err("UPDATE needs the row-lineage property, not just v3");
-        assert!(
-            v3_without_row_lineage.message().contains("row-lineage"),
-            "{v3_without_row_lineage}"
-        );
+        for properties in [vec![], vec![("write.row-lineage", "false")]] {
+            assert_eq!(
+                row_mutation_strategy_from_metadata(
+                    &strategy_metadata(FormatVersion::V3, &properties),
+                    &ConnectorRowMutationIntent::Update,
+                    "ice.db.t",
+                )
+                .expect("v3 does not require a row-lineage property"),
+                ConnectorRowMutationStrategy::CopyOnWrite,
+            );
+        }
 
         let unsupported = row_mutation_strategy_from_metadata(
             &strategy_metadata(
@@ -1077,6 +1019,28 @@ mod tests {
         )
         .expect_err("unknown update mode must fail");
         assert!(unsupported.message().contains("sideways"), "{unsupported}");
+    }
+
+    #[test]
+    fn every_merge_shape_requires_v3_even_when_it_only_inserts() {
+        use novarocks_spi::connector::{
+            ConnectorRowMutationEffect as E, ConnectorRowMutationIntent as I,
+        };
+        let metadata = strategy_metadata(FormatVersion::V2, &[ROW_LINEAGE_ON]);
+        for effects in [
+            vec![E::Insert],
+            vec![E::Replace],
+            vec![E::Delete, E::Insert],
+        ] {
+            let error =
+                row_mutation_strategy_from_metadata(&metadata, &I::Merge { effects }, "ice.db.t")
+                    .expect_err("all MERGE shapes require v3");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "UPDATE and MERGE require an Iceberg v3 table"
+            );
+        }
     }
 
     #[test]

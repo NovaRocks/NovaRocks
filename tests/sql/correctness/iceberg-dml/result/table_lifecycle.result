@@ -6,7 +6,7 @@ k1	v1
 
 -- query 4
 -- types	bigint
-count(*)
+_col0
 0
 
 -- query 6

@@ -101,6 +101,20 @@ enum Request {
         context: ConnectorRequestContext,
     },
 
+    SystemCatalogFacts {
+        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        context: ConnectorRequestContext,
+        catalog: String,
+        include_tables: bool,
+    },
+    ReferenceFacts {
+        planning_pin: ConnectorControlPlanningPin,
+        request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest,
+    },
+    ViewMetadata {
+        planning_pin: ConnectorControlPlanningPin,
+        request: novarocks_spi::connector::ConnectorViewRequest,
+    },
     Metadata {
         planning_pin: ConnectorControlPlanningPin,
         request: ConnectorTableRequest,
@@ -127,6 +141,9 @@ enum Response {
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
+    ReferenceFactsReady,
+    SystemCatalogFactsReady,
+    ViewMetadataReady,
     SourceRead(Result<(), ConnectorError>),
 }
 type Operation = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
@@ -238,6 +255,19 @@ pub(crate) struct MvRefreshPreparationIo {
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
+    system_catalog_result: Mutex<
+        Option<
+            Result<
+                Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
+                novarocks_sql::compiler::SqlCompileError,
+            >,
+        >,
+    >,
+    reference_result: Mutex<
+        Option<Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError>>,
+    >,
+    view_result:
+        Mutex<Option<Result<novarocks_spi::connector::ConnectorViewPreparation, ConnectorError>>>,
     source_result: Mutex<Option<SourceReceiving>>,
     current_metadata_cpu: Arc<crate::mv::domain::staged_create::CurrentProjectionMetadataCpu>,
     sources: Arc<CapturedRefreshSources>,
@@ -283,6 +313,9 @@ impl MvRefreshPreparationIo {
             admission: Arc::new(MvPublicationAdmissionReceiving::new()),
             registration: Arc::new(CurrentProjectionRegistration::new()),
             metadata_result: Mutex::new(None),
+            reference_result: Mutex::new(None),
+            system_catalog_result: Mutex::new(None),
+            view_result: Mutex::new(None),
             source_result: Mutex::new(None),
             current_metadata_cpu,
             sources: Arc::new(CapturedRefreshSources::default()),
@@ -490,6 +523,83 @@ impl MvRefreshPreparationIo {
                             Err(error)=>Err(contract_error(error)),
                         };
                         Response::InstallCurrent(result)
+                    }
+                    Request::SystemCatalogFacts {
+                        source,
+                        context,
+                        catalog,
+                        include_tables,
+                    } => {
+                        let mut child = source.facts_port().definition_system_catalog_facts_async(
+                            &context,
+                            &catalog,
+                            include_tables,
+                        );
+                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
+                        {
+                            let gate = original_gate
+                                .upgrade()
+                                .expect("original MV gate outlives its child");
+                            let mut receiver = gate
+                                .system_catalog_result
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            assert!(
+                                receiver.is_none(),
+                                "original MV system catalog receiver is occupied"
+                            );
+                            *receiver = Some(result);
+                        }
+                        drop(child);
+                        Response::SystemCatalogFactsReady
+                    }
+                    Request::ReferenceFacts {
+                        planning_pin,
+                        request,
+                    } => {
+                        let mut child = planning_pin
+                            .binding()
+                            .metadata()
+                            .read_reference_facts_async(request);
+                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
+                        {
+                            let gate = original_gate
+                                .upgrade()
+                                .expect("original MV gate outlives its child");
+                            let mut receiver = gate
+                                .reference_result
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            assert!(
+                                receiver.is_none(),
+                                "original MV reference receiver is occupied"
+                            );
+                            *receiver = Some(result);
+                        }
+                        drop(child);
+                        Response::ReferenceFactsReady
+                    }
+                    Request::ViewMetadata {
+                        planning_pin,
+                        request,
+                    } => {
+                        let capability = planning_pin
+                            .binding()
+                            .view_metadata()
+                            .expect("view capability admitted before requesting I/O");
+                        let mut child = capability.prepare_view(request);
+                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
+                        {
+                            let gate = original_gate
+                                .upgrade()
+                                .expect("original MV gate outlives its child");
+                            let mut receiver =
+                                gate.view_result.lock().unwrap_or_else(|e| e.into_inner());
+                            assert!(receiver.is_none(), "original MV view receiver is occupied");
+                            *receiver = Some(result);
+                        }
+                        drop(child);
+                        Response::ViewMetadataReady
                     }
                     request @ (Request::Metadata { .. } | Request::SourceMetadata { .. }) => {
                         let (planning_pin, request, source_only) = match request {
@@ -810,7 +920,7 @@ impl MvRefreshPreparationIo {
         result?;
         let mut result = None;
         self.admission.take_admitted_in(&mut result)?;
-        Ok(result.expect("successful MV admission installs the original lease"))
+        Ok(result.expect("successful MV admission installs the original planning_pin"))
     }
     pub(crate) async fn install_current(
         &self,
@@ -888,6 +998,102 @@ impl MvRefreshPreparationIo {
         .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 
+    pub(crate) async fn system_catalog_facts(
+        &self,
+        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        context: ConnectorRequestContext,
+        catalog: String,
+        include_tables: bool,
+    ) -> Result<
+        Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        let Response::SystemCatalogFactsReady = self
+            .exchange(Request::SystemCatalogFacts {
+                source,
+                context,
+                catalog,
+                include_tables,
+            })
+            .await
+        else {
+            panic!("MV system catalog response changed kind")
+        };
+        self.system_catalog_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("original system catalog result was received before its child exited")
+    }
+    pub(crate) async fn reference_facts(
+        &self,
+        planning_pin: &ConnectorControlPlanningPin,
+        identity: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError> {
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
+        context.original_operation_control().check_active()?;
+        let Response::ReferenceFactsReady = self
+            .exchange(Request::ReferenceFacts {
+                planning_pin: planning_pin.clone(),
+                request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest {
+                    table: identity,
+                    context,
+                },
+            })
+            .await
+        else {
+            panic!("MV reference response changed kind")
+        };
+        self.reference_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("original reference result was received before its child exited")
+    }
+
+    pub(crate) async fn view_metadata(
+        &self,
+        planning_pin: &ConnectorControlPlanningPin,
+        identity: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorViewMetadataValue, ConnectorError> {
+        let context = crate::connector::context_for_planning_pin_typed(planning_pin, context)?;
+        context.original_operation_control().check_active()?;
+        let capability = planning_pin.binding().view_metadata().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "connector generation does not declare view metadata capability",
+            )
+        })?;
+        let Response::ViewMetadataReady = self
+            .exchange(Request::ViewMetadata {
+                planning_pin: planning_pin.clone(),
+                request: novarocks_spi::connector::ConnectorViewRequest {
+                    view: novarocks_spi::connector::ConnectorViewIdentity {
+                        instance_id: identity.instance_id,
+                        namespace: identity.namespace,
+                        view: identity.table,
+                    },
+                    context: context.clone(),
+                },
+            })
+            .await
+        else {
+            panic!("MV view response changed kind")
+        };
+        let preparation = self
+            .view_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("original view result was received before its child exited")?;
+        crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+            capability.create_prepared_view(preparation, creation)
+        })
+        .map_err(crate::connector::schema_creation::connector_schema_error)
+    }
+
     pub(crate) fn captured_sources(&self) -> Arc<CapturedRefreshSources> {
         Arc::clone(&self.sources)
     }
@@ -958,13 +1164,15 @@ impl MvRefreshPreparationIo {
     }
 }
 
-pub(crate) fn provider_error(error: ConnectorError) -> MvApplicationError {
-    let kind = if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unavailable {
+pub(crate) fn provider_error_kind(error: &ConnectorError) -> MvApplicationErrorKind {
+    if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unavailable {
         MvApplicationErrorKind::Unavailable
     } else {
         MvApplicationErrorKind::Engine
-    };
-    MvApplicationError::from_connector(kind, error)
+    }
+}
+pub(crate) fn provider_error(error: ConnectorError) -> MvApplicationError {
+    MvApplicationError::from_connector(provider_error_kind(&error), error)
 }
 pub(crate) fn contract_error(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, message)

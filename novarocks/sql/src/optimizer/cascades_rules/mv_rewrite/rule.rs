@@ -236,18 +236,15 @@ fn try_rewrite_candidate(
         control,
     )?);
 
-    // 3. Allocate the MV scan: one new ColumnId per MV visible output,
-    //    bound by NAME to the target table columns.
+    // 3. Consume the candidate's frozen output-to-target binding.
+    if cand.output_targets.len() != cand.mv.outputs.len() {
+        return Ok(None);
+    }
     let mut scan_columns: Vec<OutputColumn> = Vec::new();
     let mut dims: Vec<(NormExpr, OutputColumn)> = Vec::new();
     let mut agg_cols: Vec<Option<OutputColumn>> = vec![None; cand.mv.outputs.len()];
     for (i, mv_out) in cand.mv.outputs.iter().enumerate() {
-        let col_def = candidate!(
-            cand.target_table
-                .columns
-                .iter()
-                .find(|c| c.name == mv_out.name)
-        ); // visible-by-name mapping (spec §5)
+        let col_def = candidate!(cand.target_table.columns.get(cand.output_targets[i]));
         let value_type = candidate!(col_def.declared_value_type().ok());
         let source_type = match &mv_out.expr {
             SpjgOutputExpr::Dimension(expr) => cand.mv_scalars.value_type(*expr),
@@ -1311,6 +1308,7 @@ mod tests {
         let (mv, mv_scalars) = mv_descriptor(mv_low);
         MvRewriteCandidate {
             mv_name: "agg_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -1343,6 +1341,7 @@ mod tests {
         let (mv, mv_scalars) = spjg_descriptor_for_test(&plan);
         MvRewriteCandidate {
             mv_name: "direct_agg_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -1979,6 +1978,7 @@ mod tests {
         let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "spj_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -2064,6 +2064,7 @@ mod tests {
         let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "wide_spj_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -2122,6 +2123,7 @@ mod tests {
         let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "or_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -2187,6 +2189,7 @@ mod tests {
         let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
         let candidate = MvRewriteCandidate {
             mv_name: "or_mv".to_string(),
+            output_targets: (0..mv.outputs.len()).collect(),
             mv,
             mv_scalars,
             target_database: "ns".to_string(),
@@ -2272,6 +2275,7 @@ mod tests {
             target_table.columns[1].nullable = count_type.nullable();
             MvRewriteCandidate {
                 mv_name: "cnt_mv".to_string(),
+                output_targets: (0..mv.outputs.len()).collect(),
                 mv,
                 mv_scalars,
                 target_database: "ns".to_string(),

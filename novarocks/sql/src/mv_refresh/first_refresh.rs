@@ -482,9 +482,13 @@ pub fn analyze_join_first_refresh_connector_write(
         context.constant_policy,
         &context.control,
     )?;
+    let root_semantics = logical_output
+        .root_semantics
+        .first_refresh_output(&crate::planner::plan_output_columns(&plan)?, snapshot)?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
+        root_semantics,
         crate::compiler::SqlCompileIntent::IcebergWrite {
             root_distribution: crate::compiler::RootDistributionRequirement::ShuffleOutputName(
                 root_hash_column,
@@ -681,9 +685,19 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.constant_policy,
         &context.control,
     )?;
+    let descriptor = change_stream_override.as_ref().cloned().unwrap_or_else(|| {
+        crate::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&plan)
+    });
+    let root_semantics = logical_output.root_semantics.imv_output(
+        &crate::planner::plan_output_columns(&plan)?,
+        snapshot,
+        &descriptor,
+        matches!(context.join_mode, SqlMvJoinIncrementalRefreshMode::Coalesce),
+    )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
+        root_semantics,
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
             sql_semantics,
@@ -1205,7 +1219,8 @@ fn build_join_incremental_refresh_logical_plan(
             )
         })?
         .into_inner();
-    let mut change_stream_override = None;
+    // Keep the actual rewrite annotation for AppendOnly as well as Coalesce.
+    let mut change_stream_override = Some(outcome.annotation.change_stream.clone());
     let plan = match mode {
         SqlMvJoinIncrementalRefreshMode::AppendOnly => outcome.plan,
         SqlMvJoinIncrementalRefreshMode::Coalesce if is_aggregate_refresh => outcome.plan,
@@ -1802,23 +1817,32 @@ fn build_join_first_refresh_append_logical_plan(
         None,
     );
     reserve_factory_for_plan(&mut factory, &input)?;
+    let join_apply_key_type = crate::planner::imv_rewrite::join_refresh_builder::join_row_key_expr(
+        function_catalog,
+        (&left_row_id, &right_row_id),
+        &left.table_object_id,
+        &right.table_object_id,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )?
+    .value_type;
     let join_apply_key_id = factory.create(
         None,
         "__nova_join_row_key".to_string(),
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
+        join_apply_key_type.clone(),
     );
     let action_id = factory.create(
         None,
         crate::common::CHANGE_OP_COLUMN.to_string(),
         novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int8, false),
     );
-    let join_apply_key = output_column(
-        join_apply_key_id,
-        "__nova_join_row_key",
-        arrow::datatypes::DataType::Utf8,
-        false,
-        true,
-    );
+    let join_apply_key = crate::analysis::OutputColumn {
+        column_id: join_apply_key_id,
+        name: "__nova_join_row_key".to_string(),
+        value_type: join_apply_key_type,
+        is_internal: true,
+    };
     let action = output_column(
         action_id,
         crate::common::CHANGE_OP_COLUMN,
@@ -1973,20 +1997,16 @@ fn find_row_id_column(
         crate::common::ICEBERG_ROW_ID_COL,
         &format!("{role} row-id"),
     )?;
-    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64
-        || column.value_type.nullable()
-    {
+    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64 {
         return Err(format!(
             "join first-refresh {role} row-id has invalid shape"
         ));
     }
-    Ok(output_column(
-        column.column_id,
-        crate::common::ICEBERG_ROW_ID_COL,
-        arrow::datatypes::DataType::Int64,
-        false,
-        true,
-    ))
+    Ok(crate::analysis::OutputColumn {
+        name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
+        is_internal: true,
+        ..column
+    })
 }
 
 fn join_key_pairs(
@@ -3034,6 +3054,65 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn join_first_refresh_row_id_retains_exact_source_nullability() {
+        for nullable in [false, true] {
+            let column = output_column(
+                crate::column_id::ColumnId(7),
+                "_row_id",
+                DataType::Int64,
+                nullable,
+                false,
+            );
+            let scan = JoinBaseScan {
+                columns: vec![column.clone()],
+            };
+            let actual = find_row_id_column(&scan, "left").unwrap();
+            assert_eq!(actual.column_id, column.column_id);
+            assert_eq!(actual.name, column.name);
+            assert_eq!(actual.value_type, column.value_type);
+            assert!(actual.is_internal);
+        }
+    }
+
+    #[test]
+    fn join_first_refresh_row_id_still_requires_unique_int64_source() {
+        let column = output_column(
+            crate::column_id::ColumnId(7),
+            "_row_id",
+            DataType::Utf8,
+            true,
+            false,
+        );
+        assert_eq!(
+            find_row_id_column(
+                &JoinBaseScan {
+                    columns: vec![column]
+                },
+                "left"
+            )
+            .unwrap_err(),
+            "join first-refresh left row-id has invalid shape"
+        );
+        let column = output_column(
+            crate::column_id::ColumnId(7),
+            "_row_id",
+            DataType::Int64,
+            true,
+            false,
+        );
+        assert!(
+            find_row_id_column(
+                &JoinBaseScan {
+                    columns: vec![column.clone(), column]
+                },
+                "left"
+            )
+            .unwrap_err()
+            .contains("multiple left row-id columns")
+        );
+    }
 
     type FinalJoinFirstRefreshCompile =
         fn(
@@ -4217,6 +4296,7 @@ mod tests {
         let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
             logical.logical_plan,
             logical.factory,
+            logical.root_semantics,
             crate::compiler::SqlCompileIntent::ChangeStreamWrite,
             crate::compiler::SqlSessionContext {
                 sql_semantics: effective,

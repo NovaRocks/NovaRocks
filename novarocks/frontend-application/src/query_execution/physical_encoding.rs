@@ -931,7 +931,7 @@ mod tests {
             &self,
             _: &SqlNeedBatch,
             _: &ReadAccessSink<FrozenProviderRead>,
-        ) -> Result<SqlFactBatch, String> {
+        ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
             panic!("a VALUES statement asks for nothing")
         }
     }

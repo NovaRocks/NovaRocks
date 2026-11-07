@@ -1,5 +1,5 @@
 -- query 1
--- types	tinyint	varchar
+-- types	integer	varchar
 i	s
 1	x
 2	y

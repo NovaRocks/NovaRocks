@@ -51,13 +51,13 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_mv_sched_pause_${uuid0};
 USE ns_${uuid0};
+INSERT INTO ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders VALUES
+  (1, 10);
 CREATE MATERIALIZED VIEW orders_pause_mv_${uuid0}
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 REFRESH ASYNC EVERY INTERVAL 1 SECOND
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k1, v2 FROM orders;
-INSERT INTO ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders VALUES
-  (1, 10);
 
 -- query 2
 -- @retry_count=30

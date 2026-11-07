@@ -47,12 +47,21 @@ impl SqlLogicalExplainCatalog {
             &session.current_database,
             crate::catalog::TableLookupMode::ExplainStats,
             0,
-        )?;
+        )?
+        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         Ok(Self {
             catalog,
             session,
             control,
         })
+    }
+
+    pub fn continue_catalog(
+        mut self,
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Self, SqlCompileError> {
+        self.catalog.accept_facts(facts, &self.control)?;
+        Ok(self)
     }
 
     pub fn needs(&self) -> &[CatalogRelationNeed] {

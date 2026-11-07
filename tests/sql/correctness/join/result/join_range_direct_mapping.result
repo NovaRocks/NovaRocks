@@ -1,279 +1,279 @@
 -- query 12
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 10000	10000	10000	10000
 
 -- query 13
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 10000	10000	10000	10000
 
 -- query 14
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 769	769	769	769
 
 -- query 15
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 10000	10000	714	714
 
 -- query 16
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 40000	40000	40000	40000
 
 -- query 17
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 40000	40000	40000	40000
 
 -- query 18
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 40000	40000	40000	40000
 
 -- query 19
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 40000	40000	40000	40000
 
 -- query 20
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 9000	9000	9000	9000
 
 -- query 21
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 9000	9000	9000	9000
 
 -- query 22
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 693	693	693	693
 
 -- query 23
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 572	572	572	572
 
 -- query 24
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 36000	36000	36000	36000
 
 -- query 25
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 36000	36000	36000	36000
 
 -- query 26
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 36000	36000	36000	36000
 
 -- query 27
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 36000	36000	36000	36000
 
 -- query 28
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 29
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 30
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 384	384	384	384
 
 -- query 31
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 428	428	428	428
 
 -- query 32
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 20000	20000	20000	20000
 
 -- query 33
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 20000	20000	20000	20000
 
 -- query 34
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 20000	20000	20000	20000
 
 -- query 35
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 20000	20000	20000	20000
 
 -- query 36
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 10000	10000
 
 -- query 37
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 10000	10000
 
 -- query 38
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 769	769
 
 -- query 39
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 714	714
 
 -- query 40
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 20000	20000
 
 -- query 41
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 20000	20000
 
 -- query 42
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 20000	20000
 
 -- query 43
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 20000	20000
 
 -- query 44
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 45
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 46
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9231	9231
 
 -- query 47
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9286	9286
 
 -- query 48
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 49
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 50
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 51
 -- legacy
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 53
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 54
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 55
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 384	384	384	384
 
 -- query 56
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 428	428	428	428
 
 -- query 57
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 58
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 5000	5000	5000	5000
 
 -- query 59
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 384	384	384	384
 
 -- query 60
 -- types	bigint	bigint	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+_col0	_col1	_col2	_col3
 428	428	428	428
 
 -- query 61
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 62
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 63
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9231	9231
 
 -- query 64
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9286	9286
 
 -- query 65
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 66
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 0	0
 
 -- query 67
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9231	9231
 
 -- query 68
 -- types	bigint	bigint
-count(t1.c_int)	count(t1.c_bigint)
+_col0	_col1
 9286	9286

@@ -470,6 +470,13 @@ fn input(
 fn integral(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<i64>> {
     let array = output.values();
     match array.data_type() {
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.map(i64::from))
+            .collect(),
         DataType::Int16 => array
             .as_any()
             .downcast_ref::<Int16Array>()
@@ -504,16 +511,16 @@ fn errors(output: &novarocks_functions::SelectedValues<'_>) -> Vec<usize> {
 #[test]
 fn five_signed_operators_keep_frozen_mixed_widths_and_sparse_selected_addresses() {
     for (left, right, expected_carrier) in [
-        (DataType::Int8, DataType::Int8, DataType::Int16),
-        (DataType::Int16, DataType::Int8, DataType::Int32),
-        (DataType::Int16, DataType::Int32, DataType::Int64),
+        (DataType::Int8, DataType::Int8, DataType::Int8),
+        (DataType::Int16, DataType::Int8, DataType::Int16),
+        (DataType::Int16, DataType::Int32, DataType::Int32),
         (DataType::Int32, DataType::Int64, DataType::Int64),
     ] {
         for (op, integral_expected) in [
             (BinaryOperator::Add, vec![Some(4), Some(-4), None]),
             (BinaryOperator::Subtract, vec![Some(10), Some(-10), None]),
             (BinaryOperator::Multiply, vec![Some(-21), Some(-21), None]),
-            (BinaryOperator::Divide, vec![]),
+            (BinaryOperator::Divide, vec![Some(-2), Some(-2), None]),
             (BinaryOperator::Modulo, vec![Some(1), Some(-1), None]),
         ] {
             let program = build_program(op, left.clone(), right.clone(), Wrap::Bare, true);
@@ -529,22 +536,8 @@ fn five_signed_operators_keep_frozen_mixed_widths_and_sparse_selected_addresses(
                 .evaluate(&batch, selection, &Control)
                 .unwrap();
             assert_eq!(output.selection(), selection);
-            if op == BinaryOperator::Divide {
-                assert_eq!(output.values().data_type(), &DataType::Float64);
-                assert_eq!(
-                    output
-                        .values()
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap()
-                        .iter()
-                        .collect::<Vec<_>>(),
-                    vec![Some(-7.0 / 3.0), Some(-7.0 / 3.0), None]
-                );
-            } else {
-                assert_eq!(output.values().data_type(), &expected_carrier);
-                assert_eq!(integral(&output), integral_expected);
-            }
+            assert_eq!(output.values().data_type(), &expected_carrier);
+            assert_eq!(integral(&output), integral_expected);
             assert!(output.errors().is_empty());
             let resolved = program
                 .checked()
@@ -641,17 +634,85 @@ fn signed_overflow_and_modulo_faults_use_selected_row_errors_independent_of_allo
         let output = instance(&program)
             .evaluate(&batch, Selection::all(4), &Control)
             .unwrap();
+        assert_eq!(integral(&output), vec![None, None, None, None]);
+        assert_eq!(errors(&output), vec![0, 1]);
         assert_eq!(
-            output
-                .values()
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some(9_223_372_036_854_775_808.0), None, None, None]
+            output.errors()[0].reason(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange
         );
-        assert!(output.errors().is_empty());
+        assert_eq!(
+            output.errors()[1].reason(),
+            novarocks_functions::DataFailureReason::DivisionByZero
+        );
+    }
+}
+
+#[test]
+fn narrow_signed_boundaries_reach_original_selected_error_journal() {
+    for (carrier, min, max) in [
+        (DataType::Int8, i64::from(i8::MIN), i64::from(i8::MAX)),
+        (DataType::Int16, i64::from(i16::MIN), i64::from(i16::MAX)),
+        (DataType::Int32, i64::from(i32::MIN), i64::from(i32::MAX)),
+    ] {
+        for allow in [false, true] {
+            for (op, left, right, reason) in [
+                (
+                    BinaryOperator::Add,
+                    max,
+                    1,
+                    novarocks_functions::DataFailureReason::NumericOutOfRange,
+                ),
+                (
+                    BinaryOperator::Subtract,
+                    min,
+                    1,
+                    novarocks_functions::DataFailureReason::NumericOutOfRange,
+                ),
+                (
+                    BinaryOperator::Multiply,
+                    max,
+                    2,
+                    novarocks_functions::DataFailureReason::NumericOutOfRange,
+                ),
+                (
+                    BinaryOperator::Divide,
+                    min,
+                    -1,
+                    novarocks_functions::DataFailureReason::NumericOutOfRange,
+                ),
+                (
+                    BinaryOperator::Divide,
+                    7,
+                    0,
+                    novarocks_functions::DataFailureReason::DivisionByZero,
+                ),
+                (
+                    BinaryOperator::Modulo,
+                    7,
+                    0,
+                    novarocks_functions::DataFailureReason::DivisionByZero,
+                ),
+            ] {
+                let program =
+                    build_program(op, carrier.clone(), carrier.clone(), Wrap::Bare, allow);
+                let batch = input(
+                    &program,
+                    &[Some(2), Some(left), None],
+                    &[Some(1), Some(right), Some(0)],
+                    &[None; 3],
+                );
+                let selected_rows = [1, 2];
+                let selection = Selection::try_sparse(3, &selected_rows).unwrap();
+                let output = instance(&program)
+                    .evaluate(&batch, selection, &Control)
+                    .unwrap();
+                assert_eq!(output.values().data_type(), &carrier);
+                assert_eq!(output.selection(), selection);
+                assert_eq!(integral(&output), vec![None, None]);
+                assert_eq!(errors(&output), vec![0]);
+                assert_eq!(output.errors()[0].reason(), reason);
+            }
+        }
     }
 }
 

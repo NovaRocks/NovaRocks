@@ -97,6 +97,7 @@ fn lower_core(
             labels,
             message,
             applicability: source_applicability,
+            declared_violation,
         } => {
             let same_applicability = matches!(
                 (source_applicability, applicability),
@@ -138,6 +139,7 @@ fn lower_core(
             }
             AssertRowsMode::PerKeyAtMostOne {
                 applicability,
+                declared_violation: *declared_violation,
                 key_slots: copied_slots,
                 key_labels: copied_labels,
                 message_prefix: copy_text(message, work)?,

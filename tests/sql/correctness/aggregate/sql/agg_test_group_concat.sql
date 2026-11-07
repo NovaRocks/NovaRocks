@@ -1085,7 +1085,7 @@ USE ${case_db};
 select group_concat(distinct  order by score) from ss order by 1;
 
 -- query 248
--- @expect_error=No matching function with signature: group_concat(array<tinyint(4)>, varchar).
+-- @expect_error=No matching function with signature: group_concat(array<int(11)>, varchar).
 USE ${case_db};
 select group_concat([1,2]) from ss;
 
@@ -1094,7 +1094,7 @@ USE ${case_db};
 select group_concat(json_object("2:3")) from ss;
 
 -- query 250
--- @expect_error=No matching function with signature: group_concat(map<tinyint(4),tinyint(4)>, varchar).
+-- @expect_error=No matching function with signature: group_concat(map<int(11),int(11)>, varchar).
 USE ${case_db};
 select group_concat(map(2,3)) from ss;
 

@@ -22,7 +22,7 @@ PLAN FRAGMENT 1
            TABLE: ${case_db}.oq6_alias_base
            columns: k, v
            min-max stats
-           predicates: CAST(v AS Int64) > 10
+           predicates: v > 10
 
 -- query 6
 -- types	varchar
@@ -106,4 +106,4 @@ PLAN FRAGMENT 2
            TABLE: ${case_db}.oq6_alias_base
            columns: k
            min-max stats
-           predicates: CAST(k AS Int64) < 3
+           predicates: k < 3

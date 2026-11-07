@@ -932,8 +932,10 @@ impl CurrentProjectionRegistration {
             Some(Ok(O::KnownCommitted {
                 finalization,
                 cleanup,
+                effect,
                 ..
             })) => R::KnownCommitted(crate::connector::mutation::CompletedCatalogMutation {
+                effect,
                 finalization,
                 cleanup,
             }),

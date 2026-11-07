@@ -20,4 +20,4 @@ PLAN FRAGMENT 1
        TABLE: ${case_db}.oq12_stats_or
        columns: a, b
        min-max stats
-       predicates: CAST(a AS Int64) = 1 OR CAST(a AS Int64) = 2
+       predicates: a = 1 OR a = 2

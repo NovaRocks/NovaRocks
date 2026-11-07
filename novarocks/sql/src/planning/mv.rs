@@ -413,7 +413,54 @@ mod refresh_property_facade_tests {
         let query = parse_query(sql);
         let (resolved, _, _) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved)
+        SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")
+    }
+
+    #[test]
+    fn union_aggregate_uses_root_names_with_anonymous_later_branch() {
+        let input = analyzed_refresh_input(
+            "SELECT id + 1 AS K, count(*) AS C FROM fact_east GROUP BY id + 1 UNION ALL SELECT id + 1, count(*) FROM fact_west GROUP BY id + 1",
+        );
+        assert_eq!(input.analysis_facts().output_columns[0].name, "K");
+        let property = input
+            .refresh_property(&crate::compiler::SqlCompileControl::unbounded())
+            .unwrap();
+        assert_eq!(
+            property.identity,
+            TargetIdentity::BranchScoped(Box::new(TargetIdentity::GroupRowId(vec!["K".into()])))
+        );
+        input
+            .refresh_contract(&crate::compiler::SqlCompileControl::unbounded())
+            .unwrap();
+    }
+
+    #[test]
+    fn mv_definition_names_are_validated_before_persistence_and_keep_source_case() {
+        use crate::analyze_error::AnalyzeErrorKind as K;
+        for (sql, expected) in [
+            ("SELECT 1 FROM fact_east", K::MissingColumnName),
+            (
+                "SELECT id AS a, amount AS A, 3 FROM fact_east",
+                K::DuplicateColumnName,
+            ),
+            (
+                "SELECT 1, id AS a, amount AS A FROM fact_east",
+                K::MissingColumnName,
+            ),
+        ] {
+            let query = parse_query(sql);
+            let (resolved, _, _) =
+                crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
+            let error = SqlResolvedMvRefreshInput::from_analysis(resolved).unwrap_err();
+            assert_eq!(error.kind(), expected, "{sql}");
+            assert!(
+                error.span().is_none(),
+                "source-less capture must not invent a location"
+            );
+        }
+        let input = analyzed_refresh_input("SELECT ID, amount AS Total FROM fact_east");
+        assert_eq!(input.analysis_facts().output_columns[0].name, "ID");
+        assert_eq!(input.analysis_facts().output_columns[1].name, "Total");
     }
 
     #[test]
@@ -1179,17 +1226,38 @@ mod refresh_property_facade_tests {
 /// second raw-query representation.
 pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Sealed {
     #[doc(hidden)]
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput;
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError>;
 }
 
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
-pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery);
+pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery, Box<[String]>);
 
 impl SqlResolvedMvRefreshInput {
-    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(source: T) -> Self {
+    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(
+        source: T,
+    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
         source.into_sql_resolved_mv_refresh_input()
+    }
+
+    pub(crate) fn from_validated_analysis(
+        resolved: crate::analysis::ResolvedQuery,
+        names: Vec<String>,
+    ) -> Self {
+        Self(resolved, names.into_boxed_slice())
+    }
+
+    fn checked(
+        resolved: crate::analysis::ResolvedQuery,
+    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
+        let names = crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            None,
+        )?;
+        Ok(Self::from_validated_analysis(resolved, names))
     }
 
     pub fn refresh_property(
@@ -1197,8 +1265,52 @@ impl SqlResolvedMvRefreshInput {
         control: &dyn PureCompileControl,
     ) -> Result<RefreshFragmentProperty, SqlCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = derive_fragment_property(&self.0, &mut work);
+        let result = self.bound_refresh_property(&mut work);
         finish_refresh_identity(result, work)
+    }
+
+    fn bound_refresh_property(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<RefreshFragmentProperty, SqlCompileError> {
+        // Synthesize and compare internal branch layouts before exposing the
+        // original root's names. Later UNION branches do not declare that root.
+        let mut property = derive_fragment_property(&self.0, work)?;
+        let names = match &mut property.identity {
+            TargetIdentity::GroupRowId(names) => Some(names),
+            TargetIdentity::BranchScoped(inner) => match inner.as_mut() {
+                TargetIdentity::GroupRowId(names) => Some(names),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(names) = names {
+            let branch = first_union_branch_resolved_query(&self.0)?;
+            let QueryBody::Select(select) = &branch.body else {
+                return Err(SqlCompileError::Compilation(
+                    "MV group identity has no SELECT root".into(),
+                ));
+            };
+            let visible = branch
+                .output_columns
+                .iter()
+                .filter(|column| !column.is_internal)
+                .collect::<Vec<_>>();
+            if visible.len() != self.1.len()
+                || select.projection.len() != visible.len()
+                || select
+                    .projection
+                    .iter()
+                    .zip(&visible)
+                    .any(|(item, field)| item.output_column_id != field.column_id)
+            {
+                return Err(SqlCompileError::Compilation(
+                    "MV group identity changed its original root occurrence binding".into(),
+                ));
+            }
+            *names = group_key_output_names(select, Some(&self.1), work)?;
+        }
+        Ok(property)
     }
 
     pub fn refresh_contract(
@@ -1207,7 +1319,7 @@ impl SqlResolvedMvRefreshInput {
     ) -> Result<SqlImvRefreshContractFacts, SqlCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         let result = (|| {
-            let property = derive_fragment_property(&self.0, &mut work)?;
+            let property = self.bound_refresh_property(&mut work)?;
             // The existing contract projection remains an opaque ordinary owner.
             work.flush()?;
             let contract = property
@@ -1223,7 +1335,7 @@ impl SqlResolvedMvRefreshInput {
     /// target schema. Analyzer columns remain private to the SQL crate.
     pub fn analysis_facts(&self) -> SqlMvAnalysisFacts {
         SqlMvAnalysisFacts {
-            output_columns: output_column_facts(&self.0),
+            output_columns: output_column_facts(&self.0, &self.1),
         }
     }
 
@@ -1235,7 +1347,7 @@ impl SqlResolvedMvRefreshInput {
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
     pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0)
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and
@@ -1275,7 +1387,7 @@ impl SqlResolvedMvRefreshInput {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(SqlMvAggregateLayoutFacts {
             calls: aggregate_call_facts,
-            output_columns: output_column_facts(resolved),
+            output_columns: output_column_facts(resolved, &self.1),
             aggregate_input_types,
             group_key_source_indexes,
         })
@@ -1363,16 +1475,20 @@ impl SqlResolvedMvRefreshInput {
 impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
 
 impl SqlResolvedMvRefreshInputSource for crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self)
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
+        SqlResolvedMvRefreshInput::checked(self)
     }
 }
 
 impl resolved_mv_refresh_input_private::Sealed for &crate::analysis::ResolvedQuery {}
 
 impl SqlResolvedMvRefreshInputSource for &crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self.clone())
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
+        SqlResolvedMvRefreshInput::checked(self.clone())
     }
 }
 
@@ -2041,29 +2157,20 @@ fn group_key_source_indexes(calls: &SqlMvAggregateCalls) -> Result<Vec<usize>, S
         .collect()
 }
 
-fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOutputColumnFacts> {
-    if resolved.output_columns.is_empty() {
-        match &resolved.body {
-            crate::analysis::QueryBody::Select(select) => select
-                .projection
-                .iter()
-                .map(|item| SqlMvOutputColumnFacts {
-                    name: item.output_name.clone(),
-                    value_type: item.expr.value_type.clone(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    } else {
-        resolved
-            .output_columns
-            .iter()
-            .map(|column| SqlMvOutputColumnFacts {
-                name: column.name.clone(),
-                value_type: column.value_type.clone(),
-            })
-            .collect()
-    }
+fn output_column_facts(
+    resolved: &crate::analysis::ResolvedQuery,
+    names: &[String],
+) -> Vec<SqlMvOutputColumnFacts> {
+    resolved
+        .output_columns
+        .iter()
+        .filter(|column| !column.is_internal)
+        .zip(names)
+        .map(|(column, name)| SqlMvOutputColumnFacts {
+            name: name.clone(),
+            value_type: column.value_type.clone(),
+        })
+        .collect()
 }
 
 fn first_union_branch_query(query: &Query) -> Result<Query, String> {
@@ -5925,7 +6032,7 @@ fn derive_from_select(
         work.flush()?;
         let aggregate_input_shape = classify_aggregate_input_shape(select.from.as_ref(), &child)?;
         work.flush()?;
-        let group_key_output_names = group_key_output_names(select, work)?;
+        let group_key_output_names = group_key_output_names(select, None, work)?;
         Ok(RefreshFragmentProperty {
             identity: TargetIdentity::GroupRowId(group_key_output_names),
             state: StateContract::AggregateState {
@@ -6325,10 +6432,11 @@ fn iceberg_ref_from_scan(scan: &crate::analysis::ScanRelation) -> Result<TableId
 /// GROUP BY key is projected, so this captures the full group-key output set.
 fn group_key_output_names(
     select: &ResolvedSelect,
+    published: Option<&[String]>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<String>, SqlCompileError> {
     let mut names = Vec::new();
-    for item in &select.projection {
+    for (ordinal, item) in select.projection.iter().enumerate() {
         let mut matched = false;
         for group_key in &select.group_by {
             work.flush()?;
@@ -6343,7 +6451,14 @@ fn group_key_output_names(
             }
         }
         if matched {
-            names.push(item.output_name.clone());
+            names.push(match published {
+                Some(names) => names.get(ordinal).cloned().ok_or_else(|| {
+                    SqlCompileError::Compilation(
+                        "MV group key is outside the frozen output declaration".into(),
+                    )
+                })?,
+                None => item.output_name.clone(),
+            });
         }
         work.step()?;
     }

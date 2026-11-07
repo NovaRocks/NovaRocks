@@ -309,7 +309,7 @@ pub(crate) enum ExecutionReason {
     AggregateGroupContract = 314,
     AssertRowsContract = 315,
     AssertRowsMismatch = 316,
-    AssertRowsDuplicateKey = 317,
+    // Reason 317 is shared in failure-contract::execution_reason.
     AssertRowsCounter = 318,
     // Retired production formatting paths; keep their IDs in independent
     // diagnostic regression fixtures without reassigning either number.

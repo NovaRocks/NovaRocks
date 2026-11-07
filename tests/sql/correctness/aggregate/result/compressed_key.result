@@ -21,31 +21,31 @@ c17	c18	c19	c20	c21	c22	c23	c24
 
 -- query 10
 -- types	tinyint	bigint
-c1	sum(c1)
+c1	_col1
 NULL	NULL
 -1	-1
 0	0
 
 -- query 11
 -- types	tinyint	smallint	bigint
-c1	c2	sum(c1)
+c1	c2	_col2
 NULL	NULL	NULL
 NULL	128	NULL
 NULL	129	NULL
 
 -- query 12
 -- types	smallint	bigint
-c2	sum(c1)
+c2	_col1
 1	150
 
 -- query 13
 -- types	integer	bigint
-c3	sum(c1)
+c3	_col1
 1	150
 
 -- query 14
 -- types	bigint	bigint
-c4	sum(c1)
+c4	_col1
 2	300
 
 -- query 15
@@ -55,42 +55,42 @@ c5	sum(c1)
 
 -- query 16
 -- types	date	bigint
-c6	sum(c1)
+c6	_col1
 2000-01-03	103
 
 -- query 17
 -- types	timestamp(6)	bigint
-c7	sum(c1)
+c7	_col1
 2000-01-03 00:00:00.000000	103
 
 -- query 18
 -- types	varchar	bigint
-c8	sum(c1)
+c8	_col1
 10	1500
 
 -- query 19
 -- types	varchar	bigint
-c9	sum(c1)
+c9	_col1
 100	100
 
 -- query 20
 -- types	tinyint	bigint
-c13	sum(c1)
+c13	_col1
 2	148800
 
 -- query 21
 -- types	smallint	bigint
-c14	sum(c1)
+c14	_col1
 2	148800
 
 -- query 22
 -- types	smallint	bigint
-c14	sum(c1)
+c14	_col1
 2	148800
 
 -- query 23
 -- types	bigint	bigint
-c16	sum(c1)
+c16	_col1
 2	300
 
 -- query 24
@@ -100,25 +100,25 @@ c17	sum(c1)
 
 -- query 25
 -- types	date	bigint
-c18	sum(c1)
+c18	_col1
 
 -- query 26
 -- types	timestamp(6)	bigint
-c19	sum(c1)
+c19	_col1
 
 -- query 27
 -- types	smallint	bigint
-c2	sum(c1)
+c2	_col1
 199	NULL
 
 -- query 28
 -- types	integer	bigint
-c3	sum(c1)
+c3	_col1
 199	NULL
 
 -- query 29
 -- types	bigint	bigint
-c4	sum(c1)
+c4	_col1
 199	NULL
 
 -- query 30
@@ -128,42 +128,42 @@ c5	sum(c1)
 
 -- query 31
 -- types	date	bigint
-c6	sum(c1)
+c6	_col1
 2002-12-31	31
 
 -- query 32
 -- types	timestamp(6)	bigint
-c7	sum(c1)
+c7	_col1
 2002-12-31 00:00:00.000000	31
 
 -- query 33
 -- types	varchar	bigint
-c8	sum(c1)
+c8	_col1
 99	14850
 
 -- query 34
 -- types	varchar	bigint
-c9	sum(c1)
+c9	_col1
 9999	NULL
 
 -- query 35
 -- types	tinyint	bigint
-c13	sum(c1)
+c13	_col1
 7	160800
 
 -- query 36
 -- types	smallint	bigint
-c14	sum(c1)
+c14	_col1
 7	160800
 
 -- query 37
 -- types	smallint	bigint
-c14	sum(c1)
+c14	_col1
 7	160800
 
 -- query 38
 -- types	bigint	bigint
-c16	sum(c1)
+c16	_col1
 199	NULL
 
 -- query 39
@@ -173,17 +173,17 @@ c17	sum(c1)
 
 -- query 40
 -- types	date	bigint
-c18	sum(c1)
+c18	_col1
 2020-02-02	1219200
 
 -- query 41
 -- types	timestamp(6)	bigint
-c19	sum(c1)
+c19	_col1
 2020-02-02 00:00:00.000000	1219200
 
 -- query 42
 -- types	integer	bigint	bigint
-c3	c4	sum(c1)
+c3	c4	_col2
 28	28	4200
 
 -- query 43
@@ -193,7 +193,7 @@ c3	c5	sum(c1)
 
 -- query 44
 -- types	integer	timestamp(6)	bigint
-c3	c7	sum(c1)
+c3	c7	_col2
 2	2001-04-02 00:00:00.000000	2
 
 -- query 45
@@ -225,72 +225,72 @@ c1	c2	c3	c4
 
 -- query 52
 -- types	decimal(4, 2)	decimal(38, 2)
-c1	sum(c1)
+c1	_col1
 0.00	0.00
 
 -- query 53
 -- types	decimal(10, 2)	decimal(38, 2)
-c2	sum(c1)
+c2	_col1
 0.00	0.00
 
 -- query 54
 -- types	decimal(27, 9)	decimal(38, 2)
-c3	sum(c1)
+c3	_col1
 0.000000000	0.00
 
 -- query 55
 -- types	decimal(38, 5)	decimal(38, 2)
-c4	sum(c1)
+c4	_col1
 0.00000	0.00
 
 -- query 56
 -- types	decimal(4, 2)	decimal(10, 2)	decimal(38, 2)
-c1	c2	sum(c1)
+c1	c2	_col2
 0.00	0.00	0.00
 
 -- query 57
 -- types	decimal(4, 2)	decimal(27, 9)	decimal(38, 2)
-c1	c3	sum(c1)
+c1	c3	_col2
 0.00	0.000000000	0.00
 
 -- query 58
 -- types	decimal(4, 2)	decimal(38, 5)	decimal(38, 2)
-c1	c4	sum(c1)
+c1	c4	_col2
 0.00	0.00000	0.00
 
 -- query 59
 -- types	decimal(10, 2)	decimal(27, 9)	decimal(38, 2)
-c2	c3	sum(c1)
+c2	c3	_col2
 0.00	0.000000000	0.00
 
 -- query 60
 -- types	decimal(10, 2)	decimal(38, 5)	decimal(38, 2)
-c2	c4	sum(c1)
+c2	c4	_col2
 0.00	0.00000	0.00
 
 -- query 61
 -- types	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
-c3	c4	sum(c1)
+c3	c4	_col2
 0.000000000	0.00000	0.00
 
 -- query 62
 -- types	decimal(4, 2)	decimal(10, 2)	decimal(27, 9)	decimal(38, 2)
-c1	c2	c3	sum(c1)
+c1	c2	c3	_col3
 0.00	0.00	0.000000000	0.00
 
 -- query 63
 -- types	decimal(4, 2)	decimal(10, 2)	decimal(38, 5)	decimal(38, 2)
-c1	c2	c4	sum(c1)
+c1	c2	c4	_col3
 0.00	0.00	0.00000	0.00
 
 -- query 64
 -- types	decimal(10, 2)	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
-c2	c3	c4	sum(c1)
+c2	c3	c4	_col3
 0.00	0.000000000	0.00000	0.00
 
 -- query 65
 -- types	decimal(4, 2)	decimal(10, 2)	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
-c1	c2	c3	c4	sum(c1)
+c1	c2	c3	c4	_col4
 0.00	0.00	0.000000000	0.00000	0.00
 
 -- query 71

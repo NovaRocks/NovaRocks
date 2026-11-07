@@ -89,6 +89,8 @@ enum Code {
     PermissionDenied,
     NotFound,
     FunctionNotFound,
+    DivisionByZero,
+    InvalidView,
     AlreadyExists,
     NotSupported,
     InvalidSessionProperty,
@@ -100,10 +102,17 @@ enum Code {
     TableNotFound,
     ColumnNotFound,
     DuplicateNamedQuery,
+    DuplicateColumnName,
+    MissingColumnName,
     TypeMismatch,
     InvalidLiteral,
+    MismatchedColumnAliases,
     InvalidArguments,
+    TooManyArguments,
+    ViewIsStale,
+    ViewIsRecursive,
     DuplicateWindowName,
+    MergeTargetRowMultipleMatches,
     GenericInternal,
     PageTransportError,
     PageTransportTimeout,
@@ -125,6 +134,8 @@ impl Code {
             PermissionDenied => (4, "PERMISSION_DENIED", "USER_ERROR"),
             NotFound => (5, "NOT_FOUND", "USER_ERROR"),
             FunctionNotFound => (6, "FUNCTION_NOT_FOUND", "USER_ERROR"),
+            DivisionByZero => (8, "DIVISION_BY_ZERO", "USER_ERROR"),
+            InvalidView => (11, "INVALID_VIEW", "USER_ERROR"),
             AlreadyExists => (12, "ALREADY_EXISTS", "USER_ERROR"),
             NotSupported => (13, "NOT_SUPPORTED", "USER_ERROR"),
             InvalidSessionProperty => (14, "INVALID_SESSION_PROPERTY", "USER_ERROR"),
@@ -136,10 +147,19 @@ impl Code {
             TableNotFound => (46, "TABLE_NOT_FOUND", "USER_ERROR"),
             ColumnNotFound => (47, "COLUMN_NOT_FOUND", "USER_ERROR"),
             DuplicateNamedQuery => (53, "DUPLICATE_NAMED_QUERY", "USER_ERROR"),
+            DuplicateColumnName => (54, "DUPLICATE_COLUMN_NAME", "USER_ERROR"),
+            MissingColumnName => (55, "MISSING_COLUMN_NAME", "USER_ERROR"),
             TypeMismatch => (58, "TYPE_MISMATCH", "USER_ERROR"),
             InvalidLiteral => (59, "INVALID_LITERAL", "USER_ERROR"),
+            MismatchedColumnAliases => (61, "MISMATCHED_COLUMN_ALIASES", "USER_ERROR"),
             InvalidArguments => (76, "INVALID_ARGUMENTS", "USER_ERROR"),
+            TooManyArguments => (77, "TOO_MANY_ARGUMENTS", "USER_ERROR"),
+            ViewIsStale => (81, "VIEW_IS_STALE", "USER_ERROR"),
+            ViewIsRecursive => (82, "VIEW_IS_RECURSIVE", "USER_ERROR"),
             DuplicateWindowName => (92, "DUPLICATE_WINDOW_NAME", "USER_ERROR"),
+            MergeTargetRowMultipleMatches => {
+                (119, "MERGE_TARGET_ROW_MULTIPLE_MATCHES", "USER_ERROR")
+            }
             GenericInternal => (65536, "GENERIC_INTERNAL_ERROR", "INTERNAL_ERROR"),
             PageTransportError => (65539, "PAGE_TRANSPORT_ERROR", "INTERNAL_ERROR"),
             PageTransportTimeout => (65540, "PAGE_TRANSPORT_TIMEOUT", "INTERNAL_ERROR"),
@@ -193,6 +213,12 @@ impl fmt::Display for PublicMessage<'_> {
             // ExecutionFailureInput::user_error has no location and renders
             // exactly this descriptor prefix plus the original safe detail.
             // Borrow both facts instead of cloning the detail into a UserError.
+            Self::Execution(input) if input.row_match_violation_message().is_some() => formatter
+                .write_str(
+                    input
+                        .row_match_violation_message()
+                        .expect("declared SQL message"),
+                ),
             Self::Execution(input) => write!(
                 formatter,
                 "[{}] {}",
@@ -275,6 +301,9 @@ fn project_message(
     location: Option<TrinoErrorLocation>,
     effect: Option<StatementExternalEffectDisposition>,
 ) -> TrinoQueryError {
+    if code == Code::MergeTargetRowMultipleMatches {
+        return project(code, diagnostics::bound_display(&message), location);
+    }
     let public = StatementExternalEffectDisposition::diagnostic(&message, effect);
     let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
@@ -330,6 +359,18 @@ fn service_error(
             QueryServiceErrorKind::Internal => Code::GenericInternal,
         }
     };
+    if code == Code::MergeTargetRowMultipleMatches {
+        let message = error
+            .execution_failure()
+            .and_then(|input| input.row_match_violation_message())
+            .or_else(|| {
+                error
+                    .user_error()
+                    .and_then(|user| row_match_message_for_code(user.code().as_str()))
+            })
+            .expect("declared row match SQL identity has a standard message");
+        return project(code, diagnostics::bound_display(message), None);
+    }
     let public = error.diagnostic_with_external_effect(effect);
     let bounded = diagnostics::bound_display(&public);
     if bounded.truncated
@@ -361,7 +402,25 @@ fn cancellation_code(reason: &QueryCancellationReason) -> Code {
     }
 }
 
+fn row_match_message_for_code(code: &str) -> Option<&'static str> {
+    use novarocks_query_application::execution_error::{
+        MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE, UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE,
+    };
+    match code {
+        "query.execution.merge_target_row_multiple_matches" => {
+            Some(MERGE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE)
+        }
+        "query.execution.update_target_row_multiple_matches" => {
+            Some(UPDATE_TARGET_ROW_MULTIPLE_MATCHES_MESSAGE)
+        }
+        _ => None,
+    }
+}
+
 fn execution_code(input: &ExecutionFailureInput) -> Code {
+    if input.row_match_violation_message().is_some() {
+        return Code::MergeTargetRowMultipleMatches;
+    }
     let descriptor = input.descriptor().descriptor;
     let code = user_code(descriptor.code.as_str()).unwrap_or(Code::GenericInternal);
     // ConnectorMutationFailureKind::AlreadyExists owns the Data/CONNECTOR/6002
@@ -412,6 +471,8 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
 fn user_code(code: &str) -> Option<Code> {
     use Code::*;
     Some(match code {
+        "query.execution.merge_target_row_multiple_matches"
+        | "query.execution.update_target_row_multiple_matches" => MergeTargetRowMultipleMatches,
         "sql.lex.unexpected_character"
         | "sql.lex.unterminated_string"
         | "sql.lex.unterminated_quoted_identifier"
@@ -424,6 +485,12 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.analyze.unknown_table" => TableNotFound,
         "sql.analyze.unknown_column" => ColumnNotFound,
         "sql.analyze.unknown_function" => FunctionNotFound,
+        "sql.analyze.missing_column_name" => MissingColumnName,
+        "sql.analyze.duplicate_column_name" => DuplicateColumnName,
+        "sql.analyze.mismatched_column_aliases" => MismatchedColumnAliases,
+        "sql.analyze.invalid_view" => InvalidView,
+        "sql.analyze.view_is_stale" => ViewIsStale,
+        "sql.analyze.view_is_recursive" => ViewIsRecursive,
         "sql.analyze.type_mismatch" => TypeMismatch,
         "sql.analyze.invalid_literal" => InvalidLiteral,
         "sql.analyze.invalid_argument" => InvalidArguments,
@@ -452,6 +519,8 @@ fn user_code(code: &str) -> Option<Code> {
         | "query.execution.control"
         | "query.execution.commit_unknown" => GenericInternal,
         "query.execution.numeric_out_of_range" => NumericOutOfRange,
+        "query.execution.division_by_zero" => DivisionByZero,
+        "sql.analyze.too_many_arguments" => TooManyArguments,
         "query.execution.cancelled" => UserCanceled,
         "query.execution.deadline_exceeded" => ExceededTimeLimit,
         "query.execution.resource_exhausted" | "query.execution.representation" => {

@@ -143,8 +143,17 @@ pub fn validate_argument_observed(
             ));
         }
         work.step()?;
+        // Shape validation established the Scalar's one physical row. Its
+        // immutable value promise is checked once for nonempty demand, not
+        // once per logical broadcast result. Other addressing domains retain
+        // their original selected-row validation.
+        let rows_to_validate = if matches!(argument, EvaluatedArgument::Scalar(_)) {
+            usize::from(!selection.is_empty())
+        } else {
+            selection.len()
+        };
         if !value_type.nullable() {
-            for (ordinal, row) in selection.iter().enumerate() {
+            for (ordinal, row) in selection.iter().take(rows_to_validate).enumerate() {
                 if logical_is_null(
                     argument.array().as_ref(),
                     argument.value_row(ordinal, row),
@@ -161,11 +170,7 @@ pub fn validate_argument_observed(
             // that row once while preserving the kernel's full output demand.
             let rows = selection
                 .iter()
-                .take(if matches!(argument, EvaluatedArgument::Scalar(_)) {
-                    1
-                } else {
-                    selection.len()
-                })
+                .take(rows_to_validate)
                 .enumerate()
                 .map(|(ordinal, row)| argument.value_row(ordinal, row));
             novarocks_value_arrays::hydrate::validate_required_rows_observed(

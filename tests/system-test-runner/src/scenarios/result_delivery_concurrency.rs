@@ -208,7 +208,7 @@ impl Scenario for ConcurrentResults {
             ensure!(
                 actual == 1
                     && result.columns.len() == 1
-                    && result.columns[0].type_signature.raw_type == "bigint",
+                    && result.columns[0].type_signature.raw_type == "integer",
                 "concurrent post-drain health lost its original typed value"
             );
             Ok(

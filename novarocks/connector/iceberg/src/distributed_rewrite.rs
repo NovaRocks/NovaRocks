@@ -1103,11 +1103,15 @@ pub(crate) fn frozen_rewrite_scan_schema(
         _ if row_lineage => {
             let mut fields = physical_schema.fields().to_vec();
             fields.extend([
-                Arc::new(Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false)),
+                Arc::new(Field::new(
+                    ICEBERG_ROW_ID_COL,
+                    DataType::Int64,
+                    crate::typed_read::IcebergMetadataColumn::RowId.nullable(),
+                )),
                 Arc::new(Field::new(
                     ICEBERG_LAST_UPDATED_SEQ_COL,
                     DataType::Int64,
-                    true,
+                    crate::typed_read::IcebergMetadataColumn::LastUpdatedSequenceNumber.nullable(),
                 )),
             ]);
             Arc::new(Schema::new(fields))
@@ -2097,6 +2101,11 @@ mod tests {
                 crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).unwrap(),
             );
             let source = rewrite_input_schema(request.operation(), physical, row_lineage);
+            if !position && row_lineage {
+                for name in [ICEBERG_ROW_ID_COL, ICEBERG_LAST_UPDATED_SEQ_COL] {
+                    assert!(source.field_with_name(name).unwrap().is_nullable());
+                }
+            }
             let execution = rewrite_execution_schema(
                 request.operation(),
                 &metadata,
@@ -2129,6 +2138,8 @@ mod tests {
                 let expected = execution.binding(ordinal).unwrap();
                 assert_eq!(actual.execution_type(), Some(expected));
                 assert_eq!(actual.field().data_type(), expected.data_type());
+                assert_eq!(actual.field().is_nullable(), expected.nullable());
+                assert_eq!(source_field.is_nullable(), expected.nullable());
                 assert_eq!(actual.field().metadata(), source_field.metadata());
             }
             if let ConnectorWriteInputShape::DeletionVector {

@@ -892,26 +892,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-compatibility/novarocks_mor_lineage_spark_read",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_multi_dv_puffin_novarocks_dml",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_complex_nested",
       "failure": {
         "class": "error_code",
@@ -952,26 +932,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-dml/merge_insert_row_id_unique",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/mor_lineage_sequence_inheritance",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-dml/struct_named_metadata_value",
       "failure": {
         "class": "error_code",
@@ -979,16 +939,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/update_mor",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
       "expires": "2026-12-15"
     },
     {
@@ -1472,16 +1422,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-rest/iceberg_rest_update_merge",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_bucket_shuffle_right_outer_equivalence",
       "failure": {
         "class": "error_code",
@@ -1962,56 +1902,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-dml/merge_into_cow",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_matched_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_matched_delete_insert",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_mor",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_upsert_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 3 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:mv-rewrite/mv_rewrite_count_rollup_empty",
       "failure": {
         "class": "error_code",
@@ -2360,6 +2250,16 @@
       "reason": "The case remains FAIL: its original step-4 expected Representation error now actually matches, and result steps 5/6/8/9 pass; the new first failure is positive result statement 10, selected overload builtin.scalar/array_length/(list<any<T>>)->i32;strict;legacy, with actual sql.analyze.unavailable_implementation. B7 owns this exact missing array scalar implementation. Installed cardinality does not install the distinct array_length declaration, as the current owner predicate and independent owner test explicitly state. No independent failed oracle or cleanup violation accompanies this refusal. Deliver that exact pure array_length profile, then pass the entire unchanged current frozen native case including its step-4 negative oracle and later array results before removal; unreached statements 11-13 are not PASS.",
       "owner": "UEA-5E B7",
       "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:mv-storage-contract/mv_storage_contract_spine",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "RWM-5 baseline e869bf82f: unchanged native 1FE+3BE case first fails at step 9 because builtin.aggregate/sum_state/derived-v1 has no installed implementation for the selected carrier. The prior step 8 text assertion passes; step 22 legacy golden is unreachable. Suite, server and private fixture cleanup completed. Evidence: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-original/. Exit: UEA-7B4 delivers the aggregate-state implementation, the entire unchanged case passes and step 22 is strictly converted, then remove this entry.",
+      "owner": "UEA-7B4",
+      "expires": "2026-12-15"
     }
   ],
   "quarantine": [
@@ -2432,13 +2332,6 @@
       "owner": "B4 set-operation/CTE/topology capability",
       "exit_condition": "B4 restores the missing UNION/topology placement capability; decimal/decimal_error_policy_contract then passes its original exact query.execution.numeric_out_of_range negative oracle at step 24 and every remaining required oracle; remove this quarantine after native verification.",
       "review_by": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/sqlx2_mor_update_from_duplicate_source_rejected",
-      "owner": "B1, B2",
-      "review_by": "2026-12-15",
-      "reason": "D0-6: the unchanged negative oracle at UPDATE FROM step 2 requires MOR UPDATE duplicate _row_id rejection. Current native execution instead returns UnsupportedCompiledShape from the DML compilation Source domain before runtime; the SQL-owned row-mutation graph necessarily authors Router and the compiled carrier explicitly refuses that B1 router capability. B2 owns the MOR UPDATE consumer contract. Preserve the failed negative oracle; this is quarantine only, never a known-only error-code exemption.",
-      "exit_condition": "B1 restores the exact compiled change-stream Router sink/edge used by this MOR UPDATE producer, and B2 revalidates this unchanged full native case: duplicate _row_id error must match, original target remains unchanged, and the complete case/suite cleanup passes. Remove this exact quarantine after that delivery; an arbitrary Unsupported code, a different duplicate test, or a passed prefix is insufficient."
     },
     {
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_base_rename_referenced",
@@ -2523,6 +2416,13 @@
       "review_by": "2026-12-15",
       "reason": "User scope decision on 2026-11-03: keep finite support under current upstream limitations; stop maximum-depth expansion and temporarily ignore this exact depth64 case. Native id-only INSERT reaches query.execution.invariant in its DML source domain; the underlying cause remains unconfirmed. The separately confirmed Writer32 refusal is not proof of that Invariant root cause. The iceberg-rust 0.11 embedded-manifest-schema recursion limit is a separately confirmed upstream gap; do not relabel all observed failures as that SDK cause. Preserve original SQL, goldens, SDK inputs and native failures; this is a case-scope quarantine, not a generic error-code waiver.",
       "exit_condition": "After an official upstream release/public API satisfies the manifest recovery condition, explicitly reassess the remaining codec, Writer, value-path and client gaps under a separately approved scope. Run the original complete case on native 1FE+3BE, including all result oracles and cleanup; remove this quarantine only after it passes. The review date does not establish support."
+    },
+    {
+      "unit": "sql-case:mv-storage-contract/mv_storage_contract_postcommit_projection_failure",
+      "owner": "UEA-7B4",
+      "review_by": "2026-12-15",
+      "reason": "RWM-5 baseline e869bf82f: unchanged native step 8 reports an infrastructure failure (query completed before the post-query marker barrier was reached), so it cannot be a known-failure error-code exemption. In a separate diagnostic copy with only the step 8 kill/expected-error directives removed, the refresh fails with sql.analyze.unavailable_implementation for builtin.aggregate/sum_state/derived-v1, matching the spine aggregate-state blocker. The original negative assertion remains failed and the hold wiring is not qualified. Original evidence: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-original/; diagnostic only: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-diagnostic/. All observed suite/server/private-fixture cleanup completed.",
+      "exit_condition": "UEA-7B4 installs the aggregate-state implementation; rerun the entire original case with its unchanged postcommit fault and negative oracle, prove the intended marker/crash/recovery and cleanup, strictly convert step 9, then remove quarantine. If the barrier still cannot be reached after the aggregate refusal is removed, hand the exact first failure to RWM-4 without weakening the oracle."
     }
   ]
 }

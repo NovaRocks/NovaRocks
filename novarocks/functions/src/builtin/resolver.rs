@@ -102,9 +102,8 @@ pub fn resolve_scalar_function_signature_with_overload(
     // position. Strictly widening only: a spec never accepts an actual it
     // could not hold.
     for (index, sig) in candidates.iter().enumerate() {
-        if integer_widening_matches(sig, arg_types) {
-            return resolved_signature(sig, arg_types, &Bindings::default())
-                .map(|resolved| (index, resolved));
+        if let Some(bindings) = integer_widening_bindings(sig, arg_types) {
+            return resolved_signature(sig, arg_types, &bindings).map(|resolved| (index, resolved));
         }
     }
 
@@ -156,6 +155,9 @@ pub fn resolve_scalar_function_signature_at_overload(
     }
     let mut bindings = Bindings::default();
     if polymorphic_matches(signature, arg_types, &mut bindings, BindMode::Strict) {
+        return resolved_signature(signature, arg_types, &bindings);
+    }
+    if let Some(bindings) = integer_widening_bindings(signature, arg_types) {
         return resolved_signature(signature, arg_types, &bindings);
     }
     if concrete_cast_matches(signature, arg_types) {
@@ -457,13 +459,21 @@ fn carrier_matches_with_creation<H>(
                 )
             })?,
             2 => {
-                if anchor_matches(spec, actual) {
-                    true
-                } else if integer_widens_losslessly(spec, actual) {
+                if integer_widens_losslessly(spec, actual)
+                    || integer_widens_to_map_key(sig, index, actual, &bindings, args)
+                {
                     widened = true;
                     true
                 } else {
-                    false
+                    with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                        super::signature::unify_with_construction(
+                            spec,
+                            actual,
+                            &mut bindings,
+                            BindMode::Strict,
+                            creation,
+                        )
+                    })?
                 }
             }
             3 => {
@@ -539,15 +549,21 @@ fn value_signature_decision_with_creation<'a, H>(
     for (index, actual) in arguments.iter().enumerate() {
         work.step()?;
         work.flush()?;
-        let matched = with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
-            super::signature::unify_value_with_construction(
-                signature_spec_at(signature, index),
-                actual,
-                &mut bindings,
-                mode,
-                creation,
-            )
-        })?;
+        let matched = if pass == 2
+            && value_widens_to_map_key(signature, index, actual, &bindings, carriers)
+        {
+            true
+        } else {
+            with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                super::signature::unify_value_with_construction(
+                    signature_spec_at(signature, index),
+                    actual,
+                    &mut bindings,
+                    mode,
+                    creation,
+                )
+            })?
+        };
         work.step()?;
         if !matched {
             return Ok(None);
@@ -702,25 +718,95 @@ fn polymorphic_matches(
 
 /// True iff every argument either anchor-matches its spec or is an integer
 /// that the spec's own integer type can hold without loss.
-fn integer_widening_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
+fn integer_widening_bindings(sig: &Signature, arg_types: &[DataType]) -> Option<Bindings> {
     if !check_arity(sig, arg_types.len()) {
-        return false;
+        return None;
     }
     let mut widened_any = false;
-    let matched = arg_types.iter().enumerate().all(|(idx, actual)| {
+    let mut bindings = Bindings::default();
+    for (idx, actual) in arg_types.iter().enumerate() {
         let spec = signature_spec_at(sig, idx);
-        if anchor_matches(spec, actual) {
-            return true;
-        }
-        if integer_widens_losslessly(spec, actual) {
+        if integer_widens_losslessly(spec, actual)
+            || integer_widens_to_map_key(
+                sig,
+                idx,
+                actual,
+                &bindings,
+                ScalarCarriers::from_data_types(arg_types),
+            )
+        {
             widened_any = true;
-            return true;
+        } else if !unify(spec, actual, &mut bindings, BindMode::Strict) {
+            return None;
         }
-        false
-    });
-    // A signature that matched without widening anything was already decided
-    // by an earlier pass; only reach here for one this pass actually rescued.
-    matched && widened_any
+    }
+    // The original strict/polymorphic passes retain precedence. A fixed
+    // signed anchor must actually widen; generic siblings keep strict T/D.
+    widened_any.then_some(bindings)
+}
+
+/// Only the declared Map<K, V> plus probe K role anchors this conversion.
+/// The original Map key and binding stay fixed. Scalar repeated T, List<T>,
+/// undecided NULL maps and later bindings never authorize a generic widening.
+/// This inspects one actual Map key in constant work, without a prefix scan.
+fn integer_widens_to_map_key(
+    signature: &Signature,
+    index: usize,
+    actual: &DataType,
+    bindings: &Bindings,
+    arguments: ScalarCarriers<'_>,
+) -> bool {
+    if index != 1 {
+        return false;
+    }
+    let TypeSpec::Any(name) = signature_spec_at(signature, index) else {
+        return false;
+    };
+    let TypeSpec::Map(key, _) = signature_spec_at(signature, 0) else {
+        return false;
+    };
+    if !matches!(key.as_ref(), TypeSpec::Any(key_name) if key_name == name) {
+        return false;
+    }
+    let Some(DataType::Map(entries, _)) = arguments.get(0) else {
+        return false;
+    };
+    let DataType::Struct(fields) = entries.data_type() else {
+        return false;
+    };
+    if fields.len() != 2 {
+        return false;
+    }
+    let Some(bound) = bindings.lookup(name) else {
+        return false;
+    };
+    let anchor = match bound {
+        DataType::Int8 => TypeSpec::Int8,
+        DataType::Int16 => TypeSpec::Int16,
+        DataType::Int32 => TypeSpec::Int32,
+        DataType::Int64 => TypeSpec::Int64,
+        _ => return false,
+    };
+    // The right-hand side is now a primitive; this cannot walk a nested key.
+    fields[0].data_type() == &bound && integer_widens_losslessly(&anchor, actual)
+}
+
+fn value_widens_to_map_key(
+    signature: &Signature,
+    index: usize,
+    actual: &FunctionValueType,
+    bindings: &Bindings,
+    arguments: ScalarCarriers<'_>,
+) -> bool {
+    let TypeSpec::Any(name) = signature_spec_at(signature, index) else {
+        return false;
+    };
+    let Some(bound) = bindings.lookup_value_borrowed(name) else {
+        return false;
+    };
+    actual.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && bound.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+        && integer_widens_to_map_key(signature, index, actual.data_type(), bindings, arguments)
 }
 
 fn integer_widens_losslessly(spec: &TypeSpec, actual: &DataType) -> bool {
@@ -818,6 +904,182 @@ mod tests {
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))
+    }
+
+    #[test]
+    fn lossless_anchor_widening_keeps_strict_generic_siblings_and_selected_replay() {
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            true,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let plain = FunctionValueType::new(DataType::Utf8, false);
+        for (name, arguments) in [
+            (
+                "lead",
+                vec![
+                    json.clone(),
+                    FunctionValueType::new(DataType::Int32, false),
+                    plain.clone(),
+                ],
+            ),
+            (
+                "lag",
+                vec![
+                    json.clone(),
+                    FunctionValueType::new(DataType::Int16, true),
+                    plain.clone(),
+                ],
+            ),
+            (
+                "array_slice",
+                vec![
+                    FunctionValueType::new(list_of(DataType::Int32), true),
+                    FunctionValueType::new(DataType::Int32, false),
+                ],
+            ),
+            (
+                "session_number",
+                vec![
+                    FunctionValueType::new(DataType::Int32, true),
+                    FunctionValueType::new(DataType::Int32, false),
+                ],
+            ),
+            (
+                "__map_element_at",
+                vec![
+                    FunctionValueType::new(
+                        DataType::Map(
+                            Arc::new(Field::new(
+                                "entries",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("key", DataType::Int64, false),
+                                        Field::new("value", DataType::Utf8, true),
+                                    ]
+                                    .into(),
+                                ),
+                                false,
+                            )),
+                            false,
+                        ),
+                        true,
+                    ),
+                    FunctionValueType::new(DataType::Int32, true),
+                ],
+            ),
+        ] {
+            let carriers = arguments
+                .iter()
+                .map(|ty| ty.data_type().clone())
+                .collect::<Vec<_>>();
+            let (carrier_index, carrier) =
+                resolve_scalar_function_signature_with_overload(name, &carriers).unwrap();
+            let (index, resolved) =
+                resolve_scalar_value_signature_with_overload(name, &arguments, &Control).unwrap();
+            assert_eq!(index, carrier_index, "{name}");
+            assert_eq!(carrier.argument_types[1], DataType::Int64);
+            assert_eq!(
+                resolved.argument_types[0], arguments[0],
+                "generic source stays exact: {name}"
+            );
+            assert_eq!(
+                resolved.argument_types[1],
+                FunctionValueType::new(DataType::Int64, arguments[1].nullable())
+            );
+            if arguments.len() == 3 {
+                assert_eq!(
+                    resolved.argument_types[2], arguments[2],
+                    "independent D domain stays exact"
+                );
+            }
+            assert_eq!(
+                resolve_scalar_function_signature_at_overload(name, index, &carriers).unwrap(),
+                carrier
+            );
+            assert_eq!(
+                resolve_scalar_value_signature_at_overload(name, index, &arguments, &Control)
+                    .unwrap(),
+                resolved
+            );
+        }
+        let narrow_map = FunctionValueType::new(
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Int32, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        );
+        assert!(
+            resolve_scalar_value_signature_with_overload(
+                "__map_element_at",
+                &[narrow_map, FunctionValueType::new(DataType::Int64, false)],
+                &Control
+            )
+            .is_err(),
+            "probe cannot narrow or change the existing map-key binding"
+        );
+        let repeated = Signature::new(
+            vec![TypeSpec::Any("T"), TypeSpec::Any("T"), TypeSpec::Int64],
+            TypeSpec::Any("T"),
+        );
+        for arguments in [
+            [DataType::Int8, DataType::Int16, DataType::Int32],
+            [DataType::Int16, DataType::Int8, DataType::Int32],
+        ] {
+            assert!(
+                integer_widening_bindings(&repeated, &arguments).is_none(),
+                "ordinary repeated T stays strict in both orders"
+            );
+        }
+        let list = FunctionValueType::new(list_of(DataType::Int64), false);
+        let item = FunctionValueType::new(DataType::Int32, false);
+        assert!(
+            resolve_scalar_function_signature_with_overload(
+                "array_append",
+                &[list.data_type().clone(), DataType::Int32]
+            )
+            .is_err(),
+            "List<T> does not grant the Map key role"
+        );
+        assert!(
+            resolve_scalar_value_signature_with_overload("array_append", &[list, item], &Control)
+                .is_err()
+        );
+        assert!(
+            resolve_scalar_value_signature_with_overload(
+                "lead",
+                &[json.clone(), plain.clone()],
+                &Control
+            )
+            .is_err(),
+            "text offset cannot widen"
+        );
+        assert!(
+            resolve_scalar_value_signature_with_overload("lead", &[plain, json], &Control).is_err(),
+            "nominal JSON cannot become a signed offset"
+        );
     }
 
     #[test]

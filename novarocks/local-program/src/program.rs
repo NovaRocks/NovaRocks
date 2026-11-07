@@ -74,6 +74,7 @@ pub enum AssertRowsMode {
     },
     PerKeyAtMostOne {
         applicability: ProgramAssertionApplicability,
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
         key_slots: Vec<SlotId>,
         key_labels: Vec<Arc<str>>,
         message_prefix: Arc<str>,
@@ -1863,6 +1864,7 @@ fn validate_relationships(
                 return Err(LocalProgramError::LayoutMismatch.into());
             }
             if let AssertRowsMode::PerKeyAtMostOne {
+                declared_violation,
                 applicability,
                 key_slots,
                 key_labels,
@@ -1870,6 +1872,9 @@ fn validate_relationships(
             } = mode
             {
                 if key_slots.is_empty()
+                    || declared_violation.is_some_and(|reason| {
+                        !novarocks_failure_contract::sql_reason::is_row_match_violation(reason)
+                    })
                     || key_slots.len() != key_labels.len()
                     || message_prefix.is_empty()
                     || key_labels.iter().any(|label| label.is_empty())

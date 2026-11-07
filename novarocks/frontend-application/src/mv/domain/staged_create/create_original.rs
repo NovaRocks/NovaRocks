@@ -1226,7 +1226,7 @@ fn committed_failure(error: CreatePhaseFailure) -> CreatePhaseFailure {
         domain.message(),
     )
     .with_compile_control(domain.compile_control_error())
-    .with_unavailable_implementation(domain.unavailable_implementation().cloned());
+    .with_analyze_error(domain.analyze_error().cloned());
     if let Some(cause) = domain.original_failure() {
         known = known.with_original_failure(cause.clone())
     }
@@ -1628,6 +1628,7 @@ mod original_stage_tests {
                 object_id,
                 Bytes::from_static(b"schema-1"),
                 true,
+                Some(1),
                 true,
                 vec![
                     MvObservedSourceField::try_new(
@@ -1773,17 +1774,31 @@ mod original_stage_tests {
                 entrance.clone(),
             ));
             let host = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
-            let ports = IcebergMvCorePorts::new_with_management_entrance(
-                Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-                None,
-                host.clone(),
-                host,
-                readiness,
-                Arc::new(UnavailableMvStorageObservationPort),
-                entrance.clone(),
-                crate::application::test_constant_policy(),
-            );
+            let ports = {
+                let trc_catalog = Arc::new(
+                    crate::catalog_application::query_catalog::new_query_catalog_service(),
+                );
+                let trc_controls = host.clone();
+                let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+                    trc_catalog.clone(),
+                    trc_controls.clone(),
+                );
+                IcebergMvCorePorts::new_with_management_entrance(
+                    Arc::new(
+                        novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap(),
+                    ),
+                    trc_catalog.clone(),
+                    None,
+                    trc_controls.clone(),
+                    host,
+                    readiness,
+                    Arc::new(UnavailableMvStorageObservationPort),
+                    entrance.clone(),
+                    crate::application::test_constant_policy(),
+                    Arc::new(novarocks_query_application::view::QueryViewService::new()),
+                    trc_system_relations,
+                )
+            };
             let wake = Arc::new(Wake::default());
             let cancellation = QueryCancellationView::governed(scope.cancellation().unwrap(), None);
             let requests = Arc::new(NoRepositoryIo);

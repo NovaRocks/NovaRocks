@@ -33,6 +33,6 @@ FROM (
     SELECT CAST(3 AS BIGINT)
 ) b
 LEFT JOIN LATERAL UNNEST(
-    IF(b.id = 1, [10, 20], IF(b.id = 2, [], CAST(NULL AS ARRAY<BIGINT>)))
+    IF(b.id = 1, [CAST(10 AS BIGINT), 20], IF(b.id = 2, [], CAST(NULL AS ARRAY<BIGINT>)))
 ) AS u(x) ON TRUE
 ORDER BY b.id, x;

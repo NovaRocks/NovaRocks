@@ -1,5 +1,5 @@
 -- query 7
--- types	bigint	bigint	bigint
+-- types	integer	integer	bigint
 g	k	cnt
 0	2	1
 0	3	1

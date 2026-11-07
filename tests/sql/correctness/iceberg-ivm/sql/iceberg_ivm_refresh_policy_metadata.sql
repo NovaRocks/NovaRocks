@@ -47,6 +47,8 @@ CREATE TABLE ice_ivm_policy_${uuid0}.ns_${uuid0}.orders (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
+-- Establish a real v3 source snapshot before testing MV policy metadata.
+INSERT INTO ice_ivm_policy_${uuid0}.ns_${uuid0}.orders VALUES (1, 1);
 SET CATALOG ice_ivm_policy_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW orders_policy_mv_${uuid0}

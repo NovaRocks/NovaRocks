@@ -24,14 +24,17 @@ pub(crate) fn insert_pre_expand_keyed_assert(
     physical: &mut PhysicalPlanNode,
     keyed_assert: &PreExpandKeyedAssertSpec,
 ) -> Result<(), String> {
+    if keyed_assert.key_columns.is_empty() {
+        return Err("DML change-stream keyed assert requires at least one key".to_string());
+    }
     let mut expand_count = 0usize;
-    let mut key_column_id = None;
+    let mut key_column_ids = None;
     let mut applicability_column_id = None;
     validate_pre_expand_keyed_assert_in_node(
         physical,
         keyed_assert,
         &mut expand_count,
-        &mut key_column_id,
+        &mut key_column_ids,
         &mut applicability_column_id,
     )?;
     if expand_count != 1 {
@@ -39,11 +42,11 @@ pub(crate) fn insert_pre_expand_keyed_assert(
             "DML change-stream keyed assert requires exactly one native ChangeEventExpand node, found {expand_count}"
         ));
     }
-    let key_column_id = key_column_id.expect("one validated ChangeEventExpand has one key");
+    let key_column_ids = key_column_ids.expect("one validated ChangeEventExpand has keys");
     apply_pre_expand_keyed_assert_in_node(
         physical,
         keyed_assert,
-        key_column_id,
+        &key_column_ids,
         applicability_column_id,
     );
     Ok(())
@@ -53,7 +56,7 @@ fn validate_pre_expand_keyed_assert_in_node(
     node: &PhysicalPlanNode,
     keyed_assert: &PreExpandKeyedAssertSpec,
     expand_count: &mut usize,
-    key_column_id: &mut Option<ColumnId>,
+    key_column_ids: &mut Option<Vec<ColumnId>>,
     applicability_column_id: &mut Option<ColumnId>,
 ) -> Result<(), String> {
     for child in &node.children {
@@ -61,7 +64,7 @@ fn validate_pre_expand_keyed_assert_in_node(
             child,
             keyed_assert,
             expand_count,
-            key_column_id,
+            key_column_ids,
             applicability_column_id,
         )?;
     }
@@ -76,7 +79,13 @@ fn validate_pre_expand_keyed_assert_in_node(
             node.children.len()
         ));
     };
-    *key_column_id = Some(find_pre_expand_key_column_id(child, expand, keyed_assert)?);
+    *key_column_ids = Some(
+        keyed_assert
+            .key_columns
+            .iter()
+            .map(|(name, label)| find_pre_expand_key_column_id(child, expand, name, label))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     *applicability_column_id = keyed_assert.applicability_output_ordinal.map(|ordinal| {
         let column = effective_physical_output_columns(child).get(ordinal).ok_or_else(|| {
             format!("DML change-stream applicability output ordinal {ordinal} is outside the native child")
@@ -92,14 +101,14 @@ fn validate_pre_expand_keyed_assert_in_node(
 fn apply_pre_expand_keyed_assert_in_node(
     node: &mut PhysicalPlanNode,
     keyed_assert: &PreExpandKeyedAssertSpec,
-    key_column_id: ColumnId,
+    key_column_ids: &[ColumnId],
     applicability_column_id: Option<ColumnId>,
 ) -> bool {
     for child in &mut node.children {
         if apply_pre_expand_keyed_assert_in_node(
             child,
             keyed_assert,
-            key_column_id,
+            key_column_ids,
             applicability_column_id,
         ) {
             return true;
@@ -112,13 +121,20 @@ fn apply_pre_expand_keyed_assert_in_node(
     let child = node.children.pop().expect("validated single child");
     let output_columns = child.output_columns.clone();
     node.children.push(PhysicalPlanNode {
-        kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
-            "DML change-stream matched row uniqueness",
-            vec![key_column_id],
-            vec![keyed_assert.key_label.clone()],
-            keyed_assert.message_prefix.clone(),
-            applicability_column_id,
-        )),
+        kind: PhysicalPlanKind::AssertOneRow(
+            PlanAssertOneRowNode::per_key_at_most_one(
+                "DML change-stream matched row uniqueness",
+                key_column_ids.to_vec(),
+                keyed_assert
+                    .key_columns
+                    .iter()
+                    .map(|(_, label)| label.clone())
+                    .collect(),
+                keyed_assert.message_prefix.clone(),
+                applicability_column_id,
+            )
+            .with_declared_violation(keyed_assert.declared_violation),
+        ),
         children: vec![child],
         output_columns,
         stats: node.stats.clone(),
@@ -130,16 +146,14 @@ fn apply_pre_expand_keyed_assert_in_node(
 fn find_pre_expand_key_column_id(
     child: &PhysicalPlanNode,
     expand: &crate::planner::physical::DistributedChangeEventExpandNode,
-    keyed_assert: &PreExpandKeyedAssertSpec,
+    key_column_name: &str,
+    key_label: &str,
 ) -> Result<ColumnId, String> {
-    match unique_output_column_id_by_name(
-        effective_physical_output_columns(child),
-        &keyed_assert.key_column_name,
-    ) {
+    match unique_output_column_id_by_name(effective_physical_output_columns(child), key_column_name)
+    {
         Ok(column_id) => Ok(column_id),
-        Err(name_err) if can_derive_key_from_row_id_assignment(keyed_assert) => {
-            find_pre_expand_key_column_id_from_assignment(child, expand, keyed_assert)?
-                .ok_or(name_err)
+        Err(name_err) if can_derive_key_from_assignment(key_column_name, key_label) => {
+            find_pre_expand_key_column_id_from_assignment(child, expand, key_label)?.ok_or(name_err)
         }
         Err(err) => Err(err),
     }
@@ -163,31 +177,33 @@ fn unique_output_column_id_by_name(
     Ok(column.column_id)
 }
 
-fn can_derive_key_from_row_id_assignment(keyed_assert: &PreExpandKeyedAssertSpec) -> bool {
-    keyed_assert
-        .key_column_name
-        .eq_ignore_ascii_case("__nr_row_id")
-        && keyed_assert
-            .key_label
-            .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
+fn can_derive_key_from_assignment(key_column_name: &str, key_label: &str) -> bool {
+    [
+        ("__nr_file", crate::common::ICEBERG_FILE_PATH_COL),
+        ("__nr_pos", crate::common::ICEBERG_ROW_POS_COL),
+        ("__nr_row_id", crate::common::ICEBERG_ROW_ID_COL),
+    ]
+    .iter()
+    .any(|(name, label)| {
+        key_column_name.eq_ignore_ascii_case(name) && key_label.eq_ignore_ascii_case(label)
+    })
 }
 
 fn find_pre_expand_key_column_id_from_assignment(
     child: &PhysicalPlanNode,
     expand: &crate::planner::physical::DistributedChangeEventExpandNode,
-    keyed_assert: &PreExpandKeyedAssertSpec,
+    key_label: &str,
 ) -> Result<Option<ColumnId>, String> {
     let mut output_columns = expand
         .output_columns
         .iter()
-        .filter(|column| column.name.eq_ignore_ascii_case(&keyed_assert.key_label));
+        .filter(|column| column.name.eq_ignore_ascii_case(key_label));
     let Some(output_column) = output_columns.next() else {
         return Ok(None);
     };
     if output_columns.next().is_some() {
         return Err(format!(
-            "DML change-stream native keyed assert output column `{}` is ambiguous",
-            keyed_assert.key_label
+            "DML change-stream native keyed assert output column `{key_label}` is ambiguous"
         ));
     }
 
@@ -207,8 +223,7 @@ fn find_pre_expand_key_column_id_from_assignment(
             if let Some(previous) = key_column_id {
                 if previous != column_id {
                     return Err(format!(
-                        "DML change-stream native keyed assert output `{}` is assigned from multiple child columns: {:?} and {:?}",
-                        keyed_assert.key_label, previous, column_id
+                        "DML change-stream native keyed assert output `{key_label}` is assigned from multiple child columns: {previous:?} and {column_id:?}"
                     ));
                 }
             } else {

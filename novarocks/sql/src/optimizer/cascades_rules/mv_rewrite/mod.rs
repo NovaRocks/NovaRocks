@@ -45,6 +45,8 @@ pub(crate) struct MvRewriteCandidate {
     /// SPJG decomposition of the MV defining query, expressed over the
     /// base table's ColumnIds (allocated in the shared ColumnRefFactory).
     pub mv: SpjgDescriptor,
+    /// Exact target column indices bound from the original analyzed names.
+    pub output_targets: Box<[usize]>,
     /// Scalar arena that owns every ScalarId stored in `mv`.
     pub mv_scalars: ScalarArena,
     /// Database (namespace) of the MV target table, for ScanOp.

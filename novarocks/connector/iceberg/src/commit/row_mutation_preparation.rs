@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn a_strategy_rule_failure_is_a_denial_not_an_internal_fault() {
         let owner = owner();
-        // UPDATE needs v3 + row lineage; a v2 table fails the rule.
+        // UPDATE needs v3; a v2 table fails the rule.
         let handle = PayloadSpec::new(&metadata(FormatVersion::V2, &[])).handle();
         let error = denial(
             prepare_row_mutation(
@@ -1211,7 +1211,7 @@ mod tests {
             error,
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "UPDATE requires an Iceberg v3 table with write.row-lineage=true",
+                "UPDATE and MERGE require an Iceberg v3 table",
             )
         );
     }

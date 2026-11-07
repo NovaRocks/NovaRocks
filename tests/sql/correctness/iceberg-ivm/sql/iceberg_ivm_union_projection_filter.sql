@@ -62,6 +62,15 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_union_pf_${uuid0};
 USE ns_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
+INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live VALUES
+  (10, 'same', 11),
+  (20, 'live-only', 20);
+INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive VALUES
+  (10, 'same', 99),
+  (30, 'archive-only', 30);
 CREATE MATERIALIZED VIEW union_pf_mv_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -73,15 +82,6 @@ UNION ALL
 SELECT id, name, amount
 FROM ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive
 WHERE amount >= 0;
-
--- query 2
--- @skip_result_check=true
-INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live VALUES
-  (10, 'same', 11),
-  (20, 'live-only', 20);
-INSERT INTO ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_archive VALUES
-  (10, 'same', 99),
-  (30, 'archive-only', 30);
 REFRESH MATERIALIZED VIEW union_pf_mv_${uuid0};
 
 -- query 3

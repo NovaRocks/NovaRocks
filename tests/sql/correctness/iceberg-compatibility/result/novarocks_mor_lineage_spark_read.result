@@ -1,5 +1,5 @@
 -- query 7
--- legacy
+-- types	bigint	integer
 id	value
 1	10
 2	220

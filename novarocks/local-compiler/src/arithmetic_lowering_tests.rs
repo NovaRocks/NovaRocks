@@ -552,11 +552,7 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                     .own_effects(invocation.context)
                     .for_use(invocation.context)
                     .unwrap();
-                assert_eq!(
-                    own.may_raise_row_error,
-                    op == ArithmeticOperator::Modulo
-                        || (op != ArithmeticOperator::Divide && (left == 3 || right == 3))
-                );
+                assert!(own.may_raise_row_error);
                 assert!(!own.has_instance_state);
                 for (ordinal, local, physical, source_ordinal, physical_value) in [
                     (0, *a, fixture.left, 1, 103),
@@ -657,20 +653,20 @@ fn nested_signed_arithmetic_preserves_independent_scoped_switches_and_child_row_
             .unwrap();
         assert_eq!(outer.allow_throw_exception(), allow);
         assert_eq!(inner.allow_throw_exception(), !allow);
-        assert_eq!(outer.left_type().data_type(), &DataType::Int16);
+        assert_eq!(outer.left_type().data_type(), &DataType::Int8);
         assert!(outer.left_type().nullable());
-        assert_eq!(outer.result_type().data_type(), &DataType::Int32);
+        assert_eq!(outer.result_type().data_type(), &DataType::Int8);
         let parent = outer.own_effects(invocation.context);
         let argument = inner.own_effects(child.context);
         assert!(
-            !parent
+            parent
                 .for_use(invocation.context)
                 .unwrap()
                 .may_raise_row_error
         );
         assert!(argument.for_use(child.context).unwrap().may_raise_row_error);
-        // Use the actual checked occurrence edge. A pure parent's own facts
-        // cannot erase its child's error; this does not fabricate a call token.
+        // Use the actual checked occurrence edge. Both arithmetic operations
+        // retain their own errors without fabricating a call token.
         let composed = parent
             .join_control_argument(argument, flow.shared_flow(), 0)
             .unwrap();
@@ -716,7 +712,7 @@ fn assert_arithmetic_failure(error: FragmentCompileError, expected: ArithmeticPr
     );
 }
 #[test]
-fn nullable_false_division_cannot_hide_a_successful_null_behind_nonnullable_result() {
+fn nullable_false_division_preserves_the_existing_arithmetic_result_contract() {
     let functions = functions();
     let ty = FunctionValueType::new(DataType::Int64, false);
     let fixture = fixture(
@@ -728,8 +724,8 @@ fn nullable_false_division_cannot_hide_a_successful_null_behind_nonnullable_resu
         false,
         false,
     );
-    // The checked source has nonnullable literal operands 12 and 0. Division
-    // by zero succeeds with NULL, so preparation must reject this result claim.
+    // Integer division now reports row errors, but this slice deliberately
+    // retains the existing nullable frozen binary arithmetic output contract.
     let source = package(&fixture);
     assert!(
         !source

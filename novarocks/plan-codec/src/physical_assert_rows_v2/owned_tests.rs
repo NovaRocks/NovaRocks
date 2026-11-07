@@ -307,6 +307,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             }
         }
         let node = source(p::RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
             keys: vec![p::ValueId::new(0); 320].into_boxed_slice(),
             labels: vec![Box::<str>::from("Ω\0界"); 320].into_boxed_slice(),
@@ -416,6 +417,7 @@ fn caller_owned_empty_inner_headers_refuse_before_floor_pending_quantum() {
             },
         ));
         let empty = source(p::RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
             keys: Box::default(),
             labels: Box::default(),
@@ -423,6 +425,7 @@ fn caller_owned_empty_inner_headers_refuse_before_floor_pending_quantum() {
         });
         let empty_raw = expected(wire::row_count_assertion_node::Kind::PerKeyAtMostOne(
             wire::PerKeyRowCountAssertion {
+                declared_sql_violation: None,
                 applicability: Some(wire::AssertionApplicability {
                     kind: Some(wire::assertion_applicability::Kind::AllRows(
                         novarocks_proto_models::physical_control_v2::Empty {},

@@ -245,6 +245,18 @@ impl QueryServiceError {
         if !matches!(&self.body, QueryServiceErrorBody::Execution { .. }) {
             return;
         }
+        if let Some(input) = self.execution_failure()
+            && input.row_match_violation_message().is_some()
+        {
+            let message = input.user_error().to_string();
+            if let QueryServiceErrorBody::Execution {
+                message: target, ..
+            } = &mut self.body
+            {
+                *target = message;
+            }
+            return;
+        }
         let message = StatementExternalEffectDisposition::diagnostic(
             &ExecutionPublicBase(self),
             self.external_effect_disposition,
@@ -484,6 +496,19 @@ impl fmt::Display for ServiceExternalEffectDiagnostic<'_> {
             self.error.external_effect_disposition,
             self.companion,
         );
+        if self
+            .error
+            .execution_failure()
+            .is_some_and(|input| input.row_match_violation_message().is_some())
+        {
+            return fmt::Display::fmt(
+                &StatementExternalEffectDisposition::diagnostic(
+                    &ExecutionPublicBase(self.error),
+                    combined,
+                ),
+                f,
+            );
+        }
         if combined == self.error.external_effect_disposition {
             return f.write_str(self.error.message());
         }
@@ -661,6 +686,51 @@ mod publication_message_tests {
         LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationStatementTag,
         LakePublicationTarget,
     };
+
+    #[test]
+    fn declared_match_message_keeps_publication_and_effect_only_in_sidecars() {
+        use novarocks_failure_contract::{FailureClass, FailureFact, sql_reason};
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Data,
+                sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            ),
+            SafeDetail::truncating("keyed assertion (reason 7:317): duplicate physical position"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let expected = input.user_error().to_string();
+        for disposition in [
+            LakePublicationDisposition::KnownUncommitted,
+            LakePublicationDisposition::CommitUnknown,
+            LakePublicationDisposition::KnownCommitted,
+        ] {
+            let terminal = publication(disposition);
+            let error = QueryServiceError::from_execution_failure(input.clone())
+                .attach_publication_terminal(terminal.clone())
+                .attach_external_effect_disposition(
+                    StatementExternalEffectDisposition::KnownCommitted,
+                );
+            assert_eq!(error.message(), expected);
+            assert_eq!(error.execution_failure(), Some(&input));
+            assert_eq!(error.publication_terminal(), Some(&terminal));
+            assert_eq!(
+                error.external_effect_disposition(),
+                Some(StatementExternalEffectDisposition::KnownCommitted)
+            );
+            let diagnostic = error
+                .diagnostic_with_external_effect(Some(
+                    StatementExternalEffectDisposition::KnownCommitted,
+                ))
+                .to_string();
+            assert!(diagnostic.contains("lake publication id="), "{diagnostic}");
+            assert!(
+                diagnostic.contains("KnownCommitted")
+                    || diagnostic.contains("KnownUncommitted")
+                    || diagnostic.contains("CommitUnknown"),
+                "{diagnostic}"
+            );
+        }
+    }
 
     fn selected_input() -> ExecutionFailureInput {
         let source = ConnectorError::new(

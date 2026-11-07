@@ -1240,6 +1240,101 @@ fn default_fixture(
 }
 
 #[test]
+fn installed_lead_lag_i32_text_defaults_keep_bounds_nulls_and_existing_null_targets() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a"),
+        None,
+        Some("c"),
+        Some("d"),
+    ]));
+    let defaults: ArrayRef = Arc::new(Int32Array::from(vec![
+        Some(i32::MIN),
+        Some(i32::MAX),
+        None,
+        Some(6),
+    ]));
+    let frames = whole_frames(4);
+    let peers = [WindowRowRange { start: 0, end: 4 }];
+    for name in NAMES {
+        for distance in [1, 5] {
+            let offset = cv(Some(distance), false);
+            let fixture = Fixture::with_arguments(
+                name,
+                vec![
+                    FunctionArgument::Value {
+                        value_type: ty(&source, true),
+                        constant: None,
+                    },
+                    FunctionArgument::Value {
+                        value_type: offset.value_type().clone(),
+                        constant: Some(offset.clone()),
+                    },
+                    FunctionArgument::Value {
+                        value_type: ty(&defaults, true),
+                        constant: None,
+                    },
+                ],
+                DecimalOverflowPolicy::OutputNull,
+            );
+            admit_offset_profile(&fixture, &CompileControl::default()).unwrap();
+            let prepared = fixture
+                .prepare(options(false), &CompileControl::default())
+                .unwrap();
+            let args = [
+                EvaluatedArgument::Column(&source),
+                EvaluatedArgument::Constant(&offset),
+                EvaluatedArgument::Column(&defaults),
+            ];
+            let mut part = WindowEvaluationPartition::begin(
+                prepared.clone(),
+                geometry(&prepared, &args, &peers, &frames),
+                &Control::default(),
+            )
+            .unwrap();
+            let expected = match (name, distance) {
+                (_, 5) => [Some("-2147483648"), Some("2147483647"), None, Some("6")],
+                ("lead", 1) => [None, Some("c"), Some("d"), Some("6")],
+                ("lag", 1) => [Some("-2147483648"), Some("a"), None, Some("c")],
+                _ => unreachable!(),
+            };
+            let out = part
+                .evaluate(Selection::all(4), 4, &Control::default())
+                .unwrap();
+            assert!(out.errors().is_empty());
+            assert_eq!(
+                out.values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let rows = [1, 3];
+            let out = part
+                .evaluate(
+                    Selection::try_sparse(4, &rows).unwrap(),
+                    2,
+                    &Control::default(),
+                )
+                .unwrap();
+            assert!(out.errors().is_empty());
+            assert_eq!(
+                out.values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [expected[1], expected[3]]
+            );
+            assert!(part.retained_bytes().unwrap() <= part.retained_upper_bound());
+            part.finish(&Control::default()).unwrap();
+        }
+    }
+}
+
+#[test]
 fn three_arguments_convert_complete_defaults_and_only_replace_missing_targets() {
     let source: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10), None, Some(30)]));
     let defaults: ArrayRef = Arc::new(StringArray::from(vec![
@@ -1847,6 +1942,9 @@ fn lead_lag_static_default_admission_matches_original_recipe_profiles() {
         for (value, default, supported) in [
             (DataType::Int64, DataType::Utf8, true),
             (DataType::Utf8, DataType::Int64, true),
+            (DataType::Utf8, DataType::Int32, true),
+            (DataType::Utf8, DataType::Int8, false),
+            (DataType::Utf8, DataType::Int16, false),
             (DataType::Int32, DataType::Float64, true),
             (DataType::Boolean, DataType::Boolean, false),
             (
