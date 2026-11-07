@@ -27,7 +27,8 @@ use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
 pub use command::convert_insert_command;
 pub(crate) use shaping::{
-    omitted_insert_expr, shape_insert_source, shape_insert_source_with_constants,
+    canonical_insert_wrapper_expression, omitted_insert_expr, shape_insert_source,
+    shape_insert_source_with_constants,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

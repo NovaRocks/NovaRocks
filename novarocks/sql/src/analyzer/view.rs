@@ -55,18 +55,18 @@ impl AnalyzerContext<'_> {
             ));
         }
         let statements = novarocks_parser::parse(&view.raw_sql).map_err(|error| {
-            AnalyzeError::invalid_view(
-                format!(
-                    "Failed parsing stored view '{}': {error}",
-                    view.identity.fqn()
-                ),
-                span,
+            AnalyzeError::stored_definition_parse_failure(
+                crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
+                view.raw_sql.clone().into(),
+                error,
+                Some(span),
             )
         })?;
         let [ast::Statement::Query(query)] = statements.as_slice() else {
-            return Err(AnalyzeError::invalid_view(
-                "Stored view source must contain exactly one query",
-                span,
+            return Err(AnalyzeError::stored_definition_not_query(
+                crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
+                view.raw_sql.clone().into(),
+                Some(span),
             ));
         };
         crate::sql_mode::validate_persisted_query_semantics_typed(query, &self.sql_semantics)
@@ -1330,6 +1330,112 @@ mod tests {
         );
         let synthetic = stored_body_error(&inner, original, Span::new(0, 0));
         assert_eq!(synthetic.to_user_error(Some(caller)).location(), None);
+    }
+
+    #[test]
+    fn stored_parser_failure_preserves_the_saved_source_and_actual_cause_at_the_user_reference() {
+        use crate::analyze_error::StoredDefinitionKind;
+
+        let saved = "SELECT\n (";
+        let parser_error = novarocks_parser::parse(saved).unwrap_err();
+        let parser_public = parser_error.to_user_error(saved);
+        let mut catalog = catalog(declaration(
+            saved,
+            "x",
+            FunctionValueType::new(D::Int64, false),
+        ));
+        let caller = "SELECT '雪' AS label,\n       x\nFROM v";
+        let error = analyze(caller, &catalog).unwrap_err();
+        assert_eq!(error.kind(), AnalyzeErrorKind::InvalidView);
+        assert_eq!(
+            error.stored_definition().unwrap().kind(),
+            StoredDefinitionKind::View
+        );
+        assert_eq!(error.stored_definition().unwrap().name(), "caller.db.v");
+        assert_eq!(error.stored_view_definition_source(), Some(saved));
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<novarocks_parser::ParserError>(),
+            Some(&parser_error)
+        );
+        let public = error.to_user_error(Some(caller));
+        assert_eq!(public.code().as_str(), "sql.analyze.invalid_view");
+        let location = public.location().unwrap();
+        assert_eq!(location.line(), 3);
+        assert_eq!(location.column(), 6);
+        assert_eq!(location.end_line(), Some(3));
+        assert_eq!(location.end_column(), Some(7));
+        assert!(public.message().contains("caller.db.v"));
+        assert!(public.message().contains(parser_public.code().as_str()));
+        let stored_location = parser_public.location().unwrap();
+        assert!(public.message().contains(&format!(
+            "{}:{}",
+            stored_location.line(),
+            stored_location.column()
+        )));
+        assert!(error.to_user_error(None).location().is_none());
+
+        let outer_saved = "\nSELECT x FROM v";
+        let mut outer = declaration(outer_saved, "x", FunctionValueType::new(D::Int64, false));
+        outer.identity.table = "w".into();
+        catalog.views.insert(outer.identity.fqn(), outer);
+        let outer_caller = "SELECT '雪' AS label,\n       x\nFROM w";
+        let nested = analyze(outer_caller, &catalog).unwrap_err();
+        assert_eq!(nested.kind(), AnalyzeErrorKind::InvalidView);
+        assert_eq!(nested.stored_definition().unwrap().name(), "caller.db.v");
+        assert_eq!(nested.stored_view_definition_source(), Some(outer_saved));
+        let location = nested
+            .to_user_error(Some(outer_caller))
+            .location()
+            .unwrap()
+            .clone();
+        assert_eq!(location.line(), 3);
+        assert_eq!(location.column(), 6);
+        let mut cause: &(dyn std::error::Error + 'static) = &nested;
+        let mut actual_parser = None;
+        while let Some(next) = cause.source() {
+            if let Some(parser) = next.downcast_ref::<novarocks_parser::ParserError>() {
+                actual_parser = Some(parser);
+            }
+            cause = next;
+        }
+        assert_eq!(actual_parser, Some(&parser_error));
+        let inner = std::error::Error::source(&nested)
+            .unwrap()
+            .downcast_ref::<AnalyzeError>()
+            .unwrap();
+        assert_eq!(inner.stored_view_definition_source(), Some(saved));
+    }
+
+    #[test]
+    fn stored_non_query_source_preserves_definition_identity_without_inventing_a_parser_failure() {
+        use crate::analyze_error::StoredDefinitionKind;
+
+        for saved in ["DELETE FROM t", "SELECT 1 AS x; SELECT 2 AS x"] {
+            let catalog = catalog(declaration(
+                saved,
+                "x",
+                FunctionValueType::new(D::Int64, false),
+            ));
+            let caller = "SELECT x\nFROM v";
+            let error = analyze(caller, &catalog).unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::InvalidView);
+            assert_eq!(
+                error.stored_definition().unwrap().kind(),
+                StoredDefinitionKind::View
+            );
+            assert_eq!(error.stored_definition().unwrap().name(), "caller.db.v");
+            assert_eq!(error.stored_view_definition_source(), Some(saved));
+            assert!(std::error::Error::source(&error).is_none());
+            let public = error.to_user_error(Some(caller));
+            assert_eq!(public.code().as_str(), "sql.analyze.invalid_view");
+            assert!(public.message().contains("caller.db.v"));
+            assert!(public.message().contains("exactly one query"));
+            let location = public.location().unwrap();
+            assert_eq!(location.line(), 2);
+            assert_eq!(location.column(), 6);
+        }
     }
 
     #[test]

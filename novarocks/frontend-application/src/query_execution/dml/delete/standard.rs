@@ -39,10 +39,13 @@ use crate::query_execution::planning::write_sink::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
+#[cfg(test)]
+use novarocks_parser::ast::Statement;
 use novarocks_parser::ast::{
     BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
-    ObjectName as ParserObjectName, Query, Statement, UnaryOperator,
+    ObjectName as ParserObjectName, Query, UnaryOperator,
 };
+use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::ConnectorRowMutationStrategy;
 use novarocks_spi::connector::ConnectorWriteOperationId;
@@ -92,17 +95,17 @@ pub(super) fn resolve_target(
     Ok((target, target_ref))
 }
 
-fn delete_where_sql(
-    stmt: &Delete,
+fn delete_where_expr<'a>(
+    stmt: &'a Delete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
-) -> Result<String, String> {
+) -> Result<&'a Expr, String> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
         "DELETE requires a WHERE clause; for full table replacement use \
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
             .to_string()
     })?;
     validate_where(where_clause, &target_binding.dml_target_columns()?)?;
-    Ok(novarocks_parser::printer::print_expr(where_clause))
+    Ok(where_clause)
 }
 
 pub(super) async fn prepare_delete_statement_async(
@@ -126,7 +129,7 @@ pub(super) async fn prepare_delete_statement_async(
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
         connector_context.clone(),
     ).await?;
-    let where_sql = delete_where_sql(stmt, &target_binding)?;
+    let where_expr = delete_where_expr(stmt, &target_binding)?;
     // This provider author is pure over the frozen table metadata. It keeps
     // the original operation identity and signs strategy, base and routing.
     let (write_lease, mutation) = target_binding.prepare_row_mutation(
@@ -157,7 +160,7 @@ pub(super) async fn prepare_delete_statement_async(
     let (delete_query, sql_write_input, table_bindings) = bind_delete_write(
         target,
         target_ref,
-        &where_sql,
+        where_expr,
         sink_mode,
         target_binding.planning_pin(),
         &write_session,
@@ -202,7 +205,7 @@ fn delete_write_mode(
 fn bind_delete_write(
     target: &TargetBackend,
     target_ref: &str,
-    where_sql: &str,
+    where_expr: &Expr,
     sink_mode: DmlWriteSinkMode,
     planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     write_session: &crate::query_execution::write_session::ConnectorWriteSession,
@@ -254,7 +257,7 @@ fn bind_delete_write(
     )?;
     let delete_query = build_delete_position_sink_query(
         target,
-        where_sql,
+        where_expr,
         &write_input_columns(write_target.input()),
         target_ref,
     )?;
@@ -263,10 +266,68 @@ fn bind_delete_write(
 
 fn build_delete_position_sink_query(
     target: &TargetBackend,
-    where_clause: &str,
+    where_clause: &Expr,
     sink_columns: &[ColumnDef],
     target_ref: &str,
 ) -> Result<Query, String> {
+    let query = delete_position_sink_query_ast(target, where_clause, sink_columns, target_ref)?;
+    #[cfg(debug_assertions)]
+    crate::query_execution::dml::equivalence::require("F9", &query, || {
+        Ok(legacy_delete_position_sink_sql(
+            target,
+            &novarocks_parser::printer::print_expr(where_clause),
+            sink_columns,
+            target_ref,
+        ))
+    })?;
+    Ok(query)
+}
+
+fn delete_position_sink_query_ast(
+    target: &TargetBackend,
+    where_clause: &Expr,
+    sink_columns: &[ColumnDef],
+    target_ref: &str,
+) -> Result<Query, String> {
+    let projection = sink_columns
+        .iter()
+        .map(|column| {
+            build::item(
+                build::identifier(build::ident(&column.name, Some('`'))),
+                None,
+                false,
+            )
+        })
+        .collect();
+    let name = build::object_name(
+        [&target.catalog, &target.namespace, &target.table]
+            .into_iter()
+            .map(|part| build::ident(part, Some('`')))
+            .collect(),
+    )
+    .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
+    let version = (target_ref != "main").then(|| ast::TableVersion {
+        kind: ast::TableVersionKind::ForVersionAsOf,
+        value: build::string(target_ref),
+        span: SYNTHETIC,
+    });
+    let select = build::select(
+        projection,
+        vec![build::relation(build::table(name, version, None))],
+        Some(where_clause.clone()),
+        ast::GroupBy::None,
+    )
+    .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
+    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+}
+
+#[cfg(debug_assertions)]
+fn legacy_delete_position_sink_sql(
+    target: &TargetBackend,
+    where_clause: &str,
+    sink_columns: &[ColumnDef],
+    target_ref: &str,
+) -> String {
     let projection = sink_columns
         .iter()
         .map(|column| sql_identifier(&column.name))
@@ -277,11 +338,10 @@ fn build_delete_position_sink_query(
     } else {
         format!(" FOR VERSION AS OF {}", sql_string_literal(target_ref))
     };
-    let sql = format!(
+    format!(
         "SELECT {projection} FROM {}{version_clause} WHERE {where_clause}",
         qualify_iceberg_table(target)
-    );
-    parse_generated_query(&sql, "DELETE position-delete rewrite")
+    )
 }
 
 /// The delete-shaped input this statement asks the session to admit.
@@ -343,6 +403,7 @@ fn write_input_columns(
         .collect()
 }
 
+#[cfg(test)]
 fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
     let statements = novarocks_parser::parse(sql)
         .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
@@ -359,6 +420,7 @@ fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
     }
 }
 
+#[cfg(debug_assertions)]
 fn qualify_iceberg_table(target: &TargetBackend) -> String {
     format!(
         "{}.{}.{}",
@@ -368,10 +430,12 @@ fn qualify_iceberg_table(target: &TargetBackend) -> String {
     )
 }
 
+#[cfg(debug_assertions)]
 fn sql_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+#[cfg(debug_assertions)]
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -860,18 +924,39 @@ mod tests {
             column("_pos", DataType::Int64),
             column("region", DataType::Utf8),
         ];
-        let where_clause = "region = 'east' AND amount = 10";
+        let where_clause = where_expr("region = 'east' AND amount = 10");
 
         let query =
-            super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "main")
+            super::build_delete_position_sink_query(&target, &where_clause, &sink_columns, "main")
                 .expect("rewrite query");
-        let rendered = novarocks_parser::printer::print_query(&query);
-
-        assert!(rendered.contains("`_file`"));
-        assert!(rendered.contains("`_pos`"));
-        assert!(rendered.contains("`region`"));
-        assert!(rendered.contains("FROM `ice`.`db`.`orders`"));
-        assert!(!rendered.contains("FOR VERSION AS OF"));
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        assert_eq!(select.selection.as_ref(), Some(&where_clause));
+        assert_eq!(select.projection.len(), 3);
+        for (item, expected) in select.projection.iter().zip(["_file", "_pos", "region"]) {
+            let novarocks_parser::ast::SelectItem::UnnamedExpr(Expr::Identifier(name)) = item
+            else {
+                panic!("identity or partition-source column");
+            };
+            assert_eq!(name.value, expected);
+            assert!(name.quoted);
+            assert_eq!(name.quote_style, Some('`'));
+        }
+        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
+            &select.from[0].relation
+        else {
+            panic!("target table");
+        };
+        assert_eq!(
+            name.parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ice", "db", "orders"]
+        );
+        assert!(name.parts.iter().all(|part| part.quote_style == Some('`')));
+        assert!(version.is_none());
     }
 
     #[test]
@@ -887,15 +972,81 @@ mod tests {
             column("_file", DataType::Utf8),
             column("_pos", DataType::Int64),
         ];
-        let where_clause = "id = 1";
+        let where_clause = where_expr("id = 1");
 
         let query =
-            super::build_delete_position_sink_query(&target, where_clause, &sink_columns, "dev")
+            super::build_delete_position_sink_query(&target, &where_clause, &sink_columns, "dev")
                 .expect("rewrite query");
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let novarocks_parser::ast::TableFactor::Table { name, version, .. } =
+            &select.from[0].relation
+        else {
+            panic!("target table");
+        };
+        assert_eq!(
+            name.parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ice", "db", "orders"]
+        );
+        let version = version.as_ref().expect("branch pin");
+        assert_eq!(
+            version.kind,
+            novarocks_parser::ast::TableVersionKind::ForVersionAsOf
+        );
+        assert!(
+            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String("dev".into()))
+        );
+    }
 
-        let rendered = novarocks_parser::printer::print_query(&query);
-        assert!(rendered.contains("FROM `ice`.`db`.`orders`"));
-        assert!(rendered.contains("FOR VERSION AS OF 'dev'"));
+    #[test]
+    fn delete_position_sink_keeps_branch_bytes_and_user_predicate_positions() {
+        let target = crate::catalog_application::resolver::TargetBackend {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "orders".into(),
+        };
+        let where_clause = where_expr("id = 1");
+        let sink_columns = [
+            column("_file", DataType::Utf8),
+            column("_pos", DataType::Int64),
+        ];
+        let branch = "feature\\branch'quoted";
+        let query =
+            super::delete_position_sink_query_ast(&target, &where_clause, &sink_columns, branch)
+                .unwrap();
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        assert_eq!(select.selection.as_ref(), Some(&where_clause));
+        let novarocks_parser::ast::TableFactor::Table {
+            version: Some(version),
+            ..
+        } = &select.from[0].relation
+        else {
+            panic!("branch pin");
+        };
+        assert!(
+            matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String(branch.into()))
+        );
+        #[cfg(debug_assertions)]
+        {
+            let legacy = super::legacy_delete_position_sink_sql(
+                &target,
+                &novarocks_parser::printer::print_expr(&where_clause),
+                &sink_columns,
+                branch,
+            );
+            let parsed = super::parse_generated_query(&legacy, "legacy branch comparison").unwrap();
+            assert!(
+                !novarocks_parser::ast::syntax_eq_query(&query, &parsed),
+                "the old literal path consumed the branch backslash"
+            );
+        }
     }
 
     // --------------- Timestamp predicate tests ---------------

@@ -940,9 +940,11 @@ mod compile_control_tests {
 
     #[test]
     fn aggregate_preanalysis_preserves_original_request_entry_control() {
-        let query =
-            crate::mv::domain::refresh::definition::parse_mv_select_query("SELECT sum(x) FROM t")
-                .unwrap();
+        let query = crate::mv::domain::refresh::definition::read_stored_mv_query(
+            "SELECT sum(x) FROM t",
+            &novarocks_types::naming::TableIdentity::new("default_catalog", "default_db", "mv"),
+        )
+        .unwrap();
         let provider = NoLookupAfterControl;
         for deadline in [false, true] {
             let control = SqlCompileControl::new(
@@ -1079,8 +1081,9 @@ mod captured_create_analysis_tests {
         use novarocks_sql::planning::catalog::{
             ConnectorReadTableFacts, materialize_connector_read_table,
         };
-        let query = crate::mv::domain::refresh::definition::parse_mv_select_query(
+        let query = crate::mv::domain::refresh::definition::read_stored_mv_query(
             "SELECT count(*) AS n FROM ice.sales.orders",
+            &novarocks_types::naming::TableIdentity::new("ice", "sales", "mv"),
         )
         .unwrap();
         let preparation = SqlCapturedCatalogPreparation::try_new(

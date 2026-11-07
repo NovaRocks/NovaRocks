@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Syntax constructors share the parser's shapes, using fixed SQL as the oracle.
+//! Source-shaped constructors use fixed SQL as the oracle; domain-authored
+//! values preserve their original AST facts without source lexing.
 //! These pure tests need no fixture or process and run with the parser package.
 
 use novarocks_parser::{
@@ -116,6 +117,41 @@ fn identifiers_literals_and_unary_nodes_match_parser_shapes() {
         build::number("9223372036854775808"),
         Err(BuildError::Number(_))
     ));
+}
+
+#[test]
+fn domain_authored_decimal_literals_keep_their_value_beyond_source_integer_width() {
+    // A typed caller can author a DECIMAL value wider than a source integer.
+    // Literal construction preserves that value; source-number admission keeps
+    // its existing width check and cannot serve as the oracle for this input.
+    let digits = "12345678901234567890123456789012345678";
+    let kind = ast::LiteralKind::Number(digits.into());
+    let value = build::literal(kind.clone());
+    let Expr::Literal(literal) = value else {
+        panic!("authored decimal literal");
+    };
+    assert_eq!(literal.kind, kind);
+    assert_eq!(literal.span, SYNTHETIC);
+    assert!(matches!(build::number(digits), Err(BuildError::Number(_))));
+}
+
+#[test]
+fn one_field_value_tuples_remain_distinct_from_source_parentheses() {
+    let field = build::literal(ast::LiteralKind::Number(
+        "12345678901234567890123456789012345678".into(),
+    ));
+    let value = build::tuple_value(vec![field.clone()]).expect("one-field value tuple");
+    let Expr::Tuple(tuple) = value else {
+        panic!("typed one-field tuple");
+    };
+    assert_eq!(tuple.expressions, vec![field.clone()]);
+    assert_eq!(tuple.span, SYNTHETIC);
+    let source_parentheses = build::tuple(vec![field.clone()]).expect("source parentheses");
+    let Expr::Nested(nested) = source_parentheses else {
+        panic!("source parentheses retain their Nested shape");
+    };
+    assert_eq!(*nested.expression, field);
+    assert_eq!(nested.span, SYNTHETIC);
 }
 
 #[test]
@@ -402,6 +438,7 @@ fn builders_reject_missing_required_structure() {
         Err(BuildError::EmptyCase)
     );
     assert_eq!(build::tuple(Vec::new()), Err(BuildError::EmptyTuple));
+    assert_eq!(build::tuple_value(Vec::new()), Err(BuildError::EmptyTuple));
     assert_eq!(build::union_all(Vec::new()), Err(BuildError::EmptyUnion));
     assert_eq!(
         build::qualified_wildcard(Vec::new()),

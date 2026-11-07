@@ -387,8 +387,15 @@ mod tests {
             distribution: None,
             refresh_policy: crate::mv::domain::application::MvCreateRefreshPolicy::Manual,
             select_sql: sql.into(),
-            select_query: crate::mv::domain::refresh::definition::parse_mv_select_query(sql)
-                .unwrap(),
+            select_query: crate::mv::domain::refresh::definition::read_stored_mv_query(
+                sql,
+                &novarocks_types::naming::TableIdentity {
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: "mv".into(),
+                },
+            )
+            .unwrap(),
             properties: Vec::new(),
             primary_key: None,
         };

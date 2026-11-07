@@ -18,11 +18,12 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_parser::{Span, ast, printer};
+use novarocks_parser::{Span, ast, build, printer};
 use novarocks_types::naming::normalize_identifier;
 use novarocks_types::schema::{ColumnDef, ColumnDefault, validate_column_default};
 
 use super::command::{literal_query, plain_function};
+#[cfg(debug_assertions)]
 use crate::query_execution::dml::iceberg_writer::value_type_to_sql_type_name;
 use novarocks_type_contract::FunctionValueType;
 
@@ -152,19 +153,6 @@ fn shape_insert_source_in(
     Ok(Some((query, constants)))
 }
 
-fn query_with_body(body: ast::SetExpr) -> ast::Query {
-    ast::Query {
-        with: None,
-        body: Box::new(body),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        limit_comma_offset: false,
-        fetch: None,
-        span: Span::new(0, 0),
-    }
-}
-
 fn body_has_distinct_set(body: &ast::SetExpr) -> bool {
     match body {
         ast::SetExpr::SetOperation(operation) => {
@@ -248,24 +236,48 @@ fn shape_body(
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
             // Each leaf's target projection still precedes UNION common typing.
-            let inner_sql =
-                printer::print_query(&query_with_body(ast::SetExpr::Select(select.clone())));
-            let sql = format!(
-                "SELECT {} FROM ({inner_sql}) AS __nr_insert_literal_src",
-                expressions
-                    .iter()
-                    .map(printer::print_expr)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let statements = novarocks_parser::parse(&sql)
-                .map_err(|error| format!("INSERT literal projection: {error}"))?;
-            let [ast::Statement::Query(query)] = statements.as_slice() else {
-                return Err("INSERT literal projection expected query".into());
+            #[cfg(debug_assertions)]
+            let legacy_sql = {
+                let inner_sql =
+                    printer::print_query(&build::query(ast::SetExpr::Select(select.clone())));
+                format!(
+                    "SELECT {} FROM ({inner_sql}) AS __nr_insert_literal_src",
+                    expressions
+                        .iter()
+                        .map(printer::print_expr)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
             };
-            *body = ast::SetExpr::Query(Box::new(query.clone()));
-            // Bind the expression in the FINAL parsed target wrapper, not a
-            // pointer or ordinal from the original pre-print SELECT.
+            let expressions = expressions
+                .into_iter()
+                .map(canonical_insert_wrapper_expression)
+                .collect::<Result<Vec<_>, _>>()?;
+            let inner = build::query(ast::SetExpr::Select(select.clone()));
+            let query = build::query(ast::SetExpr::Select(Box::new(
+                build::select(
+                    expressions
+                        .into_iter()
+                        .map(|expr| build::item(expr, None, false))
+                        .collect(),
+                    vec![build::relation(build::derived(
+                        inner,
+                        Some(build::alias(
+                            build::ident("__nr_insert_literal_src", None),
+                            Vec::new(),
+                            true,
+                        )),
+                    ))],
+                    None,
+                    ast::GroupBy::None,
+                )
+                .map_err(|error| error.to_string())?,
+            )));
+            #[cfg(debug_assertions)]
+            crate::query_execution::dml::equivalence::require("F7", &query, || Ok(legacy_sql))?;
+            *body = ast::SetExpr::Query(Box::new(query));
+            // Bind constants in the final target wrapper. Its original inner
+            // SELECT and the published path remain attached to the same tree.
             constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
             if let Some(authored) = authored.as_ref() {
                 for (column, value) in authored.iter().enumerate() {
@@ -640,70 +652,130 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn cast_expr(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
-    let sql = format!(
-        "SELECT CAST(NULL AS {})",
-        value_type_to_sql_type_name(target)?
-    );
-    let statements =
-        novarocks_parser::parse(&sql).map_err(|error| format!("INSERT target type: {error}"))?;
-    let [ast::Statement::Query(query)] = statements.as_slice() else {
-        return Err("INSERT target type expected query".into());
-    };
-    let ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Err("INSERT target type expected SELECT".into());
-    };
-    let ast::SelectItem::UnnamedExpr(ast::Expr::Cast(template)) = &select.projection[0] else {
-        return Err("INSERT target type expected CAST".into());
-    };
-    let mut cast = template.clone();
-    cast.span = expr.span();
-    cast.expr = Box::new(expr);
-    Ok(ast::Expr::Cast(cast))
+    let data_type = novarocks_sql::sql_type_syntax(target).map_err(|error| error.to_string())?;
+    #[cfg(debug_assertions)]
+    {
+        let template = build::query(ast::SetExpr::Select(Box::new(
+            build::select(
+                vec![build::item(
+                    build::cast(build::null(), data_type.clone()),
+                    None,
+                    false,
+                )],
+                Vec::new(),
+                None,
+                ast::GroupBy::None,
+            )
+            .map_err(|error| error.to_string())?,
+        )));
+        crate::query_execution::dml::equivalence::require("F8", &template, || {
+            Ok(format!(
+                "SELECT CAST(NULL AS {})",
+                value_type_to_sql_type_name(target)?
+            ))
+        })?;
+    }
+    Ok(build::cast(expr, data_type))
 }
 
 fn literal(kind: ast::LiteralKind) -> ast::Expr {
-    ast::Expr::Literal(ast::Literal {
-        kind,
-        span: Span::new(0, 0),
-    })
+    build::literal(kind)
 }
 fn null_expr() -> ast::Expr {
-    literal(ast::LiteralKind::Null)
+    build::null()
 }
 fn number(value: String) -> ast::Expr {
-    literal(ast::LiteralKind::Number(value))
+    // Typed defaults retain their exact coefficient, including values that are
+    // not source-language i64 literals. This is not a parser rejection fallback.
+    build::literal(ast::LiteralKind::Number(value))
 }
 fn string(value: String) -> ast::Expr {
-    literal(ast::LiteralKind::String(value))
+    build::string(value)
 }
 fn binary(value: &[u8]) -> ast::Expr {
-    literal(ast::LiteralKind::HexString(hex::encode_upper(value)))
+    build::hex_string(hex::encode_upper(value))
 }
 fn array(elements: Vec<ast::Expr>) -> ast::Expr {
-    ast::Expr::Array(ast::ArrayExpr {
-        element_type: None,
-        elements,
-        span: Span::new(0, 0),
-    })
+    build::array(elements)
 }
-fn tuple(expressions: Vec<ast::Expr>) -> ast::Expr {
-    ast::Expr::Tuple(ast::TupleExpr {
-        expressions,
-        span: Span::new(0, 0),
-    })
+fn tuple(expressions: Vec<ast::Expr>) -> Result<ast::Expr, String> {
+    build::tuple_value(expressions).map_err(|error| error.to_string())
 }
 fn map(entries: Vec<(ast::Expr, ast::Expr)>) -> ast::Expr {
-    ast::Expr::Map(ast::MapExpr {
-        entries: entries
-            .into_iter()
-            .map(|(key, value)| ast::MapEntry {
-                key,
-                value,
-                span: Span::new(0, 0),
-            })
-            .collect(),
-        span: Span::new(0, 0),
-    })
+    build::map(entries)
+}
+
+/// Normalize only the expressions whose original INSERT wrapper crossed the
+/// printer/parser boundary. VALUES retains its existing typed-value syntax.
+/// Source positions and the shape of every already-admitted user subtree stay
+/// attached to that subtree; no tree is returned after construction fails.
+pub(crate) fn canonical_insert_wrapper_expression(expr: ast::Expr) -> Result<ast::Expr, String> {
+    use ast::Fold;
+    #[derive(Default)]
+    struct WrapperSyntax {
+        error: Option<String>,
+    }
+    impl ast::Fold for WrapperSyntax {
+        fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
+            if self.error.is_some() {
+                return expression;
+            }
+            match expression {
+                ast::Expr::Literal(original) => {
+                    let ast::LiteralKind::Number(value) = &original.kind else {
+                        return ast::Expr::Literal(original);
+                    };
+                    match build::number(value.clone()) {
+                        Ok(mut canonical) => {
+                            match &mut canonical {
+                                ast::Expr::Literal(literal) => literal.span = original.span,
+                                ast::Expr::Unary(unary) => {
+                                    unary.span = original.span;
+                                    if let ast::Expr::Literal(literal) = unary.expression.as_mut() {
+                                        literal.span = original.span;
+                                    }
+                                }
+                                _ => unreachable!("numeric constructor returns literal or unary"),
+                            }
+                            canonical
+                        }
+                        Err(error) => {
+                            self.error = Some(error.to_string());
+                            ast::Expr::Literal(original)
+                        }
+                    }
+                }
+                ast::Expr::Tuple(tuple) => {
+                    let expressions = tuple
+                        .expressions
+                        .into_iter()
+                        .map(|expr| self.fold_expr(expr))
+                        .collect();
+                    match build::tuple(expressions) {
+                        Ok(mut canonical) => {
+                            match &mut canonical {
+                                ast::Expr::Tuple(value) => value.span = tuple.span,
+                                ast::Expr::Nested(value) => value.span = tuple.span,
+                                _ => unreachable!("tuple constructor returns tuple or parentheses"),
+                            }
+                            canonical
+                        }
+                        Err(error) => {
+                            self.error = Some(error.to_string());
+                            build::null()
+                        }
+                    }
+                }
+                expression => ast::fold_expr(self, expression),
+            }
+        }
+    }
+    let mut syntax = WrapperSyntax::default();
+    let expression = syntax.fold_expr(expr);
+    match syntax.error {
+        Some(error) => Err(error),
+        None => Ok(expression),
+    }
 }
 
 fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast::Expr, String> {
@@ -806,7 +878,7 @@ fn default_to_expr(default: &ColumnDefault, data_type: &DataType) -> Result<ast:
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?,
-            )
+            )?
         }
         (value, data_type) => {
             return Err(format!(

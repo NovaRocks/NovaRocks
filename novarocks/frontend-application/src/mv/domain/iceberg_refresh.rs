@@ -47,7 +47,9 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
-use crate::mv::domain::refresh::definition::{mv_definition_fingerprint, parse_mv_select_query};
+use crate::mv::domain::refresh::definition::{
+    mv_definition_fingerprint, read_stored_mv_query, stored_mv_identity,
+};
 #[cfg(test)]
 use crate::mv::domain::refresh::execution_policy::{
     non_join_incremental_write_mode, select_join_incremental_execution_mode,

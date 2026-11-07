@@ -30,6 +30,7 @@ use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use novarocks_parser::ast::{Query, Statement};
+use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -529,6 +530,116 @@ fn wrap_insert_query_with_write_projection(
     let mut projection = Vec::with_capacity(write_columns.len());
     for (write_idx, column) in write_columns.iter().enumerate() {
         let target_name = novarocks_types::naming::normalize_identifier(&column.name)?;
+        let source = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
+            Some((*source_idx, insert_columns[*source_idx].as_str()))
+        } else if insert_columns.is_empty() {
+            source_index_for_write_column(column, write_idx, source_columns, write_columns)
+                .map(|index| (index, source_columns[index].name.as_str()))
+        } else {
+            None
+        };
+        let expression = match source {
+            Some((ordinal, name)) => build::column(
+                build::ident(source_alias, Some('`')),
+                build::ident_at(
+                    name,
+                    Some('`'),
+                    insert_source_expression_span(query, ordinal),
+                ),
+            ),
+            None => crate::dml::insert::omitted_insert_expr(column)?,
+        };
+        let expression = crate::dml::insert::canonical_insert_wrapper_expression(expression)?;
+        let target = column
+            .declared_value_type()
+            .map_err(|error| error.to_string())?;
+        let expression = build::cast(
+            expression,
+            novarocks_sql::sql_type_syntax(&target).map_err(|error| error.to_string())?,
+        );
+        projection.push(build::item(
+            expression,
+            Some(build::ident(&column.name, Some('`'))),
+            true,
+        ));
+    }
+    let alias_source_columns = if insert_columns.is_empty() {
+        source_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>()
+    } else {
+        insert_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    };
+    let wrapped = build::query(ast::SetExpr::Select(Box::new(
+        build::select(
+            projection,
+            vec![build::relation(build::derived(
+                query.clone(),
+                Some(build::alias(
+                    build::ident(source_alias, Some('`')),
+                    alias_source_columns
+                        .into_iter()
+                        .map(|name| build::ident(name, Some('`')))
+                        .collect(),
+                    true,
+                )),
+            ))],
+            None,
+            ast::GroupBy::None,
+        )
+        .map_err(|error| error.to_string())?,
+    )));
+    #[cfg(debug_assertions)]
+    super::equivalence::require("F6", &wrapped, || {
+        legacy_wrap_insert_query_with_write_projection_sql(
+            query,
+            insert_columns,
+            source_columns,
+            write_columns,
+        )
+    })?;
+    Ok(wrapped)
+}
+
+/// A direct SELECT output has one user expression that the outer cast derives
+/// from. Other query shapes have no unique source expression for that output.
+fn insert_source_expression_span(query: &Query, ordinal: usize) -> novarocks_parser::Span {
+    match query.body.as_ref() {
+        ast::SetExpr::Select(select) => {
+            select
+                .projection
+                .get(ordinal)
+                .map_or(SYNTHETIC, |item| match item {
+                    ast::SelectItem::UnnamedExpr(expr)
+                    | ast::SelectItem::ExprWithAlias { expr, .. } => expr.span(),
+                    _ => SYNTHETIC,
+                })
+        }
+        ast::SetExpr::Query(query) => insert_source_expression_span(query, ordinal),
+        _ => SYNTHETIC,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn legacy_wrap_insert_query_with_write_projection_sql(
+    query: &Query,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+) -> Result<String, String> {
+    let insert_idx_by_target = if insert_columns.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        insert_column_index_by_target_name(insert_columns, write_columns)?
+    };
+    let source_alias = "__nr_insert_src";
+    let mut projection = Vec::with_capacity(write_columns.len());
+    for (write_idx, column) in write_columns.iter().enumerate() {
+        let target_name = novarocks_types::naming::normalize_identifier(&column.name)?;
         let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
             let source_expr = format!(
                 "{}.{}",
@@ -577,7 +688,8 @@ fn wrap_insert_query_with_write_projection(
         sql_identifier(source_alias),
         alias_columns
     );
-    parse_generated_query(&sql, "append INSERT SELECT projection")
+    parse_generated_query(&sql, "append INSERT SELECT projection")?;
+    Ok(sql)
 }
 
 fn same_column_sequence(left: &[ColumnDef], right: &[ColumnDef]) -> Result<bool, String> {
@@ -1659,17 +1771,36 @@ mod tests {
         )
         .expect("append source query");
 
-        let rendered = printer::print_query(&query);
-        assert!(
-            rendered.contains("FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)"),
-            "derived query should carry source column aliases, got: {rendered}"
+        use ast::SyntaxEq;
+        let expected = parse_query(
+            "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c` FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)",
         );
         assert!(
-            rendered.starts_with(
-                "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c`"
-            ),
-            "projection should target table column order, got: {rendered}"
+            query.syntax_eq(&expected),
+            "unexpected INSERT target projection: {query:#?}"
         );
+        let ast::SetExpr::Select(outer) = query.body.as_ref() else {
+            panic!("outer SELECT");
+        };
+        let ast::TableFactor::Derived { subquery, .. } = &outer.from[0].relation else {
+            panic!("derived source");
+        };
+        assert_eq!(
+            subquery.as_ref(),
+            &source,
+            "the original source and its positions are retained"
+        );
+        let ast::SetExpr::Select(original) = source.body.as_ref() else {
+            panic!("source SELECT");
+        };
+        let ast::SelectItem::ExprWithAlias {
+            expr: ast::Expr::Cast(cast),
+            ..
+        } = &outer.projection[0]
+        else {
+            panic!("target CAST");
+        };
+        assert_eq!(cast.span, original.projection[1].span());
     }
 
     #[test]
@@ -1691,20 +1822,29 @@ mod tests {
 
         let query = append_source_to_query(&source, &["k1".to_string()], &target_columns)
             .expect("append source query");
-        let rendered = printer::print_query(&query);
-
-        assert!(
-            rendered.contains("CAST(NULL AS MAP"),
-            "omitted map column should be cast from NULL once, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("CAST(NULL AS STRUCT"),
-            "omitted struct column should be cast from NULL once, got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("CAST(CAST(NULL"),
-            "omitted complex columns must not produce nested casts, got: {rendered}"
-        );
+        let ast::SetExpr::Select(outer) = query.body.as_ref() else {
+            panic!("outer SELECT");
+        };
+        for (item, expected) in outer.projection[1..].iter().zip(["MAP", "STRUCT"]) {
+            let ast::SelectItem::ExprWithAlias {
+                expr: ast::Expr::Cast(cast),
+                ..
+            } = item
+            else {
+                panic!("target CAST");
+            };
+            assert_eq!(cast.data_type.name.parts[0].value, expected);
+            assert!(
+                matches!(
+                    cast.expr.as_ref(),
+                    ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Null,
+                        ..
+                    })
+                ),
+                "omitted complex columns are cast from NULL exactly once"
+            );
+        }
     }
 }
 

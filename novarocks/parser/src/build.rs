@@ -171,7 +171,9 @@ pub fn null() -> Expr {
     literal(LiteralKind::Null)
 }
 
-fn literal(kind: LiteralKind) -> Expr {
+/// Preserve an already-authored literal kind, including typed program values.
+/// This does not admit source text or reapply the source lexer's integer width.
+pub fn literal(kind: LiteralKind) -> Expr {
     Expr::Literal(Literal {
         kind,
         span: SYNTHETIC,
@@ -527,11 +529,20 @@ pub fn tuple(mut expressions: Vec<Expr>) -> Result<Expr, BuildError> {
     match expressions.len() {
         0 => Err(BuildError::EmptyTuple),
         1 => Ok(nested(expressions.pop().expect("one expression"))),
-        _ => Ok(Expr::Tuple(TupleExpr {
-            expressions,
-            span: SYNTHETIC,
-        })),
+        _ => tuple_value(expressions),
     }
+}
+
+/// Preserve a positional value tuple whose arity is owned by a typed caller.
+/// A one-field value tuple remains distinct from source parentheses.
+pub fn tuple_value(expressions: Vec<Expr>) -> Result<Expr, BuildError> {
+    if expressions.is_empty() {
+        return Err(BuildError::EmptyTuple);
+    }
+    Ok(Expr::Tuple(TupleExpr {
+        expressions,
+        span: SYNTHETIC,
+    }))
 }
 
 pub fn map(entries: Vec<(Expr, Expr)>) -> Expr {

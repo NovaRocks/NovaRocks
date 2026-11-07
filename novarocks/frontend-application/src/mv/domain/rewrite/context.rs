@@ -162,9 +162,11 @@ impl IcebergMvRewriteContext {
         let sql_schema = sql_schema_facts(&projection, &runtime_bindings, &analysis)?;
         let definition = facts.definition();
         let canonical_select_query = Arc::new(
-            crate::mv::domain::refresh::definition::parse_mv_select_query(
+            crate::mv::domain::refresh::definition::read_stored_mv_query(
                 &definition.query.effective_sql,
-            )?,
+                &crate::mv::domain::refresh::definition::stored_mv_identity(&projection),
+            )
+            .map_err(|error| error.to_string())?,
         );
         let base_refs = definition
             .relation_occurrences

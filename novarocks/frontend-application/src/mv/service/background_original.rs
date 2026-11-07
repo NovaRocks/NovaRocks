@@ -828,8 +828,10 @@ impl SchedulerOriginal {
                 },
             };
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
-            if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
-                tracing::warn!(mv_id=request.projection().mv_id,target=%request.target.display_name(),disposition_kind,reason,"frontend MV scheduler refresh did not complete");
+            if let Some((disposition_kind, error_code, reason)) =
+                scheduler_outcome_log_fields(&disposition)
+            {
+                tracing::warn!(mv_id=request.projection().mv_id,target=%request.target.display_name(),disposition_kind,error_code,reason,"frontend MV scheduler refresh did not complete");
             }
             let decision = scheduler::complete(&product, &request, disposition, now_unix_millis());
             #[cfg(novarocks_dev_controls)]

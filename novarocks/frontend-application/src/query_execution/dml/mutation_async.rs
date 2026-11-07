@@ -239,6 +239,20 @@ impl PreparedMutationFacts {
         if !self.is_copy_on_write() {
             return Err("COW selection requires its signed copy-on-write strategy".into());
         }
+        match self.as_ref() {
+            Self::Update(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
+            Self::Merge(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
+        }
         if let Self::Merge(prepared) = self.as_ref()
             && matches!(
                 prepared.stmt.matched.as_ref().map(|clause| &clause.action),
@@ -254,7 +268,7 @@ impl PreparedMutationFacts {
             Self::Update(p) => {
                 let source_sql = mutation_source_to_sql(
                     state,
-                    &p.stmt.source,
+                    &p.stmt.cow_text()?.source,
                     p.current_catalog.as_deref(),
                     &p.target,
                 )?;

@@ -832,7 +832,19 @@ impl MutationAction {
                         match self.io.as_ref().unwrap().poll_quiescent(root_owner, cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => self.fail(internal_error(error.to_string())),
-                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Ok(())) => {
+                                let session = self.session();
+                                if deferred_lowering_before_publication(
+                                    self.failure.as_ref(),
+                                    session.as_deref(),
+                                    self.publication.as_ref().unwrap(),
+                                ) {
+                                    // Keep the original admission refusal after its actual
+                                    // CPU and IO exit. No provider operation exists to settle.
+                                    self.phase = Phase::Done;
+                                    continue;
+                                }
+                            }
                         }
                     }
                     let session = self.session();
@@ -906,6 +918,20 @@ impl MutationAction {
     }
 }
 
+/// A deferred admission refusal cannot author a publication that never began.
+/// Any existing session, Call or terminal keeps the ordinary settlement path.
+fn deferred_lowering_before_publication(
+    failure: Option<&DmlExecutionError>,
+    session: Option<&ConnectorWriteSession>,
+    publication: &StatementPublication,
+) -> bool {
+    matches!(failure, Some(DmlExecutionError::DeferredLowering(_)))
+        && session.is_none()
+        && publication.call.is_none()
+        && publication.attempt.terminal().is_none()
+        && publication.disposition().is_none()
+}
+
 /// Borrow the existing error authors while the exact cause remains in its
 /// original source through abort, client projection and residual handoff.
 fn project_failure(
@@ -918,9 +944,11 @@ fn project_failure(
         DmlExecutionError::Execution(input) => {
             QueryServiceError::from_execution_failure(input.clone())
         }
-        DmlExecutionError::Engine(error) => routed_execution_service_error(
-            dml_result::<()>(Err(crate::dml::DmlError::executor(error))).unwrap_err(),
-        ),
+        DmlExecutionError::Engine(error) | DmlExecutionError::DeferredLowering(error) => {
+            routed_execution_service_error(
+                dml_result::<()>(Err(crate::dml::DmlError::executor(error))).unwrap_err(),
+            )
+        }
         DmlExecutionError::Compilation(source) => QueryServiceError::from_compile_control(
             novarocks_type_contract::CompileControlError::Source(source.clone()),
         ),
@@ -1281,6 +1309,64 @@ mod tests {
     use crate::query_execution::dml::mutation_flow::CowFailure;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn deferred_cow_source_refusal_preserves_the_original_admission_diagnostic() {
+        use novarocks_spi::connector::{
+            LakePublicationFamily, LakePublicationId, LakePublicationTarget,
+        };
+        let message = "UPDATE assignment span is outside the admitted SQL source";
+        let original = project_failure(&DmlExecutionError::Engine(message.into()), "", None);
+        let deferred = DmlExecutionError::DeferredLowering(message.into());
+        let mut publication = StatementPublication::new(DmlPublicationAttempt::new(
+            LakePublicationId::new_v7(),
+            LakePublicationFamily::DataMutation,
+            LakePublicationTarget::try_new("ice".into(), "db".into(), Some("orders".into()), None)
+                .unwrap(),
+            None,
+        ));
+        assert!(deferred_lowering_before_publication(
+            Some(&deferred),
+            None,
+            &publication,
+        ));
+        let projected = project_failure(&deferred, "", publication.attempt.terminal());
+        assert_eq!(projected.kind(), original.kind());
+        assert_eq!(projected.message(), original.message());
+        assert_eq!(
+            projected.diagnostic_with_external_effect(None).to_string(),
+            original.diagnostic_with_external_effect(None).to_string(),
+        );
+        assert!(projected.publication_terminal().is_none());
+        assert!(projected.external_effect_disposition().is_none());
+        assert!(publication.disposition().is_none());
+        assert!(!deferred_lowering_before_publication(
+            Some(&DmlExecutionError::Engine(message.into())),
+            None,
+            &publication,
+        ));
+        let fixture = crate::query_execution::write_session::tests::fixture_with_outcome(
+            1,
+            16,
+            crate::query_execution::write_session::tests::known_committed(),
+        );
+        assert!(!deferred_lowering_before_publication(
+            Some(&deferred),
+            Some(&fixture.session),
+            &publication,
+        ));
+        publication
+            .attempt
+            .terminal_pre_dispatch_uncommitted()
+            .unwrap();
+        assert!(!deferred_lowering_before_publication(
+            Some(&deferred),
+            None,
+            &publication,
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(publication.poll_retirement(&mut cx).is_ready());
+    }
 
     struct ReadyErrorThenPanicDrop(Option<DmlExecutionError>);
     impl Future for ReadyErrorThenPanicDrop {

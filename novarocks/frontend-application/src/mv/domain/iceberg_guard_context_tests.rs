@@ -865,3 +865,96 @@ async fn ordinary_table_and_legacy_drop_keep_their_original_guard_boundary_witho
         );
     }
 }
+
+async fn drop_column_dependency_readiness(
+    stored_source: Option<&str>,
+) -> (
+    novarocks_mv_application::service::MvKeyedProductService,
+    crate::mv::domain::readiness::MvReadinessPort,
+) {
+    use novarocks_mv_application::persistence::test_support::KeyedProjectionFixture;
+
+    let (product, repository) = super::super::test_admission::keyed_product().await;
+    let service = product.keyed_readiness_service().unwrap();
+    let mut fixture = KeyedProjectionFixture::new(
+        novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "views", "mv_orders"),
+        Some(2),
+    );
+    if let Some(source) = stored_source {
+        fixture.definition.query.effective_sql = source.into();
+    }
+    let facts = fixture.build().unwrap();
+    service
+        .seed_projection(uuid::Uuid::now_v7(), facts)
+        .await
+        .unwrap();
+    assert_eq!(repository.list_keyed_projections().await.unwrap().len(), 1);
+    let readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
+        service,
+        tokio::runtime::Handle::current(),
+        product.management_entrance().unwrap(),
+    );
+    assert_eq!(readiness.list_ready_projections().unwrap().len(), 1);
+    (product, readiness)
+}
+
+fn orders_dependency_target() -> TargetBackend {
+    TargetBackend {
+        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+        catalog: "ice".into(),
+        namespace: "sales".into(),
+        table: "orders".into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_column_guard_keeps_readable_ready_mv_dependencies() {
+    let (_product, readiness) = drop_column_dependency_readiness(None).await;
+    let column = crate::catalog_application::statement::ColumnPath::parse("amount").unwrap();
+    let error = super::reject_drop_column_mv_dependencies_with_readiness(
+        &readiness,
+        &orders_dependency_target(),
+        &column,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "DROP COLUMN `amount` is blocked because a materialized view references it"
+    );
+    let unreferenced =
+        crate::catalog_application::statement::ColumnPath::parse("unreferenced").unwrap();
+    super::reject_drop_column_mv_dependencies_with_readiness(
+        &readiness,
+        &orders_dependency_target(),
+        &unreferenced,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_column_guard_refuses_unreadable_ready_mv_definition_without_explicit_leaf_reference()
+{
+    let source = "SELECT\n (";
+    let parser_error = novarocks_parser::parse(source)
+        .unwrap_err()
+        .to_user_error(source);
+    let (_product, readiness) = drop_column_dependency_readiness(Some(source)).await;
+    let column = crate::catalog_application::statement::ColumnPath::parse("unreferenced").unwrap();
+    let error = super::reject_drop_column_mv_dependencies_with_readiness(
+        &readiness,
+        &orders_dependency_target(),
+        &column,
+    )
+    .unwrap_err();
+    assert!(error.contains("DROP COLUMN `unreferenced`"));
+    assert!(error.contains("ice.views.mv_orders"));
+    assert!(error.contains("sql.analyze.invalid_view"));
+    assert!(error.contains(parser_error.code().as_str()));
+    let location = parser_error.location().unwrap();
+    assert!(error.contains(&format!("{}:{}", location.line(), location.column())));
+
+    let mut unrelated = orders_dependency_target();
+    unrelated.table = "another_table".into();
+    super::reject_drop_column_mv_dependencies_with_readiness(&readiness, &unrelated, &column)
+        .unwrap();
+}
