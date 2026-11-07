@@ -2930,6 +2930,13 @@ mod tests {
     #[test]
     fn frontend_projects_query_application_session_settings_to_native_options() {
         let mut settings = SessionExecutionSettings::default();
+        assert_eq!(
+            query_options_from_session_settings(&settings)
+                .as_proto()
+                .query_mem_limit,
+            0
+        );
+        settings.set_query_mem_limit_bytes(23).unwrap();
         settings.set_query_timeout_secs(17);
         settings.set_group_concat_max_len(-1);
         settings.set_pipeline_dop(4);
@@ -2947,6 +2954,7 @@ mod tests {
         let proto = options.as_proto();
         assert_eq!(proto.group_concat_max_len, Some(-1));
         assert_eq!(proto.query_timeout, 17);
+        assert_eq!(proto.query_mem_limit, 23);
         assert_eq!(proto.pipeline_dop, 4);
         assert_eq!(proto.runtime_filter_scan_wait_time_ms, Some(0));
         assert_eq!(proto.runtime_filter_wait_timeout_ms, Some(3));
@@ -4095,16 +4103,22 @@ mod tests {
         let [ParsedStatement::Query(query)] = statements.as_slice() else {
             panic!("query");
         };
+        let mut execution = SessionExecutionSettings::default();
+        execution.set_query_mem_limit_bytes(7).unwrap();
         let options = with_query_hints(
-            QueryOptions::from_proto(Default::default()),
+            query_options_from_session_settings(&execution),
             &novarocks_sql::sql_mode::query_sql_semantics(&session, query).unwrap(),
             Some(query),
         );
         assert!(!options.as_proto().allow_throw_exception);
         assert_eq!(options.as_proto().query_mem_limit, 9);
-        let restored =
-            with_query_hints(QueryOptions::from_proto(Default::default()), &session, None);
+        let restored = with_query_hints(
+            query_options_from_session_settings(&execution),
+            &session,
+            None,
+        );
         assert!(restored.as_proto().allow_throw_exception);
+        assert_eq!(restored.as_proto().query_mem_limit, 7);
         assert!(session.sql_mode().group_concat_legacy());
     }
 }
