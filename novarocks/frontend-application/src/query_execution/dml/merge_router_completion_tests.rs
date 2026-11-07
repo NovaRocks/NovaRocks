@@ -262,9 +262,10 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
                     ["_file", "_pos", "__nr_merge_action"].map(Box::<str>::from)
                 );
                 assert_eq!(keys.len(), 3);
+                // The generated CASE retains the original Int32 action tags.
                 for (key, data_type) in
                     keys.iter()
-                        .zip([DataType::Utf8, DataType::Int64, DataType::Int64])
+                        .zip([DataType::Utf8, DataType::Int64, DataType::Int32])
                 {
                     assert_eq!(fragment.values()[key].ty.data_type(), &data_type);
                 }
