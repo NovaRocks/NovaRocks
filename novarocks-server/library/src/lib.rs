@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 #[cfg(all(
     feature = "native-compatibility-test-fixture",
     not(novarocks_dev_controls)

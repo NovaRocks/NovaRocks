@@ -1008,6 +1008,7 @@ mod tests {
                 let view = crate::TaskPreparationView::from_execution_port(
                     &original,
                     Duration::from_secs(30),
+                    f.work.child_authority().and_then(|work| work.verify_live()),
                 );
                 let conclusion = TaskConclusion::Terminated(TerminationDetail::Canceled(
                     CancelReason::UpstreamNoLongerNeeded,
@@ -1054,11 +1055,58 @@ mod tests {
     }
 
     #[test]
+    fn an_exited_preparation_work_refuses_a_control_view_without_panicking() {
+        use novarocks_control_runtime::transaction::RuntimeLedger;
+        use novarocks_control_runtime_core::{
+            capacity::ReservationResources, identity::Generation, scope::WorkAdmission,
+        };
+        let f = fixture();
+        let original = f.port.execution_port();
+        let ledger = RuntimeLedger::new(Default::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut work, mut capacity) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let authority = work.child_authority().unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        let view = crate::TaskPreparationView::from_execution_port(
+            &original,
+            Duration::from_millis(1),
+            authority.verify_live(),
+        );
+        let failure = view.borrow_control().checkpoint().unwrap_err();
+        assert_eq!(
+            failure.failure_fact().reason(),
+            crate::failure_reason::WorkerFailureReason::PreparationOwnerUnavailable.reason()
+        );
+        drop(view);
+        ledger.reap_scope_ready(scope.id(), 1).unwrap();
+        capacity.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+        drop(original);
+        f.finish();
+    }
+
+    #[test]
     fn preparation_control_explicit_cadence_returns_retry_without_creating_stop() {
         let f = fixture();
         let original = f.port.execution_port();
-        let view =
-            crate::TaskPreparationView::from_execution_port(&original, Duration::from_millis(1));
+        let view = crate::TaskPreparationView::from_execution_port(
+            &original,
+            Duration::from_millis(1),
+            f.work.child_authority().and_then(|work| work.verify_live()),
+        );
         assert!(view.borrow_control().wait().is_ok());
         assert!(view.borrow_control().checkpoint().is_ok());
         assert!(f.port.accepted().is_none());
@@ -1422,8 +1470,12 @@ mod tests {
         let f = fixture();
         let view = f.port.execution_port();
         let control = Arc::new(
-            TaskExecutionControl::new(f.port.identity(), view.clone(), TaskFailurePhase::Execution)
-                .unwrap(),
+            TaskExecutionControl::for_test(
+                f.port.identity(),
+                view.clone(),
+                TaskFailurePhase::Execution,
+            )
+            .unwrap(),
         );
         let dropped = Arc::new(AtomicUsize::new(0));
         control.report_failure(ExecutionFailure::from_domain(CapturedControl {
@@ -1523,7 +1575,7 @@ mod tests {
         let f = fixture();
         let view = f.port.execution_port();
         let control = Arc::new(
-            TaskExecutionControl::new(
+            TaskExecutionControl::for_test(
                 f.port.identity(),
                 view.clone(),
                 TaskFailurePhase::Preparation,

@@ -173,11 +173,6 @@ impl IcebergCatalogControlState {
         }
     }
 
-    #[doc(hidden)]
-    pub fn poison_table_cache_for_test(&self) {
-        self.physical_table_cache.poison_for_test();
-    }
-
     pub fn cached_data_files(
         &self,
         namespace_name: &str,

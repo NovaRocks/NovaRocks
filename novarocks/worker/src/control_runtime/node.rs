@@ -575,7 +575,7 @@ impl WorkerNodeHost {
             return None;
         }
         Some(Arc::new(
-            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+            novarocks_execution::runtime::task_control::TaskExecutionControl::for_test(
                 identity,
                 owner.port().execution_port(),
                 novarocks_execution_contract::TaskFailurePhase::Execution,
@@ -1393,13 +1393,12 @@ impl WorkerNodeHost {
             .map_err(|original| NodeHostRefusal::new("Root drain wake", original))
     }
     pub(crate) fn confirm_ingress_closed(&self) -> Result<(), NodeHostRefusal> {
+        // The original owner publishes and wakes under this same lock. A
+        // poller can retire Root after unlock, so a second wake is not valid.
         self.control
             .lock()
             .confirm_ingress_closed()
-            .map_err(|original| NodeHostRefusal::new("Root physical ingress closure", original))?;
-        self.runtime
-            .notify_host_actor(&self.root_registration)
-            .map_err(|original| NodeHostRefusal::new("Root ingress closure wake", original))
+            .map_err(|original| NodeHostRefusal::new("Root physical ingress closure", original))
     }
     /// An already admitted neutral request moves directly to the same Root.
     pub(crate) fn observe_ticket(
@@ -2203,6 +2202,12 @@ impl WorkerNodeHost {
                     &ticket,
                     ParticipationHostBinding {
                         actor: self.actor_ids.next(),
+                        health: self
+                            .tasks
+                            .protocol_events
+                            .as_ref()
+                            .expect("original role execution ports validated at startup")
+                            .execution_health(),
                         core,
                         policy: self.config.policy,
                         storage: self.config.storage.clone(),
@@ -2652,6 +2657,30 @@ impl WorkerNodeHost {
 }
 
 impl WorkerNodeHost {
+    #[cfg(test)]
+    pub(crate) fn original_participation_scope_for_test(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<novarocks_control_runtime::transaction::ScopeHandle> {
+        let address = self.directory.participation(participation)?;
+        let host = address.lock()?;
+        Some(host.scope().clone())
+    }
+    pub(crate) fn participation_detachment_blockers(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<
+        Option<super::node_metrics::WorkerDetachmentBlockers>,
+        novarocks_control_runtime::transaction::RuntimeError,
+    > {
+        let Some(address) = self.directory.participation(participation) else {
+            return Ok(None);
+        };
+        let Some(host) = address.try_lock() else {
+            return Ok(None);
+        };
+        host.detachment_blockers()
+    }
     pub(crate) fn trace_drain_inventory(&self) {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;

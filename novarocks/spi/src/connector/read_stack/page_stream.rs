@@ -33,8 +33,9 @@
 //!
 //! No runtime type crosses this interface. The host does poll a stream, and
 //! call its methods, inside a Tokio runtime context, so a stream may create
-//! Tokio timers and spawn onto that runtime; it must never block the thread
-//! that polls it.
+//! timers and use its I/O drivers. Entering that context grants no work or
+//! spawn authority: concurrent operations use the connector's admitted
+//! operation and I/O entries. A stream never blocks the thread that polls it.
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
@@ -282,7 +283,7 @@ mod tests {
 
     #[test]
     fn a_sealed_source_stops_its_operations_refuses_new_ones_and_exits_when_they_end() {
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let mut failures = operations.claim_failure_receiver().unwrap();
         let stopped = Arc::new(AtomicUsize::new(0));
         let stop = {
@@ -341,7 +342,7 @@ mod tests {
 
     #[test]
     fn sealing_a_source_seals_its_child_and_exits_only_after_the_child_did() {
-        let parent = ConnectorSourceOperations::new();
+        let parent = ConnectorSourceOperations::for_test();
         let mut failures = parent.claim_failure_receiver().unwrap();
         let child = parent.child().expect("child admitted");
         assert_eq!(parent.live_operations(), 1, "the child is one operation");
@@ -384,7 +385,7 @@ mod tests {
     #[test]
     fn a_child_admitted_while_its_parent_seals_ends_with_the_parent() {
         for _ in 0..200 {
-            let parent = ConnectorSourceOperations::new();
+            let parent = ConnectorSourceOperations::for_test();
             let child = std::thread::scope(|scope| {
                 let admitting = scope.spawn(|| parent.child());
                 let sealing = scope.spawn(|| parent.seal());
@@ -402,7 +403,7 @@ mod tests {
 
     #[test]
     fn closing_a_child_leaves_its_parent_open() {
-        let parent = ConnectorSourceOperations::new();
+        let parent = ConnectorSourceOperations::for_test();
         let first = parent.child().expect("first child");
         first.seal();
         assert!(first.is_exited());
@@ -424,7 +425,7 @@ mod tests {
     #[test]
     fn admission_racing_the_seal_is_either_stopped_or_refused() {
         for _ in 0..200 {
-            let operations = ConnectorSourceOperations::new();
+            let operations = ConnectorSourceOperations::for_test();
             let stopped = Arc::new(AtomicUsize::new(0));
             let admitted = std::thread::scope(|scope| {
                 let admitting = scope.spawn(|| {
@@ -467,7 +468,7 @@ mod source_stop_tests {
                 "original operation failed",
             )),
         ] {
-            let operations = ConnectorSourceOperations::new();
+            let operations = ConnectorSourceOperations::for_test();
             let mut failures = operations.claim_failure_receiver().unwrap();
             if let Some(error) = &original {
                 operations
@@ -540,7 +541,7 @@ mod source_stop_tests {
     }
     #[test]
     fn ending_the_last_ticket_inside_stop_cannot_publish_exit_before_that_stop_returns() {
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let ticket = Arc::new(Mutex::new(None::<ConnectorOperationTicket>));
         let entered = Arc::new(Barrier::new(2));
         let resume = Arc::new(Barrier::new(2));

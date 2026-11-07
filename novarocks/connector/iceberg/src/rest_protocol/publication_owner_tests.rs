@@ -69,6 +69,7 @@ impl Fixture {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime)),
         )
         .for_request(context.clone());

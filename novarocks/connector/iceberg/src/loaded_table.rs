@@ -1172,18 +1172,6 @@ impl IcebergPhysicalTableCache {
             entries.remove(&key);
         }
     }
-
-    /// Test-only fault injection used by Core integration coverage. This is
-    /// intentionally provider-owned: production composition never invokes it.
-    #[doc(hidden)]
-    pub fn poison_for_test(&self) {
-        let entries = Arc::clone(&self.entries);
-        let _ = std::thread::spawn(move || {
-            let _guard = entries.write().expect("table cache write lock");
-            panic!("injected table cache failure");
-        })
-        .join();
-    }
 }
 
 fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String), String> {
@@ -1567,6 +1555,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
         )
     }

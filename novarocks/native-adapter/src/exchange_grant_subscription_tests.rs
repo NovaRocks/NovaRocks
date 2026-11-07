@@ -1016,7 +1016,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exit_flag = exited.clone();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-        let activity = novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity::new(move || {
+        let activity = novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity::for_test(move || {
             exit_flag.store(true, Ordering::Release); let _ = exit_tx.send(());
         });
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();

@@ -29,6 +29,11 @@ pub(super) fn queued_materialization_withdraws_without_factory() {
     materialization_boundaries::queued_materialization_withdraws_without_factory();
 }
 
+#[test]
+fn actual_sender_exit_wakes_the_original_node_after_hot_holder_disposal() {
+    materialization_boundaries::sender_exit_wakes_original_node_after_holder_disposal();
+}
+
 use super::*;
 use crate::control_runtime::{
     control_internal::CONTROL_INTERNAL_STORAGE,
@@ -89,13 +94,17 @@ impl ParticipationHostFactory for Factory {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: crate::ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
         self.0.observe_host();
         self.0.factories.fetch_add(1, Ordering::SeqCst);
-        Ok(Arc::new(Instance {
-            participation,
-            calls: self.0.clone(),
-        }))
+        // The fixture keeps the real granted instance obligation until Drop.
+        Ok(grant
+            .bind_test_instance(Arc::new(Instance {
+                participation,
+                calls: self.0.clone(),
+            }))
+            .expect("fixture binds its exact original instance"))
     }
 }
 impl ParticipationHostInstance for Instance {
@@ -828,6 +837,16 @@ pub(super) fn run_node_lifecycle_with_task<T: Send + 'static>(
     if !wait_until(|| scene.runtime.is_empty() && scene.ledger.is_empty()) {
         scene.fail("Root actual metadata and Scope drain timeout", ());
     }
+    // A repeated physical-close observation must stay idempotent after the
+    // same Root has retired; it cannot enqueue another wake to that old actor.
+    if let Err(original) = scene.node.confirm_ingress_closed() {
+        scene.fail(
+            "Node repeated ingress close after actual Root retirement",
+            original,
+        );
+    }
+    assert!(scene.runtime.is_empty());
+    assert!(scene.ledger.is_empty());
     finish_scene(scene, workers, close_kind, shutdown_task_ports);
 }
 

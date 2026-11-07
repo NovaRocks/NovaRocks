@@ -314,8 +314,20 @@ impl ExchangeFrameTransmitter for UnitTransport {
     fn forget_unit_facts(&self, stream: ExchangeStreamIdentity) {
         self.state.lock().unwrap().watches.remove(&stream);
     }
-    fn schedule_unit_retry(&self, _delay: Duration, task: Retry) -> Result<(), FailureFact> {
-        self.state.lock().unwrap().retries.push_back(task);
+    fn schedule_unit_retry(
+        &self,
+        _delay: Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        task: Retry,
+    ) -> Result<(), FailureFact> {
+        self.state
+            .lock()
+            .unwrap()
+            .retries
+            .push_back(Box::new(move || {
+                task();
+                drop(activity);
+            }));
         Ok(())
     }
 }
@@ -370,7 +382,12 @@ impl ExchangeFrameTransmitter for BlockingEosTransmitter {
     fn forget_unit_facts(&self, stream: ExchangeStreamIdentity) {
         self.transport.forget_unit_facts(stream);
     }
-    fn schedule_unit_retry(&self, delay: Duration, task: Retry) -> Result<(), FailureFact> {
-        self.transport.schedule_unit_retry(delay, task)
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        task: Retry,
+    ) -> Result<(), FailureFact> {
+        self.transport.schedule_unit_retry(delay, activity, task)
     }
 }

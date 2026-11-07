@@ -25,6 +25,7 @@ use crate::{
 use novarocks_control_runtime_core::{
     capacity::CapacityError, identity::Tick, mailbox::InputClass, owned_storage::OwnedSlotNeed,
 };
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     ops::{Deref, DerefMut},
@@ -118,6 +119,68 @@ pub struct LedgerInventoryObservation {
     pub reservations: usize,
     pub unused_owned_slots: OwnedSlotNeed,
     pub unresolved_work: usize,
+    pub live_by_label: BTreeMap<&'static str, usize>,
+    pub unresolved_by_label: BTreeMap<&'static str, usize>,
+}
+/// One original Work header, including exited work awaiting its children,
+/// reports or pins. This observation confers no exit or retirement authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkInventoryEntry {
+    pub work: novarocks_control_runtime_core::identity::WorkId,
+    pub parent: Option<novarocks_control_runtime_core::identity::WorkId>,
+    pub kind: novarocks_control_runtime_core::scope::WorkKind,
+    pub phase: novarocks_control_runtime_core::scope::WorkPhase,
+    pub label: Option<&'static str>,
+    pub body_exited: bool,
+    pub captures_exited: bool,
+    pub unresolved: bool,
+}
+/// A coherent, on-demand scope diagnostic. The application knows its own
+/// control roles and can exclude them when displaying detachment blockers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScopeWorkInventory {
+    pub entries: Vec<WorkInventoryEntry>,
+    pub live_by_label: BTreeMap<&'static str, usize>,
+    pub unresolved_by_label: BTreeMap<&'static str, usize>,
+}
+impl crate::transaction::ScopeHandle {
+    pub fn work_inventory(&self) -> Result<ScopeWorkInventory, crate::transaction::RuntimeError> {
+        let state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let scope = state
+            .scopes
+            .get(&self.id)
+            .ok_or(crate::transaction::RuntimeError::UnknownScope)?;
+        let mut inventory = ScopeWorkInventory::default();
+        for id in scope.work_ids() {
+            let work = scope
+                .work(id)
+                .expect("work identity from same original scope");
+            let label = state.work_labels.get(&(self.id, id)).copied();
+            let unresolved = state.unresolved.contains(&(self.id, id));
+            if let Some(label) = label {
+                *inventory.live_by_label.entry(label).or_default() += 1;
+                if unresolved {
+                    *inventory.unresolved_by_label.entry(label).or_default() += 1;
+                }
+            }
+            inventory.entries.push(WorkInventoryEntry {
+                work: id,
+                parent: work.parent,
+                kind: work.kind,
+                phase: work.phase,
+                label,
+                body_exited: work.body_exited,
+                captures_exited: work.captures_exited,
+                unresolved,
+            });
+        }
+        Ok(inventory)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerInventoryPage {
@@ -481,6 +544,13 @@ impl crate::transaction::RuntimeLedger {
                             }
                             round.sample.unresolved_work +=
                                 usize::from(state.unresolved.contains(&(id, work)));
+                            if let Some(label) = state.work_labels.get(&(id, work)) {
+                                *round.sample.live_by_label.entry(label).or_default() += 1;
+                                if state.unresolved.contains(&(id, work)) {
+                                    *round.sample.unresolved_by_label.entry(label).or_default() +=
+                                        1;
+                                }
+                            }
                             visited += 1;
                             round.sample.records_visited += 1;
                         } else {

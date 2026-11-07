@@ -524,6 +524,7 @@ impl IcebergReadBinding {
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
+        refresh_executor: Arc<dyn novarocks_fs::RefreshExecutor>,
         file_io_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
         let pool = Arc::new(
@@ -532,8 +533,13 @@ impl IcebergReadBinding {
             )
             .expect("build object-store provider pool"),
         );
-        let resources =
-            FsAccessResources::new(pool, access_resolver, file_runtime, file_io_spawner);
+        let resources = FsAccessResources::new(
+            pool,
+            access_resolver,
+            file_runtime,
+            refresh_executor,
+            file_io_spawner,
+        );
         let access_domain = StorageAccessDomainId::from_bytes([0x54; 32]);
         let storage_access = match object_store_config.as_ref() {
             Some(config) => IcebergStorageAccess::StaticObjectStore {
@@ -1229,17 +1235,7 @@ impl IcebergReadBinding {
                     .as_ref()
                     .and_then(|request| request.range_scope().zip(request.source_operations()))
                     .ok_or_else(|| invalid("BE Iceberg scan requires an exact execution source"))?;
-                let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
-                    scope.parts();
-                let scope = novarocks_fs::FileRangeScope::try_new(
-                    query_high,
-                    query_low,
-                    attempt,
-                    fragment_high,
-                    fragment_low,
-                    node_id,
-                )
-                .map_err(|error| invalid(error.to_string()))?;
+                let scope = novarocks_fs::FileRangeScope::from_connector(&scope);
                 Some(service.bind(scope, operations.clone()))
             }
         };
@@ -1466,6 +1462,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             spawner,
         )
         .with_range_service(Arc::clone(&range_service));
@@ -1484,8 +1481,9 @@ mod tests {
             missing.is_err(),
             "BE scan cannot invent a scheduling source"
         );
-        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope");
-        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let scope = ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).expect("scope");
+        let operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
         let request = request.with_execution_source(scope, operations.clone());
         let context = binding
             .for_request(request.clone())
@@ -1497,7 +1495,7 @@ mod tests {
         assert!(Arc::ptr_eq(range.service(), &range_service));
         assert_eq!(
             range.scope(),
-            novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap()
+            novarocks_fs::FileRangeScope::for_test(1, 2, 3, 4, 5, 6).unwrap()
         );
         let ticket = range.operations().admit(Arc::new(|| {})).expect("admitted");
         assert_eq!(
@@ -1895,6 +1893,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
@@ -2114,6 +2113,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::clone(&io_spawner),
         );
 
@@ -2148,6 +2148,7 @@ mod tests {
             Some(config),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
 
@@ -2177,6 +2178,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
@@ -2208,6 +2210,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
@@ -2356,6 +2359,7 @@ mod catalog_control_tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         )
     }
@@ -2541,6 +2545,7 @@ mod node_local_tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         IcebergReadBinding::from_catalog_properties(

@@ -341,8 +341,9 @@ fn prepare_compiled_task_in(
     // opening a result session or allowing any execution capture to attach.
     let control_error = match (context.result_identity, context.task_control.as_ref()) {
         (Some(identity), Some(control)) if identity == control.identity() => None,
+        #[cfg(test)]
         (None, None) => None,
-        (Some(_), None) => Some(crate::runtime::task::ExecutionFailure::from_domain(
+        (_, None) => Some(crate::runtime::task::ExecutionFailure::from_domain(
             crate::runtime::task_control::MissingTaskExecutionControl,
         )),
         _ => Some(crate::runtime::task::ExecutionFailure::from_domain(
@@ -428,6 +429,7 @@ fn prepare_compiled_task_in(
         Arc::clone(&context.exchange_receiver_port),
         context.cleanup_faults(),
     );
+    resources.hold_query_task(context.query_task.take());
     let prepare_result = (|| {
         resources.acquire_sink_commit(instance_task_key)?;
         context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
@@ -610,6 +612,7 @@ fn prepare_compiled_task_in(
     })();
     match prepare_result {
         Ok(prepared) => {
+            #[cfg(test)]
             if context.completion_work.is_none() && context.result_identity.is_none() {
                 let (roles, poller) =
                     crate::runtime::local_completion::LocalCompletionPoller::admit(

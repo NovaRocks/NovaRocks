@@ -1,9 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use crate::native_query_context::NativeQueryContextRuntime;
+    use crate::native_query_context::{NativeQueryContextRuntime, NativeTaskAdmissionResources};
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig,
     };
@@ -11,19 +8,26 @@ mod tests {
         ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     };
     use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
+    use novarocks_execution::runtime::query_context::QueryContext;
     use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::{QueryId, UniqueId};
-    use novarocks_worker::query_context::{QueryContextManager, QueryExecutionKey};
+    use std::sync::Arc;
 
-    /// The execution key of a query's first attempt, the one these tests admit.
-    fn first_attempt(query_id: QueryId) -> QueryExecutionKey {
-        QueryExecutionKey::native_attempt(
-            query_id,
-            std::num::NonZeroU64::new(1).expect("nonzero attempt"),
-        )
+    fn execution(query: QueryId, attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(query, AttemptId::new(attempt).unwrap()).unwrap()
     }
-
+    fn admit(
+        runtime: &NativeQueryContextRuntime,
+        context: &Arc<QueryContext>,
+        task: UniqueId,
+        limit: Option<i64>,
+    ) -> Result<NativeTaskAdmissionResources, String> {
+        let memory = runtime
+            .prepare_query_memory_typed(context, limit)
+            .map_err(|error| error.to_string())?;
+        Ok(runtime.prepare_admission_with_memory(task, memory, None))
+    }
     fn execution_runtime() -> Arc<ExecutionRuntime> {
         let config = ExecutionRuntimeConfig {
             driver_threads: 1,
@@ -61,334 +65,138 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_pre_ready_registration_republishes_removed_resources() {
-        let manager = QueryContextManager::new_for_test();
-        let last_publication = Arc::new(Mutex::new(None));
-        let observed = Arc::clone(&last_publication);
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager.clone(),
-            crate::backend_test_support::test_memory_authority(),
-        )
-        .observe_resource_publication_for_test(Arc::new(move |snapshot| {
-            *observed.lock().expect("publication observer") = Some(snapshot);
-        }));
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(91_401, 91_402),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("valid execution id");
-        let fragment = UniqueId::new(91_403, 1);
-        let lease = runtime
-            .register_task_execution(
-                execution_id,
-                fragment,
-                Duration::from_secs(5),
-                Duration::from_secs(5),
-            )
-            .expect("register fragment");
-        assert_eq!(
-            manager
-                .native_execution_resource_snapshot()
-                .active_fragments,
-            1
+    fn preparation_rollback_releases_only_its_task_reference_and_keeps_the_participation_owner() {
+        let runtime =
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let context = runtime
+            .establish_query_resources(execution(QueryId::new(91411, 91412), 1), None)
+            .unwrap();
+        let running = context.task_guard();
+        let first_preparation = runtime.prepare_query_memory_typed(&context, None).unwrap();
+        let last_preparation = runtime.prepare_query_memory_typed(&context, None).unwrap();
+        assert_eq!(context.active_tasks(), 3);
+        drop(first_preparation);
+        assert_eq!(context.active_tasks(), 2);
+        drop(running);
+        assert_eq!(context.active_tasks(), 1);
+        drop(last_preparation);
+        assert_eq!(context.active_tasks(), 0);
+        let weak = Arc::downgrade(&context);
+        assert!(
+            weak.upgrade().is_some(),
+            "the original Participation still owns its resources"
         );
-
-        drop(lease);
-        let snapshot = manager.native_execution_resource_snapshot();
-        assert_eq!(snapshot.active_contexts, 0);
-        assert_eq!(snapshot.active_fragments, 0);
-        assert_eq!(
-            *last_publication.lock().expect("publication observer"),
-            Some(snapshot),
-            "rollback must publish the removed owner state"
-        );
+        drop(context);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
-    fn preparation_rollback_preserves_live_siblings_and_releases_after_completed_siblings() {
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager.clone(),
-            crate::backend_test_support::test_memory_authority(),
+    fn releasing_the_participation_keeps_resources_until_its_last_actual_task_guard_exits() {
+        let runtime =
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let query = QueryId::new(91111, 91112);
+        let context = runtime
+            .establish_query_resources(execution(query, 1), Some(4096))
+            .unwrap();
+        let weak = Arc::downgrade(&context);
+        let guard = context.task_guard();
+        let account = guard.memory_binding().account().id();
+        drop(context);
+        assert_eq!(weak.upgrade().unwrap().active_tasks(), 1);
+        let successor = runtime
+            .establish_query_resources(execution(query, 2), Some(8192))
+            .unwrap();
+        assert_ne!(successor.memory_binding().account().id(), account);
+        assert_eq!(successor.tracker().limit(), 8192);
+        assert_eq!(guard.tracker().limit(), 4096);
+        drop(guard);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(successor.active_tasks(), 0);
+    }
+
+    #[test]
+    fn equal_execution_keys_do_not_replace_the_original_participation_resource_reference() {
+        let runtime =
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let execution = execution(QueryId::new(91421, 91422), 1);
+        let first = runtime
+            .establish_query_resources(execution, Some(1024))
+            .unwrap();
+        let second = runtime
+            .establish_query_resources(execution, Some(2048))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_ne!(
+            first.memory_binding().account().id(),
+            second.memory_binding().account().id()
         );
-        let execution = QueryExecutionId::new(
-            QueryId::new(91_411, 91_412),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("valid execution");
-        let register = |fragment| {
-            runtime
-                .register_task_execution(
-                    execution,
-                    fragment,
-                    Duration::from_secs(5),
-                    Duration::from_secs(5),
-                )
-                .expect("register native responsibility")
-        };
-        let running = UniqueId::new(91_413, 1);
-        register(running).into_running();
-        let first_preparation = register(UniqueId::new(91_413, 2));
-        let last_preparation = register(UniqueId::new(91_413, 3));
-
-        drop(first_preparation);
-        let snapshot = manager.native_execution_resource_snapshot();
-        assert_eq!(snapshot.active_contexts, 1);
-        assert_eq!(snapshot.active_fragments, 2);
-        runtime.unregister_task_execution(execution, running);
-        runtime.finish_task(execution);
-        let snapshot = manager.native_execution_resource_snapshot();
-        assert_eq!(snapshot.active_contexts, 1);
-        assert_eq!(snapshot.active_fragments, 1);
-
-        drop(last_preparation);
-        let snapshot = manager.native_execution_resource_snapshot();
-        assert_eq!(snapshot.active_contexts, 0);
-        assert_eq!(snapshot.active_fragments, 0);
+        let original = admit(&runtime, &first, UniqueId::new(91423, 1), None).unwrap();
+        assert_eq!(original.query_mem_tracker().limit(), 1024);
+        assert_eq!(
+            original.query_memory().unwrap().account().id(),
+            first.memory_binding().account().id()
+        );
+        assert_eq!(second.active_tasks(), 0);
     }
 
     #[test]
     fn native_admission_installs_one_query_memory_limit() {
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager.clone(),
-            crate::backend_test_support::test_memory_authority(),
-        );
-        let query_id = QueryId::new(91_101, 91_102);
-        let execution_id =
-            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
-                .expect("valid execution id");
-
-        let first = runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_103, 1),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(1024),
-                None,
-            )
-            .expect("first fragment installs limit");
+        let runtime =
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let context = runtime
+            .establish_query_resources(execution(QueryId::new(91101, 91102), 1), None)
+            .unwrap();
+        let first = admit(&runtime, &context, UniqueId::new(91103, 1), Some(1024)).unwrap();
         assert_eq!(first.query_mem_tracker().limit(), 1024);
-
-        runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_103, 2),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(1024),
-                None,
-            )
-            .expect("same query contract is idempotent");
-        let error = runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_103, 3),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(2048),
-                None,
-            )
+        let second = admit(&runtime, &context, UniqueId::new(91103, 2), Some(1024)).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.query_mem_tracker(),
+            &second.query_mem_tracker()
+        ));
+        let error = admit(&runtime, &context, UniqueId::new(91103, 3), Some(2048))
             .err()
-            .expect("query memory limit drift must fail");
+            .unwrap();
         assert!(error.contains("already has limit 1024"), "{error}");
+        assert_eq!(context.active_tasks(), 2, "a refused task creates no guard");
     }
 
-    #[test]
-    fn terminal_attempt_retires_a_prepared_context_without_a_registered_fragment() {
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager.clone(),
-            crate::backend_test_support::test_memory_authority(),
-        );
-        let query_id = QueryId::new(91_111, 91_112);
-        let first = QueryExecutionId::new(query_id, AttemptId::new(1).unwrap()).unwrap();
-        let second = QueryExecutionId::new(query_id, AttemptId::new(2).unwrap()).unwrap();
-        runtime
-            .prepare_admission_execution(
-                first,
-                UniqueId::new(91_113, 1),
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-                Some(4096),
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            manager.native_execution_resource_snapshot().active_contexts,
-            1
-        );
-        assert_eq!(
-            manager
-                .native_execution_resource_snapshot()
-                .active_fragments,
-            0
-        );
-
-        assert!(!runtime.retire_idle_execution(second));
-        assert!(runtime.retire_idle_execution(first));
-        assert_eq!(
-            manager.native_execution_resource_snapshot().active_contexts,
-            0
-        );
-        runtime
-            .prepare_admission_execution(
-                second,
-                UniqueId::new(91_113, 2),
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-                Some(8192),
-                None,
-            )
-            .expect("a successor attempt receives a fresh query context");
-    }
-
-    #[test]
-    fn terminal_attempt_keeps_a_registered_fragment_until_its_owner_releases_it() {
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager.clone(),
-            crate::backend_test_support::test_memory_authority(),
-        );
-        let execution =
-            QueryExecutionId::new(QueryId::new(91_121, 91_122), AttemptId::new(1).unwrap())
-                .unwrap();
-        let task_key = UniqueId::new(91_123, 1);
-        runtime
-            .prepare_admission_execution(
-                execution,
-                task_key,
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-                None,
-                None,
-            )
-            .unwrap();
-        let registration = runtime
-            .register_task_execution(
-                execution,
-                task_key,
-                Duration::from_secs(1),
-                Duration::from_secs(300),
-            )
-            .unwrap();
-
-        assert!(!runtime.retire_idle_execution(execution));
-        assert_eq!(
-            manager
-                .native_execution_resource_snapshot()
-                .active_fragments,
-            1
-        );
-        drop(registration);
-        assert_eq!(
-            manager.native_execution_resource_snapshot().active_contexts,
-            0
-        );
-    }
-
-    /// The limit is stated on both mechanisms at the same number, and the
-    /// account is one per query rather than one per fragment.
     #[test]
     fn the_query_limit_lands_on_the_account_as_well_as_the_tracker() {
-        let manager = QueryContextManager::new_for_test();
-        let authority = crate::backend_test_support::test_memory_authority();
         let runtime =
-            NativeQueryContextRuntime::new_for_test(manager.clone(), Arc::clone(&authority));
-        let query_id = QueryId::new(91_201, 91_202);
-        let execution_id =
-            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
-                .expect("valid execution id");
-
-        let admitted = runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_203, 1),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(4096),
-                None,
-            )
-            .expect("the first fragment installs the limit");
-
-        let account = manager
-            .ensure_query_account(first_attempt(query_id), &authority)
-            .expect("the account must exist after admission");
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let context = runtime
+            .establish_query_resources(execution(QueryId::new(91201, 91202), 1), Some(4096))
+            .unwrap();
+        let admitted = admit(&runtime, &context, UniqueId::new(91203, 1), Some(4096)).unwrap();
+        let account = context.memory_binding().account();
+        assert_eq!(admitted.query_mem_tracker().limit(), 4096);
+        assert_eq!(account.snapshot().policy_limit_bytes, Some(4096));
+        let again = admit(&runtime, &context, UniqueId::new(91203, 2), Some(4096)).unwrap();
         assert_eq!(
-            admitted.query_mem_tracker().limit(),
-            4096,
-            "the tracker keeps the limit it always had"
-        );
-        assert_eq!(
-            account.snapshot().policy_limit_bytes,
-            Some(4096),
-            "the same number must also be the account's policy"
-        );
-
-        // A second fragment of the same query reuses one account: capacity is
-        // a property of the query, not of each fragment that turns up.
-        runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_203, 2),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(4096),
-                None,
-            )
-            .expect("the same query contract is idempotent");
-        let again = manager
-            .ensure_query_account(first_attempt(query_id), &authority)
-            .expect("the account must still exist");
-        assert_eq!(
-            again.id(),
+            again.query_memory().unwrap().account().id(),
             account.id(),
-            "one query must have exactly one memory account"
+            "one Participation supplies the same account to its tasks"
         );
     }
 
-    /// Installing the policy must not change any query's outcome yet: charges
-    /// still live on the tracker, so the account's own `L` is zero and the
-    /// policy refuses nothing. This is the property that makes W2A safe to
-    /// ship ahead of the charge migration.
     #[test]
     fn the_account_policy_refuses_nothing_while_charges_still_live_on_the_tracker() {
-        let manager = QueryContextManager::new_for_test();
-        let authority = crate::backend_test_support::test_memory_authority();
         let runtime =
-            NativeQueryContextRuntime::new_for_test(manager.clone(), Arc::clone(&authority));
-        let query_id = QueryId::new(91_301, 91_302);
-        let execution_id =
-            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
-                .expect("valid execution id");
-
-        let admitted = runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(91_303, 1),
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-                Some(4096),
-                None,
-            )
-            .expect("the first fragment installs the limit");
-
-        // Charge the tracker well past the limit, exactly as a real query
-        // would today. The tracker is the mechanism that decides, so this is
-        // where the old behaviour still lives.
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let context = runtime
+            .establish_query_resources(execution(QueryId::new(91301, 91302), 1), Some(4096))
+            .unwrap();
+        let admitted = admit(&runtime, &context, UniqueId::new(91303, 1), Some(4096)).unwrap();
         admitted.query_mem_tracker().consume(8192);
-        let account = manager
-            .ensure_query_account(first_attempt(query_id), &authority)
-            .expect("the account must exist");
+        let account = context.memory_binding().account();
         assert_eq!(
             account.snapshot().live_bytes,
             0,
-            "no charge has moved onto the account in this slice"
+            "tracker charges do not grant or charge the account"
         );
         account
             .prefund(4096)
-            .expect("the account policy must still have its whole limit available");
+            .expect("the account retains its whole policy limit");
         admitted.query_mem_tracker().release(8192);
     }
 
@@ -396,35 +204,18 @@ mod tests {
     fn worker_query_tracker_and_execution_fallback_share_parent_and_label() {
         let query_id = QueryId::new(0x6d65_6d31, 0x6d65_6d32);
         let label = mem_tracker::query_tracker_label(query_id.high(), query_id.low());
-        assert!(
-            process_root_children_labelled(&label).is_empty(),
-            "the test query id must be unique to this test"
-        );
-
-        let manager = QueryContextManager::new_for_test();
-        let runtime = NativeQueryContextRuntime::new_for_test(
-            manager,
-            crate::backend_test_support::test_memory_authority(),
-        );
-        let execution_id =
-            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
-                .expect("valid execution id");
-        let admitted = runtime
-            .prepare_admission_execution(
-                execution_id,
-                UniqueId::new(0x6d65_6d33, 1),
-                Duration::from_secs(5),
-                Duration::from_secs(5),
-                None,
-                None,
-            )
-            .expect("worker query context admission");
+        assert!(process_root_children_labelled(&label).is_empty());
+        let runtime =
+            NativeQueryContextRuntime::new(crate::backend_test_support::test_memory_authority());
+        let context = runtime
+            .establish_query_resources(execution(query_id, 1), None)
+            .unwrap();
+        let admitted = admit(&runtime, &context, UniqueId::new(0x6d65_6d33, 1), None).unwrap();
         let from_context = admitted.query_mem_tracker();
         assert_eq!(from_context.label(), label);
         let after_context = process_root_children_labelled(&label);
         assert_eq!(after_context.len(), 1);
         assert!(Arc::ptr_eq(&after_context[0], &from_context));
-
         let _state = RuntimeState::for_local_execution(
             None,
             None,

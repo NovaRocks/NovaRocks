@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(novarocks_dev_controls)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use novarocks_execution::runtime_filter::{
     RuntimeFilterChannelId, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
@@ -91,6 +91,7 @@ impl NativeRuntimeFilterParticipantFactory {
         &self,
         execution_id: QueryExecutionId,
         contribution: DecodedRuntimeFilterContribution,
+        sender_work: novarocks_worker::RuntimeFilterSenderWork,
     ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError> {
         let query_id = UniqueId::new(
             execution_id.query_id().high(),
@@ -125,7 +126,7 @@ impl NativeRuntimeFilterParticipantFactory {
             install,
             state,
             transport_policy,
-            GrpcRuntimeFilterEnvelopeSink::new(self.runtime.clone()),
+            GrpcRuntimeFilterEnvelopeSink::new(self.runtime.clone(), sender_work),
         )
     }
 }
@@ -135,6 +136,7 @@ pub struct RuntimeFilterParticipant {
     execution_id: QueryExecutionId,
     state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
+    dispatch_closed: Arc<RwLock<bool>>,
     close_hook: RuntimeFilterParticipantCloseHook,
     #[cfg(novarocks_dev_controls)]
     accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous,
@@ -261,6 +263,7 @@ impl RuntimeFilterParticipant {
             execution_id,
             state,
             outbound,
+            dispatch_closed: Arc::new(RwLock::new(false)),
             close_hook: Arc::new(|_, _| Ok(())),
             #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
@@ -341,6 +344,13 @@ impl RuntimeFilterParticipant {
         &self,
         envelope: BackendNativeRuntimeFilterEnvelope,
     ) -> BackendIngressResult {
+        let closed = self
+            .dispatch_closed
+            .read()
+            .expect("runtime filter dispatch gate");
+        if *closed {
+            return rejected(QUERY_UNAVAILABLE_REJECTION);
+        }
         let query_id = UniqueId::new(
             self.execution_id.query_id().high(),
             self.execution_id.query_id().low(),
@@ -472,7 +482,14 @@ impl RuntimeFilterParticipant {
     }
 
     pub fn close(&self, reason: QueryTerminationReason) -> Result<(), RuntimeFilterContractError> {
+        let mut closed = self
+            .dispatch_closed
+            .write()
+            .expect("runtime filter dispatch gate");
+        *closed = true;
         self.state.close();
+        self.outbound.transport_sink.shutdown();
+        drop(closed);
         (self.close_hook)(self, reason)
     }
 
@@ -522,6 +539,7 @@ impl RuntimeFilterParticipant {
             execution_id: self.execution_id,
             state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
+            dispatch_closed: Arc::clone(&self.dispatch_closed),
             close_hook,
             #[cfg(novarocks_dev_controls)]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
@@ -1886,8 +1904,12 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn inbound_contribution_retry_is_folded_as_the_same_producer_stream_duplicate() {
+    fn inbound_contribution_participant(
+        observer: Option<Arc<dyn BackendRuntimeFilterEventObserver>>,
+    ) -> (
+        Arc<RuntimeFilterParticipant>,
+        BackendNativeRuntimeFilterEnvelope,
+    ) {
         let fixture = BackendRuntimeFilterFixture::membership();
         let identity = fixture.identity();
         let producer = fixture.producer_contract();
@@ -1949,7 +1971,7 @@ mod tests {
         .expect("aggregator routing");
         let install = BackendParticipantInstall::new(identity, 2, [channel], routing)
             .expect("aggregator install");
-        let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
+        let observation = RuntimeFilterObservationEmitter::from_install(&install, observer);
         let session = Arc::new(
             BackendRuntimeFilterSession::from_channel_install(
                 identity,
@@ -1975,7 +1997,7 @@ mod tests {
         )
         .expect("aggregator participant");
         let contribution = fixture.membership_contribution();
-        let envelope = || {
+        let envelope = {
             BackendNativeRuntimeFilterEnvelope::new(
                 BackendEnvelopeKind::Contribution,
                 identity,
@@ -1996,12 +2018,24 @@ mod tests {
             .expect("contribution envelope")
         };
 
+        (participant, envelope)
+    }
+
+    #[test]
+    fn inbound_contribution_retry_is_folded_as_the_same_producer_stream_duplicate() {
+        let (participant, envelope) = inbound_contribution_participant(None);
+        let source_instance = envelope
+            .route_identity()
+            .as_contribution()
+            .unwrap()
+            .task_key();
+
         assert_eq!(
-            participant.dispatch_envelope(envelope()).status(),
+            participant.dispatch_envelope(envelope.clone()).status(),
             novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
         );
         assert_eq!(
-            participant.dispatch_envelope(envelope()).status(),
+            participant.dispatch_envelope(envelope.clone()).status(),
             novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
         );
 
@@ -2012,6 +2046,75 @@ mod tests {
         assert_eq!(stream.latest_accepted_sequence(), Some(0));
         assert_eq!(stream.accepted(), 1);
         assert_eq!(stream.duplicate(), 1);
+    }
+
+    #[test]
+    fn close_waits_for_the_original_dispatch_callback_and_refuses_later_envelopes() {
+        struct BlockingObserver {
+            entered: std::sync::mpsc::SyncSender<()>,
+            proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl BackendRuntimeFilterEventObserver for BlockingObserver {
+            fn record(&self, event: BackendRuntimeFilterEvent) {
+                if matches!(
+                    event,
+                    BackendRuntimeFilterEvent::ContributionAccepted { .. }
+                ) {
+                    self.entered.send(()).unwrap();
+                    self.proceed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }
+        }
+        let (entered, callback_entered) = std::sync::mpsc::sync_channel(1);
+        let (proceed, callback_proceed) = std::sync::mpsc::sync_channel(1);
+        let (participant, envelope) =
+            inbound_contribution_participant(Some(Arc::new(BlockingObserver {
+                entered,
+                proceed: Mutex::new(callback_proceed),
+            })));
+        let original = participant.clone();
+        let incoming = envelope.clone();
+        let dispatch = std::thread::spawn(move || original.dispatch_envelope(incoming));
+        callback_entered
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+
+        // The close-hook alias shares the same actual dispatch gate, as it
+        // already shares the original Worker state and transport sink.
+        let closing = participant.with_close_hook_for_test(Arc::new(|_, _| Ok(())));
+        let (started, close_started) = std::sync::mpsc::sync_channel(1);
+        let (done, close_done) = std::sync::mpsc::sync_channel(1);
+        let close = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = closing.close(QueryTerminationReason::QueryTerminationLocalFailure);
+            done.send(()).unwrap();
+            result
+        });
+        close_started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let closed_before_callback_exited =
+            close_done.recv_timeout(Duration::from_millis(50)).is_ok();
+        // Release and join both original calls before asserting the negative
+        // observation, including when a regression lets close finish early.
+        proceed.send(()).unwrap();
+        assert_eq!(
+            dispatch.join().unwrap().status(),
+            novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted,
+        );
+        close.join().unwrap().unwrap();
+        assert!(!closed_before_callback_exited);
+        let refused = participant.dispatch_envelope(envelope);
+        assert_eq!(
+            refused.status(),
+            novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Rejected,
+        );
+        assert_eq!(
+            refused.rejection_reason(),
+            Some(QUERY_UNAVAILABLE_REJECTION)
+        );
     }
 
     #[test]

@@ -839,7 +839,7 @@ mod stream_construction_tests {
         }
         for reader_first in [true, false] {
             let reports = Arc::new(Reports::default());
-            let operations = ConnectorSourceOperations::new();
+            let operations = ConnectorSourceOperations::for_test();
             let receiver = operations.claim_failure_receiver().unwrap();
             let mut work = Some(operations.admit(Arc::new(|| {})).unwrap());
             let sibling = operations.admit(Arc::new(|| {})).unwrap();
@@ -948,7 +948,7 @@ mod stream_construction_tests {
             }
         }
         let reports = Arc::new(Reports::default());
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let events = operations.claim_failure_receiver().unwrap();
         let unknown = operations.admit(Arc::new(|| {})).unwrap();
         let work = operations.admit(Arc::new(|| {})).unwrap();
@@ -1036,9 +1036,9 @@ mod stream_construction_tests {
             matches!(failure.cause(), ExecutionFailureCause::Domain(source)
             if source.downcast_ref::<super::super::TypedScanBindingFailure>().is_some())
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let request = request.with_execution_source(
-            novarocks_spi::connector::ConnectorRangeScope::try_new(1, 2, 1, 3, 4, 7).unwrap(),
+            novarocks_spi::connector::ConnectorRangeScope::for_test(1, 2, 1, 3, 4, 7).unwrap(),
             operations.clone(),
         );
         let same = required_source_operations(&request).unwrap();

@@ -217,6 +217,7 @@ mod preparer_tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+                novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
                 Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
             );
             let io = crate::fs_io::build_file_io_for_location(

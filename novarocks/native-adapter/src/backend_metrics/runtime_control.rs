@@ -28,6 +28,7 @@ pub(super) struct RuntimeControlMetrics {
     ledger: IntGaugeVec,
     refusals: IntGaugeVec,
     inventory: IntGaugeVec,
+    work_labels: IntGaugeVec,
     available: IntGaugeVec,
     errors: IntGaugeVec,
 }
@@ -71,6 +72,12 @@ impl RuntimeControlMetrics {
                 "Freshly completed bounded traversal over canonical ledger records, covering an observation interval rather than a coherent instant. Work phases are lease phases, not physical executor queues. Missing/incomplete intervals are omitted; no cached or default zero inventory is exported.",
                 &["resource"],
             )?,
+            work_labels: gauge(
+                registry,
+                "novarocks_backend_control_runtime_work_labels",
+                "Original Work headers by fixed label over a freshly completed inventory interval. Live and unresolved counts are diagnostic, never exit receipts or capacity.",
+                &["label", "state"],
+            )?,
             available: gauge(
                 registry,
                 "novarocks_backend_control_runtime_observation_available",
@@ -90,6 +97,7 @@ impl RuntimeControlMetrics {
         self.ledger.reset();
         self.refusals.reset();
         self.inventory.reset();
+        self.work_labels.reset();
         self.errors.reset();
         let counters = owner
             .and_then(WorkerTaskControl::runtime_observation_snapshot)
@@ -144,9 +152,22 @@ impl RuntimeControlMetrics {
                 .with_label_values(&["inventory_interval_records_visited"])
                 .set(cumulative);
         }
-        let inventory = page
-            .and_then(|page| page.completed)
-            .and_then(inventory_values);
+        let completed = page.and_then(|page| page.completed);
+        if let Some(sample) = completed.as_ref() {
+            for label in novarocks_worker::WORK_DIAGNOSTIC_LABELS {
+                for (state, counts) in [
+                    ("live", &sample.live_by_label),
+                    ("unresolved", &sample.unresolved_by_label),
+                ] {
+                    if let Ok(count) = i64::try_from(counts.get(label).copied().unwrap_or(0)) {
+                        self.work_labels
+                            .with_label_values(&[label, state])
+                            .set(count);
+                    }
+                }
+            }
+        }
+        let inventory = completed.and_then(inventory_values);
         self.available
             .with_label_values(&["inventory_interval"])
             .set(i64::from(inventory.is_some()));

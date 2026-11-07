@@ -1074,6 +1074,18 @@ impl WorkerTaskControl {
     ) -> Option<super::node_metrics::WorkerControlPlaneSnapshot> {
         self.node.try_control_plane_snapshot()
     }
+    /// On-demand blockers from this exact Participation's original Work tree.
+    /// Roles used to run control/detachment are excluded. None is unavailable,
+    /// absent, or already detached; it must not be read as an empty exit receipt.
+    pub fn participation_detachment_blockers(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<
+        Option<super::node_metrics::WorkerDetachmentBlockers>,
+        novarocks_control_runtime::transaction::RuntimeError,
+    > {
+        self.node.participation_detachment_blockers(participation)
+    }
     /// Cumulative original-owner diagnostics. These independently sampled
     /// counters are neither a coherent instant nor a capacity/exit receipt.
     pub fn runtime_observation_snapshot(

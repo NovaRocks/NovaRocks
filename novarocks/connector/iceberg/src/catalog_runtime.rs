@@ -373,6 +373,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }

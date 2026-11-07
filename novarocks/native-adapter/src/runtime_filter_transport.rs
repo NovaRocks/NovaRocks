@@ -316,7 +316,13 @@ pub struct GrpcRuntimeFilterEnvelopeSink {
     completions: Mutex<mpsc::Receiver<BackendRuntimeFilterSinkCompletion>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
-    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    worker: Mutex<
+        Option<
+            tokio::task::JoinHandle<
+                Result<(), novarocks_control_runtime::exit_work::ExitWorkError>,
+            >,
+        >,
+    >,
 }
 
 #[allow(
@@ -324,9 +330,13 @@ pub struct GrpcRuntimeFilterEnvelopeSink {
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl GrpcRuntimeFilterEnvelopeSink {
-    pub fn new(runtime: BackendDataRuntime) -> Arc<Self> {
+    pub fn new(
+        runtime: BackendDataRuntime,
+        work: novarocks_worker::RuntimeFilterSenderWork,
+    ) -> Arc<Self> {
         Self::new_with_client_and_capacities(
             runtime.clone(),
+            work,
             Arc::new(LiveRuntimeFilterEnvelopeUnaryClient {
                 runtime: runtime.clone(),
             }),
@@ -340,12 +350,14 @@ impl GrpcRuntimeFilterEnvelopeSink {
         client: Arc<dyn BackendRuntimeFilterEnvelopeUnaryClient>,
         request_capacity: usize,
         completion_capacity: usize,
+        work: novarocks_worker::RuntimeFilterSenderWork,
     ) -> Result<Arc<Self>, String> {
         if request_capacity == 0 || completion_capacity == 0 {
             return Err("runtime filter sink capacities must be nonzero".to_string());
         }
         Ok(Self::new_with_client_and_capacities(
             test_backend_data_runtime(),
+            work,
             client,
             request_capacity,
             completion_capacity,
@@ -354,6 +366,7 @@ impl GrpcRuntimeFilterEnvelopeSink {
 
     fn new_with_client_and_capacities(
         runtime: BackendDataRuntime,
+        work: novarocks_worker::RuntimeFilterSenderWork,
         client: Arc<dyn BackendRuntimeFilterEnvelopeUnaryClient>,
         request_capacity: usize,
         completion_capacity: usize,
@@ -369,13 +382,10 @@ impl GrpcRuntimeFilterEnvelopeSink {
             shutdown_notify: Arc::clone(&shutdown_notify),
             worker: Mutex::new(None),
         });
-        let worker = runtime.handle().spawn(run_worker(
-            request_rx,
-            completion_tx,
-            client,
-            shutdown,
-            shutdown_notify,
-        ));
+        let worker = runtime.spawn_with_obligation(
+            work,
+            run_worker(request_rx, completion_tx, client, shutdown, shutdown_notify),
+        );
         *sink
             .worker
             .lock()
@@ -564,12 +574,16 @@ async fn process_request(
                         }
                         let tick = state.drive(Instant::now());
                         if let Some((_, retried)) = tick.retried().first() {
-                            if completions
-                                .send(BackendRuntimeFilterSinkCompletion::Retried(identity))
-                                .await
-                                .is_err()
-                            {
-                                return None;
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_notify.notified() => return None,
+                                sent = completions.send(
+                                    BackendRuntimeFilterSinkCompletion::Retried(identity)
+                                ) => {
+                                    if sent.is_err() {
+                                        return None;
+                                    }
+                                }
                             }
                             frame = Arc::clone(retried);
                             continue;
@@ -643,16 +657,16 @@ const fn failure_reason(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackendRuntimeFilterEnvelopeSink, GrpcRuntimeFilterEnvelopeSink,
-        decode_runtime_filter_unary_ack, test_backend_data_runtime,
-    };
+    use super::*;
     use novarocks_proto_models::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
         RuntimeFilterEnvelopeResponse, RuntimeFilterRouteIdentity,
         runtime_filter_route_identity::Value,
     };
     use novarocks_worker::runtime_filter::domain::BackendAcceptStatus;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Waker};
 
     fn contribution_route() -> RuntimeFilterRouteIdentity {
         RuntimeFilterRouteIdentity {
@@ -694,13 +708,21 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_aborts_the_owned_runtime_filter_worker() {
-        let sink = GrpcRuntimeFilterEnvelopeSink::new(test_backend_data_runtime());
+    fn shutdown_retires_the_owned_runtime_filter_worker_after_actual_exit() {
+        let runtime = test_backend_data_runtime();
+        let mut owner = novarocks_worker::ParticipationWorkTestOwner::new();
+        let sink =
+            GrpcRuntimeFilterEnvelopeSink::new(runtime.clone(), owner.runtime_filter_sender());
         assert!(
             sink.worker
                 .lock()
                 .expect("runtime filter worker lock")
                 .is_some()
+        );
+        assert!(
+            !owner
+                .poll_finish()
+                .expect("the live sender remains supervised")
         );
 
         sink.shutdown();
@@ -711,5 +733,174 @@ mod tests {
                 .expect("runtime filter worker lock")
                 .is_none()
         );
+        drop(sink);
+        runtime.block_on(owner.finish());
+    }
+
+    struct ScriptedClient {
+        fail_transport: bool,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl BackendRuntimeFilterEnvelopeUnaryClient for ScriptedClient {
+        async fn transmit(
+            &self,
+            _: BackendRemoteRoute,
+            envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
+            _: Duration,
+        ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_transport {
+                Err(BackendRuntimeFilterUnaryError::transport("scripted retry"))
+            } else {
+                Ok(BackendRuntimeFilterUnaryAck::new(
+                    *envelope.route_identity(),
+                    BackendAcceptStatus::Accepted,
+                ))
+            }
+        }
+    }
+
+    fn request() -> SinkRequest {
+        use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+        use novarocks_worker::runtime_filter::domain::{
+            BackendEnvelopeKind, BackendProducerOpenMetadata, BackendRouteEdgeId,
+            BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole, BackendRoutingChannel,
+            BackendRoutingEdge, BackendRoutingShard, BackendTransportSequence,
+        };
+        let fixture =
+            novarocks_worker::runtime_filter::fixture::BackendRuntimeFilterFixture::membership();
+        let producer = fixture.producer_contract();
+        let task = novarocks_types::UniqueId::new(18, 19);
+        let source = BackendRouteRole::Producer(producer.binding_id());
+        let edge = BackendRoutingEdge::new(
+            BackendRouteEdgeId::new(1),
+            BackendRouteEndpoint::new(1, source).unwrap(),
+            BackendRouteEndpoint::new(2, BackendRouteRole::Aggregator).unwrap(),
+            BackendRoutePeer::Remote {
+                backend_process_id: novarocks_types::BackendProcessId::new_v7(),
+                participant_id: 2,
+                endpoint: RuntimeEndpoint::new("127.0.0.1", 9072).unwrap(),
+            },
+            [BackendEnvelopeKind::Contribution],
+        )
+        .unwrap();
+        let routing = BackendRoutingShard::new(
+            fixture.identity(),
+            1,
+            [BackendRoutingChannel::new(
+                producer.channel_id(),
+                [source],
+                [],
+                [edge],
+                [((producer.binding_id(), task), 1)],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let decision = routing
+            .route_producer(
+                producer.channel_id(),
+                producer.binding_id(),
+                BackendEnvelopeKind::Contribution,
+            )
+            .unwrap();
+        let contribution = fixture.membership_contribution();
+        let envelope = BackendNativeRuntimeFilterEnvelope::new(
+            BackendEnvelopeKind::Contribution,
+            fixture.identity(),
+            producer.channel_id(),
+            BackendNativeRouteIdentity::contribution(
+                crate::runtime_filter_rpc::BackendNativeContributionRouteIdentity::new(
+                    producer.binding_id(),
+                    task,
+                    novarocks_execution::runtime_filter::PartitionId::new(0),
+                    BackendTransportSequence::new(0),
+                ),
+            ),
+            Some(BackendProducerOpenMetadata::try_new(1).unwrap()),
+            None,
+            contribution.contract_digest(),
+            contribution.canonical_bytes().clone(),
+        )
+        .unwrap();
+        SinkRequest {
+            route: decision.remote_routes()[0].clone(),
+            envelope: BackendNativeRuntimeFilterTransportEnvelope::new(
+                Arc::new(envelope),
+                BackendRuntimeFilterRetryPolicy::new(
+                    Duration::from_millis(1),
+                    3,
+                    Duration::from_secs(10),
+                    1,
+                    4096,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn stop_exits_a_worker_blocked_on_its_full_completion_channel() {
+        full_completion_channel_stops(false);
+    }
+
+    #[test]
+    fn stop_exits_a_worker_blocked_on_its_full_retry_completion_channel() {
+        full_completion_channel_stops(true);
+    }
+
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    fn full_completion_channel_stops(retry: bool) {
+        let runtime = test_backend_data_runtime();
+        let mut owner = novarocks_worker::ParticipationWorkTestOwner::new();
+        let worker = runtime.spawn_with_obligation(owner.runtime_filter_sender(), async move {
+            let request = request();
+            let identity = *request.envelope.envelope.route_identity();
+            let (requests, receiver) = mpsc::channel(1);
+            requests
+                .try_send(request)
+                .unwrap_or_else(|_| panic!("one paid request fits"));
+            let (completions, _receiver) = mpsc::channel(1);
+            completions
+                .try_send(BackendRuntimeFilterSinkCompletion::Retried(identity))
+                .unwrap();
+            let client = Arc::new(ScriptedClient {
+                fail_transport: retry,
+                calls: AtomicUsize::new(0),
+            });
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let notify = Arc::new(Notify::new());
+            let mut future = Box::pin(run_worker(
+                receiver,
+                completions,
+                client.clone(),
+                shutdown.clone(),
+                notify.clone(),
+            ));
+            assert!(poll_once(future.as_mut()).is_pending());
+            if retry {
+                // The first poll armed the retry timer. Once it is due, this
+                // poll reaches the full retry-completion send, not the timer.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert!(poll_once(future.as_mut()).is_pending());
+            }
+            assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+            shutdown.store(true, Ordering::Release);
+            notify.notify_one();
+            assert_eq!(poll_once(future.as_mut()), Poll::Ready(()));
+            drop(future);
+        });
+        runtime.block_on(async {
+            worker
+                .await
+                .expect("the sender task does not panic")
+                .expect("the actual sender exits");
+            owner.finish().await;
+        });
     }
 }

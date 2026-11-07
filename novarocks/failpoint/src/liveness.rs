@@ -234,6 +234,10 @@ impl RunnerSession {
     }
 
     /// Charge setup and liveness to the original caller deadline without renewal.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The development liveness service owns its worker lifecycle; see ADR-0218."
+    )]
     pub fn start_until(
         declaration: SessionDeclaration,
         original_deadline: Instant,
@@ -465,6 +469,10 @@ mod receiver {
         pub fn declaration(&self) -> &SessionDeclaration {
             &self.declaration
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The authorized development liveness receiver owns its worker lifecycle; see ADR-0218."
+        )]
         pub fn bind(&self, process: ProcessBinding) -> io::Result<RoleSessionOwner> {
             if process.role() != self.declaration.role {
                 return Err(invalid("test-session declaration belongs to another role"));

@@ -71,6 +71,10 @@ impl Ord for TimerEntry {
 }
 
 impl ScanPreparationTimer {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "One process-owned preparation timer service per scan host; see ADR-0218."
+    )]
     pub fn new() -> Arc<Self> {
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()

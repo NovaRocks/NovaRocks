@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join the threads that exercise memory races; see ADR-0218."
+)]
 #![cfg(not(loom))]
 mod common;
 use common::*;

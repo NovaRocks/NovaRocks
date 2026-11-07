@@ -217,6 +217,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::runtime_filter_test_support::participant_for_test;
+    use novarocks_worker::ParticipationWorkTestOwner;
     use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendEnvelopeKind};
 
     struct StubAuthority {
@@ -225,10 +226,13 @@ mod tests {
     }
 
     impl StubAuthority {
-        fn holding(name: &'static str) -> Arc<dyn BackendRuntimeFilterParticipantAuthority> {
+        fn holding(
+            name: &'static str,
+            owner: &mut ParticipationWorkTestOwner,
+        ) -> Arc<dyn BackendRuntimeFilterParticipantAuthority> {
             Arc::new(Self {
                 name,
-                participant: Some(participant_for_test()),
+                participant: Some(participant_for_test(owner)),
             })
         }
 
@@ -259,6 +263,33 @@ mod tests {
         )
     }
 
+    fn work_owner() -> ParticipationWorkTestOwner {
+        ParticipationWorkTestOwner::new_for(novarocks_execution_contract::ParticipationRef::new(
+            crate::runtime_filter_test_support::participant_execution_id(),
+            novarocks_types::FrontendProcessId::new_v7(),
+            novarocks_types::BackendProcessId::new_v7(),
+        ))
+    }
+
+    fn finish_ingress(
+        ingress: Arc<CompositeRuntimeFilterEnvelopeIngress>,
+        owners: Vec<ParticipationWorkTestOwner>,
+    ) {
+        for authority in &ingress.authorities {
+            if let Some(participant) = authority.claim_participant(envelope().participant()) {
+                participant
+                    .close(novarocks_proto_codec::lifecycle::QueryTerminationReason::Unspecified)
+                    .expect("the original participant closes");
+            }
+        }
+        drop(ingress);
+        crate::backend_test_support::test_backend_data_runtime().block_on(async move {
+            for owner in owners {
+                owner.finish().await;
+            }
+        });
+    }
+
     #[test]
     fn an_attempt_no_owner_holds_is_refused_rather_than_admitted() {
         let ingress = CompositeRuntimeFilterEnvelopeIngress::new(vec![
@@ -282,11 +313,14 @@ mod tests {
     fn two_owners_claiming_one_attempt_is_a_conflict_not_a_first_answer_win() {
         // Taking either answer would let one owner run envelopes the other
         // believes it owns, and the wiring order would decide which.
+        let mut first = work_owner();
+        let mut second = work_owner();
         let ingress = CompositeRuntimeFilterEnvelopeIngress::new(vec![
-            StubAuthority::holding("first"),
-            StubAuthority::holding("second"),
+            StubAuthority::holding("first", &mut first),
+            StubAuthority::holding("second", &mut second),
         ]);
         let result = ingress.accept(envelope());
+        finish_ingress(ingress, vec![first, second]);
         assert_eq!(result.status(), BackendAcceptStatus::Rejected);
         assert_eq!(
             result.rejection_reason(),
@@ -299,18 +333,22 @@ mod tests {
         // Whichever slot holds it, and in either order: the sole claimant's
         // own verdict is the answer, so this reaches the participant's route
         // authority instead of a composition refusal.
-        for authorities in [
-            vec![
-                StubAuthority::disclaiming("first"),
-                StubAuthority::holding("second"),
-            ],
-            vec![
-                StubAuthority::holding("first"),
-                StubAuthority::disclaiming("second"),
-            ],
-        ] {
+        for holding_first in [false, true] {
+            let mut owner = work_owner();
+            let authorities = if holding_first {
+                vec![
+                    StubAuthority::holding("first", &mut owner),
+                    StubAuthority::disclaiming("second"),
+                ]
+            } else {
+                vec![
+                    StubAuthority::disclaiming("first"),
+                    StubAuthority::holding("second", &mut owner),
+                ]
+            };
             let ingress = CompositeRuntimeFilterEnvelopeIngress::new(authorities);
             let result = ingress.accept(envelope());
+            finish_ingress(ingress, vec![owner]);
             let reason = result
                 .rejection_reason()
                 .expect("a channel-less participant refuses this delivery itself");

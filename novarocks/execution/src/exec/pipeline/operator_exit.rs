@@ -500,9 +500,12 @@ mod tests {
             cleanup: Mutex::new(None),
             cleanups: AtomicUsize::new(0),
         });
-        let control =
-            TaskExecutionControl::new(port.identity(), port.clone(), TaskFailurePhase::Execution)
-                .unwrap();
+        let control = TaskExecutionControl::for_test(
+            port.identity(),
+            port.clone(),
+            TaskFailurePhase::Execution,
+        )
+        .unwrap();
         (port, RuntimeErrorState::for_task(Arc::new(control)))
     }
     fn watch(observation: ExitObservation) -> Arc<Observable> {

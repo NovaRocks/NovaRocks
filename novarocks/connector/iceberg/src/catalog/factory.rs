@@ -144,6 +144,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let client = crate::catalog_runtime::build_catalog_client(
@@ -231,6 +232,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         )
         .for_request(context.clone());
@@ -319,6 +321,7 @@ mod tests {
                         None,
                         FsAccessResolver::new(),
                         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
                         Arc::new(TokioFileIoSpawner::new(runtime.clone())),
                     )
                     .for_request(

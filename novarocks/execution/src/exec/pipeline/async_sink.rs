@@ -1183,6 +1183,18 @@ impl<B: AsyncSinkBackend> OperatorLifecycle for AsyncSinkOperator<B> {
             .error_state
             .get_or_insert_with(|| state.error_state())
             .clone();
+        let task = control.task_execution_control();
+        // Local unit-test health assertions retain their original domain; the
+        // explicit fixture token is never available to a production library.
+        #[cfg(test)]
+        let local_test_token = task
+            .is_none()
+            .then(crate::runtime::execution_services::test_io_control);
+        #[cfg(test)]
+        let task = task.or(local_test_token.as_ref());
+        let task = task.ok_or_else(|| {
+            ExecutionFailure::from_domain(crate::runtime::task_control::MissingTaskExecutionControl)
+        })?;
         self.shared.phase(SinkPhase::Bind);
         let backend = self
             .backend
@@ -1220,13 +1232,13 @@ impl<B: AsyncSinkBackend> OperatorLifecycle for AsyncSinkOperator<B> {
                 bind_unknown,
             )))),
             shared,
-            control,
+            control: control.clone(),
         };
         self.join_wake = Some(Arc::new(ActorWake {
             shared: self.shared.clone(),
             control: self.error_state.as_ref().unwrap().clone(),
         }));
-        self.join = Some(executor.spawn(frame));
+        self.join = Some(executor.spawn(task, frame)?);
         binding
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
@@ -2408,7 +2420,7 @@ mod tests {
             cleanup: Mutex::new(Vec::new()),
         });
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
-            crate::runtime::task_control::TaskExecutionControl::new(
+            crate::runtime::task_control::TaskExecutionControl::for_test(
                 port.identity(),
                 port.clone(),
                 TaskFailurePhase::Execution,
@@ -2884,13 +2896,18 @@ mod tests {
         }
         let _release = Release(gate.clone());
         let blocking = gate.clone();
-        let blocker = exec.spawn(async move {
-            blocking.entered.store(true, Ordering::Release);
-            let mut released = blocking.released.lock().unwrap();
-            while !*released {
-                released = blocking.cv.wait(released).unwrap();
-            }
-        });
+        let blocker = exec
+            .spawn(
+                &crate::runtime::execution_services::test_io_control(),
+                async move {
+                    blocking.entered.store(true, Ordering::Release);
+                    let mut released = blocking.released.lock().unwrap();
+                    while !*released {
+                        released = blocking.cv.wait(released).unwrap();
+                    }
+                },
+            )
+            .unwrap();
         assert!(poll_until(
             || gate.entered.load(Ordering::Acquire),
             Duration::from_secs(5)

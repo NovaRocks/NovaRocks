@@ -239,7 +239,37 @@ impl std::fmt::Debug for WorkChildAuthority {
             .finish()
     }
 }
+/// A successful point-in-time admission check. It retains neither a ledger nor
+/// derivation authority and does not prove an application identity. Identity
+/// owners use it while issuing their domain-specific execution tokens.
+#[derive(Clone, Debug)]
+pub struct AdmissionProof {
+    _private: (),
+}
 impl WorkChildAuthority {
+    /// Verifies the same original bound parent without prolonging its lifetime.
+    /// The proof grants no capacity, derivation or future lifecycle guarantee.
+    pub fn verify_live(&self) -> Result<AdmissionProof, RuntimeError> {
+        let state = self
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let scope = state
+            .scopes
+            .get(&self.scope.id)
+            .ok_or(RuntimeError::UnknownScope)?;
+        let work = scope.work(self.parent).ok_or(ScopeError::UnknownWork)?;
+        if work.unbound_guard || work.body_exited || work.captures_exited {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        if state.unresolved.contains(&(self.scope.id, self.parent)) {
+            return Err(RuntimeError::UnresolvedWork);
+        }
+        Ok(AdmissionProof { _private: () })
+    }
     pub(crate) fn scope(&self) -> &ScopeHandle {
         &self.scope
     }
@@ -317,6 +347,32 @@ impl WorkObligation {
             captures_exited: false,
             header_readiness_issued: false,
         }
+    }
+    /// Sets one opaque diagnostic label on an actually bound live Work.
+    /// Labels never grant authority or participate in retirement decisions.
+    pub fn set_diagnostic_label(&self, label: &'static str) -> Result<(), RuntimeError> {
+        let mut state = self
+            .scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let work = state
+            .scopes
+            .get(&self.scope.id)
+            .ok_or(RuntimeError::UnknownScope)?
+            .work(self.id)
+            .ok_or(ScopeError::UnknownWork)?;
+        if work.unbound_guard
+            || work.body_exited
+            || work.captures_exited
+            || state.work_labels.contains_key(&(self.scope.id, self.id))
+        {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        state.work_labels.insert((self.scope.id, self.id), label);
+        Ok(())
     }
     pub const fn id(&self) -> WorkId {
         self.id
@@ -529,13 +585,23 @@ impl WorkObligation {
     /// Records unknown exit while the actual custodian keeps this lease.
     /// Diagnostic responsibility is not a substitute for physical exit.
     pub fn mark_unresolved(&self) {
-        self.scope
+        let mut state = self
+            .scope
             .runtime
             .shared
             .state
             .lock()
-            .expect("runtime ledger lock")
-            .note_unresolved(self.scope.id, self.id);
+            .expect("runtime ledger lock");
+        if state.note_unresolved(self.scope.id, self.id) {
+            self.scope
+                .runtime
+                .shared
+                .record(|| HistoryFact::WorkUnresolved {
+                    scope: self.scope.id,
+                    work: self.id,
+                });
+        }
+        drop(state);
         self.scope.runtime.shared.changed.notify();
     }
     /// Bind exactly the declared capture containers for this actual role.
@@ -700,14 +766,7 @@ impl WorkObligation {
 impl Drop for WorkObligation {
     fn drop(&mut self) {
         if !self.body_exited || !self.captures_exited {
-            self.scope
-                .runtime
-                .shared
-                .state
-                .lock()
-                .expect("runtime ledger lock")
-                .note_unresolved(self.scope.id, self.id);
-            self.scope.runtime.shared.changed.notify();
+            self.mark_unresolved();
         }
     }
 }

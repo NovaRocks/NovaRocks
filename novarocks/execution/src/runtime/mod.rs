@@ -10,6 +10,7 @@ pub mod execution_health;
 pub mod execution_runtime;
 pub mod execution_services;
 pub mod kernel_memory;
+#[cfg(test)]
 pub(crate) mod local_completion;
 pub mod mem_tracker;
 pub mod observable;
@@ -17,6 +18,7 @@ pub mod operator_statistics;
 pub mod preparation_memory;
 pub mod preparation_metadata;
 pub mod profile;
+pub mod query_context;
 pub mod query_memory;
 pub mod query_options;
 pub mod runtime_state;

@@ -248,9 +248,10 @@ mod logical_finish_graph {
         fn schedule_unit_retry(
             &self,
             delay: Duration,
+            activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             task: Box<dyn FnOnce() + Send + 'static>,
         ) -> Result<(), novarocks_failure_contract::FailureFact> {
-            self.loopback.schedule_unit_retry(delay, task)
+            self.loopback.schedule_unit_retry(delay, activity, task)
         }
     }
 
@@ -434,7 +435,17 @@ mod logical_finish_graph {
                 sequence: crate::runtime::task::io::exchange_unit::ExchangeUnitSequence::FIRST,
                 wire_bytes: payload.len() as u64,
             };
-            port.register_unit_demand(summary_key, crate::runtime::task::io::exchange_unit::ExchangeDemandEntry { stream: summary_stream, operation: crate::runtime::task::io::exchange_unit::ExchangeDemandOperation::Register(demand) }).unwrap();
+            port.register_unit_demand(
+                summary_key,
+                crate::runtime::task::io::exchange_unit::ExchangeDemandEntry {
+                    stream: summary_stream,
+                    operation:
+                        crate::runtime::task::io::exchange_unit::ExchangeDemandOperation::Register(
+                            demand,
+                        ),
+                },
+            )
+            .unwrap();
             port.receive_unit(
                 summary_key,
                 crate::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame {

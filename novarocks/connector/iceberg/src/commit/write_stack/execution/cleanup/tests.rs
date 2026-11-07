@@ -35,6 +35,7 @@ fn binding(config: Option<ObjectStoreConfig>) -> IcebergReadBinding {
         config,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
         Arc::new(TokioFileIoSpawner::new(runtime)),
     )
 }
@@ -252,8 +253,8 @@ async fn cleanup_projection_preserves_original_scope_capabilities_and_restrictio
     let resolver: Arc<dyn ConnectorStorageResolver> = Arc::new(DenyResolver);
     let sink: Arc<dyn ConnectorVendedCredentialLeaseSink> = Arc::new(Sink);
     let io: Arc<dyn ConnectorIoAdmissionPort> = Arc::new(Io(AtomicUsize::new(0)));
-    let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
-    let range = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap();
+    let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::for_test();
+    let range = ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).unwrap();
     let properties = CatalogProperties::new(
         CatalogHandle::new(
             ConnectorInstanceId::parse("cleanup").unwrap(),

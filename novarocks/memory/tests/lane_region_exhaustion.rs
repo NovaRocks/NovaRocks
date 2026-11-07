@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! Real production capacity. Kept out of Miri because this deliberately holds
 //! every observation record and drives sixteen persistent allocation threads.
 #![cfg(not(loom))]

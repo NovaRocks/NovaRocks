@@ -1,3 +1,4 @@
+# Design: ADR-0218 (docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,6 +17,7 @@
 # under the License.
 
 disallowed-methods = [
+    { path = "tokio::runtime::LocalRuntime::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
   # The Server resolves configuration sources before injecting trust material.
   { path = "std::env::var", reason = "native trust receives Server-resolved material" },
   { path = "std::env::var_os", reason = "native trust receives Server-resolved material" },
@@ -76,6 +78,51 @@ disallowed-methods = [
   # NativeEndpointConnector owns connection establishment and trust policy.
   { path = "tonic::transport::Endpoint::connect", reason = "use NativeEndpointConnector" },
   { path = "tonic::transport::Endpoint::connect_lazy", reason = "use NativeEndpointConnector" },
+    { path = "tokio::task::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::runtime::LocalRuntime::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_blocking_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_local_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::LocalSet::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn_blocking_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio::task::Builder::spawn_local_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn_blocking_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::TaskTracker::spawn_local_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn_blocking_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinMap::spawn_local_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinQueue::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinQueue::spawn_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinQueue::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinQueue::spawn_blocking_on", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::JoinQueue::spawn_local", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::LocalPoolHandle::spawn_pinned", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "tokio_util::task::LocalPoolHandle::spawn_pinned_by_idx", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "std::thread::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218." },
+    { path = "std::thread::Builder::spawn", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218." },
+    { path = "std::thread::Builder::spawn_unchecked", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218." },
+    { path = "hyper::rt::Executor::execute", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
+    { path = "opendal::Execute::execute", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
 ]
 
 disallowed-types = [
@@ -85,6 +132,7 @@ disallowed-types = [
   { path = "tokio::fs::DirBuilder", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::File", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::OpenOptions", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+    { path = "tokio::task::LocalSet", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
 ]
 
 # Copy of the repository root threshold; Clippy reads only the nearest config.

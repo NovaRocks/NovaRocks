@@ -354,8 +354,6 @@ struct UnroutedTaskExecutionHost;
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
     fn close_participation_admission(&self, _participation: ParticipationRef) {}
 
-    fn retire_participation_execution(&self, _participation: ParticipationRef) {}
-
     fn forget_participation_admission(&self, _participation: ParticipationRef) {}
 
     fn install_receiver(
@@ -515,9 +513,8 @@ fn compose_backend_application_services(
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
-    let queries = crate::native_query_context::NativeQueryContextRuntime::global(Arc::clone(
-        &memory_authority,
-    ));
+    let queries =
+        crate::native_query_context::NativeQueryContextRuntime::new(Arc::clone(&memory_authority));
     #[cfg(novarocks_dev_controls)]
     let queries = match test_session {
         Some(session) => queries.with_test_controls(Some(session.native.clone())),
@@ -532,8 +529,8 @@ fn compose_backend_application_services(
         queries.clone(),
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
-        Arc::new(move |execution_id, contribution| {
-            runtime_filter_factory.install(execution_id, contribution)
+        Arc::new(move |execution_id, contribution, work| {
+            runtime_filter_factory.install(execution_id, contribution, work)
         }),
         data_runtime.clone(),
     );
@@ -855,6 +852,13 @@ impl BackendApplicationHost {
             .shutdown_driver_execution()
             .map_err(|cause| cause.safe_detail().to_string());
         observe_shutdown("drivers_joined");
+        let execution_result = combine_shutdown_results(
+            execution_result,
+            self.execution_runtime
+                .shutdown_sink_io()
+                .map_err(|cause| cause.safe_detail().to_string()),
+        );
+        observe_shutdown("sink_io_joined");
         // Driver shutdown publishes every actual-stop fact. Only after that
         // may the fixed completion owner drain its exact slots and return.
         let completion_result = self.task_completion_supervisor.shutdown();
@@ -1133,10 +1137,10 @@ impl BackendApplicationHost {
                     BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
                 })?
                 .with_exchange_flow(Arc::clone(&services.execution_runtime))
-                .with_native_query_resources(Arc::new(|| {
-                    novarocks_worker::query_context::query_context_manager()
-                        .native_execution_resource_snapshot()
-                }))
+                .with_native_query_resources({
+                    let host = Arc::clone(&services.participation_host);
+                    Arc::new(move || host.query_resource_snapshot())
+                })
                 .with_worker_node(services.task_control.clone())
                 .with_inbound_retention(Arc::clone(&services.task_inbound_capabilities)),
         );
@@ -1636,9 +1640,12 @@ mod tests {
         use novarocks_proto_models::filter;
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
-        use novarocks_worker::ParticipationHost;
         use novarocks_worker::SharedFactsRequest;
         use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
+        use novarocks_worker::{
+            ParticipationHostFactory, ParticipationMaterializationControl,
+            ParticipationWorkTestOwner,
+        };
 
         let exchange_flow_limits =
             super::ExchangeFlowLimits::try_new(2, 5, 0, 3, Duration::from_millis(71))
@@ -1729,25 +1736,39 @@ mod tests {
                     .expect("an empty rotation is legal"),
             ),
         );
-        services
+        let work_owner = ParticipationWorkTestOwner::new_for(participation);
+        let instance = services
             .participation_host
-            .materialize(SharedFactsRequest::new(
-                participation,
-                &catalogs,
-                &filter,
-                &options,
-                &credential,
-            ))
-            .expect("establishing a participation with a participant is legal");
+            .clone()
+            .create_instance(participation, work_owner.instance())
+            .expect("the original Participation grants its instance Work");
+        struct Active;
+        impl ParticipationMaterializationControl for Active {
+            fn is_stopped(&self) -> bool {
+                false
+            }
+        }
+        let established = instance.materialize(
+            SharedFactsRequest::new(participation, &catalogs, &filter, &options, &credential),
+            &Active,
+        );
 
         let authority: Arc<
             dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
         > = services.participation_host.clone();
         let ingress = native_runtime_filter_envelope_ingress(authority);
-        let reason = ingress
-            .accept(envelope)
-            .rejection_reason()
-            .map(str::to_string)
+        let reason = established.map(|()| {
+            ingress
+                .accept(envelope)
+                .rejection_reason()
+                .map(str::to_string)
+        });
+        let _released = instance.release();
+        drop(ingress);
+        drop(instance);
+        test_data_runtime().block_on(work_owner.finish());
+        let reason = reason
+            .expect("establishing a participation with a participant is legal")
             .expect("a channel-less participant refuses this delivery itself");
         // Reaching the participant is the whole claim: it refuses the delivery
         // on its own route authority, which no composition refusal can say.

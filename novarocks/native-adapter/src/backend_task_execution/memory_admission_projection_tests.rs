@@ -18,22 +18,20 @@
 //! Exact real admission refusal projected at the existing task-resource boundary.
 use super::memory_admission_failure_to_host;
 use crate::native_query_context::{NativeQueryContextRuntime, NativeTaskAdmissionError};
+use novarocks_execution::runtime::query_context::QueryMemoryAccountError;
 use novarocks_execution_contract::{TaskFailureCategory, TaskIdentity};
 use novarocks_memory::{AuthorityConfig, CapacityError, MemoryAuthority};
-use novarocks_types::UniqueId;
 use novarocks_types::identity::{
     AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
-use novarocks_worker::query_context::{QueryContextManager, QueryMemoryAccountError};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 #[test]
 fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category() {
     let mut config = AuthorityConfig::new(1 << 30, 1 << 29, 1 << 29);
     config.max_accounts = 1;
     let authority = Arc::new(MemoryAuthority::new(config).unwrap());
-    let runtime =
-        NativeQueryContextRuntime::new_for_test(QueryContextManager::new_for_test(), authority);
+    let runtime = NativeQueryContextRuntime::new(authority);
     let execution =
         QueryExecutionId::new(QueryId::new(97401, 97402), AttemptId::new(1).unwrap()).unwrap();
     let identity = TaskIdentity::new(
@@ -43,14 +41,7 @@ fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category()
         BackendProcessId::new_v7(),
     );
     let error = runtime
-        .prepare_admission_execution_typed(
-            execution,
-            UniqueId::new(97403, 97404),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-            None,
-            None,
-        )
+        .establish_query_resources(execution, None)
         .err()
         .unwrap();
     assert!(matches!(

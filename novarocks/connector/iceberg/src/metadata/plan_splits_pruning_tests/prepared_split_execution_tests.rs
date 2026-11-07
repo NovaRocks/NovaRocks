@@ -1143,6 +1143,7 @@ fn vended_prepared_source_fresh_refusal(expire_selected_endpoint: bool) {
         None,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
         Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
     );
     let runtime = Arc::new(

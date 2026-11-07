@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! Actual Server GLOBAL and the two original Project metadata birth scopes.
 //! Isolated with --test-threads=1; explicit retirement is protocol evidence,
 //! not production retirement or MEM cost acceptance.

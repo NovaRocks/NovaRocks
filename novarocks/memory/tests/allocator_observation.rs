@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! The counting allocator observed as the real process allocator.
 //!
 //! A unit test can only exercise the wrapper as a value. This target installs

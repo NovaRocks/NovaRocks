@@ -858,6 +858,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::clone(&io_spawner),
         );
         let access = binding

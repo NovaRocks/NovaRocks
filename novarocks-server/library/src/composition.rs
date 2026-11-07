@@ -1130,6 +1130,7 @@ pub fn compose_connector_file_planning_resources(
         pool,
         FsAccessResolver::with_runtime(runtime.clone()),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
         std::sync::Arc::new(TokioFileIoSpawner::new(runtime)),
     ))
 }

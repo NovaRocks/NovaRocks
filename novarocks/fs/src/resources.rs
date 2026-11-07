@@ -28,19 +28,6 @@ use crate::{
     RefreshPolicy, StorageAuthorityRegistry,
 };
 
-/// Bridges the registry's refresh executor onto the composed task spawner, so a
-/// refresh runs wherever that spawner puts detached blocking work rather than on
-/// the thread that asked for material.
-struct SpawnerRefreshExecutor {
-    spawner: Arc<dyn FileIoSpawner>,
-}
-
-impl RefreshExecutor for SpawnerRefreshExecutor {
-    fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.spawner.spawn_detached_blocking(job);
-    }
-}
-
 /// Filesystem resources bound by a connector instance or execution binding.
 ///
 /// Endpoint configuration and secret material are intentionally absent. Each
@@ -91,36 +78,13 @@ impl FsAccessResources {
         object_store_provider_pool: Arc<ObjectStoreProviderPool>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
+        refresh_executor: Arc<dyn RefreshExecutor>,
         file_io_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
-        Self::new_with_refresh_spawner(
-            object_store_provider_pool,
-            access_resolver,
-            file_runtime,
-            Arc::clone(&file_io_spawner),
-            file_io_spawner,
-        )
-    }
-
-    /// Keep credential acquisition on its composed owner when scan I/O uses
-    /// a dedicated runtime. The scan spawner remains available to file reads;
-    /// the refresh spawner is private to the storage-authority registry.
-    pub fn new_with_refresh_spawner(
-        object_store_provider_pool: Arc<ObjectStoreProviderPool>,
-        access_resolver: FsAccessResolver,
-        file_runtime: Arc<dyn FileIoRuntime>,
-        file_io_spawner: Arc<dyn FileIoSpawner>,
-        refresh_spawner: Arc<dyn FileIoSpawner>,
-    ) -> Self {
-        // The registry is built here rather than passed in because it must be
-        // exactly as shared as the pool beside it. Its refreshes run on the
-        // explicitly composed owner, which may differ from scan I/O. Letting
-        // callers supply the registry itself would allow two authorities with
-        // one identity, which the pool key cannot survive.
+        // The registry is exactly as shared as the pool beside it. Refreshes
+        // belong to the credential service and never use the read spawner.
         let storage_authority_registry = Arc::new(StorageAuthorityRegistry::with_default_options(
-            Arc::new(SpawnerRefreshExecutor {
-                spawner: refresh_spawner,
-            }),
+            refresh_executor,
             RefreshPolicy::default(),
         ));
         Self {
@@ -196,17 +160,25 @@ mod tests {
 
     struct CountingSpawner {
         inner: TokioFileIoSpawner,
-        refreshes: AtomicUsize,
+        spawns: AtomicUsize,
     }
 
     impl FileIoSpawner for CountingSpawner {
         fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
+            self.spawns.fetch_add(1, Ordering::Relaxed);
             self.inner.spawn(task)
         }
+    }
 
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+    struct CountingRefreshExecutor {
+        inner: crate::TokioRefreshExecutor,
+        refreshes: AtomicUsize,
+    }
+
+    impl RefreshExecutor for CountingRefreshExecutor {
+        fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
-            self.inner.spawn_detached_blocking(job);
+            self.inner.execute(job);
         }
     }
 
@@ -244,12 +216,17 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone()));
         let owner_spawner = Arc::new(CountingSpawner {
             inner: TokioFileIoSpawner::new(owner_runtime.handle().clone()),
-            refreshes: AtomicUsize::new(0),
+            spawns: AtomicUsize::new(0),
         });
         let scan_spawner = Arc::new(CountingSpawner {
             inner: TokioFileIoSpawner::new(scan_runtime.handle().clone()),
+            spawns: AtomicUsize::new(0),
+        });
+        let refresh_executor = Arc::new(CountingRefreshExecutor {
+            inner: crate::TokioRefreshExecutor::new(owner_runtime.handle().clone()),
             refreshes: AtomicUsize::new(0),
         });
+        let refresh: Arc<dyn RefreshExecutor> = refresh_executor.clone();
         let owner_tasks: Arc<dyn FileIoSpawner> = owner_spawner.clone();
         let scan_tasks: Arc<dyn FileIoSpawner> = scan_spawner.clone();
         let write = FsAccessResources::new(
@@ -259,6 +236,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::clone(&owner_io),
+            Arc::clone(&refresh),
             Arc::clone(&owner_tasks),
         );
         let read = write.with_file_io(Arc::clone(&scan_io), Arc::clone(&scan_tasks));
@@ -318,8 +296,9 @@ mod tests {
                 .expect("second view reuses material");
         });
         assert_eq!(source.acquisitions.load(Ordering::Relaxed), 1);
-        assert_eq!(owner_spawner.refreshes.load(Ordering::Relaxed), 1);
-        assert_eq!(scan_spawner.refreshes.load(Ordering::Relaxed), 0);
+        assert_eq!(refresh_executor.refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(owner_spawner.spawns.load(Ordering::Relaxed), 0);
+        assert_eq!(scan_spawner.spawns.load(Ordering::Relaxed), 0);
         assert_eq!(write.storage_authority_registry().metrics().misses, 1);
         assert_eq!(write.storage_authority_registry().metrics().hits, 1);
         assert_eq!(read_authority.metrics().refreshes_applied, 1);
@@ -339,6 +318,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
+            crate::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::clone(&io_spawner),
         );
 

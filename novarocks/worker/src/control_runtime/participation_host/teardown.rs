@@ -66,6 +66,37 @@ impl std::fmt::Debug for ParticipationTeardownRefusal {
 }
 
 impl ParticipationHostRecord {
+    /// Original non-role headers that prevent physical execution detachment.
+    /// This list is a diagnostic sample and grants no exit/retirement authority.
+    pub(crate) fn detachment_blockers(
+        &self,
+    ) -> Result<
+        Option<super::super::node_metrics::WorkerDetachmentBlockers>,
+        novarocks_control_runtime::transaction::RuntimeError,
+    > {
+        let Some(scope) = self.resources.scope.as_ref() else {
+            return Ok(None);
+        };
+        let mut inventory = scope.work_inventory()?;
+        inventory.entries.retain(|entry| {
+            !self
+                .resources
+                .metadata_resources
+                .iter()
+                .any(|role| role.work.id() == entry.work)
+        });
+        inventory.live_by_label.clear();
+        inventory.unresolved_by_label.clear();
+        for entry in &inventory.entries {
+            if let Some(label) = entry.label {
+                *inventory.live_by_label.entry(label).or_default() += 1;
+                if entry.unresolved {
+                    *inventory.unresolved_by_label.entry(label).or_default() += 1;
+                }
+            }
+        }
+        Ok(Some(inventory))
+    }
     pub(in crate::control_runtime) fn retention_snapshot(
         &self,
     ) -> Option<super::super::node_metrics::WorkerParticipationRetentionSnapshot> {
@@ -132,6 +163,11 @@ impl ParticipationHostRecord {
                 .map_err(ParticipationHostError::HostJob)?
         {
             return Ok(false);
+        }
+        if let Some(registry) = &self.resources.work_registry {
+            registry.retire_ready(3).map_err(|error| {
+                ParticipationHostError::HostJob(ParticipationHostJobError::Work(error))
+            })?;
         }
         scope
             .close_external()
@@ -241,6 +277,11 @@ impl ParticipationHostRecord {
                 .map_err(ParticipationHostError::HostJob)?
         {
             return Ok(false);
+        }
+        if let Some(registry) = &self.resources.work_registry {
+            registry.retire_ready(3).map_err(|error| {
+                ParticipationHostError::HostJob(ParticipationHostJobError::Work(error))
+            })?;
         }
         scope
             .close_external()

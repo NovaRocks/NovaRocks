@@ -4957,6 +4957,7 @@ mod public_read_schema_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
@@ -5199,6 +5200,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let original = IcebergMetadataContext::try_new(
@@ -5464,6 +5466,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
@@ -6106,6 +6109,7 @@ mod prepared_source_relation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources = crate::resources::IcebergMetadataResources::new(

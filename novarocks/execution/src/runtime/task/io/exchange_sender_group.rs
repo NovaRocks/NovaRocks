@@ -596,9 +596,10 @@ impl ExchangeFrameTransmitter for MeasuredTransmitter {
     fn schedule_unit_retry(
         &self,
         delay: std::time::Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         task: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), FailureFact> {
-        self.inner.schedule_unit_retry(delay, task)
+        self.inner.schedule_unit_retry(delay, activity, task)
     }
 }
 

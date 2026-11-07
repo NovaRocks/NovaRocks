@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 mod common;
 
 use std::sync::Arc;
@@ -89,10 +94,6 @@ impl FileIoRuntime for ControlledIo {
 impl FileIoSpawner for ControlledIo {
     fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         Ok(FileIoJob::new(self.runtime.spawn(task)))
-    }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.runtime.spawn_blocking(job);
     }
 }
 

@@ -2719,6 +2719,7 @@ mod sdk_nested_representation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let facts = FrozenDataWriteFacts {
@@ -2885,6 +2886,7 @@ mod sdk_nested_representation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let context = staged_write_context_from_frozen_facts(

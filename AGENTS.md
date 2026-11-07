@@ -372,6 +372,20 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/execution/src/exec/pipeline/global_driver_executor.rs`
   Global driver scheduling executor.
 
+- `novarocks/control-runtime/src/{exit_work.rs,exit_custody.rs}` 与
+  `novarocks/worker/src/control_runtime/participation_host/work_issuer.rs`
+  保管原 `ExitObligation`、panic 与 `ExitCustody`；`run_future` / `run_blocking`
+  先销毁本工作和 captures 再报告退出，由原看管方消费报告、退休并回收 header。
+  `ParticipationInstanceGrant` 与 `InstanceWorkIssuer` 只从原参与派生实例和 RF sender 工作。
+  凭证放在负责 join 的 owner，不能以 abort、terminal 或超时替代实际退出；
+  第三方内部阻塞副作业与显式服务移交边界见
+  [ADR-0218](docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)。
+
+- `novarocks/worker/src/host.rs` 的 `TaskPreparationContext`、`TaskScanSourceIssuer`
+  与 `PreparationControlLoan` 按 Worker 原 Task 记录签发控制令牌及 scan 根/范围；
+  `AdmissionProof` 仅证明签发时存活，不授予容量、派生权或未来生命周期保证。
+  Execution/Native 消费签发结果，不自填身份或接回 raw runtime/submit 入口。
+
 - `novarocks/execution/src/exec/pipeline/dependency.rs`
   Operator dependency management.
 
@@ -415,8 +429,19 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 - `novarocks/worker/src/result_buffer.rs`
   BE-local result buffering, retained budget and fetch behavior.
 
-- `novarocks/worker/src/query_context.rs`
-  BE-local query context manager, cleanup leases and resource snapshots.
+- `novarocks/execution/src/runtime/query_context.rs` 与
+  `novarocks/native-adapter/src/{native_query_context.rs,backend_task_execution/participation_host.rs}`
+  原 `NativeParticipationInstance` 拥有本次尝试的 `QueryContext`；Task 只取得原资源引用，
+  不按键重建、不由全局管理器或过期线程回收。`QueryTaskGuard` 随 Execution
+  `runtime/task/resources.rs` 的真实资源退出，在 `CompletionExited` 前放下原上下文引用；
+  active_tasks 只作诊断，不决定参与寿命。参与工作由原 registry 退休/reap，
+  `ExecutionCustodyRetired` 仍以实际 Scope 移除为前提。见 ADR-0218。
+
+- `novarocks/native-adapter/src/{exchange_transmitter.rs,runtime_filter_transport.rs}` 与
+  `novarocks/execution/src/runtime/execution_services.rs`
+  分别拥有带 `ExchangeCallActivity`、`RuntimeFilterSenderWork` 与 `TaskExecutionControl`
+  的私有/受控提交入口。RF close 的本地分发栅栏与 sender 实际退出分别推进；
+  sink IO shutdown 先封准入再等真实 live，停止等待不归还仍活责任。
 
 - `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime state for cache, runtime filters, and execution context.
@@ -893,7 +918,16 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 - `cargo clippy --workspace --all-targets -- -D warnings`（CI 严格 Clippy 阶段；CI wrapper 另固定 `--profile dev --locked --target-dir target`）
 - `cargo build`
 - 全局基线只放宽 Databend 与 RisingWave 共同放宽的项：`Cargo.toml` 的 `[workspace.lints.clippy] result_large_err = "allow"`，根 `clippy.toml` 的 `too-many-arguments-threshold = 10`；`large_enum_variant` 与 `type_complexity` 保持默认。新增局部例外使用带理由的 `#[expect(lint, reason = "...")]`，不新增 `#[allow]`。升级 `rust-toolchain.toml` 时，负责修复新诊断，或按相同对齐规则调整并写明理由。
-- Clippy 只读取离 crate 最近的一份 `clippy.toml`，不合并配置；修改根配置时同步更新 `novarocks/native-trust/clippy.toml`。
+- 根 `clippy.toml` 默认禁止裸启动 API，是禁用清单的唯一出处；新增共享 crate 没有近邻
+  配置时自动受其约束。查询工作须走带原义务或 Worker 签发令牌的入口。
+  服务 carrier 与已有凭证的私有提交点仅在最小位置写
+  `#[expect(clippy::disallowed_methods, reason = "...")]`（类型禁令用对应 lint），
+  不用共享 crate 全局 allow 绕过；例外必须说明真实 join/退出或服务移交边界。见 ADR-0218。
+- Clippy 只读取离 crate 最近的一份 `clippy.toml`，不合并；修改根禁令时核对
+  `native-trust`、`control-runtime-core`、`worker-protocol` 的现有近邻限制并同步根清单，
+  保留各自额外 API 限制。已核实的 FE 专用 crate 和测试基础设施以自身配置明确豁免；
+  任何新增 BE production 消费或共享职责都须重新审查，FE 接入共同监督后逐项收回。
+  `allow-invalid` 不证明某第三方方法已被匹配；第三方内部启动的范围和已知限制见 ADR-0218。
 - 改动 crate 依赖时参考 [SPI](docs/guides/development/spi-boundary.md)、[StateStore](docs/guides/development/state-store-boundary.md) 与 [Memory](docs/guides/development/memory-boundary.md) 边界指南；依赖方向由 crate 结构与 review 维持，CI 不做依赖边界检查。
 - 按影响面执行 nextest；独立 Cargo doctest，局部调试可用 `cargo test -p <owner>`
 
@@ -1072,6 +1106,16 @@ for reasons of their own, so the count overstates the problem. Re-run a
 suspected case against a clean server before attributing it to the change.
 
 ## 9. Suggested Starting Points for Typical Changes
+
+- **工作签发、退出与启动入口**：先读 ADR-0218，再看
+  `novarocks/control-runtime/src/{exit_work.rs,exit_custody.rs,obligation.rs}`、
+  `novarocks/worker/src/host.rs`、
+  `novarocks/worker/src/control_runtime/participation_host/work_issuer.rs` 与
+  `novarocks/native-adapter/src/backend_task_execution/participation_host.rs`。
+  Task 实际资源退出见 Execution `runtime/task/resources.rs`；
+  sink、RF、exchange 与 scan 分别沿自身受控入口和原 join owner。
+  裸启动禁令查根 `clippy.toml`，近邻配置不合并；先确认实际 owner 与生命周期，
+  不把协议 terminal、取消请求、guard 计数或源码形状当退出证明。
 
 - **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,

@@ -519,6 +519,7 @@ impl ExchangeFrameTransmitter for Ports {
     fn schedule_unit_retry(
         &self,
         _: Duration,
+        _: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
         _: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
         panic!("CountOnly Root fixture attempted Unit retry")
@@ -690,6 +691,7 @@ impl BundleFixture {
         &self,
         preparation: &mut TaskPreparationContext<'_>,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+        expected_task_key: novarocks_types::UniqueId,
     ) -> TaskPreparationCapture {
         self.host_entries.fetch_add(1, Ordering::SeqCst);
         assert!(
@@ -697,6 +699,21 @@ impl BundleFixture {
             "the stopped preparation must not enter the host"
         );
         let identity = preparation.view().identity();
+        let (range_scope, operations) = preparation.scan_source(17).unwrap();
+        let execution = identity.query_execution_id();
+        assert_eq!(
+            range_scope.parts(),
+            (
+                execution.query_id().high(),
+                execution.query_id().low(),
+                execution.attempt_id().get(),
+                expected_task_key.high(),
+                expected_task_key.low(),
+                17,
+            ),
+            "scan tokens must preserve the original Task descriptor identity"
+        );
+        operations.seal();
         let children = preparation.original_children_for_test().clone();
         let activation_window = self.activation_window.lock().unwrap().clone();
         if let Some(window) = activation_window {
@@ -705,6 +722,7 @@ impl BundleFixture {
         let (owner, cadence) = preparation.view().control();
         let owner = owner.expect("same original execution port");
         let waker = preparation.readiness_waker();
+        let (admission, task_key) = preparation.admission_for_test();
         let roles = preparation.take_capture().unwrap();
         let before = self.inventory(identity);
         let wrong_identity = TaskIdentity::new(
@@ -723,6 +741,8 @@ impl BundleFixture {
             cadence,
             roles,
             waker.clone(),
+            admission.clone(),
+            task_key,
         ) {
             Err(original) => original,
             Ok(_) => panic!("wrong child must return the whole original bundle"),
@@ -734,11 +754,10 @@ impl BundleFixture {
             "wrong-child refusal cannot change original role IDs, inventory or payment"
         );
         self.whole_refusals.fetch_add(1, Ordering::SeqCst);
-        let mut rebound =
-            TaskPreparationContext::from_admitted(owner, &children, cadence, returned, waker)
-                .unwrap_or_else(|_| {
-                    panic!("the returned whole bundle binds to its original children")
-                });
+        let mut rebound = TaskPreparationContext::from_admitted(
+            owner, &children, cadence, returned, waker, admission, task_key,
+        )
+        .unwrap_or_else(|_| panic!("the returned whole bundle binds to its original children"));
         assert_eq!(
             self.inventory(identity),
             before,
@@ -875,7 +894,7 @@ struct CompiledTaskHost {
 }
 impl TaskExecutionHost for CompiledTaskHost {
     fn close_participation_admission(&self, _: ParticipationRef) {}
-    fn retire_participation_execution(&self, _: ParticipationRef) {}
+
     fn forget_participation_admission(&self, _: ParticipationRef) {}
     fn install_receiver(
         &self,
@@ -886,9 +905,11 @@ impl TaskExecutionHost for CompiledTaskHost {
         // Validate the whole binding before moving/dropping the actual input;
         // its source still belongs to this original physical preparation.
         let original_roles = match &self.bundle {
-            Some(bundle) => {
-                bundle.take_original_capture(&mut preparation, self.execution.execution_health())
-            }
+            Some(bundle) => bundle.take_original_capture(
+                &mut preparation,
+                self.execution.execution_health(),
+                descriptor.task_key(),
+            ),
             None => preparation.take_capture().unwrap(),
         };
         if let Some(bundle) = &self.bundle {
@@ -960,13 +981,13 @@ impl TaskExecutionHost for CompiledTaskHost {
             Arc::new(Ports),
             Arc::new(Ports),
             Arc::new(NoopTaskEventSink),
+            descriptor.identity(),
+            control,
+            completion_work,
         )
         .with_root_result_session(session)
         .with_execution_runtime(self.execution.clone())
-        .with_task_commit_port(Arc::new(Ports))
-        .with_result_identity(descriptor.identity())
-        .with_task_control(control)
-        .with_completion_work(completion_work);
+        .with_task_commit_port(Arc::new(Ports));
         let dormant = prepare_compiled_task(submission, participation).unwrap();
         let runnable = Arc::new(Runnable {
             identity: descriptor.identity(),

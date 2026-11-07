@@ -1060,6 +1060,7 @@ mod tests {
             object_store_config,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(owner.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(owner.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(owner.handle().clone())),
         )
     }

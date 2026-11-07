@@ -2971,6 +2971,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
@@ -5199,7 +5200,6 @@ mod tests {
     }
 
     struct ManifestReadFailureSpawner {
-        handle: tokio::runtime::Handle,
         kind: novarocks_fs::FileErrorKind,
         message: &'static str,
         attempts: std::sync::atomic::AtomicUsize,
@@ -5213,10 +5213,6 @@ mod tests {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(novarocks_fs::FileError::new(self.kind, self.message))
-        }
-
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-            self.handle.spawn_blocking(job);
         }
     }
 
@@ -5309,7 +5305,6 @@ mod tests {
         // Install the failing dispatch only after all setup reads. Each
         // remaining read is the exact local manifest named by this split.
         let spawner = Arc::new(ManifestReadFailureSpawner {
-            handle: runtime.handle().clone(),
             kind,
             message,
             attempts: std::sync::atomic::AtomicUsize::new(0),

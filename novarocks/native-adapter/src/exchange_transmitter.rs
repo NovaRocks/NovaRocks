@@ -1,7 +1,12 @@
+use std::future::Future;
+use std::mem::ManuallyDrop;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use novarocks_execution::runtime::task::io::ExchangeFrameTransmitter;
+use novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity;
 
 use novarocks_proto_codec::FieldPath;
 #[cfg(test)]
@@ -40,6 +45,59 @@ struct GrpcExchangeFrameTransmitter {
     send_timeout: Duration,
     capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     grants: Arc<crate::exchange_grant_subscription::ExchangeGrantClients>,
+}
+
+// The inner future (including a never-polled retry closure) is destroyed before
+// the activity on completion, cancellation and data-runtime shutdown alike.
+struct ExchangeCallFuture<F> {
+    future: Option<Pin<Box<F>>>,
+    activity: Option<ExchangeCallActivity>,
+}
+impl<F> ExchangeCallFuture<F> {
+    fn finish(&mut self) {
+        // If capture destruction panics, retain the original activity instead
+        // of authoring a false exit while unwinding the remaining fields.
+        let activity = ManuallyDrop::new(self.activity.take());
+        drop(self.future.take());
+        drop(ManuallyDrop::into_inner(activity));
+    }
+}
+impl<F: Future<Output = ()>> Future for ExchangeCallFuture<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        let result = this
+            .future
+            .as_mut()
+            .expect("live exchange call")
+            .as_mut()
+            .poll(context);
+        if result.is_ready() {
+            this.finish();
+        }
+        result
+    }
+}
+impl<F> Drop for ExchangeCallFuture<F> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The original ExchangeCallActivity covers the transmitted future and its captures; see ADR-0218."
+)]
+fn spawn_exchange_call(
+    runtime: &BackendDataRuntime,
+    activity: ExchangeCallActivity,
+    future: impl Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    runtime.handle().spawn(ExchangeCallFuture {
+        future: Some(Box::pin(future)),
+        activity: Some(activity),
+    })
 }
 
 impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
@@ -161,13 +219,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
-        self.runtime.handle().spawn(async move {
+        spawn_exchange_call(&self.runtime, activity, async move {
             #[cfg(novarocks_dev_controls)]
             let _observation = _observer;
-            // This guard follows the real local request future, including its
-            // owned DTO/payload aliases. Unknown is only a result notification;
-            // the caller cannot release this guard from that callback.
-            let _activity = activity;
             let client = NativeRpcClient::new_backend_endpoint(
                 runtime,
                 frame.destination.native_endpoint().clone(),
@@ -292,9 +346,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         }
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
-        self.runtime.handle().spawn(async move {
-            // The inner future owns all request/client captures. The original
-            // activity remains outside it and outside the outcome callback.
+        spawn_exchange_call(&self.runtime, activity, async move {
             let outcome = async move {
                 let client = NativeRpcClient::new_backend_endpoint(
                     runtime,
@@ -330,7 +382,6 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             }
             .await;
             done(outcome);
-            drop(activity);
         });
     }
 
@@ -350,9 +401,10 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
     fn schedule_unit_retry(
         &self,
         delay: Duration,
+        activity: novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity,
         task: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
-        self.runtime.handle().spawn(async move {
+        spawn_exchange_call(&self.runtime, activity, async move {
             tokio::time::sleep(delay).await;
             task();
         });
@@ -483,6 +535,106 @@ pub(crate) mod tests {
             FieldPath::root("test"),
         )
     }
+
+    struct ExitCapture(Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl Drop for ExitCapture {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("capture");
+        }
+    }
+
+    struct ReadyCall(ExitCapture);
+    impl Future for ReadyCall {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            // Keep the capture in the completed future until its real Drop.
+            let _ = &self.0;
+            Poll::Ready(())
+        }
+    }
+
+    #[test]
+    fn completed_exchange_call_drops_captures_before_its_activity() {
+        let runtime = crate::backend_test_support::test_backend_data_runtime();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let activity_events = events.clone();
+        let job = spawn_exchange_call(
+            &runtime,
+            ExchangeCallActivity::for_test(move || {
+                activity_events.lock().unwrap().push("activity")
+            }),
+            ReadyCall(ExitCapture(events.clone())),
+        );
+        runtime.block_on(job).unwrap();
+        assert_eq!(*events.lock().unwrap(), ["capture", "activity"]);
+    }
+
+    #[test]
+    fn a_panicking_capture_destructor_does_not_report_activity_exit() {
+        struct PanickingCapture;
+        impl Future for PanickingCapture {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        impl Drop for PanickingCapture {
+            fn drop(&mut self) {
+                panic!("capture destruction failed");
+            }
+        }
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit = exited.clone();
+        let call = ExchangeCallFuture {
+            future: Some(Box::pin(PanickingCapture)),
+            activity: Some(ExchangeCallActivity::for_test(move || {
+                exit.store(true, std::sync::atomic::Ordering::Release);
+            })),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(call)));
+        assert!(outcome.is_err());
+        assert!(!exited.load(std::sync::atomic::Ordering::Acquire));
+    }
+    #[test]
+    fn runtime_shutdown_drops_a_sleeping_retry_capture_before_its_activity() {
+        let carrier = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime = BackendDataRuntime::new(
+            carrier.handle().clone(),
+            crate::backend_test_support::test_backend_native_trust(),
+            crate::BackendNativeTransport::Plaintext,
+        );
+        let transmitter = grpc_exchange_transmitter(
+            runtime,
+            Duration::from_secs(1),
+            novarocks_worker::TaskInboundCapabilities::new(),
+            #[cfg(novarocks_dev_controls)]
+            None,
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let activity_events = events.clone();
+        let capture = ExitCapture(events.clone());
+        transmitter
+            .schedule_unit_retry(
+                Duration::from_secs(3600),
+                ExchangeCallActivity::for_test(move || {
+                    activity_events.lock().unwrap().push("activity")
+                }),
+                Box::new(move || {
+                    drop(capture);
+                    panic!("shutdown must cancel the sleeping retry");
+                }),
+            )
+            .unwrap();
+        carrier.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        assert!(events.lock().unwrap().is_empty());
+        drop(carrier);
+        assert_eq!(*events.lock().unwrap(), ["capture", "activity"]);
+    }
     #[test]
     fn missing_frozen_sender_process_is_refused_before_tcp_dial() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -505,7 +657,7 @@ pub(crate) mod tests {
         transmitter.deliver_unit(
             frame,
             CancellationToken::new(),
-            ExchangeCallActivity::new(move || {
+            ExchangeCallActivity::for_test(move || {
                 exit.store(true, std::sync::atomic::Ordering::Release);
             }),
             Box::new(move |outcome| tx.send(outcome).unwrap()),
@@ -559,7 +711,7 @@ pub(crate) mod tests {
                 operation: ExchangeDemandOperation::StopSender,
             }],
             stop.clone(),
-            ExchangeCallActivity::new(move || {
+            ExchangeCallActivity::for_test(move || {
                 exit_tx.send(()).unwrap();
             }),
             Box::new(move |outcome| {
@@ -648,7 +800,7 @@ pub(crate) mod tests {
                 frame.destination.clone(),
                 vec![ExchangeDemandEntry { stream, operation }],
                 stop,
-                ExchangeCallActivity::new(|| {}),
+                ExchangeCallActivity::for_test(|| {}),
                 Box::new(move |outcome| tx.send(outcome).unwrap()),
             );
             rx.recv_timeout(Duration::from_secs(2)).unwrap()

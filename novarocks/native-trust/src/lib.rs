@@ -22,6 +22,13 @@
 //! applications own their listeners, channels, retries, and observability.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
 
 mod adapter;
 mod auth;

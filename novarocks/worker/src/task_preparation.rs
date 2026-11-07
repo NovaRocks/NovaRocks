@@ -19,6 +19,17 @@
 //! Input, body unwind and whole-report custody belong to control_runtime::preparation.
 
 use crate::failure_reason::WorkerFailureReason as R;
+use crate::{control_runtime::preparation::PreparationParent, task_port::TaskPendingNotice};
+use novarocks_control_runtime::{
+    completion::ReportSlot,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::WorkRetirementObserver,
+    transaction::{RuntimeError, ScopeHandle},
+};
+use novarocks_control_runtime_core::{
+    identity::ConsumerId,
+    scope::{ScopeError, WorkKind},
+};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureProjection};
 use novarocks_execution_contract::{TaskFailurePhase, TaskIdentity};
@@ -87,37 +98,124 @@ enum Mode {
     Adopted,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Phase {
-    NotStarted,
-    Started,
-    Unresolved,
-    Exited,
-}
-#[derive(Clone, Copy)]
 #[repr(usize)]
 enum Step {
     Cancel,
     Inbound,
     Receiver,
-    Poll,
+    Child,
     Adopt,
-    ChildDrop,
     Publication,
 }
 const STEPS: usize = Step::Publication as usize + 1;
+const CALLBACKS: [Step; 5] = [
+    Step::Cancel,
+    Step::Inbound,
+    Step::Receiver,
+    Step::Adopt,
+    Step::Publication,
+];
+const OBSERVER: ConsumerId = ConsumerId::new(2).unwrap();
+const HOST_WORK_STORAGE: crate::control_runtime_policy::StorageNeed =
+    crate::control_runtime_policy::StorageNeed {
+        requests: 0,
+        inputs: 0,
+        batches: 0,
+        effects: 0,
+        cuts: 0,
+        replies: 0,
+        work: 1,
+        completions: 1,
+        captures: 1,
+    };
 type Payload = Box<dyn Any + Send>;
-type PanicCustody = [Option<ManuallyDrop<Payload>>; STEPS];
+
+/// The phase and physical-exit authority belong to the original runtime work.
+/// `claimed` and `invoked` only serialize foreign calls and record whether an
+/// adoption actually ran; neither can establish exit or release capacity.
+struct HostWork {
+    custody: ExitCustody,
+    obligation: Option<ExitObligation>,
+    report: ReportSlot,
+    retirement: WorkRetirementObserver,
+    claimed: bool,
+    invoked: bool,
+    panic: Option<ManuallyDrop<Payload>>,
+}
+impl HostWork {
+    fn reserve(parent: &PreparationParent, step: Step) -> Result<Self, RuntimeError> {
+        let kind = match step {
+            Step::Adopt | Step::Publication => WorkKind::Business,
+            _ => WorkKind::Cleanup,
+        };
+        let original = parent.reserve_host_work(
+            kind,
+            HOST_WORK_STORAGE
+                .resources()
+                .expect("fixed host work storage"),
+        )?;
+        original.work().set_diagnostic_label(match step {
+            Step::Cancel => crate::control_runtime::work_labels::PREPARATION_CANCEL,
+            Step::Inbound => crate::control_runtime::work_labels::PREPARATION_INBOUND,
+            Step::Receiver => crate::control_runtime::work_labels::PREPARATION_RECEIVER,
+            Step::Child => crate::control_runtime::work_labels::PREPARATION_CHILD,
+            Step::Adopt => crate::control_runtime::work_labels::PREPARATION_ADOPT,
+            Step::Publication => crate::control_runtime::work_labels::PREPARATION_PUBLICATION,
+        })?;
+        let retirement = original.work().retirement_observer();
+        let report = original.report().clone();
+        let (custody, obligation) = ExitCustody::from_admitted(original);
+        Ok(Self {
+            custody,
+            obligation: Some(obligation),
+            report,
+            retirement,
+            claimed: false,
+            invoked: false,
+            panic: None,
+        })
+    }
+    fn exited(&self) -> bool {
+        matches!(
+            self.custody.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+        )
+    }
+    fn idle(&self) -> bool {
+        !self.claimed || self.exited()
+    }
+    fn retire(&self) -> Result<(), RuntimeError> {
+        if self.custody.phase() == ExitCustodyPhase::Exited {
+            // A never-started holder revoked the report. A real invocation
+            // filled it, and this actual host observer consumes its one leg.
+            if !self.report.retirement_ready()? {
+                self.report.consume(OBSERVER)?;
+            }
+            self.custody.try_retire().map_err(runtime_error)?;
+        }
+        Ok(())
+    }
+}
+fn runtime_error(error: ExitCustodyError) -> RuntimeError {
+    match error {
+        ExitCustodyError::Runtime(error) => error,
+        ExitCustodyError::InvalidPhase(_) => ScopeError::InvalidTransition.into(),
+    }
+}
 
 struct State {
     mode: Mode,
     body_exited: bool,
+    never_invoked: bool,
     registered: bool,
     child: Option<Arc<dyn TaskPreparationChild>>,
     output_exit: Option<TaskPreparationOutputExit>,
-    phases: [Phase; STEPS],
-    // Cold, bounded process custody. Never place opaque panic payloads in a
-    // Task's originating failure graph or invoke their destructor on exit.
-    panics: Option<Box<PanicCustody>>,
+    parent: Option<PreparationParent>,
+    financial_scope: Option<ScopeHandle>,
+    pending: Option<Arc<dyn TaskPendingNotice>>,
+    work: [Option<HostWork>; STEPS],
+    polling: bool,
+    callbacks_closed: bool,
 }
 
 pub(crate) struct TaskPreparationScope {
@@ -128,10 +226,8 @@ pub(crate) struct TaskPreparationScope {
     before_body_exit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-/// Positive evidence from the same original scope: its physical preparation
-/// returned, every rollback callback/child exited, and runtime adoption never
-/// began. This is neither a whole-preparation report nor source/Work exit.
-/// The borrow preserves the exact original scope without another owner or grant.
+/// Positive domain evidence from the same original scope. Runtime retirement
+/// supplies work exit; the original child additionally supplies output custody.
 pub(crate) struct NeverAdoptedPreparationExit<'a> {
     scope: &'a TaskPreparationScope,
 }
@@ -142,18 +238,15 @@ impl NeverAdoptedPreparationExit<'_> {
     pub(crate) fn same_scope(&self, scope: &TaskPreparationScope) -> bool {
         std::ptr::eq(self.scope, scope)
     }
-    /// Expose only the fact cached from this scope's original physical Poll.
-    /// Construction already proved ChildDrop and all never-adopted exits.
     pub(crate) fn output_exit(&self) -> TaskPreparationOutputExit {
         self.scope
             .state
             .lock()
             .expect("original preparation output exit")
             .output_exit
-            .expect("the original physical Poll supplied output evidence")
+            .expect("the original child supplied output evidence")
     }
 }
-
 #[derive(Clone, Copy)]
 pub(crate) enum PreparationCleanup {
     Inbound,
@@ -170,50 +263,117 @@ impl TaskPreparationScope {
             state: Mutex::new(State {
                 mode: Mode::Preparing,
                 body_exited: false,
+                never_invoked: false,
                 registered: false,
                 child: None,
                 output_exit: None,
-                phases: [Phase::NotStarted; STEPS],
-                panics: None,
+                parent: None,
+                financial_scope: None,
+                pending: None,
+                work: std::array::from_fn(|_| None),
+                polling: false,
+                callbacks_closed: false,
             }),
         }
     }
     pub(crate) fn identity(&self) -> TaskIdentity {
         self.identity
     }
+
+    /// Called within the original preparation body, before any foreign host
+    /// call. Later callbacks move these already-admitted original obligations.
+    pub(crate) fn bind_runtime(
+        &self,
+        parent: PreparationParent,
+        pending: Arc<dyn TaskPendingNotice>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().expect("preparation child scope lock");
+        if state.mode == Mode::Rollback {
+            return Err(ScopeError::Stopped.into());
+        }
+        if state.parent.is_some() || state.body_exited || state.callbacks_closed {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        state.pending = Some(pending);
+        state.financial_scope = Some(parent.scope().clone());
+        state.parent = Some(parent.clone());
+        for step in CALLBACKS {
+            state.work[step as usize] = Some(HostWork::reserve(&parent, step)?);
+        }
+        Ok(())
+    }
     pub(crate) fn register(
         &self,
         child: Arc<dyn TaskPreparationChild>,
     ) -> Result<(), TaskPreparationChildRegistrationFailure> {
         let mut state = self.state.lock().expect("preparation child scope lock");
-        if state.mode != Mode::Preparing || state.body_exited {
-            drop(state);
+        if state.mode != Mode::Preparing || state.body_exited || state.callbacks_closed {
             return Err(TaskPreparationChildRegistrationFailure::ScopeClosed);
         }
         if state.registered {
-            drop(state);
             return Err(TaskPreparationChildRegistrationFailure::AlreadyRegistered);
         }
+        let parent = state
+            .parent
+            .as_ref()
+            .ok_or(TaskPreparationChildRegistrationFailure::ScopeClosed)?;
+        let mut work = HostWork::reserve(parent, Step::Child)
+            .map_err(|_| TaskPreparationChildRegistrationFailure::ScopeClosed)?;
+        // Cleanup admission and its start remain valid after a stop race.
+        if work
+            .obligation
+            .as_mut()
+            .expect("new child obligation")
+            .start()
+            .is_err()
+        {
+            let obligation = work.obligation.take().expect("unused child obligation");
+            obligation
+                .revoke_unused_and_exit()
+                .expect("unused child exit");
+            state.work[Step::Child as usize] = Some(work);
+            return Err(TaskPreparationChildRegistrationFailure::ScopeClosed);
+        }
+        work.claimed = true;
+        work.invoked = true;
+        state.work[Step::Child as usize] = Some(work);
         state.registered = true;
         state.child = Some(child);
         Ok(())
     }
-    fn fault(&self, reason: R, step: Step, payload: Option<Payload>) {
-        // Wrap custody before acquiring a lock. No return/unwind path here
-        // implicitly invokes an unknown payload's destructor.
-        let payload = payload.map(ManuallyDrop::new);
-        {
-            let mut state = self.state.lock().expect("preparation child scope lock");
-            state.phases[step as usize] = Phase::Unresolved;
-            if let Some(payload) = payload {
-                let custody = state
-                    .panics
-                    .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
-                if custody[step as usize].is_none() {
-                    custody[step as usize] = Some(payload);
-                }
-            }
+    fn notify(&self) {
+        let pending = self
+            .state
+            .lock()
+            .expect("preparation child scope lock")
+            .pending
+            .clone();
+        if let Some(pending) = pending {
+            pending.pending();
         }
+    }
+    fn fault(
+        &self,
+        reason: R,
+        step: Step,
+        payload: Option<Payload>,
+        original: Option<ExitObligation>,
+    ) {
+        let payload = payload.map(ManuallyDrop::new);
+        let remaining = {
+            let mut state = self.state.lock().expect("preparation child scope lock");
+            let work = state.work[step as usize]
+                .as_mut()
+                .expect("admitted failing host work");
+            if work.panic.is_none() {
+                work.panic = payload;
+            }
+            work.obligation.take()
+        };
+        // No unknown callback or payload destructor runs under either lock.
+        // Ordinary authority Drop records the original work as unresolved.
+        drop(original);
+        drop(remaining);
         self.health.report_unresolved(
             ExecutionExitOrigin::Task {
                 identity: self.identity,
@@ -221,41 +381,116 @@ impl TaskPreparationScope {
             },
             FailureFact::new(FailureClass::Unexpected, reason.reason()),
         );
+        self.notify();
     }
-    fn is_unresolved(&self, step: Step) -> bool {
+    fn unresolved(&self, step: Step) -> bool {
         self.state
             .lock()
             .expect("preparation child scope lock")
-            .phases[step as usize]
-            == Phase::Unresolved
+            .work[step as usize]
+            .as_ref()
+            .is_some_and(|work| work.custody.phase() == ExitCustodyPhase::Unresolved)
     }
-    fn once(&self, step: Step, reason: R, action: impl FnOnce()) -> bool {
-        {
-            let mut state = self.state.lock().expect("preparation child scope lock");
-            match state.phases[step as usize] {
-                Phase::Exited => return true,
-                Phase::Started | Phase::Unresolved => return false,
-                Phase::NotStarted => state.phases[step as usize] = Phase::Started,
-            }
+    fn callbacks_idle(state: &State) -> bool {
+        CALLBACKS.iter().all(|step| {
+            state.work[*step as usize]
+                .as_ref()
+                .is_none_or(HostWork::idle)
+        })
+    }
+    fn cleanup_exited(state: &State) -> bool {
+        state.never_invoked
+            || [Step::Cancel, Step::Inbound, Step::Receiver]
+                .iter()
+                .all(|step| {
+                    state.work[*step as usize]
+                        .as_ref()
+                        .is_some_and(HostWork::exited)
+                })
+    }
+    fn claim(state: &mut State, step: Step) -> Option<ExitObligation> {
+        let work = state.work[step as usize].as_mut()?;
+        if work.claimed || work.exited() {
+            return None;
         }
-        self.run_claimed(step, reason, action)
+        work.claimed = true;
+        work.obligation.take()
     }
-    /// The original phase was claimed in the same transaction as its mode
-    /// gate. Its callback and capture disposal are both inside this boundary.
-    fn run_claimed(&self, step: Step, reason: R, action: impl FnOnce()) -> bool {
+    fn invoke_claimed(
+        &self,
+        step: Step,
+        reason: R,
+        mut original: ExitObligation,
+        action: impl FnOnce(),
+    ) -> bool {
+        if original.start().is_err() {
+            // The caller retains ownership of refused publication closures by
+            // checking its start before handing them to this helper.
+            let disposed = catch_unwind(AssertUnwindSafe(|| drop(action)));
+            return match disposed {
+                Ok(()) => {
+                    original
+                        .revoke_unused_and_exit()
+                        .expect("stopped callback remains unused");
+                    self.notify();
+                    false
+                }
+                Err(payload) => {
+                    self.fault(reason, step, Some(payload), Some(original));
+                    false
+                }
+            };
+        }
+        self.invoke_started(step, reason, original, action)
+    }
+    fn invoke_started(
+        &self,
+        step: Step,
+        reason: R,
+        original: ExitObligation,
+        action: impl FnOnce(),
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("preparation child scope lock")
+            .work[step as usize]
+            .as_mut()
+            .expect("claimed callback work")
+            .invoked = true;
         match catch_unwind(AssertUnwindSafe(action)) {
             Ok(()) => {
-                self.state
-                    .lock()
-                    .expect("preparation child scope lock")
-                    .phases[step as usize] = Phase::Exited;
+                if original.exited().is_err() {
+                    self.fault(reason, step, None, None);
+                    return false;
+                }
+                self.notify();
                 true
             }
             Err(payload) => {
-                self.fault(reason, step, Some(payload));
+                self.fault(reason, step, Some(payload), Some(original));
                 false
             }
         }
+    }
+    fn once(&self, step: Step, reason: R, action: impl FnOnce()) -> bool {
+        let original = {
+            let mut state = self.state.lock().expect("preparation child scope lock");
+            if state.never_invoked
+                || state.work[step as usize]
+                    .as_ref()
+                    .is_some_and(HostWork::exited)
+            {
+                drop(state);
+                drop(action);
+                return true;
+            }
+            Self::claim(&mut state, step)
+        };
+        let Some(original) = original else {
+            drop(action);
+            return false;
+        };
+        self.invoke_claimed(step, reason, original, action)
     }
     pub(crate) fn request_rollback(&self) {
         let child = {
@@ -263,14 +498,12 @@ impl TaskPreparationScope {
             state.mode = Mode::Rollback;
             state.child.clone()
         };
-        // Independent from every cleanup/poll/adoption phase. A failed hook
-        // must never suppress the original Root cancellation request.
-        self.once(Step::Cancel, R::PreparationChildRollback, || {
+        self.once(Step::Cancel, R::PreparationChildRollback, move || {
             if let Some(child) = &child {
                 child.request_rollback();
             }
+            drop(child);
         });
-        drop(child);
     }
     pub(crate) fn cleanup(&self, kind: PreparationCleanup, action: impl FnOnce()) {
         let (step, reason) = match kind {
@@ -279,8 +512,21 @@ impl TaskPreparationScope {
         };
         self.once(step, reason, action);
     }
-    /// Read only this original provider owner's physical body observation.
-    /// Source disposal and provider-child exit do not create this fact.
+    /// The actual runner disposed its never-invoked host closure and input.
+    /// There was no provider installation and no registered child to clean up.
+    pub(crate) fn body_never_invoked(&self) {
+        {
+            let mut state = self.state.lock().expect("preparation child scope lock");
+            assert!(
+                !state.registered,
+                "an uninvoked host cannot register a child"
+            );
+            state.never_invoked = true;
+            state.mode = Mode::Rollback;
+            state.output_exit = Some(TaskPreparationOutputExit::NoOutputCreated);
+        }
+        self.close_unused();
+    }
     #[cfg(test)]
     pub(crate) fn physical_bodies_exited(&self) -> bool {
         self.state
@@ -291,8 +537,6 @@ impl TaskPreparationScope {
     pub(crate) fn body_exited(&self) {
         #[cfg(test)]
         {
-            // The original physical setter invokes this outside its lock.
-            // Releasing a test gate does not supply the body-exit fact.
             let hook = self.before_body_exit.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
@@ -305,11 +549,14 @@ impl TaskPreparationScope {
     }
     #[cfg(test)]
     pub(crate) fn before_original_body_exit_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
-        let mut slot = self.before_body_exit.lock().unwrap();
-        assert!(slot.replace(hook).is_none());
+        assert!(
+            self.before_body_exit
+                .lock()
+                .unwrap()
+                .replace(hook)
+                .is_none()
+        );
     }
-    /// Read this scope's original return author. This neither adopts its
-    /// runtime nor proves whole preparation exit or returns P/byte capacity.
     pub(crate) fn body_has_exited(&self) -> bool {
         self.state
             .lock()
@@ -319,203 +566,273 @@ impl TaskPreparationScope {
     #[cfg(test)]
     pub(crate) fn original_adoption_unstarted_for_test(&self) -> bool {
         let state = self.state.lock().unwrap();
-        state.mode == Mode::Preparing && state.phases[Step::Adopt as usize] == Phase::NotStarted
+        state.mode == Mode::Preparing
+            && state.work[Step::Adopt as usize]
+                .as_ref()
+                .is_none_or(|work| !work.invoked)
     }
-    /// Read only the original provider-child cleanup observations. Adoption
-    /// transfers runtime ownership elsewhere; this proves only that these
-    /// preparation callbacks/metadata captures have actually exited.
-    pub(crate) fn host_captures_exited(&self) -> bool {
+    /// Retire only actual runtime receipts. No provider hook or foreign Drop
+    /// runs here, so metadata callers can drive the same finite reaper path.
+    pub(crate) fn retire_ready(&self) -> Result<bool, RuntimeError> {
         let state = self.state.lock().expect("preparation child scope lock");
-        state.body_exited
-            && Self::started_actions_exited(&state)
-            && state.phases[Step::ChildDrop as usize] == Phase::Exited
-            && match state.mode {
-                Mode::Adopted => state.phases[Step::Publication as usize] == Phase::Exited,
-                Mode::Rollback => {
-                    state.phases[Step::Poll as usize] == Phase::Exited
-                        && [Step::Cancel, Step::Inbound, Step::Receiver]
-                            .iter()
-                            .all(|step| state.phases[*step as usize] == Phase::Exited)
-                }
-                Mode::Preparing | Mode::Adopting => false,
-            }
-    }
-    /// Never-started optional cleanup roles impose no exit obligation. Once
-    /// a real call starts, however, adoption cannot hide its live captures or
-    /// unresolved exit by switching to another lifecycle branch.
-    fn started_actions_exited(state: &State) -> bool {
-        state
-            .phases
+        for work in state.work.iter().flatten() {
+            work.retire()?;
+        }
+        let reaped = match &state.financial_scope {
+            Some(scope) => scope.reap_ready(STEPS)?,
+            None => 0,
+        };
+        let retired = state
+            .work
             .iter()
-            .all(|phase| matches!(phase, Phase::NotStarted | Phase::Exited))
+            .flatten()
+            .all(|work| work.retirement.is_retired());
+        let pending = state.pending.clone();
+        drop(state);
+        // Another original ready header can consume this finite reaper turn.
+        // Keep the same owner runnable after real progress, without polling a
+        // pending callback or manufacturing its physical exit.
+        if reaped != 0
+            && let Some(pending) = pending
+        {
+            pending.pending();
+        }
+        Ok(retired)
+    }
+    #[cfg(test)]
+    pub(crate) fn host_captures_exited(&self) -> bool {
+        self.retire_ready().unwrap();
+        let state = self.state.lock().unwrap();
+        state.body_exited
+            && state
+                .work
+                .iter()
+                .flatten()
+                .all(|work| work.retirement.is_retired())
+    }
+    fn close_unused(&self) {
+        let unused = {
+            let mut state = self.state.lock().expect("preparation child scope lock");
+            state.callbacks_closed = true;
+            CALLBACKS
+                .iter()
+                .filter_map(|step| {
+                    let work = state.work[*step as usize].as_mut()?;
+                    if work.claimed {
+                        None
+                    } else {
+                        work.obligation.take()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for original in unused {
+            original
+                .revoke_unused_and_exit()
+                .expect("unused preparation callback exit");
+        }
+        self.notify();
     }
     fn clear_child(&self) -> bool {
-        let child = {
+        let (child, original) = {
             let mut state = self.state.lock().expect("preparation child scope lock");
-            match state.phases[Step::ChildDrop as usize] {
-                Phase::Exited => return true,
-                Phase::Started | Phase::Unresolved => return false,
-                Phase::NotStarted => {}
-            }
-            if !Self::started_actions_exited(&state)
-                || (state.mode == Mode::Rollback
-                    && [Step::Cancel, Step::Inbound, Step::Receiver, Step::Poll]
-                        .iter()
-                        .any(|step| state.phases[*step as usize] != Phase::Exited))
+            if state.polling
+                || !Self::callbacks_idle(&state)
+                || (state.mode == Mode::Rollback && !Self::cleanup_exited(&state))
             {
                 return false;
             }
-            state.phases[Step::ChildDrop as usize] = Phase::Started;
-            state.child.take()
+            if !state.registered {
+                return true;
+            }
+            let work = state.work[Step::Child as usize]
+                .as_ref()
+                .expect("registered child work");
+            if work.exited() {
+                return true;
+            }
+            if work.custody.phase() == ExitCustodyPhase::Unresolved {
+                return false;
+            }
+            let Some(child) = state.child.take() else {
+                return false;
+            };
+            let original = state.work[Step::Child as usize]
+                .as_mut()
+                .unwrap()
+                .obligation
+                .take()
+                .expect("same running child obligation");
+            (child, original)
         };
         match catch_unwind(AssertUnwindSafe(|| drop(child))) {
             Ok(()) => {
-                self.state
-                    .lock()
-                    .expect("preparation child scope lock")
-                    .phases[Step::ChildDrop as usize] = Phase::Exited;
-                true
+                let unknown_output = {
+                    let state = self.state.lock().expect("preparation child scope lock");
+                    state.output_exit == Some(TaskPreparationOutputExit::Unknown)
+                        && state.work[Step::Adopt as usize]
+                            .as_ref()
+                            .is_none_or(|work| !work.invoked)
+                };
+                if unknown_output {
+                    self.fault(
+                        R::PreparationChildUnresolved,
+                        Step::Child,
+                        None,
+                        Some(original),
+                    );
+                    return false;
+                }
+                if original.exited().is_err() {
+                    self.fault(R::PreparationChildDrop, Step::Child, None, None);
+                    false
+                } else {
+                    self.notify();
+                    true
+                }
             }
             Err(payload) => {
-                self.fault(R::PreparationChildDrop, Step::ChildDrop, Some(payload));
+                self.fault(
+                    R::PreparationChildDrop,
+                    Step::Child,
+                    Some(payload),
+                    Some(original),
+                );
                 false
             }
         }
     }
     pub(crate) fn rollback_exited(&self) -> bool {
-        let (child, registered) = {
+        let (child, registered, already_observed) = {
             let mut state = self.state.lock().expect("preparation child scope lock");
             if !state.body_exited
                 || state.mode != Mode::Rollback
-                || !Self::started_actions_exited(&state)
-                || [Step::Cancel, Step::Inbound, Step::Receiver]
-                    .iter()
-                    .any(|step| state.phases[*step as usize] != Phase::Exited)
+                || state.polling
+                || !Self::callbacks_idle(&state)
+                || !Self::cleanup_exited(&state)
             {
                 return false;
             }
-            match state.phases[Step::Poll as usize] {
-                Phase::Started | Phase::Unresolved => return false,
-                Phase::Exited => {
-                    drop(state);
-                    let child_exited = self.clear_child();
-                    return child_exited;
-                }
-                Phase::NotStarted => state.phases[Step::Poll as usize] = Phase::Started,
+            if state.work[Step::Child as usize]
+                .as_ref()
+                .is_some_and(|work| work.custody.phase() == ExitCustodyPhase::Unresolved)
+            {
+                return false;
             }
-            (state.child.clone(), state.registered)
+            let observed = state.output_exit.is_some();
+            state.polling = !observed;
+            (state.child.clone(), state.registered, observed)
         };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            match child.as_ref() {
+        if !already_observed {
+            let result = catch_unwind(AssertUnwindSafe(move || match child.as_ref() {
                 Some(child) => child.poll_exit(),
-                // The original registration gate is permanently sealed by
-                // physical rollback; no registered child ever created output.
                 None if !registered => TaskPreparationChildExit::Exited {
                     output: TaskPreparationOutputExit::NoOutputCreated,
                 },
                 None => TaskPreparationChildExit::Exited {
                     output: TaskPreparationOutputExit::Unknown,
                 },
-            }
-        }));
-        drop(child); // The scope still owns the original Arc; this is metadata only.
-        match result {
-            Ok(TaskPreparationChildExit::Pending) => {
-                self.state
-                    .lock()
-                    .expect("preparation child scope lock")
-                    .phases[Step::Poll as usize] = Phase::NotStarted;
-                false
-            }
-            Ok(TaskPreparationChildExit::Exited { output }) => {
-                {
+            }));
+            match result {
+                Ok(TaskPreparationChildExit::Pending) => {
+                    self.state
+                        .lock()
+                        .expect("preparation child scope lock")
+                        .polling = false;
+                    return false;
+                }
+                Ok(TaskPreparationChildExit::Exited { output }) => {
                     let mut state = self.state.lock().expect("preparation child scope lock");
                     state.output_exit = Some(output);
-                    state.phases[Step::Poll as usize] = Phase::Exited;
+                    state.polling = false;
                 }
-                self.clear_child()
-            }
-            Ok(TaskPreparationChildExit::Unresolved) => {
-                self.fault(R::PreparationChildUnresolved, Step::Poll, None);
-                false
-            }
-            Err(payload) => {
-                self.fault(R::PreparationChildPoll, Step::Poll, Some(payload));
-                false
+                Ok(TaskPreparationChildExit::Unresolved) => {
+                    self.fault(R::PreparationChildUnresolved, Step::Child, None, None);
+                    return false;
+                }
+                Err(payload) => {
+                    self.fault(R::PreparationChildPoll, Step::Child, Some(payload), None);
+                    return false;
+                }
             }
         }
+        if !self.clear_child() {
+            return false;
+        }
+        self.close_unused();
+        true
     }
-    /// Read only positive observations already completed by the original
-    /// physical rollback owner. In particular this never calls poll_exit or
-    /// drops a child on a metadata/poller thread. Rollback permanently rejects
-    /// subsequent adoption/registration; the original Adopt phase distinguishes
-    /// never-adopted from an adopted runtime that later entered rollback.
     pub(crate) fn never_adopted_rollback_exit(&self) -> Option<NeverAdoptedPreparationExit<'_>> {
         let state = self.state.lock().expect("preparation child scope lock");
         if state.mode != Mode::Rollback
-            || state.phases[Step::Adopt as usize] != Phase::NotStarted
             || !state.body_exited
-            || !Self::started_actions_exited(&state)
             || state.child.is_some()
+            || state.polling
             || state.output_exit.is_none()
-            || [
-                Step::Cancel,
-                Step::Inbound,
-                Step::Receiver,
-                Step::Poll,
-                Step::ChildDrop,
-            ]
-            .iter()
-            .any(|step| state.phases[*step as usize] != Phase::Exited)
+            || !Self::cleanup_exited(&state)
+            || !Self::callbacks_idle(&state)
+            || state.work[Step::Adopt as usize]
+                .as_ref()
+                .is_some_and(|work| work.invoked)
+            || state.work[Step::Child as usize]
+                .as_ref()
+                .is_some_and(|work| !work.exited())
         {
             return None;
         }
         Some(NeverAdoptedPreparationExit { scope: self })
     }
     pub(crate) fn output_exit_unresolved(&self) {
-        if !self.is_unresolved(Step::Poll) {
-            self.fault(R::PreparationChildUnresolved, Step::Poll, None);
+        if !self.unresolved(Step::Child) {
+            self.fault(R::PreparationChildUnresolved, Step::Child, None, None);
         }
     }
     pub(crate) fn adopt_runtime(&self) -> bool {
-        let child = {
+        let (child, mut original) = {
             let mut state = self.state.lock().expect("preparation child scope lock");
-            tracing::debug!(pid = std::process::id(), task = ?self.identity,
-                mode = ?state.mode, body_exited = state.body_exited,
-                child_present = state.child.is_some(),
-                "Original preparation received its physical activation attempt");
-            if !state.body_exited {
-                return false;
+            if !state.body_exited || state.callbacks_closed {
+                return state.mode == Mode::Adopted;
             }
             match state.mode {
                 Mode::Rollback => return false,
                 Mode::Adopted => return true,
                 Mode::Preparing | Mode::Adopting => {}
             }
-            // Claim in this same mode transaction. An earlier rollback must
-            // not be followed by a newly started provider adoption callback.
-            if state.phases[Step::Adopt as usize] != Phase::NotStarted {
+            let Some(original) = Self::claim(&mut state, Step::Adopt) else {
                 return false;
-            }
+            };
             state.mode = Mode::Adopting;
-            state.phases[Step::Adopt as usize] = Phase::Started;
-            state.child.clone()
+            (state.child.clone(), original)
         };
-        let adopted = self.run_claimed(Step::Adopt, R::PreparationChildAdopt, move || {
+        if original.start().is_err() {
+            drop(child);
+            original
+                .revoke_unused_and_exit()
+                .expect("stopped adoption never ran");
+            self.request_rollback();
+            return false;
+        }
+        let accepted = {
+            let state = self.state.lock().expect("preparation child scope lock");
+            state.mode == Mode::Adopting
+        };
+        if !accepted {
+            drop(child);
+            original
+                .withdraw_unpublished_and_exit()
+                .expect("rollback withdrew uninvoked adoption");
+            self.notify();
+            return false;
+        }
+        if !self.invoke_started(Step::Adopt, R::PreparationChildAdopt, original, move || {
             if let Some(child) = &child {
                 child.adopt_runtime();
             }
             drop(child);
-        });
-        if !adopted {
-            if self.is_unresolved(Step::Adopt) {
-                self.request_rollback();
-            }
+        }) {
+            self.request_rollback();
             return false;
         }
-        // adopt_runtime clears the provider's Preparation observation role.
-        // Retain only its metadata cancellation handle until commit returns,
-        // so an unknown commit cannot suppress independent Root cancellation.
         let mut state = self.state.lock().expect("preparation child scope lock");
         if state.mode != Mode::Adopting {
             return false;
@@ -523,26 +840,31 @@ impl TaskPreparationScope {
         state.mode = Mode::Adopted;
         true
     }
-    /// Runtime activation is independent owned cleanup work. Unknown opaque
-    /// body custody keeps the original P, but cannot strand installed operators
-    /// after their original Task cause has already stood them down.
     pub(crate) fn start_runtime<F: FnOnce()>(&self, action: F) -> Result<bool, F> {
-        {
+        let mut original = {
             let mut state = self.state.lock().expect("preparation child scope lock");
-            if state.mode != Mode::Adopted
-                || state.phases[Step::Publication as usize] != Phase::NotStarted
-            {
-                // The original host still owns a rejected action, including
-                // its dormant runtime captures. Refusal never destroys it or
-                // treats an earlier call as execution of this new closure.
+            if state.mode != Mode::Adopted || state.callbacks_closed {
                 return Err(action);
             }
-            state.phases[Step::Publication as usize] = Phase::Started;
+            let Some(original) = Self::claim(&mut state, Step::Publication) else {
+                return Err(action);
+            };
+            original
+        };
+        if original.start().is_err() {
+            original
+                .revoke_unused_and_exit()
+                .expect("stopped publication never ran");
+            self.request_rollback();
+            return Err(action);
         }
-        if !self.run_claimed(Step::Publication, R::PreparationExitPublication, action) {
-            if self.is_unresolved(Step::Publication) {
-                self.request_rollback();
-            }
+        if !self.invoke_started(
+            Step::Publication,
+            R::PreparationExitPublication,
+            original,
+            action,
+        ) {
+            self.request_rollback();
             return Ok(false);
         }
         if self
@@ -552,14 +874,18 @@ impl TaskPreparationScope {
             .mode
             != Mode::Adopted
         {
-            // Rollback may have won after the call really started. Its own
-            // cleanup owner must observe the child and every started callback
-            // before retiring the original preparation holder.
             return Ok(false);
         }
-        let child_retired = self.clear_child();
-        let state = self.state.lock().expect("preparation child scope lock");
-        Ok(child_retired && state.mode == Mode::Adopted && Self::started_actions_exited(&state))
+        if !self.clear_child() {
+            return Ok(false);
+        }
+        self.close_unused();
+        Ok(self
+            .state
+            .lock()
+            .expect("preparation child scope lock")
+            .mode
+            == Mode::Adopted)
     }
 }
 
@@ -621,7 +947,96 @@ mod host_handoff_tests {
             }
         }
     }
-    fn scope() -> Arc<TaskPreparationScope> {
+    struct TestScope {
+        original: Arc<TaskPreparationScope>,
+        custody: crate::control_runtime::preparation::PreparationCustody,
+        body: Mutex<Option<crate::control_runtime::preparation::PreparationJob>>,
+        ledger: novarocks_control_runtime::transaction::RuntimeLedger,
+        financial_scope: ScopeHandle,
+    }
+    impl std::ops::Deref for TestScope {
+        type Target = Arc<TaskPreparationScope>;
+        fn deref(&self) -> &Self::Target {
+            &self.original
+        }
+    }
+    impl TestScope {
+        fn body_exited(&self) {
+            self.original.body_exited();
+            self.body
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one original test body")
+                .finish_body_for_test();
+        }
+    }
+    impl Drop for TestScope {
+        fn drop(&mut self) {
+            if let Some(body) = self.body.lock().unwrap().take() {
+                self.original.body_never_invoked();
+                self.original.body_exited();
+                body.finish_body_for_test();
+            }
+            self.original.retire_ready().unwrap();
+            if !self.custody.publish_whole_exit().unwrap() {
+                // The panic tests intentionally keep the original unknown
+                // work, capacity and payload in their real runtime custody.
+                // Every normal test must fully retire and reap instead.
+                assert!(
+                    !self.ledger.unresolved_work().is_empty(),
+                    "a normal host test left live work"
+                );
+                return;
+            }
+            for report in [self.custody.body_report(), self.custody.exit_report()] {
+                for consumer in [ConsumerId::new(1).unwrap(), OBSERVER] {
+                    report.consume(consumer).unwrap();
+                }
+            }
+            let mut remainder = self
+                .custody
+                .take_after_exit()
+                .unwrap()
+                .expect("original whole exit");
+            remainder.finish().unwrap();
+            drop(remainder);
+            self.financial_scope.reap_ready(STEPS + 1).unwrap();
+            self.financial_scope.close_external().unwrap();
+            self.ledger.remove_scope(self.financial_scope.id()).unwrap();
+            assert!(
+                self.ledger.is_empty(),
+                "normal host test retired its actual runtime inventory"
+            );
+        }
+    }
+    struct Pending;
+    impl TaskPendingNotice for Pending {
+        fn pending(&self) {}
+    }
+    #[derive(Debug)]
+    struct EmptyInput;
+    impl novarocks_execution_contract::CreationContent for EmptyInput {
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn retained_bytes(&self) -> usize {
+            0
+        }
+        fn into_stored(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+    fn scope() -> TestScope {
+        use crate::control_admission::Dimension;
+        use crate::control_runtime::preparation::{
+            PREPARATION_STORAGE, PreparationBinding, PreparationCustody,
+        };
+        use novarocks_control_runtime::{completion::ReportSlot, transaction::RuntimeLedger};
+        use novarocks_control_runtime_core::{
+            capacity::ResourceVector, completion::ConsumerKind, identity::Generation,
+            scope::WorkAdmission,
+        };
         use novarocks_types::{
             AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
         };
@@ -631,10 +1046,68 @@ mod host_handoff_tests {
             TaskId::new(1).unwrap(),
             BackendProcessId::new_v7(),
         );
-        Arc::new(TaskPreparationScope::new(
-            identity,
-            Arc::new(ExecutionHealth::default()),
-        ))
+        let quota = ResourceVector::new([(Dimension::PreparingTasks.id(), 1)]).unwrap();
+        let ledger = RuntimeLedger::new(quota.clone());
+        let generation = Generation::new(1).unwrap();
+        let financial_scope = ledger.open_scope_next(None, generation).unwrap();
+        let mut resources = PREPARATION_STORAGE.resources().unwrap();
+        resources.quota = quota;
+        let (work, mut capacity) = financial_scope
+            .reserve_next(
+                generation,
+                resources,
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Business)
+            .unwrap();
+        let mut report = || {
+            ReportSlot::reserve_next(
+                &mut capacity,
+                generation,
+                2,
+                [
+                    (
+                        ConsumerId::new(1).unwrap(),
+                        ConsumerKind::Owner {
+                            scope: financial_scope.id(),
+                            generation,
+                        },
+                    ),
+                    (OBSERVER, ConsumerKind::Observer),
+                ],
+            )
+            .unwrap()
+        };
+        let reports = [report(), report()];
+        let health = Arc::new(ExecutionHealth::default());
+        let pending: Arc<dyn TaskPendingNotice> = Arc::new(Pending);
+        let (custody, mut body) = PreparationCustody::from_admitted(
+            PreparationBinding {
+                stop: crate::task_port::TaskStopSignal::initial(identity),
+                pending: pending.clone(),
+                health: health.clone(),
+            },
+            work,
+            capacity,
+            reports,
+            novarocks_execution_contract::TaskCreationInput::new(
+                novarocks_execution_contract::FrozenBytes::freeze(bytes::Bytes::new()),
+                Box::new(EmptyInput),
+            ),
+        );
+        let parent = body.start_for_test();
+        let original = Arc::new(TaskPreparationScope::new(identity, health));
+        custody.bind_host_children(original.clone());
+        original.bind_runtime(parent, pending).unwrap();
+        TestScope {
+            original,
+            custody,
+            body: Mutex::new(Some(body)),
+            ledger,
+            financial_scope,
+        }
     }
     fn entered(receiver: &mpsc::Receiver<()>) {
         receiver
@@ -820,5 +1293,309 @@ mod host_handoff_tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(rejected);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn host_callbacks_start_original_work_and_drop_captures_before_exit() {
+        struct CaptureExit {
+            work: ExitCustody,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for CaptureExit {
+            fn drop(&mut self) {
+                assert_eq!(self.work.phase(), ExitCustodyPhase::Started);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let scope = scope();
+        scope.body_exited();
+        scope.request_rollback();
+        for (kind, step) in [
+            (PreparationCleanup::Inbound, Step::Inbound),
+            (PreparationCleanup::Receiver, Step::Receiver),
+        ] {
+            let work = scope.state.lock().unwrap().work[step as usize]
+                .as_ref()
+                .unwrap()
+                .custody
+                .clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let capture = CaptureExit {
+                work: work.clone(),
+                dropped: dropped.clone(),
+            };
+            scope.cleanup(kind, move || {
+                assert_eq!(work.phase(), ExitCustodyPhase::Started);
+                std::hint::black_box(&capture);
+            });
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+        assert!(scope.rollback_exited());
+        assert!(scope.host_captures_exited());
+        let state = scope.state.lock().unwrap();
+        assert!(!state.work[Step::Adopt as usize].as_ref().unwrap().invoked);
+        assert!(
+            !state.work[Step::Publication as usize]
+                .as_ref()
+                .unwrap()
+                .invoked
+        );
+        assert!(
+            state
+                .work
+                .iter()
+                .flatten()
+                .all(|work| work.retirement.is_retired())
+        );
+    }
+    #[test]
+    fn provider_cancel_adopt_poll_drop_and_publication_use_their_original_started_work() {
+        struct CheckedChild {
+            scope: std::sync::Weak<TaskPreparationScope>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl CheckedChild {
+            fn observe(&self, step: Step) {
+                let scope = self.scope.upgrade().expect("original child scope");
+                let state = scope.state.lock().unwrap();
+                assert_eq!(
+                    state.work[step as usize].as_ref().unwrap().custody.phase(),
+                    ExitCustodyPhase::Started,
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl TaskPreparationChild for CheckedChild {
+            fn request_rollback(&self) {
+                self.observe(Step::Cancel);
+            }
+            fn poll_exit(&self) -> TaskPreparationChildExit {
+                self.observe(Step::Child);
+                TaskPreparationChildExit::Exited {
+                    output: TaskPreparationOutputExit::NoOutputCreated,
+                }
+            }
+            fn adopt_runtime(&self) {
+                self.observe(Step::Adopt);
+            }
+        }
+        impl Drop for CheckedChild {
+            fn drop(&mut self) {
+                self.observe(Step::Child);
+            }
+        }
+        for adopt in [false, true] {
+            let scope = scope();
+            let calls = Arc::new(AtomicUsize::new(0));
+            scope
+                .register(Arc::new(CheckedChild {
+                    scope: Arc::downgrade(&scope.original),
+                    calls: calls.clone(),
+                }))
+                .unwrap();
+            scope.body_exited();
+            if adopt {
+                assert!(scope.adopt_runtime());
+                let publication = scope.state.lock().unwrap().work[Step::Publication as usize]
+                    .as_ref()
+                    .unwrap()
+                    .custody
+                    .clone();
+                let drops = Arc::new(AtomicUsize::new(0));
+                struct PublicationCapture(ExitCustody, Arc<AtomicUsize>);
+                impl Drop for PublicationCapture {
+                    fn drop(&mut self) {
+                        assert_eq!(self.0.phase(), ExitCustodyPhase::Started);
+                        self.1.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                let capture = PublicationCapture(publication, drops.clone());
+                assert!(
+                    scope
+                        .start_runtime(move || {
+                            std::hint::black_box(&capture);
+                        })
+                        .unwrap_or_else(|_| panic!("original publication admitted"))
+                );
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            } else {
+                scope.request_rollback();
+                scope.cleanup(PreparationCleanup::Inbound, || {});
+                scope.cleanup(PreparationCleanup::Receiver, || {});
+                assert!(scope.rollback_exited());
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+            }
+            assert!(scope.host_captures_exited());
+        }
+    }
+    #[test]
+    fn stopped_scope_refuses_adoption_and_publication_but_runs_original_cleanup() {
+        for before_adoption in [true, false] {
+            let scope = scope();
+            scope.register(Arc::new(Child { adoption: None })).unwrap();
+            scope.body_exited();
+            if !before_adoption {
+                assert!(scope.adopt_runtime());
+            }
+            scope.financial_scope.request_stop().unwrap();
+            if before_adoption {
+                assert!(!scope.adopt_runtime());
+            } else {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let refused = scope.start_runtime(captured(&drops));
+                assert!(refused.is_err());
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                drop(refused);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+            }
+            let calls = AtomicUsize::new(0);
+            scope.cleanup(PreparationCleanup::Inbound, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+            scope.cleanup(PreparationCleanup::Receiver, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(scope.rollback_exited());
+            assert!(scope.host_captures_exited());
+            assert!(scope.health.is_healthy());
+        }
+    }
+    #[test]
+    fn a_registered_pending_child_keeps_the_original_preparation_work_live() {
+        use std::sync::atomic::AtomicBool;
+        struct PendingChild {
+            ready: Arc<AtomicBool>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl TaskPreparationChild for PendingChild {
+            fn request_rollback(&self) {}
+            fn poll_exit(&self) -> TaskPreparationChildExit {
+                if self.ready.load(Ordering::SeqCst) {
+                    TaskPreparationChildExit::Exited {
+                        output: TaskPreparationOutputExit::NoOutputCreated,
+                    }
+                } else {
+                    TaskPreparationChildExit::Pending
+                }
+            }
+            fn adopt_runtime(&self) {}
+        }
+        impl Drop for PendingChild {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let scope = scope();
+        let ready = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        scope
+            .register(Arc::new(PendingChild {
+                ready: ready.clone(),
+                drops: drops.clone(),
+            }))
+            .unwrap();
+        scope.body_exited();
+        scope.request_rollback();
+        scope.cleanup(PreparationCleanup::Inbound, || {});
+        scope.cleanup(PreparationCleanup::Receiver, || {});
+        assert!(!scope.rollback_exited());
+        assert!(!scope.custody.publish_whole_exit().unwrap());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        assert!(scope.rollback_exited());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(scope.custody.publish_whole_exit().unwrap());
+    }
+    #[derive(Debug)]
+    struct OriginalPanic(u16);
+    struct PanickingChild(u16);
+    impl TaskPreparationChild for PanickingChild {
+        fn request_rollback(&self) {
+            if self.0 == 152 {
+                std::panic::panic_any(OriginalPanic(self.0));
+            }
+        }
+        fn poll_exit(&self) -> TaskPreparationChildExit {
+            if self.0 == 155 {
+                std::panic::panic_any(OriginalPanic(self.0));
+            }
+            TaskPreparationChildExit::Exited {
+                output: TaskPreparationOutputExit::NoOutputCreated,
+            }
+        }
+        fn adopt_runtime(&self) {
+            if self.0 == 156 {
+                std::panic::panic_any(OriginalPanic(self.0));
+            }
+        }
+    }
+    impl Drop for PanickingChild {
+        fn drop(&mut self) {
+            if self.0 == 157 {
+                std::panic::panic_any(OriginalPanic(self.0));
+            }
+        }
+    }
+    #[test]
+    fn each_panicking_host_boundary_keeps_its_work_payload_and_original_health_reason() {
+        for code in 152..=158 {
+            let scope = scope();
+            scope.register(Arc::new(PanickingChild(code))).unwrap();
+            scope.body_exited();
+            let step = match code {
+                156 => {
+                    assert!(!scope.adopt_runtime());
+                    Step::Adopt
+                }
+                158 => {
+                    assert!(scope.adopt_runtime());
+                    assert!(
+                        !scope
+                            .start_runtime(|| std::panic::panic_any(OriginalPanic(code)))
+                            .unwrap_or(false)
+                    );
+                    Step::Publication
+                }
+                _ => {
+                    scope.request_rollback();
+                    scope.cleanup(PreparationCleanup::Inbound, || {
+                        if code == 153 {
+                            std::panic::panic_any(OriginalPanic(code));
+                        }
+                    });
+                    scope.cleanup(PreparationCleanup::Receiver, || {
+                        if code == 154 {
+                            std::panic::panic_any(OriginalPanic(code));
+                        }
+                    });
+                    assert!(!scope.rollback_exited());
+                    match code {
+                        152 => Step::Cancel,
+                        153 => Step::Inbound,
+                        154 => Step::Receiver,
+                        _ => Step::Child,
+                    }
+                }
+            };
+            let fault = scope.health.failure().expect("the original callback fault");
+            assert_eq!(fault.fact().class(), FailureClass::Unexpected);
+            assert_eq!(fault.fact().reason().code(), code);
+            assert!(!scope.custody.publish_whole_exit().unwrap());
+            let state = scope.state.lock().unwrap();
+            let original = state.work[step as usize].as_ref().unwrap();
+            assert_eq!(original.custody.phase(), ExitCustodyPhase::Unresolved);
+            assert_eq!(
+                original
+                    .panic
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<OriginalPanic>()
+                    .unwrap()
+                    .0,
+                code
+            );
+            assert!(!original.retirement.is_retired());
+        }
     }
 }

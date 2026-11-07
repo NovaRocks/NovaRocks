@@ -344,6 +344,10 @@ where
     ) -> Result<Self, (std::io::Error, Self)> {
         Self::start_inner(limits, runner, Some(waker), true)
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The original host pool owns and joins its worker threads; see ADR-0218."
+    )]
     fn start_inner(
         limits: HostExecutorLimits,
         runner: F,

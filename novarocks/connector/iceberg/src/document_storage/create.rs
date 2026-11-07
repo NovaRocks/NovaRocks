@@ -229,6 +229,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             file_io.clone(),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             file_io.clone(),
         );
         let state = IcebergCatalogControlState::new(configuration);

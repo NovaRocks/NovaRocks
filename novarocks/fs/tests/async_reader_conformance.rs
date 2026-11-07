@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! The awaited Parquet reader against the blocking one: the same rows,
 //! positions and storage reads, with a decoder request's independent ranges
 //! fetched concurrently through the source's range service.
@@ -110,10 +115,6 @@ impl FileIoSpawner for OrderedGateSpawner {
             task.await;
         })))
     }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
-    }
 }
 
 /// Counts file tasks, one per storage read segment or stat.
@@ -126,10 +127,6 @@ impl FileIoSpawner for CountingSpawner {
     fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         self.spawned.fetch_add(1, Ordering::SeqCst);
         Ok(FileIoJob::new(self.handle.spawn(task)))
-    }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
     }
 }
 
@@ -225,7 +222,7 @@ fn request_through(
             io_spawner: spawner,
             range: service.map(|(service, operations)| {
                 service.bind(
-                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    FileRangeScope::for_test(1, 0, 1, 1, 0, 1).unwrap(),
                     operations,
                 )
             }),
@@ -326,7 +323,7 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
         Arc::clone(&spawner),
         Some((
             service(Arc::clone(&spawner), &handle, 2),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     let expected = collect(open_file_reader(blocking).expect("open").as_mut()).expect("read");
@@ -336,7 +333,7 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
         Arc::clone(&spawner),
         Some((
             service(Arc::clone(&spawner), &handle, 2),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     let actual = handle.block_on(async {
@@ -363,7 +360,7 @@ fn awaited_footer_and_page_indexes_read_what_the_blocking_path_reads() {
             Arc::clone(&as_spawner),
             Some((
                 service(as_spawner, &handle, 2),
-                ConnectorSourceOperations::new(),
+                ConnectorSourceOperations::for_test(),
             )),
         );
         let context = request.context.clone();
@@ -443,7 +440,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
     let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     let mut request = request_through(
         &large.file,
         &handle,
@@ -501,7 +498,7 @@ fn a_failed_range_stops_its_sibling_and_the_error_wins() {
     let gated = OrderedGateSpawner::new(handle.clone(), true);
     gated.fail_unrun(0);
     let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     let mut request = request_through(
         &large.file,
         &handle,
@@ -550,7 +547,7 @@ fn concurrent_ranges_of_a_small_file_share_one_whole_file_read() {
         Arc::clone(&as_spawner),
         Some((
             service(as_spawner, &handle, 4),
-            ConnectorSourceOperations::new(),
+            ConnectorSourceOperations::for_test(),
         )),
     );
     request.options.coalesce_reads = false;

@@ -1729,6 +1729,14 @@ impl ParticipationRequestCustody {
 
 impl ParticipationHostRecord {
     pub(crate) fn notify_header_readiness(&self, notice: &HeaderReadyNotice) -> bool {
+        if self
+            .resources
+            .work_registry
+            .as_ref()
+            .is_some_and(|registry| registry.note_header_ready(notice))
+        {
+            return true;
+        }
         let Some(original) = self.resources.requests.get(&notice.work()) else {
             // Common has already routed this actual header cell to the same
             // actor incarnation. Other host owners, including replay legs,
