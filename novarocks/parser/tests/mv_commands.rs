@@ -62,12 +62,84 @@ fn materialized_view_query_is_typed_and_excludes_outside_trivia_and_semicolon() 
         "SELECT id FROM orders"
     );
     assert_eq!(
+        create.raw_query_source,
+        "SELECT id /* inside */ FROM orders"
+    );
+    assert_eq!(
+        source.get(create.query_source_span.start()..create.query_source_span.end()),
+        Some(create.raw_query_source.as_str())
+    );
+    assert_eq!(
         create.query.span,
         novarocks_parser::Span::new(
             source.find("SELECT").expect("query start"),
             source.find("  /* trailing */").expect("query end"),
         )
     );
+}
+
+#[test]
+fn materialized_view_body_source_keeps_internal_trivia_and_statement_boundaries() {
+    let body =
+        "select /* 内部 */ `MiXeD` , sum(v1) AS total -- per key\n  from orders   group by `MiXeD`";
+    let source = format!(
+        "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH (`MiXeD`) BUCKETS 1 \
+         AS /* outside query */\n{body} -- outside query\n; SELECT 9"
+    );
+    let statements = parse(&source).expect("MV body with internal trivia should parse");
+    let Statement::MaterializedView(MaterializedViewStatement::Create(create)) = &statements[0]
+    else {
+        panic!("expected typed CREATE MATERIALIZED VIEW");
+    };
+    assert_eq!(create.raw_query_source, body);
+    assert_eq!(
+        source.get(create.query_source_span.start()..create.query_source_span.end()),
+        Some(body)
+    );
+    assert_eq!(statements.len(), 2);
+}
+
+#[test]
+fn materialized_view_body_source_excludes_outer_trivia_at_eof() {
+    let source = "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH (x) BUCKETS 1 \
+                  AS /* before */ SELECT 1 AS x /* tail */  ";
+    let statements = parse(source).expect("MV body at EOF should parse");
+    let [Statement::MaterializedView(MaterializedViewStatement::Create(create))] =
+        statements.as_slice()
+    else {
+        panic!("expected typed CREATE MATERIALIZED VIEW");
+    };
+    assert_eq!(create.raw_query_source, "SELECT 1 AS x");
+    assert_eq!(
+        source.get(create.query_source_span.start()..create.query_source_span.end()),
+        Some(create.raw_query_source.as_str())
+    );
+}
+
+#[test]
+fn materialized_view_body_source_includes_parentheses_with_and_query_suffixes() {
+    for body in [
+        "(SELECT 1 AS x)",
+        "WITH c(x) AS (VALUES (1)) SELECT x FROM c",
+        "SELECT 1 AS x OFFSET 0 ROWS",
+        "SELECT 1 AS x FETCH FIRST 2 ROWS ONLY",
+    ] {
+        let source = format!(
+            "CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH (x) BUCKETS 1 \
+             AS /* before */ {body} /* after */;"
+        );
+        let statements = parse(&source).expect("complete MV query body should parse");
+        let [Statement::MaterializedView(MaterializedViewStatement::Create(create))] =
+            statements.as_slice()
+        else {
+            panic!("expected typed CREATE MATERIALIZED VIEW");
+        };
+        assert_eq!(create.raw_query_source, body);
+        assert_eq!(
+            source.get(create.query_source_span.start()..create.query_source_span.end()),
+            Some(body)
+        );
+    }
 }
 
 #[test]

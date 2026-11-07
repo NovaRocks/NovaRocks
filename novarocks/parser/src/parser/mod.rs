@@ -44,6 +44,8 @@ use crate::{
 };
 
 pub use expr::parse_expression;
+pub(crate) use pratt::balance_boolean_chain;
+pub(crate) use query::balance_union_all;
 
 /// `statements ::= { statement [ ";" ] } EOF`
 ///
@@ -394,12 +396,12 @@ type FamilyParser = for<'source, 'tokens> fn(
     &mut StatementParser<'source, 'tokens>,
 ) -> Result<Option<Statement>, ParseError>;
 
-fn is_integer_number(value: &str) -> bool {
+pub(crate) fn is_integer_number(value: &str) -> bool {
     !value.contains(['.', 'e', 'E'])
 }
 
 /// Check the complete signed spelling before rejecting its positive magnitude.
-fn number_literal_kind(value: String, span: Span) -> Result<LiteralKind, ParseError> {
+pub(crate) fn number_literal_kind(value: String, span: Span) -> Result<LiteralKind, ParseError> {
     if is_integer_number(&value) && value.parse::<i64>().is_err() {
         return Err(ParseError::UnexpectedToken {
             expected: "signed 64-bit integer literal",

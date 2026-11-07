@@ -64,6 +64,11 @@ pub struct CreateMaterializedView {
     pub primary_key: Option<Vec<Ident>>,
     pub properties: Vec<MaterializedViewProperty>,
     pub query: Query,
+    /// Effective user query token range, including internal trivia, captured
+    /// before normalization or AST printing. The CREATE prefix and outer trivia are excluded.
+    pub raw_query_source: String,
+    /// Original body byte range in the admitted statement.
+    pub query_source_span: Span,
     pub span: Span,
 }
 

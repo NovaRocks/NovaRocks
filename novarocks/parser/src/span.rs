@@ -24,6 +24,9 @@ pub struct Span {
     end: usize,
 }
 
+/// No user source location exists for a wholly synthesized syntax node.
+pub const SYNTHETIC: Span = Span::new(0, 0);
+
 impl Span {
     pub const fn new(start: usize, end: usize) -> Self {
         assert!(start <= end);
@@ -40,6 +43,31 @@ impl Span {
 
     pub const fn is_empty(self) -> bool {
         self.start == self.end
+    }
+
+    /// Covers both source ranges without assigning a location to synthetic nodes.
+    ///
+    /// Empty spans contribute no source location. Unlike source-order merging,
+    /// this also supports generated trees that reuse user nodes in another order.
+    pub const fn cover(self, other: Self) -> Self {
+        if self.is_empty() {
+            if other.is_empty() { SYNTHETIC } else { other }
+        } else if other.is_empty() {
+            self
+        } else {
+            Self::new(
+                if self.start < other.start {
+                    self.start
+                } else {
+                    other.start
+                },
+                if self.end > other.end {
+                    self.end
+                } else {
+                    other.end
+                },
+            )
+        }
     }
 
     /// Derives the user-facing byte-column location from this source span.

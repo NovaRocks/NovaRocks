@@ -575,6 +575,7 @@ impl AnalyzeError {
     pub fn to_user_error(&self, source: Option<&str>) -> UserError {
         let location = self
             .span
+            .filter(|span| !span.is_empty())
             .zip(source)
             .map(|(span, source)| span.to_user_error_location(source));
         UserError::from_descriptor(
@@ -716,6 +717,31 @@ mod tests {
         let user_error = error.to_user_error(Some("SELECT x"));
         assert_eq!(user_error.phase(), ErrorPhase::Analyze);
         assert_eq!(user_error.location().expect("location").column(), 8);
+    }
+
+    #[test]
+    fn empty_spans_have_no_user_location_without_changing_the_error() {
+        let source = "SELECT 'é' AS label,\n  '雪', missing";
+        let start = source.find("missing").unwrap();
+        let span = Span::new(start, start + "missing".len());
+        let user_node = AnalyzeError::unknown_column("unknown column missing", span);
+        let synthetic = AnalyzeError::unknown_column("unknown column missing", Span::new(0, 0));
+        let expected = user_node.to_user_error(Some(source));
+        let location = expected.location().expect("user expression location");
+        assert_eq!(location.line(), 2);
+        assert_eq!(location.column(), 10);
+        assert_eq!(location.end_line(), Some(2));
+        assert_eq!(location.end_column(), Some(17));
+        for projected in [
+            synthetic.to_user_error(Some(source)),
+            user_node.to_user_error(None),
+            synthetic.to_user_error(None),
+        ] {
+            assert!(projected.location().is_none());
+            assert_eq!(projected.code(), expected.code());
+            assert_eq!(projected.message(), expected.message());
+            assert_eq!(projected.phase(), expected.phase());
+        }
     }
 
     #[test]

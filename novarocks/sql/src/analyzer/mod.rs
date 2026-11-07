@@ -370,7 +370,8 @@ fn analyze_with_factory_and_function_catalog_inner(
 
 /// Analysis state belongs to one SELECT, never to an enclosing query's children.
 struct GroupingAnalysis {
-    select_span: novarocks_parser::Span,
+    /// Identity only, never dereferenced; the scoped immutable AST outlives this state.
+    select: *const ast::Select,
     keys: Vec<ast::Expr>,
     repeat: bool,
     enabled: std::cell::Cell<bool>,
@@ -446,7 +447,7 @@ impl<'a> AnalyzerContext<'a> {
                 Vec::new()
             };
             std::rc::Rc::new(GroupingAnalysis {
-                select_span: select.span,
+                select,
                 keys,
                 repeat: repeat.is_some(),
                 enabled: std::cell::Cell::new(false),
@@ -890,7 +891,7 @@ impl<'a> AnalyzerContext<'a> {
                     .grouping_scope
                     .borrow()
                     .as_ref()
-                    .is_some_and(|state| state.select_span == s.span);
+                    .is_some_and(|state| std::ptr::eq(state.select, s.as_ref()));
                 if !same_select {
                     return self.with_grouping_scope(Some(s), |ctx| ctx.analyze_set_expr(set_expr));
                 }
@@ -6013,6 +6014,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nested_synthetic_selects_keep_their_own_grouping_analysis() {
+        struct SyntheticSelects;
+        impl ast::Fold for SyntheticSelects {
+            fn fold_select(&mut self, select: ast::Select) -> ast::Select {
+                let mut select = ast::fold_select(self, select);
+                select.span = novarocks_parser::Span::new(0, 0);
+                select
+            }
+        }
+
+        let query = parse_native_query(
+            "SELECT k, sum(g) AS total FROM \
+             (SELECT k, grouping(k) AS g FROM (VALUES (1), (2)) t(k) \
+              GROUP BY ROLLUP(k)) s GROUP BY k",
+        )
+        .unwrap();
+        let synthetic = ast::Fold::fold_query(&mut SyntheticSelects, query.clone());
+        let (expected, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let (actual, _, _) = analyze(&synthetic, &TestCatalog, "default").unwrap();
+        let output = |query: &ResolvedQuery| {
+            query
+                .output_columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.field_name.clone(),
+                        column.value_type.data_type().clone(),
+                        column.value_type.nullable(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(output(&actual), output(&expected));
+        for resolved in [&expected, &actual] {
+            let QueryBody::Select(outer) = &resolved.body else {
+                panic!("outer SELECT");
+            };
+            assert_eq!(outer.group_by.len(), 1);
+            assert!(outer.repeat.is_none());
+            let Some(Relation::Subquery { query: inner, .. }) = &outer.from else {
+                panic!("derived SELECT");
+            };
+            let QueryBody::Select(inner) = &inner.body else {
+                panic!("inner SELECT");
+            };
+            let repeat = inner.repeat.as_ref().expect("inner ROLLUP");
+            assert_eq!(repeat.grouping_ids, vec![0, 1]);
+            assert_eq!(repeat.all_rollup_columns, vec!["k"]);
+            assert_eq!(repeat.grouping_fn_args.len(), 1);
+            assert_eq!(repeat.grouping_fn_args[0].1, vec!["k"]);
+            assert_eq!(
+                inner.projection[1].expr.value_type.data_type(),
+                &DataType::Int32
+            );
+        }
+    }
+
+    #[test]
+    fn same_location_selects_do_not_borrow_enclosing_grouping_keys() {
+        let mut outer = parse_native_query("SELECT a FROM (VALUES (1)) t(a) GROUP BY a").unwrap();
+        let mut inner =
+            parse_native_query("SELECT b, grouping(b) FROM (VALUES (1)) s(b) GROUP BY b").unwrap();
+        let ast::SetExpr::Select(outer_select) = outer.body.as_mut() else {
+            panic!("outer SELECT");
+        };
+        let ast::SetExpr::Select(inner_select) = inner.body.as_mut() else {
+            panic!("inner SELECT");
+        };
+        outer_select.span = novarocks_parser::Span::new(0, 0);
+        inner_select.span = novarocks_parser::Span::new(0, 0);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = AnalyzerContext {
+            grouping_scope: Default::default(),
+            view_stack: Default::default(),
+            control: &control,
+            constant_policy: crate::constant::test_constant_policy(),
+            materialized_values: None,
+            catalog: &TestCatalog,
+            current_database: "default",
+            function_catalog: crate::functions::builtin_sql_function_catalog(),
+            sql_semantics: Default::default(),
+            factory: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::column_id::ColumnRefFactory::new(),
+            )),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Default::default(),
+            next_lambda_slot_id: Default::default(),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
+        };
+        ctx.with_grouping_scope(Some(outer_select), |ctx| {
+            let enclosing = ctx.grouping_scope.borrow().clone().unwrap();
+            let (body, columns) = ctx.analyze_set_expr(inner.body.as_ref())?;
+            assert_eq!(columns.len(), 2);
+            let QueryBody::Select(inner) = body else {
+                panic!("inner SELECT");
+            };
+            assert!(matches!(
+                inner.projection[1].expr.kind,
+                ExprKind::Literal(LiteralValue::Int(0))
+            ));
+            let restored = ctx.grouping_scope.borrow().clone().unwrap();
+            assert_eq!(restored.keys.len(), 1);
+            assert!(ast::SyntaxEq::syntax_eq(
+                &restored.keys[0],
+                &enclosing.keys[0]
+            ));
+            assert!(restored.calls.borrow().is_empty());
+            assert!(enclosing.calls.borrow().is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(ctx.grouping_scope.borrow().is_none());
     }
 
     #[test]

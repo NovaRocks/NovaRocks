@@ -73,6 +73,7 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
     let mut primary_key = None;
     let mut properties = Vec::new();
     let query;
+    let body_start;
     loop {
         if parser.consume_if_word("COMMENT") {
             if comment.is_some() {
@@ -109,12 +110,21 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
             }
             properties = parse_properties(parser)?;
         } else if parser.consume_if_word("AS") {
+            body_start = parser.current_offset();
             query = query::parse_query(parser)?;
             break;
         } else {
             return Err(parser.unexpected("materialized view clause or AS"));
         }
     }
+    let body_end = parser.tokens[..parser.position]
+        .iter()
+        .rfind(|token| !matches!(token.kind, crate::TokenKind::Trivia(_)))
+        .expect("a parsed query consumed at least one significant token")
+        .span
+        .end();
+    let query_source_span = Span::new(body_start, body_end);
+    let raw_query_source = parser.source_slice(query_source_span).to_owned();
     let span = Span::new(start, query.span.end());
     let Some(distribution) = distribution else {
         return Err(parser.unexpected("DISTRIBUTED BY HASH (...) BUCKETS <count>"));
@@ -133,6 +143,8 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
             primary_key,
             properties,
             query,
+            raw_query_source,
+            query_source_span,
             span,
         }),
     ))
