@@ -125,13 +125,13 @@ SET GLOBAL trc_unknown_property = 1;
 SET SESSION pipeline_dop = 1 + 2;
 
 -- query 27
-SET SESSION pipeline_dop = TINYINT '4';
+SET SESSION pipeline_dop = CAST(4 AS tinyint);
 
 -- query 28
 SET SESSION global_runtime_filter_probe_min_selectivity = 1;
 
 -- query 29
-SET SESSION global_runtime_filter_probe_min_selectivity = BIGINT '1';
+SET SESSION global_runtime_filter_probe_min_selectivity = CAST(1 AS bigint);
 
 -- query 30
 SET SESSION enable_global_runtime_filter = CAST('true' AS boolean);
