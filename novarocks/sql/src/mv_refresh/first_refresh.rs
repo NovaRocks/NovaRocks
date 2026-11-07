@@ -36,7 +36,7 @@ use crate::planner::logical::LogicalPlanNode;
 use crate::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use novarocks_parser::Span;
-use novarocks_parser::ast;
+use novarocks_parser::{ast, build};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -78,7 +78,7 @@ pub(crate) struct SqlMvFirstRefreshPlannerInput {
     reason = "The first-refresh artifact input preserves the staged SQL-to-application handoff contract."
 )]
 pub(crate) enum SqlMvFirstRefreshArtifactInput {
-    Sql(MvFirstRefreshPhysicalSql),
+    Sql(MvFirstRefreshPhysicalQuery),
     Logical {
         plan: LogicalPlanNode,
         factory: ColumnRefFactory,
@@ -113,7 +113,7 @@ pub(crate) struct SqlMvFirstRefreshPlan {
     reason = "The first-refresh artifact remains part of the retained immutable handoff contract."
 )]
 pub(crate) enum SqlMvFirstRefreshPlanArtifact {
-    Sql(MvFirstRefreshPhysicalSql),
+    Sql(MvFirstRefreshPhysicalQuery),
     Logical {
         plan: LogicalPlanNode,
         factory: ColumnRefFactory,
@@ -244,19 +244,19 @@ fn validate_root_distribution(
 /// `root_hash_column` is the target contract's hidden apply key. The native
 /// planner must derive its actual writer fanout from the admitted topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvFirstRefreshPhysicalSql {
-    sql: String,
+pub(crate) struct MvFirstRefreshPhysicalQuery {
+    query: Box<ast::Query>,
     root_hash_column: String,
 }
 
-/// Move-only SQL source artifact for a first-refresh write.
+/// Move-only query artifact for a first-refresh write.
 ///
 /// Applications can retain and hand this value back to SQL, but cannot read
-/// its SQL text or obtain a logical/physical planner graph from it.
-pub struct SqlMvFirstRefreshArtifact(MvFirstRefreshPhysicalSql);
+/// its syntax tree or obtain a logical/physical planner graph from it.
+pub struct SqlMvFirstRefreshArtifact(MvFirstRefreshPhysicalQuery);
 
 impl SqlMvFirstRefreshArtifact {
-    fn from_physical(physical: MvFirstRefreshPhysicalSql) -> Self {
+    fn from_physical(physical: MvFirstRefreshPhysicalQuery) -> Self {
         Self(physical)
     }
 
@@ -264,11 +264,11 @@ impl SqlMvFirstRefreshArtifact {
         self.0.root_hash_column()
     }
 
-    fn sql(&self) -> &str {
-        self.0.sql()
+    fn query(&self) -> &ast::Query {
+        &self.0.query
     }
 
-    /// Declare catalog facts for this original opaque SQL artifact. Its text
+    /// Declare catalog facts for this original opaque query artifact. Its AST
     /// stays SQL-owned; the caller observes only exact SchemaOnly requests.
     pub fn catalog_preparation(
         &self,
@@ -278,15 +278,8 @@ impl SqlMvFirstRefreshArtifact {
     ) -> Result<crate::compiler::SqlCapturedCatalogPreparation, crate::compiler::SqlCompileError>
     {
         control.check()?;
-        let statements = novarocks_parser::parse(self.sql())
-            .map_err(|error| crate::compiler::SqlCompileError::Compilation(error.to_string()))?;
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            return Err(crate::compiler::SqlCompileError::InvalidRequest(
-                "MV first-refresh artifact is not a query".into(),
-            ));
-        };
         crate::compiler::SqlCapturedCatalogPreparation::try_new(
-            query.clone(),
+            self.query().clone(),
             current_catalog,
             current_database,
             control,
@@ -328,7 +321,7 @@ pub fn analyze_mv_first_refresh_connector_write(
     );
     let settings = context.optimizer_settings.clone();
     let request = crate::compiler::SqlAnalyzeRequest::new(
-        crate::compiler::SqlStatementInput::sql(artifact.sql()),
+        crate::compiler::SqlStatementInput::parsed_query(artifact.0.query),
         crate::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         crate::compiler::SqlSessionContext {
             sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -2208,11 +2201,7 @@ fn max_plan_column_id(plan: &crate::planner::logical::LogicalPlanNode) -> Result
     Ok(max_id)
 }
 
-impl MvFirstRefreshPhysicalSql {
-    pub(crate) fn sql(&self) -> &str {
-        &self.sql
-    }
-
+impl MvFirstRefreshPhysicalQuery {
     pub(crate) fn root_hash_column(&self) -> &str {
         &self.root_hash_column
     }
@@ -2516,11 +2505,20 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
-    let sql =
+    let query =
         prepare_projection_full_read_sql(select_query, pin, current_catalog, current_database)?;
+    #[cfg(debug_assertions)]
+    super::equivalence::require("S1.Projection", &query, || {
+        super::equivalence::prepare_projection_full_read_sql(
+            select_query,
+            pin,
+            current_catalog,
+            current_database,
+        )
+    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
-        MvFirstRefreshPhysicalSql {
-            sql,
+        MvFirstRefreshPhysicalQuery {
+            query: Box::new(query),
             root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
         },
     ))
@@ -2533,16 +2531,26 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
-    let sql = prepare_union_projection_full_read_sql(
+    let query = prepare_union_projection_full_read_sql(
         select_query,
         branch_count,
         pin,
         current_catalog,
         current_database,
     )?;
+    #[cfg(debug_assertions)]
+    super::equivalence::require("S1.UnionProjection", &query, || {
+        super::equivalence::prepare_union_projection_full_read_sql(
+            select_query,
+            branch_count,
+            pin,
+            current_catalog,
+            current_database,
+        )
+    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
-        MvFirstRefreshPhysicalSql {
-            sql,
+        MvFirstRefreshPhysicalQuery {
+            query: Box::new(query),
             root_hash_column: crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
         },
     ))
@@ -2601,22 +2609,40 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
     target_schema: Option<&Schema>,
     aggregate_input_types: Option<&[Option<DataType>]>,
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
-    let state_sql = prepare_aggregate_first_refresh_state_sql(
+    let state_query = prepare_aggregate_first_refresh_state_sql(
         select_query,
         calls,
         pin,
         current_catalog,
         current_database,
     )?;
+    let query = aggregate_physical_query(
+        state_query,
+        calls,
+        None,
+        target_schema,
+        aggregate_input_types,
+    )?;
+    #[cfg(debug_assertions)]
+    super::equivalence::require("S1.Aggregate", &query, || {
+        let state_sql = super::equivalence::prepare_aggregate_first_refresh_state_sql(
+            select_query,
+            calls,
+            pin,
+            current_catalog,
+            current_database,
+        )?;
+        super::equivalence::aggregate_physical_sql(
+            &state_sql,
+            calls,
+            None,
+            target_schema,
+            aggregate_input_types,
+        )
+    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
-        MvFirstRefreshPhysicalSql {
-            sql: aggregate_physical_sql(
-                &state_sql,
-                calls,
-                None,
-                target_schema,
-                aggregate_input_types,
-            )?,
+        MvFirstRefreshPhysicalQuery {
+            query: Box::new(query),
             root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
         },
     ))
@@ -2754,21 +2780,56 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
         current_catalog,
         current_database,
     )?;
-    let sql = branches
+    let bodies = branches
         .into_iter()
         .enumerate()
-        .map(|(branch_index, (calls, state_sql))| {
+        .map(|(branch_index, (calls, state_query))| {
             validate_branch_aggregate_contract(branch_index, &calls, first_branch_calls)?;
             let branch_id = i32::try_from(branch_index).map_err(|_| {
                 format!("MV first-refresh branch index {branch_index} exceeds Int32")
             })?;
-            aggregate_physical_sql(&state_sql, &calls, Some(branch_id), target_schema, None)
+            let query = aggregate_physical_query(
+                state_query,
+                &calls,
+                Some(branch_id),
+                target_schema,
+                None,
+            )?;
+            Ok(*query.body)
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .join(" UNION ALL ");
+        .collect::<Result<Vec<_>, String>>()?;
+    let query = build::query(build::union_all(bodies).map_err(|error| error.to_string())?);
+    #[cfg(debug_assertions)]
+    super::equivalence::require("S1.BranchUnionAggregate", &query, || {
+        let branches = super::equivalence::prepare_branch_union_aggregate_first_refresh_state_sqls(
+            select_query,
+            branch_count,
+            first_branch_calls,
+            pin,
+            current_catalog,
+            current_database,
+        )?;
+        branches
+            .into_iter()
+            .enumerate()
+            .map(|(branch_index, (calls, state_sql))| {
+                let branch_id = i32::try_from(branch_index).map_err(|_| {
+                    format!("MV first-refresh branch index {branch_index} exceeds Int32")
+                })?;
+                super::equivalence::aggregate_physical_sql(
+                    &state_sql,
+                    &calls,
+                    Some(branch_id),
+                    target_schema,
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|parts| parts.join(" UNION ALL "))
+    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
-        MvFirstRefreshPhysicalSql {
-            sql,
+        MvFirstRefreshPhysicalQuery {
+            query: Box::new(query),
             root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
         },
     ))
@@ -2780,7 +2841,7 @@ fn prepare_aggregate_first_refresh_state_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<String, String> {
+) -> Result<ast::Query, String> {
     let state_query = rewrite_select_sql_for_state(select_query, calls)?;
     pin_state_sql(&state_query, pin, current_catalog, current_database)
 }
@@ -2792,7 +2853,7 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<Vec<(SqlAggregateCalls, String)>, String> {
+) -> Result<Vec<(SqlAggregateCalls, ast::Query)>, String> {
     branch_union_queries(
         select_query,
         branch_count,
@@ -2802,7 +2863,7 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     )?
     .into_iter()
     .enumerate()
-    .map(|(branch_index, (branch_query, _branch_sql))| {
+    .map(|(branch_index, branch_query)| {
         let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
         if branch_index == 0 && &branch_calls != first_branch_calls {
             return Err(
@@ -2811,19 +2872,18 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
             );
         }
         let state_query = rewrite_select_sql_for_state(&branch_query, &branch_calls)?;
-        let state_sql = novarocks_parser::printer::print_query(&state_query);
-        Ok((branch_calls, state_sql))
+        Ok((branch_calls, state_query))
     })
     .collect()
 }
 
-fn aggregate_physical_sql(
-    state_sql: &str,
+fn aggregate_physical_query(
+    state_query: ast::Query,
     calls: &SqlAggregateCalls,
     branch_id: Option<i32>,
     target_schema: Option<&Schema>,
     aggregate_input_types: Option<&[Option<DataType>]>,
-) -> Result<String, String> {
+) -> Result<ast::Query, String> {
     let mut projection = Vec::with_capacity(
         1 + calls.visible_outputs.len()
             + calls.aggregates.len()
@@ -2839,29 +2899,29 @@ fn aggregate_physical_sql(
         .iter()
         .map(|key| qualified_column("state", &key.output_name))
         .collect::<Vec<_>>();
-    projection.push(format!(
-        "mv_group_row_id({}) AS {}",
-        group_key_refs.join(", "),
-        quote_sql_identifier(SQL_MV_ROW_ID_COLUMN),
+    projection.push(aggregate_projection_item(
+        build::function(
+            build::object_name(vec![build::ident("mv_group_row_id", None)])
+                .map_err(|error| error.to_string())?,
+            group_key_refs,
+        ),
+        SQL_MV_ROW_ID_COLUMN,
     ));
-
     for output in &calls.visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let key = calls.group_keys.get(*group_key_index).ok_or_else(|| {
                     format!("MV first-refresh group key index {group_key_index} out of range")
                 })?;
-                projection.push(format!(
-                    "{} AS {}",
+                projection.push(aggregate_projection_item(
                     qualified_column("state", &key.output_name),
-                    quote_sql_identifier(&key.output_name),
+                    &key.output_name,
                 ));
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
                 let aggregate = calls.aggregates.get(*aggregate_index).ok_or_else(|| {
                     format!("MV first-refresh aggregate index {aggregate_index} out of range")
                 })?;
-                let state_name = state_column_name(&aggregate.output_name);
                 let witness = if matches!(
                     aggregate.function,
                     AggregateFunctionKind::Sum
@@ -2880,14 +2940,17 @@ fn aggregate_physical_sql(
                 } else {
                     None
                 };
-                let args = if aggregate.function == AggregateFunctionKind::Avg {
-                    let sum_state_name = avg_sum_state_column_name(&aggregate.output_name);
-                    let count_state_name = avg_count_state_column_name(&aggregate.output_name);
-                    let state_args = format!(
-                        "{}, {}",
-                        qualified_column("state", &sum_state_name),
-                        qualified_column("state", &count_state_name),
-                    );
+                let arguments = if aggregate.function == AggregateFunctionKind::Avg {
+                    let mut arguments = vec![
+                        qualified_column(
+                            "state",
+                            &avg_sum_state_column_name(&aggregate.output_name),
+                        ),
+                        qualified_column(
+                            "state",
+                            &avg_count_state_column_name(&aggregate.output_name),
+                        ),
+                    ];
                     let input_type = aggregate_input_types
                         .and_then(|types| types.get(*aggregate_index))
                         .and_then(Option::as_ref);
@@ -2900,33 +2963,42 @@ fn aggregate_physical_sql(
                         })
                         .map(|field| aggregate_visible_type_witness(field.data_type()))
                         .transpose()?;
-                    match output_witness {
-                        Some(witness) => {
-                            let input_scale = match input_type {
-                                Some(DataType::Decimal128(_, scale)) => i64::from(*scale),
-                                _ => -1,
-                            };
-                            format!("{state_args}, CAST({input_scale} AS BIGINT), {witness}",)
-                        }
-                        None => state_args,
+                    if let Some(witness) = output_witness {
+                        let input_scale = match input_type {
+                            Some(DataType::Decimal128(_, scale)) => i64::from(*scale),
+                            _ => -1,
+                        };
+                        arguments.push(build::cast(
+                            build::integer(input_scale),
+                            build::simple_type("BIGINT"),
+                        ));
+                        arguments.push(witness);
                     }
+                    arguments
                 } else {
-                    match witness {
-                        Some(witness) => {
-                            format!("{}, {witness}", qualified_column("state", &state_name))
-                        }
-                        None => qualified_column("state", &state_name),
+                    let mut arguments = vec![qualified_column(
+                        "state",
+                        &state_column_name(&aggregate.output_name),
+                    )];
+                    if let Some(witness) = witness {
+                        arguments.push(witness);
                     }
+                    arguments
                 };
-                projection.push(format!(
-                    "{}({args}) AS {}",
-                    aggregate_visible_function(aggregate.function),
-                    quote_sql_identifier(&aggregate.output_name),
+                projection.push(aggregate_projection_item(
+                    build::function(
+                        build::object_name(vec![build::ident(
+                            aggregate_visible_function(aggregate.function),
+                            None,
+                        )])
+                        .map_err(|error| error.to_string())?,
+                        arguments,
+                    ),
+                    &aggregate.output_name,
                 ));
             }
         }
     }
-
     for aggregate in &calls.aggregates {
         let state_names = if aggregate.function == AggregateFunctionKind::Avg {
             vec![
@@ -2937,53 +3009,79 @@ fn aggregate_physical_sql(
             vec![state_column_name(&aggregate.output_name)]
         };
         for state_name in state_names {
-            projection.push(format!(
-                "{} AS {}",
+            projection.push(aggregate_projection_item(
                 qualified_column("state", &state_name),
-                quote_sql_identifier(&state_name),
+                &state_name,
             ));
         }
     }
     if calls.needs_retraction_count_state() {
-        projection.push(format!(
-            "{} AS {}",
+        projection.push(aggregate_projection_item(
             qualified_column("state", SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN),
-            quote_sql_identifier(SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN),
+            SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
     }
     if let Some(branch_id) = branch_id {
-        projection.push(format!(
-            "CAST({branch_id} AS INT) AS {}",
-            quote_sql_identifier(BRANCH_ID_COLUMN_NAME),
+        projection.push(aggregate_projection_item(
+            build::cast(
+                build::integer(i64::from(branch_id)),
+                build::simple_type("INT"),
+            ),
+            BRANCH_ID_COLUMN_NAME,
         ));
     }
-
-    Ok(format!(
-        "SELECT {} FROM ({state_sql}) AS state",
-        projection.join(", "),
-    ))
+    Ok(build::query(ast::SetExpr::Select(Box::new(
+        build::select(
+            projection,
+            vec![build::relation(build::derived(
+                state_query,
+                Some(build::alias(build::ident("state", None), Vec::new(), true)),
+            ))],
+            None,
+            ast::GroupBy::None,
+        )
+        .map_err(|error| error.to_string())?,
+    ))))
 }
 
-fn aggregate_visible_type_witness(data_type: &DataType) -> Result<String, String> {
-    let sql_type = match data_type {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int8 => "TINYINT".to_string(),
-        DataType::Int16 => "SMALLINT".to_string(),
-        DataType::Int32 => "INT".to_string(),
-        DataType::Int64 => "BIGINT".to_string(),
-        DataType::Float32 => "FLOAT".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Utf8 | DataType::LargeUtf8 => "STRING".to_string(),
-        DataType::Date32 => "DATE".to_string(),
-        DataType::Timestamp(_, _) => "DATETIME".to_string(),
-        DataType::Decimal128(precision, scale) => format!("DECIMAL({precision},{scale})"),
+fn aggregate_projection_item(expr: ast::Expr, alias: &str) -> ast::SelectItem {
+    build::item(expr, Some(build::ident(alias, Some('`'))), true)
+}
+
+fn aggregate_visible_type_witness(data_type: &DataType) -> Result<ast::Expr, String> {
+    let type_name = match data_type {
+        DataType::Boolean => build::simple_type("BOOLEAN"),
+        DataType::Int8 => build::simple_type("TINYINT"),
+        DataType::Int16 => build::simple_type("SMALLINT"),
+        DataType::Int32 => build::simple_type("INT"),
+        DataType::Int64 => build::simple_type("BIGINT"),
+        DataType::Float32 => build::simple_type("FLOAT"),
+        DataType::Float64 => build::simple_type("DOUBLE"),
+        DataType::Utf8 | DataType::LargeUtf8 => build::simple_type("STRING"),
+        DataType::Date32 => build::simple_type("DATE"),
+        DataType::Timestamp(_, _) => build::simple_type("DATETIME"),
+        DataType::Decimal128(precision, scale) if *scale >= 0 => build::type_name(
+            build::object_name(vec![build::ident("DECIMAL", None)])
+                .map_err(|error| error.to_string())?,
+            [i64::from(*precision), i64::from(*scale)]
+                .into_iter()
+                .map(|value| {
+                    ast::TypeNameArgument::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Number(value.to_string()),
+                        span: novarocks_parser::SYNTHETIC,
+                    })
+                })
+                .collect(),
+            vec![false],
+        )
+        .map_err(|error| error.to_string())?,
         other => {
             return Err(format!(
                 "unsupported MV aggregate visible target type {other:?}"
             ));
         }
     };
-    Ok(format!("CAST(NULL AS {sql_type})"))
+    Ok(build::cast(build::null(), type_name))
 }
 
 fn validate_branch_aggregate_contract(
@@ -3035,16 +3133,11 @@ fn aggregate_visible_function(kind: AggregateFunctionKind) -> &'static str {
     }
 }
 
-fn qualified_column(qualifier: &str, column: &str) -> String {
-    format!(
-        "{}.{}",
-        quote_sql_identifier(qualifier),
-        quote_sql_identifier(column)
+fn qualified_column(qualifier: &str, column: &str) -> ast::Expr {
+    build::column(
+        build::ident(qualifier, Some('`')),
+        build::ident(column, Some('`')),
     )
-}
-
-fn quote_sql_identifier(identifier: &str) -> String {
-    format!("`{}`", identifier.replace('`', "``"))
 }
 
 #[cfg(test)]
@@ -3801,8 +3894,8 @@ mod tests {
             root_distribution: RootDistributionRequirement::ShuffleOutputName(
                 "__apply_key__".to_string(),
             ),
-            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalSql {
-                sql: "SELECT 1 AS `__apply_key__`".to_string(),
+            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
+                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         })
@@ -3824,8 +3917,8 @@ mod tests {
             target_contract: sqlx2_target_contract(),
             target_binding: sqlx2_target_binding(),
             root_distribution,
-            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalSql {
-                sql: "SELECT 1 AS `__apply_key__`".to_string(),
+            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalQuery {
+                query: Box::new(parse_query("SELECT 1 AS `__apply_key__`")),
                 root_hash_column: "__apply_key__".to_string(),
             }),
         };
@@ -3839,6 +3932,75 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    fn projection_expression<'a>(query: &'a ast::Query, output: &str) -> &'a ast::Expr {
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected SELECT");
+        };
+        select
+            .projection
+            .iter()
+            .find_map(|item| match item {
+                ast::SelectItem::ExprWithAlias { expr, alias, .. } if alias.value == output => {
+                    Some(expr)
+                }
+                _ => None,
+            })
+            .expect("expected named projection")
+    }
+
+    fn assert_function(query: &ast::Query, expected: &str) {
+        use ast::Visit;
+        struct Functions(Vec<String>);
+        impl ast::Visit for Functions {
+            fn visit_function_call(&mut self, call: &ast::FunctionCall) {
+                self.0.push(
+                    call.name
+                        .parts
+                        .iter()
+                        .map(|part| part.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+                ast::walk_function_call(self, call);
+            }
+        }
+        let mut functions = Functions(Vec::new());
+        functions.visit_query(query);
+        assert!(
+            functions.0.iter().any(|name| name == expected),
+            "expected {expected}, found {:?}",
+            functions.0
+        );
+    }
+
+    fn snapshot_literals(query: &ast::Query) -> Vec<String> {
+        use ast::Visit;
+        struct Versions(Vec<String>);
+        impl ast::Visit for Versions {
+            fn visit_table_factor(&mut self, factor: &ast::TableFactor) {
+                if let ast::TableFactor::Table {
+                    version: Some(version),
+                    ..
+                } = factor
+                {
+                    assert_eq!(version.kind, ast::TableVersionKind::ForVersionAsOf);
+                    let ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Number(value),
+                        ..
+                    }) = &version.value
+                    else {
+                        panic!("expected snapshot integer");
+                    };
+                    self.0.push(value.clone());
+                }
+                ast::walk_table_factor(self, factor);
+            }
+        }
+        let mut versions = Versions(Vec::new());
+        versions.visit_query(query);
+        versions.0
     }
 
     fn pin() -> SqlMvSnapshotPin {
@@ -4054,12 +4216,10 @@ mod tests {
             prepared.root_hash_column(),
             crate::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
         );
-        assert!(prepared.sql().contains("__nova_base_row_id"));
-        assert!(
-            prepared.sql().contains("VERSION AS OF 42"),
-            "expected pinned physical SQL, got: {}",
-            prepared.sql()
-        );
+        use ast::SyntaxEq;
+        assert!(prepared.query().syntax_eq(&parse_query(
+            "SELECT v, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 42",
+        )));
     }
 
     #[test]
@@ -4070,10 +4230,9 @@ mod tests {
             prepare_aggregate_first_refresh_write_sql(&query, &calls, &pin(), Some("ice"), "db")
                 .unwrap();
         assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
-        assert!(prepared.sql().contains("mv_group_row_id"));
-        assert!(prepared.sql().contains("sum_state_visible"));
-        assert!(prepared.sql().contains("__agg_state_total"));
-        assert!(!prepared.sql().contains("RecordBatch"));
+        assert_function(prepared.query(), "mv_group_row_id");
+        assert_function(prepared.query(), "sum_state_visible");
+        projection_expression(prepared.query(), "__agg_state_total");
     }
 
     #[test]
@@ -4094,9 +4253,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
-        assert!(prepared.sql().contains("VERSION AS OF 11"));
-        assert!(prepared.sql().contains("VERSION AS OF 22"));
-        assert!(prepared.sql().contains("sum_state_visible"));
+        assert_eq!(snapshot_literals(prepared.query()), vec!["11", "22"]);
+        assert_function(prepared.query(), "sum_state_visible");
     }
 
     #[test]
@@ -4122,7 +4280,12 @@ mod tests {
                 Some(&[Some(DataType::Decimal128(20, 4))]),
             )
             .unwrap();
-        assert!(prepared.sql().contains("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))"), "{}", prepared.sql());
+        use ast::SyntaxEq;
+        let expected = novarocks_parser::parser::parse_expression(
+            "avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))",
+            &novarocks_parser::lex("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))").unwrap(),
+        ).unwrap();
+        assert!(projection_expression(prepared.query(), "a_d").syntax_eq(&expected));
     }
 
     #[test]
@@ -4143,9 +4306,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
-        assert!(prepared.sql().contains("VERSION AS OF 11"));
-        assert!(prepared.sql().contains("VERSION AS OF 22"));
-        assert!(prepared.sql().contains("count_state_visible"));
+        assert_eq!(snapshot_literals(prepared.query()), vec!["11", "22"]);
+        assert_function(prepared.query(), "count_state_visible");
+    }
+
+    #[test]
+    fn branch_union_first_refresh_balances_four_original_branch_outputs() {
+        let queries = (0..4)
+            .map(|index| format!("SELECT k, sum(v) AS total FROM ice.db.t{index} GROUP BY k"))
+            .collect::<Vec<_>>();
+        let select_query = parse_query(&queries.join(" UNION ALL "));
+        let calls = SqlAggregateCalls::extract(&parse_query(&queries[0])).unwrap();
+        let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
+            (1, "ice.db.t0", 10, "t0"),
+            (2, "ice.db.t1", 11, "t1"),
+            (3, "ice.db.t2", 12, "t2"),
+            (4, "ice.db.t3", 13, "t3"),
+        ]);
+        let prepared = prepare_branch_union_aggregate_first_refresh_write_sql(
+            &select_query,
+            4,
+            &calls,
+            &pin,
+            Some("ice"),
+            "db",
+        )
+        .unwrap();
+        let ast::SetExpr::SetOperation(root) = prepared.query().body.as_ref() else {
+            panic!("expected UNION ALL");
+        };
+        assert!(matches!(root.left.as_ref(), ast::SetExpr::SetOperation(_)));
+        assert!(matches!(root.right.as_ref(), ast::SetExpr::SetOperation(_)));
+        assert_eq!(
+            snapshot_literals(prepared.query()),
+            vec!["10", "11", "12", "13"]
+        );
+        fn collect_branch_ids(body: &ast::SetExpr, ids: &mut Vec<String>) {
+            match body {
+                ast::SetExpr::SetOperation(operation) => {
+                    collect_branch_ids(&operation.left, ids);
+                    collect_branch_ids(&operation.right, ids);
+                }
+                ast::SetExpr::Select(select) => {
+                    let expr = select
+                        .projection
+                        .iter()
+                        .find_map(|item| match item {
+                            ast::SelectItem::ExprWithAlias { expr, alias, .. }
+                                if alias.value == BRANCH_ID_COLUMN_NAME =>
+                            {
+                                Some(expr)
+                            }
+                            _ => None,
+                        })
+                        .expect("branch id projection");
+                    let ast::Expr::Cast(cast) = expr else {
+                        panic!("branch id CAST");
+                    };
+                    let ast::Expr::Literal(ast::Literal {
+                        kind: ast::LiteralKind::Number(value),
+                        ..
+                    }) = cast.expr.as_ref()
+                    else {
+                        panic!("branch id integer");
+                    };
+                    ids.push(value.clone());
+                }
+                _ => panic!("expected branch SELECT"),
+            }
+        }
+        let mut ids = Vec::new();
+        collect_branch_ids(&prepared.query().body, &mut ids);
+        assert_eq!(ids, vec!["0", "1", "2", "3"]);
+    }
+
+    #[test]
+    fn aggregate_avg_nondecimal_input_keeps_signed_scale_witness() {
+        use ast::SyntaxEq;
+        let query = parse_query("SELECT k, avg(v) AS total FROM ice.db.fact GROUP BY k");
+        let calls = SqlAggregateCalls::extract(&query).unwrap();
+        let schema = Schema::new(vec![Field::new("total", DataType::Float64, true)]);
+        let prepared =
+            prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
+                &query,
+                &calls,
+                &pin(),
+                Some("ice"),
+                "db",
+                Some(&schema),
+                Some(&[Some(DataType::Float64)]),
+            )
+            .unwrap();
+        let source = "avg_state_visible(`state`.`__agg_state_total_avg_sum`, `state`.`__agg_state_total_avg_count`, CAST(-1 AS BIGINT), CAST(NULL AS DOUBLE))";
+        let expected = novarocks_parser::parser::parse_expression(
+            source,
+            &novarocks_parser::lex(source).unwrap(),
+        )
+        .unwrap();
+        assert!(projection_expression(prepared.query(), "total").syntax_eq(&expected));
     }
 
     #[test]

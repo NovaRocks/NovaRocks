@@ -25,8 +25,8 @@
 use std::collections::HashSet;
 
 use novarocks_parser::Span;
-use novarocks_parser::ast;
 use novarocks_parser::printer;
+use novarocks_parser::{ast, build};
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
 
@@ -167,7 +167,7 @@ pub(super) fn prepare_projection_full_read_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<String, String> {
+) -> Result<ast::Query, String> {
     let mut query = select_query.clone();
     inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
     append_physical_apply_key(query)
@@ -179,7 +179,7 @@ pub(super) fn prepare_union_projection_full_read_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<String, String> {
+) -> Result<ast::Query, String> {
     if branch_count < 2 {
         return Err("iceberg UNION ALL MV full refresh requires at least 2 branches".to_string());
     }
@@ -209,7 +209,7 @@ pub(super) fn prepare_union_projection_full_read_sql(
     let mut next_branch_id = 0;
     append_union_projection_hidden_columns(query.body.as_mut(), &mut next_branch_id)?;
     debug_assert_eq!(next_branch_id, branch_count_i32);
-    Ok(printer::print_query(&query))
+    Ok(query)
 }
 
 pub(super) fn pin_state_sql(
@@ -217,10 +217,10 @@ pub(super) fn pin_state_sql(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<String, String> {
+) -> Result<ast::Query, String> {
     let mut query = state_query.clone();
     inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
-    Ok(printer::print_query(&query))
+    Ok(query)
 }
 
 pub(super) fn branch_union_queries(
@@ -229,7 +229,7 @@ pub(super) fn branch_union_queries(
     pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<Vec<(ast::Query, String)>, String> {
+) -> Result<Vec<ast::Query>, String> {
     let mut query = select_query.clone();
     inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
     let mut branch_bodies = Vec::new();
@@ -245,41 +245,12 @@ pub(super) fn branch_union_queries(
         .map(|body| {
             let mut branch_query = query.clone();
             branch_query.body = Box::new(body);
-            let branch_sql = printer::print_query(&branch_query);
-            Ok((branch_query, branch_sql))
+            Ok(branch_query)
         })
         .collect()
 }
 
-fn synthetic_ident(value: &str) -> ast::Ident {
-    ast::Ident {
-        value: value.to_string(),
-        quoted: false,
-        quote_style: None,
-        span: Span::new(0, 0),
-    }
-}
-
-fn number_literal(value: String) -> ast::Expr {
-    ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value),
-        span: Span::new(0, 0),
-    })
-}
-
-fn int_type_name() -> ast::TypeName {
-    ast::TypeName {
-        name: ast::ObjectName {
-            parts: vec![synthetic_ident("INT")],
-            span: Span::new(0, 0),
-        },
-        arguments: vec![],
-        argument_separator_spaces: vec![],
-        span: Span::new(0, 0),
-    }
-}
-
-fn append_physical_apply_key(mut query: ast::Query) -> Result<String, String> {
+fn append_physical_apply_key(mut query: ast::Query) -> Result<ast::Query, String> {
     let ast::SetExpr::Select(select) = query.body.as_mut() else {
         return Err("iceberg MV physical SELECT expects a SELECT body".to_string());
     };
@@ -297,13 +268,12 @@ fn append_physical_apply_key(mut query: ast::Query) -> Result<String, String> {
             );
         }
     }
-    select.projection.push(ast::SelectItem::ExprWithAlias {
-        expr: ast::Expr::Identifier(synthetic_ident("_row_id")),
-        alias: synthetic_ident(HIDDEN_APPLY_KEY_COLUMN_NAME),
-        explicit_as: true,
-        span: Span::new(0, 0),
-    });
-    Ok(printer::print_query(&query))
+    select.projection.push(build::item(
+        build::identifier(build::ident("_row_id", None)),
+        Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
+        true,
+    ));
+    Ok(query)
 }
 
 fn validate_reserved_projection_output_names(
@@ -404,24 +374,19 @@ fn append_union_projection_hidden_columns(
             *next_branch_id = next_branch_id
                 .checked_add(1)
                 .ok_or_else(|| "iceberg UNION ALL MV branch id overflow".to_string())?;
-            select.projection.push(ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::Identifier(synthetic_ident("_row_id")),
-                alias: synthetic_ident(HIDDEN_APPLY_KEY_COLUMN_NAME),
-                explicit_as: true,
-                span: Span::new(0, 0),
-            });
-            select.projection.push(ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::Cast(ast::CastExpr {
-                    kind: ast::CastKind::Cast,
-                    expr: Box::new(number_literal(branch_id.to_string())),
-                    data_type: int_type_name(),
-                    format: None,
-                    span: Span::new(0, 0),
-                }),
-                alias: synthetic_ident(BRANCH_ID_COLUMN_NAME),
-                explicit_as: true,
-                span: Span::new(0, 0),
-            });
+            select.projection.push(build::item(
+                build::identifier(build::ident("_row_id", None)),
+                Some(build::ident(HIDDEN_APPLY_KEY_COLUMN_NAME, None)),
+                true,
+            ));
+            select.projection.push(build::item(
+                build::cast(
+                    build::integer(i64::from(branch_id)),
+                    build::simple_type("INT"),
+                ),
+                Some(build::ident(BRANCH_ID_COLUMN_NAME, None)),
+                true,
+            ));
             Ok(())
         }
         _ => Err("iceberg UNION ALL MV full refresh expects SELECT branches".to_string()),
@@ -568,7 +533,7 @@ fn walk_factor(
             }
             *version = Some(ast::TableVersion {
                 kind: ast::TableVersionKind::ForVersionAsOf,
-                value: number_literal(pinned.snapshot_id().to_string()),
+                value: build::integer(pinned.snapshot_id()),
                 span: Span::new(0, 0),
             });
             state.next_occurrence += 1;
@@ -672,8 +637,10 @@ mod tests {
         let sql = prepare_projection_full_read_sql(&query, &pin, Some("ice"), "db")
             .expect("SQL-only projection shape");
 
-        assert!(sql.contains("VERSION AS OF 42"), "{sql}");
-        assert!(sql.contains("__nova_base_row_id"), "{sql}");
+        use ast::SyntaxEq;
+        assert!(sql.syntax_eq(&parse_query(
+            "SELECT id, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 42",
+        )));
         assert_eq!(
             pin.get(SqlMvRelationOccurrenceId::new(7))
                 .map(SqlMvSnapshotPinOccurrence::snapshot_id),
@@ -706,8 +673,10 @@ mod tests {
         let sql = prepare_projection_full_read_sql(&query, &pin, Some("ice"), "db")
             .expect("repeated definition occurrences remain distinct");
 
-        assert_eq!(sql.matches("VERSION AS OF 11").count(), 1, "{sql}");
-        assert_eq!(sql.matches("VERSION AS OF 22").count(), 1, "{sql}");
+        use ast::SyntaxEq;
+        assert!(sql.syntax_eq(&parse_query(
+            "SELECT l.id, _row_id AS __nova_base_row_id FROM ice.db.fact FOR VERSION AS OF 11 AS l JOIN ice.db.fact FOR VERSION AS OF 22 AS r ON l.id = r.id",
+        )));
         assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
         assert_eq!(pin.occurrences()[1].occurrence_id().get(), 42);
     }

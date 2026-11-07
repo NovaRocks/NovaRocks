@@ -41,6 +41,8 @@ pub(crate) mod parser;
 pub mod planning;
 pub mod semantic;
 pub mod sql_mode;
+mod type_syntax;
+pub use type_syntax::{TypeSyntaxError, sql_type_syntax};
 
 pub(crate) mod optimizer;
 

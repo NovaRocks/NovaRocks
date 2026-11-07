@@ -41,7 +41,7 @@ use novarocks_sql::compiler::{
 use novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifact;
 
 /// The opaque SQL artifact comes back unchanged with its captured catalog.
-/// Parsing its private SQL remains the original SQL author's responsibility.
+/// Its private query AST remains owned by the original SQL author.
 pub(crate) enum MvCatalogCaptureQuery {
     Query(Box<novarocks_parser::ast::Query>),
     FirstSql(SqlMvFirstRefreshArtifact),
