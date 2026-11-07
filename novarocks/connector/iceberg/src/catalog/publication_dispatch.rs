@@ -188,8 +188,8 @@ mod tests {
         .unwrap()
         .with_vended_credential_lease_sink(Arc::new(OriginalCredentialSink))
         .with_execution_source(
-            ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap(),
-            ConnectorSourceOperations::new(),
+            ConnectorRangeScope::for_test(1, 2, 3, 4, 5, 6).unwrap(),
+            ConnectorSourceOperations::for_test(),
         );
         let marker = original.request_scope_extension_or_insert_with(|| 42_u64);
         let policy = CatalogEvidencePolicy::default();

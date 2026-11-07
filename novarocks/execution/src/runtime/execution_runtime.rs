@@ -277,7 +277,7 @@ impl ExecutionRuntime {
         Arc::clone(&self.exchange_registry)
     }
 
-    pub fn driver_executor(&self) -> Arc<GlobalDriverExecutor> {
+    pub(crate) fn driver_executor(&self) -> Arc<GlobalDriverExecutor> {
         Arc::clone(&self.driver_executor)
     }
 
@@ -286,6 +286,15 @@ impl ExecutionRuntime {
     /// Application shutdown invokes this before releasing the runtime owner.
     pub fn shutdown_driver_execution(&self) -> crate::runtime::task::ExecutionResult<()> {
         self.driver_executor.shutdown()
+    }
+
+    /// Seal sink actor admission before waiting for actual future/capture exit.
+    /// A deadline only stops this wait; live actors retain their own responsibility.
+    pub fn shutdown_sink_io(&self) -> crate::runtime::task::ExecutionResult<()> {
+        let io = self.services.sink_io();
+        io.close_admission();
+        io.wait_live_exit(crate::exec::pipeline::global_driver_executor::DEFAULT_SHUTDOWN_TIMEOUT)
+            .map_err(Into::into)
     }
 
     pub fn exchange_unit_scheduler(&self) -> Arc<ExchangeUnitSendScheduler> {

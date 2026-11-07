@@ -65,9 +65,7 @@ pub(crate) enum WorkerFailureReason {
     CatalogConfiguration = 80,
     CatalogPropertiesConflict = 81,
     CatalogNotReadyAfterInstall = 82,
-    QueryContextNativeKey = 83,
-    QueryFragmentNativeKey = 84,
-    QueryContextMissing = 85,
+    // 83–85 retired with the process-global QueryContext manager.
     ResultPolicyZeroRoot = 86,
     ResultPolicyZeroProcess = 87,
     ResultPolicyRootExceedsProcess = 88,
@@ -122,6 +120,7 @@ pub(crate) enum WorkerFailureReason {
     RootControlReadAdmission = 171,
     TaskDisposalCallback = 172,
     ParticipationMissing = 173,
+    ParticipationWorkUnresolved = 174,
 }
 
 impl WorkerFailureReason {
@@ -135,11 +134,11 @@ mod tests {
     use super::{WorkerFailureReason, domain};
 
     #[test]
-    fn resource_and_participation_missing_keep_distinct_stable_codes() {
-        let resource = WorkerFailureReason::QueryContextMissing.reason();
+    fn unresolved_work_and_participation_missing_keep_distinct_stable_codes() {
+        let resource = WorkerFailureReason::ParticipationWorkUnresolved.reason();
         let participation = WorkerFailureReason::ParticipationMissing.reason();
         assert_eq!(resource.domain(), domain::WORKER.get());
-        assert_eq!(resource.code(), 85);
+        assert_eq!(resource.code(), 174);
         assert_eq!(participation.domain(), domain::WORKER.get());
         assert_eq!(participation.code(), 173);
     }

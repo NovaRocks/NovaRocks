@@ -1682,13 +1682,22 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
             previous_table_object_ids,
             Some(1),
             "target-uuid".to_string(),
-            Arc::from(vec![novarocks_types::schema::ColumnDef {
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }]),
+            Arc::from(vec![
+                novarocks_types::schema::ColumnDef {
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                novarocks_types::schema::ColumnDef {
+                    name: "__nova_base_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+            ]),
             Arc::new(SqlImvSchemaContract {
                 bases: Vec::new(),
                 output_columns: Vec::new(),

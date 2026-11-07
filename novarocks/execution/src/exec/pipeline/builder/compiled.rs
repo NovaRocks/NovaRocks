@@ -1411,8 +1411,10 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
             key_slots,
             key_labels,
             message_prefix,
+            declared_violation,
             ..
         } => AssertNumRowsMode::PerKeyAtMostOne {
+            declared_violation: *declared_violation,
             key_slots: key_slots.clone(),
             key_labels: key_labels.iter().map(ToString::to_string).collect(),
             message_prefix: message_prefix.to_string(),

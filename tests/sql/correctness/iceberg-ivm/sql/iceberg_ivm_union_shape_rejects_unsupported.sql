@@ -70,6 +70,10 @@ CREATE TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 (
 )
 TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
+-- Give every source a real v3 snapshot before testing unrelated UNION shape admission.
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 VALUES (1, 'seed', 1);
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 VALUES (1, 'seed', 1);
+INSERT INTO ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 VALUES (1, 'seed', 1);
 SET CATALOG ice_ivm_union_reject_${uuid0};
 USE ns_${uuid0};
 

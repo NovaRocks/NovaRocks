@@ -62,10 +62,6 @@ impl FileIoSpawner for GatedFileIoSpawner {
             task.await;
         })))
     }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
-    }
 }
 
 /// Runs every spawned file task at once, counting them.
@@ -79,10 +75,6 @@ impl FileIoSpawner for CountingFileIoSpawner {
         self.spawned.fetch_add(1, Ordering::SeqCst);
         Ok(FileIoJob::new(self.handle.spawn(task)))
     }
-
-    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-        self.handle.spawn_blocking(job);
-    }
 }
 
 /// Routes `context`'s reads through a range service whose every file task is
@@ -93,7 +85,7 @@ pub(crate) fn route_reads_through(
     spawner: Arc<dyn FileIoSpawner>,
     handle: tokio::runtime::Handle,
 ) -> ConnectorSourceOperations {
-    let operations = ConnectorSourceOperations::new();
+    let operations = ConnectorSourceOperations::for_test();
     context.io_spawner = Arc::clone(&spawner);
     context.range = Some(
         FileRangeService::new(
@@ -104,7 +96,7 @@ pub(crate) fn route_reads_through(
             handle,
         )
         .bind(
-            FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+            FileRangeScope::for_test(1, 0, 1, 2, 0, 3).unwrap(),
             operations.clone(),
         ),
     );

@@ -55,16 +55,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_string_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW string_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(name) AS mn,
-       MAX(name) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -77,6 +67,16 @@ INSERT INTO ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items VALUES
   (4, 'east', 'date'),
   (5, 'east', 'elderberry'),
   (6, 'east', NULL);
+CREATE MATERIALIZED VIEW string_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(name) AS mn,
+       MAX(name) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items
+GROUP BY region;
 REFRESH MATERIALIZED VIEW string_mv_${uuid0};
 
 -- query 3

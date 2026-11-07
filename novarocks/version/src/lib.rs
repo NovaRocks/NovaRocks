@@ -88,6 +88,9 @@ impl StaticPlanInterpreter {
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
+/// Planner-declared row assertion violations change the package descriptor and
+/// plan contract revision, so those exact inputs separate their compatibility
+/// islands without an additional execution-only epoch change.
 ///
 /// Epoch 15 gives signed integer arithmetic its declared width, checked
 /// overflow and integer division semantics. Epoch-14 peers interpret the same

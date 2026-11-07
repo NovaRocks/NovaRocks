@@ -1402,6 +1402,10 @@ impl ObjectStoreProviderPool {
         Self::start(ObjectStoreProviderPoolOptions { capacity, idle_ttl })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The provider pool owns its janitor service; see ADR-0218."
+    )]
     fn start(options: ObjectStoreProviderPoolOptions) -> FileResult<Self> {
         // Build both transport policies once, before publishing the pool or
         // starting its janitor. Operators clone these clients, not their pools.

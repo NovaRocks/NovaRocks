@@ -115,6 +115,10 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
         Some(self.activity.clone())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "FE catalog-control work uses this shared provider service carrier; see ADR-0218."
+    )]
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,
@@ -500,12 +504,14 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(scan_runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(scan_runtime.handle().clone())),
         );
         let write_access = crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(data_runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(data_runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(data_runtime.handle().clone())),
         );
         let read_context = read_access
@@ -634,6 +640,7 @@ mod tests {
             Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(TokioFileIoSpawner::new(handle.clone())),
         );
         let access = crate::access_binding::IcebergReadBinding::with_metadata_credential_resolver(
@@ -729,6 +736,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
+            novarocks_fs::TokioRefreshExecutor::shared(tokio::runtime::Handle::current()),
             Arc::new(TokioFileIoSpawner::new(tokio::runtime::Handle::current())),
         );
         let factory = IcebergControlRoleBindingFactory::new(

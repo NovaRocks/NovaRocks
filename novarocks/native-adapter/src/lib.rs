@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Server-resolved Native transport capabilities and protocol adapters.
 
 /// Capabilities compiled by this owner; activation still requires a role session.
@@ -351,7 +359,30 @@ impl BackendDataRuntime {
         self.transport_admission.as_ref()
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Runs the original sender ExitObligation and wakes its Worker owner after actual drop; see ADR-0218."
+    )]
+    pub(crate) fn spawn_with_obligation<F>(
+        &self,
+        work: novarocks_worker::RuntimeFilterSenderWork,
+        future: F,
+    ) -> tokio::task::JoinHandle<
+        Result<F::Output, novarocks_control_runtime::exit_work::ExitWorkError>,
+    >
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (obligation, panic, wake) = work.into_parts();
+        let future = novarocks_control_runtime::exit_work::run_future(obligation, future, panic);
+        self.handle.spawn(ParticipationExitWakeFuture {
+            future: Box::pin(future),
+            _wake: ParticipationExitWake(wake),
+        })
+    }
+
+    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
     where
         F: Future + Send,
         F::Output: Send,
@@ -362,7 +393,7 @@ impl BackendDataRuntime {
             self.handle.block_on(future)
         }
     }
-    pub fn handle(&self) -> &Handle {
+    pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
     pub fn native_trust(&self) -> &Arc<NativeTrust> {
@@ -373,6 +404,28 @@ impl BackendDataRuntime {
     }
     pub(crate) fn channels(&self) -> &native_channel_cache::NativeChannelCache {
         &self.channels
+    }
+}
+
+struct ParticipationExitWake(novarocks_worker::ParticipationWorkWake);
+impl Drop for ParticipationExitWake {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
+struct ParticipationExitWakeFuture<F> {
+    // Rust destroys the actual obligated future before the wake, even when
+    // that destruction unwinds and records a real Unresolved work.
+    future: std::pin::Pin<Box<F>>,
+    _wake: ParticipationExitWake,
+}
+impl<F: Future> Future for ParticipationExitWakeFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
     }
 }
 

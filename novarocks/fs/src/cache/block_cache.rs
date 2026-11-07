@@ -227,6 +227,10 @@ impl BlockCache {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Ownership transfers to the cache service before asynchronous cache write; see ADR-0218."
+    )]
     pub fn write(
         self: &Arc<Self>,
         cache_key: CacheKey,

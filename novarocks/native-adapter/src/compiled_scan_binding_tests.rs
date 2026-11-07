@@ -412,7 +412,10 @@ fn bind_filtered(
             #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             runtime,
-            task_key: UniqueId::new(3, 4),
+            scan_sources: novarocks_worker::TaskScanSourceIssuer::for_test(
+                runtime.execution_id(),
+                novarocks_types::UniqueId::new(3, 4),
+            ),
             query_options: &options,
             stop: ConnectorStopOwner::new().view(),
             runtime_filters: endpoints,

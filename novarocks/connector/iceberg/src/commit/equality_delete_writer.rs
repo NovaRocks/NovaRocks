@@ -278,6 +278,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         crate::fs_io::build_file_io_for_location(location, binding)

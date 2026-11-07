@@ -56,14 +56,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_pagg_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW pagg_mv_${uuid0}
-PARTITION BY region
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region, COUNT(*) AS c, COUNT(amount) AS c_amount, SUM(amount) AS s, AVG(amount) AS a
-FROM ice_ivm_pagg_${uuid0}.ns_${uuid0}.orders
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -72,6 +64,14 @@ INSERT INTO ice_ivm_pagg_${uuid0}.ns_${uuid0}.orders VALUES
   ('east', 20),
   ('west', NULL),
   ('south', 5);
+CREATE MATERIALIZED VIEW pagg_mv_${uuid0}
+PARTITION BY region
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region, COUNT(*) AS c, COUNT(amount) AS c_amount, SUM(amount) AS s, AVG(amount) AS a
+FROM ice_ivm_pagg_${uuid0}.ns_${uuid0}.orders
+GROUP BY region;
 REFRESH MATERIALIZED VIEW pagg_mv_${uuid0};
 
 -- query 3

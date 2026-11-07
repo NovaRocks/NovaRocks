@@ -124,7 +124,13 @@ fn local_binding() -> (IcebergReadBinding, tokio::runtime::Runtime) {
         Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
     let io_spawner: Arc<dyn FileIoSpawner> =
         Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
-    let binding = IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
+    let binding = IcebergReadBinding::new(
+        None,
+        FsAccessResolver::new(),
+        file_runtime,
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
+        io_spawner,
+    );
     (binding, runtime)
 }
 
@@ -3037,6 +3043,7 @@ pub(super) fn unreachable_rest_runtime() -> (
         None,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(handle.clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
         Arc::new(TokioFileIoSpawner::new(handle.clone())),
     );
     let runtime = crate::metadata_context::IcebergMetadataContext::try_new(
@@ -3630,6 +3637,7 @@ fn refusing_write_runtime(
         FsAccessResolver::new(),
         file_io.clone(),
         file_io.clone(),
+        file_io.clone(),
     );
     let state = crate::catalog_control::IcebergCatalogControlState::new(configuration);
     let resources =
@@ -3906,6 +3914,7 @@ impl FrozenRewriteLake {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources =

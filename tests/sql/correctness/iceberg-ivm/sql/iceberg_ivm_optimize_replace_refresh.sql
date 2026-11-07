@@ -56,13 +56,13 @@ TBLPROPERTIES (
 );
 SET CATALOG ice_ivm_opt_replace_${uuid0};
 USE ns_${uuid0};
+INSERT INTO fact VALUES (1, 'east', 10);
 CREATE MATERIALIZED VIEW fact_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT region, COUNT(*) AS c, SUM(amount) AS s
 FROM fact
 GROUP BY region;
-INSERT INTO fact VALUES (1, 'east', 10);
 REFRESH MATERIALIZED VIEW fact_mv_${uuid0};
 
 -- query 2

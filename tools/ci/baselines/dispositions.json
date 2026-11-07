@@ -2230,6 +2230,16 @@
       "reason": "The case remains FAIL: its original step-4 expected Representation error now actually matches, and result steps 5/6/8/9 pass; the new first failure is positive result statement 10, selected overload builtin.scalar/array_length/(list<any<T>>)->i32;strict;legacy, with actual sql.analyze.unavailable_implementation. B7 owns this exact missing array scalar implementation. Installed cardinality does not install the distinct array_length declaration, as the current owner predicate and independent owner test explicitly state. No independent failed oracle or cleanup violation accompanies this refusal. Deliver that exact pure array_length profile, then pass the entire unchanged current frozen native case including its step-4 negative oracle and later array results before removal; unreached statements 11-13 are not PASS.",
       "owner": "UEA-5E B7",
       "expires": "2026-12-15"
+    },
+    {
+      "unit": "sql-case:mv-storage-contract/mv_storage_contract_spine",
+      "failure": {
+        "class": "error_code",
+        "code": "sql.analyze.unavailable_implementation"
+      },
+      "reason": "RWM-5 baseline e869bf82f: unchanged native 1FE+3BE case first fails at step 9 because builtin.aggregate/sum_state/derived-v1 has no installed implementation for the selected carrier. The prior step 8 text assertion passes; step 22 legacy golden is unreachable. Suite, server and private fixture cleanup completed. Evidence: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-original/. Exit: UEA-7B4 delivers the aggregate-state implementation, the entire unchanged case passes and step 22 is strictly converted, then remove this entry.",
+      "owner": "UEA-7B4",
+      "expires": "2026-12-15"
     }
   ],
   "quarantine": [
@@ -2302,13 +2312,6 @@
       "owner": "B4 set-operation/CTE/topology capability",
       "exit_condition": "B4 restores the missing UNION/topology placement capability; decimal/decimal_error_policy_contract then passes its original exact query.execution.numeric_out_of_range negative oracle at step 24 and every remaining required oracle; remove this quarantine after native verification.",
       "review_by": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/sqlx2_mor_update_from_duplicate_source_rejected",
-      "owner": "B1, B2",
-      "review_by": "2026-12-15",
-      "reason": "D0-6: the unchanged negative oracle at UPDATE FROM step 2 requires MOR UPDATE duplicate _row_id rejection. Current native execution instead returns UnsupportedCompiledShape from the DML compilation Source domain before runtime; the SQL-owned row-mutation graph necessarily authors Router and the compiled carrier explicitly refuses that B1 router capability. B2 owns the MOR UPDATE consumer contract. Preserve the failed negative oracle; this is quarantine only, never a known-only error-code exemption.",
-      "exit_condition": "B1 restores the exact compiled change-stream Router sink/edge used by this MOR UPDATE producer, and B2 revalidates this unchanged full native case: duplicate _row_id error must match, original target remains unchanged, and the complete case/suite cleanup passes. Remove this exact quarantine after that delivery; an arbitrary Unsupported code, a different duplicate test, or a passed prefix is insufficient."
     },
     {
       "unit": "sql-case:iceberg-ivm/iceberg_ivm_a11_base_rename_referenced",
@@ -2393,6 +2396,13 @@
       "review_by": "2026-12-15",
       "reason": "User scope decision on 2026-11-03: keep finite support under current upstream limitations; stop maximum-depth expansion and temporarily ignore this exact depth64 case. Native id-only INSERT reaches query.execution.invariant in its DML source domain; the underlying cause remains unconfirmed. The separately confirmed Writer32 refusal is not proof of that Invariant root cause. The iceberg-rust 0.11 embedded-manifest-schema recursion limit is a separately confirmed upstream gap; do not relabel all observed failures as that SDK cause. Preserve original SQL, goldens, SDK inputs and native failures; this is a case-scope quarantine, not a generic error-code waiver.",
       "exit_condition": "After an official upstream release/public API satisfies the manifest recovery condition, explicitly reassess the remaining codec, Writer, value-path and client gaps under a separately approved scope. Run the original complete case on native 1FE+3BE, including all result oracles and cleanup; remove this quarantine only after it passes. The review date does not establish support."
+    },
+    {
+      "unit": "sql-case:mv-storage-contract/mv_storage_contract_postcommit_projection_failure",
+      "owner": "UEA-7B4",
+      "review_by": "2026-12-15",
+      "reason": "RWM-5 baseline e869bf82f: unchanged native step 8 reports an infrastructure failure (query completed before the post-query marker barrier was reached), so it cannot be a known-failure error-code exemption. In a separate diagnostic copy with only the step 8 kill/expected-error directives removed, the refresh fails with sql.analyze.unavailable_implementation for builtin.aggregate/sum_state/derived-v1, matching the spine aggregate-state blocker. The original negative assertion remains failed and the hold wiring is not qualified. Original evidence: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-original/; diagnostic only: /Users/harbor/.local/state/novarocks/experiments/rwm-5/20261106T032100Z-7f66244c/p01-mv-diagnostic/. All observed suite/server/private-fixture cleanup completed.",
+      "exit_condition": "UEA-7B4 installs the aggregate-state implementation; rerun the entire original case with its unchanged postcommit fault and negative oracle, prove the intended marker/crash/recovery and cleanup, strictly convert step 9, then remove quarantine. If the barrier still cannot be reached after the aggregate refusal is removed, hand the exact first failure to RWM-4 without weakening the oracle."
     }
   ]
 }

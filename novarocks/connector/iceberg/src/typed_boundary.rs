@@ -712,10 +712,9 @@ impl IcebergTypedBoundary {
 
     /// Whether this relation's rows carry Iceberg v3 row lineage.
     ///
-    /// The answer is a table property, which the handle deliberately does not
-    /// carry: only the four split-planning knobs travel on it. It is read back
-    /// from the pinned metadata the handle was frozen against, so the column
-    /// set a scan is offered describes the very snapshot it will read.
+    /// The format version in the exact pinned metadata determines availability;
+    /// table properties cannot enable or disable v3 lineage. The handle carries
+    /// only split-planning knobs, so this reads the same frozen table frame.
     fn relation_has_row_lineage(
         &self,
         handle: &IcebergTableHandle,
@@ -4958,6 +4957,7 @@ mod public_read_schema_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
@@ -5200,6 +5200,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let original = IcebergMetadataContext::try_new(
@@ -5465,6 +5466,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
@@ -6107,6 +6109,7 @@ mod prepared_source_relation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources = crate::resources::IcebergMetadataResources::new(

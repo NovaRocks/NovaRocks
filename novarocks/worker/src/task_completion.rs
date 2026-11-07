@@ -666,6 +666,10 @@ impl fmt::Debug for TaskCompletionSupervisor {
     }
 }
 impl TaskCompletionSupervisor {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The completion service runs original admitted completion obligations and joins its supervisor; see ADR-0218."
+    )]
     pub fn start(runtime: Handle, capacity: usize) -> Arc<Self> {
         assert!(capacity > 0, "task completion capacity must be positive");
         let (ready, mut receiver) = mpsc::channel(capacity);

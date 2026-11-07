@@ -1616,7 +1616,17 @@ pub(crate) mod tests {
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
     )]
     fn join_projection_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
-        crate::compiler::mv_rewrite::test_join_snapshot(false)
+        let mut snapshot = (*crate::compiler::mv_rewrite::test_join_snapshot(false)).clone();
+        let contract = Arc::make_mut(&mut snapshot.schema_contract);
+        contract.target.hidden_apply_key.column_name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
+        contract.target.hidden_apply_key.source =
+            crate::planner::vocabulary::ApplyKeySource::JoinRowKey;
+        for column in Arc::make_mut(&mut snapshot.target_columns) {
+            if column.name == "__row_id__" {
+                column.name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
+            }
+        }
+        Arc::new(snapshot)
     }
 
     #[allow(
@@ -3490,11 +3500,7 @@ pub(crate) mod tests {
             crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 descriptor,
-                &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                    target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                    target_table_uuid: "uuid-tgt".to_string(),
-                    target_snapshot_id: Some(99),
-                },
+                &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&join_projection_mv_ctx()),
                 &mut factory,
                 200,
                 201,
@@ -3539,11 +3545,7 @@ crate::constant::test_constant_policy(),
                     crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                         outcome.plan,
                         descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
+                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&join_projection_mv_ctx()),
                         &mut factory,
                         200,
                         201,
@@ -3593,11 +3595,7 @@ crate::constant::test_constant_policy(),
                     crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                         outcome.plan,
                         descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
+                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&join_projection_mv_ctx()),
                         &mut factory,
                         200,
                         201,
@@ -3651,11 +3649,7 @@ crate::constant::test_constant_policy(),
                     crate::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                         outcome.plan,
                         descriptor,
-                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
-                            target_binding: crate::compiler::mv_rewrite::test_target_binding(),
-                            target_table_uuid: "uuid-tgt".to_string(),
-                            target_snapshot_id: Some(99),
-                        },
+                        &crate::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&join_projection_mv_ctx()),
                         &mut factory,
                         200,
                         201,

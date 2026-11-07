@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! The public lane contract a Frontend consumer builds on: one lane channel
 //! per connection, configured from the frozen geometry, whose stream position
 //! follows each response body to its public exit.

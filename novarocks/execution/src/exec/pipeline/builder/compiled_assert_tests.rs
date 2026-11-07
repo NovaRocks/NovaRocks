@@ -57,6 +57,7 @@ fn global(desired_rows: u64, comparison: RowCountAssertion) -> RowCountAssertion
 
 fn keyed(columns: &[ValueId]) -> RowCountAssertionSpec {
     RowCountAssertionSpec::PerKeyAtMostOne {
+        declared_violation: None,
         applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
         keys: Box::from([columns[0]]),
         labels: Box::from(["k".into()]),
@@ -180,6 +181,7 @@ fn conditional_program(rows: &[(Option<i64>, i64, Option<bool>)], dop: usize) ->
             assertion,
             source,
             RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation: None,
                 applicability: AssertionApplicability::WhenTrue(columns[2]),
                 keys: Box::from([columns[0]]),
                 labels: Box::from(["target".into()]),
@@ -293,5 +295,32 @@ fn compiled_conditional_builder_preserves_all_bypass_rows_with_null_keys() {
             (0..12).collect::<Vec<_>>(),
             "bypass rows never enter the target-key decoder or duplicate set"
         );
+    }
+}
+
+#[test]
+fn compiled_keyed_assertion_preserves_the_declared_sql_identity_through_execution() {
+    use novarocks_failure_contract::sql_reason;
+    for reason in [
+        sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+        sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+    ] {
+        let compiled = program(&[(Some(7), 10), (Some(7), 20)], |columns| {
+            let mut spec = keyed(columns);
+            let RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation, ..
+            } = &mut spec
+            else {
+                unreachable!()
+            };
+            *declared_violation = Some(reason);
+            spec
+        });
+        assert!(
+            matches!(compiled.graph().nodes()[1].kind(), ProgramNodeKind::AssertNumRows { mode: AssertRowsMode::PerKeyAtMostOne { declared_violation: Some(actual), .. }, .. } if *actual == reason)
+        );
+        let error = try_run(&compiled)
+            .expect_err("a declared duplicate still fails the real compiled pipeline");
+        assert!(error.contains("keyed assertion (reason 7:317)"), "{error}");
     }
 }

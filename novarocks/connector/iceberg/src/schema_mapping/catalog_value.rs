@@ -40,13 +40,7 @@ pub(crate) fn table(
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
     let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
-    table_with_metadata_root_policy(
-        &document,
-        declaration,
-        pseudo_columns,
-        MetadataRootPolicy::Ordinary,
-        creation,
-    )
+    table_from_document(&document, declaration, pseudo_columns, creation)
 }
 
 /// Reuse the same validated document for catalog schema and planning facts.
@@ -57,45 +51,24 @@ pub(crate) fn table_with_document(
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
-    table_with_metadata_root_policy(
-        document,
-        declaration,
-        pseudo_columns,
-        MetadataRootPolicy::Ordinary,
-        creation,
-    )
+    table_from_document(document, declaration, pseudo_columns, creation)
 }
 
-/// The exact frozen COW source requires every metadata occurrence. Its loaded
-/// data declaration remains unchanged; this is not a writer target widening.
+/// The exact frozen COW source retains the same format-owned metadata NULL
+/// facts as an ordinary scan; freezing a file does not assign it row lineage.
 pub(crate) fn frozen_row_mutation_table(
     metadata: &TableMetadata,
     declaration: &Schema,
     pseudo_columns: &[String],
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
-    creation.work(1)?;
-    let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
-    table_with_metadata_root_policy(
-        &document,
-        declaration,
-        pseudo_columns,
-        MetadataRootPolicy::FrozenRowMutation,
-        creation,
-    )
+    table(metadata, declaration, pseudo_columns, creation)
 }
 
-#[derive(Clone, Copy)]
-enum MetadataRootPolicy {
-    Ordinary,
-    FrozenRowMutation,
-}
-
-fn table_with_metadata_root_policy(
+fn table_from_document(
     document: &super::nominal_declaration::TableNominalDocument,
     declaration: &Schema,
     pseudo_columns: &[String],
-    metadata_roots: MetadataRootPolicy,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     let integers = crate::scalar_integer_domain::of_schema(declaration, &document.integers)?;
@@ -144,11 +117,7 @@ fn table_with_metadata_root_policy(
             }
         }
         let column: IcebergMetadataColumn = found.ok_or_else(bad)?;
-        let nullable = match metadata_roots {
-            MetadataRootPolicy::Ordinary => column.nullable(),
-            MetadataRootPolicy::FrozenRowMutation => false,
-        };
-        let value = metadata_column_with_nullability(column, nullable, creation)?;
+        let value = metadata_column(column, creation)?;
         let name = creation.text(name)?;
         fields.push(creation.arc(Field::new(
             name,

@@ -447,6 +447,10 @@ pub(crate) struct EventDispatcher {
 }
 
 impl EventDispatcher {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Process event-dispatcher construction and owned worker lifecycle; see ADR-0218."
+    )]
     pub(crate) fn new() -> Self {
         let state = Arc::new(EventDispatcherState {
             queues: Mutex::new(EventDispatcherQueues::new()),
@@ -1621,7 +1625,7 @@ mod tests {
             None,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
                 Arc::new(
-                    crate::runtime::task_control::TaskExecutionControl::new(
+                    crate::runtime::task_control::TaskExecutionControl::for_test(
                         owner.identity(),
                         owner.clone(),
                         TaskFailurePhase::Execution,

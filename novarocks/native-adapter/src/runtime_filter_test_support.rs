@@ -13,8 +13,11 @@ use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 /// build a route graph first. Any envelope it receives is refused by its own
 /// route authority, which is exactly what distinguishes "the participant
 /// decided" from "nobody was asked".
-pub fn participant_for_test()
--> std::sync::Arc<crate::runtime_filter_participant::RuntimeFilterParticipant> {
+/// The caller closes and drops every participant alias before awaiting the
+/// original owner's `finish`, including this participant's real sender work.
+pub fn participant_for_test(
+    owner: &mut novarocks_worker::ParticipationWorkTestOwner,
+) -> std::sync::Arc<crate::runtime_filter_participant::RuntimeFilterParticipant> {
     use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 
     let contribution = novarocks_proto_codec::lifecycle::RuntimeFilterContribution::parse(
@@ -45,7 +48,11 @@ pub fn participant_for_test()
     NativeRuntimeFilterParticipantFactory::new(
         crate::backend_test_support::test_backend_data_runtime(),
     )
-    .install(participant_execution_id(), decoded)
+    .install(
+        participant_execution_id(),
+        decoded,
+        owner.runtime_filter_sender(),
+    )
     .expect("a channel-less participant installs")
 }
 

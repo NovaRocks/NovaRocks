@@ -878,7 +878,7 @@ mod tests {
     }
 
     fn request(cancellation: ConnectorStopView) -> ConnectorRequestContext {
-        execution_request(cancellation, ConnectorSourceOperations::new())
+        execution_request(cancellation, ConnectorSourceOperations::for_test())
     }
 
     fn execution_request(
@@ -895,7 +895,7 @@ mod tests {
         // This is an execution fixture, with its exact NODE and real Task
         // operation ledger. Production never supplies a default source.
         .with_execution_source(
-            novarocks_spi::connector::ConnectorRangeScope::try_new(1, 2, 1, 3, 4, NODE)
+            novarocks_spi::connector::ConnectorRangeScope::for_test(1, 2, 1, 3, 4, NODE)
                 .expect("fixture execution scope"),
             operations,
         )
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn terminating_the_scan_stops_its_stream_and_seals_its_task_source() {
         let queues = attempt_queues();
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let provider = ScriptedStreamProvider::new(vec![vec![
             Some(int_page(vec![1])),
             Some(int_page(vec![2])),
@@ -1569,7 +1569,7 @@ mod tests {
     #[test]
     fn closing_the_scan_stream_seals_its_source_and_waits_for_its_operations() {
         let queues = attempt_queues();
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let provider = ScriptedStreamProvider::new(Vec::new());
         let source = stream_source_with(
             Arc::clone(&provider) as Arc<dyn ConnectorReadPageSourceProvider>,

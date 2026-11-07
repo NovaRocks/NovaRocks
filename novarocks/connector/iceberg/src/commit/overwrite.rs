@@ -544,6 +544,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }
@@ -1014,6 +1015,7 @@ pub(crate) mod preparer_tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+                novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
                 Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime.clone())),
             );
             let catalog_runtime = match activity {

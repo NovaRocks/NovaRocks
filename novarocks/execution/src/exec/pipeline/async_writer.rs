@@ -433,14 +433,26 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         if self.join.is_some() {
             return Ok(());
         }
+        let task = runtime_error.task_execution_control();
+        // Existing unit tests deliberately keep a Local error/health oracle.
+        // Their explicit fixture token does not exist in a production target.
+        #[cfg(test)]
+        let local_test_token = task
+            .is_none()
+            .then(crate::runtime::execution_services::test_io_control);
+        #[cfg(test)]
+        let task = task.or(local_test_token.as_ref());
+        let task = task.ok_or_else(|| {
+            ExecutionFailure::from_domain(crate::runtime::task_control::MissingTaskExecutionControl)
+        })?;
         let start = self.start.take().ok_or(WriterFailure::AlreadyBound)?;
         let shared = Arc::clone(&self.shared);
         let config = self.config;
         self.runtime_error = Some(runtime_error.clone());
         // Install the original guard before the executor can cancel an unpolled
         // task. Its receiver already owns every accepted queued command.
-        let frame = WriterActorFrame::new(start, shared, config, runtime_error);
-        self.join = Some(executor.spawn(supervise_actor(frame)));
+        let frame = WriterActorFrame::new(start, shared, config, runtime_error.clone());
+        self.join = Some(executor.spawn(task, supervise_actor(frame))?);
         Ok(())
     }
 
@@ -2414,9 +2426,18 @@ pub(crate) mod tests {
             Box::new(|rows, _| Ok(rows)),
         );
         let runtime = runtime();
-        owner.join = Some(runtime.services().sink_io().spawn(async {
-            std::future::pending::<()>().await;
-        }));
+        owner.join = Some(
+            runtime
+                .services()
+                .sink_io()
+                .spawn(
+                    &crate::runtime::execution_services::test_io_control(),
+                    async {
+                        std::future::pending::<()>().await;
+                    },
+                )
+                .unwrap(),
+        );
 
         owner.shared.set_done();
 
@@ -4856,10 +4877,15 @@ pub(crate) mod tests {
         let (release, released) = std::sync::mpsc::channel::<()>();
         // This is the real one-worker sink executor. The original writer task
         // cannot run before its external cancellation request is installed.
-        let blocker = executor.spawn(async move {
-            entered.send(()).unwrap();
-            let _ = released.recv();
-        });
+        let blocker = executor
+            .spawn(
+                &crate::runtime::execution_services::test_io_control(),
+                async move {
+                    entered.send(()).unwrap();
+                    let _ = released.recv();
+                },
+            )
+            .unwrap();
         let reached = entering.recv_timeout(Duration::from_secs(5));
         if reached.is_err() {
             drop(release);

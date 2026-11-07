@@ -26,7 +26,7 @@
 //! Every emission step has the original byte/work bounds. Caller admission
 //! precedes cursor, hydrated payload and decoding construction.
 
-// Design: ADR-0214 (docs/adr/ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md)
+// Design: ADR-0221 (docs/adr/ADR-0221-schema-free-online-units-and-prepared-layout-recipes.md)
 use std::sync::Arc;
 
 use arrow::array::{

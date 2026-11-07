@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_original_source_keeps_required_metadata_and_optional_data_roots() {
+    fn frozen_original_source_keeps_format_metadata_nullability_and_optional_data_roots() {
         let (metadata, payload) = original_source();
         assert!(payload.row_mutation_frozen_source);
         let source_before =
@@ -220,8 +220,17 @@ mod tests {
         assert!(execution.binding(1).unwrap().nullable());
         for name in &payload.metadata_columns {
             let ordinal = execution.schema().index_of(name).unwrap();
-            assert!(!execution.binding(ordinal).unwrap().nullable(), "{name}");
-            assert!(!execution.schema().field(ordinal).is_nullable(), "{name}");
+            let nullable = matches!(name.as_str(), "_row_id" | "_last_updated_sequence_number");
+            assert_eq!(
+                execution.binding(ordinal).unwrap().nullable(),
+                nullable,
+                "{name}"
+            );
+            assert_eq!(
+                execution.schema().field(ordinal).is_nullable(),
+                nullable,
+                "{name}"
+            );
         }
         assert!(
             execution
@@ -246,44 +255,6 @@ mod tests {
             source_before,
             crate::metadata::projected_schema_with_metadata(&payload, &[], &metadata).unwrap(),
         );
-    }
-
-    #[test]
-    fn ordinary_metadata_nullability_stays_independent_and_frozen_pair_still_rejects_it() {
-        let (metadata, payload) = original_source();
-        let mut request = |_| Ok(());
-        let mut work = |_| Ok(());
-        let mut creation = ConnectorReadSchemaCreation::new(
-            ValueTypeStorageLifetime::pure(),
-            &mut request,
-            &mut work,
-        );
-        let mut ordinary = payload.clone();
-        ordinary.row_mutation_frozen_source = false;
-        let ordinary_execution = from_original_metadata(&ordinary, &metadata, &mut creation)
-            .expect("ordinary complete declaration");
-        let ordinal = ordinary_execution
-            .schema()
-            .index_of("_last_updated_sequence_number")
-            .unwrap();
-        assert!(ordinary_execution.binding(ordinal).unwrap().nullable());
-        assert!(ordinary_execution.schema().field(ordinal).is_nullable());
-        sign_source(
-            &ordinary,
-            &metadata,
-            ordinary_execution.clone(),
-            &mut creation,
-        )
-        .expect("ordinary strict pairing");
-        let error = sign_source(&payload, &metadata, ordinary_execution, &mut creation)
-            .expect_err("ordinary declaration cannot sign a required frozen metadata source");
-        match error {
-            PureProviderCompileError::Provider(cause) => {
-                assert_eq!(cause.kind(), ConnectorErrorKind::InvalidRequest);
-                assert!(cause.message().contains("root names or NULL facts differ"));
-            }
-            PureProviderCompileError::Control(cause) => panic!("unexpected control {cause:?}"),
-        }
     }
 
     #[test]

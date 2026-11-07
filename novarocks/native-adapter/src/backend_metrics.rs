@@ -19,13 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 mod runtime_control;
 
+use crate::backend_task_execution::NativeQueryExecutionResourceSnapshot;
 use crate::management_http::RoleMetricsRenderer;
 use novarocks_memory::attribution::readout::{
     AttributionSnapshot, CLASS_LABELS, PRODUCTION_LABELS,
 };
 use novarocks_memory::lane::REGION_LABELS;
 use novarocks_memory::observe::PhysicalMemoryReading;
-use novarocks_worker::query_context::NativeQueryExecutionResourceSnapshot;
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
@@ -1003,7 +1003,7 @@ impl BackendMetricsRegistry {
             let (counted, physical) = (observation.sample)();
             publish_process_memory(gauges, counted, physical);
         }
-        // Contexts can disappear in rollback and expiry paths. The owner is
+        // Contexts leave only through the original instance resource teardown. The owner is
         // the only source for these gauges, and the lock keeps concurrent
         // scrapes from publishing snapshots out of order.
         if let Some(observation) = &self.native_query_resources {
@@ -1011,10 +1011,6 @@ impl BackendMetricsRegistry {
             publish_backend_query_execution_resource(
                 "native_query_contexts_active",
                 snapshot.active_contexts,
-            );
-            publish_backend_query_execution_resource(
-                "native_query_contexts_second_chance",
-                snapshot.second_chance_contexts,
             );
             publish_backend_query_execution_resource(
                 "native_query_active_tasks",
@@ -2106,11 +2102,7 @@ mod tests {
     impl novarocks_worker::TaskExecutionHost for UnusedPreparationHost {
         fn close_participation_admission(&self, _: novarocks_execution_contract::ParticipationRef) {
         }
-        fn retire_participation_execution(
-            &self,
-            _: novarocks_execution_contract::ParticipationRef,
-        ) {
-        }
+
         fn forget_participation_admission(
             &self,
             _: novarocks_execution_contract::ParticipationRef,
@@ -2348,7 +2340,6 @@ mod tests {
             .expect("construct Backend registry")
             .with_native_query_resources(Arc::new(move || NativeQueryExecutionResourceSnapshot {
                 active_contexts: observed.load(AtomicOrdering::Relaxed),
-                second_chance_contexts: 0,
                 active_fragments: 0,
             }));
 

@@ -557,6 +557,10 @@ impl ExchangeGrantClients {
         })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Peer subscriptions belong to the process-shared exchange service; see ADR-0218."
+    )]
     pub(crate) fn watch(
         &self,
         destination: RuntimeEndpoint,

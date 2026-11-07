@@ -60,6 +60,10 @@ impl std::fmt::Debug for TokioRefreshExecutor {
 }
 
 impl RefreshExecutor for TokioRefreshExecutor {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Credential renewal belongs to the shared storage-authority service; see ADR-0218."
+    )]
     fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
         // The handle is injected, never discovered: this crate does not reach
         // for a current runtime on a connector's behalf.

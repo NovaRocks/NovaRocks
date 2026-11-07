@@ -228,6 +228,10 @@ impl NativeRpcListener {
         clippy::too_many_arguments,
         reason = "role identity and its authentication metric remain explicit composition inputs"
     )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The native listener owns its runtime service task; see ADR-0218."
+    )]
     fn start_inner<S, F, H>(
         host: &str,
         port: u16,
@@ -706,6 +710,10 @@ async fn notified_or_forever(close: Option<&Notify>) {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The original native listener admits and drains connection service tasks; see ADR-0218."
+)]
 async fn serve_native_listener<S>(
     listener: TokioTcpListener,
     app: S,

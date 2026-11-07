@@ -877,6 +877,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     .unwrap();
     finish_assertion(SourceDistribution::Hash(75), |key, _| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key]),
             labels: Box::from([Box::<str>::from("account_id")]),
@@ -887,6 +888,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
 
     finish_assertion(SourceDistribution::Singleton, |key, _| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key]),
             labels: Box::from([Box::<str>::from("account_id")]),
@@ -896,6 +898,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     .unwrap();
     finish_assertion(SourceDistribution::Hash(75), |key, order| {
         RowCountAssertionSpec::PerKeyAtMostOne {
+            declared_violation: None,
             applicability: crate::AssertionApplicability::AllRows,
             keys: Box::from([key, order]),
             labels: Box::from([Box::<str>::from("account_id"), Box::<str>::from("event_id")]),
@@ -916,6 +919,7 @@ fn assertion_modes_require_global_or_colocated_distribution() {
     assert!(contains_error(
         finish_assertion(SourceDistribution::Hash(75), |_, _| {
             RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation: None,
                 applicability: crate::AssertionApplicability::AllRows,
                 keys: Box::default(),
                 labels: Box::default(),

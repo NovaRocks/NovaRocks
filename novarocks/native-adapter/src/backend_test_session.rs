@@ -41,6 +41,10 @@ impl BackendTestSessionConfig {
         self.provider_bind = Some(bind);
         self
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The authorized development session owns its liveness carrier; see ADR-0218."
+    )]
     pub(crate) fn bind(&self, process: BackendProcessId) -> Result<BackendTestSession, String> {
         let role = self
             .prepared

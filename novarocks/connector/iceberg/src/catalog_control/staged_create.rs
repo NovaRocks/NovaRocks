@@ -3268,6 +3268,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         IcebergMetadataContext::try_new(
@@ -3611,6 +3612,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         IcebergMetadataContext::try_new(
@@ -3699,6 +3701,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let runtime = IcebergMetadataContext::try_new(
@@ -3773,6 +3776,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let runtime = Arc::new(
@@ -4065,6 +4069,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let runtime = IcebergMetadataContext::with_catalog_for_test(

@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 //! Real Server GLOBAL, production Type host and original source-field producer.
 //! This target is isolated and run with --test-threads=1. It proves the bounded
 //! birth/last-free protocol; production query retirement and MEM cost stay open.

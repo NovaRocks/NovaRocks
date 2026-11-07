@@ -570,6 +570,7 @@ fn catalog_binding(config: &IcebergCatalogConfiguration) -> IcebergReadBinding {
         config.object_store_config.clone(),
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
         Arc::new(TokioFileIoSpawner::new(runtime)),
     )
 }
@@ -692,6 +693,7 @@ fn child_control(
         Arc::new(ObjectStoreProviderPool::new(Default::default()).expect("child provider pool")),
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
         Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
     );
     let planning_binding = IcebergReadBinding::with_metadata_credential_resolver(

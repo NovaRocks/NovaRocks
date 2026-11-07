@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-10-28
 related:
-  - "ADR-0219-typed-task-summaries-and-per-kind-completion.md"
+  - "ADR-0222-typed-task-summaries-and-per-kind-completion.md"
 provenance:
   - "discussion: 2026-10-23 accepted independent write placement, logical summary and strict delivery contracts"
   - "implementation: frozen write placement and exact Task completion assembly"

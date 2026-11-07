@@ -95,6 +95,20 @@ fn retired_fetch_result_status() -> tonic::Status {
     tonic::Status::unimplemented("FetchResult is retired; use FetchRootResult")
 }
 
+// Design: ADR-0218 (docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)
+// RPC blocking dispatch belongs to the listener service. Its captured ingress
+// ownership remains live until the handler actually returns; query operations
+// still enter their original Worker owner and its admission/exit gates.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Listener-owned blocking RPC service dispatch; see ADR-0218."
+)]
+fn serve_blocking<T: Send + 'static>(
+    handler: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(handler)
+}
+
 #[tonic::async_trait]
 impl NovaRocksGrpc for BackendRpcService {
     type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
@@ -125,7 +139,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let kernel = self.exchange_data_plane.clone();
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = serve_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "exchange_unit",
                 queued_at.elapsed(),
@@ -147,7 +161,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let kernel = self.exchange_data_plane.clone();
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = serve_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "exchange_demand",
                 queued_at.elapsed(),
@@ -193,7 +207,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = serve_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "runtime_filter",
                 queued_at.elapsed(),
@@ -225,7 +239,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = serve_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
                 "prune_catalogs",
                 queued_at.elapsed(),
@@ -248,7 +262,7 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
         let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = serve_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait("heartbeat", queued_at.elapsed());
             let _ownership = ownership;
             heartbeat.respond(raw)

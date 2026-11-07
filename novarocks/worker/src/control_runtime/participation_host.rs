@@ -31,6 +31,7 @@ pub(crate) use task_io::TaskIoPorts;
 mod internal;
 mod owner_control;
 mod teardown;
+pub(crate) mod work_issuer;
 pub(crate) use internal::ParticipationInternalAdvance;
 mod execution_observation;
 mod progress;
@@ -118,6 +119,7 @@ pub(crate) struct ParticipationHostBinding {
     pub storage: AdmissionStorage,
     pub max_live_tasks: usize,
     pub max_live_roots: usize,
+    pub health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
 }
 
 #[derive(Debug)]
@@ -286,6 +288,8 @@ pub(crate) struct ParticipationHostResources {
     pub(in crate::control_runtime) internal: internal::ParticipationInternal,
     pub io: Option<ParticipationIoInventory>,
     pub host_jobs: Option<ParticipationHostJobs>,
+    pub(super) work_registry: Option<work_issuer::ParticipationWorkRegistry>,
+    health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
     pending_host_jobs: progress::PendingHostJobs,
     pub lifecycle: Option<ParticipationLifecycle>,
     pub(super) removal: Option<super::participation_removal::ParticipationRemovalOwner>,
@@ -471,6 +475,8 @@ impl ParticipationHostRecord {
             internal: internal::ParticipationInternal::default(),
             io: None,
             host_jobs: None,
+            work_registry: None,
+            health: binding.health.clone(),
             pending_host_jobs: Default::default(),
             lifecycle: None,
             removal: None,
@@ -740,6 +746,18 @@ impl ParticipationHostRecord {
             .take()
             .expect("original admitted Participation IO bank")
             .into_parts();
+        let work_registry = work_issuer::ParticipationWorkRegistry::new(
+            self.ledger.clone(),
+            self.scope().clone(),
+            self.identity,
+            &self.resources.metadata_resources[LIFETIME].work,
+            self.control_runtime.clone(),
+            self.registration().clone(),
+            notice.clone(),
+            self.resources.health.clone(),
+        )
+        .map_err(|error| ParticipationHostError::HostJob(ParticipationHostJobError::Work(error)))?;
+        self.resources.work_registry = Some(work_registry.clone());
         self.resources.host_jobs = Some(ParticipationHostJobs::from_admitted(
             ParticipationHostJobBinding {
                 runtime: self.control_runtime.clone(),
@@ -752,6 +770,7 @@ impl ParticipationHostRecord {
                 admission: self.resources.admission.capacity.id(),
                 admission_work: self.resources.admission.work.reference(),
                 notice,
+                work_registry,
             },
             parts,
         ));
@@ -1539,6 +1558,9 @@ mod tests {
         ) -> ParticipationHostBinding {
             ParticipationHostBinding {
                 actor,
+                health: Arc::new(
+                    novarocks_execution::runtime::execution_health::ExecutionHealth::new(),
+                ),
                 core: ParticipationCore::new(
                     self.identity,
                     generation(),

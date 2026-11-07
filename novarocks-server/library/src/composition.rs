@@ -180,7 +180,8 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             observed.object_id,
             observed.schema_version,
             observed.format_v3,
-            observed.stored_row_lineage_enabled,
+            observed.selected_snapshot_id,
+            observed.selected_snapshot_has_row_range,
             fields,
             &context,
         )
@@ -249,7 +250,6 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             observed.schema_version,
             observed.partition_spec_version,
             observed.format_v3,
-            observed.explicit_row_lineage_enabled,
             fields,
             observed.partition_fields,
             &context,
@@ -1130,6 +1130,7 @@ pub fn compose_connector_file_planning_resources(
         pool,
         FsAccessResolver::with_runtime(runtime.clone()),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
         std::sync::Arc::new(TokioFileIoSpawner::new(runtime)),
     ))
 }

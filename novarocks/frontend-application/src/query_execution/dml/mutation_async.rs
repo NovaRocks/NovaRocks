@@ -105,7 +105,6 @@ pub(crate) async fn prepare_mutation_facts_async(
         )
         .map(PreparedMutationFacts::Merge),
     }
-    .map_err(Into::into)
 }
 
 impl PreparedMutationFacts {

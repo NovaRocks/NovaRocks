@@ -870,8 +870,8 @@ fn reserved_name_error(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     if lower == "_row_id" || lower == "_last_updated_sequence_number" {
         Some(format!(
-            "column \"{}\" is only available on Iceberg V3 row-lineage tables \
-             (table is not Iceberg V3 with write.row-lineage=true)",
+            "column \"{}\" is only available on Iceberg v3 tables \
+             (table is not Iceberg v3)",
             lower
         ))
     } else {
@@ -953,7 +953,7 @@ mod tests {
             )
             .unwrap();
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
-        assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
+        assert!(err.contains("only available on Iceberg v3 tables (table is not Iceberg v3)"));
     }
 
     #[test]
@@ -981,7 +981,7 @@ mod tests {
             .unwrap();
         // V2 path adds no row-lineage metadata columns.
         let err = scope.resolve(None, "_row_id").expect_err("must fail");
-        assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
+        assert!(err.contains("only available on Iceberg v3 tables (table is not Iceberg v3)"));
     }
 
     #[test]

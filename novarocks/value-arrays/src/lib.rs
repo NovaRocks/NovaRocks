@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Carrier-neutral byte values, frozen-layout construction and conversion.
 //!
 //! This crate owns value algorithms and original failure facts. Input acceptance,

@@ -80,8 +80,9 @@ pub(crate) fn build_runtime_state(
         (Some(identity), Some(control)) if identity == control.identity() => {
             crate::runtime::runtime_state::RuntimeErrorState::for_task(control)
         }
+        #[cfg(test)]
         (None, None) => crate::runtime::runtime_state::RuntimeErrorState::default(),
-        (Some(_), None) => {
+        (_, None) => {
             return Err(super::ExecutionFailure::from_domain(
                 crate::runtime::task_control::MissingTaskExecutionControl,
             ));

@@ -83,6 +83,7 @@ pub(crate) enum ParticipationHostReturned {
     Disposed,
     StartRefused(ExitCustodyError),
     Panicked,
+    WorkRefused(crate::ParticipationWorkError),
 }
 impl std::fmt::Display for ParticipationHostReturned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,6 +110,7 @@ impl std::fmt::Display for ParticipationHostReturned {
             Self::StartRefused(error) => {
                 write!(f, "Participation host call could not start: {error}")
             }
+            Self::WorkRefused(error) => write!(f, "Participation work was refused: {error}"),
             Self::Panicked => {
                 f.write_str("Participation host call panicked; original custody remains unresolved")
             }
@@ -122,6 +124,7 @@ pub(crate) enum ParticipationHostJobError {
     Runtime(RuntimeError),
     ActorTurn(ActorTurnError),
     Exit(ExitCustodyError),
+    Work(crate::ParticipationWorkError),
     WrongOwner,
     WrongPhase,
 }
@@ -142,6 +145,7 @@ impl std::fmt::Display for ParticipationHostJobError {
                     "Participation host physical exit observation failed: {error}"
                 )
             }
+            Self::Work(error) => write!(f, "Participation work supervision failed: {error}"),
             Self::WrongOwner => {
                 f.write_str("Participation host job does not belong to the original owner")
             }
@@ -157,6 +161,7 @@ impl std::error::Error for ParticipationHostJobError {
             Self::Runtime(error) => Some(error),
             Self::ActorTurn(error) => Some(error),
             Self::Exit(error) => Some(error),
+            Self::Work(error) => Some(error),
             Self::Removal(_) | Self::WrongOwner | Self::WrongPhase => None,
         }
     }
@@ -305,6 +310,7 @@ struct Custody {
     admission_work: ScopedWorkRef,
     pending: Notify,
     notice: ParticipationReadyNotice,
+    work_registry: super::participation_host::work_issuer::ParticipationWorkRegistry,
     state: Mutex<State>,
     retained: Mutex<Option<Arc<Self>>>,
 }
@@ -322,6 +328,7 @@ pub(super) struct ParticipationHostJobBinding {
     pub admission: ReservationId,
     pub admission_work: ScopedWorkRef,
     pub notice: ParticipationReadyNotice,
+    pub work_registry: super::participation_host::work_issuer::ParticipationWorkRegistry,
 }
 
 #[must_use = "A refusal returns both original opaque captures to their actual caller"]
@@ -410,6 +417,7 @@ impl ParticipationHostJobs {
             admission,
             admission_work,
             notice,
+            work_registry,
         } = binding;
         let ParticipationIoParts {
             materialization,
@@ -432,6 +440,7 @@ impl ParticipationHostJobs {
             admission_work,
             pending: Notify::default(),
             notice,
+            work_registry,
             state: Mutex::new(State {
                 m: Call::new(materialization, Some(materialization_input)),
                 r: Call::new(release, Some(release_input)),
@@ -1376,7 +1385,22 @@ impl ParticipationHostJob {
                 .expect("Participation factory loan");
             Arc::clone(s.rich.factory.as_ref().expect("original host factory"))
         };
-        let instance = match factory.create_instance(self.owner.0.participation) {
+        let grant = match self.owner.0.work_registry.issue_instance() {
+            Ok(grant) => grant,
+            Err(crate::ParticipationWorkError::Runtime(RuntimeError::Scope(
+                ScopeError::Stopped,
+            ))) => {
+                self.owner
+                    .0
+                    .state
+                    .lock()
+                    .expect("original M no-instance fact")
+                    .no_instance_created = true;
+                return ParticipationHostReturned::MaterializationWithdrawn;
+            }
+            Err(error) => return ParticipationHostReturned::WorkRefused(error),
+        };
+        let instance = match factory.create_instance(self.owner.0.participation, grant) {
             Ok(instance) => instance,
             Err(rejection) => {
                 let failure = rejection.operation_failure();

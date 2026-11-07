@@ -96,6 +96,7 @@ impl ParticipationHostFactory for BoundaryFactory {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: crate::ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
         assert_ne!(
             *self.boundary.forbidden.lock().unwrap(),
@@ -105,11 +106,13 @@ impl ParticipationHostFactory for BoundaryFactory {
         self.calls.observe_host();
         self.calls.factories.fetch_add(1, Ordering::SeqCst);
         *self.boundary.factory_thread.lock().unwrap() = Some(std::thread::current().id());
-        Ok(Arc::new(BoundaryInstance {
-            participation,
-            calls: self.calls.clone(),
-            boundary: self.boundary.clone(),
-        }))
+        Ok(grant
+            .bind_test_instance(Arc::new(BoundaryInstance {
+                participation,
+                calls: self.calls.clone(),
+                boundary: self.boundary.clone(),
+            }))
+            .expect("fixture binds its exact original instance"))
     }
 }
 impl ParticipationHostInstance for BoundaryInstance {
@@ -541,4 +544,385 @@ pub(super) fn queued_materialization_withdraws_without_factory() {
     finish(scene, &boundary);
     assert_eq!(target_drops.load(Ordering::SeqCst), 4);
     assert_eq!(source_drops.load(Ordering::SeqCst), 4);
+}
+
+struct SenderExitBoundary {
+    runtime: tokio::runtime::Handle,
+    polled: AtomicBool,
+    drop_entered: AtomicBool,
+    dropped: AtomicBool,
+    allow_drop: Mutex<bool>,
+    changed: Condvar,
+}
+impl SenderExitBoundary {
+    fn open_drop(&self) {
+        *self.allow_drop.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+struct OpenSenderDropOnExit(Arc<SenderExitBoundary>);
+impl Drop for OpenSenderDropOnExit {
+    fn drop(&mut self) {
+        self.0.open_drop();
+    }
+}
+struct SenderExitCapture(Arc<SenderExitBoundary>);
+impl Drop for SenderExitCapture {
+    fn drop(&mut self) {
+        self.0.drop_entered.store(true, Ordering::Release);
+        let mut allowed = self.0.allow_drop.lock().unwrap();
+        while !*allowed {
+            allowed = self.0.changed.wait(allowed).unwrap();
+        }
+        self.0.dropped.store(true, Ordering::Release);
+    }
+}
+struct PendingOriginalSender {
+    boundary: Arc<SenderExitBoundary>,
+    _capture: SenderExitCapture,
+}
+impl std::future::Future for PendingOriginalSender {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.boundary.polled.store(true, Ordering::Release);
+        std::task::Poll::Pending
+    }
+}
+struct OriginalSenderWake(crate::ParticipationWorkWake);
+impl Drop for OriginalSenderWake {
+    fn drop(&mut self) {
+        self.0.notify();
+    }
+}
+struct OriginalSenderFuture<F> {
+    // Match the Native carrier's physical order: inner future/captures first,
+    // the original WorkWake second. The wake contains metadata only.
+    future: std::pin::Pin<Box<F>>,
+    _wake: OriginalSenderWake,
+}
+impl<F: std::future::Future> std::future::Future for OriginalSenderFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+type SenderJoin =
+    tokio::task::JoinHandle<Result<(), novarocks_control_runtime::exit_work::ExitWorkError>>;
+struct SenderInstanceCaptures {
+    participation: ParticipationRef,
+    calls: Arc<Calls>,
+    boundary: Arc<SenderExitBoundary>,
+    issuer: crate::InstanceWorkIssuer,
+    worker: Mutex<Option<SenderJoin>>,
+    released: AtomicBool,
+}
+struct SenderInstance {
+    captures: Option<SenderInstanceCaptures>,
+    work: Option<novarocks_control_runtime::exit_custody::ExitObligation>,
+}
+struct SenderFactory {
+    calls: Arc<Calls>,
+    boundary: Arc<SenderExitBoundary>,
+}
+impl ParticipationHostFactory for SenderFactory {
+    fn create_instance(
+        self: Arc<Self>,
+        participation: ParticipationRef,
+        grant: crate::ParticipationInstanceGrant,
+    ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
+        assert_eq!(grant.participation(), participation);
+        self.calls.observe_host();
+        self.calls.factories.fetch_add(1, Ordering::SeqCst);
+        let (mut work, issuer) = grant.into_parts();
+        work.start()
+            .expect("the original granted instance starts once");
+        Ok(Arc::new(SenderInstance {
+            captures: Some(SenderInstanceCaptures {
+                participation,
+                calls: self.calls.clone(),
+                boundary: self.boundary.clone(),
+                issuer,
+                worker: Mutex::new(None),
+                released: AtomicBool::new(false),
+            }),
+            work: Some(work),
+        }))
+    }
+}
+impl ParticipationHostInstance for SenderInstance {
+    fn participation(&self) -> ParticipationRef {
+        self.captures.as_ref().unwrap().participation
+    }
+    fn materialize(
+        &self,
+        request: SharedFactsRequest<'_>,
+        control: &dyn crate::ParticipationMaterializationControl,
+    ) -> Result<(), HostRejection> {
+        let captures = self.captures.as_ref().unwrap();
+        assert_eq!(request.participation(), captures.participation);
+        assert!(!control.is_stopped());
+        captures.calls.observe_host();
+        captures
+            .calls
+            .materializations
+            .fetch_add(1, Ordering::SeqCst);
+        let (work, panic, wake) = captures
+            .issuer
+            .runtime_filter_sender()
+            .unwrap()
+            .into_parts();
+        let sender = PendingOriginalSender {
+            boundary: captures.boundary.clone(),
+            _capture: SenderExitCapture(captures.boundary.clone()),
+        };
+        let future = novarocks_control_runtime::exit_work::run_future(work, sender, panic);
+        let worker = captures.boundary.runtime.spawn(OriginalSenderFuture {
+            future: Box::pin(future),
+            _wake: OriginalSenderWake(wake),
+        });
+        assert!(captures.worker.lock().unwrap().replace(worker).is_none());
+        Ok(())
+    }
+    fn release(&self) -> ReleasedParticipationEvidence {
+        let captures = self.captures.as_ref().unwrap();
+        captures.calls.observe_host();
+        captures.calls.releases.fetch_add(1, Ordering::SeqCst);
+        assert!(!captures.released.swap(true, Ordering::AcqRel));
+        captures.worker.lock().unwrap().take().unwrap().abort();
+        ReleasedParticipationEvidence::none()
+    }
+    fn advance_shared_domain(
+        &self,
+        _: &novarocks_execution_contract::task_execution::operation::ParticipationDomainUpdate,
+    ) -> Result<(), HostRejection> {
+        unreachable!("the original sender wake scenario has no domain update")
+    }
+}
+impl Drop for SenderInstance {
+    fn drop(&mut self) {
+        let captures = self.captures.take().unwrap();
+        assert!(captures.released.load(Ordering::Acquire));
+        assert!(captures.worker.lock().unwrap().is_none());
+        let calls = captures.calls.clone();
+        calls.observe_host();
+        // Actual instance captures, including its original issuer, leave H
+        // before the original work records exit. RF is an independent child.
+        drop(captures);
+        self.work.take().unwrap().exited().unwrap();
+        calls.instance_drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub(super) fn sender_exit_wakes_original_node_after_holder_disposal() {
+    for workers in [1, 2] {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let boundary = Arc::new(SenderExitBoundary {
+            runtime: runtime.handle().clone(),
+            polled: AtomicBool::new(false),
+            drop_entered: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+            allow_drop: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let _open_on_failure = OpenSenderDropOnExit(boundary.clone());
+        let StartedScenario {
+            scene,
+            raw,
+            getters,
+            source_drops,
+            participation,
+            capability,
+        } = start_scenario(
+            workers,
+            2,
+            ReservationResources::default(),
+            start_cold_notifications,
+            |calls| {
+                Arc::new(SenderFactory {
+                    calls,
+                    boundary: boundary.clone(),
+                })
+            },
+        );
+        let clock_origin = scene.clock.now();
+        acquire(
+            &scene,
+            participation,
+            capability,
+            12,
+            AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+        );
+        assert!(wait_until(
+            || scene.ledger.used(Dimension::Requests.id()) == 0
+        ));
+        let mut original = establish(&scene, operation(), raw);
+        settle_establish(&mut original, OperationOutcome::Accepted);
+        drop(original);
+        if !wait_until(|| {
+            boundary.polled.load(Ordering::Acquire)
+                && scene.ledger.used(Dimension::Requests.id()) == 0
+        }) {
+            scene.fail("the original RF sender did not actually start", ());
+        }
+        let scope = scene
+            .node
+            .original_participation_scope_for_test(participation)
+            .expect("original Participation scope is still attached");
+        quiesce(&scene, participation, 13, false, 1);
+        assert!(wait_until(
+            || scene.ledger.used(Dimension::Requests.id()) == 0
+        ));
+        let expires = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= expires {
+                scene.fail("RF scenario actual Release timeout", ());
+            }
+            let mut release = scene
+                .node
+                .submit_participation(
+                    participation,
+                    scene.node.next_source(),
+                    operation_number(14),
+                    deadline(),
+                    ParticipationCommand::Release,
+                )
+                .unwrap();
+            let delivery = wait_delivery(&mut release).expect("the original Release RPC completes");
+            assert_eq!(delivery.request(), release.request());
+            let released = match delivery.body() {
+                ParticipationReplyBody::Release {
+                    release: novarocks_execution_contract::ReleaseOutcome::Released,
+                    ..
+                } => true,
+                ParticipationReplyBody::Release {
+                    release: novarocks_execution_contract::ReleaseOutcome::NotReady,
+                    ..
+                } => false,
+                other => panic!("unexpected original RF Release result: {other:?}"),
+            };
+            drop(delivery);
+            drop(release);
+            assert!(wait_until_deadline(expires, || scene
+                .ledger
+                .used(Dimension::Requests.id())
+                == 0));
+            if released {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut blocked = None;
+        if !wait_until(|| {
+            if scene.calls.instance_drops.load(Ordering::SeqCst) != 1
+                || !boundary.drop_entered.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            let Ok(Some(inventory)) = scene.node.participation_detachment_blockers(participation)
+            else {
+                return false;
+            };
+            if inventory.entries.len() != 2 {
+                return false;
+            }
+            let instance = inventory.entries.iter().find(|entry| {
+                entry.label == Some(crate::control_runtime::work_labels::PARTICIPATION_INSTANCE)
+            });
+            let sender = inventory.entries.iter().find(|entry| {
+                entry.label == Some(crate::control_runtime::work_labels::RUNTIME_FILTER_SENDER)
+            });
+            if let (Some(instance), Some(sender)) = (instance, sender)
+                && instance.body_exited
+                && instance.captures_exited
+                && !sender.body_exited
+                && !sender.captures_exited
+                && sender.parent == Some(instance.work)
+                && !instance.unresolved
+                && !sender.unresolved
+            {
+                blocked = Some(inventory);
+                true
+            } else {
+                false
+            }
+        }) {
+            scene.fail(
+                "H retired but original instance/RF custody was not preserved",
+                (scope, blocked),
+            );
+        }
+        let blocked = blocked.unwrap();
+        assert_eq!(
+            blocked.live_by_label[crate::control_runtime::work_labels::PARTICIPATION_INSTANCE],
+            1
+        );
+        assert_eq!(
+            blocked.live_by_label[crate::control_runtime::work_labels::RUNTIME_FILTER_SENDER],
+            1
+        );
+        assert!(!boundary.dropped.load(Ordering::Acquire));
+        assert!(scope.gates().is_ok());
+        assert_eq!(scene.clock.now(), clock_origin);
+
+        // Critical boundary: no more RPC, manual host/ledger progress, clock
+        // advance or notify_pollers. Only the actual sender Drop can emit its
+        // original header readiness and WorkWake to the original Node Actor.
+        boundary.open_drop();
+        if !wait_until(|| {
+            matches!(
+                scope.gates(),
+                Err(novarocks_control_runtime::transaction::RuntimeError::UnknownScope)
+            )
+        }) {
+            scene.fail(
+                "actual RF exit did not wake original two-level retirement and Scope removal",
+                blocked,
+            );
+        }
+        assert!(boundary.dropped.load(Ordering::Acquire));
+        assert_eq!(scene.clock.now(), clock_origin);
+        if !wait_until(|| {
+            scene
+                .node
+                .route(participation)
+                .is_some_and(|route| route.read().state == ParticipationState::TerminalRetained)
+        }) {
+            scene.fail(
+                "the original terminal route did not retain after execution Scope removal",
+                (),
+            );
+        }
+        assert_eq!(scene.calls.factories.load(Ordering::SeqCst), 1);
+        assert_eq!(scene.calls.materializations.load(Ordering::SeqCst), 1);
+        assert_eq!(scene.calls.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(scene.calls.instance_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(scene.calls.on_host.load(Ordering::SeqCst), 4);
+        assert_eq!(getters.load(Ordering::SeqCst), 3);
+        assert_eq!(source_drops.load(Ordering::SeqCst), 4);
+
+        // Process closure follows the already-proven physical detachment and
+        // joins the same original pools; it cannot make that proof pass.
+        scene.node.begin_drain().unwrap();
+        scene.node.confirm_ingress_closed().unwrap();
+        if !wait_until(|| scene.runtime.is_empty() && scene.ledger.is_empty()) {
+            scene.fail(
+                "original RF Node process drain did not empty its runtime/ledger",
+                (),
+            );
+        }
+        finish_scene(
+            scene,
+            workers,
+            "OriginalRfSenderWake",
+            shutdown_cold_notifications,
+        );
+        drop(runtime);
+    }
 }

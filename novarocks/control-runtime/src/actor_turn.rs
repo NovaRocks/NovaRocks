@@ -6294,6 +6294,10 @@ impl<A: Actor> PollerPool<A> {
             true
         })
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The control-runtime poller service owns and joins its original worker threads; see ADR-0218."
+    )]
     fn start_with_dispatch<H>(
         runtime: ActorRuntime<A>,
         clock: Arc<dyn Clock>,

@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "Unit tests exercise thread/task mechanics under their original test owners; the production library is linted separately; see ADR-0218."
+    )
+)]
+
 //! Worker-owned policy for native task execution.
 //!
 //! The execution contract supplies immutable cross-process facts. This crate
@@ -57,7 +65,6 @@ mod ingress;
 mod lease;
 mod lifecycle;
 mod operation;
-pub mod query_context;
 pub mod read_attempt;
 mod receipt;
 mod reliable_transport;
@@ -89,7 +96,7 @@ mod task_preparation_limits;
 mod task_reporter;
 pub use host::{
     TaskPreparationCapture, TaskPreparationCaptureTaken, TaskPreparationContext,
-    TaskPreparationView,
+    TaskPreparationView, TaskScanSourceIssuer,
 };
 pub mod typed_connector_runtime;
 pub mod typed_page_source;
@@ -134,6 +141,7 @@ pub use control_runtime::node_bootstrap::{
     WorkerNodeRuntime, WorkerNodeShutdownError, WorkerNodeStartRefusal,
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
+pub use control_runtime::node_metrics::WorkerDetachmentBlockers;
 pub use control_runtime::node_metrics::{
     WorkerAdmissionSnapshot, WorkerCapacityRefusalKind, WorkerControlPlanePhase,
     WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot, WorkerControlPlaneWorkerSnapshot,
@@ -149,6 +157,14 @@ pub use control_runtime::operator_statistics::{
 pub use control_runtime::participation_host::observation::{
     ObservationProjection, ObservationProjectionError,
 };
+#[cfg(any(test, novarocks_dev_controls))]
+pub use control_runtime::participation_host::work_issuer::ParticipationWorkTestOwner;
+pub use control_runtime::participation_host::work_issuer::{
+    InstanceWorkIssuer, ParticipationInstanceGrant, ParticipationWorkError, ParticipationWorkWake,
+    RuntimeFilterSenderWork,
+};
+/// Fixed Work labels used only for low-cardinality diagnostics.
+pub use control_runtime::work_labels::WORK_DIAGNOSTIC_LABELS;
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };

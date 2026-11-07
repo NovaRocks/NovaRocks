@@ -425,7 +425,7 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
         ColumnDef {
             name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
-            nullable: false,
+            nullable: true,
             write_default: None,
             logical_type: None,
         },
@@ -3431,6 +3431,25 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             expected_row_lineage_metadata_names()
+        );
+        for declaration in &old_scan.table.iceberg_row_lineage_metadata_columns {
+            let nullable = is_reuse_lineage_metadata_column(&declaration.name);
+            assert_eq!(declaration.nullable, nullable, "{}", declaration.name);
+            let output = old_scan
+                .columns
+                .iter()
+                .find(|column| column.name == declaration.name)
+                .expect("metadata scan output");
+            assert_eq!(output.value_type.nullable(), nullable, "{}", output.name);
+        }
+        assert!(
+            !old_scan
+                .columns
+                .iter()
+                .find(|column| column.name == "__row_id__")
+                .expect("required group apply key")
+                .value_type
+                .nullable()
         );
 
         let delta_input = find_signed_delta_project(&changed);

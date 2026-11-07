@@ -309,7 +309,7 @@ pub(crate) enum ExecutionReason {
     AggregateGroupContract = 314,
     AssertRowsContract = 315,
     AssertRowsMismatch = 316,
-    AssertRowsDuplicateKey = 317,
+    // Reason 317 is shared in failure-contract::execution_reason.
     AssertRowsCounter = 318,
     // Retired production formatting paths; keep their IDs in independent
     // diagnostic regression fixtures without reassigning either number.
@@ -609,7 +609,10 @@ pub(crate) enum ExecutionReason {
     SummaryCount = 613,
     SummaryContract = 614,
     FanoutRequiredBranchWithdrawn = 615,
+    // Taskless completion is test-only; 639 and 640 remain reserved in production.
+    #[cfg(test)]
     SettlementContinuationPanicked = 639,
+    #[cfg(test)]
     CompletionWorkUnresolved = 640,
     TaskExecutionOwnerRetired = 641,
     ReceiverConstructionClosed = 642,

@@ -45,8 +45,12 @@
 //! `active` predicate of an in-flight install, so holding both would invert the
 //! order and deadlock.
 
+use novarocks_control_runtime::exit_custody::ExitObligation;
+use novarocks_execution::runtime::query_context::QueryContext;
+use novarocks_worker::{InstanceWorkIssuer, ParticipationInstanceGrant, RuntimeFilterSenderWork};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -97,6 +101,7 @@ use novarocks_worker::{
 type RuntimeFilterParticipantInstaller = dyn Fn(
         QueryExecutionId,
         DecodedRuntimeFilterContribution,
+        RuntimeFilterSenderWork,
     ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError>
     + Send
     + Sync;
@@ -132,6 +137,7 @@ struct InstalledParticipation {
     instance_owned: bool,
     credentials: Arc<ParticipationCredentialSlot>,
     facts: Mutex<ParticipationFacts>,
+    query_context: Mutex<Option<Arc<QueryContext>>>,
 }
 
 /// Observe the same release decision as in-flight shared-fact installation.
@@ -157,6 +163,7 @@ impl InstalledParticipation {
             instance_owned: false,
             credentials: Arc::new(ParticipationCredentialSlot::new()),
             facts: Mutex::new(ParticipationFacts::default()),
+            query_context: Mutex::new(None),
         }
     }
 
@@ -174,6 +181,7 @@ impl InstalledParticipation {
         Self {
             instance_owned: false,
             credentials: Arc::new(ParticipationCredentialSlot::new()),
+            query_context: Mutex::new(None),
             facts: Mutex::new(ParticipationFacts {
                 released: true,
                 query_options: None,
@@ -300,7 +308,33 @@ impl fmt::Debug for NativeParticipationHost {
     }
 }
 
+/// Snapshot sampled from the original Native instance records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeQueryExecutionResourceSnapshot {
+    pub active_contexts: usize,
+    pub active_fragments: usize,
+}
+
 impl NativeParticipationHost {
+    pub fn query_resource_snapshot(&self) -> NativeQueryExecutionResourceSnapshot {
+        let records = self
+            .participations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut snapshot = NativeQueryExecutionResourceSnapshot::default();
+        for installed in records.by_reference.values() {
+            let context = installed
+                .query_context
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(context) = context.as_ref() {
+                snapshot.active_contexts += 1;
+                snapshot.active_fragments += context.active_tasks();
+            }
+        }
+        snapshot
+    }
+
     /// Crate-private because only this process's composition can install a
     /// Native runtime-filter participant around a Worker participant.
     pub(crate) fn new(
@@ -543,12 +577,19 @@ impl NativeParticipationHost {
         // still unwinding, and releasing a query that holds none is a no-op.
         self.catalog_manager
             .release_query(participation.query_execution_id());
-        if self
-            .queries
-            .retire_idle_execution(participation.query_execution_id())
-        {
-            self.queries.publish_resource_snapshot();
+        let context = installed
+            .query_context
+            .lock()
+            .expect("original Participation query resources")
+            .take();
+        if let Some(context) = &context {
+            assert_eq!(
+                context.active_tasks(),
+                0,
+                "Release follows actual Task resource retirement"
+            );
         }
+        drop(context);
         self.publish_catalog_lease_metrics();
         evidence
     }
@@ -590,6 +631,7 @@ impl NativeParticipationHost {
         &self,
         participation: ParticipationRef,
         installed: &InstalledParticipation,
+        issuer: &InstanceWorkIssuer,
         catalogs: Vec<CatalogProperties>,
         contribution: &proto::RuntimeFilterContribution,
         options: QueryOptions,
@@ -608,18 +650,30 @@ impl NativeParticipationHost {
         installed.credentials.install(material.leases())?;
         self.still_establishing(installed)?;
 
-        let (delivery_expire, query_expire) =
-            novarocks_execution::runtime::query_options::query_expire_durations(Some(&options));
-        let resources = self.queries.establish_query_resources(
-            execution_id,
-            delivery_expire,
-            query_expire,
-            options.exec_mem_limit(),
-        );
-        self.queries.publish_resource_snapshot();
-        resources.map_err(|error| {
-            HostRejection::from_domain(super::execution_host::failure_category(&error), error)
-        })?;
+        let context = self
+            .queries
+            .establish_query_resources(execution_id, options.exec_mem_limit())
+            .map_err(|error| {
+                HostRejection::from_domain(super::execution_host::failure_category(&error), error)
+            })?;
+        {
+            let facts = installed
+                .facts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if facts.released {
+                return Err(cancelled_establish());
+            }
+            let mut resources = installed
+                .query_context
+                .lock()
+                .expect("original Participation query resources");
+            assert!(
+                resources.is_none(),
+                "one original Participation QueryContext"
+            );
+            *resources = Some(context);
+        }
         self.still_establishing(installed)?;
 
         {
@@ -637,7 +691,10 @@ impl NativeParticipationHost {
         }
 
         if let Some(decoded) = self.decode_contribution(participation, installed, contribution)? {
-            let participant = (self.runtime_filter_installer)(execution_id, decoded)
+            let sender = issuer
+                .runtime_filter_sender()
+                .map_err(participation_work_rejection)?;
+            let participant = (self.runtime_filter_installer)(execution_id, decoded, sender)
                 .map_err(runtime_filter_rejection)?;
             self.adopt_participant(participation, installed, participant)?;
         }
@@ -676,9 +733,18 @@ impl NativeParticipationHost {
         .map_err(|_| cancelled_establish())?;
         // The original query options already installed this policy while the
         // participation established. This is only an exact-owner lookup.
+        let context = installed
+            .query_context
+            .lock()
+            .expect("original query resources")
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                participation_facts_rejection(ParticipationFactsFailure::Unavailable(participation))
+            })?;
         let tracker = self
             .queries
-            .type_construction_tracker(participation.query_execution_id(), None)
+            .type_construction_tracker(context.as_ref(), None)
             .map_err(|error| {
                 if installed.is_released() {
                     cancelled_establish()
@@ -882,9 +948,11 @@ impl NativeParticipationHost {
 /// The one admitted Participation incarnation. Directory retention follows this
 /// capability, including every actual in-flight call clone held by its owner.
 struct NativeParticipationInstance {
-    host: Arc<NativeParticipationHost>,
+    host: ManuallyDrop<Arc<NativeParticipationHost>>,
     participation: ParticipationRef,
-    installed: Arc<InstalledParticipation>,
+    installed: ManuallyDrop<Arc<InstalledParticipation>>,
+    issuer: ManuallyDrop<InstanceWorkIssuer>,
+    work: Option<ExitObligation>,
     materialization_started: AtomicBool,
     release_started: AtomicBool,
     release_completed: AtomicBool,
@@ -894,8 +962,14 @@ impl ParticipationHostFactory for NativeParticipationHost {
     fn create_instance(
         self: Arc<Self>,
         participation: ParticipationRef,
+        grant: ParticipationInstanceGrant,
     ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
-        let installed = {
+        if grant.participation() != participation {
+            return Err(participation_facts_rejection(
+                ParticipationFactsFailure::InstanceCapabilityRequired,
+            ));
+        }
+        let (installed, work, issuer) = {
             let mut participations = self
                 .participations
                 .lock()
@@ -915,14 +989,24 @@ impl ParticipationHostFactory for NativeParticipationHost {
                     ),
                 ));
             }
+            let (mut work, issuer) = grant.into_parts();
+            if let Err(error) = work.start() {
+                work.revoke_unused_and_exit()
+                    .expect("refused original instance was never started");
+                return Err(participation_work_rejection(
+                    novarocks_worker::ParticipationWorkError::Exit(error),
+                ));
+            }
             let installed = Arc::new(InstalledParticipation::instance_owned());
             participations.insert(participation, Arc::clone(&installed));
-            installed
+            (installed, work, issuer)
         };
         Ok(Arc::new(NativeParticipationInstance {
-            host: self,
+            host: ManuallyDrop::new(self),
             participation,
-            installed,
+            installed: ManuallyDrop::new(installed),
+            issuer: ManuallyDrop::new(issuer),
+            work: Some(work),
             materialization_started: AtomicBool::new(false),
             release_started: AtomicBool::new(false),
             release_completed: AtomicBool::new(false),
@@ -964,6 +1048,7 @@ impl ParticipationHostInstance for NativeParticipationInstance {
             self.host.install_shared_facts(
                 self.participation,
                 &self.installed,
+                &self.issuer,
                 catalogs,
                 contribution,
                 options,
@@ -1000,23 +1085,39 @@ impl ParticipationHostInstance for NativeParticipationInstance {
         domain: &ParticipationDomainUpdate,
     ) -> Result<(), HostRejection> {
         self.host
-            .apply_shared_domain(self.participation, &self.installed, domain)
+            .apply_shared_domain(self.participation, &self.installed, &self.issuer, domain)
     }
 }
 
 impl Drop for NativeParticipationInstance {
     fn drop(&mut self) {
-        if self.release_completed.load(Ordering::Acquire) {
-            // Drop supplies no release, report, or physical-exit proof. The
-            // Worker scope must retain every actual call/report capability.
+        let released = self.release_completed.load(Ordering::Acquire);
+        if released {
             self.host
                 .participations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove_if_same(self.participation, &self.installed);
         }
-        // An unreleased owner leaves its original row retained. Never run
-        // foreign cleanup or silently permit replacement from an opaque Drop.
+        let work = self
+            .work
+            .take()
+            .expect("one original instance exit obligation");
+        // SAFETY: these fields are initialized once and destroyed only here.
+        // ManuallyDrop prevents a second automatic Drop after the exit fact.
+        unsafe {
+            ManuallyDrop::drop(&mut self.installed);
+            ManuallyDrop::drop(&mut self.issuer);
+            ManuallyDrop::drop(&mut self.host);
+        }
+        if released {
+            work.exited()
+                .expect("original instance exits after its real resources");
+        } else {
+            // A lost unreleased instance is a real defect. Its retained row
+            // and original custody cannot be turned into successful teardown.
+            drop(work);
+        }
     }
 }
 
@@ -1049,105 +1150,29 @@ impl novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority
     }
 }
 
+#[cfg(any(test, novarocks_dev_controls))]
 impl ParticipationHost for NativeParticipationHost {
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
-        let participation = request.participation();
-        let options_fingerprint = request.query_options().fingerprint();
-
-        // Every payload is projected before anything is installed. A request
-        // this process cannot read back is not half an establish: refusing it
-        // here means the failure costs no catalog bind and no resident secret.
-        //
-        // A projection failure still has to consume a released marker. The
-        // marker is only ever consumed by the materialize that follows it, so
-        // returning early without taking it would leave one entry per such
-        // establish in a map that lives as long as the process.
-        let projected = catalog_bindings(request.catalog_binding().as_ref()).and_then(|catalogs| {
-            let contribution = runtime_filter_install(request.initial_runtime_filter().as_ref())?;
-            let options = query_options(request.query_options().as_ref())?;
-            let material = credential_material(request.initial_credential())?;
-            Ok((catalogs, contribution, options, material))
+        let released = self
+            .participations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request.participation())
+            .is_some_and(|installed| !installed.instance_owned && installed.is_released());
+        let projected = catalog_bindings(request.catalog_binding().as_ref()).and_then(|_| {
+            runtime_filter_install(request.initial_runtime_filter().as_ref())?;
+            query_options(request.query_options().as_ref())?;
+            credential_material(request.initial_credential())?;
+            Ok(())
         });
-        let (catalogs, contribution, options, material) = match projected {
-            Ok(projected) => projected,
-            Err(error) => {
-                self.discard_released_marker(participation);
-                return Err(error);
-            }
-        };
-
-        let installed = {
-            let mut participations = self
-                .participations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if participations
-                .by_execution
-                .get(&participation.query_execution_id())
-                .and_then(|owner| participations.get(*owner))
-                .is_some_and(|owner| owner.instance_owned)
-            {
-                return Err(participation_facts_rejection(
-                    ParticipationFactsFailure::InstanceCapabilityRequired,
-                ));
-            }
-            match participations.get(participation) {
-                Some(existing) if existing.instance_owned => {
-                    return Err(participation_facts_rejection(
-                        ParticipationFactsFailure::InstanceCapabilityRequired,
-                    ));
-                }
-                Some(existing) if existing.is_released() => {
-                    // The owner released this participation before its facts were
-                    // installed. Consume the marker and refuse: installing now
-                    // would strand a participant and a credential slot that
-                    // nothing will ever release, because the owner calls
-                    // `release` exactly once per participation.
-                    participations.remove(participation);
-                    return Err(cancelled_establish());
-                }
-                Some(_) => {
-                    return Err(participation_facts_rejection(
-                        ParticipationFactsFailure::AlreadyMaterialized,
-                    ));
-                }
-                None => {
-                    let installed = Arc::new(InstalledParticipation::establishing());
-                    participations.insert(participation, Arc::clone(&installed));
-                    installed
-                }
-            }
-        };
-
-        match self.install_shared_facts(
-            participation,
-            &installed,
-            catalogs,
-            contribution,
-            options,
-            options_fingerprint,
-            material,
-            &|| installed.is_released(),
-        ) {
-            Ok(()) => Ok(()),
-            Err(rejection) => {
-                // Undo here as well as in `release`. The owner does call
-                // `release` after a failed materialize, but a host that leaves
-                // a half-installed participation behind when it says "no" would be
-                // relying on that, and the trait does not promise it.
-                //
-                // The evidence this seals is dropped on purpose: a materialize
-                // that failed has no release acknowledgement to report it on,
-                // and an establish that never completed has no observation
-                // worth publishing.
-                drop(self.tear_down(participation, &installed));
-                self.participations
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove_if_same(participation, &installed);
-                Err(rejection)
-            }
+        self.discard_released_marker(request.participation());
+        projected?;
+        if released {
+            return Err(cancelled_establish());
         }
+        Err(participation_facts_rejection(
+            ParticipationFactsFailure::InstanceCapabilityRequired,
+        ))
     }
 
     fn release(&self, participation: ParticipationRef) -> ReleasedParticipationEvidence {
@@ -1213,7 +1238,10 @@ impl ParticipationHost for NativeParticipationHost {
                 ParticipationFactsFailure::InstanceCapabilityRequired,
             ));
         }
-        self.apply_shared_domain(participation, &installed, domain)
+        let _ = domain;
+        Err(participation_facts_rejection(
+            ParticipationFactsFailure::InstanceCapabilityRequired,
+        ))
     }
 }
 
@@ -1222,6 +1250,7 @@ impl NativeParticipationHost {
         &self,
         participation: ParticipationRef,
         installed: &InstalledParticipation,
+        issuer: &InstanceWorkIssuer,
         domain: &ParticipationDomainUpdate,
     ) -> Result<(), HostRejection> {
         self.still_establishing(installed)?;
@@ -1259,9 +1288,15 @@ impl NativeParticipationHost {
                         return Err(sealed_participant());
                     }
                 }
-                let participant =
-                    (self.runtime_filter_installer)(participation.query_execution_id(), decoded)
-                        .map_err(runtime_filter_rejection)?;
+                let sender = issuer
+                    .runtime_filter_sender()
+                    .map_err(participation_work_rejection)?;
+                let participant = (self.runtime_filter_installer)(
+                    participation.query_execution_id(),
+                    decoded,
+                    sender,
+                )
+                .map_err(runtime_filter_rejection)?;
                 self.adopt_participant(participation, installed, participant)
             }
             ParticipationDomainUpdate::Credential(update) => {
@@ -1459,6 +1494,13 @@ fn catalog_rejection(
     HostRejection::from_domain(super::execution_host::failure_category(&error), error)
 }
 
+fn participation_work_rejection(error: novarocks_worker::ParticipationWorkError) -> HostRejection {
+    if error.is_stopped() {
+        return cancelled_establish();
+    }
+    HostRejection::from_domain(TaskFailureCategory::Internal, error)
+}
+
 fn runtime_filter_rejection(error: RuntimeFilterContractError) -> HostRejection {
     HostRejection::from_domain(super::execution_host::failure_category(&error), error)
 }
@@ -1643,6 +1685,26 @@ use novarocks_spi::connector::{
 };
 
 impl TaskParticipationFacts for NativeParticipationHost {
+    fn query_context(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<Arc<QueryContext>, HostRejection> {
+        let participation = self.participation_for_execution(execution).ok_or_else(|| {
+            participation_facts_rejection(ParticipationFactsFailure::TaskParticipationUnavailable(
+                execution,
+            ))
+        })?;
+        let installed = self.active_participation(participation)?;
+        let context = installed
+            .query_context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        context.ok_or_else(|| {
+            participation_facts_rejection(ParticipationFactsFailure::QueryOptionsMissing)
+        })
+    }
+
     fn query_options(
         &self,
         execution: QueryExecutionId,
@@ -1919,8 +1981,9 @@ impl TaskEventSink for ParticipationRuntimeFilterEventSink {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeParticipationHost;
+    use super::{NativeParticipationHost, NativeQueryExecutionResourceSnapshot};
 
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
@@ -2139,11 +2202,13 @@ mod tests {
             &self,
             execution_id: QueryExecutionId,
             contribution: DecodedRuntimeFilterContribution,
+            work: novarocks_worker::RuntimeFilterSenderWork,
         ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError> {
             self.ledger.installs.fetch_add(1, Ordering::SeqCst);
-            let participant =
-                NativeRuntimeFilterParticipantFactory::new(test_backend_data_runtime())
-                    .install(execution_id, contribution)?;
+            let participant = NativeRuntimeFilterParticipantFactory::new(
+                test_backend_data_runtime(),
+            )
+            .install(execution_id, contribution, work)?;
             let ledger = Arc::clone(&self.ledger);
             Ok(
                 participant.with_close_hook_for_test(Arc::new(move |_participant, _reason| {
@@ -2231,6 +2296,8 @@ mod tests {
         catalog_manager: Arc<CatalogManager<ConnectorExecutionRoleBinding>>,
         catalog_factory: Arc<ScriptedFactory>,
         filter_factory: Arc<RecordingFilterFactory>,
+        owners: Mutex<BTreeMap<ParticipationRef, novarocks_worker::ParticipationWorkTestOwner>>,
+        instances: Mutex<BTreeMap<ParticipationRef, Arc<dyn ParticipationHostInstance>>>,
     }
 
     impl Fixture {
@@ -2252,14 +2319,13 @@ mod tests {
             );
             let filter_installer = Arc::clone(&filter_factory);
             let host = Arc::new(NativeParticipationHost::new(
-                crate::native_query_context::NativeQueryContextRuntime::new_for_test(
-                    novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                crate::native_query_context::NativeQueryContextRuntime::new(
                     crate::backend_test_support::test_memory_authority(),
                 ),
                 Arc::clone(&catalog_manager),
                 factories,
-                Arc::new(move |execution_id, contribution| {
-                    filter_installer.install(execution_id, contribution)
+                Arc::new(move |execution_id, contribution, work| {
+                    filter_installer.install(execution_id, contribution, work)
                 }),
                 test_backend_data_runtime(),
             ));
@@ -2268,6 +2334,47 @@ mod tests {
                 catalog_manager,
                 catalog_factory,
                 filter_factory,
+                owners: Mutex::new(BTreeMap::new()),
+                instances: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn create_instance(
+            &self,
+            participation: ParticipationRef,
+        ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection> {
+            let grant = self
+                .owners
+                .lock()
+                .unwrap()
+                .entry(participation)
+                .or_insert_with(|| {
+                    novarocks_worker::ParticipationWorkTestOwner::new_for(participation)
+                })
+                .instance();
+            self.host.clone().create_instance(participation, grant)
+        }
+
+        fn release(
+            &self,
+            participation: ParticipationRef,
+        ) -> novarocks_worker::ReleasedParticipationEvidence {
+            let instance = self.instances.lock().unwrap().get(&participation).cloned();
+            match instance {
+                Some(instance) => instance.release(),
+                None => self.host.release(participation),
+            }
+        }
+
+        fn advance_shared_domain(
+            &self,
+            participation: ParticipationRef,
+            domain: &ParticipationDomainUpdate,
+        ) -> Result<(), HostRejection> {
+            let instance = self.instances.lock().unwrap().get(&participation).cloned();
+            match instance {
+                Some(instance) => instance.advance_shared_domain(domain),
+                None => self.host.advance_shared_domain(participation, domain),
             }
         }
 
@@ -2299,6 +2406,38 @@ mod tests {
             let filter = filter_payload(contribution);
             let options: Arc<dyn CodecOwnedContent> =
                 Arc::new(WireContent::new(b"query-options", query_options));
+            let instance = {
+                let mut instances = self.instances.lock().unwrap();
+                if let Some(instance) = instances.get(&participation) {
+                    instance.clone()
+                } else {
+                    let instance = self.create_instance(participation)?;
+                    instances.insert(participation, instance.clone());
+                    instance
+                }
+            };
+            struct Active;
+            impl ParticipationMaterializationControl for Active {
+                fn is_stopped(&self) -> bool {
+                    false
+                }
+            }
+            instance.materialize(
+                SharedFactsRequest::new(participation, &catalog, &filter, &options, credential),
+                &Active,
+            )
+        }
+
+        fn legacy_establish(
+            &self,
+            participation: ParticipationRef,
+            catalogs: Vec<CatalogProperties>,
+            contribution: proto::RuntimeFilterContribution,
+            credential: &CredentialUpdate,
+        ) -> Result<(), HostRejection> {
+            let catalog = catalog_payload(catalogs);
+            let filter = filter_payload(contribution);
+            let options = query_options_payload();
             self.host.materialize(SharedFactsRequest::new(
                 participation,
                 &catalog,
@@ -2314,6 +2453,21 @@ mod tests {
 
         fn handle_leases(&self) -> usize {
             self.catalog_manager.pin_snapshot().handle_pins
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let instances = std::mem::take(self.instances.get_mut().unwrap());
+            for instance in instances.values() {
+                drop(instance.release());
+            }
+            drop(instances);
+            let owners = std::mem::take(self.owners.get_mut().unwrap());
+            let runtime = test_backend_data_runtime();
+            for owner in owners.into_values() {
+                runtime.block_on(owner.finish());
+            }
         }
     }
 
@@ -2350,7 +2504,7 @@ mod tests {
         }
         let fixture = Fixture::new();
         let identity = participation(91_003);
-        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        let instance = fixture.create_instance(identity).unwrap();
         assert!(
             !fixture
                 .host
@@ -2390,21 +2544,15 @@ mod tests {
     fn an_instance_is_registered_once_and_release_before_materialization_cannot_reopen_it() {
         let fixture = Fixture::new();
         let identity = participation(91_001);
-        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        let instance = fixture.create_instance(identity).unwrap();
         assert_eq!(instance.participation(), identity);
-        assert!(fixture.host.clone().create_instance(identity).is_err());
+        assert!(fixture.create_instance(identity).is_err());
         let other_reference = ParticipationRef::new(
             identity.query_execution_id(),
             FrontendProcessId::new_v7(),
             identity.backend_process_id(),
         );
-        assert!(
-            fixture
-                .host
-                .clone()
-                .create_instance(other_reference)
-                .is_err()
-        );
+        assert!(fixture.create_instance(other_reference).is_err());
         let wrong = materialize_instance(
             &instance,
             participation(91_002),
@@ -2425,7 +2573,7 @@ mod tests {
                 ),))
                 .is_err()
         );
-        assert!(fixture.host.clone().create_instance(identity).is_err());
+        assert!(fixture.create_instance(identity).is_err());
         assert!(
             fixture
                 .host
@@ -2452,7 +2600,7 @@ mod tests {
                 .participation_for_execution(identity.query_execution_id()),
             None
         );
-        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        let successor = fixture.create_instance(identity).unwrap();
         drop(successor.release());
         drop(successor);
     }
@@ -2461,7 +2609,7 @@ mod tests {
     fn the_actual_instance_rotates_and_closes_its_original_slot_without_key_fallback() {
         let fixture = Fixture::new();
         let identity = participation(91_003);
-        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        let instance = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &instance,
             identity,
@@ -2512,7 +2660,7 @@ mod tests {
         );
         assert!(
             fixture
-                .establish(identity, vec![], no_contribution(), &empty_credential())
+                .legacy_establish(identity, vec![], no_contribution(), &empty_credential())
                 .is_err()
         );
         assert_eq!(original.credentials.installed_epoch(lease_id(1)), Some(2));
@@ -2533,10 +2681,10 @@ mod tests {
                 ),))
                 .is_err()
         );
-        assert!(fixture.host.clone().create_instance(identity).is_err());
+        assert!(fixture.create_instance(identity).is_err());
         drop(instance.release());
         drop(instance);
-        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        let successor = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &successor,
             identity,
@@ -2566,7 +2714,7 @@ mod tests {
             ..novarocks_worker::CatalogManagerConfig::default()
         });
         let identity = participation(91_004);
-        let instance = fixture.host.clone().create_instance(identity).unwrap();
+        let instance = fixture.create_instance(identity).unwrap();
         let entered = Arc::new(Barrier::new(2));
         let proceed = Arc::new(Barrier::new(2));
         *fixture.catalog_factory.entered.lock().unwrap() = Some(entered.clone());
@@ -2593,14 +2741,14 @@ mod tests {
             .unwrap()
             .get(identity)
             .is_some_and(|current| Arc::ptr_eq(current, &original));
-        let replacement_refused = fixture.host.clone().create_instance(identity).is_err();
+        let replacement_refused = fixture.create_instance(identity).is_err();
         let closed = original.credentials.installed_lease_count() == 0;
         proceed.wait();
         let materialized = materialization.join().unwrap();
         let old_leases_released = fixture.query_leases() == 0;
         *fixture.catalog_factory.entered.lock().unwrap() = None;
         *fixture.catalog_factory.proceed.lock().unwrap() = None;
-        let successor = fixture.host.clone().create_instance(identity).unwrap();
+        let successor = fixture.create_instance(identity).unwrap();
         materialize_instance(
             &successor,
             identity,
@@ -2627,8 +2775,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .queries
-                .type_construction_tracker(participation.query_execution_id(), None,)
+                .query_context(participation.query_execution_id())
                 .is_err()
         );
         fixture
@@ -2646,7 +2793,13 @@ mod tests {
         let tracker = fixture
             .host
             .queries
-            .type_construction_tracker(participation.query_execution_id(), Some(4096))
+            .type_construction_tracker(
+                &fixture
+                    .host
+                    .query_context(participation.query_execution_id())
+                    .unwrap(),
+                Some(4096),
+            )
             .expect("the first task can borrow the already-established tracker");
         let installed = fixture.host.active_participation(participation).unwrap();
         let control = super::ParticipationTypeConstructionControl(&installed);
@@ -2657,7 +2810,7 @@ mod tests {
         .unwrap();
         let held = tracker.current();
         assert!(held > 0);
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert!(matches!(
             creator.request_layout(std::alloc::Layout::new::<u64>()),
             Err(
@@ -2676,9 +2829,101 @@ mod tests {
         assert!(
             fixture
                 .host
-                .queries
-                .type_construction_tracker(participation.query_execution_id(), None,)
+                .query_context(participation.query_execution_id())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn later_tasks_borrow_the_same_instance_resources_and_metrics_follow_actual_guards() {
+        let fixture = Fixture::new();
+        let participation = participation(81_011);
+        let execution = participation.query_execution_id();
+        assert_eq!(
+            fixture.host.query_resource_snapshot(),
+            NativeQueryExecutionResourceSnapshot::default()
+        );
+        fixture
+            .establish_with_options(
+                participation,
+                Vec::new(),
+                no_contribution(),
+                proto::QueryOptions {
+                    query_mem_limit: 4096,
+                    ..Default::default()
+                },
+                &empty_credential(),
+            )
+            .unwrap();
+        let context = fixture.host.query_context(execution).unwrap();
+        let weak = Arc::downgrade(&context);
+        let account = context.memory_binding().account().id();
+        let first = fixture
+            .host
+            .queries
+            .prepare_query_memory_typed(&context, Some(4096))
+            .unwrap();
+        assert_eq!(
+            fixture.host.query_resource_snapshot(),
+            NativeQueryExecutionResourceSnapshot {
+                active_contexts: 1,
+                active_fragments: 1,
+            }
+        );
+        drop(first);
+        assert_eq!(fixture.host.query_resource_snapshot().active_fragments, 0);
+        let later = fixture.host.query_context(execution).unwrap();
+        assert!(Arc::ptr_eq(&context, &later));
+        let later_task = fixture
+            .host
+            .queries
+            .prepare_query_memory_typed(&later, None)
+            .unwrap();
+        assert_eq!(later_task.binding().account().id(), account);
+        assert_eq!(
+            later_task.binding().account().snapshot().policy_limit_bytes,
+            Some(4096)
+        );
+        assert!(
+            fixture
+                .host
+                .queries
+                .prepare_query_memory_typed(&later, Some(8192))
+                .is_err()
+        );
+        assert_eq!(
+            fixture.host.query_resource_snapshot().active_fragments,
+            1,
+            "a rejected limit cannot create another actual Task reference"
+        );
+        assert_eq!(
+            context
+                .memory_binding()
+                .account()
+                .snapshot()
+                .policy_limit_bytes,
+            Some(4096)
+        );
+        drop(later_task);
+        drop(later);
+        fixture.release(participation);
+        assert_eq!(
+            fixture.host.query_resource_snapshot(),
+            NativeQueryExecutionResourceSnapshot::default()
+        );
+        assert!(fixture.host.query_context(execution).is_err());
+        assert!(
+            fixture
+                .instances
+                .lock()
+                .unwrap()
+                .contains_key(&participation),
+            "cold instance metadata is not an active QueryContext"
+        );
+        drop(context);
+        assert!(
+            weak.upgrade().is_none(),
+            "Release relinquished the instance's original resource reference"
         );
     }
 
@@ -2749,7 +2994,7 @@ mod tests {
             "the established participation retains the exact original wire witness"
         );
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert!(
             fixture
                 .host
@@ -2773,7 +3018,7 @@ mod tests {
             )
             .expect("a complete establish");
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(fixture.query_leases(), 0, "catalog leases must be dropped");
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
@@ -2787,7 +3032,7 @@ mod tests {
             "a released participation has no credential authority"
         );
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
             1,
@@ -2818,7 +3063,7 @@ mod tests {
             )
             .expect("a complete establish");
 
-        let evidence = fixture.host.release(participation);
+        let evidence = fixture.release(participation);
         let telemetry = release_runtime_filter_telemetry(&evidence)
             .expect("the sealed content has a Backend projection")
             .expect("a release that held a participant reports its observation");
@@ -2845,11 +3090,7 @@ mod tests {
             .expect("a complete establish");
 
         assert!(
-            fixture
-                .host
-                .release(participation)
-                .runtime_filter()
-                .is_none(),
+            fixture.release(participation).runtime_filter().is_none(),
             "a query with no runtime filter on this backend must not report an \
              empty contribution"
         );
@@ -2921,7 +3162,7 @@ mod tests {
 
         // The install is now inside the provider bind.
         entered.wait();
-        fixture.host.release(participation);
+        fixture.release(participation);
         proceed.wait();
 
         let rejection = establishing
@@ -3114,7 +3355,7 @@ mod tests {
             .expect("establish");
         assert!(TaskParticipationFacts::storage_resolver(fixture.host.as_ref(), execution).is_ok());
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         match TaskParticipationFacts::storage_resolver(fixture.host.as_ref(), execution) {
             Err(refusal) => assert_refusal(refusal),
             Ok(_) => panic!("a released participation holds no credentials either"),
@@ -3130,7 +3371,7 @@ mod tests {
         // protocol bug, which is exactly when unbounded growth is worst.
         let fixture = Fixture::new();
         let participation = participation(1);
-        fixture.host.release(participation);
+        fixture.release(participation);
 
         // A catalog payload where the runtime filter belongs: well-formed, and
         // not what this domain asked for, so the projection refuses.
@@ -3165,9 +3406,9 @@ mod tests {
         let fixture = Fixture::new();
         let participation = participation(1);
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         let rejection = fixture
-            .establish(
+            .legacy_establish(
                 participation,
                 vec![catalog_properties()],
                 participant_contribution(1),
@@ -3221,7 +3462,7 @@ mod tests {
             0
         );
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
             0,
@@ -3343,7 +3584,6 @@ mod tests {
         let binds_before = fixture.catalog_factory.binds.load(Ordering::SeqCst);
 
         fixture
-            .host
             .advance_shared_domain(
                 participation,
                 &ParticipationDomainUpdate::Credential(credential(2, ANNOUNCED_SCOPE, expiry)),
@@ -3403,7 +3643,6 @@ mod tests {
         // A handle this codec did not produce cannot be projected, so the
         // rotation is refused before it can touch the slot.
         let rejection = fixture
-            .host
             .advance_shared_domain(
                 participation,
                 &ParticipationDomainUpdate::Credential(CredentialUpdate::new(
@@ -3443,7 +3682,6 @@ mod tests {
             .expect("establish");
 
         let rejection = fixture
-            .host
             .advance_shared_domain(
                 participation,
                 &ParticipationDomainUpdate::CatalogBinding {
@@ -3476,7 +3714,6 @@ mod tests {
             .expect("establish with no participant");
 
         fixture
-            .host
             .advance_shared_domain(
                 participation,
                 &ParticipationDomainUpdate::SharedDynamicFilter {
@@ -3495,7 +3732,6 @@ mod tests {
         );
 
         let rejection = fixture
-            .host
             .advance_shared_domain(
                 participation,
                 &ParticipationDomainUpdate::SharedDynamicFilter {
@@ -3515,7 +3751,7 @@ mod tests {
             "the refusal must be decided before a second participant is built"
         );
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
             1,
@@ -3542,7 +3778,7 @@ mod tests {
             Some(live)
         );
 
-        fixture.host.release(live);
+        fixture.release(live);
         assert_eq!(
             fixture.host.participation_for_execution(execution_id(1)),
             None,
@@ -3551,7 +3787,7 @@ mod tests {
 
         // A release that arrives before its establish leaves a marker behind.
         // A marker carries no facts, so it must never be resolvable either.
-        fixture.host.release(participation(2));
+        fixture.release(participation(2));
         assert_eq!(
             fixture.host.participation_for_execution(execution_id(2)),
             None
@@ -3564,7 +3800,6 @@ mod tests {
     fn an_advance_for_a_participation_without_shared_facts_is_refused() {
         let fixture = Fixture::new();
         let rejection = fixture
-            .host
             .advance_shared_domain(
                 participation(1),
                 &ParticipationDomainUpdate::Credential(empty_credential()),
@@ -3578,10 +3813,9 @@ mod tests {
         fixture
             .establish(released, vec![], no_contribution(), &empty_credential())
             .expect("establish");
-        fixture.host.release(released);
+        fixture.release(released);
         assert!(
             fixture
-                .host
                 .advance_shared_domain(
                     released,
                     &ParticipationDomainUpdate::Credential(credential(
@@ -3620,7 +3854,7 @@ mod tests {
             )
             .expect("establish");
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
             1
@@ -3637,7 +3871,7 @@ mod tests {
                 .is_none()
         );
 
-        fixture.host.release(participation);
+        fixture.release(participation);
         assert_eq!(
             fixture.filter_factory.ledger.closes.load(Ordering::SeqCst),
             1,

@@ -282,10 +282,6 @@ mod tests {
                 panic!("injected range task failure");
             })))
         }
-
-        fn spawn_detached_blocking(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
-            unreachable!("range test has no credential refresh")
-        }
     }
 
     #[tokio::test]

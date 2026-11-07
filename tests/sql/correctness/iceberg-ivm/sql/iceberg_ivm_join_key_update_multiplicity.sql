@@ -59,14 +59,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_join_mult_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW join_mv_${uuid0}
-DISTRIBUTED BY HASH(order_id) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT l.order_id, l.amount, r.dim_id, r.label
-FROM ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_left_${uuid0} AS l
-JOIN ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_right_${uuid0} AS r ON l.rid = r.rid
-WHERE l.amount >= 50;
 
 -- query 2
 -- @skip_result_check=true
@@ -81,6 +73,14 @@ INSERT INTO ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_right_${uuid0} VALUES
 
 -- query 3
 -- @skip_result_check=true
+CREATE MATERIALIZED VIEW join_mv_${uuid0}
+DISTRIBUTED BY HASH(order_id) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT l.order_id, l.amount, r.dim_id, r.label
+FROM ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_left_${uuid0} AS l
+JOIN ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_right_${uuid0} AS r ON l.rid = r.rid
+WHERE l.amount >= 50;
 REFRESH MATERIALIZED VIEW join_mv_${uuid0};
 
 -- query 4

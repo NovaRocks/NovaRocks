@@ -375,7 +375,7 @@ fn fixture_read_schema() -> SchemaRef {
         Field::new("__nova_join_row_key", DataType::Utf8, false),
         Field::new("_file", DataType::Utf8, false),
         Field::new("_pos", DataType::Int64, false),
-        Field::new("_row_id", DataType::Int64, false),
+        Field::new("_row_id", DataType::Int64, true),
         Field::new("_last_updated_sequence_number", DataType::Int64, true),
     ]))
 }
@@ -389,7 +389,7 @@ pub(crate) fn fixture_read_schema_for_table(table: &str) -> SchemaRef {
             Field::new("__nova_base_row_id", DataType::Int64, false),
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int64, false),
-            Field::new("_row_id", DataType::Int64, false),
+            Field::new("_row_id", DataType::Int64, true),
             Field::new("_last_updated_sequence_number", DataType::Int64, true),
         ]));
     }
@@ -400,7 +400,7 @@ pub(crate) fn fixture_read_schema_for_table(table: &str) -> SchemaRef {
             Field::new("__nova_join_row_key", DataType::Utf8, false),
             Field::new("_file", DataType::Utf8, false),
             Field::new("_pos", DataType::Int64, false),
-            Field::new("_row_id", DataType::Int64, false),
+            Field::new("_row_id", DataType::Int64, true),
             Field::new("_last_updated_sequence_number", DataType::Int64, true),
         ]));
     }
@@ -431,7 +431,7 @@ fn fixture_read_value_types_for_table(
             (DataType::Int64, false),
             (DataType::Utf8, false),
             (DataType::Int64, false),
-            (DataType::Int64, false),
+            (DataType::Int64, true),
             (DataType::Int64, true),
         ]
     } else if matches!(table, "l" | "r" | "mv") {
@@ -441,7 +441,7 @@ fn fixture_read_value_types_for_table(
             (DataType::Utf8, false),
             (DataType::Utf8, false),
             (DataType::Int64, false),
-            (DataType::Int64, false),
+            (DataType::Int64, true),
             (DataType::Int64, true),
         ]
     } else if table == FIXTURE_HIDDEN_KEY_TABLE {
@@ -462,7 +462,7 @@ fn fixture_read_value_types_for_table(
             (DataType::Utf8, false),
             (DataType::Utf8, false),
             (DataType::Int64, false),
-            (DataType::Int64, false),
+            (DataType::Int64, true),
             (DataType::Int64, true),
         ]
     };

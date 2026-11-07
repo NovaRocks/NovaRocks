@@ -75,6 +75,18 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_ujoin_${uuid0};
 USE ns_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
+INSERT INTO ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim VALUES
+  (10, 'east', 7),
+  (20, 'west', 11),
+  (30, 'south', 13);
+INSERT INTO ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact VALUES
+  (1, 10, 100),
+  (2, 10, 200),
+  (3, 20, 50),
+  (4, 30, 70);
 CREATE MATERIALIZED VIEW ujoin_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -88,18 +100,6 @@ SELECT d.region, COUNT(*) AS c, SUM(d.amount) AS s
 FROM ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact AS f
 JOIN ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim AS d ON f.dim_id = d.id
 GROUP BY d.region;
-
--- query 2
--- @skip_result_check=true
-INSERT INTO ice_ivm_ujoin_${uuid0}.ns_${uuid0}.dim VALUES
-  (10, 'east', 7),
-  (20, 'west', 11),
-  (30, 'south', 13);
-INSERT INTO ice_ivm_ujoin_${uuid0}.ns_${uuid0}.fact VALUES
-  (1, 10, 100),
-  (2, 10, 200),
-  (3, 20, 50),
-  (4, 30, 70);
 REFRESH MATERIALIZED VIEW ujoin_mv_${uuid0};
 
 -- query 3

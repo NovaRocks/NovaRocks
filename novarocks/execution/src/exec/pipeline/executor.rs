@@ -60,7 +60,7 @@ fn test_driver_executor() -> &'static super::global_driver_executor::GlobalDrive
 }
 
 /// A fully materialized pipeline that has not submitted any drivers to the global executor.
-pub struct PreparedPipelineExecution {
+pub(crate) struct PreparedPipelineExecution {
     tasks: DriverBatch,
     completion: Arc<DriverGroupCompletion>,
     task_ctx: Arc<TaskContext>,
@@ -69,6 +69,7 @@ pub struct PreparedPipelineExecution {
 }
 
 impl PreparedPipelineExecution {
+    #[cfg(test)]
     pub(crate) fn admit_local_completion_poller(
         &self,
         poller: crate::runtime::local_completion::LocalCompletionPoller,
@@ -104,7 +105,8 @@ impl PreparedPipelineExecution {
         self.completion.bind_resources_finisher(slot)
     }
 
-    pub fn driver_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn driver_count(&self) -> usize {
         self.tasks.len()
     }
 
@@ -113,12 +115,15 @@ impl PreparedPipelineExecution {
     }
 
     /// Submit this execution exactly once by consuming its dormant task collection.
-    pub fn start(self) -> RunningPipelineExecution {
+    pub(crate) fn start(self) -> RunningPipelineExecution {
         self.start_with_initial_failure(None)
     }
 
     /// Submit this execution with a terminal failure already latched.
-    pub fn start_failed(self, error: impl Into<ExecutionFailure>) -> RunningPipelineExecution {
+    pub(crate) fn start_failed(
+        self,
+        error: impl Into<ExecutionFailure>,
+    ) -> RunningPipelineExecution {
         self.start_with_initial_failure(Some(error.into()))
     }
 
@@ -205,7 +210,7 @@ impl PreparedPipelineExecution {
 }
 
 /// A submitted fragment-local pipeline execution.
-pub struct RunningPipelineExecution {
+pub(crate) struct RunningPipelineExecution {
     completion: Arc<DriverGroupCompletion>,
     task_ctx: Arc<TaskContext>,
     runtime_state: Arc<RuntimeState>,
@@ -218,29 +223,31 @@ impl RunningPipelineExecution {
     }
 
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
-    pub fn cancel(&self, err: impl Into<ExecutionFailure>) {
+    pub(crate) fn cancel(&self, err: impl Into<ExecutionFailure>) {
         let err = err.into();
         self.task_ctx.set_final_status(err);
     }
 
-    pub fn fail(&self, err: impl Into<ExecutionFailure>) {
+    #[cfg(test)]
+    pub(crate) fn fail(&self, err: impl Into<ExecutionFailure>) {
         self.cancel(err)
     }
 
     /// Returns the local execution conclusion as soon as it is known.
     ///
     /// An error can be visible while submitted drivers are still draining.
-    pub fn conclusion(&self) -> Option<ExecutionResult<()>> {
+    pub(crate) fn conclusion(&self) -> Option<ExecutionResult<()>> {
         self.completion.conclusion()
     }
 
     /// Returns actual-stop proof only after every submitted driver has exited.
-    pub fn stopped_fact(&self) -> Option<DriverGroupStoppedFact> {
+    #[cfg(test)]
+    pub(crate) fn stopped_fact(&self) -> Option<DriverGroupStoppedFact> {
         self.completion.stopped_fact()
     }
 
     /// Drain submitted drivers and return their local terminal result.
-    pub fn join(&self) -> ExecutionResult<()> {
+    pub(crate) fn join(&self) -> ExecutionResult<()> {
         let timeout_error = self
             .runtime_state
             .query_options()

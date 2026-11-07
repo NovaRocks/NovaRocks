@@ -17,6 +17,11 @@
  * under the License.
  */
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "Integration tests own and join their threads and runtime tasks; see ADR-0218."
+)]
+
 use super::shift_support::{program_for_arguments, runtime_for_names};
 use arrow::{
     array::{ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},

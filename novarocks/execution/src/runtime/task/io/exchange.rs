@@ -46,9 +46,12 @@ pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
         wake: super::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_failure_contract::FailureFact>;
     fn forget_unit_facts(&self, stream: ExchangeStreamIdentity);
+    /// Keep the retry activity through the timer, callback and their captures.
+    /// A refused submission must destroy the callback before its activity.
     fn schedule_unit_retry(
         &self,
         delay: std::time::Duration,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
         task: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), novarocks_failure_contract::FailureFact>;
 }
@@ -382,11 +385,13 @@ pub(crate) mod test_support {
         fn schedule_unit_retry(
             &self,
             delay: std::time::Duration,
+            activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             task: Box<dyn FnOnce() + Send + 'static>,
         ) -> Result<(), novarocks_failure_contract::FailureFact> {
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
                 task();
+                drop(activity);
             });
             Ok(())
         }
@@ -427,6 +432,7 @@ pub(crate) mod test_support {
         fn schedule_unit_retry(
             &self,
             _: std::time::Duration,
+            _: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
             _: Box<dyn FnOnce() + Send + 'static>,
         ) -> Result<(), novarocks_failure_contract::FailureFact> {
             panic!("result-only fixture attempted retry")

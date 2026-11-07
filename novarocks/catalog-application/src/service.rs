@@ -2489,6 +2489,7 @@ mod tests {
             Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
         );
         let access = IcebergReadBinding::with_metadata_credential_resolver(fs, resolver.clone());
@@ -2641,6 +2642,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
             Arc::new(TokioFileIoSpawner::new(runtime.clone())),
         );
         let factory = Arc::new(IcebergControlRoleBindingFactory::new(
@@ -3234,6 +3236,7 @@ mod tests {
                 Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
                 FsAccessResolver::new(),
                 Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+                novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
                 Arc::new(TokioFileIoSpawner::new(runtime.clone())),
             );
             let access =

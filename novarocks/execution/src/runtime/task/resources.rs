@@ -455,6 +455,7 @@ pub(crate) struct LocalTaskResources {
     root_result: Option<RootResultRegistration>,
     exchange: Option<ExchangeRegistration>,
     cleanup_faults: ResourceCleanupFaults,
+    query_task: Option<crate::runtime::query_context::QueryTaskGuard>,
 }
 
 impl LocalTaskResources {
@@ -471,7 +472,19 @@ impl LocalTaskResources {
             root_result: None,
             exchange: None,
             cleanup_faults,
+            query_task: None,
         }
+    }
+
+    pub(crate) fn hold_query_task(
+        &mut self,
+        guard: Option<crate::runtime::query_context::QueryTaskGuard>,
+    ) {
+        assert!(
+            self.query_task.is_none(),
+            "one original query Task resource guard"
+        );
+        self.query_task = guard;
     }
 
     pub(crate) fn acquire_sink_commit(
@@ -631,6 +644,7 @@ impl LocalTaskResources {
             exchange,
             commit_port: self.commit_port.take().map(ResourceCell::new),
             exchange_port: self.exchange_receiver_port.take().map(ResourceCell::new),
+            query_task: self.query_task.take().map(ResourceCell::new),
         }
     }
 }
@@ -825,6 +839,7 @@ pub(crate) struct RuntimeTaskResources {
     exchange: Option<RuntimeExchange>,
     commit_port: Option<ResourceCell<Arc<dyn TaskCommitPort>>>,
     exchange_port: Option<ResourceCell<Arc<dyn ExchangeReceiverPort>>>,
+    query_task: Option<ResourceCell<crate::runtime::query_context::QueryTaskGuard>>,
 }
 impl RuntimeTaskResources {
     pub(crate) fn interrupt(&mut self, reason: &str, control: &RuntimeErrorState) {
@@ -912,7 +927,7 @@ impl RuntimeTaskResources {
             port.hook(control, |_| Ok(()));
             port.retire(control);
         }
-        self.root.as_ref().is_none_or(ResourceCell::exited)
+        let resources_exited = self.root.as_ref().is_none_or(ResourceCell::exited)
             && self.result.as_ref().is_none_or(ResourceCell::exited)
             && self.sink_commit.as_ref().is_none_or(ResourceCell::exited)
             && self.commit_port.as_ref().is_none_or(ResourceCell::exited)
@@ -921,7 +936,15 @@ impl RuntimeTaskResources {
                 exchange.stop.as_ref().is_none_or(ResourceCell::exited)
                     && exchange.keys.iter().all(ResourceCell::exited)
                     && exchange.registration.exited()
-            })
+            });
+        if !resources_exited {
+            return false;
+        }
+        if let Some(query_task) = &mut self.query_task {
+            query_task.hook(control, |_| Ok(()));
+            query_task.retire(control);
+        }
+        self.query_task.as_ref().is_none_or(ResourceCell::exited)
     }
 }
 
@@ -1478,8 +1501,12 @@ mod cleanup_notification_tests {
         });
         let weak_port = Arc::downgrade(&port);
         let control = Arc::new(
-            TaskExecutionControl::new(port.identity(), port.clone(), TaskFailurePhase::Execution)
-                .unwrap(),
+            TaskExecutionControl::for_test(
+                port.identity(),
+                port.clone(),
+                TaskFailurePhase::Execution,
+            )
+            .unwrap(),
         );
         let state = RuntimeErrorState::for_task(control.clone());
         let tracker =

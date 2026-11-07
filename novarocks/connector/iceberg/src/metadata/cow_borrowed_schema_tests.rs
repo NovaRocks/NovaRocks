@@ -324,12 +324,19 @@ fn historical_cow_projection_keeps_nominal_domains_and_raw_carriers_distinct() {
             .metadata()
             .contains_key(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
     );
-    assert!(
+    assert_eq!(
         borrowed
             .fields()
             .iter()
             .skip(8)
-            .all(|field| !field.is_nullable())
+            .map(|field| (field.name().as_str(), field.is_nullable()))
+            .collect::<Vec<_>>(),
+        [
+            ("_file", false),
+            ("_pos", false),
+            ("_row_id", true),
+            ("_last_updated_sequence_number", true),
+        ]
     );
     let projected = projected_schema_with_metadata(&source, &[5, 6, 3, 5], &metadata).unwrap();
     assert_eq!(projected.fields()[0], projected.fields()[3]);

@@ -1,0 +1,26 @@
+-- query 2
+-- types	varchar	bigint	bigint	bigint
+property_value	total_rows	assigned_ids	assigned_sequences
+absent	2	2	2
+false	2	2	2
+
+-- query 4
+-- types	varchar	bigint	varchar
+property_value	id	v
+absent	1	aa
+absent	2	bb
+absent	3	c
+false	1	aa
+false	2	bb
+false	3	c
+
+-- query 5
+-- types	varchar	bigint	bigint	bigint	bigint
+property_value	total_rows	assigned_ids	unique_ids	assigned_sequences
+absent	3	3	3	3
+false	3	3	3	3
+
+-- query 10
+-- types	bigint	varchar
+id	v
+1	a

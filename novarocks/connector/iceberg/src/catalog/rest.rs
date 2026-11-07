@@ -1727,6 +1727,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
@@ -1948,6 +1949,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
+            novarocks_fs::TokioRefreshExecutor::shared(executor.handle().clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
@@ -2152,6 +2154,7 @@ mod evidence_tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
             Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
         )
         .for_request(context.clone());
@@ -2478,6 +2481,7 @@ mod evidence_tests {
                     None,
                     FsAccessResolver::new(),
                     Arc::new(TokioFileIoRuntime::new(handle.clone())),
+                    novarocks_fs::TokioRefreshExecutor::shared(handle.clone()),
                     Arc::new(TokioFileIoSpawner::new(handle)),
                 );
                 Arc::new(RestEndpoints::new(

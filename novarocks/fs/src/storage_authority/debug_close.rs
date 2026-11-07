@@ -134,6 +134,10 @@ impl std::fmt::Debug for StorageAuthorityCloseControls {
 }
 impl StorageAuthorityCloseControls {
     pub const DOMAIN: &'static str = "storage-authority";
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Authorized development-control carrier retains the original grants; see ADR-0218."
+    )]
     pub fn from_grants(handles: Vec<GrantHandle>) -> Result<Self, String> {
         let owner = handles.first().map(|handle| handle.cancellation());
         let mut grants: Vec<Grant> = Vec::new();

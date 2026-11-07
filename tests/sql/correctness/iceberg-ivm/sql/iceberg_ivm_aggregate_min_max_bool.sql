@@ -55,16 +55,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_mmbool_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW mmbool_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(flag) AS mn,
-       MAX(flag) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -77,6 +67,16 @@ INSERT INTO ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events VALUES
   (4, 'east', NULL),
   (5, 'west', true),
   (6, 'west', true);
+CREATE MATERIALIZED VIEW mmbool_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(flag) AS mn,
+       MAX(flag) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events
+GROUP BY region;
 REFRESH MATERIALIZED VIEW mmbool_mv_${uuid0};
 
 -- query 3

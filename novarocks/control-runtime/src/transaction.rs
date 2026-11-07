@@ -89,6 +89,7 @@ pub(crate) struct LedgerState {
     pub(crate) scopes: BTreeMap<ScopeId, ScopeState>,
     pub(crate) slots: BTreeMap<SlotId, crate::completion::ReportRecord>,
     pub(crate) unresolved: BTreeSet<(ScopeId, WorkId)>,
+    pub(crate) work_labels: BTreeMap<(ScopeId, WorkId), &'static str>,
     unresolved_by_scope: BTreeMap<ScopeId, usize>,
     pub(crate) abandoned_bundles: BTreeSet<ReservationId>,
     pub(crate) pending_retirement: BTreeSet<(ScopeId, WorkId)>,
@@ -159,12 +160,15 @@ impl LedgerState {
             binding.ready();
         }
     }
-    pub(crate) fn note_unresolved(&mut self, scope: ScopeId, work: WorkId) {
+    pub(crate) fn note_unresolved(&mut self, scope: ScopeId, work: WorkId) -> bool {
         if self.unresolved.insert((scope, work)) {
             let count = self.unresolved_by_scope.entry(scope).or_default();
             *count = count
                 .checked_add(1)
                 .expect("unresolved work count fits admitted work");
+            true
+        } else {
+            false
         }
     }
     fn clear_unresolved(&mut self, scope: ScopeId, work: WorkId) {
@@ -385,6 +389,7 @@ impl RuntimeLedger {
                         scopes: BTreeMap::new(),
                         slots: BTreeMap::new(),
                         unresolved: BTreeSet::new(),
+                        work_labels: BTreeMap::new(),
                         unresolved_by_scope: BTreeMap::new(),
                         abandoned_bundles: BTreeSet::new(),
                         pending_retirement: BTreeSet::new(),
@@ -879,6 +884,7 @@ impl RuntimeLedger {
             .ok_or(RuntimeError::UnknownScope)?
             .retire_work(work)?;
         state.clear_unresolved(scope, work);
+        state.work_labels.remove(&(scope, work));
         state.note_header_retired(scope, work);
         self.shared
             .record(|| HistoryFact::WorkRetired { scope, work });
@@ -924,6 +930,20 @@ impl RuntimeLedger {
             }
         }
         state.scopes.remove(&id);
+        // Actor-owned roles can retire atomically with execution detachment.
+        // Remove any remaining diagnostic labels without scanning other scopes.
+        let labels = (id, WorkId::new(1).expect("minimum Work identity"))
+            ..=(id, WorkId::new(u64::MAX).expect("maximum Work identity"));
+        while let Some(key) = state
+            .work_labels
+            .range(labels.clone())
+            .next()
+            .map(|(key, _)| *key)
+        {
+            state.work_labels.remove(&key);
+        }
+        self.shared
+            .record(|| HistoryFact::ScopeRemoved { scope: id });
         if let Some((parent, work)) = state.parent_links.remove(&id) {
             let parent_scope = state
                 .scopes

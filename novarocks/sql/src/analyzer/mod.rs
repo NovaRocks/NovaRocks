@@ -7059,7 +7059,7 @@ mod tests {
             parse_raw_and_analyze("SELECT * FROM __nr_ivm_delta('cat.ns.orders', 100, 200) AS t")
                 .expect_err("must fail");
         assert!(
-            err.contains("write.row-lineage") || err.contains("row-lineage metadata"),
+            err.contains("Iceberg v3") || err.contains("row-lineage metadata"),
             "expected row-lineage rebuild diagnostic, got: {err}"
         );
     }

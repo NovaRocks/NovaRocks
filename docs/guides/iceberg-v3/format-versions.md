@@ -66,12 +66,11 @@ Spec 新增能力：
 ```sql
 CREATE TABLE t (id BIGINT, v INT)
 TBLPROPERTIES (
-  "format-version"    = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 ```
 
-> NovaRocks 中**写指定 branch / MERGE INTO 等高级 DML 都要求 v3 + row-lineage**，建议新表默认 V3。
+> NovaRocks 中写指定 branch、UPDATE / MERGE 要求 v3；row lineage 随格式版本提供，无需额外开关。
 
 ## ❌ V1（read-only legacy）
 

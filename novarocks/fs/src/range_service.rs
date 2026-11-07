@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
-use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{ConnectorOperationTicket, ConnectorSourceOperations};
+use novarocks_spi::connector::{ConnectorError, ConnectorRangeScope};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
 
@@ -46,7 +46,17 @@ pub struct FileRangeScope {
 }
 
 impl FileRangeScope {
-    pub fn try_new(
+    /// Preserves the source identity admitted by the connector's owner.
+    pub fn from_connector(scope: &ConnectorRangeScope) -> Self {
+        let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) = scope.parts();
+        Self {
+            query: (query_high, query_low, attempt),
+            source: (fragment_high, fragment_low, node_id),
+        }
+    }
+
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub fn for_test(
         query_high: i64,
         query_low: i64,
         attempt: u64,
@@ -711,6 +721,7 @@ struct RequestState {
     active: usize,
     failed: bool,
     exit_error: Option<FileError>,
+    cleanup_unresolved: bool,
     exit: Option<oneshot::Sender<FileResult<()>>>,
     /// The request's operation in its source, ended with its physical exit.
     ticket: Option<ConnectorOperationTicket>,
@@ -755,7 +766,13 @@ pub struct FileRangeService {
 
 /// Settles one dispatched segment exactly once: with the supervisor's real
 /// outcome, or, when the supervisor ends early (its runtime dropped it or it
-/// panicked), with an error. The window slot is released either way.
+/// panicked), with unresolved cleanup. The window slot is released either way;
+/// only a drained job proves physical exit.
+enum SegmentExit {
+    Drained(FileResult<()>),
+    Unresolved(FileError),
+}
+
 struct SegmentSettlement {
     service: Arc<FileRangeService>,
     id: u64,
@@ -783,7 +800,8 @@ impl SegmentSettlement {
 
     fn settle(mut self, exit: FileResult<()>) {
         self.settled = true;
-        self.service.segment_exit(self.id, self.scope, exit);
+        self.service
+            .segment_exit(self.id, self.scope, SegmentExit::Drained(exit));
     }
 }
 
@@ -802,7 +820,7 @@ impl Drop for SegmentSettlement {
             self.service.segment_exit(
                 self.id,
                 self.scope,
-                Err(FileError::new(
+                SegmentExit::Unresolved(FileError::new(
                     FileErrorKind::Internal,
                     "range segment supervisor ended before its task exited",
                 )),
@@ -957,6 +975,7 @@ impl FileRangeService {
                 active: 0,
                 failed: false,
                 exit_error: None,
+                cleanup_unresolved: false,
                 exit: Some(exit_sender),
                 ticket: Some(ticket),
                 holds: Vec::new(),
@@ -1025,6 +1044,7 @@ impl FileRangeService {
                 active: 0,
                 failed: false,
                 exit_error: None,
+                cleanup_unresolved: false,
                 exit: Some(exit_sender),
                 ticket: Some(ticket),
                 holds: Vec::new(),
@@ -1182,6 +1202,11 @@ impl FileRangeService {
         if let Some(ticket) = request.ticket.take() {
             ticket.end(match &request.exit_error {
                 None => novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited,
+                Some(error) if request.cleanup_unresolved => {
+                    novarocks_spi::connector::read_stack::ConnectorOperationExit::CleanupUnresolved(
+                        ConnectorError::from(error),
+                    )
+                }
                 Some(error) => {
                     novarocks_spi::connector::read_stack::ConnectorOperationExit::WorkFailed(
                         ConnectorError::from(error),
@@ -1320,6 +1345,10 @@ impl FileRangeService {
         None
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The segment supervisor owns the original FileIoJob drain and preserves unresolved loss; see ADR-0218."
+    )]
     fn spawn_segment(self: &Arc<Self>, work: Dispatch) {
         let Dispatch {
             id,
@@ -1377,7 +1406,7 @@ impl FileRangeService {
             }
             Err(error) => {
                 self.unit_result(id, Err(error));
-                self.segment_exit(id, scope, Ok(()));
+                self.segment_exit(id, scope, SegmentExit::Drained(Ok(())));
             }
         }
     }
@@ -1398,7 +1427,7 @@ impl FileRangeService {
         }
     }
 
-    fn segment_exit(self: &Arc<Self>, id: u64, scope: FileRangeScope, exit: FileResult<()>) {
+    fn segment_exit(self: &Arc<Self>, id: u64, scope: FileRangeScope, exit: SegmentExit) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -1413,12 +1442,23 @@ impl FileRangeService {
         }
         if let Some(request) = state.requests.get_mut(&id) {
             request.active -= 1;
-            if let Err(error) = exit {
-                if let Some(request) = state.requests.get_mut(&id) {
+            let error = match exit {
+                SegmentExit::Drained(Ok(())) => None,
+                SegmentExit::Drained(Err(error)) => {
                     request
                         .exit_error
                         .get_or_insert_with(|| FileError::new(error.kind(), error.to_string()));
+                    Some(error)
                 }
+                SegmentExit::Unresolved(error) => {
+                    if !request.cleanup_unresolved {
+                        request.exit_error = Some(FileError::new(error.kind(), error.to_string()));
+                    }
+                    request.cleanup_unresolved = true;
+                    Some(error)
+                }
+            };
+            if let Some(error) = error {
                 self.fail_request_locked(&mut state, id, error);
             }
             if state
@@ -1473,9 +1513,6 @@ mod tests {
                 task.await;
             })))
         }
-        fn spawn_detached_blocking(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
-            unreachable!()
-        }
     }
 
     fn fixture() -> (tempfile::TempDir, BoundFile) {
@@ -1496,7 +1533,7 @@ mod tests {
     }
 
     fn scope(query: i64, source: i64) -> FileRangeScope {
-        FileRangeScope::try_new(query, 0, 1, source, 0, 1).expect("scope")
+        FileRangeScope::for_test(query, 0, 1, source, 0, 1).expect("scope")
     }
 
     fn range(offset: u64, length: u64) -> FileReadRange {
@@ -1530,6 +1567,7 @@ mod tests {
                 active: 0,
                 failed: false,
                 exit_error: None,
+                cleanup_unresolved: false,
                 exit: None,
                 ticket: None,
                 holds: Vec::new(),
@@ -1564,7 +1602,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -1604,7 +1642,7 @@ mod tests {
             Handle::current(),
         );
         let mut read = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -1613,7 +1651,7 @@ mod tests {
             )
             .expect("read admitted");
         let mut stat = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .stat_wait(file, FileCancellation::new())
             .await
             .expect("stat admitted");
@@ -1645,7 +1683,7 @@ mod tests {
             Handle::current(),
         );
         let mut read = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -1654,7 +1692,7 @@ mod tests {
             )
             .expect("read admitted");
         let FileStatStart::Started(mut stat) = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_stat(file, FileCancellation::new())
             .expect("stat admission")
         else {
@@ -1685,7 +1723,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let charge = Arc::new(());
         let request = source
@@ -1718,7 +1756,7 @@ mod tests {
         );
 
         // A request that already exited keeps nothing it is handed.
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 2), operations.clone());
         let mut request = source
             .start(
@@ -1748,7 +1786,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let mut request = source
             .start(
@@ -1819,7 +1857,7 @@ mod tests {
             Handle::current(),
         );
         // Another source holds the only slot and the only queue entry.
-        let other = service.bind(scope(1, 2), ConnectorSourceOperations::new());
+        let other = service.bind(scope(1, 2), ConnectorSourceOperations::for_test());
         let mut running = other
             .start(
                 FileRangeClass::Demand,
@@ -1837,7 +1875,7 @@ mod tests {
             )
             .expect("queued");
 
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let source = service.bind(scope(1, 1), operations.clone());
         let waiting = tokio::spawn({
             let file = file.clone();
@@ -1899,8 +1937,8 @@ mod tests {
             Handle::current(),
         );
         // Two scan nodes of one Task: one query, two sources.
-        let first_operations = ConnectorSourceOperations::new();
-        let second_operations = ConnectorSourceOperations::new();
+        let first_operations = ConnectorSourceOperations::for_test();
+        let second_operations = ConnectorSourceOperations::for_test();
         let first = service.bind(scope(1, 1), first_operations.clone());
         let second = service.bind(scope(1, 2), second_operations.clone());
         let mut first_read = first
@@ -1987,7 +2025,7 @@ mod tests {
             scan_runtime.handle().clone(),
         );
         let _guard = io_runtime.enter();
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let mut stuck = blocked_service
             .bind(scope(1, 1), operations.clone())
             .start(
@@ -2020,14 +2058,15 @@ mod tests {
             .expect("the actual source outcome consumer");
         assert_eq!(
             io_runtime.block_on(operations.exited()),
-            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved
         );
-        let Some(novarocks_spi::connector::read_stack::ConnectorSourceFailureEvent::Required(exit)) =
-            io_runtime.block_on(futures::future::poll_fn(|cx| failures.poll_event(cx)))
+        let Some(
+            novarocks_spi::connector::read_stack::ConnectorSourceFailureEvent::CleanupUnresolved(
+                exit,
+            ),
+        ) = io_runtime.block_on(futures::future::poll_fn(|cx| failures.poll_event(cx)))
         else {
-            panic!(
-                "the source keeps the actual supervisor work failure independently of physical exit"
-            );
+            panic!("the source preserves the supervisor's missing physical exit");
         };
         assert_eq!(
             exit.kind(),
@@ -2036,6 +2075,91 @@ mod tests {
         io_runtime
             .block_on(blocked_service.drain())
             .expect("nothing is left to wait for");
+    }
+
+    #[tokio::test]
+    async fn any_unobserved_segment_exit_keeps_request_cleanup_unresolved() {
+        // One request's exit covers every segment, including a supervisor
+        // lost before it observed its job. A different segment's ordinary
+        // failure cannot replace that missing physical-exit evidence.
+        for unresolved_first in [true, false] {
+            let (_dir, file) = fixture();
+            let operations = ConnectorSourceOperations::for_test();
+            let ticket = operations.admit(Arc::new(|| {})).expect("admit request");
+            let service = FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                GateSpawner::new(),
+                Handle::current(),
+            );
+            let scope = scope(1, 1);
+            let (exit, mut exited) = oneshot::channel();
+            {
+                let mut state = service.state.lock().expect("state");
+                state.active = 2;
+                state.source_active.insert(scope, 2);
+                state.requests.insert(
+                    7,
+                    RequestState {
+                        scope,
+                        class: FileRangeClass::Demand,
+                        paused: false,
+                        file,
+                        cancellation: FileCancellation::new(),
+                        work: RequestWork::Read {
+                            pending: VecDeque::new(),
+                            completed: Vec::new(),
+                            expected_length: 0,
+                            result: None,
+                        },
+                        active: 2,
+                        failed: false,
+                        exit_error: None,
+                        cleanup_unresolved: false,
+                        exit: Some(exit),
+                        ticket: Some(ticket),
+                        holds: Vec::new(),
+                    },
+                );
+            }
+            let lost = SegmentSettlement::new(Arc::clone(&service), 7, scope);
+            let failed = SegmentSettlement::new(Arc::clone(&service), 7, scope);
+            let error = FileError::new(FileErrorKind::Internal, "segment task failed");
+            if unresolved_first {
+                drop(lost);
+                assert!(matches!(
+                    exited.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(operations.live_operations(), 1);
+                failed.settle(Err(error));
+            } else {
+                failed.settle(Err(error));
+                assert!(matches!(
+                    exited.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(operations.live_operations(), 1);
+                drop(lost);
+            }
+            assert!(exited.await.expect("request exit outcome").is_err());
+            operations.seal();
+            let mut failures = operations
+                .claim_failure_receiver()
+                .expect("failure receiver");
+            assert_eq!(
+                operations.exited().await,
+                novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved,
+            );
+            assert!(matches!(
+                futures::future::poll_fn(|cx| failures.poll_event(cx)).await,
+                Some(novarocks_spi::connector::read_stack::ConnectorSourceFailureEvent::CleanupUnresolved(_)),
+            ));
+            assert_eq!(service.state.lock().expect("state").active, 0);
+            assert_eq!(service.live_supervisors.load(Ordering::Acquire), 0);
+            service.drain().await.expect("supervisors exited");
+        }
     }
 
     #[tokio::test]
@@ -2052,7 +2176,7 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut request = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start_with_present(
                 FileRangeClass::Demand,
                 file,
@@ -2089,7 +2213,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2132,7 +2256,7 @@ mod tests {
                 .expect("prepared wrong file");
             assert!(
                 service
-                    .bind(scope(1, 1), ConnectorSourceOperations::new())
+                    .bind(scope(1, 1), ConnectorSourceOperations::for_test())
                     .try_start_with_present(
                         FileRangeClass::Demand,
                         file.clone(),
@@ -2159,7 +2283,7 @@ mod tests {
             .expect("prepared middle span");
         std::fs::remove_file(dir.path().join("range.parquet")).expect("remove source");
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start_wait_with_present(file, range(0, 12), FileCancellation::new(), Some(present))
             .await
             .expect("accepted request");
@@ -2183,7 +2307,7 @@ mod tests {
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
             .expect("prepared middle span");
         let mut partial = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start_with_present(
                 FileRangeClass::Demand,
                 file,
@@ -2221,7 +2345,7 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2231,7 +2355,7 @@ mod tests {
             .expect("first");
         assert_eq!(spawner.started(), 1);
         let mut speculative = match service
-            .bind(scope(1, 2), ConnectorSourceOperations::new())
+            .bind(scope(1, 2), ConnectorSourceOperations::for_test())
             .try_start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2244,7 +2368,7 @@ mod tests {
             FileRangeStart::Deferred => panic!("unexpected defer"),
         };
         let mut later_demand = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2301,7 +2425,7 @@ mod tests {
             Handle::current(),
         );
         let mut active = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2310,7 +2434,7 @@ mod tests {
             )
             .expect("active");
         let mut waiting = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2320,7 +2444,7 @@ mod tests {
             .expect("waiting");
         assert!(matches!(
             service
-                .bind(scope(3, 1), ConnectorSourceOperations::new())
+                .bind(scope(3, 1), ConnectorSourceOperations::for_test())
                 .try_start(
                     FileRangeClass::Prefetch,
                     file,
@@ -2379,7 +2503,7 @@ mod tests {
             Handle::current(),
         );
         let mut q1s1 = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2388,7 +2512,7 @@ mod tests {
             )
             .expect("first");
         let mut q1s1_next = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2397,7 +2521,7 @@ mod tests {
             )
             .expect("same source");
         let mut q1s2 = service
-            .bind(scope(1, 2), ConnectorSourceOperations::new())
+            .bind(scope(1, 2), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2406,7 +2530,7 @@ mod tests {
             )
             .expect("other source");
         let mut q2s1 = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2458,7 +2582,7 @@ mod tests {
             Handle::current(),
         );
         let mut first = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2467,7 +2591,7 @@ mod tests {
             )
             .expect("active demand");
         let mut queued = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file.clone(),
@@ -2479,7 +2603,7 @@ mod tests {
         let waiting_file = file.clone();
         let waiting = tokio::spawn(async move {
             waiting_service
-                .bind(scope(3, 1), ConnectorSourceOperations::new())
+                .bind(scope(3, 1), ConnectorSourceOperations::for_test())
                 .start_wait(waiting_file, range(8, 4), FileCancellation::new())
                 .await
         });
@@ -2492,7 +2616,7 @@ mod tests {
         assert_eq!(service.demand_waiters.load(Ordering::SeqCst), 1);
         assert!(matches!(
             service
-                .bind(scope(4, 1), ConnectorSourceOperations::new())
+                .bind(scope(4, 1), ConnectorSourceOperations::for_test())
                 .try_start(
                     FileRangeClass::Prefetch,
                     file,
@@ -2544,7 +2668,7 @@ mod tests {
             runtime.handle().clone(),
         );
         let mut request = match service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .try_start(
                 FileRangeClass::Prefetch,
                 file,
@@ -2605,7 +2729,7 @@ mod tests {
             Handle::current(),
         );
         let mut request = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2652,7 +2776,7 @@ mod tests {
             Handle::current(),
         );
         let mut prefetch = service
-            .bind(scope(1, 1), ConnectorSourceOperations::new())
+            .bind(scope(1, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Prefetch,
                 file.clone(),
@@ -2679,7 +2803,7 @@ mod tests {
         .expect("first segment exits");
         assert_eq!(spawner.started(), 1, "queued segment remains paused");
         let mut demand = service
-            .bind(scope(2, 1), ConnectorSourceOperations::new())
+            .bind(scope(2, 1), ConnectorSourceOperations::for_test())
             .start(
                 FileRangeClass::Demand,
                 file,
@@ -2726,9 +2850,6 @@ mod tests {
                 task.await;
             })))
         }
-        fn spawn_detached_blocking(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
-            unreachable!()
-        }
     }
 
     #[tokio::test]
@@ -2763,7 +2884,7 @@ mod tests {
             spawner.clone(),
             Handle::current(),
         );
-        let operations = ConnectorSourceOperations::new();
+        let operations = ConnectorSourceOperations::for_test();
         let mut request = service
             .bind(scope(1, 1), operations.clone())
             .start(

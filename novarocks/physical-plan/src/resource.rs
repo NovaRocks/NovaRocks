@@ -1328,6 +1328,7 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
         NodeKind::AssertOneRow(spec) => match spec {
             crate::RowCountAssertionSpec::Global { subject, .. } => usage.add_bytes(subject.len()),
             crate::RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation: _,
                 keys,
                 labels,
                 message,

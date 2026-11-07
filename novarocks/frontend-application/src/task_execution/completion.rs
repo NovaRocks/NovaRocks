@@ -104,7 +104,7 @@ impl std::fmt::Display for WriteVerdict {
 /// optional metrics, and absence means "not reported", so inferring the set
 /// from them would silently shrink it — and a shrunken writer set is exactly
 /// how a partial write reports success.
-// Design: ADR-0219 (docs/adr/ADR-0219-typed-task-summaries-and-per-kind-completion.md)
+// Design: ADR-0222 (docs/adr/ADR-0222-typed-task-summaries-and-per-kind-completion.md)
 #[derive(Clone, Debug)]
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,

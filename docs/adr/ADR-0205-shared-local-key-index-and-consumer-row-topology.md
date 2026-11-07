@@ -8,7 +8,7 @@ superseded-by: null
 partially-supersedes: [ADR-0004]
 date: 2026-10-29
 related:
-  - "ADR-0220-result-content-identity-and-deterministic-fingerprints.md"
+  - "ADR-0223-result-content-identity-and-deterministic-fingerprints.md"
 provenance:
   - "discussion: 2026-10-26 instance-local typed key equality, bulk construction and consumer ownership"
 code-anchors:

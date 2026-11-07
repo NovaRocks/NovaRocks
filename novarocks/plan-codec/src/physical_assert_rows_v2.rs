@@ -36,6 +36,30 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 type Error = AssertRowsNodeCodecError;
 
+fn encode_declared_violation(
+    reason: Option<novarocks_failure_contract::FailureReason>,
+) -> Result<Option<u32>, Error> {
+    match reason {
+        None => Ok(None),
+        Some(reason) if novarocks_failure_contract::sql_reason::is_row_match_violation(reason) => {
+            Ok(Some(u32::from(reason.code())))
+        }
+        Some(_) => Err(invalid(
+            "keyed assertion declared violation is not registered",
+        )),
+    }
+}
+
+fn decode_declared_violation(
+    code: Option<u32>,
+) -> Result<Option<novarocks_failure_contract::FailureReason>, Error> {
+    code.map(|code| {
+        novarocks_failure_contract::sql_reason::row_match_violation_from_code(code)
+            .ok_or_else(|| invalid("keyed assertion declared violation is not registered"))
+    })
+    .transpose()
+}
+
 fn encode_comparison(value: p::RowCountAssertion) -> wire::RowCountComparison {
     match value {
         p::RowCountAssertion::Eq => wire::RowCountComparison::Eq,
@@ -61,6 +85,7 @@ fn physical_applicability_references(value: p::AssertionApplicability) -> usize 
     usize::from(matches!(value, p::AssertionApplicability::WhenTrue(_)))
 }
 fn wire_applicability(value: &wire::PerKeyRowCountAssertion) -> Result<Option<u32>, Error> {
+    decode_declared_violation(value.declared_sql_violation)?;
     match value.applicability.as_ref().and_then(|a| a.kind.as_ref()) {
         Some(wire::assertion_applicability::Kind::AllRows(_)) => Ok(None),
         Some(wire::assertion_applicability::Kind::WhenTrueValueId(id)) => Ok(Some(*id)),
@@ -78,14 +103,18 @@ fn physical_outer(
             keys,
             labels,
             applicability,
+            declared_violation,
             ..
-        } => add(
-            header,
+        } => {
+            encode_declared_violation(*declared_violation)?;
             add(
-                add(keys.len(), labels.len())?,
-                physical_applicability_references(*applicability),
-            )?,
-        ),
+                header,
+                add(
+                    add(keys.len(), labels.len())?,
+                    physical_applicability_references(*applicability),
+                )?,
+            )
+        }
     }
 }
 fn wire_outer(
@@ -478,6 +507,7 @@ fn emit_encode(
             labels,
             message,
             applicability,
+            declared_violation,
         } => {
             let key_value_ids = encode_ids(keys, work)?;
             let mut copied = reserve(labels.len(), work)?;
@@ -486,6 +516,7 @@ fn emit_encode(
                 work.step()?;
             }
             wire::row_count_assertion_node::Kind::PerKeyAtMostOne(wire::PerKeyRowCountAssertion {
+                declared_sql_violation: encode_declared_violation(*declared_violation)?,
                 applicability: Some(wire::AssertionApplicability {
                     kind: Some(match applicability {
                         p::AssertionApplicability::AllRows => {
@@ -548,6 +579,7 @@ fn emit_decode(
                 work.step()?;
             }
             p::RowCountAssertionSpec::PerKeyAtMostOne {
+                declared_violation: decode_declared_violation(v.declared_sql_violation)?,
                 applicability: match v
                     .applicability
                     .as_ref()

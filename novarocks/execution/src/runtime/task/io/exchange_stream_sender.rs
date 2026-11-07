@@ -735,6 +735,24 @@ impl ExchangeStreamSender {
         })
     }
 
+    // Retry timers count as control activity, but must not retain the sender.
+    // Their reservation is made under the same lock as the retry-waiting flag.
+    fn retry_activity(self: &Arc<Self>) -> ExchangeCallActivity {
+        let sender = Arc::downgrade(self);
+        ExchangeCallActivity::new(move || {
+            if let Some(sender) = sender.upgrade() {
+                {
+                    let mut state = sender.state.lock().expect("exchange stream sender lock");
+                    state.active_control_calls = state
+                        .active_control_calls
+                        .checked_sub(1)
+                        .expect("one original exchange retry capture exit");
+                }
+                sender.notify();
+            }
+        })
+    }
+
     fn stop_outcome(self: &Arc<Self>, outcome: ExchangeDemandCallOutcome) {
         let result = {
             let mut state = self.state.lock().expect("exchange stream sender lock");
@@ -770,10 +788,15 @@ impl ExchangeStreamSender {
                 ExchangeDemandCallOutcome::NotProcessed(_)
                 | ExchangeDemandCallOutcome::Unknown(_) => {
                     state.stop_retry_waiting = true;
+                    state.active_control_calls = state
+                        .active_control_calls
+                        .checked_add(1)
+                        .expect("exchange control activity count exhausted");
                     drop(state);
                     let weak = Arc::downgrade(self);
                     if let Err(failure) = self.transmitter.schedule_unit_retry(
                         self.config.retry_delay,
+                        self.retry_activity(),
                         Box::new(move || {
                             if let Some(sender) = weak.upgrade() {
                                 sender
@@ -1068,10 +1091,15 @@ impl ExchangeStreamSender {
                     }
                     state.demand_registered = None;
                     state.demand_retry_waiting = true;
+                    state.active_control_calls = state
+                        .active_control_calls
+                        .checked_add(1)
+                        .expect("exchange control activity count exhausted");
                 }
                 let weak = Arc::downgrade(self);
                 if let Err(failure) = self.transmitter.schedule_unit_retry(
                     self.config.retry_delay,
+                    self.retry_activity(),
                     Box::new(move || {
                         if let Some(sender) = weak.upgrade() {
                             sender
@@ -1229,9 +1257,16 @@ impl ExchangeStreamSender {
             ExchangeCallOutcome::NotProcessed(_) | ExchangeCallOutcome::Unknown(_) => {
                 let schedule = {
                     let mut state = self.state.lock().expect("exchange stream sender lock");
-                    state.status == ExchangeStreamSenderStatus::Open
+                    let schedule = state.status == ExchangeStreamSenderStatus::Open
                         && sequence > state.kernel.snapshot().consumed_through
-                        && state.retry_pending.insert(sequence)
+                        && state.retry_pending.insert(sequence);
+                    if schedule {
+                        state.active_control_calls = state
+                            .active_control_calls
+                            .checked_add(1)
+                            .expect("exchange control activity count exhausted");
+                    }
+                    schedule
                 };
                 if !schedule {
                     return;
@@ -1239,6 +1274,7 @@ impl ExchangeStreamSender {
                 let weak = Arc::downgrade(self);
                 if let Err(failure) = self.transmitter.schedule_unit_retry(
                     self.config.retry_delay,
+                    self.retry_activity(),
                     Box::new(move || {
                         if let Some(sender) = weak.upgrade() {
                             let mut state =

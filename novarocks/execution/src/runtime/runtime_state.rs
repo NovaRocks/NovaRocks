@@ -131,6 +131,15 @@ impl RuntimeErrorState {
             RuntimeFailureControl::Local(_) => None,
         }
     }
+    /// Borrow the original Worker-issued Task token without issuing new work.
+    pub(crate) fn task_execution_control(
+        &self,
+    ) -> Option<&crate::runtime::task_control::TaskExecutionControl> {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => Some(owner.as_ref()),
+            RuntimeFailureControl::Local(_) => None,
+        }
+    }
     pub fn for_task(
         control: std::sync::Arc<crate::runtime::task_control::TaskExecutionControl>,
     ) -> Self {
@@ -661,12 +670,17 @@ mod tests {
         let state =
             RuntimeState::for_local_execution(None, None, None, None, None, None, Some(runtime));
         let exec = state.sink_io_executor().expect("sink_io executor");
-        let handle = exec.spawn(async {
-            std::thread::current()
-                .name()
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        });
+        let handle = exec
+            .spawn(
+                &crate::runtime::execution_services::test_io_control(),
+                async {
+                    std::thread::current()
+                        .name()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                },
+            )
+            .unwrap();
         let name = futures::executor::block_on(handle).expect("join");
         assert!(
             name.contains("novarocks-sink-io"),
