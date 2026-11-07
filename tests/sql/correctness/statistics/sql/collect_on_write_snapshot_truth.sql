@@ -21,30 +21,30 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE DATABASE IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0};
+CREATE DATABASE IF NOT EXISTS statistics_cat_${suite_uuid0}.${suite_uuid0};
 
 -- query 2
 -- Start with maintenance disabled so this nonempty parent deliberately has no
 -- Puffin. Enabling it for the second append must not publish an NDV that only
 -- describes the second row.
 -- @skip_result_check=true
-CREATE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0} (
+CREATE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} (
     id BIGINT,
     k BIGINT
 ) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0} VALUES (1, 10);
+INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} VALUES (1, 10);
 
 -- query 4
 -- @skip_result_check=true
-ALTER TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}
+ALTER TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0}
 SET TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true');
 
 -- query 5
 -- @skip_result_check=true
-INSERT INTO statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0} VALUES (2, 20);
+INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} VALUES (2, 20);
 
 -- query 6
 -- @result_contains=COLLECT_ON_WRITE_MISSING_PARENT_OK
@@ -55,7 +55,7 @@ cat > "$tmp_scala" <<'SPARK_SCALA'
 import scala.jdk.CollectionConverters._
 import org.apache.iceberg.spark.Spark3Util
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val current = table.currentSnapshot().snapshotId()
 require(table.statisticsFiles().asScala.forall(_.snapshotId() != current), "nonempty parent without statistics gained a partial current-snapshot StatisticsFile")
 println("COLLECT_ON_WRITE_MISSING_PARENT_OK")
@@ -69,7 +69,7 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_MISSING_PARENT_OK"
 -- Spark replaces it below with an independently produced standard Puffin
 -- parent before Nova performs the incremental union.
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
+ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 8
 -- Wait for this case's own job, not any SUCCEEDED job on the shared
@@ -78,7 +78,7 @@ ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_mis
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=namespace=${suite_uuid0}
 -- @result_rows_where=table=cow_missing_parent_${uuid0}
 -- @result_rows_count=1
 -- @result_rows_expect=state=SUCCEEDED
@@ -102,7 +102,7 @@ import org.apache.iceberg.puffin.{Blob, Puffin, PuffinCompressionCodec, Standard
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.iceberg.shaded.org.apache.datasketches.theta.UpdateSketch
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val snapshot = table.currentSnapshot()
 val path = table.location() + "/metadata/spark-parent-" + UUID.randomUUID().toString + ".stats"
 val writer = Puffin.write(table.io().newOutputFile(path)).createdBy("ncp-8-spark-parent").build()
@@ -145,7 +145,7 @@ printf '%s\n' "$spark_out" | grep -F "SPARK_CROSS_ENGINE_PARENT_OK"
 -- the same newly committed snapshot. Duplicate values exercise Theta union
 -- instead of making the expected NDV equal to the number of written rows.
 -- @skip_result_check=true
-INSERT INTO statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}
+INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0}
 VALUES (2, 20), (3, 30);
 
 -- query 11
@@ -158,7 +158,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.iceberg.puffin.StandardBlobTypes
 import org.apache.iceberg.spark.Spark3Util
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val current = table.currentSnapshot().snapshotId()
 val currentStatistics = table.statisticsFiles().asScala.filter(_.snapshotId() == current).toSeq
 require(currentStatistics.size == 1, "collect-on-write did not publish exactly one current-snapshot StatisticsFile")
@@ -177,14 +177,14 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_INCREMENTAL_OK"
 -- Repair from the full table and then append again. This alternation exercises
 -- both producers without changing the published Puffin contract.
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
+ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 13
 -- The second ANALYZE of this table: both of its jobs must have succeeded.
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=namespace=${suite_uuid0}
 -- @result_rows_where=table=cow_missing_parent_${uuid0}
 -- @result_rows_count=2
 -- @result_rows_expect=state=SUCCEEDED
@@ -193,7 +193,7 @@ SHOW ANALYZE JOBS;
 
 -- query 14
 -- @skip_result_check=true
-INSERT INTO statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}
+INSERT INTO statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0}
 VALUES (4, 40);
 
 -- query 15
@@ -206,7 +206,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.iceberg.puffin.StandardBlobTypes
 import org.apache.iceberg.spark.Spark3Util
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val current = table.currentSnapshot().snapshotId()
 val theta = table.statisticsFiles().asScala
   .filter(_.snapshotId() == current)
@@ -224,7 +224,7 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_ALTERNATING_OK"
 -- query 16
 -- DELETE must not reseat this current StatisticsFile onto its new snapshot.
 -- @skip_result_check=true
-DELETE FROM statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0} WHERE id = 1;
+DELETE FROM statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} WHERE id = 1;
 
 -- query 17
 -- @result_contains=COLLECT_ON_WRITE_DELETE_BASIS_OK
@@ -235,7 +235,7 @@ cat > "$tmp_scala" <<'SPARK_SCALA'
 import scala.jdk.CollectionConverters._
 import org.apache.iceberg.spark.Spark3Util
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val current = table.currentSnapshot().snapshotId()
 require(table.statisticsFiles().asScala.forall(_.snapshotId() != current), "DELETE reseated a StatisticsFile onto the new snapshot")
 require(table.statisticsFiles().asScala.exists(_.snapshotId() != current), "DELETE discarded the ancestor StatisticsFile")
@@ -249,14 +249,14 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_DELETE_BASIS_OK"
 -- A full ANALYZE after an ineligible mutation must restore exact evidence for
 -- the mutation snapshot instead of leaving the optimizer on ancestor data.
 -- @skip_result_check=true
-ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0};
+ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0};
 
 -- query 19
 -- The third ANALYZE of this table: all three of its jobs must have succeeded.
 -- @retry_count=60
 -- @retry_interval_ms=1000
 -- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=nr_statistics_${suite_uuid0}
+-- @result_rows_where=namespace=${suite_uuid0}
 -- @result_rows_where=table=cow_missing_parent_${uuid0}
 -- @result_rows_count=3
 -- @result_rows_expect=state=SUCCEEDED
@@ -273,7 +273,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.iceberg.puffin.StandardBlobTypes
 import org.apache.iceberg.spark.Spark3Util
 
-val table = Spark3Util.loadIcebergTable(spark, "ice_rest.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0}")
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.${suite_uuid0}.cow_missing_parent_${uuid0}")
 val current = table.currentSnapshot().snapshotId()
 val theta = table.statisticsFiles().asScala
   .filter(_.snapshotId() == current)
@@ -290,4 +290,4 @@ printf '%s\n' "$spark_out" | grep -F "COLLECT_ON_WRITE_MUTATION_REPAIR_OK"
 
 -- query 21
 -- @skip_result_check=true
-DROP TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.cow_missing_parent_${uuid0} FORCE;
+DROP TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.cow_missing_parent_${uuid0} FORCE;
