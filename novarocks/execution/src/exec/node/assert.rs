@@ -35,6 +35,7 @@ pub enum AssertNumRowsMode {
         subquery_string: Option<String>,
     },
     PerKeyAtMostOne {
+        declared_violation: Option<novarocks_failure_contract::FailureReason>,
         // The planner must hash-partition by these slots before this assert for global per-key semantics.
         key_slots: Vec<SlotId>,
         key_labels: Vec<String>,

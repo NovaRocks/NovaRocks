@@ -38,19 +38,18 @@ under the License.
 
 ## 启用方式
 
-v3 默认提供行血缘列，`write.row-lineage=false` 可显式关闭。需要 UPDATE/MERGE 等依赖已存储行血缘
-事实的写入时，应显式声明 `write.row-lineage=true`；仅能读出元数据列不等于所有历史文件都已物化行血缘。
+row lineage 只由格式版本决定：所有 v3 表都提供这两列，不读取 `write.row-lineage`。
+无属性或属性为 `false` 的 v3 表同样支持；带属性为 `true` 的 v2 表仍不具备 v3 能力。
 建表例子：
 
 ```sql
 CREATE TABLE orders (id BIGINT, v INT)
 TBLPROPERTIES (
-  "format-version"    = "3",
-  "write.row-lineage" = "true"
+  "format-version" = "3"
 );
 ```
 
-启用后：
+v3 表中：
 - INSERT / OVERWRITE 的新逻辑行在实际提交时分配 `_row_id`
 - UPDATE 复用原行的 `_row_id`，仅推进 `_last_updated_sequence_number`
 - DELETE 不分配新 ID，DV / position-delete 上记录被删行
@@ -66,7 +65,13 @@ SELECT id, v, _row_id, _last_updated_sequence_number
 
 `_row_id` 表达逻辑行身份；行内 NULL 从文件 first-row-id 和位置继承。物理存储的 `_row_id` 优先于
 位置推导，所以保留源 ID 的重写文件不要求行顺序仍与 first-row-id 连续。
-`_last_updated_sequence_number` 表达该行实际逻辑年龄；行内 NULL 读取时继承文件的 data sequence。
+`_last_updated_sequence_number` 表达该行实际逻辑年龄；文件已有 `first_row_id` 时，行内 NULL 继承文件的 data sequence。
+
+v2 升级到 v3、尚未发生 v3 提交的旧文件没有 `first_row_id`，其中两列都返回 SQL NULL。
+首次 v3 提交为保留的历史 manifest 分配范围。对这些旧行的 UPDATE 应显式使用 MOR
+（`novarocks.update.mode=merge-on-read`）；默认 COW 对缺失行血统的旧文件仍有能力限制。
+MERGE 按 `_file` 判断匹配，并按物理位置判重，不以可能为空的 `_row_id` 判断是否命中。
+MV 基表另须所选快照带 row range；缺失时先执行一次 v3 提交，例如 OPTIMIZE，再重试。
 
 ## ✅ INSERT / OVERWRITE 的 row-id 分配
 

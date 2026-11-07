@@ -54,7 +54,7 @@ impl IcebergCowSourceProof {
                 .ok_or_else(|| invalid("Iceberg COW proof contains a non-metadata field"))?;
             if metadata == IcebergMetadataColumn::IsDeleted
                 || !seen.insert(column.base_field_id())
-                || column.nullable()
+                || column.nullable() != metadata.nullable()
             {
                 return Err(invalid(
                     "Iceberg COW proof metadata fields differ from the signed source",

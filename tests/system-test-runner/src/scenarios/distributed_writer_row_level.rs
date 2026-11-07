@@ -383,52 +383,59 @@ fn selected_actions(
         })();
         settle_diagnostic(context, diagnostic, observation, primary)?;
     }
-    mutate(
+    reject_duplicate_matches(
+        context,
         control,
         &table,
         &sql(3),
-        0,
-        0,
         &format!("{label} FALSE+NULL"),
     )?;
     assert_rows(control, &table, &expected, "inactive duplicate pair")?;
 
     // A valid id=3 action accompanies the two active id=4 matches. Even if
     // another route stages its output first, the statement must publish none.
-    let before = snapshot_count(control, &table)?;
-    let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-    let result = control.execute(sql(4));
-    match result {
-        Err(StatementFailure::Trino(error)) => anyhow::ensure!(
-            error.error_code == 0
-                && error.error_name == "GENERIC_USER_ERROR"
-                && error.error_type == "USER_ERROR"
-                && error
-                    .message
-                    .starts_with("[query.execution.invalid_data] Data failure (reason 7:317)"),
-            "{label} TRUE+TRUE returned the wrong public failure: {error:?}"
-        ),
-        other => {
-            bail!("{label} TRUE+TRUE must fail with the public duplicate-key error, got {other:?}")
-        }
-    }
-    let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-    assert_commit_never_invoked(
-        before_terminals,
-        after_terminals,
+    reject_duplicate_matches(
+        context,
+        control,
+        &table,
+        &sql(4),
         &format!("{label} TRUE+TRUE"),
     )?;
-    super::writer_statement_actor::require_public_error_reentry(control)?;
-    anyhow::ensure!(
-        snapshot_count(control, &table)? == before,
-        "{label} TRUE+TRUE partially committed"
-    );
     assert_rows(
         control,
         &table,
         &expected,
         "duplicate active matches leave every original row",
     )?;
+    Ok(())
+}
+
+fn reject_duplicate_matches(
+    context: &mut ScenarioContext,
+    control: &mut SqlSession,
+    table: &str,
+    statement: &str,
+    label: &str,
+) -> Result<()> {
+    let before = snapshot_count(control, table)?;
+    let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
+    match control.execute(statement) {
+        Err(StatementFailure::Trino(error)) => anyhow::ensure!(
+            error.error_code == 119
+                && error.error_name == "MERGE_TARGET_ROW_MULTIPLE_MATCHES"
+                && error.error_type == "USER_ERROR"
+                && error.message == "One MERGE target table row matched more than one source row",
+            "{label} returned the wrong public failure: {error:?}"
+        ),
+        other => bail!("{label} must reject duplicate physical target matches, got {other:?}"),
+    }
+    let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
+    assert_commit_never_invoked(before_terminals, after_terminals, label)?;
+    super::writer_statement_actor::require_public_error_reentry(control)?;
+    anyhow::ensure!(
+        snapshot_count(control, table)? == before,
+        "{label} partially committed"
+    );
     Ok(())
 }
 
@@ -503,18 +510,18 @@ fn unmatched_inserts(
         &expected,
         "unmatched distributed insert row bag",
     )?;
-    // All TRUE inputs now match, while FALSE/NULL inputs still do not. With
-    // no matched action, the same relation has no selected event at all.
-    mutate(
+    // All inserted inputs now match. The duplicate source key 500 therefore
+    // selects the same physical target position twice, even without a matched
+    // clause; the no-clause group participates in Trino's uniqueness check.
+    reject_duplicate_matches(
+        context,
         control,
         &table,
         &format!(
             "MERGE INTO {table} t USING {source} s ON t.id=s.id \
          WHEN NOT MATCHED AND s.selected THEN INSERT (id,v) VALUES(s.id,s.v)"
         ),
-        0,
-        0,
-        "inactive unmatched FALSE/NULL inputs",
+        "insert-only matched duplicate targets",
     )?;
     assert_rows(
         control,

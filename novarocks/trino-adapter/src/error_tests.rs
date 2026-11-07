@@ -60,6 +60,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("VIEW_IS_STALE", 81, "USER_ERROR"),
     ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
+    ("MERGE_TARGET_ROW_MULTIPLE_MATCHES", 119, "USER_ERROR"),
     ("GENERIC_INTERNAL_ERROR", 65536, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_ERROR", 65539, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_TIMEOUT", 65540, "INTERNAL_ERROR"),
@@ -126,6 +127,10 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
+        "query.execution.merge_target_row_multiple_matches"
+        | "query.execution.update_target_row_multiple_matches" => {
+            "MERGE_TARGET_ROW_MULTIPLE_MATCHES"
+        }
         "sql.parse.unsupported_statement"
         | "sql.analyze.unsupported_expression"
         | "sql.analyze.unsupported_query_shape"
@@ -249,10 +254,18 @@ fn every_registered_user_descriptor_has_an_explicit_trino_mapping() {
             descriptor.code
         );
         assert_wire(&wire, expected_descriptor_name(descriptor.code.as_str()));
-        assert_eq!(
-            wire.message,
-            format!("[{}] original domain detail", descriptor.code)
-        );
+        // Trino standard row-match errors deliberately use the standard text
+        // without a NovaRocks descriptor prefix or publication suffix.
+        let expected = match descriptor.code.as_str() {
+            "query.execution.merge_target_row_multiple_matches" => {
+                "One MERGE target table row matched more than one source row".to_owned()
+            }
+            "query.execution.update_target_row_multiple_matches" => {
+                "One UPDATE target table row matched more than one source row".to_owned()
+            }
+            _ => format!("[{}] original domain detail", descriptor.code),
+        };
+        assert_eq!(wire.message, expected);
     }
 }
 
@@ -946,5 +959,74 @@ fn originating_connector_mutation_cause_reaches_the_service_mapping_with_its_eff
         );
         assert!(mapped.message.contains(message));
         assert!(!mapped.message.contains("do_not_retry=true"));
+    }
+}
+
+#[test]
+fn declared_row_match_identity_controls_standard_error_without_reclassifying_other_assertions() {
+    use novarocks_failure_contract::{execution_reason, sql_reason};
+    for (reason, message) in [
+        (
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One MERGE target table row matched more than one source row",
+        ),
+        (
+            sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+            "One UPDATE target table row matched more than one source row",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(FailureClass::Data, reason),
+            SafeDetail::truncating("keyed assertion (reason 7:317): private physical key detail"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryServiceError::from_execution_failure(input.clone())
+            .attach_external_effect_disposition(StatementExternalEffectDisposition::KnownCommitted);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &error,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+        assert!(wire.sql_state.is_none());
+        assert!(wire.error_location.is_none());
+        assert_eq!(error.execution_failure(), Some(&input));
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(StatementExternalEffectDisposition::KnownCommitted)
+        );
+        let execution = QueryExecutionError::from_execution(input);
+        let wire = query_error(TrinoErrorSource::Execution {
+            error: &execution,
+            sql: "opaque statement",
+        });
+        assert_wire(&wire, "MERGE_TARGET_ROW_MULTIPLE_MATCHES");
+        assert_eq!(wire.message, message);
+    }
+    for (class, reason, name) in [
+        (
+            FailureClass::Data,
+            execution_reason::ASSERT_ROWS_DUPLICATE_KEY,
+            "GENERIC_USER_ERROR",
+        ),
+        (
+            FailureClass::Invariant,
+            sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+            "GENERIC_INTERNAL_ERROR",
+        ),
+    ] {
+        let input = ExecutionFailureInput::new(
+            FailureFact::new(class, reason),
+            SafeDetail::truncating("One MERGE target table row matched more than one source row"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let error = QueryExecutionError::from_execution(input);
+        assert_wire(
+            &query_error(TrinoErrorSource::Execution {
+                error: &error,
+                sql: "MERGE",
+            }),
+            name,
+        );
     }
 }

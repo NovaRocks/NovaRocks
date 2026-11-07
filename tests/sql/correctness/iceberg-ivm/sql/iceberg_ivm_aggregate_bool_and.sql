@@ -53,15 +53,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_bool_and_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW bool_and_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       BOOL_AND(flag) AS all_true,
-       COUNT(*) AS c
-FROM ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -75,6 +66,15 @@ INSERT INTO ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events VALUES
   (5, 'east', NULL),
   (6, 'west', true),
   (7, 'west', true);
+CREATE MATERIALIZED VIEW bool_and_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       BOOL_AND(flag) AS all_true,
+       COUNT(*) AS c
+FROM ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events
+GROUP BY region;
 REFRESH MATERIALIZED VIEW bool_and_mv_${uuid0};
 
 -- query 3

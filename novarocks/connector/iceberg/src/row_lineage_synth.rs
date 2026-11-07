@@ -23,23 +23,11 @@
 //!
 //! # The inherit-vs-stored rule
 //!
-//! A row-lineage column is either *inherited* from a file-level fact or
-//! *stored* as a real column in the data file. Which one applies is decided
-//! per column and per row, and the two columns never decide for each other:
-//!
-//! * A data file that materializes the reserved column carries the lineage its
-//!   rows already had, which is exactly how a rewrite preserves history. That
-//!   stored value wins.
-//! * A null in a materialized column, and a file that materializes no column
-//!   at all, both mean "inherit": `_row_id` becomes
-//!   `first_row_id + absolute row position` and
-//!   `_last_updated_sequence_number` becomes the file's own data sequence
-//!   number.
-//!
-//! A file may materialize one column and not the other, so each column asks
-//! the question separately. The inherited fact is demanded only by the rows
-//! that actually need it: a file whose stored column covers every row is read
-//! without it rather than rejected for lacking it.
+//! A file without `first_row_id` predates row-ID allocation. Both lineage
+//! columns are NULL for that file, including physically stored values, matching
+//! iceberg-rust and Iceberg Java. Once a file has `first_row_id`, each column
+//! resolves independently: stored non-null values win, NULL or absent values
+//! inherit the row position or the file's data sequence number.
 
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Schema;
@@ -173,13 +161,11 @@ fn stored_values<'a>(
 
 /// Resolve `_row_id` for every row of a batch.
 ///
-/// A stored non-null value wins; every other row inherits
-/// `first_row_id + positions[row]`. `first_row_id` is a manifest fact, so it
-/// is passed as the option it is and demanded only by a row that inherits: a
-/// file whose stored column covers every row needs no such fact.
+/// Without the file's `first_row_id`, every value is NULL. Otherwise a stored
+/// non-null value wins and every other row inherits `first_row_id + position`.
 ///
 /// `positions` are the rows' file-level absolute zero-based positions. They
-/// are required rather than optional because a batch-relative index is not a
+/// are required for allocated files because a batch-relative index is not a
 /// file position for any batch after the first, and a wrong `_row_id` is
 /// indistinguishable from a right one.
 pub(crate) fn synthesize_row_id(
@@ -188,7 +174,10 @@ pub(crate) fn synthesize_row_id(
     num_rows: usize,
     first_row_id: Option<i64>,
     positions: &[i64],
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<Option<i64>>, String> {
+    let Some(first_row_id) = first_row_id else {
+        return Ok(vec![None; num_rows]);
+    };
     let stored = stored_values(schema, columns, IcebergRowLineageColumn::RowId)?;
 
     if positions.len() != num_rows {
@@ -203,35 +192,34 @@ pub(crate) fn synthesize_row_id(
         if let Some(stored) = stored
             && !stored.is_null(row)
         {
-            out.push(stored.value(row));
+            out.push(Some(stored.value(row)));
             continue;
         }
-        let first_row_id = first_row_id.ok_or_else(|| {
-            format!(
-                "row {row} inherits its {ICEBERG_ROW_ID_COL} but the data file carries no first row id"
-            )
-        })?;
         let computed = first_row_id.checked_add(position).ok_or_else(|| {
             format!(
                 "Row ID overflow when computing fallback _row_id: first_row_id={first_row_id}, position={position}"
             )
         })?;
-        out.push(computed);
+        out.push(Some(computed));
     }
     Ok(out)
 }
 
 /// Resolve `_last_updated_sequence_number` for every row of a batch.
 ///
-/// A stored non-null value wins; every other row inherits the data file's own
-/// sequence number. That fact is demanded only by a row that inherits, for the
-/// same reason `first_row_id` is.
+/// Without `first_row_id`, every value is NULL. Otherwise a stored non-null
+/// value wins and every other row inherits the data file's own sequence number.
+/// That sequence fact is demanded only by a row that inherits.
 pub(crate) fn synthesize_last_updated_sequence_number(
     schema: &Schema,
     columns: &[ArrayRef],
     num_rows: usize,
+    first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<Option<i64>>, String> {
+    if first_row_id.is_none() {
+        return Ok(vec![None; num_rows]);
+    }
     let stored = stored_values(
         schema,
         columns,
@@ -243,14 +231,14 @@ pub(crate) fn synthesize_last_updated_sequence_number(
         if let Some(stored) = stored
             && !stored.is_null(row)
         {
-            out.push(stored.value(row));
+            out.push(Some(stored.value(row)));
             continue;
         }
-        out.push(data_sequence_number.ok_or_else(|| {
+        out.push(Some(data_sequence_number.ok_or_else(|| {
             format!(
                 "row {row} inherits its {ICEBERG_LAST_UPDATED_SEQ_COL} but the data file carries no data sequence number"
             )
-        })?);
+        })?));
     }
     Ok(out)
 }
@@ -306,7 +294,7 @@ mod tests {
         assert_eq!(
             synthesize_row_id(&schema, &columns, 3, Some(1000), &[0, 1, 2])
                 .expect("synthesis succeeds"),
-            vec![42, 1001, 7]
+            vec![Some(42), Some(1001), Some(7)]
         );
     }
 
@@ -318,41 +306,27 @@ mod tests {
         assert_eq!(
             synthesize_row_id(&schema, &columns, 2, Some(500), &[3, 9])
                 .expect("synthesis succeeds"),
-            vec![503, 509]
+            vec![Some(503), Some(509)]
         );
     }
 
-    /// A file whose stored column covers every row is complete on its own, so
-    /// the manifest's `first_row_id` is never consulted.
+    /// A missing allocation base nulls the entire column, even stored values.
     #[test]
-    fn a_fully_stored_row_id_column_needs_no_first_row_id() {
-        let schema = schema_with_stored_row_id();
-        let columns = vec![
-            Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![Some(42_i64), Some(7)])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
-        ];
-
-        assert_eq!(
-            synthesize_row_id(&schema, &columns, 2, None, &[0, 1]).expect("synthesis succeeds"),
-            vec![42, 7]
-        );
-    }
-
-    /// The inherited fact is not optional for a row that actually inherits.
-    #[test]
-    fn an_inheriting_row_without_first_row_id_fails_closed() {
+    fn missing_first_row_id_nulls_both_lineage_columns() {
         let schema = schema_with_stored_row_id();
         let columns = vec![
             Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
             Arc::new(Int64Array::from(vec![Some(42_i64), None])) as ArrayRef,
-            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(11_i64), Some(12)])) as ArrayRef,
         ];
-
-        let error = synthesize_row_id(&schema, &columns, 2, None, &[0, 1])
-            .expect_err("an inheriting row needs the file's first row id");
-        assert!(error.contains("row 1"), "{error}");
-        assert!(error.contains("first row id"), "{error}");
+        assert_eq!(
+            synthesize_row_id(&schema, &columns, 2, None, &[]).unwrap(),
+            vec![None, None]
+        );
+        assert_eq!(
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, None, Some(99)).unwrap(),
+            vec![None, None]
+        );
     }
 
     #[test]
@@ -365,9 +339,9 @@ mod tests {
         ];
 
         assert_eq!(
-            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(99))
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(500), Some(99))
                 .expect("synthesis succeeds"),
-            vec![11, 99]
+            vec![Some(11), Some(99)]
         );
     }
 
@@ -397,13 +371,13 @@ mod tests {
         assert_eq!(
             synthesize_row_id(&schema, &columns, 2, Some(500), &[3, 9])
                 .expect("synthesis succeeds"),
-            vec![503, 509]
+            vec![Some(503), Some(509)]
         );
         // ... while the stored `_last_updated_sequence_number` is preserved.
         assert_eq!(
-            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(99))
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(500), Some(99))
                 .expect("synthesis succeeds"),
-            vec![11, 12]
+            vec![Some(11), Some(12)]
         );
     }
 }

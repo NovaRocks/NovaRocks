@@ -57,17 +57,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_p_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW minmax_p_mv_${uuid0}
-PARTITION BY region
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(amount) AS mn,
-       MAX(amount) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_minmax_p_${uuid0}.ns_${uuid0}.orders
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -87,6 +76,17 @@ INSERT INTO ice_ivm_minmax_p_${uuid0}.ns_${uuid0}.orders VALUES
   ('LA', 27),
   ('LA', 37),
   ('LA', 47);
+CREATE MATERIALIZED VIEW minmax_p_mv_${uuid0}
+PARTITION BY region
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(amount) AS mn,
+       MAX(amount) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_minmax_p_${uuid0}.ns_${uuid0}.orders
+GROUP BY region;
 REFRESH MATERIALIZED VIEW minmax_p_mv_${uuid0};
 
 -- query 3

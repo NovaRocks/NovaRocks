@@ -278,6 +278,7 @@ mod tests {
             ConnectorTableObjectId::try_new(Bytes::from_static(b"object-1")).expect("object"),
             Bytes::from_static(b"schema-2"),
             true,
+            Some(1),
             true,
             vec![
                 MvObservedSourceField::try_new(

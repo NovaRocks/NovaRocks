@@ -61,6 +61,15 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_fanin_${uuid0};
 USE ns_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
+INSERT INTO ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_east VALUES
+  (1, 'east', 10),
+  (2, 'west', 7);
+INSERT INTO ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_west VALUES
+  (3, 'east', 5),
+  (4, 'north', 3);
 CREATE MATERIALIZED VIEW fanin_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -74,15 +83,6 @@ FROM (
   FROM ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_west
 ) u
 GROUP BY region;
-
--- query 2
--- @skip_result_check=true
-INSERT INTO ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_east VALUES
-  (1, 'east', 10),
-  (2, 'west', 7);
-INSERT INTO ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_west VALUES
-  (3, 'east', 5),
-  (4, 'north', 3);
 REFRESH MATERIALIZED VIEW fanin_mv_${uuid0};
 
 -- query 3

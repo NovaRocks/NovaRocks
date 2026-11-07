@@ -326,13 +326,19 @@ fn literal_when_matrix_retains_truth_only_case_and_exact_action_tags() {
 }
 
 #[test]
-fn insert_only_has_no_target_assertion_and_no_synthetic_identity() {
-    assert!(mor_merge_pre_expand_assertion(false).is_none());
-    let assertion = mor_merge_pre_expand_assertion(true).unwrap();
-    assert_eq!(assertion.key_column_name, "__nr_row_id");
+fn insert_only_checks_matched_target_positions_without_synthetic_identity() {
+    let assertion = mor_merge_pre_expand_assertion();
+    assert_eq!(
+        assertion.key_columns,
+        vec![
+            ("__nr_file".into(), "_file".into()),
+            ("__nr_pos".into(), "_pos".into()),
+            ("__nr_merge_action".into(), "__nr_merge_action".into()),
+        ]
+    );
     assert!(
         assertion.applicability_output_ordinal.is_none(),
-        "SQL owns the selected-action scope ordinal"
+        "SQL owns the matched-file scope ordinal"
     );
     let authored = compile_selected_action(None, "TRUE", "TRUE", true);
     let plan = authored.plan();

@@ -49,6 +49,7 @@ TBLPROPERTIES (
   "format-version" = "3",
   "write.row-lineage" = "true"
 );
+INSERT INTO ${case_db}.orders_shape VALUES (1, 10);
 CREATE MATERIALIZED VIEW ${case_db}.orders_shape_mv
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

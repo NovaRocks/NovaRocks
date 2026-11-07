@@ -86,11 +86,13 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_ki
 -- restart must not resume a completed CTAS as a second Catalog mutation.
 -- @skip_result_check=true
 -- @restart_fe_after_step=true
-CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success AS
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success
+TBLPROPERTIES ('write.row-lineage'='false') AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 8
-SELECT COUNT(*) AS n
+SELECT COUNT(*) AS n, COUNT(_row_id) AS assigned_ids,
+       COUNT(_last_updated_sequence_number) AS assigned_sequences
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 
 -- query 9
@@ -166,5 +168,36 @@ printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "CONCURRENT_APPEND_MUTATION_OK"
 
 -- query 13
+-- Default CTAS must not invent a lineage property; an explicit false property
+-- survives as metadata while format v3 still supplies actual lineage values.
+-- Java metadata and Spark reads are an independent oracle, using the same
+-- existing staged REST fixture as the preceding positive CTAS operations.
+-- @result_contains=CTAS_FORMAT_LINEAGE_PROPERTIES_OK
+shell: set -eu
+tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-ctas-lineage-properties-XXXXXX.scala")"
+trap 'rm -f "$tmp_scala"' EXIT
+cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iru5-commit-interop/SparkCommitInterop.scala" > "$tmp_scala"
+cat >> "$tmp_scala" <<'SPARK_SCALA'
+Iru5SparkCommitInterop.checked("CTAS_FORMAT_LINEAGE_PROPERTIES_OK") {
+  for ((name, expectedProperty) <- Seq(("response_lost", None), ("restart_after_success", Some("false")))) {
+    val qualified = "ice_rest.ns_${uuid0}." + name
+    val table = Iru5SparkCommitInterop.table(spark, qualified)
+    require(Iru5SparkCommitInterop.metadata(table).formatVersion() == 3, "CTAS always creates v3")
+    require(Option(table.properties().get("write.row-lineage")) == expectedProperty, "CTAS must preserve exactly the user's lineage property")
+    require(table.currentSnapshot().firstRowId() != null, "CTAS data snapshot must have a row range")
+    val counts = spark.sql("SELECT COUNT(*), COUNT(_row_id), COUNT(DISTINCT _row_id), COUNT(_last_updated_sequence_number) FROM " + qualified).collect().head
+    require((0 to 3).forall(i => counts.getLong(i) == 3L), "CTAS lineage is independent of the ordinary property")
+  }
+}
+SPARK_SCALA
+spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || {
+  printf '%s\n' "$spark_out"
+  exit 1
+}
+printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | tr '\r' '\n' | grep -Fx 'CTAS_FORMAT_LINEAGE_PROPERTIES_OK'
+
+-- query 14
+-- @cleanup=true
 -- @skip_result_check=true
 DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;

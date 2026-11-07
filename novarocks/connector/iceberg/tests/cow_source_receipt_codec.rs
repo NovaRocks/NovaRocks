@@ -95,10 +95,11 @@ fn source_proof_facts() -> IcebergTableHandle {
         .chain(ROW_LINEAGE_METADATA_COLUMNS)
     {
         proof.metadata_columns.push(
-            IcebergColumnHandle::base_column(&NestedField::required(
+            IcebergColumnHandle::base_column(&NestedField::new(
                 metadata.field_id(),
                 metadata.column_name(),
                 Type::Primitive(metadata.declared_type()),
+                !metadata.nullable(),
             ))
             .unwrap()
             .to_proto(),
@@ -163,12 +164,24 @@ fn cow_source_receipt_codec_keeps_original_domain_pin_and_signed_fields() {
     assert_eq!(decoded.read_domain(), table.read_domain());
     let proof = decoded.frozen_cow_source().unwrap();
     assert_eq!(proof.metadata_columns().len(), 4);
-    assert!(proof.metadata_columns().iter().all(|c| !c.nullable()));
+    assert_eq!(
+        proof
+            .metadata_columns()
+            .iter()
+            .map(|column| (column.base_column_identity().name(), column.nullable()))
+            .collect::<Vec<_>>(),
+        [
+            ("_file", false),
+            ("_pos", false),
+            ("_row_id", true),
+            ("_last_updated_sequence_number", true),
+        ]
+    );
     assert!(original_table_facts().frozen_cow_source().is_none());
     assert!(IcebergMetadataColumn::LastUpdatedSequenceNumber.nullable());
 }
 #[test]
-fn cow_source_receipt_codec_rejects_wrong_pin_and_nullable_proof() {
+fn cow_source_receipt_codec_rejects_wrong_pin_and_metadata_nullability() {
     let table = source_proof_facts();
     let mut raw = table.to_proto();
     raw.frozen_cow_source.as_mut().unwrap().data_file_path = "s3://fixture/other.parquet".into();
@@ -177,13 +190,66 @@ fn cow_source_receipt_codec_rejects_wrong_pin_and_nullable_proof() {
         error.message(),
         "Iceberg COW proof differs from its frozen table source"
     );
+    for ordinal in 0..4 {
+        let mut raw = table.to_proto();
+        let column = &mut raw.frozen_cow_source.as_mut().unwrap().metadata_columns[ordinal];
+        column.nullable = !column.nullable;
+        let error = IcebergTableHandle::from_proto(&raw).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Iceberg COW proof metadata fields differ from the signed source"
+        );
+    }
+}
+
+#[test]
+fn cow_source_receipt_codec_rejects_foreign_type_and_metadata_membership() {
+    let table = source_proof_facts();
     let mut raw = table.to_proto();
-    raw.frozen_cow_source.as_mut().unwrap().metadata_columns[3].nullable = true;
-    let error = IcebergTableHandle::from_proto(&raw).unwrap_err();
+    raw.frozen_cow_source.as_mut().unwrap().metadata_columns[0] = IcebergColumnHandle::base_column(
+        &NestedField::required(77, "foreign", Type::Primitive(PrimitiveType::String)),
+    )
+    .unwrap()
+    .to_proto();
     assert_eq!(
-        error.message(),
+        IcebergTableHandle::from_proto(&raw).unwrap_err().message(),
+        "Iceberg COW proof contains a non-metadata field"
+    );
+
+    let mut raw = table.to_proto();
+    raw.frozen_cow_source.as_mut().unwrap().metadata_columns[2] =
+        IcebergColumnHandle::base_column(&NestedField::optional(
+            IcebergMetadataColumn::RowId.field_id(),
+            "_row_id",
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .unwrap()
+        .to_proto();
+    assert_eq!(
+        IcebergTableHandle::from_proto(&raw).unwrap_err().message(),
+        "iceberg metadata column _row_id must be declared as long"
+    );
+
+    let mut raw = table.to_proto();
+    let columns = &mut raw.frozen_cow_source.as_mut().unwrap().metadata_columns;
+    columns[1] = columns[0].clone();
+    assert_eq!(
+        IcebergTableHandle::from_proto(&raw).unwrap_err().message(),
         "Iceberg COW proof metadata fields differ from the signed source"
     );
+
+    for ordinal in [0, 3] {
+        let mut raw = table.to_proto();
+        raw.frozen_cow_source
+            .as_mut()
+            .unwrap()
+            .metadata_columns
+            .remove(ordinal);
+        assert_eq!(
+            IcebergTableHandle::from_proto(&raw).unwrap_err().message(),
+            "Iceberg COW proof metadata membership is incomplete"
+        );
+    }
 }
 #[test]
 fn cow_source_receipt_codec_three_compile_causes_preserve_actual_prefix() {

@@ -54,6 +54,15 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_ins_${uuid0};
 USE ns_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
+INSERT INTO ice_ivm_minmax_ins_${uuid0}.ns_${uuid0}.orders VALUES
+  ('east', 30),
+  ('east', 10),
+  ('east', 20),
+  ('west', 100),
+  ('west', 200);
 CREATE MATERIALIZED VIEW minmax_ins_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -64,15 +73,6 @@ SELECT region,
        COUNT(*) AS c
 FROM ice_ivm_minmax_ins_${uuid0}.ns_${uuid0}.orders
 GROUP BY region;
-
--- query 2
--- @skip_result_check=true
-INSERT INTO ice_ivm_minmax_ins_${uuid0}.ns_${uuid0}.orders VALUES
-  ('east', 30),
-  ('east', 10),
-  ('east', 20),
-  ('west', 100),
-  ('west', 200);
 REFRESH MATERIALIZED VIEW minmax_ins_mv_${uuid0};
 
 -- query 3

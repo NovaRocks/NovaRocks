@@ -65,18 +65,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_jmm_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW jmm_mv_${uuid0}
-DISTRIBUTED BY HASH(user_region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT u.user_region,
-       MIN(o.order_amount) AS mn,
-       MAX(o.order_amount) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders AS o
-JOIN ice_ivm_jmm_${uuid0}.ns_${uuid0}.users AS u
-  ON o.user_id = u.id
-GROUP BY u.user_region;
 
 -- query 2
 -- @skip_result_check=true
@@ -90,6 +78,18 @@ INSERT INTO ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders VALUES
   (102, 2, 40),
   (103, 2, 60),
   (104, 3, 99);
+CREATE MATERIALIZED VIEW jmm_mv_${uuid0}
+DISTRIBUTED BY HASH(user_region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT u.user_region,
+       MIN(o.order_amount) AS mn,
+       MAX(o.order_amount) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders AS o
+JOIN ice_ivm_jmm_${uuid0}.ns_${uuid0}.users AS u
+  ON o.user_id = u.id
+GROUP BY u.user_region;
 REFRESH MATERIALIZED VIEW jmm_mv_${uuid0};
 
 -- query 3

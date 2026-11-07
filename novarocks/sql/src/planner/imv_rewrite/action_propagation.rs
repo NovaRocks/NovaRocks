@@ -539,7 +539,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
                     novarocks_type_contract::FunctionValueType::new(
                         arrow::datatypes::DataType::Int64,
-                        false,
+                        true,
                     ),
                 )?;
                 for input in &mut plan.children {
@@ -638,7 +638,7 @@ fn promote_project_union_row_id_output(
     let row_id_column = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
         ctx,
         crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
-        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
     )?;
     let Some(union_plan) = plan.children.get_mut(0) else {
         return Ok(false);
@@ -670,13 +670,8 @@ fn promote_project_union_row_id_output(
         }
         item.expr.value_type = novarocks_type_contract::FunctionValueType::new(
             arrow::datatypes::DataType::Int64,
-            false,
+            true,
         );
-        item.expr.value_type = item
-            .expr
-            .value_type
-            .with_nullable(false)
-            .expect("validated root NULL contract");
         item.output_column_id = row_id_column;
         item.output_name = ImvRowIdColumn::NAME.to_string();
     }
@@ -1123,7 +1118,7 @@ mod tests {
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Int64,
-                        false,
+                        true,
                     ),
                 },
                 output_name: ImvRowIdColumn::NAME.to_string(),
@@ -1701,6 +1696,7 @@ mod tests {
             .find(|column| ImvRowIdColumn::matches(column))
             .expect("union should expose _row_id");
         assert_eq!(row_id.column_id, ColumnId(100));
+        assert!(row_id.value_type.nullable());
         for child in &changed.children {
             let LogicalPlanKind::Project(project) = &child.kind else {
                 panic!("expected normalized Project branch");
@@ -1711,6 +1707,7 @@ mod tests {
                 .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
                 .expect("branch should expose _row_id");
             assert_eq!(item.output_column_id, row_id.column_id);
+            assert!(item.expr.value_type.nullable());
         }
     }
 
@@ -1769,7 +1766,7 @@ mod tests {
                             },
                             value_type: novarocks_type_contract::FunctionValueType::new(
                                 DataType::Int64,
-                                false,
+                                true,
                             ),
                         },
                         output_name: ImvRowIdColumn::NAME.to_string(),
@@ -1811,6 +1808,8 @@ mod tests {
             .find(|column| ImvRowIdColumn::matches(column))
             .expect("union should expose _row_id");
         assert_eq!(project_row_id.output_column_id, union_row_id.column_id);
+        assert!(project_row_id.expr.value_type.nullable());
+        assert!(union_row_id.value_type.nullable());
         for child in &union_plan.children {
             let LogicalPlanKind::Project(project) = &child.kind else {
                 panic!("expected normalized Project branch");
@@ -1821,6 +1820,7 @@ mod tests {
                 .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
                 .expect("branch should expose _row_id");
             assert_eq!(item.output_column_id, union_row_id.column_id);
+            assert!(item.expr.value_type.nullable());
         }
     }
 

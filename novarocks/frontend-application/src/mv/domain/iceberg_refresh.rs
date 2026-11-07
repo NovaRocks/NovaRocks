@@ -598,7 +598,6 @@ pub(crate) fn finish_mv_create_preparation(
             });
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
-        ("write.row-lineage".to_string(), "true".to_string()),
         (
             APPLY_KEY_COLUMN_PROPERTY.to_string(),
             apply_key_column_name.to_string(),
@@ -847,7 +846,7 @@ fn validate_union_projection_schema_contract_for_base(
     occurrence: &RelationOccurrence,
     base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
-) -> Result<(), String> {
+) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
     let interpretation = projection.facts.interpretation();
     if interpretation.branches.len() != branch_count {
         return Err(format!(
@@ -857,13 +856,14 @@ fn validate_union_projection_schema_contract_for_base(
             iceberg_target.table,
             interpretation.branches.len(),
             branch_count
-        ));
+        ).into());
     }
     if interpretation.apply_key.kind != ApplyKeyKind::BaseRowId {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} must use BaseRowId inner apply keys",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ));
+        )
+        .into());
     }
     validate_branch_id_field(projection, target_observation).map_err(|error| {
         format!(
@@ -879,7 +879,7 @@ fn validate_union_projection_schema_contract_for_base(
         Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} requires schema rebind, which is not supported for UNION ALL refresh; rebuild or recreate the MV",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ))
+        ).into())
     }
 }
 #[allow(

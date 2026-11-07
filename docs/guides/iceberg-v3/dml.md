@@ -31,7 +31,7 @@ under the License.
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | 见 [maintenance](maintenance.md) |
 | INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | v3、分区表，见下文 |
 | CTAS（`CREATE TABLE AS SELECT`） | ✅ | 标准 REST staged-create，显式 warehouse；Hadoop/HMS 在副作用前拒绝 |
-| CTAS 默认 V3 row-lineage | ❌ | 默认格式为 v2，v3 需显式声明 |
+| CTAS 默认 V3 row-lineage | ✅ | 默认格式 v3，不注入 lineage 属性 |
 | TRUNCATE TABLE | ✅ | 清空目标 ref，保留 schema 和历史 |
 | CDC sink（Flink-style 持续写入） | ❌ | |
 
@@ -142,7 +142,9 @@ USING (SELECT id, user_id, amount, ts FROM orders_changes) s
 - not matched 走 FastAppend
 - matched DELETE 走 position-delete / DV 路径
 
-要求基表 v3 + row-lineage。
+要求基表 v3；`write.row-lineage` 不参与准入。
+
+MOR路径按目标行物理位置与命中子句判重，未命中子句的匹配行也参与；重复返回Trino119，UPDATE FROM使用UPDATE原文。当前UPDATE/UPDATE FROM默认仍可走COW，其独立consumer的重复拒绝没有这个119身份。当前SQL MERGE统一路由MOR，表的COW设置不代表MERGE实际走COW。
 
 ### ❌ MERGE INTO 写指定 branch
 
@@ -158,10 +160,10 @@ CREATE TABLE t_new AS SELECT * FROM t_old;
 namespace。完整初始化、属性和数据请求使用 assert-create 一次发布；零行结果创建无快照空表。
 目标被并发创建时按 `IF NOT EXISTS` 语义结束，结果未知时按 lake-publication 核对。
 
-## ❌ CTAS 默认 V3 row-lineage
+## ✅ CTAS 默认 V3 row-lineage
 
-CTAS 默认格式仍为 v2。需要 v3 写入时，在 CREATE 中显式设置 `format-version=3`；需要依赖已存储
-行血缘的 UPDATE/MERGE 等能力时，同时显式设置 `write.row-lineage=true`。
+CTAS 只创建 v3 表，显式请求其他格式会在准入时拒绝；不注入 `write.row-lineage`。
+用户显式给出的这个属性（包括 `false`）作为普通表属性保留，不改变 v3 的 lineage 能力。
 
 ## ✅ TRUNCATE TABLE
 

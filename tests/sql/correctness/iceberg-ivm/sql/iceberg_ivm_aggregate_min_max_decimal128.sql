@@ -56,16 +56,6 @@ TBLPROPERTIES ("format-version" = "3",
   "write.row-lineage" = "true");
 SET CATALOG ice_ivm_minmax_decimal_db_${uuid0};
 USE ns_${uuid0};
-CREATE MATERIALIZED VIEW decimal_mv_${uuid0}
-DISTRIBUTED BY HASH(region) BUCKETS 1
-PROPERTIES ('storage_engine' = 'iceberg')
-AS
-SELECT region,
-       MIN(amount) AS mn,
-       MAX(amount) AS mx,
-       COUNT(*) AS c
-FROM ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales
-GROUP BY region;
 
 -- query 2
 -- @skip_result_check=true
@@ -78,6 +68,16 @@ INSERT INTO ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales VALUES
   (3, 'east', 30.00),
   (4, 'east', 40.25),
   (5, 'east', 50.99);
+CREATE MATERIALIZED VIEW decimal_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT region,
+       MIN(amount) AS mn,
+       MAX(amount) AS mx,
+       COUNT(*) AS c
+FROM ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales
+GROUP BY region;
 REFRESH MATERIALIZED VIEW decimal_mv_${uuid0};
 
 -- query 3

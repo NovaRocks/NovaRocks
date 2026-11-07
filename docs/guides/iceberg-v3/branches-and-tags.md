@@ -83,7 +83,7 @@ ALTER TABLE t CREATE OR REPLACE BRANCH dev AS OF VERSION 1234567890123;
 
 ## ✅ 写入指定 branch
 
-> 要求基表是 v3 + `write.row-lineage = true`。
+> 要求基表是 v3；row lineage 由格式版本提供，不读取 `write.row-lineage`。
 
 NovaRocks 用 `<table>.branch_<name>` 后缀语法限定写入 ref——**注意这与 Spark 的 `<table>@<branch>` 不同**：
 

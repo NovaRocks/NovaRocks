@@ -24,7 +24,8 @@ NovaRocks 的受管物化视图以 Iceberg 表保存结果。本文说明当前�
 ## 使用前提
 
 - 使用 Iceberg REST catalog。原生 Hadoop/Hive catalog 不提供受管 MV 写入能力，管理操作在外部副作用前拒绝。
-- 基表是 Iceberg format v3，且启用 `write.row-lineage=true`。不满足条件时，`CREATE MATERIALIZED VIEW` 拒绝。
+- 基表是 Iceberg format v3，且准确所选快照带 row range。`write.row-lineage` 不参与判断；从 v2 升级但尚未进行 v3 提交的快照会被拒绝，报错包含所选快照与恢复办法：执行一次 v3 提交，例如 OPTIMIZE，再重试。
+- MV 目标表只要求格式 v3；新建目标不注入 `write.row-lineage`。
 - MV 目标与基表位于同一 Iceberg catalog。定义的关系、字段和目标布局必须能由当前 provider 事实准确绑定；无法证明的形状拒绝，不猜测旧字段 ID 或 snapshot。
 - 首次刷新需要基表当前有可钉住的 snapshot。刚创建、从未产生 snapshot 的空基表当前使刷新走 `SkipEmpty`；有 snapshot 但可见行数为零的基表可以发布零行结果。
 

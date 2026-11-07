@@ -7616,9 +7616,10 @@ impl<'a> ContractLoweringVisitor<'a> {
             if !assertion.group_key_labels.is_empty()
                 || assertion.keyed_message_prefix.is_some()
                 || assertion.applicability_column_id.is_some()
+                || assertion.declared_violation.is_some()
             {
                 return Err(ContractLoweringError::InvalidAssertion {
-                    detail: "global assertion carries keyed labels, message, or applicability",
+                    detail: "global assertion carries keyed labels, message, applicability, or violation",
                 });
             }
             let desired = assertion
@@ -7692,6 +7693,7 @@ impl<'a> ContractLoweringVisitor<'a> {
             };
             RowCountAssertionSpec::PerKeyAtMostOne {
                 applicability,
+                declared_violation: assertion.declared_violation,
                 keys,
                 labels: assertion
                     .group_key_labels
@@ -18581,6 +18583,7 @@ mod tests {
         let input = column(1, "account_id", DataType::Int64, false);
         let global = PhysicalPlanNode {
             kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode {
+                declared_violation: None,
                 subquery_text: "select account_id from accounts".to_string(),
                 desired_num_rows: Some(1),
                 assertion: PlanRowCountAssertion::Le,
@@ -18631,25 +18634,55 @@ mod tests {
     }
 
     #[test]
+    fn global_assertion_cannot_silently_drop_a_declared_keyed_violation() {
+        let input = column(1, "id", DataType::Int64, false);
+        let plan = PhysicalPlanNode {
+            kind: PhysicalPlanKind::AssertOneRow(
+                PlanAssertOneRowNode::global_at_most_one("scalar subquery")
+                    .with_declared_violation(Some(
+                        novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+                    )),
+            ),
+            children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
+            output_columns: vec![input],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let error = finish_for_test(&plan).unwrap_err();
+        assert!(
+            error.to_string().contains("global assertion carries keyed"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn conditional_keyed_assertion_keeps_true_only_scope_and_independent_stage() {
-        let key = column(1, "actual_row_id", DataType::Int64, true);
-        let mask = column(2, "selected_action_applies", DataType::Boolean, true);
-        let columns = vec![key.clone(), mask.clone()];
+        let key = column(1, "actual_file", DataType::Utf8, true);
+        let position = column(3, "actual_position", DataType::Int64, true);
+        let action = column(4, "selected_clause", DataType::Int64, false);
+        let mask = column(2, "target_file_present", DataType::Boolean, true);
+        let columns = vec![key.clone(), position.clone(), action.clone(), mask.clone()];
+        let file = || TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("fixture.parquet".into())),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        };
         let keyed = PhysicalPlanNode {
             kind: PhysicalPlanKind::AssertOneRow(PlanAssertOneRowNode::per_key_at_most_one(
                 "mutation",
-                vec![key.column_id],
-                vec!["actual_row_id".into()],
+                vec![key.column_id, position.column_id, action.column_id],
+                vec!["_file".into(), "_pos".into(), "selected_clause".into()],
                 "duplicate selected target",
                 Some(mask.column_id),
             )),
             children: vec![values(
                 columns.clone(),
                 vec![
-                    vec![literal_int(7), literal_bool(true)],
-                    vec![literal_int(7), literal_bool(false)],
+                    vec![file(), literal_int(7), literal_int(0), literal_bool(true)],
+                    vec![file(), literal_int(7), literal_int(0), literal_bool(false)],
                     vec![
+                        file(),
                         literal_int(7),
+                        literal_int(0),
                         TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Null),
                             value_type: novarocks_type_contract::FunctionValueType::new(
@@ -18697,6 +18730,11 @@ mod tests {
         assert_eq!(
             scheme.definition.algorithm,
             novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+        );
+        assert_eq!(
+            keys.len(),
+            3,
+            "conditional exchange retains the complete tuple"
         );
         let fragment = &plan.fragments()[&edge.destination.fragment];
         assert_eq!(

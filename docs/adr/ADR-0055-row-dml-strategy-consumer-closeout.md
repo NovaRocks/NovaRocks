@@ -12,6 +12,9 @@ partially-superseded-by:
   - id: ADR-0171
     scope: "Compromise 5: forward written-version prediction; source facts and provider strategy ownership remain effective"
     link: "ADR-0171-commit-operation-model.md"
+  - id: ADR-0219
+    scope: "Historical write.row-lineage-dependent eligibility and compromise 1's v2 plus property write limitation; Provider strategy and SQL predicate ownership remain active"
+    link: "ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md"
 date: 2026-08-11
 provenance:
   - "discussion: 2026-08-11 row-DML physical routing closeout"

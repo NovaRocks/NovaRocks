@@ -166,7 +166,7 @@ impl DmlChangeStreamPreparations {
         effect_set: DmlRowMutationEffectSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::dml::error::DmlExecutionError> {
         use novarocks_spi::connector::ConnectorRowMutationIntent;
 
         let intent = match effect_set {
@@ -858,7 +858,7 @@ fn finish_update_mutation_preparation(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-) -> Result<PreparedUpdateMutation, String> {
+) -> Result<PreparedUpdateMutation, crate::dml::error::DmlExecutionError> {
     let planning_pin = target_binding.planning_pin().clone();
     // Validate assignments against the Provider's exact target declaration.
     // Partition columns are ordinary target values: the signed strategy keeps
@@ -878,9 +878,9 @@ fn finish_update_mutation_preparation(
         strategy @ (novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
         | novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead) => strategy,
         other => {
-            return Err(format!(
-                "UPDATE cannot be served by row-mutation strategy {other:?}"
-            ));
+            return Err(
+                format!("UPDATE cannot be served by row-mutation strategy {other:?}").into(),
+            );
         }
     };
     let target_columns =
@@ -978,7 +978,7 @@ fn finish_merge_mutation_preparation(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-) -> Result<PreparedMergeMutation, String> {
+) -> Result<PreparedMergeMutation, crate::dml::error::DmlExecutionError> {
     let planning_pin = target_binding.planning_pin().clone();
     // The clause composition is a statement fact; what it implies physically is
     // not. A MERGE that can delete matched rows needs merge-on-read even on a
@@ -1007,9 +1007,9 @@ fn finish_merge_mutation_preparation(
         strategy @ (novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
         | novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead) => strategy,
         other => {
-            return Err(format!(
-                "MERGE cannot be served by row-mutation strategy {other:?}"
-            ));
+            return Err(
+                format!("MERGE cannot be served by row-mutation strategy {other:?}").into(),
+            );
         }
     };
     let target_columns = if table_write_mode
@@ -1201,9 +1201,14 @@ fn build_update_mor_producer(
             target_columns: target_columns.to_vec(),
         },
         Some(DmlPreExpandKeyedAssert {
+            declared_violation: Some(
+                novarocks_failure_contract::sql_reason::UPDATE_TARGET_ROW_MULTIPLE_MATCHES,
+            ),
             applicability_output_ordinal: None,
-            key_column_name: "__nr_row_id".to_string(),
-            key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            key_columns: vec![
+                ("__nr_file".into(), "_file".into()),
+                ("__nr_pos".into(), "_pos".into()),
+            ],
             message_prefix: "MOR UPDATE matched target row".to_string(),
         }),
     ))
@@ -3416,15 +3421,24 @@ fn build_exact_cow_merge_selection_query(
     )
 }
 
-/// SQL derives the true-only scope from this producer's selected action.
-/// Unmatched INSERT rows may keep a NULL target identity without inventing one.
-fn mor_merge_pre_expand_assertion(has_matched_action: bool) -> Option<DmlPreExpandKeyedAssert> {
-    has_matched_action.then(|| DmlPreExpandKeyedAssert {
+/// Every matched target row participates, including rows for which no WHEN
+/// clause applies. Unmatched INSERT rows keep their actual NULL target locator.
+// Design: ADR-0219 (docs/adr/ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md)
+fn mor_merge_pre_expand_assertion() -> DmlPreExpandKeyedAssert {
+    DmlPreExpandKeyedAssert {
+        declared_violation: Some(
+            novarocks_failure_contract::sql_reason::MERGE_TARGET_ROW_MULTIPLE_MATCHES,
+        ),
         applicability_output_ordinal: None,
-        key_column_name: "__nr_row_id".to_string(),
-        key_label: novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        key_columns: vec![
+            ("__nr_file".into(), "_file".into()),
+            ("__nr_pos".into(), "_pos".into()),
+            // With one supported WHEN MATCHED clause, action identifies the
+            // selected clause; zero is the group for no selected clause.
+            ("__nr_merge_action".into(), "__nr_merge_action".into()),
+        ],
         message_prefix: "MOR MERGE matched target row".to_string(),
-    })
+    }
 }
 
 fn build_merge_mor_producer(
@@ -3557,7 +3571,7 @@ fn build_merge_mor_producer(
             matched_delete: has_matched_delete,
             not_matched_insert: has_not_matched_insert,
         },
-        mor_merge_pre_expand_assertion(has_matched_update || has_matched_delete),
+        Some(mor_merge_pre_expand_assertion()),
     ))
 }
 
@@ -3613,21 +3627,21 @@ fn build_merge_match_query_sql(
             format!("{target_alias}.{}", quote_ident(column))
         }
     };
-    let row_id = qualify("_row_id");
+    let file = qualify("_file");
     let nullable_target_column = |column: &str| {
         let value = qualify(column);
-        format!("CASE WHEN {row_id} IS NOT NULL THEN {value} ELSE NULL END")
+        format!("CASE WHEN {file} IS NOT NULL THEN {value} ELSE NULL END")
     };
     let mut action_cases = Vec::new();
     if let Some(action) = matched_action {
         action_cases.push(format!(
-            "WHEN {row_id} IS NOT NULL AND ({}) THEN {action}",
+            "WHEN {file} IS NOT NULL AND ({}) THEN {action}",
             matched_predicate_sql.unwrap_or("TRUE")
         ));
     }
     if has_not_matched_insert {
         action_cases.push(format!(
-            "WHEN {row_id} IS NULL AND ({}) THEN {MERGE_ACTION_NOT_MATCHED_INSERT}",
+            "WHEN {file} IS NULL AND ({}) THEN {MERGE_ACTION_NOT_MATCHED_INSERT}",
             not_matched_predicate_sql.unwrap_or("TRUE")
         ));
     }
@@ -5024,7 +5038,7 @@ mod tests {
 
         assert!(!sql.contains("t.*"), "{sql}");
         assert!(
-            sql.contains("CASE WHEN t.`_row_id` IS NOT NULL THEN t.`id` ELSE NULL END AS `id`"),
+            sql.contains("CASE WHEN t.`_file` IS NOT NULL THEN t.`id` ELSE NULL END AS `id`"),
             "{sql}"
         );
         assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
@@ -5032,7 +5046,7 @@ mod tests {
         assert!(sql.contains("AS __nr_merge_action"), "{sql}");
         assert!(
             sql.contains(
-                "CASE WHEN t.`_row_id` IS NOT NULL THEN t.`_row_id` ELSE NULL END AS __nr_row_id"
+                "CASE WHEN t.`_file` IS NOT NULL THEN t.`_row_id` ELSE NULL END AS __nr_row_id"
             ),
             "{sql}"
         );

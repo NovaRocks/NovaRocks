@@ -169,7 +169,8 @@ pub struct MvSourceSchemaObservation {
     object_id: ConnectorTableObjectId,
     schema_version: Bytes,
     format_v3: bool,
-    stored_row_lineage_enabled: bool,
+    selected_snapshot_id: Option<i64>,
+    selected_snapshot_has_row_range: bool,
     fields: Vec<MvObservedSourceField>,
 }
 
@@ -179,14 +180,20 @@ impl MvSourceSchemaObservation {
         object_id: ConnectorTableObjectId,
         schema_version: Bytes,
         format_v3: bool,
-        stored_row_lineage_enabled: bool,
+        selected_snapshot_id: Option<i64>,
+        selected_snapshot_has_row_range: bool,
         fields: Vec<MvObservedSourceField>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
         validate_table(&table, "MV source schema")?;
-        if stored_row_lineage_enabled && !format_v3 {
-            return corrupt("MV source row lineage requires its observed v3 format");
+        if selected_snapshot_has_row_range && !format_v3 {
+            return corrupt("MV source snapshot row range requires its observed v3 format");
+        }
+        if selected_snapshot_id.is_some_and(|id| id < 0)
+            || (selected_snapshot_has_row_range && selected_snapshot_id.is_none())
+        {
+            return corrupt("MV source snapshot row range has no valid selected snapshot ID");
         }
         if schema_version.is_empty() || fields.is_empty() {
             return corrupt("MV CREATE source observation has no schema version or fields");
@@ -225,7 +232,8 @@ impl MvSourceSchemaObservation {
             object_id,
             schema_version,
             format_v3,
-            stored_row_lineage_enabled,
+            selected_snapshot_id,
+            selected_snapshot_has_row_range,
             fields,
         })
     }
@@ -246,8 +254,14 @@ impl MvSourceSchemaObservation {
         self.format_v3
     }
 
-    pub const fn stored_row_lineage_enabled(&self) -> bool {
-        self.stored_row_lineage_enabled
+    /// The exact selected source snapshot; `None` means no snapshot exists.
+    pub const fn selected_snapshot_id(&self) -> Option<i64> {
+        self.selected_snapshot_id
+    }
+
+    /// Whether that snapshot records its v3 row-ID allocation range.
+    pub const fn selected_snapshot_has_row_range(&self) -> bool {
+        self.selected_snapshot_has_row_range
     }
 
     pub fn fields(&self) -> &[MvObservedSourceField] {
@@ -442,7 +456,6 @@ pub struct MvSchemaValidationObservation {
     schema_version: Bytes,
     partition_spec_version: Bytes,
     format_v3: bool,
-    stored_row_lineage_enabled: bool,
     fields: Vec<(u32, MvObservedSourceField)>,
     partition_fields: Vec<MvExactPartitionField>,
 }
@@ -455,7 +468,6 @@ impl MvSchemaValidationObservation {
         schema_version: Bytes,
         partition_spec_version: Bytes,
         format_v3: bool,
-        stored_row_lineage_enabled: bool,
         fields: Vec<(u32, MvObservedSourceField)>,
         partition_fields: Vec<MvExactPartitionField>,
         context: &ConnectorRequestContext,
@@ -531,7 +543,6 @@ impl MvSchemaValidationObservation {
             schema_version,
             partition_spec_version,
             format_v3,
-            stored_row_lineage_enabled,
             fields,
             partition_fields,
         })
@@ -554,9 +565,6 @@ impl MvSchemaValidationObservation {
     }
     pub const fn is_format_v3(&self) -> bool {
         self.format_v3
-    }
-    pub const fn stored_row_lineage_enabled(&self) -> bool {
-        self.stored_row_lineage_enabled
     }
     pub fn fields(&self) -> &[(u32, MvObservedSourceField)] {
         &self.fields
@@ -1182,6 +1190,7 @@ mod tests {
             target_object_id(),
             Bytes::from_static(b"schema-1"),
             true,
+            Some(11),
             true,
             vec![field.clone(), field],
             &context(),
@@ -1191,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn source_schema_cannot_claim_stored_row_lineage_without_v3() {
+    fn source_snapshot_cannot_claim_a_row_range_without_v3() {
         let field = MvObservedSourceField::try_new(
             Bytes::from_static(b"id"),
             "id".into(),
@@ -1204,6 +1213,7 @@ mod tests {
             target_object_id(),
             Bytes::from_static(b"schema-1"),
             false,
+            Some(11),
             true,
             vec![field],
             &context(),
@@ -1231,7 +1241,6 @@ mod tests {
                     .unwrap(),
                 Bytes::from_static(b"schema"),
                 Bytes::from_static(b"spec"),
-                true,
                 true,
                 fields,
                 vec![],
@@ -1276,7 +1285,6 @@ mod tests {
                     .unwrap(),
                 Bytes::from_static(b"schema"),
                 Bytes::from_static(b"spec"),
-                true,
                 true,
                 vec![(0, field.clone())],
                 partition_fields,

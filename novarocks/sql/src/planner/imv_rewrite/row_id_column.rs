@@ -19,9 +19,9 @@
 //!
 //! `_row_id` is the Iceberg v3 row-lineage identity. The IMV apply key
 //! (`__nova_base_row_id`) is derived from it. Phase 3 injects it (internal,
-//! Int64, non-null) on Delta-bound scans and version snapshot scans so refresh
-//! rewrite rules can build row-identity apply keys from real plan outputs. It
-//! is never exposed to user-visible output.
+//! Int64, with its source NULL contract) on Delta-bound scans and version
+//! snapshot scans so refresh rewrite rules can build row-identity apply keys
+//! from real plan outputs. It is never exposed to user-visible output.
 
 use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
@@ -47,7 +47,7 @@ impl ImvRowIdColumn {
         OutputColumn {
             column_id,
             name: Self::NAME.to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
 
             is_internal: true,
         }
@@ -67,7 +67,7 @@ impl ImvRowIdColumn {
         columns.push(ColumnDef {
             name: Self::NAME.to_string(),
             data_type: DataType::Int64,
-            nullable: false,
+            nullable: true,
             write_default: None,
             logical_type: None,
         });
@@ -124,6 +124,17 @@ impl LogicalRewriteRule for InjectRowIdRule {
             let LogicalPlanKind::Scan(mut scan) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
+            ImvRowIdColumn::ensure_metadata_column(
+                &mut scan.table.iceberg_row_lineage_metadata_columns,
+            );
+            let metadata = scan
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+                .expect("row-ID metadata was retained or inserted");
+            let value_type =
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, metadata.nullable);
             let column_id = match scan
                 .columns
                 .iter()
@@ -133,15 +144,15 @@ impl LogicalRewriteRule for InjectRowIdRule {
                 None => crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                     ctx,
                     ImvRowIdColumn::NAME,
-                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    value_type.clone(),
                 )?,
             };
             scan.columns
                 .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
-            scan.columns.push(ImvRowIdColumn::output_column(column_id));
-            ImvRowIdColumn::ensure_metadata_column(
-                &mut scan.table.iceberg_row_lineage_metadata_columns,
-            );
+            scan.columns.push(OutputColumn {
+                value_type,
+                ..ImvRowIdColumn::output_column(column_id)
+            });
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                 LogicalPlanKind::Scan(scan),
                 children,
@@ -255,7 +266,7 @@ mod tests {
         let col = ImvRowIdColumn::output_column(ColumnId(7));
         assert_eq!(col.name, "_row_id");
         assert_eq!(col.value_type.data_type().clone(), DataType::Int64);
-        assert!(!col.value_type.nullable());
+        assert!(col.value_type.nullable());
         assert!(col.is_internal);
     }
 
@@ -349,6 +360,7 @@ mod tests {
         let metadata = factory.get(row_id.column_id);
         assert_eq!(metadata.name, row_id.name);
         assert_eq!(metadata.value_type, row_id.value_type);
+        assert!(metadata.value_type.nullable());
         assert_eq!(factory.peek_next_id(), allocated_id.0 + 1);
         // Reservations carry identity only; they are not authored columns.
         assert!(factory.value_type(ColumnId(1)).is_none());
@@ -391,6 +403,50 @@ mod tests {
         assert_eq!(row_id_columns.len(), 1);
         assert_eq!(row_id_columns[0].column_id, ColumnId(9));
         assert!(row_id_columns[0].is_internal);
+    }
+
+    #[test]
+    fn inject_row_id_preserves_authored_source_nullability_in_factory_and_scan() {
+        for nullable in [false, true] {
+            let rule = InjectRowIdRule;
+            let mut ctx = build_ctx();
+            let mut scan = delta_scan();
+            scan.table
+                .iceberg_row_lineage_metadata_columns
+                .push(ColumnDef {
+                    name: "_row_id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable,
+                    write_default: None,
+                    logical_type: None,
+                });
+            let plan = scan_plan(scan);
+            let mut arena = ScalarArena::new();
+            let expr = to_optimizer_expr(&plan, &mut arena);
+            let RewriteResult::Changed(changed) = rule.apply(expr, &mut ctx).unwrap() else {
+                panic!("expected injected scan");
+            };
+            let changed = crate::planner::optimizer_bridge::logical::to_logical_plan(
+                changed,
+                &ctx.scalar_arena().borrow(),
+            );
+            let LogicalPlanKind::Scan(scan) = changed.kind else {
+                panic!("expected injected scan");
+            };
+            let row_id = scan
+                .columns
+                .iter()
+                .find(|column| ImvRowIdColumn::matches(column))
+                .unwrap();
+            assert_eq!(row_id.value_type.nullable(), nullable);
+            let factory = ctx.column_ref_factory().unwrap().borrow();
+            assert_eq!(factory.get(row_id.column_id).value_type, row_id.value_type);
+            assert_eq!(scan.table.iceberg_row_lineage_metadata_columns.len(), 1);
+            assert_eq!(
+                scan.table.iceberg_row_lineage_metadata_columns[0].nullable,
+                nullable
+            );
+        }
     }
 
     #[test]
