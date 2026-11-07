@@ -892,26 +892,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-compatibility/novarocks_mor_lineage_spark_read",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_multi_dv_puffin_novarocks_dml",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_complex_nested",
       "failure": {
         "class": "error_code",
@@ -952,26 +932,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-dml/merge_insert_row_id_unique",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/mor_lineage_sequence_inheritance",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-dml/struct_named_metadata_value",
       "failure": {
         "class": "error_code",
@@ -979,16 +939,6 @@
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/named_struct/dynamic-v1` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B7a, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 1; 1 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-dml-oracle-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
       "owner": "UEA-5E B7a",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/update_mor",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
       "expires": "2026-12-15"
     },
     {
@@ -1472,16 +1422,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-rest/iceberg_rest_update_merge",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Compiled carrier does not express change-stream router sinks; owner B1; remove after capability repair and native verification",
-      "owner": "B1",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:join/join_bucket_shuffle_right_outer_equivalence",
       "failure": {
         "class": "error_code",
@@ -1959,56 +1899,6 @@
       },
       "reason": "builtin.scalar/array_sum/dynamic-v1 missing installed pure implementation. Actual clean fffbffe8 step29; no executed independent oracle failed. B7 installs the original array_sum pure owner/effect/carrier contract, then the entire unchanged case passes all original result/numeric expected-error oracles; admission alone does not close this record.",
       "owner": "B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_cow",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_matched_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_matched_delete_insert",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_mor",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/merge_into_upsert_delete",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Statement 3 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
-      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
