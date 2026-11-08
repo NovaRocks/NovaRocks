@@ -300,6 +300,25 @@ impl TaskGraph {
             .flatten()
             .copied()
     }
+    pub(crate) fn producer_stage_after(
+        &self,
+        consumer: StageId,
+        after: Option<StageId>,
+    ) -> Option<StageId> {
+        let producers = self.producer_stages.get(&consumer)?;
+        match after {
+            Some(after) => producers
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next()
+                .copied(),
+            None => producers.first().copied(),
+        }
+    }
+    pub(crate) fn is_producer_stage(&self, consumer: StageId, producer: StageId) -> bool {
+        self.producer_stages
+            .get(&consumer)
+            .is_some_and(|producers| producers.contains(&producer))
+    }
     pub fn participations(&self) -> impl ExactSizeIterator<Item = &ParticipationRef> {
         self.participations.iter()
     }

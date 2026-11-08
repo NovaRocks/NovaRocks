@@ -29,7 +29,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::completion_facts::parent_released_children;
 use crate::conclusion::{LatchOutcome, TerminationLatch};
 use crate::config::DispatchBudget;
 use crate::config::FrozenTransportLimits as TransportBudget;
@@ -334,6 +333,36 @@ enum TerminalCleanupCursor {
     Reconciliations,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StagePropagationCursor {
+    Children {
+        parent: StageId,
+        after: Option<StageId>,
+    },
+    Consumers {
+        parent: StageId,
+        producer: StageId,
+    },
+    Tasks {
+        parent: StageId,
+        producer: StageId,
+        after: Option<TaskId>,
+    },
+}
+#[derive(Debug, Default)]
+struct StageParentDebt {
+    scan_done: bool,
+    scan_cancelled: bool,
+    retry_unproven: bool,
+    rescan_requested: bool,
+    cancels: usize,
+}
+#[derive(Clone, Copy, Debug)]
+struct StageCancelDebt {
+    parent: StageId,
+    request: novarocks_execution_contract::CancelTask,
+}
+
 /// The task protocol of one query execution attempt.
 #[derive(Debug)]
 pub struct QueryTaskExecution {
@@ -345,6 +374,10 @@ pub struct QueryTaskExecution {
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
     derived_edges: EdgeDerivations,
+    stage_demand: crate::stage::demand::StageDemandObservations,
+    stage_propagation: Option<StagePropagationCursor>,
+    stage_parent_debts: BTreeMap<StageId, StageParentDebt>,
+    stage_cancel_debts: BTreeMap<TaskOperationId, StageCancelDebt>,
     now: MonotonicInstant,
     ids: OperationIds,
     covered_observation_active: bool,
@@ -381,7 +414,11 @@ pub struct QueryTaskExecution {
     accepted_protocol_dirty_tasks: BTreeSet<TaskId>,
     accepted_protocol_writer_evidence: BTreeMap<TaskId, Arc<TaskStatus>>,
     required_result_terminal_control_deadline: Option<MonotonicInstant>,
-    drained_tasks: BTreeSet<TaskId>,
+    // First local terminal order, including terminal without TaskStatus.
+    // This 1-based graph frontier is not an observation/source sequence.
+    drained_tasks: BTreeMap<TaskId, usize>,
+    stage_demand_cuts: BTreeMap<StageId, usize>,
+    withdrawal_materialized: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
 }
@@ -651,6 +688,7 @@ impl QueryTaskExecution {
             .copied()
             .map(|participation| (participation, CoveredParticipationObservation::default()))
             .collect();
+        let stage_demand = crate::stage::demand::StageDemandObservations::new(&graph);
         Ok(Self {
             graph,
             stages,
@@ -660,6 +698,10 @@ impl QueryTaskExecution {
             dispatcher,
             edges,
             derived_edges: EdgeDerivations::default(),
+            stage_demand,
+            stage_propagation: None,
+            stage_parent_debts: BTreeMap::new(),
+            stage_cancel_debts: BTreeMap::new(),
             now,
             ids,
             covered_observation_active: false,
@@ -692,7 +734,9 @@ impl QueryTaskExecution {
             accepted_protocol_dirty_tasks: BTreeSet::new(),
             accepted_protocol_writer_evidence: BTreeMap::new(),
             required_result_terminal_control_deadline: None,
-            drained_tasks: BTreeSet::new(),
+            drained_tasks: BTreeMap::new(),
+            stage_demand_cuts: BTreeMap::new(),
+            withdrawal_materialized: BTreeSet::new(),
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
         })
@@ -1148,7 +1192,10 @@ impl QueryTaskExecution {
             .task_by_identity_ref(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         Ok(!self.terminal_cleanup_started
-            && (destination_close || (!self.normal_drain_started && !task.normally_stood_down())))
+            && (destination_close
+                || (!self.normal_drain_started
+                    && !self.stage_demand_withdraws(identity)
+                    && !task.normally_stood_down())))
     }
     /// Checks the original immutable input, never a caller-supplied class.
     /// The concrete driver uses this before both Native admission and dispatch.
@@ -1181,13 +1228,14 @@ impl QueryTaskExecution {
                 "attempt drain rejects new task updates".into(),
             ));
         }
+        self.apply_prior_withdrawal(identity)?;
         let (stage_id, task_id) = self
             .locate(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         self.stages
             .get_mut(&stage_id)
             .expect("located stage")
-            .task_mut(task_id)
+            .task_mut_observed(task_id, &self.stage_demand)
             .expect("located Task")
             .begin_input_preparation(update, &mut self.ids)
     }
@@ -1200,7 +1248,7 @@ impl QueryTaskExecution {
         operation: TaskOperationId,
         grant: QueuedInputGrantRef,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        self.apply_prior_normal_drain(identity)?;
+        self.apply_prior_withdrawal(identity)?;
         if self.terminal_cleanup_started {
             self.task_by_identity(identity)
                 .ok_or(TaskExecutionError::UnknownOperation)?
@@ -1217,18 +1265,53 @@ impl QueryTaskExecution {
     /// Task BEFORE accepting a later primary fact that could discard input.
     /// This preserves the first disposition and the original ACK priority,
     /// regardless of whether the background cursor has reached this row.
-    fn apply_prior_normal_drain(
-        &mut self,
-        identity: TaskIdentity,
-    ) -> Result<(), TaskExecutionError> {
-        if self.normal_drain_started
-            && !self
-                .task_by_identity_ref(identity)
-                .ok_or(TaskExecutionError::UnknownOperation)?
-                .normally_stood_down()
+    fn stage_demand_withdraws(&self, identity: TaskIdentity) -> bool {
+        let Some(&frontier) = self.stage_demand_cuts.get(&identity.stage_id()) else {
+            return false;
+        };
+        if self
+            .stages
+            .get(&identity.stage_id())
+            .and_then(StageExecution::root_task)
+            == Some(identity.task_id())
+        {
+            return false;
+        }
+        !self.edges.requires_drain(identity)
+            || self
+                .drained_tasks
+                .get(&identity.task_id())
+                .is_some_and(|&ordinal| ordinal <= frontier)
+    }
+    fn apply_prior_withdrawal(&mut self, identity: TaskIdentity) -> Result<(), TaskExecutionError> {
+        if !self.withdrawal_materialized.contains(&identity.task_id())
+            && (self.normal_drain_started || self.stage_demand_withdraws(identity))
         {
             self.stand_down_task_normally(identity)?;
         }
+        Ok(())
+    }
+    /// Current proof linearizes one original producer-stage authorization.
+    /// Task fanout materializes this accepted cut. Consumer regression cannot
+    /// revoke it; a later strict terminal cannot enter its original frontier.
+    fn accept_stage_demand_cut(
+        &mut self,
+        parent: StageId,
+        producer: StageId,
+    ) -> Result<(), TaskExecutionError> {
+        if self.terminal_cleanup_started
+            || self.released_children_of.contains(&parent)
+            || !self.graph.is_producer_stage(parent, producer)
+            || self.stage_demand.producer() != Some(producer)
+            || self.stage_demand.all_consumers_released() != Some(true)
+        {
+            return Err(TaskExecutionError::Schedule(
+                "stage demand cut lacks its original current consumer proof".into(),
+            ));
+        }
+        self.stage_demand_cuts
+            .insert(producer, self.drained_tasks.len());
+        self.stage_demand.finish();
         Ok(())
     }
 
@@ -1283,6 +1366,7 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?
             .begin_normal_stand_down();
         self.settle_task_drain(identity.stage_id(), identity.task_id());
+        self.withdrawal_materialized.insert(identity.task_id());
         Ok(())
     }
 
@@ -1300,6 +1384,19 @@ impl QueryTaskExecution {
         // create a new original reconciliation which must remain observable.
         self.terminal_retired_reconciliations = std::mem::take(&mut self.status_reconciliations);
         self.normal_drain_cursor = None;
+        if let Some(cursor) = self.stage_propagation.take() {
+            let parent = match cursor {
+                StagePropagationCursor::Children { parent, .. }
+                | StagePropagationCursor::Consumers { parent, .. }
+                | StagePropagationCursor::Tasks { parent, .. } => parent,
+            };
+            self.stage_parent_debts
+                .get_mut(&parent)
+                .expect("same active parent traversal")
+                .scan_cancelled = true;
+            self.finish_stage_parent_if_ready(parent);
+        }
+        self.stage_demand.finish();
         self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Tasks(None));
     }
     pub(crate) fn has_pending_terminal_cleanup(&self) -> bool {
@@ -1321,7 +1418,7 @@ impl QueryTaskExecution {
         match *cursor {
             TerminalCleanupCursor::Tasks(after) => {
                 if let Some(identity) = self.graph.task_after(after).map(|task| task.identity()) {
-                    self.apply_prior_normal_drain(identity)?;
+                    self.apply_prior_withdrawal(identity)?;
                     self.task_by_identity(identity)
                         .expect("frozen Task")
                         .discard_creation_after_attempt_failure();
@@ -1426,7 +1523,7 @@ impl QueryTaskExecution {
             .and_then(|stage| stage.task(task_id))
             .ok_or(TaskExecutionError::UnknownOperation)?
             .identity();
-        self.apply_prior_normal_drain(identity)?;
+        self.apply_prior_withdrawal(identity)?;
         let result = self.acknowledge_task_inner(stage_id, task_id, ack);
         // Local FailedClosed can become terminal without a TaskStatus or Task
         // failure latch. Count it even on Err before the outer failure policy
@@ -1446,7 +1543,7 @@ impl QueryTaskExecution {
             .get_mut(&stage_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let mut task = stage
-            .task_mut(task_id)
+            .task_mut_observed(task_id, &self.stage_demand)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let participation = task.participation();
         match ack.kind() {
@@ -1580,7 +1677,7 @@ impl QueryTaskExecution {
                 owner.on_participation_ack(ack)?;
                 if owner.establish_acknowledged() {
                     for stage in self.stages.values_mut() {
-                        for (_, mut task) in stage.tasks_mut() {
+                        for (_, mut task) in stage.tasks_mut_observed(&self.stage_demand) {
                             if task.participation() == participation {
                                 task.on_participation_established();
                             }
@@ -1651,6 +1748,7 @@ impl QueryTaskExecution {
             .len();
         for index in 0..count {
             let identity = self.tasks_by_participation[&participation][index];
+            self.apply_prior_withdrawal(identity)?;
             let (result, was_fenced_out, fenced_out) = {
                 let mut task = self
                     .task_by_identity(identity)
@@ -2229,7 +2327,7 @@ impl QueryTaskExecution {
         report: &mut StatusReport,
     ) -> Result<(), TaskExecutionError> {
         let identity = status.identity();
-        self.apply_prior_normal_drain(identity)?;
+        self.apply_prior_withdrawal(identity)?;
         let result = self.apply_published_inner(status, report);
         if self.locate(identity).is_some() {
             self.settle_task_drain(identity.stage_id(), identity.task_id());
@@ -2250,7 +2348,9 @@ impl QueryTaskExecution {
             .stages
             .get_mut(&stage_id)
             .expect("the stage was just located");
-        let mut task = stage.task_mut(task_id).expect("the task was just located");
+        let mut task = stage
+            .task_mut_observed(task_id, &self.stage_demand)
+            .expect("the task was just located");
         let was_owned = task.create_ownership_proven();
         let accepted = match task.observe_status(status)? {
             StatusObservation::Accept => {
@@ -2344,86 +2444,327 @@ impl QueryTaskExecution {
         let Some(owner) = self.owners.get_mut(&participation) else {
             return;
         };
-        if terminal && self.drained_tasks.insert(task_id) {
-            owner.note_task_drained();
+        if terminal {
+            let next = self
+                .drained_tasks
+                .len()
+                .checked_add(1)
+                .expect("frozen Task terminal ordinal");
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.drained_tasks.entry(task_id)
+            {
+                entry.insert(next);
+                owner.note_task_drained();
+            }
         }
         if output_settled && self.released_outputs.insert(task_id) {
             owner.note_output_released();
         }
     }
 
-    /// Cancels a producer only after all of its consumers have stopped.
-    ///
-    /// Exactly one layer per call: a child only releases its own producers
-    /// once its own derived state says it has stopped consuming, which needs
-    /// its tasks to have actually stood down.
-    fn propagate_stage_release(&mut self) -> Result<(), TaskExecutionError> {
-        let released = self
-            .stages
-            .iter()
-            .filter(|(stage_id, stage)| {
-                parent_released_children(stage.state())
-                    && !self.released_children_of.contains(stage_id)
-            })
-            .map(|(&stage_id, _)| stage_id)
-            .collect::<Vec<_>>();
-        let now = self.now;
-        for stage_id in released {
-            let children = self.graph.producer_stages(stage_id).collect::<Vec<_>>();
-            let mut candidates = VecDeque::new();
-            for child in children {
-                // A multicast producer can feed several consumer stages.
-                // One finished branch releases only its own need; cancelling
-                // the producer then would strand another branch without EOS.
-                let all_consumers_released = self
-                    .graph
-                    .edges()
-                    .filter(|edge| edge.producer_stage() == child)
-                    .all(|edge| {
-                        self.stages
-                            .get(&edge.consumer_stage())
-                            .is_some_and(StageExecution::released_children)
+    /// Original stage-demand derivation, charged one Stage/consumer/Task at a
+    /// time. The accepted stage cut precedes fanout and remains independent
+    /// of Native admission debt, so Full cannot occupy the unique proof or
+    /// block another producer's eligibility traversal.
+    pub(crate) fn has_pending_stage_propagation(&self) -> bool {
+        !self.terminal_cleanup_started
+            && (self.stage_propagation.is_some() || self.stage_demand.has_pending_parents())
+    }
+    pub(crate) fn propagate_stage_release(
+        &mut self,
+        context: &mut dyn crate::capacity::StepContext,
+    ) -> Result<bool, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Ok(false);
+        }
+        if let Some(StagePropagationCursor::Consumers { .. }) = self.stage_propagation
+            && let Some(consumer) = self.stage_demand.next_consumer()
+        {
+            let released = self
+                .stages
+                .get(&consumer)
+                .ok_or(TaskExecutionError::UnknownOperation)?
+                .released_children();
+            return self.stage_demand.check_next(consumer, released, context);
+        }
+        if !self.has_pending_stage_propagation() || !context.charge(1) {
+            return Ok(false);
+        }
+        match self.stage_propagation {
+            None => {
+                let parent = self
+                    .stage_demand
+                    .next_parent()
+                    .expect("real coalesced Stage change");
+                if let Some(debt) = self.stage_parent_debts.get_mut(&parent) {
+                    // Do not lose this actual new release while the old pass
+                    // waits on a different Cancel's original Native input.
+                    debt.rescan_requested = true;
+                } else if !self.released_children_of.contains(&parent)
+                    && self
+                        .stages
+                        .get(&parent)
+                        .is_some_and(StageExecution::released_children)
+                {
+                    self.stage_parent_debts
+                        .insert(parent, StageParentDebt::default());
+                    self.stage_propagation = Some(StagePropagationCursor::Children {
+                        parent,
+                        after: None,
                     });
-                if !all_consumers_released {
-                    continue;
-                }
-                let Some(stage) = self.stages.get(&child) else {
-                    continue;
-                };
-                let identities = stage
-                    .tasks()
-                    .filter(|(task_id, _)| Some(**task_id) != stage.root_task())
-                    .map(|(_, task)| task.identity())
-                    .collect::<Vec<_>>();
-                for identity in identities {
-                    self.stand_down_task_normally(identity)?;
-                }
-                let intents = self
-                    .stages
-                    .get_mut(&child)
-                    .expect("the child stage was just located")
-                    .cancel_normally_stood_down_tasks(&mut self.ids);
-                for intent in intents {
-                    let identity = match &intent {
-                        OperationIntent::CancelTask(request) => request.identity(),
-                        _ => continue,
-                    };
-                    candidates.push_back(AdmissionCandidate::minted(
-                        OperationTarget::Task {
-                            stage: child,
-                            task: identity.task_id(),
-                        },
-                        intent,
-                    ));
                 }
             }
-            // Only a pass that admitted every cancel this release owes closes
-            // the release: a cancel skipped behind a full target is still
-            // owed, and its stage is asked again on the next turn.
-            if self.enqueue_candidates(candidates, now)?.complete() {
-                self.released_children_of.insert(stage_id);
+            Some(StagePropagationCursor::Children { parent, after }) => {
+                if let Some(producer) = self.graph.producer_stage_after(parent, after) {
+                    self.stage_demand.begin(producer)?;
+                    self.stage_propagation =
+                        Some(StagePropagationCursor::Consumers { parent, producer });
+                } else {
+                    self.stage_parent_debts
+                        .get_mut(&parent)
+                        .expect("original parent traversal")
+                        .scan_done = true;
+                    self.finish_stage_parent_if_ready(parent);
+                    self.stage_propagation = None;
+                }
+            }
+            Some(StagePropagationCursor::Consumers { parent, producer }) => {
+                match self.stage_demand.all_consumers_released() {
+                    Some(true) => {
+                        self.accept_stage_demand_cut(parent, producer)?;
+                        self.stage_propagation = Some(StagePropagationCursor::Tasks {
+                            parent,
+                            producer,
+                            after: None,
+                        });
+                    }
+                    Some(false) => {
+                        if !self.stage_demand_cuts.contains_key(&producer) {
+                            self.stage_parent_debts
+                                .get_mut(&parent)
+                                .expect("same original parent")
+                                .retry_unproven = true;
+                        }
+                        self.stage_demand.finish();
+                        self.stage_propagation = Some(StagePropagationCursor::Children {
+                            parent,
+                            after: Some(producer),
+                        });
+                    }
+                    None => {
+                        return Err(TaskExecutionError::Schedule(
+                            "stage proof traversal lost its next consumer".into(),
+                        ));
+                    }
+                }
+            }
+            Some(StagePropagationCursor::Tasks {
+                parent,
+                producer,
+                after,
+            }) => {
+                let stage = self
+                    .stages
+                    .get(&producer)
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                let next = stage.task_after(after).map(RemoteTask::identity);
+                if let Some(identity) = next {
+                    // Root exclusion precedes both physical no-more and Cancel.
+                    if stage.root_task() != Some(identity.task_id()) {
+                        self.apply_prior_withdrawal(identity)?;
+                        let intent = {
+                            let stage = self
+                                .stages
+                                .get_mut(&producer)
+                                .expect("frozen producer stage");
+                            let mut task = stage
+                                .task_mut_observed(identity.task_id(), &self.stage_demand)
+                                .expect("frozen producer Task");
+                            task.normally_stood_down()
+                                .then(|| {
+                                    task.cancel_intent(
+                                        CancelReason::UpstreamNoLongerNeeded,
+                                        &mut self.ids,
+                                    )
+                                })
+                                .flatten()
+                        };
+                        if let Some(intent) = intent {
+                            let operation = intent.operation_id();
+                            if let Err(error) = self.dispatcher.validate_operation_carrier(&intent)
+                            {
+                                self.rollback_unsent(
+                                    OperationTarget::Task {
+                                        stage: producer,
+                                        task: identity.task_id(),
+                                    },
+                                    operation,
+                                );
+                                return Err(error);
+                            }
+                            let OperationIntent::CancelTask(request) = intent else {
+                                unreachable!("original normal Cancel author")
+                            };
+                            assert!(
+                                self.stage_cancel_debts
+                                    .insert(operation, StageCancelDebt { parent, request })
+                                    .is_none(),
+                                "unique original Cancel operation"
+                            );
+                            self.stage_parent_debts
+                                .get_mut(&parent)
+                                .expect("same original parent traversal")
+                                .cancels += 1;
+                        }
+                    }
+                    self.stage_propagation = Some(StagePropagationCursor::Tasks {
+                        parent,
+                        producer,
+                        after: Some(identity.task_id()),
+                    });
+                } else {
+                    self.stage_propagation = Some(StagePropagationCursor::Children {
+                        parent,
+                        after: Some(producer),
+                    });
+                }
             }
         }
+        Ok(true)
+    }
+    fn finish_stage_parent_if_ready(&mut self, parent: StageId) {
+        if self
+            .stage_parent_debts
+            .get(&parent)
+            .is_some_and(|debt| (debt.scan_done || debt.scan_cancelled) && debt.cancels == 0)
+        {
+            let debt = self
+                .stage_parent_debts
+                .remove(&parent)
+                .expect("same original parent debt");
+            if debt.scan_cancelled {
+                return;
+            }
+            if !debt.retry_unproven {
+                self.released_children_of.insert(parent);
+            } else if debt.rescan_requested
+                && self
+                    .stages
+                    .get(&parent)
+                    .is_some_and(StageExecution::released_children)
+            {
+                self.stage_demand.revisit_parent(parent);
+            }
+        }
+    }
+    /// A read-only original request position. Full leaves this SAME request
+    /// and parent debt here. The concrete driver correlates any outstanding
+    /// Native preparation; repeatedly reading this value cannot mint Work.
+    pub(crate) fn next_stage_cancel_admission(
+        &self,
+        after: Option<TaskOperationId>,
+    ) -> Option<(TaskOperationId, novarocks_execution_contract::CancelTask)> {
+        if self.terminal_cleanup_started {
+            None
+        } else {
+            self.stage_cancel_after(after)
+        }
+    }
+    pub(crate) fn next_stage_cancel_withdrawal(
+        &self,
+        after: Option<TaskOperationId>,
+    ) -> Option<(TaskOperationId, novarocks_execution_contract::CancelTask)> {
+        if self.terminal_cleanup_started {
+            self.stage_cancel_after(after)
+        } else {
+            None
+        }
+    }
+    fn stage_cancel_after(
+        &self,
+        after: Option<TaskOperationId>,
+    ) -> Option<(TaskOperationId, novarocks_execution_contract::CancelTask)> {
+        let next = match after {
+            Some(after) => self
+                .stage_cancel_debts
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => self.stage_cancel_debts.first_key_value(),
+        };
+        next.map(|(&operation, debt)| (operation, debt.request))
+    }
+    /// Settles logical stage debt only AFTER this exact original Cancel was
+    /// admitted into its canonical dispatcher with the original Native grant.
+    /// This proves neither transport handoff nor RPC/capture actual exit.
+    pub(crate) fn stage_cancel_queued(
+        &mut self,
+        operation: TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        let debt = self
+            .stage_cancel_debts
+            .get(&operation)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let identity = debt.request.identity();
+        if self.dispatcher.operation_state(operation)? != DispatchOperationState::Queued
+            || self.dispatcher.queued_operation_kind(operation) != Some(OperationKind::CancelTask)
+            || self.operation_targets.get(&operation)
+                != Some(&OperationTarget::Task {
+                    stage: identity.stage_id(),
+                    task: identity.task_id(),
+                })
+        {
+            return Err(TaskExecutionError::Schedule(
+                "stage Cancel has not entered its original dispatcher position".into(),
+            ));
+        }
+        self.settle_stage_cancel_debt(operation)
+    }
+    /// Cleanup consumes the original withdrawal result; a passive operation
+    /// identity alone cannot erase an in-flight Native preparation or grant.
+    pub(crate) fn stage_cancel_unused(
+        &mut self,
+        operation: TaskOperationId,
+        outcome: crate::input::WithdrawalOutcome,
+    ) -> Result<(), TaskExecutionError> {
+        if !self.terminal_cleanup_started
+            || outcome != crate::input::WithdrawalOutcome::DefinitelyUnsent
+            || self.dispatcher.operation_state(operation)? != DispatchOperationState::Absent
+        {
+            return Err(TaskExecutionError::Schedule(
+                "stage Cancel retirement lacks its original definitely-unsent closure".into(),
+            ));
+        }
+        let debt = self
+            .stage_cancel_debts
+            .get(&operation)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let identity = debt.request.identity();
+        self.rollback_unsent(
+            OperationTarget::Task {
+                stage: identity.stage_id(),
+                task: identity.task_id(),
+            },
+            operation,
+        );
+        self.settle_stage_cancel_debt(operation)
+    }
+    fn settle_stage_cancel_debt(
+        &mut self,
+        operation: TaskOperationId,
+    ) -> Result<(), TaskExecutionError> {
+        let debt = self
+            .stage_cancel_debts
+            .remove(&operation)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let parent = self
+            .stage_parent_debts
+            .get_mut(&debt.parent)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        parent.cancels = parent
+            .cancels
+            .checked_sub(1)
+            .expect("same original parent Cancel debt");
+        self.finish_stage_parent_if_ready(debt.parent);
         Ok(())
     }
 
@@ -2598,7 +2939,7 @@ impl QueryTaskExecution {
                 if let Some(mut task) = self
                     .stages
                     .get_mut(&stage)
-                    .and_then(|stage| stage.task_mut(task))
+                    .and_then(|stage| stage.task_mut_observed(task, &self.stage_demand))
                 {
                     task.rollback_unsent(operation_id);
                 }
@@ -2628,7 +2969,9 @@ impl QueryTaskExecution {
         identity: TaskIdentity,
     ) -> Option<crate::stage::TaskMutation<'_>> {
         let (stage_id, task_id) = self.locate(identity)?;
-        self.stages.get_mut(&stage_id)?.task_mut(task_id)
+        self.stages
+            .get_mut(&stage_id)?
+            .task_mut_observed(task_id, &self.stage_demand)
     }
 
     fn task_by_identity_ref(&self, identity: TaskIdentity) -> Option<&RemoteTask> {
@@ -3440,5 +3783,688 @@ mod bounded_drain_tests {
             execution.take_status_reconciliations(),
             BTreeSet::from([part])
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_demand_cut_tests {
+    use super::*;
+    use crate::{
+        capacity::{QueueStage, StepContext},
+        config::DispatchLane,
+        effect::FrozenContentRef,
+    };
+    use novarocks_execution_contract::{
+        AbortCause, ContentFingerprint, DomainVersion, TaskOutputFacts, TaskStatusVersion,
+    };
+    struct Turn(usize);
+    impl StepContext for Turn {
+        fn charge(&mut self, n: usize) -> bool {
+            if n > self.0 {
+                false
+            } else {
+                self.0 -= n;
+                true
+            }
+        }
+        fn reserve_queue_stage(
+            &mut self,
+            _: DispatchLane,
+            _: bool,
+            _: BackendProcessId,
+            _: usize,
+            _: usize,
+        ) -> QueueStage {
+            panic!("stage proof grants no transport capacity")
+        }
+    }
+    fn stage(n: u32) -> StageId {
+        StageId::new(n).unwrap()
+    }
+    fn identity(execution: &QueryTaskExecution, n: u32) -> TaskIdentity {
+        execution.task(TaskId::new(n).unwrap()).unwrap().identity()
+    }
+    fn apply(
+        execution: &mut QueryTaskExecution,
+        task: TaskIdentity,
+        version: u64,
+        state: TaskState,
+    ) {
+        let termination = match state {
+            TaskState::Aborting | TaskState::Aborted => {
+                Some(TerminationDetail::Aborted(AbortCause::QueryFailed))
+            }
+            TaskState::Canceling | TaskState::Canceled => Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            _ => None,
+        };
+        let status = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(version).unwrap(),
+            state,
+            termination,
+            TaskOutputFacts::new(state == TaskState::Finished),
+        )
+        .unwrap();
+        execution
+            .apply_published(&status, &mut StatusReport::default())
+            .unwrap();
+    }
+    fn proof(execution: &QueryTaskExecution, producer: u32) {
+        execution.stage_demand.begin(stage(producer)).unwrap();
+        while let Some(consumer) = execution.stage_demand.next_consumer() {
+            let released = execution.stages[&consumer].released_children();
+            assert!(
+                execution
+                    .stage_demand
+                    .check_next(consumer, released, &mut Turn(1))
+                    .unwrap()
+            );
+        }
+    }
+    fn update() -> TaskDomainUpdate {
+        TaskDomainUpdate::TaskDynamicFilter {
+            version: DomainVersion::FIRST,
+            payload: FrozenContentRef {
+                resource: PayloadRef(NonZeroU64::new(99).unwrap()),
+                fingerprint: ContentFingerprint::from_bytes([1; 16]),
+                queued_bytes: 16,
+            },
+        }
+    }
+    #[test]
+    fn original_stage_counts_keep_already_checked_consumer_truth_current() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        execution.stage_demand.begin(stage(2)).unwrap();
+        execution
+            .stage_demand
+            .check_next(stage(1), false, &mut Turn(1))
+            .unwrap();
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        execution
+            .stage_demand
+            .check_next(stage(3), true, &mut Turn(1))
+            .unwrap();
+        assert_eq!(execution.stage_demand.all_consumers_released(), Some(true));
+        apply(&mut execution, first, 3, TaskState::Canceling);
+        assert_eq!(execution.stage_demand.all_consumers_released(), Some(false));
+        assert!(
+            execution
+                .accept_stage_demand_cut(stage(1), stage(2))
+                .is_err()
+        );
+    }
+    #[test]
+    fn accepted_stage_cut_survives_later_failure_before_any_physical_task_fanout() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let task = identity(&execution, 2);
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        let (_, intent) = execution.prepare_task_update(task, update()).unwrap();
+        let operation = intent.unwrap().operation_id();
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        proof(&execution, 2);
+        execution
+            .accept_stage_demand_cut(stage(1), stage(2))
+            .unwrap();
+        assert!(
+            !execution
+                .task(task.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert!(!execution.task_input_allowed(task, false).unwrap());
+        assert_eq!(execution.stage_demand.producer(), None);
+        apply(&mut execution, other, 3, TaskState::Aborting);
+        assert!(execution.terminal_cleanup_started);
+        assert_eq!(
+            execution
+                .complete_task_input_preparation(
+                    task,
+                    operation,
+                    QueuedInputGrantRef(NonZeroU64::new(8).unwrap())
+                )
+                .unwrap(),
+            UpdateAdmission::DiscardedNoLongerNeeded
+        );
+        assert!(execution.withdrawal_materialized.contains(&task.task_id()));
+    }
+    #[test]
+    fn strict_task_uses_original_local_terminal_frontier_and_duplicate_settlement_does_not_rewrite_it()
+     {
+        let mut execution = crate::test_support::execution_with_graph(
+            crate::stage::demand::tests::graph_variant(true, false),
+        );
+        let task = identity(&execution, 2);
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        proof(&execution, 2);
+        execution
+            .accept_stage_demand_cut(stage(1), stage(2))
+            .unwrap();
+        assert!(!execution.stage_demand_withdraws(task));
+        assert!(execution.task_input_allowed(task, false).unwrap());
+        apply(&mut execution, task, 2, TaskState::Finished);
+        let ordinal = execution.drained_tasks[&task.task_id()];
+        assert_eq!(ordinal, 1);
+        assert!(!execution.stage_demand_withdraws(task)); // Later terminal cannot enter the old cut.
+        execution.settle_task_drain(task.stage_id(), task.task_id());
+        assert_eq!(execution.drained_tasks[&task.task_id()], ordinal);
+        proof(&execution, 2);
+        execution
+            .accept_stage_demand_cut(stage(3), stage(2))
+            .unwrap();
+        assert!(execution.stage_demand_withdraws(task)); // A distinct eligible parent pass has its own later cut.
+    }
+    #[test]
+    fn producer_stage_cut_excludes_root_before_task_withdrawal_and_new_external_updates_observe_nonroot_cut()
+     {
+        let mut execution = crate::test_support::execution_with_graph(
+            crate::stage::demand::tests::graph_variant(false, true),
+        );
+        let root = execution.graph.root_identity();
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        proof(&execution, 2);
+        execution
+            .accept_stage_demand_cut(stage(1), stage(2))
+            .unwrap();
+        execution.apply_prior_withdrawal(root).unwrap();
+        assert!(!execution.stage_demand_withdraws(root));
+        assert!(execution.task_input_allowed(root, false).unwrap());
+        assert!(!execution.withdrawal_materialized.contains(&root.task_id()));
+        assert!(
+            !execution
+                .task(root.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        let mut normal =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let task = identity(&normal, 2);
+        let first = identity(&normal, 1);
+        let other = identity(&normal, 3);
+        apply(&mut normal, first, 2, TaskState::Flushing);
+        apply(&mut normal, other, 2, TaskState::Flushing);
+        proof(&normal, 2);
+        normal.accept_stage_demand_cut(stage(1), stage(2)).unwrap();
+        let (disposition, intent) = normal.prepare_task_update(task, update()).unwrap();
+        assert_eq!(disposition, UpdateAdmission::DiscardedNoLongerNeeded);
+        assert!(intent.is_none());
+    }
+    #[test]
+    fn remote_normal_flag_is_not_a_receipt_for_query_side_exact_withdrawal() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let task = identity(&execution, 2);
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        let intent = execution
+            .task_by_identity(task)
+            .unwrap()
+            .release_create(MonotonicInstant::ORIGIN)
+            .unwrap();
+        let operation = intent.operation_id();
+        execution
+            .dispatcher
+            .enqueue_reserved(
+                intent,
+                execution.now,
+                QueuedInputGrantRef(NonZeroU64::new(9).unwrap()),
+            )
+            .unwrap();
+        execution.operation_targets.insert(
+            operation,
+            OperationTarget::Task {
+                stage: task.stage_id(),
+                task: task.task_id(),
+            },
+        );
+        execution
+            .task_by_identity(task)
+            .unwrap()
+            .begin_normal_stand_down(); // Original role-local flag alone.
+        assert!(!execution.withdrawal_materialized.contains(&task.task_id()));
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        proof(&execution, 2);
+        execution
+            .accept_stage_demand_cut(stage(1), stage(2))
+            .unwrap();
+        execution.apply_prior_withdrawal(task).unwrap();
+        assert_eq!(
+            execution.dispatcher.operation_state(operation).unwrap(),
+            DispatchOperationState::Absent
+        );
+        assert!(execution.withdrawal_materialized.contains(&task.task_id()));
+    }
+    #[test]
+    fn multiple_task_guards_report_current_stage_predicate_at_their_actual_drop_order() {
+        let mut execution = crate::test_support::execution_with_graph(
+            crate::stage::demand::tests::graph_two_task_consumer(),
+        );
+        let first = identity(&execution, 1);
+        let sibling = identity(&execution, 5);
+        let other = identity(&execution, 3);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        proof(&execution, 2);
+        assert_eq!(execution.stage_demand.all_consumers_released(), Some(false));
+        let observations = &execution.stage_demand;
+        let mut guards = execution
+            .stages
+            .get_mut(&stage(1))
+            .unwrap()
+            .tasks_mut_observed(observations);
+        let (_, mut first_guard) = guards.next().unwrap();
+        let (_, mut sibling_guard) = guards.next().unwrap();
+        let failed = TaskStatus::try_new(
+            first,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Aborting,
+            Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        first_guard.observe_status(&failed).unwrap();
+        let flushing = TaskStatus::try_new(
+            sibling,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Flushing,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        sibling_guard.observe_status(&flushing).unwrap();
+        drop(sibling_guard); // Counts still contain the first guard's old Flushing.
+        assert_eq!(observations.all_consumers_released(), Some(true));
+        drop(first_guard); // Current counts true -> false, although this guard was created while false.
+        assert_eq!(observations.all_consumers_released(), Some(false));
+    }
+    fn drive(execution: &mut QueryTaskExecution) {
+        let mut steps = 0;
+        while execution.has_pending_stage_propagation() {
+            let mut turn = Turn(1);
+            assert!(execution.propagate_stage_release(&mut turn).unwrap());
+            assert_eq!(turn.0, 0);
+            steps += 1;
+            assert!(steps < 200, "real graph-bounded continuation");
+        }
+    }
+    fn queue_cancel(
+        execution: &mut QueryTaskExecution,
+        operation: TaskOperationId,
+        request: novarocks_execution_contract::CancelTask,
+        grant: u64,
+    ) {
+        execution
+            .dispatcher
+            .enqueue_reserved(
+                OperationIntent::CancelTask(request),
+                execution.now,
+                QueuedInputGrantRef(NonZeroU64::new(grant).unwrap()),
+            )
+            .unwrap();
+        let identity = request.identity();
+        execution.operation_targets.insert(
+            operation,
+            OperationTarget::Task {
+                stage: identity.stage_id(),
+                task: identity.task_id(),
+            },
+        );
+        execution.stage_cancel_queued(operation).unwrap();
+    }
+    #[test]
+    fn false_producer_proof_yields_to_sibling_and_parent_waits_for_original_cancel_admission() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let first = identity(&execution, 1);
+        let blocked = identity(&execution, 2);
+        let sibling = identity(&execution, 4);
+        apply(&mut execution, blocked, 2, TaskState::Running);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        assert!(!execution.propagate_stage_release(&mut Turn(0)).unwrap());
+        drive(&mut execution);
+        assert!(!execution.stage_demand_cuts.contains_key(&stage(2)));
+        assert!(
+            !execution
+                .task(blocked.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert!(
+            execution
+                .task(sibling.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert!(!execution.released_children_of.contains(&stage(1)));
+        let (operation, request) = execution.stage_cancel_after(None).unwrap();
+        assert_eq!(request.identity(), sibling);
+        for _ in 0..100 {
+            assert_eq!(execution.stage_cancel_after(None).unwrap().0, operation);
+        }
+        assert!(execution.stage_cancel_queued(operation).is_err());
+        let mut idle = Turn(1);
+        assert!(!execution.propagate_stage_release(&mut idle).unwrap());
+        assert_eq!(idle.0, 1);
+        queue_cancel(&mut execution, operation, request, 8);
+        assert!(!execution.released_children_of.contains(&stage(1))); // Producer2 still needs a later real release.
+        assert!(!execution.stage_parent_debts.contains_key(&stage(1)));
+        assert!(execution.stage_cancel_after(None).is_none());
+        assert_eq!(
+            execution.task(sibling.task_id()).unwrap().task_state(),
+            TaskState::Running
+        );
+    }
+    #[test]
+    fn blocked_original_cancel_keeps_same_identity_while_other_producer_and_parent_progress() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let first = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        let producer = identity(&execution, 2);
+        let sibling = identity(&execution, 4);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (blocked, original) = execution.stage_cancel_after(None).unwrap();
+        assert_eq!(original.identity(), producer);
+        let (healthy, request) = execution.stage_cancel_after(Some(blocked)).unwrap();
+        assert_eq!(request.identity(), sibling);
+        assert!(execution.stage_cancel_after(Some(healthy)).is_none());
+        assert!(!execution.released_children_of.contains(&stage(1)));
+        queue_cancel(&mut execution, healthy, request, 9);
+        assert_eq!(execution.stage_cancel_after(None).unwrap().0, blocked);
+        assert!(execution.released_children_of.contains(&stage(3))); // Second parent owns no duplicate Cancel.
+        drive(&mut execution);
+        assert_eq!(
+            execution
+                .stage_cancel_after(None)
+                .unwrap()
+                .1
+                .envelope()
+                .operation_id(),
+            original.envelope().operation_id()
+        );
+        queue_cancel(&mut execution, blocked, original, 10);
+        assert!(execution.released_children_of.contains(&stage(1)));
+    }
+    #[test]
+    fn upstream_stage_waits_for_actual_derived_flushing_instead_of_cancel_or_cancel_ack() {
+        use crate::input::{OperationReply, OperationReplyResult};
+        use novarocks_execution_contract::{OperationOutcome, operation::OperationResult};
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph_chain());
+        let root = identity(&execution, 1);
+        let middle = identity(&execution, 2);
+        let upstream = identity(&execution, 3);
+        apply(&mut execution, middle, 2, TaskState::Running);
+        apply(&mut execution, upstream, 2, TaskState::Running);
+        apply(&mut execution, root, 2, TaskState::Flushing);
+        drive(&mut execution);
+        assert!(
+            execution
+                .task(middle.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert!(
+            !execution
+                .task(upstream.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        let (operation, request) = execution.stage_cancel_after(None).unwrap();
+        queue_cancel(&mut execution, operation, request, 11);
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        let reply = OperationReply {
+            operation_id: operation,
+            kind: OperationKind::CancelTask,
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: None,
+            }),
+        };
+        execution.acknowledge(&reply).unwrap();
+        drive(&mut execution);
+        assert_eq!(
+            execution.task(middle.task_id()).unwrap().task_state(),
+            TaskState::Running
+        );
+        assert!(
+            !execution
+                .task(upstream.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        apply(&mut execution, middle, 3, TaskState::Flushing);
+        drive(&mut execution);
+        assert!(
+            execution
+                .task(upstream.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+    }
+    #[test]
+    fn physical_stage_fanout_excludes_root_and_late_cleanup_requires_original_definitely_unsent_fact()
+     {
+        let mut root_execution = crate::test_support::execution_with_graph(
+            crate::stage::demand::tests::graph_variant(false, true),
+        );
+        let first = identity(&root_execution, 1);
+        let other = identity(&root_execution, 3);
+        let root = root_execution.graph.root_identity();
+        apply(&mut root_execution, first, 2, TaskState::Flushing);
+        apply(&mut root_execution, other, 2, TaskState::Flushing);
+        drive(&mut root_execution);
+        assert!(
+            !root_execution
+                .task(root.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert!(
+            !root_execution
+                .withdrawal_materialized
+                .contains(&root.task_id())
+        );
+        assert!(root_execution.stage_cancel_after(None).is_none());
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let first = identity(&execution, 1);
+        let sibling = identity(&execution, 4);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, first, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (operation, request) = execution.stage_cancel_after(None).unwrap();
+        assert!(
+            execution
+                .stage_cancel_unused(operation, crate::input::WithdrawalOutcome::DefinitelyUnsent)
+                .is_err()
+        );
+        execution.begin_terminal_cleanup();
+        assert!(!execution.has_pending_stage_propagation());
+        assert!(
+            execution
+                .stage_cancel_unused(operation, crate::input::WithdrawalOutcome::TooLate)
+                .is_err()
+        );
+        assert_eq!(
+            execution
+                .stage_cancel_after(None)
+                .unwrap()
+                .1
+                .envelope()
+                .operation_id(),
+            request.envelope().operation_id()
+        );
+        execution
+            .stage_cancel_unused(operation, crate::input::WithdrawalOutcome::DefinitelyUnsent)
+            .unwrap();
+        assert!(execution.stage_cancel_after(None).is_none());
+        assert!(
+            execution
+                .stage_cancel_unused(operation, crate::input::WithdrawalOutcome::DefinitelyUnsent)
+                .is_err()
+        );
+    }
+    #[test]
+    fn cleanup_opens_only_original_withdrawal_debt_and_state_remains_send_between_poller_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<QueryTaskExecution>();
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let sibling = identity(&execution, 4);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (operation, _) = execution.next_stage_cancel_admission(None).unwrap();
+        assert!(execution.next_stage_cancel_withdrawal(None).is_none());
+        execution.begin_terminal_cleanup();
+        assert!(execution.next_stage_cancel_admission(None).is_none());
+        assert_eq!(
+            execution.next_stage_cancel_withdrawal(None).unwrap().0,
+            operation
+        );
+        assert!(
+            execution
+                .accept_stage_demand_cut(stage(1), stage(4))
+                .is_err()
+        );
+    }
+    #[test]
+    fn observed_task_mutation_rejects_foreign_original_stage_binding_before_mutating_any_row() {
+        let graph = crate::stage::demand::tests::graph();
+        let mut execution = crate::test_support::execution_with_graph(graph);
+        let foreign =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let task = identity(&execution, 1);
+        let source = &execution.stage_demand;
+        assert!(
+            execution
+                .stages
+                .get_mut(&stage(1))
+                .unwrap()
+                .task_mut_observed(task.task_id(), source)
+                .is_some()
+        );
+        let foreign_stage = novarocks_execution_contract::StageRef::new(
+            novarocks_types::QueryExecutionId::new(
+                novarocks_types::QueryId::new(99, 100),
+                novarocks_types::AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            stage(1),
+        );
+        assert!(!foreign.stage_demand.binds_stage(foreign_stage));
+        let mut tasks = BTreeMap::new();
+        tasks.insert(task.task_id(), crate::test_support::remote(1));
+        let mut owner = StageExecution::new(foreign_stage, None, tasks).unwrap();
+        assert!(
+            owner
+                .task_mut_observed(task.task_id(), &execution.stage_demand)
+                .is_none()
+        );
+        assert_eq!(
+            owner.task(task.task_id()).unwrap().task_state(),
+            TaskState::Planned
+        );
+    }
+    #[test]
+    fn stage_cursor_preserves_unproven_producer_after_consumer_falls_and_releases_again() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph_chain());
+        let parent = identity(&execution, 1);
+        let producer = identity(&execution, 2);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        for _ in 0..3 {
+            assert!(execution.propagate_stage_release(&mut Turn(1)).unwrap());
+        }
+        assert_eq!(execution.stage_demand.all_consumers_released(), Some(true));
+        apply(&mut execution, parent, 3, TaskState::Canceling);
+        drive(&mut execution);
+        assert!(!execution.stage_demand_cuts.contains_key(&stage(2)));
+        apply(&mut execution, parent, 4, TaskState::Canceled);
+        drive(&mut execution);
+        assert!(execution.stage_demand_cuts.contains_key(&stage(2)));
+        assert_eq!(
+            execution.stage_cancel_after(None).unwrap().1.identity(),
+            producer
+        );
+    }
+    #[test]
+    fn stage_cursor_preserves_new_release_while_original_sibling_cancel_is_waiting_for_admission() {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let producer = identity(&execution, 2);
+        let other = identity(&execution, 3);
+        let sibling = identity(&execution, 4);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, sibling, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (original, request) = execution.stage_cancel_after(None).unwrap();
+        assert_eq!(request.identity(), sibling);
+        apply(&mut execution, parent, 3, TaskState::Canceling);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        drive(&mut execution); // Other parent cannot authorize P yet.
+        apply(&mut execution, parent, 4, TaskState::Canceled);
+        drive(&mut execution); // Real release arrives during the old Full.
+        assert_eq!(execution.stage_cancel_after(None).unwrap().0, original);
+        queue_cancel(&mut execution, original, request, 20);
+        drive(&mut execution);
+        assert!(execution.stage_demand_cuts.contains_key(&stage(2)));
+        let (next, next_request) = execution.stage_cancel_after(None).unwrap();
+        assert_ne!(next, original);
+        assert_eq!(next_request.identity(), producer);
+        assert!(execution.stage_cancel_after(Some(next)).is_none());
+    }
+    #[test]
+    fn stage_cursor_preserves_original_cancel_closure_when_terminal_interrupts_partial_parent_fanout()
+     {
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let other = identity(&execution, 3);
+        let producer = identity(&execution, 2);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        apply(&mut execution, other, 2, TaskState::Flushing);
+        while execution.stage_cancel_after(None).is_none() {
+            assert!(execution.propagate_stage_release(&mut Turn(1)).unwrap());
+        }
+        let (operation, _) = execution.stage_cancel_after(None).unwrap();
+        assert!(!execution.stage_parent_debts[&stage(1)].scan_done);
+        execution.begin_terminal_cleanup();
+        assert!(execution.stage_parent_debts.contains_key(&stage(1)));
+        execution
+            .stage_cancel_unused(operation, crate::input::WithdrawalOutcome::DefinitelyUnsent)
+            .unwrap();
+        assert!(!execution.stage_parent_debts.contains_key(&stage(1)));
+        assert!(!execution.released_children_of.contains(&stage(1))); // Interrupted traversal is not normal completion.
+        assert!(!execution.has_pending_stage_propagation());
     }
 }

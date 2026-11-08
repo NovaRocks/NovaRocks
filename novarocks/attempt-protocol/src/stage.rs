@@ -31,7 +31,6 @@ use crate::completion_facts::{StageState, derive_stage_state, parent_released_ch
 use novarocks_execution_contract::{
     CancelReason, ExchangeEdgeId, StageRef, TaskIdentity, TaskState,
 };
-#[cfg(test)]
 use novarocks_types::identity::StageId;
 use novarocks_types::identity::TaskId;
 
@@ -118,6 +117,7 @@ pub struct TaskMutation<'a> {
     task: &'a mut RemoteTask,
     counts: &'a Cell<StageCounts>,
     before: TaskSnapshot,
+    observations: Option<(StageId, &'a demand::StageDemandObservations)>,
 }
 impl<'a> TaskMutation<'a> {
     fn new(task: &'a mut RemoteTask, counts: &'a Cell<StageCounts>) -> Self {
@@ -126,7 +126,18 @@ impl<'a> TaskMutation<'a> {
             task,
             counts,
             before,
+            observations: None,
         }
+    }
+    fn observed(
+        task: &'a mut RemoteTask,
+        counts: &'a Cell<StageCounts>,
+        stage: StageId,
+        observations: &'a demand::StageDemandObservations,
+    ) -> Self {
+        let mut guard = Self::new(task, counts);
+        guard.observations = Some((stage, observations));
+        guard
     }
 }
 impl Deref for TaskMutation<'_> {
@@ -145,9 +156,19 @@ impl Drop for TaskMutation<'_> {
         let after = TaskSnapshot::of(self.task);
         if after != self.before {
             let mut counts = self.counts.get();
+            // Another Task guard may already have updated these counts. The
+            // before predicate belongs to current counts at this Drop, never
+            // to the stage snapshot when this particular guard was created.
+            let released_before = parent_released_children(counts.state());
             counts.remove(self.before);
             counts.add(after);
+            let released_after = parent_released_children(counts.state());
             self.counts.set(counts);
+            if released_before != released_after
+                && let Some((stage, observations)) = self.observations
+            {
+                observations.stage_changed(stage, released_after);
+            }
         }
     }
 }
@@ -155,6 +176,7 @@ impl Drop for TaskMutation<'_> {
 /// The frontend's owner of one stage.
 #[derive(Debug)]
 pub struct StageExecution {
+    stage: StageRef,
     root_task: Option<TaskId>,
     tasks: BTreeMap<TaskId, RemoteTask>,
     counts: Cell<StageCounts>,
@@ -186,6 +208,7 @@ impl StageExecution {
             counts.add(TaskSnapshot::of(task));
         }
         Ok(Self {
+            stage,
             root_task,
             tasks,
             counts: Cell::new(counts),
@@ -200,9 +223,53 @@ impl StageExecution {
         self.tasks.get(&task_id)
     }
 
+    pub(crate) fn task_after(&self, after: Option<TaskId>) -> Option<&RemoteTask> {
+        match after {
+            Some(after) => self
+                .tasks
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => self.tasks.first_key_value(),
+        }
+        .map(|(_, task)| task)
+    }
     pub fn task_mut(&mut self, task_id: TaskId) -> Option<TaskMutation<'_>> {
         let task = self.tasks.get_mut(&task_id)?;
         Some(TaskMutation::new(task, &self.counts))
+    }
+
+    pub(crate) fn task_mut_observed<'a>(
+        &'a mut self,
+        task_id: TaskId,
+        observations: &'a demand::StageDemandObservations,
+    ) -> Option<TaskMutation<'a>> {
+        if !observations.binds_stage(self.stage) {
+            return None;
+        }
+        let task = self.tasks.get_mut(&task_id)?;
+        Some(TaskMutation::observed(
+            task,
+            &self.counts,
+            self.stage.stage_id(),
+            observations,
+        ))
+    }
+    pub(crate) fn tasks_mut_observed<'a>(
+        &'a mut self,
+        observations: &'a demand::StageDemandObservations,
+    ) -> impl ExactSizeIterator<Item = (&'a TaskId, TaskMutation<'a>)> + 'a {
+        let counts = &self.counts;
+        assert!(
+            observations.binds_stage(self.stage),
+            "original stage observation binding"
+        );
+        let stage = self.stage.stage_id();
+        self.tasks.iter_mut().map(move |(id, task)| {
+            (
+                id,
+                TaskMutation::observed(task, counts, stage, observations),
+            )
+        })
     }
 
     pub fn tasks(&self) -> impl ExactSizeIterator<Item = (&TaskId, &RemoteTask)> + '_ {
@@ -935,3 +1002,5 @@ mod aggregate_tests {
 }
 
 pub(crate) mod derivation;
+
+pub(crate) mod demand;
