@@ -54,7 +54,7 @@ use std::{
 #[cfg(not(loom))]
 std::thread_local! { static DEFER_CAPACITY_WAKES: Cell<usize> = const { Cell::new(0) }; }
 #[cfg(loom)]
-loom::thread_local! { static DEFER_CAPACITY_WAKES: Cell<usize> = const { Cell::new(0) }; }
+loom::thread_local! { static DEFER_CAPACITY_WAKES: Cell<usize> = Cell::new(0); }
 
 /// Marks only the finite actor-turn boundary. It changes no actual lock, lock
 /// order, resource, or lifetime gate. The wrapper flushes after this guard exits.
