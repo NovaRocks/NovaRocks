@@ -28,16 +28,16 @@ fn gate(m: usize) -> EstablishAuthorization {
     let (graph, activation) = crate::test_support::graph_with_strict_input(false);
     let participation = *graph.participations().next().unwrap();
     let mut ids = crate::ids::OperationIds::new(crate::ids::IdSeed::new(17, 200));
-    EstablishAuthorization::new(
+    EstablishAuthorizationStorage::new(
         activation,
         AttemptAuthorizationLimits {
             activation,
             establish_per_participation: NonZeroUsize::new(m).unwrap(),
         },
         participation,
-        ids.issue(),
     )
     .unwrap()
+    .bind(ids.issue())
 }
 fn failure(n: u64) -> AttemptFailure {
     AttemptFailure::Host(HostProjectedFailure {
@@ -456,4 +456,34 @@ fn final_whole_gate_preparation_clears_only_closed_local_correlation() {
             }
         );
     }
+}
+
+#[test]
+fn registration_preallocates_before_original_operation_exists_and_binding_moves_same_storage() {
+    let (graph, activation) = crate::test_support::graph_with_strict_input(false);
+    let participation = *graph.participations().next().unwrap();
+    let limits = AttemptAuthorizationLimits {
+        activation,
+        establish_per_participation: NonZeroUsize::new(3).unwrap(),
+    };
+    let storage = EstablishAuthorizationStorage::new(activation, limits, participation).unwrap();
+    let capacity = storage.late.capacity();
+    let pointer = storage.late.as_slices().0.as_ptr();
+    let mut ids = crate::ids::OperationIds::new(crate::ids::IdSeed::new(17, 200));
+    let original_admission = ids.issue();
+    let establish = ids.issue();
+    let mut gate = storage.bind(establish);
+    assert_eq!(gate.late.capacity(), capacity);
+    assert_eq!(gate.late.as_slices().0.as_ptr(), pointer);
+    assert_ne!(original_admission, gate.operation_id);
+    assert!(
+        matches!(gate.authorize(token(1)), Directive::Request(AttemptAuthorization::Establish { participation: part, operation_id })
+        if part == participation && operation_id == establish)
+    );
+    let wrong = AttemptActivationIdentity::from_parts(
+        activation.actor().get(),
+        activation.execution(),
+        activation.generation() + 1,
+    );
+    assert!(EstablishAuthorizationStorage::new(wrong, limits, participation).is_err());
 }

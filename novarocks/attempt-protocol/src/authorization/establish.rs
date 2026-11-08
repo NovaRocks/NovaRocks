@@ -118,12 +118,20 @@ pub(crate) struct EstablishAuthorization {
     closing: bool,
     retired: bool,
 }
-impl EstablishAuthorization {
+/// Registration-time metadata storage. The immutable Establish operation does
+/// not exist until its original admission receipt is accepted; preallocation
+/// must not mint that operation early or resize this FIFO on a poller.
+#[derive(Debug)]
+pub(crate) struct EstablishAuthorizationStorage {
+    participation: ParticipationRef,
+    late: VecDeque<AttemptAuthorizationRef>,
+    limit: usize,
+}
+impl EstablishAuthorizationStorage {
     pub(crate) fn new(
         activation: AttemptActivationIdentity,
         limits: AttemptAuthorizationLimits,
         participation: ParticipationRef,
-        operation_id: TaskOperationId,
     ) -> Result<Self, TaskExecutionError> {
         if limits.activation != activation {
             return Err(invalid("Establish limits belong to another activation"));
@@ -131,19 +139,30 @@ impl EstablishAuthorization {
         let limit = limits.establish_per_participation.get();
         Ok(Self {
             participation,
+            late: VecDeque::with_capacity(limit),
+            limit,
+        })
+    }
+    /// Bind once to the original owner-generated operation. Moving this
+    /// already priced storage allocates no row and issues no authorization.
+    pub(crate) fn bind(self, operation_id: TaskOperationId) -> EstablishAuthorization {
+        EstablishAuthorization {
+            participation: self.participation,
             operation_id,
             attempted: false,
             current: None,
-            late: VecDeque::with_capacity(limit),
-            limit,
+            late: self.late,
+            limit: self.limit,
             late_entry: false,
             authorization_flight: None,
             pass: None,
             flight: None,
             closing: false,
             retired: false,
-        })
+        }
     }
+}
+impl EstablishAuthorization {
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.authorization_flight.is_none() && self.pass.is_none() && self.flight.is_none()
     }
