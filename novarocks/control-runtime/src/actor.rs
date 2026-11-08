@@ -59,6 +59,15 @@ pub trait Actor: Send + 'static {
     );
 }
 
+/// Passive tail of one source sampled under the original inbox lock before
+/// this input was popped. Later fills do not change this cut. An empty tail
+/// proves neither producer closure nor actual exit; InputId is not a sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputSourceCut {
+    pub source: ActorId,
+    pub tail: Option<InputId>,
+}
+
 pub struct ActorStep<'a, E> {
     scope: &'a crate::transaction::ScopeHandle,
     turn: &'a mut TurnBudget,
@@ -78,6 +87,7 @@ pub struct ActorStep<'a, E> {
     metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
     input_source: Option<Option<ActorId>>,
+    input_source_cut: Option<InputSourceCut>,
 }
 impl<'a, E> ActorStep<'a, E> {
     pub(crate) fn new(
@@ -104,6 +114,7 @@ impl<'a, E> ActorStep<'a, E> {
             metadata: Vec::new(),
             stop_producing: false,
             input_source: None,
+            input_source_cut: None,
             batch: EffectBatchState::new(
                 scope.id(),
                 generation,
@@ -112,6 +123,15 @@ impl<'a, E> ActorStep<'a, E> {
                 max_dependencies,
             ),
         }
+    }
+    /// None means this registration did not request a source observation.
+    /// Some with tail=None is this claim's empty-source sample only. It grants
+    /// no input, scheduling, resource, producer-liveness or exit authority.
+    pub fn input_source_cut(&self) -> Option<InputSourceCut> {
+        self.input_source_cut
+    }
+    pub(crate) fn set_input_source_cut(&mut self, cut: Option<InputSourceCut>) {
+        self.input_source_cut = cut;
     }
     pub(crate) fn set_input_author(&mut self, author: Option<crate::actor_turn::InputAuthor>) {
         self.input_author = author;

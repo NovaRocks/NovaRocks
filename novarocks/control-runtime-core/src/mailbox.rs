@@ -79,6 +79,12 @@ impl MailboxState {
     pub fn available(&self, class: InputClass) -> usize {
         self.limits[class.index()] - self.count(class)
     }
+    /// The current FIFO tail of this one source, across all input classes.
+    /// This is a read-only identity sample, not an ordering sequence, a grant,
+    /// or proof that an empty source/producer has exited.
+    pub fn tail_from(&self, source: ActorId) -> Option<InputId> {
+        self.sources.get(&source)?.back().map(|input| input.input)
+    }
     pub fn has_ready(&self, class: InputClass) -> bool {
         self.heads[class.index()].ready_count() != 0
     }

@@ -28,7 +28,7 @@ pub use poller_observation::{
 };
 
 use crate::{
-    actor::{Actor, ActorConfig, ActorFailurePolicy, ActorStep, StepEnvelope},
+    actor::{Actor, ActorConfig, ActorFailurePolicy, ActorStep, InputSourceCut, StepEnvelope},
     notify::Notify,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
@@ -744,6 +744,14 @@ impl<A: Actor> Drop for Inbox<A> {
         );
     }
 }
+// Immutable registration choices share the original admission transaction.
+// Optional observation adds no source, resource owner, or synchronization gate.
+#[derive(Default)]
+struct RegistrationBinding {
+    attachment: Option<SlotId>,
+    failure_work: Option<WorkId>,
+    observed_source: Option<ActorId>,
+}
 struct ActorCell<A: Actor> {
     // Fresh for every registration, including reuse of the same public ActorId.
     origin: Arc<()>,
@@ -752,6 +760,7 @@ struct ActorCell<A: Actor> {
     attachment: SlotId,
     config: ActorConfig,
     failure_policy: ActorFailurePolicy,
+    observed_source: Option<ActorId>,
     core: Mutex<Option<A>>,
     inbox: Mutex<Inbox<A>>,
 }
@@ -2167,7 +2176,10 @@ impl<A: Actor> ActorRuntime<A> {
         self.register_inner(
             id,
             scope,
-            (Some(attachment), None),
+            RegistrationBinding {
+                attachment: Some(attachment),
+                ..Default::default()
+            },
             actor,
             config,
             ActorFailurePolicy::IsolateScope,
@@ -2198,10 +2210,53 @@ impl<A: Actor> ActorRuntime<A> {
         self.register_inner(
             id,
             scope,
-            (None, None),
+            RegistrationBinding::default(),
             actor,
             config,
             ActorFailurePolicy::IsolateScope,
+        )
+    }
+    /// Register the same actor while observing one original mailbox source.
+    /// Every Core input receives that source's pre-pop tail sample. This
+    /// observation creates no source role, input, selection or capacity grant.
+    pub fn register_bound_with_source_cut(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        source: ActorId,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        self.register_inner(
+            id,
+            scope,
+            RegistrationBinding {
+                observed_source: Some(source),
+                ..Default::default()
+            },
+            actor,
+            config,
+            ActorFailurePolicy::IsolateScope,
+        )
+    }
+    /// The supervised registration and its optional source observation bind
+    /// atomically to this original incarnation, without a later setter race.
+    pub fn register_supervised_bound_with_source_cut(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::obligation::WorkObligation,
+        source: ActorId,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        self.register_supervised_inner(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            (ActorFailurePolicy::IsolateScope, Some(source)),
         )
     }
     /// Bind the original failure-cleanup role outside the actor's mutable
@@ -2278,7 +2333,14 @@ impl<A: Actor> ActorRuntime<A> {
         failure_work: &crate::obligation::WorkObligation,
         failure_policy: ActorFailurePolicy,
     ) -> Result<ActorRegistration, (ActorTurnError, A)> {
-        self.register_supervised_inner(id, scope, actor, config, failure_work, failure_policy)
+        self.register_supervised_inner(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            (failure_policy, None),
+        )
     }
     fn register_supervised_inner(
         &self,
@@ -2287,8 +2349,9 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
         failure_work: &crate::obligation::WorkObligation,
-        failure_policy: ActorFailurePolicy,
+        registration: (ActorFailurePolicy, Option<ActorId>),
     ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        let (failure_policy, observed_source) = registration;
         if scope.id() != failure_work.scope().id()
             || !Arc::ptr_eq(&scope.runtime.shared, &failure_work.scope().runtime.shared)
         {
@@ -2322,7 +2385,11 @@ impl<A: Actor> ActorRuntime<A> {
         self.register_inner(
             id,
             scope,
-            (None, Some(failure_work.id())),
+            RegistrationBinding {
+                failure_work: Some(failure_work.id()),
+                observed_source,
+                ..Default::default()
+            },
             actor,
             config,
             failure_policy,
@@ -2332,7 +2399,7 @@ impl<A: Actor> ActorRuntime<A> {
         &self,
         id: ActorId,
         scope: ScopeHandle,
-        binding: (Option<SlotId>, Option<WorkId>),
+        binding: RegistrationBinding,
         actor: A,
         config: ActorConfig,
         failure_policy: ActorFailurePolicy,
@@ -2346,7 +2413,11 @@ impl<A: Actor> ActorRuntime<A> {
             Err(e) => return Err((e.into(), actor)),
         };
         let deadline = actor.next_deadline();
-        let (attachment, failure_work) = binding;
+        let RegistrationBinding {
+            attachment,
+            failure_work,
+            observed_source,
+        } = binding;
         let attachment = match attachment {
             Some(slot) => match scope.attach_actor(slot) {
                 Ok(()) => slot,
@@ -2408,6 +2479,7 @@ impl<A: Actor> ActorRuntime<A> {
                 attachment,
                 config,
                 failure_policy,
+                observed_source,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
                     observation: self.shared.observation.clone(),
@@ -3056,9 +3128,15 @@ impl<A: Actor> ActorRuntime<A> {
                         .filter(|_| candidate.charge(node.config.max_step_work))
                         .and_then(|class| {
                             budget = candidate;
-                            inbox.pop_selected(node.id, class)
+                            let source_cut = node.observed_source.map(|source| InputSourceCut {
+                                source,
+                                tail: inbox.mailbox.tail_from(source),
+                            });
+                            inbox
+                                .pop_selected(node.id, class)
+                                .map(|input| (input, source_cut))
                         })
-                        .map(|input| {
+                        .map(|(input, source_cut)| {
                             let original =
                                 inbox.inputs.get_mut(&input.input).expect("filled input");
                             original.phase = InputPhase::Consuming;
@@ -3067,11 +3145,11 @@ impl<A: Actor> ActorRuntime<A> {
                                 .payloads
                                 .remove(&input.input)
                                 .expect("filled input owns its neutral payload");
-                            (input, value, handoff_at)
+                            (input, value, handoff_at, source_cut)
                         })
                 }
             };
-            let Some((input, value, handoff_at)) = next else {
+            let Some((input, value, handoff_at, source_cut)) = next else {
                 break;
             };
             let observed = clock.map_or(observed, Clock::now);
@@ -3093,6 +3171,7 @@ impl<A: Actor> ActorRuntime<A> {
                 node.config.max_dependencies_per_effect,
                 node.config.max_step_work,
             );
+            step.set_input_source_cut(source_cut);
             step.set_failure_work(node.scope.failure_work());
             let input_author = node
                 .inbox
