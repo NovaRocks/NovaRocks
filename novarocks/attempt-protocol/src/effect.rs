@@ -154,7 +154,7 @@ pub enum PumpKind {
 pub enum Publication {
     RootStatus(Box<AttemptRootProjection>),
     ProtocolBatch(crate::publication::ProtocolPublication),
-    FinalTaskInfo(novarocks_execution_contract::FinalTaskInfo),
+    FinalTaskInfo(crate::input::FinalTaskInfoRef),
     Diagnostics(crate::publication::DiagnosticPublication),
     DevRootObservation { status: TaskStatus, installed: bool },
 }
@@ -217,12 +217,12 @@ pub enum EffectBody {
         task: TaskIdentity,
         deadline: MonotonicInstant,
     },
-    /// Move the original late/rejected diagnostic object to credentialed
-    /// disposal on its same Source. Pollers must never destroy it locally.
+    /// Resolve the original late/rejected diagnostic object for credentialed
+    /// disposal on its same Source. The object never enters the poller.
     DisposeDiagnosticInfo {
         request: AttemptRequestToken,
         task: TaskIdentity,
-        information: Box<novarocks_execution_contract::FinalTaskInfo>,
+        information: crate::input::FinalTaskInfoRef,
     },
     ReleaseQueuedInput {
         grant: crate::input::QueuedInputGrantRef,

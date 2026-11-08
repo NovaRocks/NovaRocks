@@ -19,6 +19,7 @@
 
 use super::*;
 use crate::native::task_result_transport::{DynamicFilterRead, DynamicFilterReadError};
+use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::host::publication::{
     DiagnosticSourceSnapshot, OriginalDiagnosticBinding, OriginalDiagnosticPayload,
     OriginalDiagnosticRecords,
@@ -29,7 +30,7 @@ use novarocks_attempt_protocol::publication::{
     DiagnosticClosure, DiagnosticMissing, DiagnosticPublication, DiagnosticSources,
     DiagnosticTaskObservation, RuntimeFilterDiagnostic, SplitDiagnosticObservation,
 };
-use novarocks_attempt_protocol::start::PayloadRef;
+use novarocks_attempt_protocol::{input::FinalTaskInfoRef, start::PayloadRef};
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_coordination_contract::{AttemptComputationCut, ExecutionEffect, MonotonicClock};
 use novarocks_execution_contract::ParticipationRef;
@@ -111,6 +112,15 @@ impl OriginalDiagnosticRecords for OriginalRecords {
 }
 fn reference(id: u64) -> PayloadRef {
     PayloadRef(NonZeroU64::new(id).unwrap())
+}
+fn information_reference(id: u64, task: TaskIdentity) -> FinalTaskInfoRef {
+    FinalTaskInfoRef::new(
+        novarocks_coordination_contract::AttemptRequestToken::new(NonZeroU64::new(id).unwrap()),
+        task,
+    )
+}
+fn unexpected_resolution(_: FinalTaskInfoRef) -> Result<Box<FinalTaskInfo>, TaskExecutionError> {
+    panic!("this publication must not consume a canonical final-info record")
 }
 fn selected_cut(round: &TaskRound, ready: AttemptComputationCut) -> DiagnosticPublication {
     DiagnosticPublication {
@@ -471,7 +481,11 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     let mut foreign = selected_cut(&round, exact);
     foreign.ready.cut = foreign.ready.cut.saturating_add(Duration::from_nanos(1));
     let sources = DiagnosticSourceSnapshot::resolve(&foreign, &records).unwrap();
-    assert!(collector.publish_core_cut(ready, foreign, sources).is_err());
+    assert!(
+        collector
+            .publish_core_cut(ready, foreign, sources, unexpected_resolution)
+            .is_err()
+    );
     assert!(observer.current(ready).unwrap().is_none());
 
     let mut bad_tasks = selected_cut(&round, exact);
@@ -482,19 +496,60 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
         .status()
         .unwrap()
         .clone();
-    let root_info = FinalTaskInfo::try_new(root_task, status, Vec::new(), false).unwrap();
-    bad_tasks
+    let mut root_info = Some(Box::new(
+        FinalTaskInfo::try_new(root_task, status.clone(), Vec::new(), false).unwrap(),
+    ));
+    let sibling = bad_tasks
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task != root_task)
+        .unwrap();
+    let sibling_reference = information_reference(1, sibling.0);
+    sibling.1 = DiagnosticTaskObservation::Available(sibling_reference);
+    let sources = DiagnosticSourceSnapshot::resolve(&bad_tasks, &records).unwrap();
+    assert!(matches!(
+        collector.publish_core_cut(ready, bad_tasks, sources, |reference| {
+            assert_eq!(reference, sibling_reference);
+            Ok(root_info.take().unwrap())
+        }),
+        Err(TaskExecutionError::Schedule(message))
+            if message == "core diagnostic payload names a foreign Task"
+    ));
+    assert!(observer.current(ready).unwrap().is_none());
+
+    // A row/reference mismatch is rejected before taking any rich object.
+    let mut wrong_reference = selected_cut(&round, exact);
+    wrong_reference
         .tasks
         .iter_mut()
         .find(|(task, _)| *task != root_task)
         .unwrap()
-        .1 = DiagnosticTaskObservation::Available(Box::new(root_info));
-    let sources = DiagnosticSourceSnapshot::resolve(&bad_tasks, &records).unwrap();
-    assert!(
-        collector
-            .publish_core_cut(ready, bad_tasks, sources)
-            .is_err()
-    );
+        .1 = DiagnosticTaskObservation::Available(information_reference(2, root_task));
+    let sources = DiagnosticSourceSnapshot::resolve(&wrong_reference, &records).unwrap();
+    assert!(matches!(
+        collector.publish_core_cut(ready, wrong_reference, sources, unexpected_resolution),
+        Err(TaskExecutionError::Schedule(message))
+            if message == "core diagnostic reference names a foreign Task"
+    ));
+    assert!(observer.current(ready).unwrap().is_none());
+
+    // Resolver failure stays an error and cannot publish a partial snapshot.
+    let root_reference = information_reference(3, root_task);
+    let mut failed_resolution = selected_cut(&round, exact);
+    failed_resolution
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task == root_task)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(root_reference);
+    let sources = DiagnosticSourceSnapshot::resolve(&failed_resolution, &records).unwrap();
+    assert!(matches!(
+        collector.publish_core_cut(ready, failed_resolution, sources, |reference| {
+            assert_eq!(reference, root_reference);
+            Err(TaskExecutionError::UnknownOperation)
+        }),
+        Err(TaskExecutionError::UnknownOperation)
+    ));
     assert!(observer.current(ready).unwrap().is_none());
 
     // Matching Task IDs cannot disguise a foreign frozen fragment binding.
@@ -502,7 +557,11 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     wrong_binding.fragments[0].1 = wrong_binding.fragments[0].1.wrapping_add(1);
     let cut = selected_cut(&round, exact);
     let sources = DiagnosticSourceSnapshot::resolve(&cut, &wrong_binding).unwrap();
-    assert!(collector.publish_core_cut(ready, cut, sources).is_err());
+    assert!(
+        collector
+            .publish_core_cut(ready, cut, sources, unexpected_resolution)
+            .is_err()
+    );
     let before = SplitSourceProfile {
         files_considered: 7,
         splits_emitted: 2,
@@ -514,32 +573,62 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     );
     let mut first_cut = selected_cut(&round, exact);
     first_cut.sources.split = SplitDiagnosticObservation::Available(reference(1));
+    first_cut
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task == root_task)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(root_reference);
+    let mut original_info = Some(Box::new(
+        FinalTaskInfo::try_new(root_task, status, Vec::new(), false).unwrap(),
+    ));
+    let mut resolved = 0;
     let selected_at = first_cut.sources.selected_at;
     // The canonical row is sufficient even after the weak live source is gone.
     let sources = DiagnosticSourceSnapshot::resolve(&first_cut, &records).unwrap();
     assert!(
         collector
-            .publish_core_cut(ready, first_cut, sources)
+            .publish_core_cut(ready, first_cut, sources, |reference| {
+                assert_eq!(reference, root_reference);
+                resolved += 1;
+                Ok(original_info.take().unwrap())
+            })
             .unwrap()
     );
+    assert_eq!(resolved, 1);
+    assert!(original_info.is_none());
     let first = observer.current(ready).unwrap().unwrap();
     assert_eq!(first.ready, ready);
     assert_eq!(first.selected_at, selected_at);
     assert_ne!(first.selected_at, ready.cut());
     assert!(matches!(first.split, ProfileSplitDiagnostic::Available(profile) if profile == before));
-    assert!(first.tasks.iter().all(|(_, fact)| matches!(
-        fact,
-        ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)
-    )));
+    assert!(first.tasks.iter().all(|(task, fact)| {
+        if *task == root_task {
+            matches!(fact, ProfileTaskDiagnostic::Available(info)
+                if info.final_status().identity() == root_task)
+        } else {
+            matches!(
+                fact,
+                ProfileTaskDiagnostic::Missing(ProfileDiagnosticMissing::ReadPending)
+            )
+        }
+    }));
     let mut later_cut = selected_cut(&round, exact);
     later_cut.closure = DiagnosticClosure::Cancelled;
     later_cut.sources.selected_at = selected_at.saturating_add(Duration::from_millis(1));
     later_cut.sources.runtime_filters.complete = true;
     later_cut.sources.split = SplitDiagnosticObservation::SourceGone;
+    // Even a new Available ref cannot consume records after the first cut.
+    later_cut
+        .tasks
+        .iter_mut()
+        .find(|(task, _)| *task == root_task)
+        .unwrap()
+        .1 = DiagnosticTaskObservation::Available(information_reference(4, root_task));
     let sources = DiagnosticSourceSnapshot::resolve(&later_cut, &records).unwrap();
     assert!(
         !collector
-            .publish_core_cut(ready, later_cut, sources)
+            .publish_core_cut(ready, later_cut, sources, unexpected_resolution)
             .unwrap()
     );
     let second = observer.current(ready).unwrap().unwrap();

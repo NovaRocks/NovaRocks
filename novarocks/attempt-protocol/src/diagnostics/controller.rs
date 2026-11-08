@@ -22,12 +22,12 @@
 use super::sources::{DiagnosticSourceAssembly, DiagnosticSourcesState};
 use crate::{
     capacity::StepContext,
-    completion::accept_final_info,
     error::TaskExecutionError,
     input::DiagnosticRead,
     publication::{
         DiagnosticClosure, DiagnosticMissing, DiagnosticPublication, DiagnosticTaskObservation,
     },
+    status_validation::verify_final_status,
 };
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptComputationCut, AttemptRequestToken, MonotonicInstant,
@@ -56,15 +56,15 @@ pub(crate) struct DiagnosticReadRequest {
     pub(crate) task: TaskIdentity,
     pub(crate) deadline: MonotonicInstant,
 }
-/// Passive ownership transfer of an original result allocation. This grants
-/// no Work, capacity, disposal authority, or actual-exit proof. The core must
-/// emit it through the same original Source's credentialed Cleanup leg.
+/// Selection of the original Source allocation for credentialed disposal.
+/// The reference transfers no allocation, Work, capacity, disposal authority,
+/// or actual-exit proof. The same Source's Cleanup leg resolves it.
 #[must_use = "original diagnostic data must be handed to credentialed disposal"]
 #[derive(Debug)]
 pub(crate) struct DiagnosticDisposal {
     request: AttemptRequestToken,
     task: TaskIdentity,
-    information: Box<novarocks_execution_contract::FinalTaskInfo>,
+    information: crate::input::FinalTaskInfoRef,
 }
 impl DiagnosticDisposal {
     pub(crate) fn into_effect(self) -> crate::effect::EffectBody {
@@ -75,10 +75,10 @@ impl DiagnosticDisposal {
         }
     }
 }
-/// Correlation rejection cannot discard the original potentially large result.
-/// Deliberately no From conversion: callers must handle both the error and the
-/// same original payload, without `?` implicitly destroying foreign data.
-#[must_use = "preserve both the protocol error and original diagnostic payload"]
+/// Correlation rejection preserves the separate disposal selection. The actual
+/// allocation stays with its original Source even if the pure Core unwinds.
+/// Deliberately no From conversion: callers must handle error and disposition.
+#[must_use = "preserve both the protocol error and original diagnostic disposition"]
 #[derive(Debug)]
 pub(crate) struct DiagnosticReadRejection {
     error: TaskExecutionError,
@@ -89,25 +89,11 @@ impl DiagnosticReadRejection {
         (self.error, self.disposal)
     }
 }
-fn disposal(
-    request: AttemptRequestToken,
-    task: TaskIdentity,
-    result: DiagnosticRead,
-) -> Option<DiagnosticDisposal> {
-    match result {
-        DiagnosticRead::Available(information) => Some(DiagnosticDisposal {
-            request,
-            task,
-            information,
-        }),
-        DiagnosticRead::Unavailable(_) | DiagnosticRead::Failed(_) => None,
-    }
-}
 #[derive(Debug)]
 struct FrozenDiagnostic {
     ready: AttemptComputationCut,
     closure: DiagnosticClosure,
-    rows: BTreeMap<TaskId, TaskRow>,
+    after: Option<TaskId>,
     tasks: Vec<(TaskIdentity, DiagnosticTaskObservation)>,
     sources: DiagnosticSourceAssembly,
 }
@@ -273,42 +259,75 @@ impl DiagnosticCollector {
             deadline: ready.diagnostic_deadline,
         })
     }
+    fn disposal(
+        &self,
+        request: AttemptRequestToken,
+        task: TaskIdentity,
+        result: DiagnosticRead,
+    ) -> Option<DiagnosticDisposal> {
+        let DiagnosticRead::Available(info) = result else {
+            return None;
+        };
+        let adopted = self
+            .rows
+            .get(&info.reference.task().task_id())
+            .is_some_and(|row| {
+                row.identity == info.reference.task()
+                    && row.observation == DiagnosticTaskObservation::Available(info.reference)
+            });
+        (!adopted).then_some(DiagnosticDisposal {
+            request,
+            task,
+            information: info.reference,
+        })
+    }
     pub(crate) fn result(
         &mut self,
         request: AttemptRequestToken,
         task: TaskIdentity,
         result: DiagnosticRead,
     ) -> Result<Option<DiagnosticDisposal>, DiagnosticReadRejection> {
-        let matches = self.pending.as_ref().is_some_and(|pending| {
-            pending.request == request
-                && pending.observed.identity() == task
-                && !pending.result_received
-        });
+        let reference_matches = match &result {
+            DiagnosticRead::Available(info) => {
+                info.reference.request() == request && info.reference.task() == task
+            }
+            _ => true,
+        };
+        let matches = reference_matches
+            && self.pending.as_ref().is_some_and(|pending| {
+                pending.request == request
+                    && pending.observed.identity() == task
+                    && !pending.result_received
+            });
         if !matches {
             return Err(DiagnosticReadRejection {
                 error: TaskExecutionError::UnknownOperation,
-                disposal: disposal(request, task, result),
+                disposal: self.disposal(request, task, result),
             });
         }
-        let pending = self
-            .pending
-            .as_mut()
-            .expect("same original read correlation");
-        pending.result_received = true;
         let discarded = if self.selected {
-            disposal(request, task, result)
+            self.disposal(request, task, result)
         } else {
             let (observation, discarded) = match result {
                 DiagnosticRead::Available(info) => {
-                    if accept_final_info(&pending.observed, &info).is_ok() {
-                        (DiagnosticTaskObservation::Available(info), None)
+                    if verify_final_status(
+                        &self
+                            .pending
+                            .as_ref()
+                            .expect("same original read correlation")
+                            .observed,
+                        &info.final_status,
+                    )
+                    .is_ok()
+                    {
+                        (DiagnosticTaskObservation::Available(info.reference), None)
                     } else {
                         (
                             DiagnosticTaskObservation::Missing(DiagnosticMissing::TerminalMismatch),
                             Some(DiagnosticDisposal {
                                 request,
                                 task,
-                                information: info,
+                                information: info.reference,
                             }),
                         )
                     }
@@ -330,6 +349,11 @@ impl DiagnosticCollector {
         };
         // A selected full cut ignores late data, while retaining the original
         // request correlation until its real capture exit is independently seen.
+        let pending = self
+            .pending
+            .as_mut()
+            .expect("same original read correlation");
+        pending.result_received = true;
         if pending.exited {
             self.pending = None;
         }
@@ -387,12 +411,13 @@ impl DiagnosticCollector {
         assert!(!self.selected);
         self.selected = true;
         self.reads_closed = true;
-        let rows = std::mem::take(&mut self.rows);
+        // Retain the original metadata rows after selection/publication. A
+        // duplicate reference cannot dispose an already adopted allocation.
         self.frozen = Some(FrozenDiagnostic {
             ready: self.ready.expect("original accepted readiness"),
             closure,
-            tasks: Vec::with_capacity(rows.len()),
-            rows,
+            tasks: Vec::with_capacity(self.rows.len()),
+            after: None,
             sources: DiagnosticSourceAssembly::new(sources.freeze(now)),
         });
     }
@@ -413,7 +438,7 @@ impl DiagnosticCollector {
     pub(crate) fn has_assembly_work(&self) -> bool {
         self.frozen
             .as_ref()
-            .is_some_and(|cut| !cut.rows.is_empty() || !cut.sources.complete())
+            .is_some_and(|cut| cut.tasks.len() < self.rows.len() || !cut.sources.complete())
     }
     pub(crate) fn advance(
         &mut self,
@@ -423,11 +448,19 @@ impl DiagnosticCollector {
         let Some(cut) = self.frozen.as_mut() else {
             return false;
         };
-        if !cut.rows.is_empty() {
+        if cut.tasks.len() < self.rows.len() {
             if !context.charge(1) {
                 return false;
             }
-            let (_, row) = cut.rows.pop_first().expect("selected original Task row");
+            let (&task, row) = match cut.after {
+                None => self.rows.first_key_value(),
+                Some(after) => self
+                    .rows
+                    .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .next(),
+            }
+            .expect("selected original Task row");
+            cut.after = Some(task);
             cut.tasks.push((row.identity, row.observation));
             return true;
         }
@@ -458,8 +491,8 @@ mod tests {
         publication::SplitDiagnosticObservation, start::PayloadRef,
     };
     use novarocks_execution_contract::{
-        FinalTaskInfo, OperationOutcome, ParticipationRef, TaskOutputFacts, TaskState,
-        TaskStatusVersion, root_result::RootResultEnd,
+        OperationOutcome, ParticipationRef, TaskOutputFacts, TaskState, TaskStatusVersion,
+        root_result::RootResultEnd,
     };
     use novarocks_types::BackendProcessId;
     use std::{num::NonZeroU64, time::Duration};
@@ -503,10 +536,11 @@ mod tests {
         )
         .unwrap()
     }
-    fn available(task: TaskIdentity, version: u64) -> DiagnosticRead {
-        DiagnosticRead::Available(Box::new(
-            FinalTaskInfo::try_new(task, status(task, version), vec![], false).unwrap(),
-        ))
+    fn available(request: AttemptRequestToken, task: TaskIdentity, version: u64) -> DiagnosticRead {
+        DiagnosticRead::Available(crate::input::FinalTaskInfoProjection {
+            reference: crate::input::FinalTaskInfoRef::new(request, task),
+            final_status: status(task, version),
+        })
     }
     fn setup(
         tasks: usize,
@@ -571,7 +605,7 @@ mod tests {
         collector.observe_terminal(&status(tasks[0], 1)).unwrap();
         collector.next_read(token(1), &mut Turn(1)).unwrap();
         collector
-            .result(token(1), tasks[0], available(tasks[0], 1))
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
             .unwrap();
         collector.after_input(now(1), &sources);
         assert!(collector.reads_closed());
@@ -614,7 +648,7 @@ mod tests {
         collector.next_read(token(1), &mut Turn(1)).unwrap();
         collector.before_input(now(10), false, &sources);
         collector
-            .result(token(1), tasks[0], available(tasks[0], 1))
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
             .unwrap();
         // Final-info, Task status, RF and split completion after the original
         // cut must not improve any row while bounded materialization runs.
@@ -675,7 +709,11 @@ mod tests {
             .unwrap();
         let second = collector.next_read(token(2), &mut Turn(1)).unwrap();
         collector
-            .result(second.request, second.task, available(second.task, 1))
+            .result(
+                second.request,
+                second.task,
+                available(second.request, second.task, 1),
+            )
             .unwrap();
         assert!(collector.reads_closed());
         assert!(!collector.actual_reads_exited());
@@ -707,7 +745,7 @@ mod tests {
             collector.observe_terminal(&status(*task, 2)).unwrap();
         }
         let results = [
-            available(tasks[0], 1),
+            available(token(1), tasks[0], 1),
             DiagnosticRead::Failed(HostFailureRef(NonZeroU64::new(55).unwrap())),
             DiagnosticRead::Unavailable(OperationOutcome::Gone),
         ];
@@ -753,21 +791,21 @@ mod tests {
         collector.next_read(token(1), &mut Turn(1)).unwrap();
         assert!(
             collector
-                .result(token(2), tasks[0], available(tasks[0], 1))
+                .result(token(2), tasks[0], available(token(1), tasks[0], 1))
                 .is_err()
         );
         assert!(
             collector
-                .result(token(1), tasks[1], available(tasks[1], 1))
+                .result(token(1), tasks[1], available(token(1), tasks[1], 1))
                 .is_err()
         );
         assert!(collector.actual_exit(token(2)).is_err());
         collector
-            .result(token(1), tasks[0], available(tasks[0], 1))
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
             .unwrap();
         assert!(
             collector
-                .result(token(1), tasks[0], available(tasks[0], 1))
+                .result(token(1), tasks[0], available(token(1), tasks[0], 1))
                 .is_err()
         );
         collector.before_input(now(10), false, &sources);
@@ -821,7 +859,11 @@ mod tests {
             let read = collector.next_read(token(index + 1), &mut Turn(1)).unwrap();
             assert_eq!(read.task, tasks[1 - index as usize]);
             collector
-                .result(read.request, read.task, available(read.task, 1))
+                .result(
+                    read.request,
+                    read.task,
+                    available(read.request, read.task, 1),
+                )
                 .unwrap();
             collector.actual_exit(read.request).unwrap();
         }
@@ -860,8 +902,7 @@ mod tests {
         assert_eq!(cut.sources.selected_at, now(11));
     }
     #[test]
-    fn late_mismatched_and_foreign_large_results_return_same_allocation_for_original_source_disposal()
-     {
+    fn late_mismatched_and_foreign_results_return_original_ref_for_source_disposal() {
         for mode in 0..3 {
             let (mut collector, sources, tasks, _, ready) = setup(1, false);
             collector.begin(ready).unwrap();
@@ -870,31 +911,11 @@ mod tests {
             if mode == 0 {
                 collector.before_input(now(10), false, &sources);
             }
-            use novarocks_execution_contract::{OperatorCounter, OperatorStatistics, SafeDetail};
-            let statistics = (0..4096)
-                .map(|index| {
-                    OperatorStatistics::new(index, SafeDetail::new("scan").unwrap()).with_counters(
-                        (0..64)
-                            .map(|counter| {
-                                OperatorCounter::new(SafeDetail::new("rows").unwrap(), counter)
-                            })
-                            .collect(),
-                    )
-                })
-                .collect();
-            let incoming = DiagnosticRead::Available(Box::new(
-                FinalTaskInfo::try_new(
-                    tasks[0],
-                    status(tasks[0], if mode == 1 { 1 } else { 2 }),
-                    statistics,
-                    false,
-                )
-                .unwrap(),
-            ));
-            let DiagnosticRead::Available(ref information) = incoming else {
-                unreachable!()
-            };
-            let original_address = std::ptr::from_ref(information.as_ref());
+            let reference = crate::input::FinalTaskInfoRef::new(token(1), tasks[0]);
+            let incoming = DiagnosticRead::Available(crate::input::FinalTaskInfoProjection {
+                reference,
+                final_status: status(tasks[0], if mode == 1 { 1 } else { 2 }),
+            });
             let request = if mode == 2 { token(2) } else { token(1) };
             let returned = match collector.result(request, tasks[0], incoming) {
                 Ok(disposal) => disposal.unwrap(),
@@ -914,8 +935,42 @@ mod tests {
             };
             assert_eq!(original_request, request);
             assert_eq!(task, tasks[0]);
-            assert_eq!(std::ptr::from_ref(information.as_ref()), original_address);
+            assert_eq!(information, reference);
             assert!(!collector.actual_reads_exited());
         }
+    }
+    #[test]
+    fn repeated_reference_cannot_dispose_adopted_information_before_or_after_publication() {
+        let (mut collector, mut sources, tasks, parts, ready) = setup(1, false);
+        collector.begin(ready).unwrap();
+        collector.observe_terminal(&status(tasks[0], 1)).unwrap();
+        collector.next_read(token(1), &mut Turn(1)).unwrap();
+        collector
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
+            .unwrap();
+        let (_, disposal) = collector
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
+            .unwrap_err()
+            .into_parts();
+        assert!(disposal.is_none());
+        for part in parts {
+            sources.observe_release(part, true, None).unwrap();
+        }
+        collector.after_input(now(1), &sources);
+        let cut = materialize(&mut collector, &sources);
+        assert_eq!(
+            cut.tasks[0].1,
+            DiagnosticTaskObservation::Available(crate::input::FinalTaskInfoRef::new(
+                token(1),
+                tasks[0]
+            ))
+        );
+        let (_, disposal) = collector
+            .result(token(1), tasks[0], available(token(1), tasks[0], 1))
+            .unwrap_err()
+            .into_parts();
+        assert!(disposal.is_none());
+        assert!(!collector.actual_reads_exited());
+        collector.actual_exit(token(1)).unwrap();
     }
 }

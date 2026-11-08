@@ -426,6 +426,9 @@ impl TaskFinalInfoCollector {
         ready: ComputationReadyToken,
         cut: novarocks_attempt_protocol::publication::DiagnosticPublication,
         sources: super::host::publication::DiagnosticSourceSnapshot,
+        mut resolve: impl FnMut(
+            novarocks_attempt_protocol::input::FinalTaskInfoRef,
+        ) -> Result<Box<FinalTaskInfo>, super::error::TaskExecutionError>,
     ) -> Result<bool, super::error::TaskExecutionError> {
         use novarocks_attempt_protocol::publication as core;
         let exact = cut.ready.activation == ready.activation()
@@ -465,7 +468,13 @@ impl TaskFinalInfoCollector {
         let mut tasks = Vec::with_capacity(cut.tasks.len());
         for (task, observation) in cut.tasks {
             let observation = match observation {
-                core::DiagnosticTaskObservation::Available(info) => {
+                core::DiagnosticTaskObservation::Available(reference) => {
+                    if reference.task() != task {
+                        return Err(super::error::TaskExecutionError::Schedule(
+                            "core diagnostic reference names a foreign Task".to_owned(),
+                        ));
+                    }
+                    let info = resolve(reference)?;
                     if info.final_status().identity() != task {
                         return Err(super::error::TaskExecutionError::Schedule(
                             "core diagnostic payload names a foreign Task".to_owned(),

@@ -67,7 +67,15 @@ pub fn verify_final_info(
     observed_terminal: &TaskStatus,
     info: &FinalTaskInfo,
 ) -> Result<(), FinalInfoDisagreement> {
-    let carried = info.final_status();
+    verify_final_status(observed_terminal, info.final_status())
+}
+
+/// The same original final-info validation over its bounded status projection.
+/// The actual statistics allocation remains with its Source.
+pub fn verify_final_status(
+    observed_terminal: &TaskStatus,
+    carried: &TaskStatus,
+) -> Result<(), FinalInfoDisagreement> {
     if let Err(mismatch) = observed_terminal
         .identity()
         .verify_matches(carried.identity())

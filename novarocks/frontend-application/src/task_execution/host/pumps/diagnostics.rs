@@ -22,12 +22,12 @@ use super::{OriginalJobRecord, PumpRecordError};
 use crate::native::task_result_transport::{FinalTaskInfoRead, TaskResultTransport};
 use novarocks_attempt_protocol::{
     failure::HostFailureRef,
-    input::{DiagnosticRead, ExecutorFact},
+    input::{DiagnosticRead, ExecutorFact, FinalTaskInfoProjection, FinalTaskInfoRef},
 };
 use novarocks_control_runtime::exit_custody::ExitCustody;
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::AttemptRequestToken;
-use novarocks_execution_contract::TaskIdentity;
+use novarocks_execution_contract::{FinalTaskInfo, TaskIdentity};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -48,10 +48,19 @@ struct DiagnosticRecord {
     started: bool,
     error: Option<String>,
 }
+/// The same original Source retains this allocation independently of the read
+/// slot/job. A consumed row retains only its exact request/task marker. Original
+/// Source metadata backing must cover these rows through final disposition;
+/// neither the copied reference nor physical job retirement grants capacity.
+struct InformationRecord {
+    task: TaskIdentity,
+    information: Option<Box<FinalTaskInfo>>,
+}
 struct Records {
     closing: bool,
     active: Option<AttemptRequestToken>,
     reads: BTreeMap<AttemptRequestToken, DiagnosticRecord>,
+    information: BTreeMap<AttemptRequestToken, InformationRecord>,
 }
 pub(crate) struct DiagnosticRecords {
     transport: Arc<dyn TaskResultTransport>,
@@ -65,6 +74,7 @@ impl DiagnosticRecords {
                 closing: false,
                 active: None,
                 reads: BTreeMap::new(),
+                information: BTreeMap::new(),
             }),
         })
     }
@@ -85,7 +95,9 @@ impl DiagnosticRecords {
                 return Err((PumpRecordError::AlreadyStarted, registration));
             }
         }
-        if records.reads.contains_key(&registration.request) {
+        if records.reads.contains_key(&registration.request)
+            || records.information.contains_key(&registration.request)
+        {
             return Err((PumpRecordError::DuplicateRecord, registration));
         }
         records.active = Some(registration.request);
@@ -130,7 +142,23 @@ impl DiagnosticRecords {
             .get_mut(&request)
             .ok_or(PumpRecordError::MissingRecord)?;
         let result = match result {
-            Ok(FinalTaskInfoRead::Available(info)) => DiagnosticRead::Available(info),
+            Ok(FinalTaskInfoRead::Available(info)) => {
+                // Keep the original allocation even if its actual status names a
+                // foreign Task. Core validates that bounded status; the custody
+                // reference remains bound to the original requested Task.
+                let final_status = info.final_status().clone();
+                records.information.insert(
+                    request,
+                    InformationRecord {
+                        task,
+                        information: Some(info),
+                    },
+                );
+                DiagnosticRead::Available(FinalTaskInfoProjection {
+                    reference: FinalTaskInfoRef::new(request, task),
+                    final_status,
+                })
+            }
             Ok(FinalTaskInfoRead::Unavailable(outcome)) => DiagnosticRead::Unavailable(outcome),
             Err(error) => {
                 record.error = Some(error);
@@ -142,6 +170,33 @@ impl DiagnosticRecords {
             task,
             result,
         })
+    }
+    /// Transfer the exact original allocation once. The caller must execute its
+    /// rich publication/destruction in original credentialed off-poller work;
+    /// the copied reference itself grants no access or disposal authority.
+    pub(crate) fn take_information(
+        &self,
+        reference: FinalTaskInfoRef,
+    ) -> Result<Box<FinalTaskInfo>, PumpRecordError> {
+        self.discard_information(reference)?
+            .ok_or(PumpRecordError::MissingRecord)
+    }
+    /// Idempotent disposition only for a known exact original request/Task.
+    /// Returning the Box keeps its actual destructor outside this mutex and
+    /// outside Core. Physical read retirement and close never clear these rows.
+    pub(crate) fn discard_information(
+        &self,
+        reference: FinalTaskInfoRef,
+    ) -> Result<Option<Box<FinalTaskInfo>>, PumpRecordError> {
+        let mut records = self.records.lock().expect("diagnostic canonical records");
+        let record = records
+            .information
+            .get_mut(&reference.request())
+            .ok_or(PumpRecordError::MissingRecord)?;
+        if record.task != reference.task() {
+            return Err(PumpRecordError::WrongIdentity);
+        }
+        Ok(record.information.take())
     }
     pub(crate) fn bind_reply_input(
         &self,
@@ -208,3 +263,6 @@ impl DiagnosticRecords {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

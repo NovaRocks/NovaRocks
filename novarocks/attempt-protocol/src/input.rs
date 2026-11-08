@@ -399,12 +399,39 @@ pub enum DynamicFilterRead {
     Refused(AttemptFailure),
 }
 
+/// Reference to the original Source's retained final-info allocation. It is
+/// scoped to this activation's actual read; copying it grants no access,
+/// capacity, disposal authority, or additional result/exit leg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalTaskInfoRef {
+    request: AttemptRequestToken,
+    task: TaskIdentity,
+}
+impl FinalTaskInfoRef {
+    pub const fn new(request: AttemptRequestToken, task: TaskIdentity) -> Self {
+        Self { request, task }
+    }
+    pub const fn request(self) -> AttemptRequestToken {
+        self.request
+    }
+    pub const fn task(self) -> TaskIdentity {
+        self.task
+    }
+}
+/// Only the bounded validation snapshot crosses into the pure Core. Operator
+/// statistics and their actual destructor remain in the original Source.
+#[derive(Clone, Debug)]
+pub struct FinalTaskInfoProjection {
+    pub reference: FinalTaskInfoRef,
+    pub final_status: TaskStatus,
+}
+
 /// Diagnostics remain observations. Read failure never becomes query failure.
 /// The core closes its diagnostic snapshot before applying a reply at or after
 /// the original deadline, while the host continues to retain the actual job.
 #[derive(Clone, Debug)]
 pub enum DiagnosticRead {
-    Available(Box<novarocks_execution_contract::FinalTaskInfo>),
+    Available(FinalTaskInfoProjection),
     Unavailable(novarocks_execution_contract::OperationOutcome),
     Failed(HostFailureRef),
 }

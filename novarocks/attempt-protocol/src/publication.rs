@@ -20,7 +20,7 @@
 pub(crate) mod protocol_cursor;
 
 use novarocks_coordination_contract::{AttemptComputationCut, SelectedTaskTermination};
-use novarocks_execution_contract::{FinalTaskInfo, OperationOutcome, TaskIdentity, TaskStatus};
+use novarocks_execution_contract::{OperationOutcome, TaskIdentity, TaskStatus};
 
 #[derive(Clone, Debug)]
 pub struct ProtocolTaskChange {
@@ -58,9 +58,9 @@ pub enum DiagnosticMissing {
     NotRead,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticTaskObservation {
-    Available(Box<FinalTaskInfo>),
+    Available(crate::input::FinalTaskInfoRef),
     Missing(DiagnosticMissing),
 }
 

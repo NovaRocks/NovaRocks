@@ -52,6 +52,7 @@ fn fixture() -> (
             root: None,
             protocol,
             profile: None,
+            diagnostic_records: None,
             ready: None,
             #[cfg(novarocks_dev_controls)]
             root_observer: None,
@@ -188,4 +189,17 @@ fn protocol_publication_preserves_typed_error_without_readmodel_mutation() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn final_info_publication_checks_original_profile_before_resolving_a_reference() {
+    let (mut record, _, root, _) = fixture();
+    let reference = novarocks_attempt_protocol::input::FinalTaskInfoRef::new(
+        novarocks_coordination_contract::AttemptRequestToken::new(std::num::NonZeroU64::MIN),
+        root,
+    );
+    assert!(matches!(
+        record.publish(Publication::FinalTaskInfo(reference), None),
+        Err(PublicationError::MissingProfileObserver)
+    ));
 }

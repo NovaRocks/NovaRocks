@@ -19,6 +19,7 @@
 //! The common Source retains this move-only record and serializes its metadata
 //! jobs; these methods run outside the actor poller and every runtime lock.
 
+use super::pumps::{DiagnosticRecords, PumpRecordError};
 use crate::task_execution::{
     error::TaskExecutionError,
     execution::ReleasedRuntimeFilterContributions,
@@ -209,16 +210,19 @@ impl DiagnosticSourceSnapshot {
 pub(crate) enum PublicationError {
     MissingRootPublisher,
     MissingProfileObserver,
+    MissingDiagnosticRecords,
     MissingOriginalComputationCut,
     MissingDiagnosticSources,
     ForeignOriginalComputationCut,
     Protocol(TaskExecutionError),
+    Diagnostic(PumpRecordError),
     Root(QueryExecutionError),
 }
 impl std::fmt::Display for PublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(error) => write!(f, "original attempt publication failed: {error}"),
+            Self::Diagnostic(error) => write!(f, "original diagnostic publication failed: {error}"),
             Self::Root(error) => write!(f, "original root publication failed: {error}"),
             other => write!(f, "attempt publication custody invariant failed: {other:?}"),
         }
@@ -228,6 +232,7 @@ impl std::error::Error for PublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Protocol(error) => Some(error),
+            Self::Diagnostic(error) => Some(error),
             Self::Root(error) => Some(error),
             _ => None,
         }
@@ -239,6 +244,7 @@ pub(crate) struct PublicationRecord {
     root: Option<AcceptedRootStatusSender>,
     protocol: AttemptProtocolFactsPublisher,
     profile: Option<TaskFinalInfoCollector>,
+    diagnostic_records: Option<Arc<DiagnosticRecords>>,
     ready: Option<ComputationReadyToken>,
     #[cfg(novarocks_dev_controls)]
     root_observer: Option<crate::preparation_diagnostics::StatementObservationHandle>,
@@ -249,12 +255,14 @@ impl PublicationRecord {
         root: AcceptedRootStatusSender,
         protocol: AttemptProtocolFactsPublisher,
         profile: Option<TaskFinalInfoCollector>,
+        diagnostic_records: Option<Arc<DiagnosticRecords>>,
     ) -> Self {
         Self {
             activation,
             root: Some(root),
             protocol,
             profile,
+            diagnostic_records,
             ready: None,
             #[cfg(novarocks_dev_controls)]
             root_observer: None,
@@ -311,12 +319,23 @@ impl PublicationRecord {
                     .map_err(PublicationError::Protocol)?;
                 Ok(PublicationApplied::ProtocolBatch { published })
             }
-            Publication::FinalTaskInfo(info) => {
-                self.profile
+            Publication::FinalTaskInfo(reference) => {
+                let profile = self
+                    .profile
                     .as_mut()
-                    .ok_or(PublicationError::MissingProfileObserver)?
-                    .collected
-                    .push(Arc::new(info));
+                    .ok_or(PublicationError::MissingProfileObserver)?;
+                let info = self
+                    .diagnostic_records
+                    .as_ref()
+                    .ok_or(PublicationError::MissingDiagnosticRecords)?
+                    .take_information(reference)
+                    .map_err(PublicationError::Diagnostic)?;
+                if info.final_status().identity() != reference.task() {
+                    return Err(PublicationError::Protocol(TaskExecutionError::Schedule(
+                        "core diagnostic payload names a foreign Task".into(),
+                    )));
+                }
+                profile.collected.push(Arc::from(info));
                 Ok(PublicationApplied::FinalTaskInfo)
             }
             Publication::Diagnostics(cut) => {
@@ -329,7 +348,17 @@ impl PublicationRecord {
                 self.profile
                     .as_mut()
                     .ok_or(PublicationError::MissingProfileObserver)?
-                    .publish_core_cut(ready, cut, sources)
+                    .publish_core_cut(ready, cut, sources, |reference| {
+                        self.diagnostic_records
+                            .as_ref()
+                            .ok_or_else(|| {
+                                TaskExecutionError::Schedule(
+                                    "diagnostic selection has no original canonical records".into(),
+                                )
+                            })?
+                            .take_information(reference)
+                            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))
+                    })
                     .map_err(PublicationError::Protocol)?;
                 Ok(PublicationApplied::Diagnostics)
             }
