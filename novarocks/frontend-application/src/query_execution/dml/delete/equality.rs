@@ -26,8 +26,6 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-#[cfg(test)]
-use novarocks_parser::ast::Statement;
 use novarocks_parser::ast::{AddEqualityDelete, Expr, LiteralKind, ObjectName, Query};
 use novarocks_parser::{ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -39,8 +37,6 @@ use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName};
-#[cfg(debug_assertions)]
-use novarocks_types::schema::ColumnDef;
 
 type Literal = SqlLiteral;
 
@@ -224,14 +220,6 @@ fn build_equality_delete_sink_query(
     rows: &[Vec<Expr>],
 ) -> Result<Query, String> {
     let query = equality_delete_sink_query_ast(delete_columns, rows)?;
-    #[cfg(debug_assertions)]
-    crate::query_execution::dml::equivalence::require("F10", &query, || {
-        let lowered = rows
-            .iter()
-            .map(|row| row.iter().map(lower_literal).collect())
-            .collect::<Result<Vec<Vec<_>>, _>>()?;
-        legacy_equality_delete_sink_sql(delete_columns, &lowered)
-    })?;
     Ok(query)
 }
 
@@ -325,77 +313,6 @@ fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Exp
     Ok(value.clone())
 }
 
-#[cfg(debug_assertions)]
-fn legacy_equality_delete_sink_sql(
-    delete_columns: &[ConnectorWriteFieldRequest],
-    rows: &[Vec<Literal>],
-) -> Result<String, String> {
-    if delete_columns.is_empty() {
-        return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
-    }
-    if rows.is_empty() {
-        return Err("ADD EQUALITY DELETE sink query requires at least one row".to_string());
-    }
-    for row in rows {
-        if row.len() != delete_columns.len() {
-            return Err(format!(
-                "ADD EQUALITY DELETE row has {} values, expected {}",
-                row.len(),
-                delete_columns.len()
-            ));
-        }
-    }
-
-    let target_columns = equality_delete_target_columns(delete_columns)?;
-    let alias = "__nr_eqdel";
-    let rendered_rows = rows
-        .iter()
-        .map(|row| {
-            let values = row
-                .iter()
-                .zip(target_columns.iter())
-                .map(|(literal, column)| {
-                    crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
-                        literal,
-                        &column.data_type,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ");
-            Ok(format!("({values})"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let value_columns = target_columns
-        .iter()
-        .map(|column| sql_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values_sql = format!(
-        "(VALUES {}) AS {}({})",
-        rendered_rows.join(", "),
-        sql_identifier(alias),
-        value_columns
-    );
-    let select_items = target_columns
-        .iter()
-        .map(|column| {
-            Ok(format!(
-                "{} AS {}",
-                crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                    &qualify_column(alias, &column.name),
-                    column,
-                )?,
-                sql_identifier(&column.name)
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(format!(
-        "SELECT {} FROM {}",
-        select_items.join(", "),
-        values_sql
-    ))
-}
-
 /// Keep the admitted provider's complete binding beside the unchanged literal
 /// validation projection; a Field never re-authors its semantic domain.
 fn equality_delete_input_fields(
@@ -427,56 +344,6 @@ fn equality_delete_input_fields(
                 .map_err(|error| error.to_string())
         })
         .collect()
-}
-
-#[cfg(debug_assertions)]
-fn equality_delete_target_columns(
-    delete_columns: &[ConnectorWriteFieldRequest],
-) -> Result<Vec<ColumnDef>, String> {
-    delete_columns
-        .iter()
-        .map(|column| {
-            let value = column.execution_type().ok_or_else(|| {
-                "equality-delete source lacks its complete execution declaration".to_string()
-            })?;
-            let logical_type = novarocks_types::sql_type_from_value_type(value)
-                .map_err(|error| error.to_string())?;
-            Ok(ColumnDef {
-                name: column.field().name().clone(),
-                data_type: value.data_type().clone(),
-                nullable: value.nullable(),
-                write_default: None,
-                logical_type: Some(logical_type),
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
-    let statements = novarocks_parser::parse(sql)
-        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
-    match statements.as_slice() {
-        [Statement::Query(query)] => Ok(query.clone()),
-        [other] => Err(format!(
-            "{context}: generated non-query statement: {}",
-            novarocks_parser::printer::print_statement(other)
-        )),
-        _ => Err(format!(
-            "{context}: generated {} statements, expected exactly one query",
-            statements.len()
-        )),
-    }
-}
-
-#[cfg(debug_assertions)]
-fn qualify_column(alias: &str, column: &str) -> String {
-    format!("{}.{}", sql_identifier(alias), sql_identifier(column))
-}
-
-#[cfg(debug_assertions)]
-fn sql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }
 
 /// Resolve the declared equality key columns from neutral connector metadata,
@@ -1352,23 +1219,6 @@ mod tests {
             ];
             let query = super::equality_delete_sink_query_ast(&fields, &rows).unwrap();
             assert_eq!(sink_values(&query).rows, rows, "{source}");
-            #[cfg(debug_assertions)]
-            {
-                let legacy = super::legacy_equality_delete_sink_sql(&fields, &[values]).unwrap();
-                if let Ok(parsed) =
-                    super::parse_generated_query(&legacy, "legacy numeric comparison")
-                {
-                    assert!(
-                        !novarocks_parser::ast::syntax_eq_query(&query, &parsed),
-                        "the old f64 roundtrip changed the admitted value: {source}"
-                    );
-                } else {
-                    assert_eq!(
-                        source, "VALUES (1e21)",
-                        "only the exponent's rendered oversized integer is unparseable"
-                    );
-                }
-            }
         }
     }
 

@@ -57,7 +57,7 @@ impl AnalyzerContext<'_> {
         let statements = novarocks_parser::parse(&view.raw_sql).map_err(|error| {
             AnalyzeError::stored_definition_parse_failure(
                 crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
-                view.raw_sql.clone().into(),
+                view.raw_sql.clone(),
                 error,
                 Some(span),
             )
@@ -65,7 +65,7 @@ impl AnalyzerContext<'_> {
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             return Err(AnalyzeError::stored_definition_not_query(
                 crate::analyze_error::StoredDefinition::view(view.identity.fqn()),
-                view.raw_sql.clone().into(),
+                view.raw_sql.clone(),
                 Some(span),
             ));
         };

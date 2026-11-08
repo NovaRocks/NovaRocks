@@ -39,8 +39,6 @@ use crate::query_execution::planning::write_sink::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
-#[cfg(test)]
-use novarocks_parser::ast::Statement;
 use novarocks_parser::ast::{
     BinaryOperator, Delete, Expr, FunctionCall, IsPredicate, LiteralKind,
     ObjectName as ParserObjectName, Query, UnaryOperator,
@@ -271,15 +269,6 @@ fn build_delete_position_sink_query(
     target_ref: &str,
 ) -> Result<Query, String> {
     let query = delete_position_sink_query_ast(target, where_clause, sink_columns, target_ref)?;
-    #[cfg(debug_assertions)]
-    crate::query_execution::dml::equivalence::require("F9", &query, || {
-        Ok(legacy_delete_position_sink_sql(
-            target,
-            &novarocks_parser::printer::print_expr(where_clause),
-            sink_columns,
-            target_ref,
-        ))
-    })?;
     Ok(query)
 }
 
@@ -347,29 +336,6 @@ fn delete_selection_for_query(selection: &Expr) -> Expr {
     SelectionGrouping.fold_expr(selection.clone())
 }
 
-#[cfg(debug_assertions)]
-fn legacy_delete_position_sink_sql(
-    target: &TargetBackend,
-    where_clause: &str,
-    sink_columns: &[ColumnDef],
-    target_ref: &str,
-) -> String {
-    let projection = sink_columns
-        .iter()
-        .map(|column| sql_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let version_clause = if target_ref == "main" {
-        String::new()
-    } else {
-        format!(" FOR VERSION AS OF {}", sql_string_literal(target_ref))
-    };
-    format!(
-        "SELECT {projection} FROM {}{version_clause} WHERE {where_clause}",
-        qualify_iceberg_table(target)
-    )
-}
-
 /// The delete-shaped input this statement asks the session to admit.
 ///
 /// The identity columns are the engine's own row-position projection; the
@@ -427,43 +393,6 @@ fn write_input_columns(
             logical_type: None,
         })
         .collect()
-}
-
-#[cfg(test)]
-fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
-    let statements = novarocks_parser::parse(sql)
-        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
-    match statements.as_slice() {
-        [Statement::Query(query)] => Ok(query.clone()),
-        [other] => Err(format!(
-            "{context}: generated non-query statement: {}",
-            novarocks_parser::printer::print_statement(other)
-        )),
-        _ => Err(format!(
-            "{context}: generated {} statements, expected exactly one query",
-            statements.len()
-        )),
-    }
-}
-
-#[cfg(debug_assertions)]
-fn qualify_iceberg_table(target: &TargetBackend) -> String {
-    format!(
-        "{}.{}.{}",
-        sql_identifier(&target.catalog),
-        sql_identifier(&target.namespace),
-        sql_identifier(&target.table)
-    )
-}
-
-#[cfg(debug_assertions)]
-fn sql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
-
-#[cfg(debug_assertions)]
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
@@ -1059,20 +988,6 @@ mod tests {
         assert!(
             matches!(&version.value, Expr::Literal(literal) if literal.kind == LiteralKind::String(branch.into()))
         );
-        #[cfg(debug_assertions)]
-        {
-            let legacy = super::legacy_delete_position_sink_sql(
-                &target,
-                &novarocks_parser::printer::print_expr(&where_clause),
-                &sink_columns,
-                branch,
-            );
-            let parsed = super::parse_generated_query(&legacy, "legacy branch comparison").unwrap();
-            assert!(
-                !novarocks_parser::ast::syntax_eq_query(&query, &parsed),
-                "the old literal path consumed the branch backslash"
-            );
-        }
     }
 
     #[test]

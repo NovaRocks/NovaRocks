@@ -2507,15 +2507,6 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
 ) -> Result<SqlMvFirstRefreshArtifact, String> {
     let query =
         prepare_projection_full_read_sql(select_query, pin, current_catalog, current_database)?;
-    #[cfg(debug_assertions)]
-    super::equivalence::require("S1.Projection", &query, || {
-        super::equivalence::prepare_projection_full_read_sql(
-            select_query,
-            pin,
-            current_catalog,
-            current_database,
-        )
-    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),
@@ -2538,16 +2529,6 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
         current_catalog,
         current_database,
     )?;
-    #[cfg(debug_assertions)]
-    super::equivalence::require("S1.UnionProjection", &query, || {
-        super::equivalence::prepare_union_projection_full_read_sql(
-            select_query,
-            branch_count,
-            pin,
-            current_catalog,
-            current_database,
-        )
-    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),
@@ -2623,23 +2604,6 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
         target_schema,
         aggregate_input_types,
     )?;
-    #[cfg(debug_assertions)]
-    super::equivalence::require("S1.Aggregate", &query, || {
-        let state_sql = super::equivalence::prepare_aggregate_first_refresh_state_sql(
-            select_query,
-            calls,
-            pin,
-            current_catalog,
-            current_database,
-        )?;
-        super::equivalence::aggregate_physical_sql(
-            &state_sql,
-            calls,
-            None,
-            target_schema,
-            aggregate_input_types,
-        )
-    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),
@@ -2799,34 +2763,6 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
         })
         .collect::<Result<Vec<_>, String>>()?;
     let query = build::query(build::union_all(bodies).map_err(|error| error.to_string())?);
-    #[cfg(debug_assertions)]
-    super::equivalence::require("S1.BranchUnionAggregate", &query, || {
-        let branches = super::equivalence::prepare_branch_union_aggregate_first_refresh_state_sqls(
-            select_query,
-            branch_count,
-            first_branch_calls,
-            pin,
-            current_catalog,
-            current_database,
-        )?;
-        branches
-            .into_iter()
-            .enumerate()
-            .map(|(branch_index, (calls, state_sql))| {
-                let branch_id = i32::try_from(branch_index).map_err(|_| {
-                    format!("MV first-refresh branch index {branch_index} exceeds Int32")
-                })?;
-                super::equivalence::aggregate_physical_sql(
-                    &state_sql,
-                    &calls,
-                    Some(branch_id),
-                    target_schema,
-                    None,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|parts| parts.join(" UNION ALL "))
-    })?;
     Ok(SqlMvFirstRefreshArtifact::from_physical(
         MvFirstRefreshPhysicalQuery {
             query: Box::new(query),

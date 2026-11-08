@@ -23,8 +23,6 @@ use novarocks_types::naming::normalize_identifier;
 use novarocks_types::schema::{ColumnDef, ColumnDefault, validate_column_default};
 
 use super::command::{literal_query, plain_function};
-#[cfg(debug_assertions)]
-use crate::query_execution::dml::iceberg_writer::value_type_to_sql_type_name;
 use novarocks_type_contract::FunctionValueType;
 
 /// Type direct row sources before their VALUES/UNION common-type analysis.
@@ -236,19 +234,6 @@ fn shape_body(
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
             // Each leaf's target projection still precedes UNION common typing.
-            #[cfg(debug_assertions)]
-            let legacy_sql = {
-                let inner_sql =
-                    printer::print_query(&build::query(ast::SetExpr::Select(select.clone())));
-                format!(
-                    "SELECT {} FROM ({inner_sql}) AS __nr_insert_literal_src",
-                    expressions
-                        .iter()
-                        .map(printer::print_expr)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )
-            };
             let expressions = expressions
                 .into_iter()
                 .map(canonical_insert_wrapper_expression)
@@ -273,8 +258,6 @@ fn shape_body(
                 )
                 .map_err(|error| error.to_string())?,
             )));
-            #[cfg(debug_assertions)]
-            crate::query_execution::dml::equivalence::require("F7", &query, || Ok(legacy_sql))?;
             *body = ast::SetExpr::Query(Box::new(query));
             // Bind constants in the final target wrapper. Its original inner
             // SELECT and the published path remain attached to the same tree.
@@ -653,28 +636,6 @@ fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
 
 fn cast_expr(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
     let data_type = novarocks_sql::sql_type_syntax(target).map_err(|error| error.to_string())?;
-    #[cfg(debug_assertions)]
-    {
-        let template = build::query(ast::SetExpr::Select(Box::new(
-            build::select(
-                vec![build::item(
-                    build::cast(build::null(), data_type.clone()),
-                    None,
-                    false,
-                )],
-                Vec::new(),
-                None,
-                ast::GroupBy::None,
-            )
-            .map_err(|error| error.to_string())?,
-        )));
-        crate::query_execution::dml::equivalence::require("F8", &template, || {
-            Ok(format!(
-                "SELECT CAST(NULL AS {})",
-                value_type_to_sql_type_name(target)?
-            ))
-        })?;
-    }
     Ok(build::cast(expr, data_type))
 }
 

@@ -9,8 +9,6 @@ pub mod delete;
     reason = "Retained as the staged typed DELETE predicate port until its connector owner is wired."
 )]
 pub(crate) mod delete_predicate_translate;
-#[cfg(debug_assertions)]
-pub(crate) mod equivalence;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_writer;
 pub mod insert;

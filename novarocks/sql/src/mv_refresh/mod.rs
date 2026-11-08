@@ -23,8 +23,6 @@
 use std::collections::BTreeMap;
 
 pub(crate) mod aggregate_shape;
-#[cfg(debug_assertions)]
-pub(crate) mod equivalence;
 pub mod first_refresh;
 
 /// SQL classification of an aggregate state expression in an IMV plan.

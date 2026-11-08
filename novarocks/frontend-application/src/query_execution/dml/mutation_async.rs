@@ -34,8 +34,8 @@ type Target = crate::catalog_application::resolver::TargetBackend;
 /// Pure provider-signed preparation of the exact admitted UPDATE or MERGE.
 /// COW has not begun a write; its matching computation must run first.
 pub(crate) enum PreparedMutationFacts {
-    Update(PreparedUpdateMutation),
-    Merge(PreparedMergeMutation),
+    Update(Box<PreparedUpdateMutation>),
+    Merge(Box<PreparedMergeMutation>),
 }
 
 pub(crate) async fn prepare_mutation_facts_async(
@@ -92,6 +92,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Update),
         OwnedMutationStatement::Merge(statement) => finish_merge_mutation_preparation(
             statement,
@@ -103,6 +104,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Merge),
     }
 }

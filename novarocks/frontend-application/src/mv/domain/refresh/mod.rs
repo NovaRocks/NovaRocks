@@ -25,7 +25,6 @@ pub mod non_join_incremental;
 pub mod observation;
 pub mod pin;
 pub mod planning;
-pub(crate) mod projection_first_refresh;
 pub mod repartition;
 pub mod rewrite_context;
 pub(crate) mod scan_binding;
