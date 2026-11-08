@@ -74,6 +74,22 @@ use super::participation_owner::{
 use super::remote_task::{CreateSettlement, RemoteTask, TaskTerminalReport, UpdateSettlement};
 use super::stage::{EdgeOpenTracker, StageExecution};
 
+#[derive(Debug)]
+struct QueueExpiryPass {
+    cursor: crate::dispatch::QueueExpiryCursor,
+    first_error: Option<TaskExecutionError>,
+}
+#[derive(Debug)]
+pub(crate) enum QueueExpiryProgress {
+    Yield,
+    ReleaseQueuedInput {
+        grant: QueuedInputGrantRef,
+        /// Original queued actor-Abort only; this is not settlement or exit.
+        definitely_unsent_abort: Option<TaskOperationId>,
+    },
+    Complete(Result<(), TaskExecutionError>),
+}
+
 struct CoveredStatusStreamEvent {
     source_revision: Option<u64>,
     fact: CoveredStatusStreamFact,
@@ -394,8 +410,7 @@ pub struct QueryTaskExecution {
     edge_control_effects: VecDeque<PendingEdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     pending_candidates: VecDeque<AdmissionCandidate>,
-    released_native_inputs: VecDeque<QueuedInputGrantRef>,
-    expired_actor_aborts: Vec<TaskOperationId>,
+    queue_expiry: Option<QueueExpiryPass>,
     status_reconciliations: BTreeSet<ParticipationRef>,
     terminal_retired_reconciliations: BTreeSet<ParticipationRef>,
     covered_reconciliations: BTreeSet<ParticipationRef>,
@@ -716,8 +731,7 @@ impl QueryTaskExecution {
             edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
             pending_candidates: VecDeque::new(),
-            released_native_inputs: VecDeque::new(),
-            expired_actor_aborts: Vec::new(),
+            queue_expiry: None,
             status_reconciliations: BTreeSet::new(),
             terminal_retired_reconciliations: BTreeSet::new(),
             covered_reconciliations: BTreeSet::new(),
@@ -862,10 +876,6 @@ impl QueryTaskExecution {
         std::mem::take(&mut self.covered_reconciliations)
     }
 
-    pub(crate) fn take_expired_actor_aborts(&mut self) -> Vec<TaskOperationId> {
-        std::mem::take(&mut self.expired_actor_aborts)
-    }
-
     /// Every backend's sealed runtime-filter observation, as its release
     /// reported it, with whether the set is complete.
     ///
@@ -985,51 +995,78 @@ impl QueryTaskExecution {
             .and_then(|stage| stage.task(task_id))
     }
 
-    /// Produces every intent the owners currently have and releases bounded
-    /// batches to the sink.
-    ///
-    /// Order matters only for latency, never for correctness: every owner
-    /// refuses to hand out a request twice, so the same call made in a
-    /// different order releases the same set.
-
-    fn expire_queued_operations(
-        &mut self,
-        now: MonotonicInstant,
-    ) -> Result<(), TaskExecutionError> {
-        let expired = self.dispatcher.drain_expired(now);
-        let mut first_expiry = None;
-        for expired in expired {
-            let (intent, waited, original_grant) = expired.into_parts();
-            let operation_id = intent.operation_id();
-            let kind = intent.kind();
-            self.released_native_inputs.push_back(original_grant);
-            let target = self
-                .operation_targets
-                .remove(&operation_id)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            // The dispatcher never accepted this operation, so no remote
-            // effect is possible. Roll back its owner marker before failing
-            // the attempt; cleanup can then mint the cancellation it owes.
-            if target == OperationTarget::ActorAbort {
-                self.expired_actor_aborts.push(operation_id);
-            } else {
-                self.rollback_unsent(target, operation_id);
-            }
-            first_expiry.get_or_insert(TaskExecutionError::QueueResidenceExpired {
-                operation_id,
-                kind,
-                waited,
-            });
+    /// Freeze the original expiry phase clock once. The Core must not enqueue
+    /// or dispatch across this continuation, even if real time advances.
+    pub(crate) fn begin_queue_expiry(&mut self) -> Result<(), TaskExecutionError> {
+        if self.queue_expiry.is_some() {
+            return Err(TaskExecutionError::Schedule(
+                "queue expiry phase is already active".into(),
+            ));
         }
-        if let Some(error) = first_expiry {
-            return Err(error);
-        }
+        self.queue_expiry = Some(QueueExpiryPass {
+            cursor: crate::dispatch::QueueExpiryCursor::new(self.now),
+            first_error: None,
+        });
         Ok(())
     }
-
-    /// Dispatch only previously authorized actor Abort effects while ordinary
-    /// admission is paused. Queue deadlines, permits and settlements remain
-    /// with the same dispatcher and transport owners.
+    /// Consume every original expired row before returning its first failure.
+    /// Source grant disposal and actor-Abort settlement remain explicit later
+    /// effects, independent of this protocol rollback and actual work exit.
+    pub(crate) fn advance_queue_expiry(
+        &mut self,
+        context: &mut dyn crate::capacity::StepContext,
+    ) -> Result<QueueExpiryProgress, TaskExecutionError> {
+        let mut pass = self.queue_expiry.take().ok_or_else(|| {
+            TaskExecutionError::Schedule("queue expiry phase was not selected".into())
+        })?;
+        loop {
+            match pass.cursor.advance(&mut self.dispatcher, context) {
+                crate::dispatch::ExpiryProgress::Yield => {
+                    self.queue_expiry = Some(pass);
+                    return Ok(QueueExpiryProgress::Yield);
+                }
+                crate::dispatch::ExpiryProgress::Complete => {
+                    return Ok(QueueExpiryProgress::Complete(
+                        pass.first_error.map_or(Ok(()), Err),
+                    ));
+                }
+                crate::dispatch::ExpiryProgress::Expired(expired) => {
+                    let (intent, waited, original_grant) = expired.into_parts();
+                    let operation_id = intent.operation_id();
+                    let kind = intent.kind();
+                    let target = self
+                        .operation_targets
+                        .remove(&operation_id)
+                        .ok_or(TaskExecutionError::UnknownOperation)?;
+                    let definitely_unsent_abort =
+                        (target == OperationTarget::ActorAbort).then_some(operation_id);
+                    if definitely_unsent_abort.is_none() {
+                        self.rollback_unsent(target, operation_id);
+                    }
+                    pass.first_error
+                        .get_or_insert(TaskExecutionError::QueueResidenceExpired {
+                            operation_id,
+                            kind,
+                            waited,
+                        });
+                    // Return this SAME ref before consuming another row; no
+                    // amortized-growth return buffer on a poller step. The
+                    // Core retains the pending effect through Source Full.
+                    self.queue_expiry = Some(pass);
+                    return Ok(QueueExpiryProgress::ReleaseQueuedInput {
+                        grant: original_grant,
+                        definitely_unsent_abort,
+                    });
+                }
+            }
+        }
+    }
+    pub(crate) fn queue_deadline(&self) -> Option<MonotonicInstant> {
+        self.dispatcher.queue_deadline()
+    }
+    pub(crate) fn take_released_native_input(&mut self) -> Option<QueuedInputGrantRef> {
+        self.dispatcher.take_released_grant()
+    }
 
     /// Records one domain fact for one task.
     ///
@@ -3305,6 +3342,155 @@ mod bounded_drain_tests {
         execution
             .apply_published(&status, &mut StatusReport::default())
             .unwrap();
+    }
+    #[test]
+    fn expiry_keeps_original_priority_first_error_and_frozen_clock_across_charged_turns() {
+        let mut execution = many_tasks(3);
+        let first = identity(&execution, 1);
+        let second = identity(&execution, 2);
+        let third = identity(&execution, 3);
+        let first_op = enqueue_create(&mut execution, first, grant(1));
+        execution
+            .set_now(MonotonicInstant::from_origin(Duration::from_secs(1)))
+            .unwrap();
+        let now = execution.now;
+        let priority = execution
+            .task_by_identity(second)
+            .unwrap()
+            .release_create(now)
+            .unwrap();
+        let priority_op = priority.operation_id();
+        execution
+            .dispatcher
+            .enqueue_priority_reserved(priority, execution.now, grant(2))
+            .unwrap();
+        execution.operation_targets.insert(
+            priority_op,
+            OperationTarget::Task {
+                stage: second.stage_id(),
+                task: second.task_id(),
+            },
+        );
+        execution
+            .set_now(MonotonicInstant::from_origin(Duration::from_secs(4)))
+            .unwrap();
+        let future_op = enqueue_create(&mut execution, third, grant(3));
+        execution
+            .set_now(MonotonicInstant::from_origin(Duration::from_secs(6)))
+            .unwrap();
+        execution.begin_queue_expiry().unwrap();
+        assert!(execution.begin_queue_expiry().is_err());
+        assert!(matches!(
+            execution.advance_queue_expiry(&mut Turn(1)).unwrap(),
+            QueueExpiryProgress::Yield
+        ));
+        assert_eq!(execution.dispatcher.queued_items(), 3);
+        let mut completed = None;
+        let mut released = Vec::new();
+        for _ in 0..32 {
+            execution
+                .set_now(MonotonicInstant::from_origin(Duration::from_secs(100)))
+                .unwrap();
+            match execution.advance_queue_expiry(&mut Turn(1)).unwrap() {
+                QueueExpiryProgress::Yield => {}
+                QueueExpiryProgress::ReleaseQueuedInput {
+                    grant,
+                    definitely_unsent_abort,
+                } => {
+                    assert_eq!(definitely_unsent_abort, None);
+                    released.push(grant);
+                }
+                QueueExpiryProgress::Complete(result) => {
+                    completed = Some(result);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(completed.unwrap(), Err(TaskExecutionError::QueueResidenceExpired { operation_id, waited, .. })
+            if operation_id == priority_op && waited == Duration::from_secs(5))
+        );
+        assert!(!execution.operation_targets.contains_key(&first_op));
+        assert!(!execution.operation_targets.contains_key(&priority_op));
+        assert!(execution.operation_targets.contains_key(&future_op));
+        assert_eq!(execution.dispatcher.queued_items(), 1);
+        assert_eq!(released, [grant(2), grant(1)]);
+        assert_eq!(execution.take_released_native_input(), None);
+        assert_eq!(
+            execution.queue_deadline(),
+            Some(MonotonicInstant::from_origin(Duration::from_secs(9)))
+        );
+        execution.begin_queue_expiry().unwrap();
+        assert!(
+            matches!(execution.advance_queue_expiry(&mut Turn(100)).unwrap(),
+            QueueExpiryProgress::ReleaseQueuedInput { grant: value, definitely_unsent_abort: None } if value == grant(3))
+        );
+        let QueueExpiryProgress::Complete(result) =
+            execution.advance_queue_expiry(&mut Turn(100)).unwrap()
+        else {
+            panic!("finite next original pass")
+        };
+        assert!(
+            matches!(result, Err(TaskExecutionError::QueueResidenceExpired { operation_id, waited, .. })
+            if operation_id == future_op && waited == Duration::from_secs(96))
+        );
+        assert_eq!(execution.take_released_native_input(), None);
+    }
+    #[test]
+    fn expired_actor_abort_returns_its_exact_unsent_fact_with_same_grant_without_accumulation() {
+        let mut execution = many_tasks(1);
+        let participation = *execution.graph.participations().next().unwrap();
+        let abort = execution.ids.issue();
+        execution
+            .dispatcher
+            .enqueue_priority_reserved(
+                OperationIntent::AbortParticipation(AbortParticipation::new(
+                    abort,
+                    participation,
+                    AbortCause::QueryFailed,
+                )),
+                execution.now,
+                grant(11),
+            )
+            .unwrap();
+        execution
+            .operation_targets
+            .insert(abort, OperationTarget::ActorAbort);
+        execution
+            .set_now(MonotonicInstant::from_origin(Duration::from_secs(5)))
+            .unwrap();
+        execution.begin_queue_expiry().unwrap();
+        assert!(
+            matches!(execution.advance_queue_expiry(&mut Turn(100)).unwrap(),
+            QueueExpiryProgress::ReleaseQueuedInput { grant: original, definitely_unsent_abort: Some(operation) }
+                if original == grant(11) && operation == abort)
+        );
+        assert!(matches!(
+            execution.actor_abort_dispatch_state(abort),
+            Err(TaskExecutionError::UnknownOperation)
+        ));
+        assert!(
+            matches!(execution.advance_queue_expiry(&mut Turn(0)).unwrap(),
+            QueueExpiryProgress::Complete(Err(TaskExecutionError::QueueResidenceExpired { operation_id, kind: OperationKind::AbortParticipation, .. }))
+            if operation_id == abort)
+        );
+        assert_eq!(execution.take_released_native_input(), None);
+    }
+    #[test]
+    fn no_expired_deadline_finishes_without_scanning_or_moving_original_grants() {
+        let mut execution = many_tasks(100);
+        for n in 1..=100 {
+            let id = identity(&execution, n);
+            enqueue_create(&mut execution, id, grant(u64::from(n)));
+        }
+        execution.begin_queue_expiry().unwrap();
+        assert!(matches!(
+            execution.advance_queue_expiry(&mut Turn(0)).unwrap(),
+            QueueExpiryProgress::Complete(Ok(()))
+        ));
+        assert_eq!(execution.dispatcher.queued_items(), 100);
+        assert_eq!(execution.take_released_native_input(), None);
+        assert!(execution.advance_queue_expiry(&mut Turn(1)).is_err());
     }
     #[test]
     fn normal_drain_seals_input_immediately_and_visits_one_frozen_task_per_unit() {

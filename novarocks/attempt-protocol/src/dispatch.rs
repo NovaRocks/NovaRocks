@@ -30,6 +30,9 @@
 //! operation that has already been released: an immutable request that is
 //! already on its way keeps its position and converges on its own receipt.
 
+mod expiry;
+pub(crate) use expiry::{ExpiryProgress, QueueExpiryCursor};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::FrozenTransportLimits as TransportBudget;
@@ -585,30 +588,6 @@ impl OperationDispatcher {
             .first()
             .map(|&(at, _)| at.saturating_add(self.transport.frontend_queue_residence()))
     }
-    /// The caller charges each original expiry before consuming it.
-    pub(crate) fn take_expired(&mut self, now: MonotonicInstant) -> Option<ExpiredOperation> {
-        let &(at, operation) = self.queued_times.first()?;
-        let waited = now.saturating_duration_since(at);
-        if waited < self.transport.frontend_queue_residence() {
-            return None;
-        }
-        let entry = self
-            .remove_queued(operation)
-            .expect("deadline index retains original entry");
-        Some(ExpiredOperation {
-            intent: entry.intent,
-            waited,
-            _queue_permit: entry.queue_permit,
-        })
-    }
-    pub fn drain_expired(&mut self, now: MonotonicInstant) -> Vec<ExpiredOperation> {
-        let mut expired = Vec::new();
-        while let Some(entry) = self.take_expired(now) {
-            expired.push(entry);
-        }
-        expired
-    }
-
     /// Releases one bounded batch, rotating fairly across backends and lanes.
     pub fn take_batch(&mut self) -> Option<DispatchBatch> {
         if self.rotation.is_empty() {
@@ -971,6 +950,27 @@ mod indexed_queue_tests {
             queued_bytes: 256,
         }
     }
+    struct ExpiryBudget(usize);
+    impl crate::capacity::StepContext for ExpiryBudget {
+        fn charge(&mut self, units: usize) -> bool {
+            if units > self.0 {
+                false
+            } else {
+                self.0 -= units;
+                true
+            }
+        }
+        fn reserve_queue_stage(
+            &mut self,
+            _: DispatchLane,
+            _: bool,
+            _: BackendProcessId,
+            _: usize,
+            _: usize,
+        ) -> crate::capacity::QueueStage {
+            panic!("expiry cannot grant transport capacity")
+        }
+    }
     #[test]
     fn exact_cancellation_keeps_surrounding_fifo_and_returns_only_original_grant() {
         let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, limits());
@@ -1013,11 +1013,20 @@ mod indexed_queue_tests {
             .enqueue_priority_reserved(operation(2), at(4), grant(2))
             .unwrap();
         assert_eq!(dispatcher.queue_deadline(), Some(at(5)));
-        let (intent, waited, original_grant) = dispatcher.take_expired(at(5)).unwrap().into_parts();
+        let mut cursor = QueueExpiryCursor::new(at(5));
+        let ExpiryProgress::Expired(expired) =
+            cursor.advance(&mut dispatcher, &mut ExpiryBudget(32))
+        else {
+            panic!("original expired tail behind a younger priority head")
+        };
+        let (intent, waited, original_grant) = expired.into_parts();
         assert_eq!(intent.operation_id(), operation(1).operation_id());
         assert_eq!(waited, Duration::from_secs(5));
         assert_eq!(original_grant, grant(1));
-        assert!(dispatcher.take_expired(at(5)).is_none());
+        assert!(matches!(
+            cursor.advance(&mut dispatcher, &mut ExpiryBudget(32)),
+            ExpiryProgress::Complete
+        ));
         assert_eq!(dispatcher.queue_deadline(), Some(at(9)));
         let batch = dispatcher.take_batch().unwrap();
         assert_eq!(
