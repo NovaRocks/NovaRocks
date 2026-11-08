@@ -740,7 +740,7 @@ struct CreateTaskBody {
 /// The by-value handle drops the actual shared body/header before its paid
 /// input lease. No grant is embedded in the allocation whose header it pays.
 #[derive(Debug)]
-pub(crate) struct CreateTaskIntent {
+pub struct CreateTaskIntent {
     original: Arc<CreateTaskBody>,
     retention: Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
 }

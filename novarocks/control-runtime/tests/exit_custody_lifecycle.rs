@@ -47,6 +47,7 @@ fn resources(amount: u64) -> ResourceVector {
 }
 fn work_resources(amount: u64) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota: resources(amount),
         owned_slots: OwnedSlotNeed {
             work_headers: 1,
@@ -56,6 +57,7 @@ fn work_resources(amount: u64) -> ReservationResources {
 }
 fn role_resources(amount: u64) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota: resources(amount),
         owned_slots: OwnedSlotNeed {
             work_headers: 1,
@@ -766,4 +768,112 @@ fn a_start_that_won_before_failure_keeps_real_exit_independent_from_core_consump
     f.scope.close_external().unwrap();
     f.ledger.remove_scope(f.scope.id()).unwrap();
     assert!(f.ledger.is_empty());
+}
+
+#[test]
+fn exit_custody_retires_process_and_original_keyed_quota_after_report_consumption() {
+    use novarocks_control_runtime_core::{
+        capacity::KeyedQuota,
+        identity::{CapacityKey, FamilyId},
+    };
+    struct RetiredWake {
+        owner: std::sync::Weak<std::sync::Mutex<Option<ExitCustody>>>,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl std::task::Wake for RetiredWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            let owner = self.owner.upgrade().unwrap();
+            let original = owner.lock().unwrap().as_ref().unwrap().clone();
+            assert_eq!(
+                original.phase(),
+                ExitCustodyPhase::Retired,
+                "capacity notification runs after the original custody lock is released"
+            );
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let family = FamilyId::new(7).unwrap();
+    let keyed_dimension = DimensionId::new(2).unwrap();
+    let ledger = RuntimeLedger::with_keyed_families(
+        resources(1),
+        [(family, ResourceVector::new([(keyed_dimension, 3)]).unwrap())],
+    )
+    .unwrap();
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let request = role_resources(1).with_keyed(KeyedQuota {
+        family,
+        key: CapacityKey(0x4321),
+        quota: ResourceVector::new([(keyed_dimension, 3)]).unwrap(),
+    });
+    let (work, mut capacity) = scope
+        .reserve_next(
+            generation(),
+            request,
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let consumer = ConsumerId::new(1).unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut capacity,
+        generation(),
+        1,
+        [(consumer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let reported = novarocks_control_runtime::reported_work::ReportedWork::try_new(
+        work,
+        capacity,
+        report.clone(),
+    )
+    .unwrap();
+    let (custody, mut obligation) = ExitCustody::from_admitted(reported);
+    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(custody.clone())));
+    let registrant = ledger
+        .capacity_registrant(std::task::Waker::from(std::sync::Arc::new(RetiredWake {
+            owner: std::sync::Arc::downgrade(&owner),
+            count: wake_count.clone(),
+        })))
+        .unwrap();
+    assert!(
+        scope
+            .reserve_next_or_wait(
+                generation(),
+                ReservationResources::work_only().with_keyed(KeyedQuota {
+                    family,
+                    key: CapacityKey(0x4321),
+                    quota: ResourceVector::new([(keyed_dimension, 1)]).unwrap()
+                }),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+                &registrant,
+            )
+            .is_err()
+    );
+    obligation.start().unwrap();
+    obligation.exited().unwrap();
+    assert!(
+        !custody.try_retire().unwrap(),
+        "the original report consumer still retains every quota share"
+    );
+    assert_eq!(
+        ledger.try_keyed_usage_snapshot().unwrap()[0]
+            .used
+            .get(keyed_dimension),
+        3
+    );
+    report.consume(consumer).unwrap();
+    assert!(custody.try_retire().unwrap());
+    assert_eq!(custody.phase(), ExitCustodyPhase::Retired);
+    assert_eq!(ledger.used(dimension()), 0);
+    assert!(ledger.try_keyed_usage_snapshot().unwrap().is_empty());
+    assert!(ledger.unresolved_work().is_empty());
+    assert_eq!(wake_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    ledger.reap_ready(1).unwrap();
+    scope.close_external().unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
 }

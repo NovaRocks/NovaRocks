@@ -28,7 +28,6 @@ use super::source_positions::{ReapedPosition, SourcePositionError};
 use crate::task_completion_set::AdmittedCompletionTransfer;
 use crate::{
     settlement::RegistrationNotice,
-    task_causal_input::CausalInputObligation,
     task_port::TaskPendingNotice,
     task_proposal_ingress::{
         CausalEventInput, CausalEventKind, CutSourceAdmission, IngressError, RequestMetadata,
@@ -38,6 +37,7 @@ use crate::{
 use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor as RuntimeInputAuthor, InputPhase,
 };
+use novarocks_control_runtime::causal_input::CausalInputObligation;
 use novarocks_control_runtime::obligation::WorkObligation;
 use novarocks_control_runtime::{completion::ReportSlot, transaction::ScopeHandle};
 use novarocks_control_runtime::{

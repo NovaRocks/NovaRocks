@@ -1483,3 +1483,275 @@ mod staged_scope_stop_model {
         });
     }
 }
+
+struct CapacityWakeCounter {
+    count: AtomicUsize,
+    ledger: RuntimeLedger,
+}
+impl std::task::Wake for CapacityWakeCounter {
+    fn wake(self: std::sync::Arc<Self>) {
+        // Reenter the original ledger: invocation under its mutex deadlocks.
+        let _ = self.ledger.used(DimensionId::new(1).unwrap());
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[test]
+fn capacity_registration_and_release_have_no_lost_wake_with_two_preemptions() {
+    model(|| {
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let held = scope
+            .reserve_next(
+                generation(),
+                work_resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let wake = std::sync::Arc::new(CapacityWakeCounter {
+            count: AtomicUsize::new(0),
+            ledger: ledger.clone(),
+        });
+        let registrant = ledger
+            .capacity_registrant(std::task::Waker::from(wake.clone()))
+            .unwrap();
+        let release = thread::spawn(move || drop(held));
+        let denied = match scope.reserve_next_or_wait(
+            generation(),
+            work_resources(1),
+            WorkKind::Business,
+            WorkAdmission::External,
+            &registrant,
+        ) {
+            Ok(guard) => {
+                drop(guard);
+                false
+            }
+            Err(RuntimeError::CapacityDenied(_)) => true,
+            Err(error) => panic!("unexpected reservation refusal: {error:?}"),
+        };
+        release.join().unwrap();
+        assert_eq!(wake.count.load(Ordering::SeqCst), usize::from(denied));
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+        assert_eq!(ledger.used(DimensionId::new(1).unwrap()), 0);
+    });
+}
+
+#[test]
+fn dropped_capacity_registrant_and_release_do_not_retain_wait_metadata() {
+    model(|| {
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let held = scope
+            .reserve_next(
+                generation(),
+                work_resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let wake = std::sync::Arc::new(CapacityWakeCounter {
+            count: AtomicUsize::new(0),
+            ledger: ledger.clone(),
+        });
+        let registrant = ledger
+            .capacity_registrant(std::task::Waker::from(wake.clone()))
+            .unwrap();
+        assert!(matches!(
+            scope.reserve_next_or_wait(
+                generation(),
+                work_resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+                &registrant
+            ),
+            Err(RuntimeError::CapacityDenied(_))
+        ));
+        let retire = thread::spawn(move || drop(registrant));
+        let release = thread::spawn(move || drop(held));
+        retire.join().unwrap();
+        release.join().unwrap();
+        assert!(wake.count.load(Ordering::SeqCst) <= 1);
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+    });
+}
+
+struct CapacityRollbackActor {
+    scope: novarocks_control_runtime::transaction::ScopeHandle,
+    registrant: novarocks_control_runtime::capacity_notification::CapacityRegistrant,
+}
+impl Actor for CapacityRollbackActor {
+    type Input = ();
+    type Effect = ();
+    fn timer_input(_: Tick) {}
+    fn next_deadline(&self) -> Option<Tick> {
+        None
+    }
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
+    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), step: &mut ActorStep<'_, ()>) {
+        let held = self
+            .scope
+            .reserve_next(
+                generation(),
+                work_resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        assert!(matches!(
+            self.scope.reserve_next_or_wait(
+                generation(),
+                work_resources(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+                &self.registrant
+            ),
+            Err(RuntimeError::CapacityDenied(_))
+        ));
+        assert!(step.reservation(held).is_ok());
+        panic!("intentional capacity rollback model failure");
+    }
+}
+struct CapacityRollbackWake {
+    owner: std::sync::Weak<loom::sync::Mutex<Option<ActorRuntime<CapacityRollbackActor>>>>,
+    count: AtomicUsize,
+}
+impl std::task::Wake for CapacityRollbackWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        let owner = self.owner.upgrade().unwrap();
+        let runtime = owner.lock().unwrap().as_ref().unwrap().clone();
+        // This takes the real inbox. A wake under inbox/ledger reverses or
+        // recursively acquires those same locks instead of passing this test.
+        assert!(runtime.snapshot(aid(1)).unwrap().failed);
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[test]
+fn failed_turn_capacity_wake_reenters_inbox_only_after_lock_free_handoff() {
+    model(|| {
+        let ledger = RuntimeLedger::new(resources(1));
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let runtime = ActorRuntime::new();
+        let owner = std::sync::Arc::new(loom::sync::Mutex::new(Some(runtime.clone())));
+        let wake = std::sync::Arc::new(CapacityRollbackWake {
+            owner: std::sync::Arc::downgrade(&owner),
+            count: AtomicUsize::new(0),
+        });
+        let registrant = ledger
+            .capacity_registrant(std::task::Waker::from(wake.clone()))
+            .unwrap();
+        let config = ActorConfig {
+            mailbox: [4; 4],
+            max_batches: 4,
+            max_effects_per_step: 2,
+            max_dependencies_per_effect: 2,
+            turn_budget: 16,
+            max_step_work: 2,
+        };
+        assert!(
+            runtime
+                .register_next(
+                    aid(1),
+                    scope.clone(),
+                    CapacityRollbackActor {
+                        scope: scope.clone(),
+                        registrant
+                    },
+                    config
+                )
+                .is_ok()
+        );
+        let input = runtime
+            .reserve_input(aid(1), aid(2), InputClass::Ordinary)
+            .unwrap()
+            .fill(())
+            .unwrap();
+        let observer_scope = scope.clone();
+        let observer = thread::spawn(move || {
+            let _ = observer_scope.snapshot().unwrap();
+        });
+        runtime.poll_one(Tick(1)).unwrap();
+        observer.join().unwrap();
+        assert_eq!(wake.count.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+        let novarocks_control_runtime::actor_turn::FailureSourceState::ClosedPending(supervisor) =
+            runtime.failure_source_state(aid(1)).unwrap()
+        else {
+            panic!("expected pending failure input");
+        };
+        runtime.retire_input(aid(1), input).unwrap();
+        runtime.retire_input(aid(1), supervisor).unwrap();
+        drop(runtime.take_failure_payload(aid(1)).unwrap());
+        while let Some(turn) = runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        scope.close_external().unwrap();
+        assert!(runtime.remove_actor(aid(1)).is_ok());
+        ledger.remove_scope(scope.id()).unwrap();
+    });
+}
+
+#[test]
+fn two_refused_targets_concurrently_release_one_logical_wait_exactly_once() {
+    model(|| {
+        use novarocks_control_runtime_core::capacity::KeyedQuota;
+        let family = FamilyId::new(1).unwrap();
+        let dimension = DimensionId::new(3).unwrap();
+        let ledger = RuntimeLedger::with_keyed_families(
+            resources(1),
+            [(family, ResourceVector::new([(dimension, 1)]).unwrap())],
+        )
+        .unwrap();
+        let scope = ledger.open_scope_next(None, generation()).unwrap();
+        let request = |key| {
+            ReservationResources::work_only().with_keyed(KeyedQuota {
+                family,
+                key: CapacityKey(key),
+                quota: ResourceVector::new([(dimension, 1)]).unwrap(),
+            })
+        };
+        let first = scope
+            .reserve_next(
+                generation(),
+                request(1),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let second = scope
+            .reserve_next(
+                generation(),
+                request(2),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let wake = std::sync::Arc::new(CapacityWakeCounter {
+            count: AtomicUsize::new(0),
+            ledger: ledger.clone(),
+        });
+        let registrant = ledger
+            .capacity_registrant(std::task::Waker::from(wake.clone()))
+            .unwrap();
+        for key in [1, 2] {
+            assert!(matches!(
+                scope.reserve_next_or_wait(
+                    generation(),
+                    request(key),
+                    WorkKind::Business,
+                    WorkAdmission::External,
+                    &registrant,
+                ),
+                Err(RuntimeError::CapacityDenied(_))
+            ));
+        }
+        assert_eq!(ledger.capacity_waiter_count(), 1);
+        let release_first = thread::spawn(move || drop(first));
+        let release_second = thread::spawn(move || drop(second));
+        release_first.join().unwrap();
+        release_second.join().unwrap();
+        assert_eq!(wake.count.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+        assert!(ledger.try_keyed_usage_snapshot().unwrap().is_empty());
+    });
+}

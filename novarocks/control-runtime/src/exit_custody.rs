@@ -198,7 +198,14 @@ impl ExitCustody {
     /// Actual body/capture exit is necessary but not sufficient: children and
     /// every independent report consumer must also retire before capacity can
     /// be reused. No consumer is acknowledged implicitly by this role.
+    /// Capacity notifications run after this entry releases its private custody
+    /// lock. Callers must not hold an additional lock their Waker may acquire.
     pub fn try_retire(&self) -> Result<bool, ExitCustodyError> {
+        crate::capacity_notification::with_capacity_wakes_deferred(&self.0.report.runtime, || {
+            self.try_retire_inner()
+        })
+    }
+    fn try_retire_inner(&self) -> Result<bool, ExitCustodyError> {
         let mut state = self.0.state.lock().expect("original role custody lock");
         if state.phase != ExitCustodyPhase::Exited {
             return Ok(false);
@@ -217,7 +224,7 @@ impl ExitCustody {
         let capacity = state.capacity.as_mut().expect("original role capacity");
         let release = capacity.resources().and_then(|resources| {
             capacity
-                .release_quota(&resources.quota)
+                .release_quota_with_keyed(&resources.quota, resources.keyed.as_ref())
                 .and_then(|()| capacity.finish())
         });
         if let Err(error) = release {

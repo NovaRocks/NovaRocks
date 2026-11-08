@@ -17,7 +17,9 @@
 
 //! One atomic, multidimensional ledger. Callers synchronize this with its scope.
 
-use crate::identity::{DimensionId, Generation, ReservationId, ScopeId, WorkId};
+use crate::identity::{
+    CapacityKey, DimensionId, FamilyId, Generation, ReservationId, ScopeId, WorkId,
+};
 use crate::owned_storage::{
     OwnedPosition, OwnedPositionSpan, OwnedSlotKind, OwnedSlotNeed, OwnedStorageError,
     OwnedStorageInventory,
@@ -31,6 +33,14 @@ pub struct ResourceVector(BTreeMap<DimensionId, u64>);
 pub enum CapacityError {
     DuplicateDimension,
     UnknownDimension,
+    DuplicateFamily,
+    UnknownFamily,
+    WrongKey,
+    ExhaustedKeyed {
+        family: FamilyId,
+        key: CapacityKey,
+        dimension: DimensionId,
+    },
     Overflow,
     Exhausted(DimensionId),
     DuplicateReservation,
@@ -101,16 +111,99 @@ impl ResourceVector {
         Ok(result)
     }
 }
+/// One key in a family whose dimension limits are uniform across keys.
+/// This is a request description, never a cloned capacity grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedQuota {
+    pub family: FamilyId,
+    pub key: CapacityKey,
+    pub quota: ResourceVector,
+}
+impl KeyedQuota {
+    fn checked_add(&self, other: &Self) -> Result<Self, CapacityError> {
+        if self.family != other.family || self.key != other.key {
+            return Err(CapacityError::WrongKey);
+        }
+        Ok(Self {
+            family: self.family,
+            key: self.key,
+            quota: self.quota.checked_add(&other.quota)?,
+        })
+    }
+}
+fn add_keyed(
+    a: Option<&KeyedQuota>,
+    b: Option<&KeyedQuota>,
+) -> Result<Option<KeyedQuota>, CapacityError> {
+    match (a, b) {
+        (Some(a), Some(b)) => Ok(Some(a.checked_add(b)?)),
+        (Some(a), None) | (None, Some(a)) => Ok(Some(a.clone())),
+        (None, None) => Ok(None),
+    }
+}
+fn subtract_keyed(
+    a: Option<&KeyedQuota>,
+    b: Option<&KeyedQuota>,
+) -> Result<Option<KeyedQuota>, CapacityError> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            if a.family != b.family || a.key != b.key {
+                return Err(CapacityError::WrongKey);
+            }
+            let quota = a.quota.checked_sub(&b.quota)?;
+            Ok((!quota.is_empty()).then_some(KeyedQuota {
+                family: a.family,
+                key: a.key,
+                quota,
+            }))
+        }
+        (None, Some(b)) if !b.quota.is_empty() => Err(CapacityError::InvalidSplit),
+        (a, _) => Ok(a.cloned()),
+    }
+}
+/// A release target. Number ordering never overrides process-first admission.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CapacityWaitTarget {
+    Process(DimensionId),
+    Keyed {
+        family: FamilyId,
+        key: CapacityKey,
+        dimension: DimensionId,
+    },
+}
+/// Exact active-key observation. It grants neither resource nor identity rights.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyedUsageSnapshot {
+    pub family: FamilyId,
+    pub key: CapacityKey,
+    pub used: ResourceVector,
+    pub limits: ResourceVector,
+}
+#[derive(Debug)]
+struct KeyedFamily {
+    limits: ResourceVector,
+    keys: BTreeMap<CapacityKey, ResourceVector>,
+}
+
 /// Requested or observed values only. Cloning this description never clones
 /// quota, a position, or Work. Storage is not a capacity dimension.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReservationResources {
     pub quota: ResourceVector,
+    pub keyed: Option<KeyedQuota>,
     pub owned_slots: OwnedSlotNeed,
 }
 impl ReservationResources {
     pub fn new(quota: ResourceVector, owned_slots: OwnedSlotNeed) -> Self {
-        Self { quota, owned_slots }
+        Self {
+            quota,
+            keyed: None,
+            owned_slots,
+        }
+    }
+    pub fn with_keyed(mut self, keyed: KeyedQuota) -> Self {
+        self.keyed = (!keyed.quota.is_empty()).then_some(keyed);
+        self
     }
     pub fn work_only() -> Self {
         Self::new(ResourceVector::default(), OwnedSlotNeed::work_only())
@@ -119,13 +212,16 @@ impl ReservationResources {
         Self::new(quota, OwnedSlotNeed::work_only())
     }
     pub fn is_empty(&self) -> bool {
-        self.quota.is_empty() && self.owned_slots.is_empty()
+        self.quota.is_empty()
+            && self.keyed.as_ref().is_none_or(|k| k.quota.is_empty())
+            && self.owned_slots.is_empty()
     }
     pub fn checked_add(&self, other: &Self) -> Result<Self, CapacityError> {
-        Ok(Self::new(
-            self.quota.checked_add(&other.quota)?,
-            self.owned_slots.checked_add(other.owned_slots)?,
-        ))
+        Ok(Self {
+            quota: self.quota.checked_add(&other.quota)?,
+            keyed: add_keyed(self.keyed.as_ref(), other.keyed.as_ref())?,
+            owned_slots: self.owned_slots.checked_add(other.owned_slots)?,
+        })
     }
 }
 #[derive(Debug)]
@@ -134,6 +230,7 @@ pub struct ReservationRecord {
     pub generation: Generation,
     pub work: WorkId,
     pub quota: ResourceVector,
+    pub keyed: Option<KeyedQuota>,
     owned_slots: OwnedStorageInventory,
     pub bound: bool,
     owns_work: bool,
@@ -143,7 +240,11 @@ impl ReservationRecord {
         self.owned_slots.remaining()
     }
     pub fn resources(&self) -> ReservationResources {
-        ReservationResources::new(self.quota.clone(), self.owned_slots.remaining())
+        ReservationResources {
+            quota: self.quota.clone(),
+            keyed: self.keyed.clone(),
+            owned_slots: self.owned_slots.remaining(),
+        }
     }
 }
 #[derive(Clone, Debug)]
@@ -224,6 +325,7 @@ impl OwnerUsageIndex {
 pub struct CapacityLedger {
     limits: ResourceVector,
     used: ResourceVector,
+    families: BTreeMap<FamilyId, KeyedFamily>,
     reservations: BTreeMap<ReservationId, ReservationRecord>,
     owner_counts: BTreeMap<ScopeId, usize>,
     owner_usage: BTreeMap<DimensionId, OwnerUsageIndex>,
@@ -235,11 +337,129 @@ impl CapacityLedger {
         Self {
             limits,
             used: ResourceVector::default(),
+            families: BTreeMap::new(),
             reservations: BTreeMap::new(),
             owner_counts: BTreeMap::new(),
             owner_usage: BTreeMap::new(),
             last_reservation: 0,
             healthy: true,
+        }
+    }
+    pub fn with_keyed_families(
+        limits: ResourceVector,
+        families: impl IntoIterator<Item = (FamilyId, ResourceVector)>,
+    ) -> Result<Self, CapacityError> {
+        let mut ledger = Self::new(limits);
+        ledger.configure_keyed_families(families)?;
+        Ok(ledger)
+    }
+    /// Construction-only configuration. No active reservation can gain a new quota source.
+    pub fn configure_keyed_families(
+        &mut self,
+        families: impl IntoIterator<Item = (FamilyId, ResourceVector)>,
+    ) -> Result<(), CapacityError> {
+        if self.last_reservation != 0 {
+            return Err(CapacityError::InvalidSplit);
+        }
+        let mut configured = BTreeMap::new();
+        for (family, limits) in families {
+            if self.families.contains_key(&family)
+                || configured
+                    .insert(
+                        family,
+                        KeyedFamily {
+                            limits,
+                            keys: BTreeMap::new(),
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(CapacityError::DuplicateFamily);
+            }
+        }
+        self.families.extend(configured);
+        Ok(())
+    }
+    pub fn keyed_dimension_usage(
+        &self,
+        family: FamilyId,
+        key: CapacityKey,
+        dimension: DimensionId,
+    ) -> Option<(u64, u64)> {
+        let family = self.families.get(&family)?;
+        let limit = *family.limits.0.get(&dimension)?;
+        Some((
+            family.keys.get(&key).map_or(0, |used| used.get(dimension)),
+            limit,
+        ))
+    }
+    pub fn keyed_usage_snapshot(&self) -> Vec<KeyedUsageSnapshot> {
+        self.families
+            .iter()
+            .flat_map(|(family, state)| {
+                state
+                    .keys
+                    .iter()
+                    .map(move |(key, used)| KeyedUsageSnapshot {
+                        family: *family,
+                        key: *key,
+                        used: used.clone(),
+                        limits: state.limits.clone(),
+                    })
+            })
+            .collect()
+    }
+    fn check_keyed(&self, keyed: Option<&KeyedQuota>) -> Result<(), CapacityError> {
+        let Some(keyed) = keyed else {
+            return Ok(());
+        };
+        let family = self
+            .families
+            .get(&keyed.family)
+            .ok_or(CapacityError::UnknownFamily)?;
+        for (dimension, amount) in keyed.quota.iter() {
+            let (used, limit) = self
+                .keyed_dimension_usage(keyed.family, keyed.key, dimension)
+                .ok_or(CapacityError::UnknownDimension)?;
+            if used.checked_add(amount).ok_or(CapacityError::Overflow)? > limit {
+                return Err(CapacityError::ExhaustedKeyed {
+                    family: keyed.family,
+                    key: keyed.key,
+                    dimension,
+                });
+            }
+        }
+        let _ = family;
+        Ok(())
+    }
+    fn add_keyed_usage(&mut self, keyed: Option<&KeyedQuota>) {
+        if let Some(keyed) = keyed.filter(|k| !k.quota.is_empty()) {
+            let family = self
+                .families
+                .get_mut(&keyed.family)
+                .expect("validated keyed family");
+            let used = family.keys.entry(keyed.key).or_default();
+            *used = used
+                .checked_add(&keyed.quota)
+                .expect("preflighted keyed addition");
+        }
+    }
+    fn subtract_keyed_usage(&mut self, keyed: Option<&KeyedQuota>) {
+        if let Some(keyed) = keyed.filter(|k| !k.quota.is_empty()) {
+            let family = self
+                .families
+                .get_mut(&keyed.family)
+                .expect("original keyed family");
+            let used = family
+                .keys
+                .get_mut(&keyed.key)
+                .expect("original charged key");
+            *used = used
+                .checked_sub(&keyed.quota)
+                .expect("original key covers release");
+            if used.is_empty() {
+                family.keys.remove(&keyed.key);
+            }
         }
     }
     /// Configure only dimensions needed by an actual owner read port.
@@ -419,6 +639,7 @@ impl CapacityLedger {
                 return Err(CapacityError::Exhausted(dimension));
             }
         }
+        self.check_keyed(request.resources.keyed.as_ref())?;
         let next = self.used.checked_add(&request.resources.quota)?;
         self.check_owner_add(scope.id(), &request.resources.quota)?;
         let mut owned = OwnedStorageInventory::allocate(request.id, request.resources.owned_slots)?;
@@ -431,6 +652,7 @@ impl CapacityLedger {
             header,
         )?;
         self.used = next;
+        self.add_keyed_usage(request.resources.keyed.as_ref());
         self.add_owner_usage(scope.id(), &request.resources.quota);
         self.last_reservation = request.id.get();
         self.reservations.insert(
@@ -440,6 +662,7 @@ impl CapacityLedger {
                 generation: request.generation,
                 work: request.guard,
                 quota: request.resources.quota,
+                keyed: request.resources.keyed,
                 owned_slots: owned,
                 bound: false,
                 owns_work: true,
@@ -479,6 +702,8 @@ impl CapacityLedger {
             return Err(CapacityError::UnboundReservation);
         }
         let remaining_quota = original.quota.checked_sub(&request.resources.quota)?;
+        let remaining_keyed =
+            subtract_keyed(original.keyed.as_ref(), request.resources.keyed.as_ref())?;
         original
             .owned_slots
             .check_split(request.resources.owned_slots)?;
@@ -505,6 +730,7 @@ impl CapacityLedger {
             )
             .expect("same transaction retains the admitted parent");
         original.quota = remaining_quota;
+        original.keyed = remaining_keyed;
         self.last_reservation = request.id.get();
         self.reservations.insert(
             request.id,
@@ -513,6 +739,7 @@ impl CapacityLedger {
                 generation: request.generation,
                 work: request.guard,
                 quota: request.resources.quota,
+                keyed: request.resources.keyed,
                 owned_slots: owned,
                 bound: false,
                 owns_work: true,
@@ -563,9 +790,11 @@ impl CapacityLedger {
         }
         let next = self.used.checked_sub(&record.quota)?;
         let quota = record.quota.clone();
+        let keyed = record.keyed.clone();
         scope.rollback_guard(record.work)?;
         self.used = next;
         self.subtract_owner_usage(scope.id(), &quota);
+        self.subtract_keyed_usage(keyed.as_ref());
         self.reservations.remove(&id);
         self.remove_owner_record(scope.id());
         Ok(())
@@ -576,6 +805,16 @@ impl CapacityLedger {
         id: ReservationId,
         quota: &ResourceVector,
     ) -> Result<(), CapacityError> {
+        self.release_quota_with_keyed(id, quota, None)
+    }
+    /// Process and keyed partial releases preflight together. A release cannot
+    /// change the original family/key or refund moved/bound storage positions.
+    pub fn release_quota_with_keyed(
+        &mut self,
+        id: ReservationId,
+        quota: &ResourceVector,
+        keyed: Option<&KeyedQuota>,
+    ) -> Result<(), CapacityError> {
         let record = self
             .reservations
             .get(&id)
@@ -585,13 +824,17 @@ impl CapacityLedger {
         }
         let owner = record.scope;
         let remaining = record.quota.checked_sub(quota)?;
+        let remaining_keyed = subtract_keyed(record.keyed.as_ref(), keyed)?;
         let next = self.used.checked_sub(quota)?;
         self.used = next;
         self.subtract_owner_usage(owner, quota);
-        self.reservations
+        self.subtract_keyed_usage(keyed);
+        let record = self
+            .reservations
             .get_mut(&id)
-            .expect("validated original quota")
-            .quota = remaining;
+            .expect("validated original quota");
+        record.quota = remaining;
+        record.keyed = remaining_keyed;
         Ok(())
     }
     /// Work already owns its header. Actual reports and other bound objects
@@ -607,7 +850,7 @@ impl CapacityLedger {
         if !record.bound {
             return Err(CapacityError::UnboundReservation);
         }
-        if !record.quota.is_empty() {
+        if !record.quota.is_empty() || record.keyed.as_ref().is_some_and(|k| !k.quota.is_empty()) {
             return Err(CapacityError::QuotaRemains);
         }
         if record.owns_work
@@ -629,6 +872,7 @@ impl CapacityLedger {
         if self.reservations.get(&id).is_some_and(|record| {
             !record.owns_work
                 && record.quota.is_empty()
+                && record.keyed.as_ref().is_none_or(|k| k.quota.is_empty())
                 && record.owned_slots.remaining().is_empty()
         }) {
             let owner = self
@@ -700,6 +944,7 @@ impl CapacityLedger {
             return Err(CapacityError::UnboundReservation);
         }
         let remaining = record.quota.checked_sub(&resources.quota)?;
+        let remaining_keyed = subtract_keyed(record.keyed.as_ref(), resources.keyed.as_ref())?;
         record.owned_slots.check_split(resources.owned_slots)?;
         let scope = record.scope;
         let generation = record.generation;
@@ -709,6 +954,7 @@ impl CapacityLedger {
             .owned_slots
             .split_unused(new_id, resources.owned_slots)?;
         record.quota = remaining;
+        record.keyed = remaining_keyed;
         self.last_reservation = new_id.get();
         self.reservations.insert(
             new_id,
@@ -717,6 +963,7 @@ impl CapacityLedger {
                 generation,
                 work,
                 quota: resources.quota.clone(),
+                keyed: resources.keyed.clone(),
                 owned_slots: owned,
                 bound: true,
                 owns_work: false,

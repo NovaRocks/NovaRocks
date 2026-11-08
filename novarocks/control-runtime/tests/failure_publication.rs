@@ -52,6 +52,7 @@ fn vector(n: u64) -> ResourceVector {
 }
 fn work_resources(quota: ResourceVector) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota,
         owned_slots: OwnedSlotNeed {
             work_headers: 1,

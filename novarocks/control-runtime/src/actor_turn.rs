@@ -737,6 +737,8 @@ struct ActorRuntimeShared<A: Actor> {
     state: Mutex<ActorRuntimeState<A>>,
     changed: Arc<Notify>,
     header_readiness: Arc<crate::header_readiness::HeaderReadyHub>,
+    capacity_wakes: Mutex<Vec<Arc<crate::capacity_notification::PendingCapacityWakes>>>,
+    capacity_notifier: std::sync::Arc<crate::capacity_notification::CapacityWakeNotifier>,
     history: Option<crate::history::HistoryCapture>,
     observation: crate::observation::RuntimeObservation,
 }
@@ -2067,11 +2069,42 @@ impl<A: Actor> ActorRuntime<A> {
                     open: true,
                     now: Tick(0),
                 }),
+                capacity_notifier: std::sync::Arc::new(
+                    crate::capacity_notification::CapacityWakeNotifier {
+                        changed: changed.clone(),
+                    },
+                ),
+                capacity_wakes: Mutex::new(Vec::new()),
                 changed,
                 header_readiness,
                 history,
                 observation,
             }),
+        }
+    }
+    fn attach_capacity_ledger(&self, ledger: &crate::transaction::RuntimeLedger) {
+        let queue = &ledger.shared.pending_capacity_wakes;
+        let mut queues = self
+            .shared
+            .capacity_wakes
+            .lock()
+            .expect("actor capacity notification queues lock");
+        if !queues.iter().any(|old| Arc::ptr_eq(old, queue)) {
+            queue.attach(&self.shared.capacity_notifier);
+            queues.push(queue.clone());
+        }
+    }
+    /// Take queue snapshots without retaining any runtime lock across a Waker.
+    /// A queue is shared by all attached runtimes and outlives removed Scopes.
+    fn flush_capacity_notifications(&self) {
+        let queues = self
+            .shared
+            .capacity_wakes
+            .lock()
+            .expect("actor capacity notification queues lock")
+            .clone();
+        for queue in queues {
+            queue.flush();
         }
     }
     fn node(&self, id: ActorId) -> Result<Arc<ActorCell<A>>, ActorTurnError> {
@@ -2302,6 +2335,7 @@ impl<A: Actor> ActorRuntime<A> {
                 .set(id, deadline)
                 .expect("one timer per registered actor");
         }
+        self.attach_capacity_ledger(&scope.runtime);
         let registration = ActorRegistration {
             actor: id,
             attachment,
@@ -2786,6 +2820,7 @@ impl<A: Actor> ActorRuntime<A> {
             .expect("runtime scheduler lock")
             .open = false;
         self.shared.changed.notify();
+        self.flush_capacity_notifications();
     }
     pub fn next_deadline(&self) -> Option<Tick> {
         self.shared
@@ -2908,13 +2943,26 @@ impl<A: Actor> ActorRuntime<A> {
     /// Executes one finite actor turn using an explicit simulation time. Every
     /// input still clamps this value against the shared scheduler's latest time.
     pub fn poll_one(&self, observed: Tick) -> Result<bool, ActorTurnError> {
-        self.poll_one_inner(observed, None)
+        self.poll_one_deferred(observed, None)
     }
     /// Production input steps observe time independently. Clock sampling occurs
     /// after removing the input and outside inbox, ledger, scheduler and core
     /// locks; only the clamped Tick value enters the pure actor.
     pub fn poll_one_with_clock(&self, clock: &dyn Clock) -> Result<bool, ActorTurnError> {
-        self.poll_one_inner(clock.now(), Some(clock))
+        self.poll_one_deferred(clock.now(), Some(clock))
+    }
+    fn poll_one_deferred(
+        &self,
+        observed: Tick,
+        clock: Option<&dyn Clock>,
+    ) -> Result<bool, ActorTurnError> {
+        self.flush_capacity_notifications();
+        let result = {
+            let _deferral = crate::capacity_notification::TurnWakeDeferral::enter();
+            self.poll_one_inner(observed, clock)
+        };
+        self.flush_capacity_notifications();
+        result
     }
     fn poll_one_inner(
         &self,
@@ -2941,6 +2989,7 @@ impl<A: Actor> ActorRuntime<A> {
             node
         };
         let execution_scope = node.scope.current_scope();
+        self.attach_capacity_ledger(&execution_scope.runtime);
         let mut budget = TurnBudget::new(node.config.turn_budget)?;
         loop {
             let next = {
@@ -5354,6 +5403,7 @@ impl<A: Actor> ActorRuntime<A> {
             .expect("one core owner");
         drop(inbox);
         self.shared.changed.notify();
+        self.flush_capacity_notifications();
         Ok(actor)
     }
     fn detach_execution_node(
@@ -6503,6 +6553,7 @@ mod effect_ticket_incarnation_tests {
                 .reserve_next(
                     generation,
                     ReservationResources {
+                        keyed: None,
                         quota: ResourceVector::new([]).unwrap(),
                         owned_slots: OwnedSlotNeed {
                             work_headers: 1,

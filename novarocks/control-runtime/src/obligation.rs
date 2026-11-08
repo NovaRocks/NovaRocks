@@ -19,7 +19,7 @@
 
 use crate::transaction::{RuntimeError, ScopeHandle};
 use novarocks_control_runtime_core::{
-    capacity::{ReservationRequest, ReservationResources, ResourceVector},
+    capacity::{KeyedQuota, ReservationRequest, ReservationResources, ResourceVector},
     history::{CapacityHistoryRequest, HistoryFact},
     identity::{Generation, ReservationId, ScopedWorkRef, SlotId, WorkId},
     owned_storage::{OwnedPosition, OwnedSlotKind, OwnedStorageError},
@@ -97,6 +97,13 @@ impl Drop for StepRegistration {
                 .and_then(|scope| scope.work(self.work))
                 .expect("live unbound guard work")
                 .parent;
+            let released = (state.capacity_waiters.len() != 0).then(|| {
+                state
+                    .ledger
+                    .reservation(self.reservation)
+                    .expect("original unbound reservation")
+                    .resources()
+            });
             let (ledger, scope) = state
                 .parts(self.scope.id)
                 .expect("live scope retains its reservation");
@@ -122,8 +129,12 @@ impl Drop for StepRegistration {
                     work: self.work,
                     reservation: self.reservation,
                 });
+            let wakes = released.as_ref().map_or_else(Vec::new, |released| {
+                self.scope.runtime.take_capacity_wakes(&mut state, released)
+            });
             drop(state);
             self.scope.runtime.shared.changed.notify();
+            self.scope.runtime.deliver_capacity_wakes(wakes);
         }
     }
 }
@@ -872,7 +883,14 @@ impl ReservationObligation {
             .resources())
     }
     pub fn release_quota(&mut self, resources: &ResourceVector) -> Result<(), RuntimeError> {
-        self.release_report(resources, None)
+        self.release_report(resources, None, None)
+    }
+    pub fn release_quota_with_keyed(
+        &mut self,
+        resources: &ResourceVector,
+        keyed: Option<&KeyedQuota>,
+    ) -> Result<(), RuntimeError> {
+        self.release_report(resources, keyed, None)
     }
     /// Capacity release and its reliable fact fill have one linearization point.
     /// Producer/capture retirement and each consumer acknowledgement remain separate.
@@ -881,20 +899,32 @@ impl ReservationObligation {
         resources: &ResourceVector,
         report: &crate::completion::ReportSlot,
     ) -> Result<(), RuntimeError> {
-        self.release_report(resources, Some(report))
+        self.release_report(resources, None, Some(report))
+    }
+    /// Releases the same original process/keyed shares and fills their prepaid
+    /// fact in one transaction. It does not establish producer or capture exit.
+    pub fn release_quota_with_keyed_and_report(
+        &mut self,
+        resources: &ResourceVector,
+        keyed: Option<&KeyedQuota>,
+        report: &crate::completion::ReportSlot,
+    ) -> Result<(), RuntimeError> {
+        self.release_report(resources, keyed, Some(report))
     }
     fn release_report(
         &mut self,
         resources: &ResourceVector,
+        keyed: Option<&KeyedQuota>,
         report: Option<&crate::completion::ReportSlot>,
     ) -> Result<(), RuntimeError> {
+        let keyed_empty = keyed.is_none_or(|keyed| keyed.quota.is_empty());
         // Preserve the original local no-op/error fast path without history.
         // A successful idempotent operation has no ledger transition to trace.
         if !self.active
             && (self.scope.runtime.shared.history.is_none()
-                || (resources.is_empty() && report.is_none()))
+                || (resources.is_empty() && keyed_empty && report.is_none()))
         {
-            let result = if resources.is_empty() && report.is_none() {
+            let result = if resources.is_empty() && keyed_empty && report.is_none() {
                 Ok(())
             } else {
                 Err(
@@ -916,18 +946,32 @@ impl ReservationObligation {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let refusal_intent = self.scope.runtime.shared.history.as_ref().map(|_| {
-            CapacityHistoryRequest::ReleaseQuota {
-                scope: self.scope.id,
-                source: self.id,
-                generation: state.ledger.reservation(self.id).map(|r| r.generation),
-                requested: resources.clone(),
-            }
-        });
+        let refusal_intent = self
+            .scope
+            .runtime
+            .shared
+            .history
+            .as_ref()
+            .map(|_| match keyed {
+                Some(keyed) => CapacityHistoryRequest::ReleaseKeyedQuota {
+                    scope: self.scope.id,
+                    source: self.id,
+                    generation: state.ledger.reservation(self.id).map(|r| r.generation),
+                    requested: resources.clone(),
+                    keyed: keyed.clone(),
+                },
+                None => CapacityHistoryRequest::ReleaseQuota {
+                    scope: self.scope.id,
+                    source: self.id,
+                    generation: state.ledger.reservation(self.id).map(|r| r.generation),
+                    requested: resources.clone(),
+                },
+            });
         let mut notify = false;
+        let mut wakes = Vec::new();
         let result = (|| {
             if !self.active {
-                return if resources.is_empty() && report.is_none() {
+                return if resources.is_empty() && keyed_empty && report.is_none() {
                     Ok(())
                 } else {
                     Err(
@@ -943,7 +987,9 @@ impl ReservationObligation {
                 )?;
                 report.validate_fill_for(&self.scope.runtime, &state, owner.scope, owner.work)?;
             }
-            state.ledger.release_quota(self.id, resources)?;
+            state
+                .ledger
+                .release_quota_with_keyed(self.id, resources, keyed)?;
             self.scope
                 .runtime
                 .shared
@@ -954,6 +1000,16 @@ impl ReservationObligation {
                 report.fill_validated(&mut state);
             }
 
+            if state.capacity_waiters.len() != 0 {
+                wakes = self.scope.runtime.take_capacity_wakes(
+                    &mut state,
+                    &ReservationResources {
+                        quota: resources.clone(),
+                        keyed: keyed.cloned(),
+                        owned_slots: Default::default(),
+                    },
+                );
+            }
             notify = true;
             Ok(())
         })();
@@ -967,6 +1023,7 @@ impl ReservationObligation {
         if notify {
             self.scope.runtime.shared.changed.notify();
         }
+        self.scope.runtime.deliver_capacity_wakes(wakes);
         self.scope
             .runtime
             .shared

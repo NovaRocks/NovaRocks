@@ -377,7 +377,9 @@ impl RuntimeObservation {
         if let Err(error) = result {
             use novarocks_control_runtime_core::scope::ScopeError;
             let kind = match error {
-                CapacityError::Exhausted(_) => CapacityRefusalKind::Exhausted,
+                CapacityError::Exhausted(_) | CapacityError::ExhaustedKeyed { .. } => {
+                    CapacityRefusalKind::Exhausted
+                }
                 CapacityError::Scope(ScopeError::Closed) => CapacityRefusalKind::ScopeClosed,
                 CapacityError::Scope(ScopeError::Stopped) => CapacityRefusalKind::ScopeStopped,
                 CapacityError::Scope(ScopeError::Failed) => CapacityRefusalKind::ScopeFailed,

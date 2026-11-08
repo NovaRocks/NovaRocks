@@ -655,3 +655,337 @@ fn repeated_unresolved_mark_then_unexited_drop_records_one_original_fact() {
     drop(report);
     drop(capacity);
 }
+
+struct PreHandoff {
+    order: std::sync::Arc<AtomicUsize>,
+    pending: bool,
+}
+impl Future for PreHandoff {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        if self.pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+impl Drop for PreHandoff {
+    fn drop(&mut self) {
+        assert_eq!(self.order.fetch_add(1, Ordering::SeqCst), 0);
+    }
+}
+struct OrderedCapture {
+    _capture: Capture,
+    order: std::sync::Arc<AtomicUsize>,
+}
+impl Drop for OrderedCapture {
+    fn drop(&mut self) {
+        assert_eq!(self.order.fetch_add(1, Ordering::SeqCst), 1);
+    }
+}
+#[test]
+fn gated_refused_generation_destroys_waiting_and_captures_before_unused_exit() {
+    let mut f = fixture();
+    let order = std::sync::Arc::new(AtomicUsize::new(0));
+    let (capture, destroyed) = capture(&f, false);
+    let handoff = Arc::new(HandoffCell::new());
+    let mut future = Box::pin(
+        GatedWork::new(
+            f.take(),
+            OrderedCapture {
+                _capture: capture,
+                order: order.clone(),
+            },
+            handoff.clone(),
+            PanicSink::new(),
+        )
+        .run(
+            generation(),
+            PreHandoff {
+                order: order.clone(),
+                pending: false,
+            },
+            |_, ()| -> std::future::Ready<()> { panic!("refused work body must never run") },
+        ),
+    );
+    assert_ne!(f.scope.fail().unwrap(), generation());
+    assert!(matches!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(GatedOutcome::NotStarted(
+            GatedNotStarted::GenerationRejected(_)
+        )))
+    ));
+    assert_eq!(handoff.state(), HandoffState::Starting);
+    assert_eq!(handoff.withdraw(), Withdrawal::TooLate);
+    assert_eq!(order.load(Ordering::SeqCst), 2);
+    assert!(destroyed.load(Ordering::SeqCst));
+    drop(future);
+    f.retire(false);
+}
+#[test]
+fn gated_withdrawal_wakes_pending_wait_and_preserves_unused_cleanup_order() {
+    struct CountWake(std::sync::Arc<AtomicUsize>);
+    impl std::task::Wake for CountWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let mut f = fixture();
+    let order = std::sync::Arc::new(AtomicUsize::new(0));
+    let wakes = std::sync::Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(std::sync::Arc::new(CountWake(wakes.clone())));
+    let (capture, destroyed) = capture(&f, false);
+    let handoff = Arc::new(HandoffCell::new());
+    let mut future = Box::pin(
+        GatedWork::new(
+            f.take(),
+            OrderedCapture {
+                _capture: capture,
+                order: order.clone(),
+            },
+            handoff.clone(),
+            PanicSink::new(),
+        )
+        .run(
+            generation(),
+            PreHandoff {
+                order: order.clone(),
+                pending: true,
+            },
+            |_, ()| -> std::future::Ready<()> { panic!("withdrawn work body must never run") },
+        ),
+    );
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
+    assert_eq!(handoff.withdraw(), Withdrawal::Withdrawn);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(handoff.withdraw(), Withdrawal::TooLate);
+    assert!(matches!(
+        future.as_mut().poll(&mut Context::from_waker(&waker)),
+        Poll::Ready(Ok(GatedOutcome::NotStarted(GatedNotStarted::Withdrawn)))
+    ));
+    assert_eq!(order.load(Ordering::SeqCst), 2);
+    assert!(destroyed.load(Ordering::SeqCst));
+    drop(future);
+    f.retire(false);
+}
+#[test]
+fn gated_never_polled_or_pending_drop_releases_waiting_before_captures_and_exit() {
+    for polled in [false, true] {
+        let mut f = fixture();
+        let order = std::sync::Arc::new(AtomicUsize::new(0));
+        let (capture, destroyed) = capture(&f, false);
+        let mut future = Box::pin(
+            GatedWork::new(
+                f.take(),
+                OrderedCapture {
+                    _capture: capture,
+                    order: order.clone(),
+                },
+                Arc::new(HandoffCell::new()),
+                PanicSink::new(),
+            )
+            .run(
+                generation(),
+                PreHandoff {
+                    order: order.clone(),
+                    pending: true,
+                },
+                |_, ()| std::future::ready(()),
+            ),
+        );
+        if polled {
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        drop(future);
+        assert_eq!(order.load(Ordering::SeqCst), 2);
+        assert!(destroyed.load(Ordering::SeqCst));
+        f.retire(false);
+    }
+}
+#[test]
+fn accepted_gated_work_reuses_actual_future_cleanup_and_body_panic_custody() {
+    for (ready, body_panic, capture_panic) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (true, false, true),
+        (false, false, true),
+    ] {
+        let mut f = fixture();
+        let (capture, destroyed) = capture(&f, capture_panic);
+        let sink = PanicSink::new();
+        let handoff = Arc::new(HandoffCell::new());
+        let mut future = Box::pin(
+            GatedWork::new(f.take(), capture, handoff.clone(), sink.clone()).run(
+                generation(),
+                std::future::ready(()),
+                move |capture, ()| WorkFuture {
+                    _capture: capture,
+                    pending: !ready,
+                    panic: body_panic,
+                },
+            ),
+        );
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        assert_eq!(handoff.withdraw(), Withdrawal::TooLate);
+        if body_panic || (ready && capture_panic) {
+            assert!(polled.unwrap_err().is::<ForwardedWorkPanic>());
+        } else if ready {
+            assert_eq!(polled.unwrap(), Poll::Ready(Ok(GatedOutcome::Completed(7))));
+        } else {
+            assert!(polled.unwrap().is_pending());
+        }
+        let dropped = catch_unwind(AssertUnwindSafe(|| drop(future)));
+        if !ready && !body_panic && capture_panic {
+            assert!(dropped.unwrap_err().is::<ForwardedWorkPanic>());
+        } else {
+            dropped.unwrap();
+        }
+        assert!(destroyed.load(Ordering::SeqCst));
+        if capture_panic {
+            assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
+            assert!(!f.custody.try_retire().unwrap());
+        } else {
+            f.retire(true);
+        }
+        assert_eq!(sink.has_panic(), body_panic || capture_panic);
+    }
+}
+#[test]
+fn accepted_gated_poll_and_destructor_panics_keep_both_original_payloads_unknown() {
+    let mut f = fixture();
+    let sink = PanicSink::new();
+    let body_dropped = std::sync::Arc::new(AtomicUsize::new(0));
+    let cleanup_dropped = std::sync::Arc::new(AtomicUsize::new(0));
+    let body_copy = body_dropped.clone();
+    let cleanup_copy = cleanup_dropped.clone();
+    let mut future = Box::pin(
+        GatedWork::new(f.take(), (), Arc::new(HandoffCell::new()), sink.clone()).run(
+            generation(),
+            std::future::ready(()),
+            move |(), ()| DoublePanicFuture {
+                body_dropped: body_copy,
+                cleanup_dropped: cleanup_copy,
+            },
+        ),
+    );
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    }))
+    .unwrap_err();
+    assert!(panic.is::<ForwardedWorkPanic>());
+    drop(future);
+    assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
+    assert_eq!(body_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(cleanup_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        sink.take()
+            .unwrap()
+            .downcast_ref::<PayloadDropProbe>()
+            .unwrap()
+            .stage,
+        "body"
+    );
+    assert_eq!(
+        sink.take_cleanup()
+            .unwrap()
+            .downcast_ref::<PayloadDropProbe>()
+            .unwrap()
+            .stage,
+        "cleanup"
+    );
+}
+
+#[test]
+fn gated_work_dropped_before_run_destroys_captures_before_revoking_unused_exit() {
+    let mut f = fixture();
+    let (capture, destroyed) = capture(&f, false);
+    let work = GatedWork::new(
+        f.take(),
+        capture,
+        Arc::new(HandoffCell::new()),
+        PanicSink::new(),
+    );
+    drop(work);
+    assert!(destroyed.load(Ordering::SeqCst));
+    f.retire(false);
+}
+
+#[test]
+fn refused_gated_preparation_output_exits_before_original_captures_and_unused_report() {
+    struct Prepared {
+        custody: ExitCustody,
+        destroyed: std::sync::Arc<AtomicBool>,
+    }
+    impl Drop for Prepared {
+        fn drop(&mut self) {
+            assert_eq!(self.custody.phase(), ExitCustodyPhase::Admitted);
+            self.destroyed.store(true, Ordering::SeqCst);
+        }
+    }
+    struct OutputDependentCapture {
+        _capture: Capture,
+        prepared_destroyed: std::sync::Arc<AtomicBool>,
+    }
+    impl Drop for OutputDependentCapture {
+        fn drop(&mut self) {
+            assert!(self.prepared_destroyed.load(Ordering::SeqCst));
+        }
+    }
+    let mut f = fixture();
+    let prepared_destroyed = std::sync::Arc::new(AtomicBool::new(false));
+    let (capture, destroyed) = capture(&f, false);
+    let prepared = Prepared {
+        custody: f.custody.clone(),
+        destroyed: prepared_destroyed.clone(),
+    };
+    let mut future = Box::pin(
+        GatedWork::new(
+            f.take(),
+            OutputDependentCapture {
+                _capture: capture,
+                prepared_destroyed: prepared_destroyed.clone(),
+            },
+            Arc::new(HandoffCell::new()),
+            PanicSink::new(),
+        )
+        .run(
+            generation(),
+            std::future::ready(prepared),
+            |_, _| -> std::future::Ready<()> { panic!("refused work body must never run") },
+        ),
+    );
+    f.scope.request_stop().unwrap();
+    assert!(matches!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(GatedOutcome::NotStarted(
+            GatedNotStarted::GenerationRejected(_)
+        )))
+    ));
+    assert!(prepared_destroyed.load(Ordering::SeqCst));
+    assert!(destroyed.load(Ordering::SeqCst));
+    drop(future);
+    f.retire(false);
+}

@@ -14,3 +14,38 @@
 // KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+//! Frozen coordination policy supplied by the original FE configuration.
+//!
+//! Transport limits are a value projection of already validated adapter limits;
+//! they neither reserve capacity nor grant Worker preparation positions.
+
+mod dispatch;
+mod retry;
+pub use dispatch::*;
+pub use retry::*;
+
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenTransportLimits {
+    pub max_batch_items: usize,
+    pub max_batch_encoded_bytes: usize,
+    pub max_descriptor_encoded_bytes: usize,
+    pub max_query_backend_queued_operations: usize,
+    pub max_query_backend_queued_bytes: usize,
+    pub max_backend_queued_operations: usize,
+    pub max_backend_queued_bytes: usize,
+    pub max_tasks_per_participation: usize,
+    pub max_active_tasks_per_backend: usize,
+    pub frontend_queue_residence: Duration,
+}
+
+impl FrozenTransportLimits {
+    pub const fn max_operation_queued_bytes(self) -> usize {
+        self.max_batch_encoded_bytes
+    }
+    pub const fn batch_fits(self, items: usize, encoded_bytes: usize) -> bool {
+        items > 0 && items <= self.max_batch_items && encoded_bytes <= self.max_batch_encoded_bytes
+    }
+}

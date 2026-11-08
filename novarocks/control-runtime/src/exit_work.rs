@@ -30,8 +30,10 @@ use std::{
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
+
+use novarocks_control_runtime_core::identity::Generation;
 
 pub type PanicPayload = Box<dyn Any + Send + 'static>;
 
@@ -310,6 +312,317 @@ impl<F> Drop for ObligatedBlocking<F> {
     fn drop(&mut self) {
         if self.state.obligation.is_some() && !self.state.destroying {
             self.destroy_inner();
+            let _ = self.state.exit();
+        }
+    }
+}
+
+/// The only competition between withdrawal and the actual handoff. Starting
+/// wins before the original generation gate; a refused gate still exits unused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandoffState {
+    Pending,
+    Starting,
+    Withdrawn,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Withdrawal {
+    Withdrawn,
+    TooLate,
+}
+struct HandoffRecord {
+    state: HandoffState,
+    waker: Option<Waker>,
+}
+pub struct HandoffCell(Mutex<HandoffRecord>);
+impl Default for HandoffCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl HandoffCell {
+    pub fn new() -> Self {
+        Self(Mutex::new(HandoffRecord {
+            state: HandoffState::Pending,
+            waker: None,
+        }))
+    }
+    pub fn state(&self) -> HandoffState {
+        self.0.lock().expect("work handoff lock").state
+    }
+    /// Exactly one Pending -> Withdrawn or Pending -> Starting transition wins.
+    pub fn withdraw(&self) -> Withdrawal {
+        let wake = {
+            let mut record = self.0.lock().expect("work handoff lock");
+            if record.state != HandoffState::Pending {
+                return Withdrawal::TooLate;
+            }
+            record.state = HandoffState::Withdrawn;
+            record.waker.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+        Withdrawal::Withdrawn
+    }
+    fn poll_withdrawn(&self, cx: &Context<'_>) -> Poll<()> {
+        let mut record = self.0.lock().expect("work handoff lock");
+        if record.state == HandoffState::Withdrawn {
+            return Poll::Ready(());
+        }
+        if record
+            .waker
+            .as_ref()
+            .is_none_or(|w| !w.will_wake(cx.waker()))
+        {
+            record.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+    fn try_start(&self) -> bool {
+        let mut record = self.0.lock().expect("work handoff lock");
+        if record.state != HandoffState::Pending {
+            return false;
+        }
+        record.state = HandoffState::Starting;
+        record.waker.take();
+        true
+    }
+    fn clear_waiter(&self) {
+        self.0.lock().expect("work handoff lock").waker.take();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatedNotStarted {
+    Withdrawn,
+    GenerationRejected(ExitCustodyError),
+}
+#[derive(Debug, Eq, PartialEq)]
+pub enum GatedOutcome<T> {
+    Completed(T),
+    NotStarted(GatedNotStarted),
+}
+
+/// Holds the original, unstarted exit obligation and its captures. This owner
+/// checks exit through ExitCustody even when it is dropped before `run`.
+#[must_use = "Gated work retains its original exit obligation until actual destruction"]
+pub struct GatedWork<C> {
+    captures: Option<C>,
+    state: ExitState,
+    handoff: Arc<HandoffCell>,
+    panic: PanicSink,
+}
+impl<C> GatedWork<C> {
+    pub fn new(
+        obligation: ExitObligation,
+        captures: C,
+        handoff: Arc<HandoffCell>,
+        panic: PanicSink,
+    ) -> Self {
+        Self {
+            captures: Some(captures),
+            state: ExitState::new(obligation),
+            handoff,
+            panic,
+        }
+    }
+    /// Waiting does not start the admitted work. Its future owns all pre-handoff
+    /// admission, quote and capacity registrations. On refusal, destruction is
+    /// ordered: waiting future/output, body closure, captures, then unused exit.
+    /// The body must keep any resources needed after handoff in its future.
+    pub fn run<P, B, F>(
+        mut self,
+        generation: Generation,
+        pre_handoff: P,
+        body: B,
+    ) -> impl Future<Output = Result<GatedOutcome<F::Output>, ExitWorkError>>
+    where
+        P: Future,
+        B: FnOnce(C, P::Output) -> F,
+        F: Future,
+    {
+        // Construct this guard before constructing the async future so that
+        // even a future that is never polled has the same teardown ordering.
+        let mut pending = PendingGatedWork {
+            values: Some(PendingGatedValues {
+                pre_handoff: Some(Box::pin(pre_handoff)),
+                prepared: None,
+                body: Some(body),
+                captures: self.captures.take(),
+            }),
+            state: ExitState {
+                obligation: self.state.obligation.take(),
+                started: false,
+                destroying: false,
+            },
+            handoff: self.handoff.clone(),
+            panic: self.panic.clone(),
+        };
+        async move {
+            let ready = std::future::poll_fn(|cx| {
+                // Check/register and withdrawal share the same lock. A wake
+                // between this check and the pending poll cannot be lost.
+                if pending.handoff.poll_withdrawn(cx).is_ready() {
+                    return Poll::Ready(false);
+                }
+                let polled = catch_unwind(AssertUnwindSafe(|| {
+                    pending
+                        .values
+                        .as_mut()
+                        .expect("pending gated values")
+                        .pre_handoff
+                        .as_mut()
+                        .expect("live pre-handoff future")
+                        .as_mut()
+                        .poll(cx)
+                }));
+                match polled {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(value)) => {
+                        pending
+                            .values
+                            .as_mut()
+                            .expect("pending gated values")
+                            .prepared = Some(value);
+                        Poll::Ready(true)
+                    }
+                    Err(payload) => {
+                        pending.destroy(Some(payload));
+                        let _ = pending.state.exit();
+                        resume_forwarded_panic()
+                    }
+                }
+            })
+            .await;
+            if !ready || !pending.handoff.try_start() {
+                return pending.not_started(GatedNotStarted::Withdrawn);
+            }
+            let started = pending
+                .state
+                .obligation
+                .as_mut()
+                .expect("original gated obligation")
+                .start_in_generation(generation);
+            if let Err(error) = started {
+                return pending.not_started(GatedNotStarted::GenerationRejected(error));
+            }
+            pending.state.started = true;
+            pending.handoff.clear_waiter();
+            // Destroy the completed waiting object before running the body.
+            // A destructor panic retains Unknown through the same custody as
+            // every other explicit work destruction.
+            pending.destroy_pre();
+            let values = pending.values.as_mut().expect("pending gated values");
+            let captures = values.captures.take().expect("gated captures");
+            let prepared = values.prepared.take().expect("completed pre-handoff");
+            let body = values.body.take().expect("gated body");
+            let future = GatedBody {
+                future: None,
+                initial: Some(Box::new((body, captures, prepared))),
+            };
+            // Reuse the accepted-work wrapper without starting a second time.
+            let running = ObligatedFuture {
+                inner: Some(Box::pin(future)),
+                state: ExitState {
+                    obligation: pending.state.obligation.take(),
+                    started: true,
+                    destroying: false,
+                },
+                panic: pending.panic.clone(),
+            };
+            running.await.map(GatedOutcome::Completed)
+        }
+    }
+}
+impl<C> Drop for GatedWork<C> {
+    fn drop(&mut self) {
+        if self.state.obligation.is_some() && !self.state.destroying {
+            self.handoff.clear_waiter();
+            destroy_inner(&mut self.captures, &mut self.state, &self.panic, None);
+            let _ = self.state.exit();
+        }
+    }
+}
+// Keep the produced future alive after Ready. An async `.await` wrapper
+// would destroy it inside poll, misclassifying a destructor panic as body panic.
+struct GatedBody<C, P, B, F> {
+    future: Option<Pin<Box<F>>>,
+    initial: Option<Box<(B, C, P)>>,
+}
+impl<C, P, B, F> Future for GatedBody<C, P, B, F>
+where
+    B: FnOnce(C, P) -> F,
+    F: Future,
+{
+    type Output = F::Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(initial) = this.initial.take() {
+            let (body, captures, prepared) = *initial;
+            this.future = Some(Box::pin(body(captures, prepared)));
+        }
+        this.future
+            .as_mut()
+            .expect("started gated body")
+            .as_mut()
+            .poll(cx)
+    }
+}
+// Field order is part of unused-work cleanup: release the waiting owner and
+// any prepared quote first, then the never-invoked body closure, then captures.
+struct PendingGatedValues<C, P: Future, B> {
+    pre_handoff: Option<Pin<Box<P>>>,
+    prepared: Option<P::Output>,
+    body: Option<B>,
+    captures: Option<C>,
+}
+struct PendingGatedWork<C, P: Future, B> {
+    values: Option<PendingGatedValues<C, P, B>>,
+    state: ExitState,
+    handoff: Arc<HandoffCell>,
+    panic: PanicSink,
+}
+impl<C, P: Future, B> PendingGatedWork<C, P, B> {
+    fn destroy(&mut self, payload: Option<PanicPayload>) {
+        self.handoff.clear_waiter();
+        destroy_inner(&mut self.values, &mut self.state, &self.panic, payload);
+    }
+    fn destroy_pre(&mut self) {
+        self.state.destroying = true;
+        let pre = self
+            .values
+            .as_mut()
+            .expect("pending gated values")
+            .pre_handoff
+            .take();
+        match catch_unwind(AssertUnwindSafe(|| drop(pre))) {
+            Ok(()) => self.state.destroying = false,
+            Err(payload) => {
+                // Finish explicit capture disposal before forwarding a waiting
+                // destructor panic; retain both stages if cleanup also panics.
+                let cleanup = catch_unwind(AssertUnwindSafe(|| drop(self.values.take()))).err();
+                self.panic.store_panics(payload, cleanup);
+                drop(self.state.obligation.take());
+                resume_forwarded_panic()
+            }
+        }
+    }
+    fn not_started<T>(
+        &mut self,
+        reason: GatedNotStarted,
+    ) -> Result<GatedOutcome<T>, ExitWorkError> {
+        self.destroy(None);
+        self.state
+            .exit()
+            .map(|()| GatedOutcome::NotStarted(reason))
+            .map_err(ExitWorkError::Exit)
+    }
+}
+impl<C, P: Future, B> Drop for PendingGatedWork<C, P, B> {
+    fn drop(&mut self) {
+        if self.state.obligation.is_some() && !self.state.destroying {
+            self.destroy(None);
             let _ = self.state.exit();
         }
     }

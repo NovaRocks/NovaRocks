@@ -88,6 +88,7 @@ impl ColdFailureAdmission {
             .map_err(|e| no_work(FailurePublicationError::Runtime(e)))?
             .generation;
         let resources = ReservationResources {
+            keyed: None,
             quota: ResourceVector::default(),
             owned_slots: OwnedSlotNeed {
                 work_headers: 1,

@@ -102,6 +102,13 @@ pub enum CapacityHistoryRequest {
         /// refusal must not invent a resource vector for that missing owner.
         requested: Option<crate::capacity::ReservationResources>,
     },
+    ReleaseKeyedQuota {
+        scope: ScopeId,
+        source: ReservationId,
+        generation: Option<Generation>,
+        requested: crate::capacity::ResourceVector,
+        keyed: crate::capacity::KeyedQuota,
+    },
     ReleaseQuota {
         scope: ScopeId,
         source: ReservationId,
@@ -123,6 +130,7 @@ pub enum CapacityHistoryRefusal {
     OwnedStorage(crate::owned_storage::OwnedStorageError),
     CapacityDenied {
         dimension: crate::identity::DimensionId,
+        keyed: Option<(crate::identity::FamilyId, crate::identity::CapacityKey)>,
         requested: u64,
         committed: u64,
         limit: u64,
@@ -137,6 +145,14 @@ pub enum CapacityHistoryRefusal {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HistoryFact {
+    CapacityWaitRegistered {
+        registrant: crate::identity::CapacityRegistrantId,
+        target: crate::capacity::CapacityWaitTarget,
+    },
+    CapacityWaitNotified {
+        registrant: crate::identity::CapacityRegistrantId,
+        target: crate::capacity::CapacityWaitTarget,
+    },
     CapacityRefused {
         request: CapacityHistoryRequest,
         reason: CapacityHistoryRefusal,

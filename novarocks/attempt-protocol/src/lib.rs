@@ -16,6 +16,21 @@
 // under the License.
 
 //! Deterministic frontend attempt protocol contracts.
+//!
+//! The shared boundary is the neutral activation/port vocabulary, frozen plan,
+//! input/effect values, seeded operation identities and synchronous step port.
+//! Concrete state is implemented independently of the FE host. There is no SDK,
+//! generated DTO, clock read, runnable, permit or rich-source custody here.
+//! Payload/grant/reservation references identify original host records only.
+//! They do not grant capacity or access and do not retain a foreign destructor.
+//!
+//! All times use the original process monotonic timeline. Root controls share
+//! the observation source FIFO; a pending seal is reconsidered after each
+//! observation, before applying the next. Read-state confirmation is prepaid
+//! independently of that ingress and describes one consistent snapshot.
+//!
+//! Effect completion records host handoff. Actual work/capture exit is a
+//! separate input authored from the original ExitCustody report.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -27,3 +42,20 @@ pub mod failure;
 pub mod ids;
 pub mod input;
 pub mod start;
+
+pub mod operation;
+
+/// The pure protocol surface frozen for host adapters and deterministic worlds.
+/// Implementations must finish application of one bounded input and charge all
+/// derived traversal/effect work. Budget exhaustion retains an explicit cursor;
+/// only a real remaining continuation may schedule an immediate deadline.
+pub trait AttemptCore: Sized {
+    fn new(start: start::AttemptStart) -> Result<Self, failure::AttemptFailure>;
+    fn handle(
+        &mut self,
+        now: novarocks_coordination_contract::MonotonicInstant,
+        input: input::AttemptInput,
+        context: &mut dyn capacity::StepContext,
+    ) -> Vec<effect::AttemptEffect>;
+    fn next_deadline(&self) -> Option<novarocks_coordination_contract::MonotonicInstant>;
+}

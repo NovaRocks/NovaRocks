@@ -55,6 +55,11 @@ use crate::runtime_filter::feedback::TaskRuntimeFilterFeedback;
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::Client;
 
+pub(crate) mod wire;
+use wire::{
+    classify_dynamic_filter_status, decode_dynamic_filter_response, encode_dynamic_filter_request,
+};
+
 /// What a final task info read answered.
 ///
 /// Losing final info costs diagnostics only, so absence is a reported category
@@ -420,11 +425,8 @@ impl TaskResultTransport for NativeTaskResultTransport {
         // The operation identity is minted per call and never replayed: this
         // read creates nothing, so there is nothing for a replay to be
         // idempotent against.
-        let request = encode_fetch_dynamic_filters(FetchTaskDynamicFilters::new(
-            TaskOperationId::new_v7(),
-            identity,
-            acknowledged,
-        ));
+        let request =
+            encode_dynamic_filter_request(TaskOperationId::new_v7(), identity, acknowledged);
         let response = self
             .data_runtime
             .block_on(async {
@@ -451,50 +453,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                     .map_err(|error| classify_dynamic_filter_status(&address, &error))
             })
             .map_err(DynamicFilterReadError::Unavailable)??;
-        let answered = response
-            .identity
-            .as_ref()
-            .map(|answered| {
-                novarocks_task_codec::identity::decode_task_identity(
-                    answered,
-                    FieldPath::root("fetch_task_dynamic_filters").field("identity"),
-                )
-            })
-            .transpose()
-            .map_err(|error| DynamicFilterReadError::Refused(format!("{address}: {error}")))?
-            .ok_or_else(|| {
-                DynamicFilterReadError::Refused(format!(
-                    "{address}: dynamic filter read answered without a task identity"
-                ))
-            })?;
-        // A read that agrees with itself proves nothing. This is the identity
-        // this frontend asked about, so an answer naming another task is
-        // refused rather than admitted as that task's feedback.
-        if answered != identity {
-            return Err(DynamicFilterReadError::Refused(format!(
-                "{address}: dynamic filter read for {identity} answered for {answered}"
-            )));
-        }
-        let version = DomainVersion::new(response.version).ok();
-        if version.is_none() && !response.domains.is_empty() {
-            return Err(DynamicFilterReadError::Refused(format!(
-                "{address}: dynamic filter read carries domains under version zero"
-            )));
-        }
-        let mut feedback = Vec::with_capacity(response.domains.len());
-        for domain in &response.domains {
-            let envelope = domain.envelope.as_ref().ok_or_else(|| {
-                DynamicFilterReadError::Refused(format!(
-                    "{address}: dynamic filter domain carries no envelope"
-                ))
-            })?;
-            feedback.push(
-                TaskRuntimeFilterFeedback::parse(envelope).map_err(|error| {
-                    DynamicFilterReadError::Refused(format!("{address}: {error}"))
-                })?,
-            );
-        }
-        Ok(DynamicFilterRead { version, feedback })
+        decode_dynamic_filter_response(&address, identity, response)
     }
 }
 
@@ -673,26 +632,6 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
         self.sealed
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
-    }
-}
-
-/// Classifies one dynamic filter read failure by type.
-///
-/// A status that leaves the read unfinished is `Unavailable`, and the next turn
-/// asks again. Everything else is the backend having answered that the request
-/// is illegal against the task it names, which asking again cannot repair.
-fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> DynamicFilterReadError {
-    let detail = format!(
-        "{address}: fetch_task_dynamic_filters rpc failed: {}",
-        status.message()
-    );
-    match status.code() {
-        tonic::Code::Unavailable
-        | tonic::Code::DeadlineExceeded
-        | tonic::Code::Cancelled
-        | tonic::Code::Unknown
-        | tonic::Code::ResourceExhausted => DynamicFilterReadError::Unavailable(detail),
-        _ => DynamicFilterReadError::Refused(detail),
     }
 }
 

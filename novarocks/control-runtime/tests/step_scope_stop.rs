@@ -125,6 +125,7 @@ impl Admitted {
             .reserve_next(
                 generation(),
                 ReservationResources {
+                    keyed: None,
                     quota: resources(1),
                     owned_slots: OwnedSlotNeed {
                         work_headers: 1,

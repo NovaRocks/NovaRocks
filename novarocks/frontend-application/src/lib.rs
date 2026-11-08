@@ -99,3 +99,5 @@ compile_error!("novarocks_dev_controls must match debug_assertions");
 pub use query_execution::required_constant_eval::RequiredConstantInterpreter;
 
 pub(crate) mod control_runtime;
+
+pub mod task_wire;

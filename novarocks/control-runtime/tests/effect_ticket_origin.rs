@@ -94,6 +94,7 @@ impl Fixture {
             .reserve_next(
                 Generation::new(1).unwrap(),
                 ReservationResources {
+                    keyed: None,
                     quota: ResourceVector::new([]).unwrap(),
                     owned_slots: OwnedSlotNeed {
                         work_headers: 1,

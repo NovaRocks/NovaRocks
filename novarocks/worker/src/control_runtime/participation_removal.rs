@@ -190,6 +190,7 @@ impl ParticipationRemovalOwner {
         // child. Root's existing internal Source pays for its own one input,
         // batch and effects; no Participation occupies a private idle Root input.
         let resources = ReservationResources {
+            keyed: None,
             quota: ResourceVector::default(),
             owned_slots: OwnedSlotNeed {
                 work_headers: 2,
@@ -254,6 +255,7 @@ impl ParticipationRemovalOwner {
                 generation,
                 kind: WorkKind::Cleanup,
                 resources: ReservationResources {
+                    keyed: None,
                     quota: ResourceVector::default(),
                     owned_slots: OwnedSlotNeed {
                         work_headers: 1,

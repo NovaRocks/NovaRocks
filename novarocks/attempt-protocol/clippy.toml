@@ -1,6 +1,7 @@
 # Design: ADR-0218 (docs/adr/ADR-0218-work-credentials-and-credentialed-entries.md)
 too-many-arguments-threshold = 10
 disallowed-methods = [
+    { path = "novarocks_coordination_contract::MonotonicClock::now", reason = "Attempt time is an explicit actor input." },
     { path = "tokio::runtime::LocalRuntime::spawn_blocking", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
     { path = "novarocks_types::identity::BackendProcessId::new_v7", reason = "Identifiers are explicit driver inputs." },
     { path = "novarocks_types::identity::FrontendProcessId::new_v7", reason = "Identifiers are explicit driver inputs." },
@@ -90,6 +91,7 @@ disallowed-methods = [
     { path = "opendal::Execute::execute", reason = "Query work starts only through a credentialed entry or a service carrier; see ADR-0218.", allow-invalid = true },
 ]
 disallowed-types = [
+    { path = "novarocks_coordination_contract::MonotonicClock", reason = "The attempt core receives explicit monotonic values, never a live clock." },
     { path = "std::time::Instant", reason = "Logical time is an explicit neutral value." },
     { path = "std::time::SystemTime", reason = "Logical time is an explicit neutral value." },
     { path = "std::fs::File", reason = "I/O and synchronization belong to the driver." },

@@ -57,6 +57,7 @@ fn dimension() -> DimensionId {
 }
 fn work_resources(quota: ResourceVector) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota,
         owned_slots: OwnedSlotNeed {
             work_headers: 1,
@@ -66,6 +67,7 @@ fn work_resources(quota: ResourceVector) -> ReservationResources {
 }
 fn role_resources(quota: ResourceVector) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota,
         owned_slots: OwnedSlotNeed {
             work_headers: 1,
@@ -539,4 +541,116 @@ fn exited_continuation_keeps_its_capacity_until_the_admitted_child_tree_retires(
         ledger.remove_scope(contender.id()).unwrap();
         assert!(ledger.is_empty());
     }
+}
+
+#[test]
+fn continuation_retires_process_and_original_keyed_quota_after_real_callback_exit() {
+    use novarocks_control_runtime_core::{
+        capacity::KeyedQuota,
+        identity::{CapacityKey, FamilyId},
+    };
+    struct RetiredWake {
+        owner: std::sync::Weak<std::sync::Mutex<Option<ContinuationSlot<u64>>>>,
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl std::task::Wake for RetiredWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            let owner = self.owner.upgrade().unwrap();
+            let original = owner.lock().unwrap().as_ref().unwrap().clone();
+            assert_eq!(
+                original.phase(),
+                Phase::Retired,
+                "capacity notification runs after the original custody lock is released"
+            );
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let family = FamilyId::new(9).unwrap();
+    let keyed_dimension = DimensionId::new(2).unwrap();
+    let process = ResourceVector::new([(dimension(), 1)]).unwrap();
+    let ledger = RuntimeLedger::with_keyed_families(
+        process.clone(),
+        [(family, ResourceVector::new([(keyed_dimension, 3)]).unwrap())],
+    )
+    .unwrap();
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let request = role_resources(process).with_keyed(KeyedQuota {
+        family,
+        key: CapacityKey(0x8765),
+        quota: ResourceVector::new([(keyed_dimension, 3)]).unwrap(),
+    });
+    let (work, mut capacity) = scope
+        .reserve_next(
+            generation(),
+            request,
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    let consumer = ConsumerId::new(1).unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut capacity,
+        generation(),
+        1,
+        [(consumer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let reported = novarocks_control_runtime::reported_work::ReportedWork::try_new(
+        work,
+        capacity,
+        report.clone(),
+    )
+    .unwrap();
+    let (slot, token) = ContinuationSlot::<u64>::from_admitted(reported);
+    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(slot.clone())));
+    let registrant = ledger
+        .capacity_registrant(std::task::Waker::from(std::sync::Arc::new(RetiredWake {
+            owner: std::sync::Arc::downgrade(&owner),
+            count: wake_count.clone(),
+        })))
+        .unwrap();
+    assert!(
+        scope
+            .reserve_next_or_wait(
+                generation(),
+                ReservationResources::work_only().with_keyed(KeyedQuota {
+                    family,
+                    key: CapacityKey(0x8765),
+                    quota: ResourceVector::new([(keyed_dimension, 1)]).unwrap()
+                }),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+                &registrant,
+            )
+            .is_err()
+    );
+    token
+        .register(Box::new(|value| assert_eq!(value, 9)))
+        .unwrap_or_else(|_| panic!("one original continuation callback"));
+    slot.publish_barrier(9).unwrap();
+    assert_eq!(slot.invoke().unwrap(), InvocationResult::Exited);
+    assert!(
+        !slot.try_retire().unwrap(),
+        "actual callback exit does not consume the independent report leg"
+    );
+    assert_eq!(
+        ledger.try_keyed_usage_snapshot().unwrap()[0]
+            .used
+            .get(keyed_dimension),
+        3
+    );
+    report.consume(consumer).unwrap();
+    assert!(slot.try_retire().unwrap());
+    assert_eq!(slot.phase(), Phase::Retired);
+    assert_eq!(ledger.used(dimension()), 0);
+    assert!(ledger.try_keyed_usage_snapshot().unwrap().is_empty());
+    assert!(ledger.unresolved_work().is_empty());
+    assert_eq!(wake_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    ledger.reap_ready(1).unwrap();
+    scope.close_external().unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
 }
