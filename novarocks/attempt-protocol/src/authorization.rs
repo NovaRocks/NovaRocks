@@ -21,6 +21,7 @@
 //! actual exit and original credit progress remain independently reachable.
 
 pub(crate) mod establish;
+pub(crate) mod observations;
 
 #[cfg(test)]
 mod tests;
@@ -118,9 +119,22 @@ impl AdmissionAuthorization {
         token: AttemptRequestToken,
         reply: &OperationReply,
     ) -> Result<AdmissionSettlementDirective, TaskExecutionError> {
-        if reply.operation_id() != self.request.envelope().operation_id()
-            || reply.kind() != self.request.envelope().kind()
-        {
+        let Some(observations::ObserverDebt::Admission(observed)) =
+            observations::ObserverDebt::from_reply(reply)
+        else {
+            return Err(TaskExecutionError::UnknownOperation);
+        };
+        self.settle_observed(token, observed)
+    }
+    /// Invoke at the original post-round settlement phase, never while merely
+    /// registering an ACK before its domain fold. The projection retains no
+    /// raw reply or source role and does not freeze issue ownership early.
+    pub(crate) fn settle_observed(
+        &mut self,
+        token: AttemptRequestToken,
+        observed: observations::AdmissionObservation,
+    ) -> Result<AdmissionSettlementDirective, TaskExecutionError> {
+        if observed.operation_id != self.request.envelope().operation_id() {
             return Err(TaskExecutionError::UnknownOperation);
         }
         if self.flight.is_some() {
@@ -131,14 +145,11 @@ impl AdmissionAuthorization {
         let Some(issue) = self.issue else {
             return Ok(AdmissionSettlementDirective::Unowned);
         };
-        if reply.dispatch_result() == crate::operation::OperationDispatchResult::TransportUnknown {
+        if observed.result == observations::ObservedDispatch::Unknown {
             self.prior_unknown = true;
             return Ok(AdmissionSettlementDirective::TransportUnknown);
         }
-        let receipt = match reply.payload() {
-            crate::input::AckPayload::AdmissionTicket(receipt) => Some(*receipt),
-            _ => None,
-        };
+        let outcome = observed.result.worker_outcome();
         self.flight = Some(AdmissionFlight {
             token,
             call: AdmissionCall::Settle,
@@ -147,10 +158,10 @@ impl AdmissionAuthorization {
             AttemptAuthorization::SettleAdmission {
                 issue,
                 participation: self.request.participation(),
-                operation_id: reply.operation_id(),
-                outcome: reply.worker_outcome(),
-                receipt,
-                prior_transport_unknown: reply.worker_outcome().is_none() && self.prior_unknown,
+                operation_id: observed.operation_id,
+                outcome,
+                receipt: observed.ticket,
+                prior_transport_unknown: outcome.is_none() && self.prior_unknown,
             },
         ))
     }

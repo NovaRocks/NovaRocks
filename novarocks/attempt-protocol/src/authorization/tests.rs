@@ -306,3 +306,104 @@ fn foreign_operation_and_wrong_reply_shape_cannot_consume_the_original_call() {
     assert!(gate.permits_protocol_turn());
     assert_eq!(other.issue, None);
 }
+
+#[test]
+fn recording_semantic_debt_keeps_qa_idle_until_post_round_and_retains_error_followup() {
+    use super::observations::{ObserverDebt, ObserverJournal};
+    let mut gate = gate();
+    begin(&mut gate);
+    let unknown = local(&gate, LocalDispatchResult::TransportUnknown);
+    let refused = local(&gate, LocalDispatchResult::NonWorkerRejected);
+    let ticket = ParticipationAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+        gate.request.participation(),
+        gate.request.valid_for(),
+    );
+    let worker = OperationReply {
+        operation_id: gate.request.envelope().operation_id(),
+        kind: gate.request.envelope().kind(),
+        result: OperationReplyResult::Worker(OperationResult::Verdict {
+            outcome: OperationOutcome::Accepted,
+            detail: None,
+            acknowledgement: Some(AckPayload::AdmissionTicket(ticket)),
+        }),
+    };
+    let mut journal = ObserverJournal::new([1; 4]).unwrap();
+    journal.begin_cut().unwrap();
+    for reply in [&unknown, &refused, &worker] {
+        journal.observe(reply).unwrap();
+        // Domain folding, Root/seal and publication may still run. Recording
+        // cannot start QA or select an issue before earlier settlements occur.
+        assert!(gate.permits_protocol_turn());
+        assert!(!gate.prior_unknown);
+        assert_eq!(gate.issue, Some(issue(11)));
+    }
+    journal.finish_recording().unwrap();
+    let Some(ObserverDebt::Admission(observed)) = journal.current().unwrap() else {
+        panic!("first original fact")
+    };
+    assert!(matches!(
+        gate.settle_observed(token(2), observed).unwrap(),
+        AdmissionSettlementDirective::TransportUnknown
+    ));
+    assert!(gate.prior_unknown && gate.permits_protocol_turn());
+    journal.settled_current().unwrap();
+    let Some(ObserverDebt::Admission(observed)) = journal.current().unwrap() else {
+        panic!("second original fact")
+    };
+    let AdmissionSettlementDirective::Request(AttemptAuthorization::SettleAdmission {
+        issue: selected,
+        prior_transport_unknown,
+        outcome,
+        receipt,
+        ..
+    }) = gate.settle_observed(token(3), observed).unwrap()
+    else {
+        panic!("original issue settlement")
+    };
+    assert_eq!(selected, issue(11));
+    assert!(prior_transport_unknown && outcome.is_none() && receipt.is_none());
+    // Result-credit Full or the original async QA call keeps this same row.
+    assert_eq!(
+        journal.current().unwrap(),
+        Some(ObserverDebt::Admission(observed))
+    );
+    assert!(!gate.permits_protocol_turn());
+    assert_eq!(
+        gate.replied(
+            token(3),
+            Err(AttemptAuthorizationFailure::Rejected(failure()))
+        )
+        .unwrap(),
+        AdmissionGateReply::Failed {
+            failure: failure(),
+            retire_queued_authorization: true
+        }
+    );
+    journal.settled_current().unwrap();
+    let Some(ObserverDebt::Admission(observed)) = journal.current().unwrap() else {
+        panic!("later Worker verdict remains")
+    };
+    let AdmissionSettlementDirective::Request(AttemptAuthorization::SettleAdmission {
+        issue: selected,
+        prior_transport_unknown,
+        outcome,
+        receipt,
+        ..
+    }) = gate.settle_observed(token(4), observed).unwrap()
+    else {
+        panic!("settle later original Worker verdict")
+    };
+    assert_eq!(selected, issue(11));
+    assert!(!prior_transport_unknown);
+    assert_eq!(outcome, Some(OperationOutcome::Accepted));
+    assert_eq!(receipt, Some(ticket));
+    assert_eq!(
+        gate.replied(token(4), Ok(AttemptAuthorizationDecision::AdmissionGranted))
+            .unwrap(),
+        AdmissionGateReply::Settled
+    );
+    journal.settled_current().unwrap();
+    journal.finish_cut().unwrap();
+    assert!(gate.issue.is_none() && gate.permits_protocol_turn());
+}

@@ -276,16 +276,28 @@ impl EstablishAuthorization {
         &mut self,
         result: OperationDispatchResult,
     ) -> Result<(), TaskExecutionError> {
+        self.begin_observed_settlement(super::observations::EstablishObservation {
+            operation_id: self.operation_id,
+            result: super::observations::ObservedDispatch::from_dispatch(result),
+        })
+    }
+    pub(crate) fn begin_observed_settlement(
+        &mut self,
+        observed: super::observations::EstablishObservation,
+    ) -> Result<(), TaskExecutionError> {
+        if observed.operation_id != self.operation_id {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
         if !self.permits_protocol_turn() {
             return Err(invalid(
                 "Establish ACK overtook its original serial QA call",
             ));
         }
-        let selection = match result {
-            OperationDispatchResult::TransportUnknown => Selection::Unknown,
-            OperationDispatchResult::WorkerReceipt(receipt) => Selection::Worker(receipt.outcome()),
-            OperationDispatchResult::IngressRejected(_)
-            | OperationDispatchResult::NonWorkerRejected => Selection::PreWorker,
+        use super::observations::ObservedDispatch;
+        let selection = match observed.result {
+            ObservedDispatch::Unknown => Selection::Unknown,
+            ObservedDispatch::Worker(outcome) => Selection::Worker(outcome),
+            ObservedDispatch::PreWorker => Selection::PreWorker,
         };
         self.pass = Some(Pass {
             owns_acknowledgement: self.current.is_some() || self.late_entry,

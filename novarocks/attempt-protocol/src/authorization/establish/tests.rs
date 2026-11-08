@@ -487,3 +487,100 @@ fn registration_preallocates_before_original_operation_exists_and_binding_moves_
     );
     assert!(EstablishAuthorizationStorage::new(wrong, limits, participation).is_err());
 }
+
+#[test]
+fn deferred_journal_preserves_ingress_worker_order_and_selects_guards_only_at_settlement() {
+    use crate::authorization::observations::{ObserverDebt, ObserverJournal};
+    use crate::input::{LocalDispatchResult, OperationReply, OperationReplyResult};
+    use novarocks_execution_contract::{OperationKind, operation::OperationResult};
+    for worker_first in [false, true] {
+        let mut g = gate(2);
+        authorize(&mut g, 1, false);
+        unknown(&mut g, 1);
+        authorize(&mut g, 2, true);
+        let ingress = OperationReply {
+            operation_id: g.operation_id,
+            kind: OperationKind::UpdateParticipation,
+            result: OperationReplyResult::Local {
+                result: LocalDispatchResult::NonWorkerRejected,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            },
+        };
+        let worker = OperationReply {
+            operation_id: g.operation_id,
+            kind: OperationKind::UpdateParticipation,
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: None,
+            }),
+        };
+        let replies = if worker_first {
+            [&worker, &ingress]
+        } else {
+            [&ingress, &worker]
+        };
+        let mut journal = ObserverJournal::new([1; 4]).unwrap();
+        journal.begin_cut().unwrap();
+        for reply in replies {
+            journal.observe(reply).unwrap();
+            assert!(g.permits_protocol_turn());
+            assert_eq!(g.current.unwrap().authorization, issue(2));
+            assert_eq!(g.late.front(), Some(&issue(1)));
+        }
+        journal.finish_recording().unwrap();
+        let mut trace = Vec::new();
+        let mut n = 300;
+        while let Some(ObserverDebt::Establish(observed)) = journal.current().unwrap() {
+            g.begin_observed_settlement(observed).unwrap();
+            loop {
+                n += 1;
+                let result = match g.advance(token(n)) {
+                    Step::Settle {
+                        token,
+                        authorization,
+                        settlement,
+                    } => {
+                        trace.push((authorization, settlement));
+                        assert_eq!(
+                            journal.current().unwrap(),
+                            Some(ObserverDebt::Establish(observed))
+                        );
+                        g.settled(token, authorization, Ok(())).unwrap()
+                    }
+                    Step::Ready => g.finish_empty().unwrap(),
+                    other => panic!("unexpected settlement state: {other:?}"),
+                };
+                if matches!(result, SettlementReply::Complete { .. }) {
+                    break;
+                }
+            }
+            journal.settled_current().unwrap();
+        }
+        journal.finish_cut().unwrap();
+        let expected = if worker_first {
+            vec![
+                (
+                    issue(1),
+                    AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
+                ),
+                (
+                    issue(2),
+                    AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
+                ),
+            ]
+        } else {
+            vec![
+                (issue(2), AttemptIssueSettlement::PreWorkerRejected),
+                (
+                    issue(1),
+                    AttemptIssueSettlement::Worker(OperationOutcome::Accepted),
+                ),
+            ]
+        };
+        assert_eq!(trace, expected);
+        assert!(g.current.is_none() && g.late.is_empty() && g.permits_protocol_turn());
+    }
+}
