@@ -162,7 +162,12 @@ pub struct AttemptRootProjection {
 pub enum AttemptTerminal<F> {
     Completed,
     Failed(F),
-    Stopped(AttemptStopReason),
+    Stopped {
+        reason: AttemptStopReason,
+        /// Original typed cancellation/logical failure; never reconstructed
+        /// from the coarse control reason or its display text.
+        failure: F,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,11 +228,12 @@ pub enum LogicalToAttemptBody<F> {
         action: AttemptActionId,
         request: AbortParticipation,
     },
-    Stop(AttemptStopReason),
-    /// Must share the observation source FIFO, including across mailbox classes.
-    SealRequest {
-        token: AttemptRequestToken,
+    Stop {
+        reason: AttemptStopReason,
+        failure: F,
     },
+    /// Must share the observation source FIFO, including across mailbox classes.
+    SealRequest { token: AttemptRequestToken },
     TerminalControlDemand {
         token: AttemptRequestToken,
         root: TaskIdentity,

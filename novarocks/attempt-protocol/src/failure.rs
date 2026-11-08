@@ -96,4 +96,28 @@ pub enum AttemptFailure {
     TaskProtocol(Box<crate::error::TaskExecutionError>),
     Host(HostProjectedFailure),
     SelectedTask(novarocks_coordination_contract::SelectedTaskTermination),
+    /// Emitted only by the original authorization author after its retained
+    /// exact Establish was transport-unknown and reauthorization returned the
+    /// typed exhausted-budget branch. Kind/class/text cannot infer this fact.
+    EstablishReplayExhausted {
+        original: HostProjectedFailure,
+        participation: ParticipationRef,
+        operation_id: TaskOperationId,
+    },
+    /// Positive replacement at the original frozen endpoint. The bridge uses
+    /// the existing BackendLost author; this is not heartbeat/admission loss.
+    BackendReplaced {
+        original: novarocks_types::BackendProcessId,
+        replacement: novarocks_types::BackendProcessId,
+    },
+    /// Independent accepted replacement evidence beside the SAME definitive
+    /// refusal. The bridge still invokes QA's existing witness validation and
+    /// attach operation; this fact grants no retry, admission or exit proof.
+    PreReadyReplacement {
+        refusal: Box<AttemptFailure>,
+        participation: ParticipationRef,
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        replacement: novarocks_types::BackendProcessId,
+    },
 }

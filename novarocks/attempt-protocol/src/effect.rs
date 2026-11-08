@@ -186,6 +186,12 @@ pub enum EffectBody {
         generation: NonZeroU64,
         requested_at: MonotonicInstant,
     },
+    /// Exact local lifecycle read on the original canonical Source. The
+    /// original endpoint and access/capture credentials remain in that Source.
+    ObservePreReadyProcess {
+        request: AttemptRequestToken,
+        original: BackendProcessId,
+    },
     StartPump {
         pump: PayloadRef,
         kind: PumpKind,

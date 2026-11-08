@@ -286,6 +286,15 @@ pub enum ExecutorFact {
     Observations(ObservationBatch),
     ReadState(ReadStateSnapshot),
     ReadProgress(ReadProgressSnapshot),
+    /// An exact read requested AFTER the same original QA permission (when
+    /// required), resolved against the host's frozen endpoint. Membership
+    /// change notifications alone cannot stand in for this correlated sample.
+    PreReadyProcessSnapshot {
+        request: novarocks_coordination_contract::AttemptRequestToken,
+        original: novarocks_types::BackendProcessId,
+        sampled_at: MonotonicInstant,
+        observation: MembershipObservation,
+    },
     PumpFinished {
         pump: PayloadRef,
         result: Result<(), AttemptFailure>,
