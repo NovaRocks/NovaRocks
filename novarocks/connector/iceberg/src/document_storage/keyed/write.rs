@@ -18,6 +18,8 @@
 //! Inline document updates contain only this channel's exact keys.
 // Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
+// Design: ADR-0224 (docs/adr/ADR-0224-mv-document-capacity-comes-from-real-boundaries.md)
+
 use super::{envelope, keys, limits, record, view};
 use crate::iceberg::TableUpdate;
 use crate::iceberg::spec::TableMetadata;

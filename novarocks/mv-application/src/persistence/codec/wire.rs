@@ -20,6 +20,8 @@
 //! Durable MV facts reject unknown fields, duplicate singular fields and
 //! noncanonical encodings. Recursion follows a closed, acyclic schema graph.
 
+// Design: ADR-0224 (docs/adr/ADR-0224-mv-document-capacity-comes-from-real-boundaries.md)
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::persistence::codec::PersistenceCodecError;

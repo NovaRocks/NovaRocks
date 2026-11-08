@@ -32,6 +32,8 @@ pub struct StateStoreLimits {
     pub transaction_deadline: Duration,
 }
 
+// Design: ADR-0224 (docs/adr/ADR-0224-mv-document-capacity-comes-from-real-boundaries.md)
+
 /// Usable logical capacity of one provider's storage representation.
 /// `usize::MAX` means the backend has no bound for that dimension.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
