@@ -210,6 +210,12 @@ pub struct ReadStateSnapshot {
     pub had_liveness: bool,
     pub last_liveness_at: MonotonicInstant,
     pub pauses: ReadPauseCoverage,
+    /// Actual Source read-credit suspension at this same snapshot. Accumulated
+    /// pause duration alone cannot determine whether the stream is still paused.
+    pub reading_paused: bool,
+    /// Per-stream resume version from the same Source lock. It only rejects
+    /// stale pause observations; it never orders frames or root controls.
+    pub resume_revision: u64,
     pub closed: bool,
     pub received_through_snapshot: ReceptionCoverage,
 }
@@ -223,6 +229,17 @@ pub struct SubscriptionPhaseSnapshot {
     pub generation: NonZeroU64,
     pub opening_started_at: MonotonicInstant,
     pub opened_at: Option<MonotonicInstant>,
+}
+
+/// A hint from the same Source after actual read-credit suspension ends.
+/// It changes no liveness or coverage fact and grants no capacity. A controller
+/// waiting on a paused snapshot may restore its original measurement deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadProgressSnapshot {
+    pub participation: ParticipationRef,
+    pub generation: NonZeroU64,
+    pub resumed_at: MonotonicInstant,
+    pub resume_revision: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +285,7 @@ pub enum ExecutorFact {
     SubscriptionProgress(SubscriptionPhaseSnapshot),
     Observations(ObservationBatch),
     ReadState(ReadStateSnapshot),
+    ReadProgress(ReadProgressSnapshot),
     PumpFinished {
         pump: PayloadRef,
         result: Result<(), AttemptFailure>,

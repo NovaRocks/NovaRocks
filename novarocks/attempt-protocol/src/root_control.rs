@@ -75,7 +75,10 @@ pub enum FailureReadiness {
 pub struct SealFacts {
     pub root: RootCompletion,
     pub failure: FailureReadiness,
-    pub business_failed: bool,
+    /// The original round returned before its root-control phase. This blocks
+    /// evaluation only for this turn, never latches a permanent refusal: an
+    /// allowed pre-ready observation turn may later learn positive root proof.
+    pub current_turn_failed: bool,
     pub terminal_control_required: bool,
     pub coverage_ready: bool,
     pub coverage_exhausted: bool,
@@ -175,6 +178,9 @@ impl RootControl {
     /// later strict Task completion, even while physical cleanup remains live.
     pub fn evaluate(&mut self, facts: SealFacts) -> Option<SealSettlement> {
         self.pending?;
+        if facts.current_turn_failed {
+            return None;
+        }
         if facts.terminal_control_required {
             return self.refuse(RootSealRefusal::TerminalControlRequired);
         }
@@ -185,9 +191,7 @@ impl RootControl {
                 None
             };
         }
-        if facts.business_failed {
-            return self.refuse(RootSealRefusal::TerminalWithoutSuccess);
-        }
+
         if facts.root == RootCompletion::ExactFinished && facts.failure == FailureReadiness::Empty {
             let token = self.pending.take().expect("pending request checked above");
             self.sealed = true;
@@ -226,7 +230,7 @@ mod tests {
         SealFacts {
             root: RootCompletion::ExactFinished,
             failure: FailureReadiness::Empty,
-            business_failed: false,
+            current_turn_failed: false,
             terminal_control_required: false,
             coverage_ready: true,
             coverage_exhausted: false,
@@ -299,17 +303,29 @@ mod tests {
     }
 
     #[test]
-    fn local_non_task_failure_cannot_turn_terminal_strict_tasks_into_success() {
+    fn failed_turn_preserves_pending_seal_until_the_original_terminal_or_observation_policy_runs() {
         let (graph, activation) = graph(false);
         let mut control = RootControl::new(activation, &graph).unwrap();
         control.request(token(1)).unwrap();
         let mut facts = ready(true);
-        facts.business_failed = true;
-        assert_eq!(
-            control.evaluate(facts).unwrap().result,
-            Err(RootSealRefusal::TerminalWithoutSuccess)
-        );
+        facts.current_turn_failed = true;
+        assert_eq!(control.evaluate(facts), None);
+        assert!(control.pending());
         assert!(!control.sealed());
+        // An allowed pre-ready receive turn can establish the original root
+        // proof. Ordinary failures instead invoke the explicit cleanup refusal.
+        facts.current_turn_failed = false;
+        assert!(control.evaluate(facts).unwrap().result.is_ok());
+        assert!(control.sealed());
+        let mut failed = RootControl::new(activation, &graph).unwrap();
+        failed.request(token(2)).unwrap();
+        assert_eq!(
+            failed
+                .refuse(RootSealRefusal::AttemptCleanup)
+                .unwrap()
+                .result,
+            Err(RootSealRefusal::AttemptCleanup)
+        );
     }
 
     #[test]

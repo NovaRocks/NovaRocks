@@ -19,6 +19,7 @@ use super::*;
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorStep},
     actor_turn::ActorRuntime,
+    coalescing_input::{CoalescingInput, Merge},
     obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
@@ -82,7 +83,8 @@ fn bookmark(key: StreamKey, sequence: u64) -> ObservationEvent {
 enum Seen {
     Observations(Vec<u64>),
     Control,
-    Snapshot(ReceptionCoverage),
+    Snapshot(ReadStateSnapshot),
+    Progress(ReadProgressSnapshot),
     Phase(MonotonicInstant, Option<MonotonicInstant>),
 }
 #[derive(Debug)]
@@ -127,8 +129,9 @@ impl Actor for Recorder {
             AttemptInput::Executor(ExecutorFact::SubscriptionProgress(phase)) => {
                 Seen::Phase(phase.opening_started_at, phase.opened_at)
             }
-            AttemptInput::Executor(ExecutorFact::ReadState(snapshot)) => {
-                Seen::Snapshot(snapshot.received_through_snapshot)
+            AttemptInput::Executor(ExecutorFact::ReadState(snapshot)) => Seen::Snapshot(snapshot),
+            AttemptInput::Executor(ExecutorFact::ReadProgress(progress)) => {
+                Seen::Progress(progress)
             }
             _ => unreachable!("unregistered test input"),
         };
@@ -139,6 +142,25 @@ impl Actor for Recorder {
     }
     fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!()
+    }
+}
+#[derive(Clone, Copy)]
+struct TestReadProgress(Option<ReadProgressSnapshot>);
+impl Merge for TestReadProgress {
+    fn merge(&mut self, newer: Self) {
+        if let Some(newer) = newer.0 {
+            if let Some(old) = self.0 {
+                assert_eq!(old.participation, newer.participation);
+                if (newer.generation, newer.resume_revision) < (old.generation, old.resume_revision)
+                {
+                    return;
+                }
+            }
+            self.0 = Some(newer);
+        }
+    }
+    fn unit() -> Self {
+        Self(None)
     }
 }
 struct BankState {
@@ -161,6 +183,10 @@ struct Bank {
     canonical: Mutex<BTreeMap<AttemptRequestToken, LogicalToAttempt<AttemptFailure>>>,
     projections: Mutex<usize>,
     metadata: Mutex<TestMetadataRecord>,
+    progress: Mutex<Option<CoalescingInput<Recorder, TestReadProgress>>>,
+    on_resume: Mutex<Option<Box<dyn FnOnce(ReadProgressSnapshot) + Send>>>,
+    progress_debts: Mutex<std::collections::BTreeSet<StreamKey>>,
+    progress_failed: std::sync::atomic::AtomicBool,
 }
 impl Bank {
     fn make(
@@ -177,6 +203,10 @@ impl Bank {
             canonical: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(0),
             metadata: Mutex::new(TestMetadataRecord::default()),
+            progress: Mutex::new(None),
+            on_resume: Mutex::new(None),
+            progress_debts: Mutex::new(std::collections::BTreeSet::new()),
+            progress_failed: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(BankState {
                 data: slots,
                 control,
@@ -342,6 +372,10 @@ impl ObservationMetadataObligation for TestMetadata {
             });
         }
         assert!(self.original.state.lock().unwrap().claims.is_empty());
+        assert!(
+            self.original.progress.lock().unwrap().is_none(),
+            "original Source role must actually close before metadata release"
+        );
         self.original.metadata.lock().unwrap().retired = true;
         self.retired = true;
         Ok(())
@@ -404,6 +438,27 @@ impl ObservationSourcePool for Bank {
     fn cancel_read_wait(&self, key: StreamKey) {
         self.state.lock().unwrap().waits.remove(&key);
     }
+    fn read_resumed(&self, progress: ReadProgressSnapshot) -> Result<(), ObservationError> {
+        if let Some(callback) = self.on_resume.lock().unwrap().take() {
+            callback(progress);
+        }
+        // Borrow the actual original prepaid Ordinary standing; no fabricated
+        // success and no bool/ref substituted for the publisher's obligation.
+        let original = self.progress.lock().unwrap().as_ref().unwrap().clone();
+        self.progress_debts.lock().unwrap().insert(StreamKey {
+            participation: progress.participation,
+            generation: progress.generation,
+        });
+        let published = original
+            .notify(TestReadProgress(Some(progress)))
+            .map(|_| ())
+            .map_err(ObservationError::Runtime);
+        if published.is_err() {
+            self.progress_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        published
+    }
     fn try_control(
         &self,
         reference: &RootControlRef,
@@ -427,6 +482,7 @@ impl ObservationSourcePool for Bank {
             .claims
             .values()
             .any(|stream| *stream == Some(key))
+            && !self.progress_debts.lock().unwrap().contains(&key)
     }
 }
 struct Fixture {
@@ -525,6 +581,24 @@ impl Fixture {
                 .into_standing_input()
                 .unwrap()
         };
+        let progress = runtime
+            .reserve_admitted_input(
+                actor(),
+                ActorId::new(5).unwrap(),
+                InputClass::Ordinary,
+                &work,
+            )
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        *bank.progress.lock().unwrap() = Some(CoalescingInput::new(
+            progress,
+            |update: &TestReadProgress| {
+                AttemptInput::Executor(ExecutorFact::ReadProgress(
+                    update.0.expect("actual original resume fact"),
+                ))
+            },
+        ));
         let clock = Arc::new(ManualClock::default());
         let input = OrderedObservationInput::new(
             standing(InputClass::Lifecycle),
@@ -606,6 +680,40 @@ impl Fixture {
             phase.input_retired(id).unwrap();
         }
     }
+    fn drain_progress(&self) {
+        let progress = self.bank.progress.lock().unwrap().as_ref().cloned();
+        if let Some(progress) = progress {
+            while let Some(id) = progress.in_flight().unwrap() {
+                self.runtime.poll_one(Tick(1)).unwrap();
+                self.runtime.retire_input(actor(), id).unwrap();
+                progress.after_retire().unwrap();
+            }
+            assert!(
+                !self
+                    .bank
+                    .progress_failed
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "unresolved real publisher debt cannot be refunded"
+            );
+            self.bank.progress_debts.lock().unwrap().clear();
+        }
+    }
+    fn close_progress(&self) {
+        self.drain_progress();
+        if let Some(progress) = self.bank.progress.lock().unwrap().take() {
+            progress.close_after_exit().unwrap();
+        }
+    }
+    fn confirmation(&self) -> CausalInputObligation<Recorder> {
+        CausalInputObligation::reserve_admitted(
+            &self.runtime,
+            &self.registration,
+            ActorId::new(3).unwrap(),
+            InputClass::Lifecycle,
+            &self.work,
+        )
+        .unwrap()
+    }
     fn frame(&self, sequence: u64) {
         let mut cx = Context::from_waker(Waker::noop());
         let credit = match self.bank.poll_read(self.key, &mut cx) {
@@ -646,6 +754,7 @@ impl Fixture {
         while self.input.0.state.lock().unwrap().in_flight.is_some() {
             self.consume(true);
         }
+        self.drain_progress();
         if self
             .input
             .0
@@ -658,6 +767,7 @@ impl Fixture {
             self.input.job_closed(self.key).unwrap();
             self.input.retire_stream(self.key).unwrap();
         }
+        self.close_progress();
         self.input.close_after_exit().unwrap();
         drop(self.input);
         assert!(self.bank.metadata.lock().unwrap().retired);
@@ -924,26 +1034,54 @@ fn full_source_window_does_not_block_the_independently_prepaid_confirmation() {
     )
     .unwrap();
     f.clock.at(3000);
-    let confirmation = match f.input.confirm(
+    let mut confirming = Box::pin(f.input.confirm(
         f.key,
         token(8),
         MonotonicInstant::from_origin(Duration::from_secs(2)),
         &mut independent,
-    ) {
-        Ok(id) => id,
-        Err(_) => panic!("independent confirmation blocked behind observations"),
-    };
-    f.runtime.poll_one(Tick(1)).unwrap();
-    f.runtime.retire_input(actor(), confirmation).unwrap();
-    assert_eq!(
-        f.seen.lock().unwrap()[0].1,
-        Seen::Snapshot(ReceptionCoverage::Incomplete)
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(confirming.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        !f.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, seen)| matches!(seen, Seen::Snapshot(_)))
     );
-    independent.close_after_exit().unwrap();
     f.bank.cancel_read_wait(f.key);
     f.input
         .complete_receive(&receipt, bookmark(f.key, 1), 0)
         .unwrap();
+    let confirmation = match confirming.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(id)) => id,
+        _ => panic!("same original confirmation did not complete after decode"),
+    };
+    drop(confirming);
+    // Common observation remains actually unretired/full; the independently
+    // prepaid confirmation can still fill and be consumed exactly once.
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.runtime.retire_input(actor(), confirmation).unwrap();
+    let snapshots = f
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, seen)| {
+            if let Seen::Snapshot(snapshot) = seen {
+                Some(*snapshot)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        snapshots[0].received_through_snapshot,
+        ReceptionCoverage::Complete
+    );
+    independent.close_after_exit().unwrap();
     let snapshot = f
         .input
         .read_state(f.key, token(9), MonotonicInstant::ORIGIN)
@@ -1439,6 +1577,7 @@ fn generation_keeps_phase_rpc_exit_and_actual_claim_return_as_independent_facts(
         report.consume(consumer).unwrap();
         assert!(custody.try_retire().unwrap());
         f.ledger.reap_scope_ready(f.scope.id(), 8).unwrap();
+        f.drain_progress();
         source.reap_generation(NonZeroU64::new(2).unwrap()).unwrap();
         source.close_new_jobs();
         source.close_after_jobs().unwrap();
@@ -1523,6 +1662,15 @@ fn compact_controls_project_only_at_fill_and_metadata_refusal_keeps_original() {
         Layout::new::<FailedFill<AttemptInput>>()
     );
     assert_eq!(layout.read_state, Layout::new::<ReadState>());
+    assert_eq!(
+        layout.read_confirmation,
+        Layout::new::<ReadConfirmationFuture<'static, Recorder>>()
+    );
+    assert_eq!(
+        layout.confirmation_waiter,
+        Layout::new::<Notified<'static>>()
+    );
+    assert_eq!(layout.read_progress, Layout::new::<ReadProgressSnapshot>());
     assert_eq!(layout.total_positions, f.bank.budget.total_positions);
     assert_eq!(layout.max_batch_items, 256);
     assert!(layout.root_reference.size() < layout.logical_projection.size());
@@ -1538,6 +1686,7 @@ fn compact_controls_project_only_at_fill_and_metadata_refusal_keeps_original() {
     f.consume(true);
     f.input.job_closed(f.key).unwrap();
     f.input.retire_stream(f.key).unwrap();
+    f.close_progress();
     f.bank.metadata.lock().unwrap().refuse_once = true;
     assert!(matches!(
         f.input.close_after_exit(),
@@ -1817,4 +1966,303 @@ fn valid_marker_at_the_same_open_tick_sets_had_liveness() {
         f.consume(false);
         f.finish();
     }
+}
+
+#[derive(Default)]
+struct ConfirmationWake(std::sync::atomic::AtomicUsize);
+impl std::task::Wake for ConfirmationWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn incomplete_confirmation_waits_for_real_pending_poll_change_without_any_frame() {
+    let f = Fixture::new(4, 1);
+    let mut original_result = f.confirmation();
+    let mut confirming = Box::pin(f.input.confirm(
+        f.key,
+        token(1),
+        MonotonicInstant::ORIGIN,
+        &mut original_result,
+    ));
+    let wakes = Arc::new(ConfirmationWake::default());
+    let waker = Waker::from(wakes.clone());
+    let mut confirmation_cx = Context::from_waker(&waker);
+    let mut credit = Some(f.bank.credit(false, Some(f.key)).unwrap());
+    let original_claims = f.bank.state.lock().unwrap().claims.len();
+    let mut network = std::future::poll_fn(|_| {
+        assert!(confirming.as_mut().poll(&mut confirmation_cx).is_pending());
+        assert!(f.seen.lock().unwrap().is_empty());
+        Poll::<()>::Pending
+    });
+    assert!(
+        f.input
+            .poll_receive(
+                f.key,
+                &mut credit,
+                Pin::new(&mut network),
+                &mut Context::from_waker(Waker::noop())
+            )
+            .is_pending()
+    );
+    drop(network);
+    assert!(
+        wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "clearing the actual short poll wakes the same original confirmation"
+    );
+    assert_eq!(
+        f.bank.state.lock().unwrap().claims.len(),
+        original_claims,
+        "confirmation cannot borrow a second frame loan"
+    );
+    let input = match confirming.as_mut().poll(&mut confirmation_cx) {
+        Poll::Ready(Ok(input)) => input,
+        _ => panic!("actual source change did not complete original confirmation"),
+    };
+    drop(confirming);
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.runtime.retire_input(actor(), input).unwrap();
+    let seen = f.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let Seen::Snapshot(snapshot) = &seen[0].1 else {
+        panic!("confirmation was replaced by an unrelated input");
+    };
+    assert_eq!(
+        snapshot.received_through_snapshot,
+        ReceptionCoverage::Complete
+    );
+    drop(seen);
+    original_result.close_after_exit().unwrap();
+    drop(credit);
+    f.finish();
+}
+
+fn live_controller(
+    f: &Fixture,
+    error_budget: u32,
+) -> novarocks_attempt_protocol::observation::controller::CoveredSubscription {
+    use novarocks_attempt_protocol::{
+        ids::IdSeed, input::SubscriptionPhaseSnapshot, observation::controller::*,
+    };
+    let mut controller =
+        CoveredSubscription::new(f.key.participation, IdSeed::new(10, 1), error_budget).unwrap();
+    controller.activate();
+    assert_eq!(
+        controller
+            .drive(MonotonicInstant::ORIGIN, f.key.generation, None)
+            .unwrap(),
+        Some(SubscriptionDirective::Open {
+            generation: f.key.generation
+        })
+    );
+    controller
+        .observe_phase(SubscriptionPhaseSnapshot {
+            participation: f.key.participation,
+            generation: f.key.generation,
+            opening_started_at: MonotonicInstant::ORIGIN,
+            opened_at: Some(MonotonicInstant::ORIGIN),
+        })
+        .unwrap();
+    controller
+}
+
+#[test]
+fn actual_long_pause_resume_uses_paid_progress_and_same_tick_revision() {
+    use novarocks_attempt_protocol::observation::controller::SubscriptionDirective;
+    let f = Fixture::new(4, 1);
+    let held = f.bank.credit(false, Some(f.key)).unwrap();
+    f.clock.at(4900);
+    let mut reserving = Box::pin(f.input.reserve_read(f.key));
+    let wakes = Arc::new(ConfirmationWake::default());
+    let waker = Waker::from(wakes.clone());
+    assert!(
+        reserving
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    f.clock.at(60_000);
+    let now = MonotonicInstant::from_origin(Duration::from_secs(60));
+    let snapshot = f.input.read_state(f.key, token(1), now).unwrap();
+    assert!(snapshot.reading_paused);
+    assert_eq!(snapshot.resume_revision, 0);
+    assert_eq!(snapshot.pauses.paused, Duration::from_millis(55_100));
+    let mut paused_first = live_controller(&f, 3);
+    let mut progress_first = live_controller(&f, 3);
+    for controller in [&mut paused_first, &mut progress_first] {
+        assert!(matches!(
+            controller
+                .drive(now, f.key.generation, Some(token(1)))
+                .unwrap(),
+            Some(SubscriptionDirective::Confirm(_))
+        ));
+    }
+    paused_first.observe_read_state(snapshot).unwrap();
+    assert_eq!(
+        paused_first.next_deadline(now),
+        Some(now.saturating_add(Duration::from_secs(5)))
+    );
+    let ingress = f.input.clone();
+    let key = f.key;
+    *f.bank.on_resume.lock().unwrap() = Some(Box::new(move |progress| {
+        let current = ingress
+            .read_state(key, token(9), MonotonicInstant::ORIGIN)
+            .unwrap();
+        assert!(
+            !current.reading_paused,
+            "real transition must commit before calling the foreign publisher"
+        );
+        assert_eq!(current.resume_revision, progress.resume_revision.get());
+    }));
+    drop(held);
+    assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    let credit = match reserving.as_mut().poll(&mut Context::from_waker(&waker)) {
+        Poll::Ready(Ok(credit)) => credit,
+        _ => panic!("original read credit did not resume"),
+    };
+    drop(reserving);
+    drop(credit);
+    assert!(f.bank.state.lock().unwrap().claims.is_empty());
+    assert!(
+        !f.bank.stream_claims_exited(f.key),
+        "same-generation progress debt is not a returned read claim"
+    );
+    f.drain_progress();
+    let progresses = f
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, seen)| {
+            if let Seen::Progress(progress) = seen {
+                Some(*progress)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(progresses.len(), 1);
+    let progress = progresses[0];
+    assert_eq!(progress.resumed_at, now);
+    assert_eq!(progress.resume_revision.get(), 1);
+    assert!(f.bank.stream_claims_exited(f.key));
+    paused_first.observe_read_progress(progress).unwrap();
+    progress_first.observe_read_progress(progress).unwrap();
+    progress_first.observe_read_state(snapshot).unwrap();
+    let measurement = now.saturating_add(Duration::from_millis(100));
+    assert_eq!(paused_first.next_deadline(now), Some(measurement));
+    assert_eq!(
+        progress_first.next_deadline(now),
+        Some(measurement),
+        "older paused snapshot cannot erase same-tick actual resume"
+    );
+    let current = f.input.read_state(f.key, token(2), now).unwrap();
+    assert!(!current.reading_paused);
+    assert_eq!(current.resume_revision, progress.resume_revision.get());
+    f.finish();
+}
+
+#[test]
+fn closed_confirmation_waits_for_ordered_marker_and_eof_before_retry_settlement() {
+    use novarocks_attempt_protocol::observation::controller::{
+        ObservationDisposition, SubscriptionDirective, SubscriptionStatus,
+    };
+    let f = Fixture::new(4, 4);
+    let mut controller = live_controller(&f, 1);
+    f.input.root_control(f.bank.seal()).unwrap();
+    let barrier = f.consume(false);
+    f.clock.at(5000);
+    f.frame(1);
+    f.input
+        .accept(
+            f.key,
+            ObservationEvent::Closed,
+            0,
+            f.bank.credit(false, Some(f.key)).unwrap(),
+        )
+        .unwrap();
+    let frames = f
+        .input
+        .0
+        .state
+        .lock()
+        .unwrap()
+        .queue
+        .iter()
+        .filter_map(|entry| {
+            if let EntryValue::Observation(frame) = &entry.value {
+                Some(frame.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 2);
+    let now = MonotonicInstant::from_origin(Duration::from_secs(5));
+    assert!(matches!(
+        controller
+            .drive(now, f.key.generation, Some(token(1)))
+            .unwrap(),
+        Some(SubscriptionDirective::Confirm(_))
+    ));
+    let mut result = f.confirmation();
+    let mut confirming = Box::pin(f.input.confirm(f.key, token(1), now, &mut result));
+    let confirmation = match confirming
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(Ok(id)) => id,
+        _ => panic!("independent closed confirmation waited for the common barrier"),
+    };
+    drop(confirming);
+    f.runtime.poll_one(Tick(1)).unwrap();
+    f.runtime.retire_input(actor(), confirmation).unwrap();
+    let snapshot = f
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(_, seen)| {
+            if let Seen::Snapshot(snapshot) = seen {
+                Some(*snapshot)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(snapshot.closed && snapshot.had_liveness);
+    controller.observe_read_state(snapshot).unwrap();
+    assert_eq!(
+        controller.status(),
+        SubscriptionStatus::Live,
+        "Closed is not ordinary retry-budget settlement"
+    );
+    assert_eq!(
+        controller
+            .drive(now, f.key.generation, Some(token(2)))
+            .unwrap(),
+        None
+    );
+    result.close_after_exit().unwrap();
+    f.input.root_control_processed(barrier).unwrap();
+    f.consume(false);
+    assert!(matches!(
+        controller.observe(frames[0].clone()).unwrap(),
+        ObservationDisposition::ApplyEntity(_)
+    ));
+    assert_eq!(controller.status(), SubscriptionStatus::Live);
+    assert_eq!(
+        controller.observe(frames[1].clone()).unwrap(),
+        ObservationDisposition::Ignore
+    );
+    assert_eq!(
+        controller.status(),
+        SubscriptionStatus::BudgetExhausted,
+        "only the original ordered EOF spends the one failure budget"
+    );
+    f.finish();
 }

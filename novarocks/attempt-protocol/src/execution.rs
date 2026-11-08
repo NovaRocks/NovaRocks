@@ -73,7 +73,7 @@ use super::participation_owner::{
     ParticipationEstablishFacts, ParticipationOwner, ReleaseSettlement,
 };
 use super::remote_task::{CreateSettlement, RemoteTask, TaskTerminalReport, UpdateSettlement};
-use super::stage::{EdgeOpenTracker, EdgeReadyDecision, StageExecution};
+use super::stage::{EdgeOpenTracker, StageExecution};
 
 struct CoveredStatusStreamEvent {
     source_revision: Option<u64>,
@@ -98,20 +98,9 @@ struct CoveredParticipationObservation {
     coverage_debt: Option<(u64, MonotonicInstant)>,
 }
 
-/// A frozen edge decision waiting for its producer's bounded process queue.
-/// The decision stays here until the producer has retained the domain intent.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum EdgeControlEffect {
-    Close {
-        producer: TaskIdentity,
-        edge: ExchangeEdgeId,
-        destination: TaskIdentity,
-    },
-    Open {
-        producer: TaskIdentity,
-        edge: ExchangeEdgeId,
-    },
-}
+use crate::stage::derivation::{
+    DerivedEdgeEffect as EdgeControlEffect, EdgeDerivationStep, EdgeDerivations,
+};
 
 /// The original graph row keeps its exact generated input and paid ticket
 /// through a capacity wait. No process physical position is held while Joint
@@ -128,14 +117,6 @@ impl From<EdgeControlEffect> for PendingEdgeControlEffect {
             effect,
             input: None,
             preparation: None,
-        }
-    }
-}
-
-impl EdgeControlEffect {
-    const fn producer(self) -> TaskIdentity {
-        match self {
-            Self::Close { producer, .. } | Self::Open { producer, .. } => producer,
         }
     }
 }
@@ -350,6 +331,7 @@ pub struct QueryTaskExecution {
     owners: BTreeMap<ParticipationRef, ParticipationOwner>,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
+    derived_edges: EdgeDerivations,
     now: MonotonicInstant,
     ids: OperationIds,
     covered_observation_active: bool,
@@ -628,6 +610,7 @@ impl QueryTaskExecution {
             owners,
             dispatcher,
             edges,
+            derived_edges: EdgeDerivations::default(),
             now,
             ids,
             covered_observation_active: false,
@@ -1022,7 +1005,10 @@ impl QueryTaskExecution {
         self.normal_drain_started
     }
 
-    pub(crate) fn root_seal_facts(&self, business_failed: bool) -> crate::root_control::SealFacts {
+    pub(crate) fn root_seal_facts(
+        &self,
+        current_turn_failed: bool,
+    ) -> crate::root_control::SealFacts {
         use crate::root_control::{FailureReadiness, RootCompletion, SealFacts};
         let root = self.graph.root_identity();
         let status = self.task_by_identity_ref(root).and_then(RemoteTask::status);
@@ -1041,13 +1027,13 @@ impl QueryTaskExecution {
         SealFacts {
             root,
             failure,
-            business_failed,
+            current_turn_failed,
             terminal_control_required: self.result_terminal_control_required(),
             coverage_ready: !self.covered_observation_active || self.covered_observation_ready(),
             coverage_exhausted: self.covered_recovery_expired(),
             normal_drain_can_start: !self.terminal_cleanup_started
                 && failure == FailureReadiness::Empty
-                && !business_failed
+                && !current_turn_failed
                 && self.strict_pending.is_empty(),
         }
     }
@@ -1087,49 +1073,6 @@ impl QueryTaskExecution {
             self.operation_targets.remove(&operation_id);
             self.rollback_unsent(target, operation_id);
         }
-    }
-
-    /// Project only this sealed read's actual, complete output-demand
-    /// withdrawals. Participation custody and Worker settlements remain untouched.
-    pub(crate) fn result_participation_withdrawals(
-        &self,
-        activation: novarocks_coordination_contract::AttemptActivationIdentity,
-    ) -> Vec<novarocks_coordination_contract::ResultParticipationWithdrawal> {
-        let root = self.graph.root_identity();
-        if !self.normal_drain_started
-            || self.failure_cause().is_some()
-            || activation.execution() != self.graph.execution_id()
-            || !self
-                .task_by_identity_ref(root)
-                .and_then(RemoteTask::status)
-                .is_some_and(|status| status.state() == TaskState::Finished)
-        {
-            return Vec::new();
-        }
-        let outputs = self.edges.normal_output_withdrawals(&self.graph);
-        let mut participations = BTreeMap::<ParticipationRef, bool>::new();
-        for task in self.graph.tasks() {
-            // No output edge supplies no result-withdrawal evidence.
-            let withdrawn = outputs.get(&task.identity()) == Some(&true);
-            participations
-                .entry(task.participation())
-                .and_modify(|all| *all &= withdrawn)
-                .or_insert(withdrawn);
-        }
-        self.graph
-            .participations()
-            .filter(|&&participation| {
-                participation.backend_process_id() != root.backend_process_id()
-                    && participations.get(&participation) == Some(&true)
-            })
-            .map(|&participation| {
-                novarocks_coordination_contract::ResultParticipationWithdrawal::new(
-                    activation,
-                    root,
-                    participation,
-                )
-            })
-            .collect()
     }
 
     /// Applies one exact local no-more-input authorization. An unknown Create
@@ -1475,49 +1418,37 @@ impl QueryTaskExecution {
     /// still `Creating` queues it, so the decision may be made early while the
     /// wire request still waits for that producer's own acknowledgement.
     fn open_ready_edges(&mut self, destination: TaskIdentity) -> Result<(), TaskExecutionError> {
-        let decisions = self.edges.note_created(destination);
-        self.apply_open_decisions(decisions);
+        self.derived_edges.created(destination);
         Ok(())
     }
 
-    fn apply_open_decisions(&mut self, decisions: Vec<EdgeReadyDecision>) {
-        if self.normal_drain_started {
-            return;
-        }
-        for decision in decisions {
-            let edge_id = decision.edge_id();
-            let producers = self.edges.producers_of(edge_id).to_vec();
-            for producer in producers {
-                self.edge_control_effects.push_back(
-                    EdgeControlEffect::Open {
-                        producer,
-                        edge: edge_id,
-                    }
-                    .into(),
-                );
-            }
-        }
+    fn close_destination_normally(&mut self, destination: TaskIdentity) {
+        self.derived_edges.normally_closed(destination);
     }
 
-    /// Projects a receiver's exact no-more-input decision to each frozen
-    /// producer before an edge-level open can follow it in that Task's update
-    /// sequence. Closing one destination does not close its siblings.
-    fn close_destination_normally(&mut self, destination: TaskIdentity) {
-        let resolution = self.edges.note_normally_closed(destination);
-        for effect in resolution.closed() {
-            let producers = self.edges.producers_of(effect.edge_id()).to_vec();
-            for producer in producers {
-                self.edge_control_effects.push_back(
-                    EdgeControlEffect::Close {
-                        producer,
-                        edge: effect.edge_id(),
-                        destination: effect.destination(),
-                    }
-                    .into(),
-                );
+    pub(crate) fn has_pending_edge_derivation(&self) -> bool {
+        self.derived_edges.has_pending()
+    }
+
+    /// Retains any produced fact in this same graph owner. A caller resumes
+    /// on remaining work, never re-enqueues a returned copy of an effect.
+    pub(crate) fn advance_edge_derivation(
+        &mut self,
+        context: &mut dyn crate::capacity::StepContext,
+    ) -> Result<bool, TaskExecutionError> {
+        let step = self.derived_edges.advance(
+            &mut self.edges,
+            !self.normal_drain_started && !self.terminal_cleanup_started,
+            context,
+        )?;
+        match step {
+            EdgeDerivationStep::Idle | EdgeDerivationStep::BudgetExhausted => Ok(false),
+            EdgeDerivationStep::Progress => Ok(true),
+            EdgeDerivationStep::Effect(effect) => {
+                self.edge_control_effects.push_back(effect.into());
+                Ok(true)
             }
         }
-        self.apply_open_decisions(resolution.opened().to_vec());
     }
 
     /// Moves frozen edge effects to the original per-task domain owner only
@@ -1709,6 +1640,36 @@ impl QueryTaskExecution {
     /// Applies frames that the new intake registered before a success seal in
     /// one order. A frame from an older generation still contributes its
     /// positive entity fact; it cannot advance the current coverage watermark.
+
+    /// Entity facts can enter this owner only after the current/old generation's
+    /// immutable opening witness has passed the subscription policy. The
+    /// value moves here without cloning its decoded frame on the poller.
+    pub(crate) fn apply_covered_observation(
+        &mut self,
+        accepted: crate::observation::controller::AcceptedObservation,
+    ) -> Result<StatusReport, TaskExecutionError> {
+        let observation = accepted.into_observation();
+        let ObservationEvent::Fact {
+            source_revision,
+            fact,
+        } = observation.event
+        else {
+            return Err(TaskExecutionError::Schedule(
+                "subscription policy admitted a non-entity observation".into(),
+            ));
+        };
+        let mut report = StatusReport::default();
+        self.apply_covered_frame(
+            observation.participation,
+            observation.generation.get(),
+            CoveredStatusStreamEvent {
+                source_revision,
+                fact,
+            },
+            &mut report,
+        )?;
+        Ok(report)
+    }
 
     fn apply_covered_frame(
         &mut self,
@@ -2430,45 +2391,10 @@ mod covered_progress_tests {
 #[cfg(test)]
 mod primary_terminal_tests {
     use super::*;
-    use crate::config::FrozenTransportLimits;
     use crate::input::{OperationReply, OperationReplyResult};
     use novarocks_execution_contract::{OperationOutcome, TaskOutputFacts, TaskStatusVersion};
     fn execution() -> QueryTaskExecution {
-        let (graph, _) = crate::test_support::graph_with_strict_input(false);
-        let epochs = graph
-            .participations()
-            .map(|p| {
-                (
-                    p.backend_process_id(),
-                    AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let positions = epochs.keys().map(|&p| (p, 16)).collect();
-        let transport = FrozenTransportLimits {
-            max_batch_items: 4,
-            max_batch_encoded_bytes: 4096,
-            max_descriptor_encoded_bytes: 4096,
-            max_query_backend_queued_operations: 1024,
-            max_query_backend_queued_bytes: 1_048_576,
-            max_backend_queued_operations: 4096,
-            max_backend_queued_bytes: 4_194_304,
-            max_tasks_per_participation: 1024,
-            max_active_tasks_per_backend: 1024,
-            frontend_queue_residence: Duration::from_secs(5),
-        };
-        QueryTaskExecution::new(
-            graph,
-            DispatchBudget::DEFAULT,
-            transport,
-            NativeCompatibilityId::new([0x41; 32]),
-            &epochs,
-            &positions,
-            MonotonicInstant::ORIGIN,
-            OperationIds::new(crate::ids::IdSeed::new(100, 1)),
-            RequestedLeaseDurations::DEFAULT,
-        )
-        .unwrap()
+        crate::test_support::execution_with_strict_input()
     }
     #[test]
     fn failed_closed_create_updates_strict_terminal_without_inventing_task_failure() {
@@ -2504,7 +2430,7 @@ mod primary_terminal_tests {
         assert_eq!(execution.strict_pending.len(), 1);
         assert!(!execution.strict_pending.contains(&identity));
         // A separate original business-failure gate still blocks a new seal.
-        assert!(execution.root_seal_facts(true).business_failed);
+        assert!(execution.root_seal_facts(true).current_turn_failed);
     }
     #[test]
     fn accepted_terminal_returns_deployment_position_and_strict_count_in_the_same_input() {

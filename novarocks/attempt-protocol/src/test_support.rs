@@ -141,3 +141,42 @@ pub(crate) fn graph_with_strict_input(
         AttemptActivationIdentity::from_parts(1, execution, 1),
     )
 }
+
+pub(crate) fn execution_with_strict_input() -> crate::execution::QueryTaskExecution {
+    let (graph, _) = crate::test_support::graph_with_strict_input(false);
+    let epochs = graph
+        .participations()
+        .map(|p| {
+            (
+                p.backend_process_id(),
+                novarocks_execution_contract::AdmissionEpochCapability::try_from_bytes([0x61; 16])
+                    .unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let positions = epochs.keys().map(|&p| (p, 16)).collect();
+    let transport = crate::config::FrozenTransportLimits {
+        max_batch_items: 4,
+        max_batch_encoded_bytes: 4096,
+        max_descriptor_encoded_bytes: 4096,
+        max_query_backend_queued_operations: 1024,
+        max_query_backend_queued_bytes: 1_048_576,
+        max_backend_queued_operations: 4096,
+        max_backend_queued_bytes: 4_194_304,
+        max_tasks_per_participation: 1024,
+        max_active_tasks_per_backend: 1024,
+        frontend_queue_residence: std::time::Duration::from_secs(5),
+    };
+    crate::execution::QueryTaskExecution::new(
+        graph,
+        crate::config::DispatchBudget::DEFAULT,
+        transport,
+        novarocks_types::NativeCompatibilityId::new([0x41; 32]),
+        &epochs,
+        &positions,
+        novarocks_coordination_contract::MonotonicInstant::ORIGIN,
+        crate::ids::OperationIds::new(crate::ids::IdSeed::new(100, 1)),
+        crate::lease::RequestedLeaseDurations::DEFAULT,
+    )
+    .unwrap()
+}

@@ -23,8 +23,8 @@ use novarocks_attempt_protocol::{
     failure::AttemptFailure,
     input::{
         AttemptInput, ExecutorFact, ObservationBatch, ObservationEvent, ObservationFact,
-        ObservationFailure, ObservationOpening, ReadPauseCoverage, ReadStateSnapshot,
-        ReceivedObservation, ReceptionCoverage,
+        ObservationFailure, ObservationOpening, ReadPauseCoverage, ReadProgressSnapshot,
+        ReadStateSnapshot, ReceivedObservation, ReceptionCoverage,
     },
 };
 use novarocks_control_runtime::{
@@ -47,7 +47,8 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
-use tokio::sync::Notify;
+use std::{future::Future, pin::Pin};
+use tokio::sync::{Notify, futures::Notified};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct StreamKey {
@@ -124,6 +125,9 @@ pub(crate) struct ObservationMetadataLayout {
     pub(crate) in_flight: Layout,
     pub(crate) failed_fill: Layout,
     pub(crate) read_state: Layout,
+    pub(crate) read_confirmation: Layout,
+    pub(crate) confirmation_waiter: Layout,
+    pub(crate) read_progress: Layout,
     pub(crate) total_positions: usize,
     pub(crate) max_batch_items: usize,
 }
@@ -192,6 +196,7 @@ pub(crate) enum ObservationError {
     ConfirmationBeforeRequest,
     InvalidRootControl,
     InvalidOpening,
+    ResumeRevisionExhausted,
     Oversized { charged: usize, reserved: usize },
     Runtime(ActorTurnError),
 }
@@ -309,6 +314,13 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
         cx: &mut Context<'_>,
     ) -> Poll<Result<ObservationCredit, ObservationError>>;
     fn cancel_read_wait(&self, stream: StreamKey);
+    /// Publish only a real Some -> None read suspension transition, outside the
+    /// ingress lock, through this SAME original Source's prepaid per-participant
+    /// Ordinary coalescing role. Its existing metadata author must cover the
+    /// actual publisher, backing and projected input (not only the snapshot).
+    /// No default, new loan, capacity wallet or timeout policy is permitted.
+    /// Refusal retains the original publisher's unresolved debt/custody.
+    fn read_resumed(&self, progress: ReadProgressSnapshot) -> Result<(), ObservationError>;
     /// Retain the canonical owner's EXISTING control byte share exactly once;
     /// do not allocate another payload charge for the same original request.
     fn try_control(
@@ -316,8 +328,11 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
         reference: &RootControlRef,
     ) -> Result<ObservationCredit, ObservationError>;
     /// Positive only after EVERY original read/queued/applying claim for this
-    /// generation consumed its real return receipt. Job exit or zero window
-    /// occupancy cannot substitute, including an internal async-body Drop panic.
+    /// generation consumed its real return receipt AND its read-progress
+    /// payload/debt has actually retired. The reusable standing belongs to the
+    /// stable parent Source, not a generation RPC/WC child. It must not strongly
+    /// retain that child. Job exit/zero occupancy cannot substitute, including
+    /// an internal async-body Drop panic; failed publication retains UNKNOWN.
     fn stream_claims_exited(&self, stream: StreamKey) -> bool;
 }
 
@@ -330,6 +345,7 @@ struct ReadState {
     catch_up_seen: bool,
     paused_from: Option<MonotonicInstant>,
     paused: Duration,
+    resume_revision: u64,
     closed: bool,
     pending: bool,
     accepted_unretired: usize,
@@ -348,6 +364,7 @@ impl ReadState {
             catch_up_seen: false,
             paused_from: None,
             paused: Duration::ZERO,
+            resume_revision: 0,
             closed: false,
             pending: false,
             accepted_unretired: 0,
@@ -369,15 +386,28 @@ impl ReadState {
         self.paused_from.get_or_insert(at);
         Ok(())
     }
-    fn resume(&mut self, at: MonotonicInstant) -> Result<(), ObservationError> {
+    fn resume(&mut self, at: MonotonicInstant) -> Result<Option<NonZeroU64>, ObservationError> {
         self.check_time(at)?;
+        let revision = if self.paused_from.is_some() {
+            Some(
+                NonZeroU64::new(
+                    self.resume_revision
+                        .checked_add(1)
+                        .ok_or(ObservationError::ResumeRevisionExhausted)?,
+                )
+                .expect("positive checked resume revision"),
+            )
+        } else {
+            None
+        };
         self.last_observation_at = at;
         if let Some(start) = self.paused_from.take() {
             self.paused = self
                 .paused
                 .saturating_add(at.saturating_duration_since(start));
+            self.resume_revision = revision.expect("actual suspension transition").get();
         }
-        Ok(())
+        Ok(revision)
     }
     fn receive(
         &mut self,
@@ -464,6 +494,8 @@ impl ReadState {
                 through: at,
                 paused: self.paused.saturating_add(active),
             },
+            reading_paused: self.paused_from.is_some(),
+            resume_revision: self.resume_revision,
             closed: self.closed,
             received_through_snapshot: if self.polling || self.unregistered || self.poisoned {
                 ReceptionCoverage::Incomplete
@@ -600,6 +632,9 @@ impl<A: Actor> OrderedObservationInput<A> {
             in_flight: Layout::new::<InFlight>(),
             failed_fill: Layout::new::<FailedFill<A::Input>>(),
             read_state: Layout::new::<ReadState>(),
+            read_confirmation: Layout::new::<ReadConfirmationFuture<'static, A>>(),
+            confirmation_waiter: Layout::new::<Notified<'static>>(),
+            read_progress: Layout::new::<ReadProgressSnapshot>(),
             total_positions: budget.total_positions,
             max_batch_items: ObservationBatch::MAX_ITEMS,
         })?;
@@ -757,13 +792,25 @@ impl<A: Actor> OrderedObservationInput<A> {
                     if stream.closed {
                         Err(ObservationError::StreamClosed)
                     } else {
-                        stream.resume(self.0.clock.now())
+                        let at = self.0.clock.now();
+                        stream
+                            .resume(at)
+                            .map(|revision| revision.map(|revision| (at, revision)))
                     }
                 } else {
                     Err(ObservationError::UnknownStream)
                 }
             };
-            resumed?;
+            if let Some((resumed_at, resume_revision)) = resumed? {
+                // No owner mutex spans the original publisher/runtime fill or
+                // its synchronous wakers. This is a fact hint, never policy.
+                self.0.source.read_resumed(ReadProgressSnapshot {
+                    participation: key.participation,
+                    generation: key.generation,
+                    resumed_at,
+                    resume_revision,
+                })?;
+            }
             break credit;
         };
         wait.active = false;
@@ -1190,7 +1237,7 @@ impl<A: Actor> OrderedObservationInput<A> {
     }
     /// A snapshot is independent of the full ingress and includes received but
     /// not-yet-applied liveness. One lock covers all receive/pause registration.
-    pub(crate) fn read_state(
+    fn snapshot_read_state(
         &self,
         key: StreamKey,
         request: AttemptRequestToken,
@@ -1207,23 +1254,36 @@ impl<A: Actor> OrderedObservationInput<A> {
             .ok_or(ObservationError::UnknownStream)?
             .snapshot(key, request, at)
     }
-    /// The caller has prepaid this independent Lifecycle causal result before
-    /// taking the ConfirmReadState ticket. It never queues behind observations.
-    pub(crate) fn confirm(
+    #[cfg(test)]
+    fn read_state(
         &self,
         key: StreamKey,
         request: AttemptRequestToken,
         requested_at: MonotonicInstant,
-        result: &mut CausalInputObligation<A>,
-    ) -> Result<InputId, ConfirmationFailure<A::Input>> {
-        let snapshot = self
-            .read_state(key, request, requested_at)
-            .map_err(ConfirmationFailure::Snapshot)?;
-        let input = (self.0.project)(AttemptInput::Executor(ExecutorFact::ReadState(snapshot)));
-        result
-            .fill_with_receipt(None, input)
-            .map(|(_, id)| id)
-            .map_err(ConfirmationFailure::Fill)
+    ) -> Result<ReadStateSnapshot, ObservationError> {
+        self.snapshot_read_state(key, request, requested_at)
+    }
+    /// The caller keeps the SAME credentialed Work, prepaid causal input and
+    /// generation retention for this entire future and actual capture exit.
+    /// Incomplete never consumes the result loan: the original waiter registers
+    /// before taking a snapshot, then waits only for real Source change. No
+    /// clock, sleep, retry policy, extra loan or private request queue is used.
+    pub(crate) fn confirm<'a>(
+        &'a self,
+        key: StreamKey,
+        request: AttemptRequestToken,
+        requested_at: MonotonicInstant,
+        result: &'a mut CausalInputObligation<A>,
+    ) -> ReadConfirmationFuture<'a, A> {
+        ReadConfirmationFuture {
+            ingress: self,
+            key,
+            request,
+            requested_at,
+            result,
+            waiting: None,
+            done: false,
+        }
     }
     pub(crate) fn root_control_processed(&self, input: InputId) -> Result<(), ObservationError> {
         self.consumed(input, true)
@@ -1633,6 +1693,66 @@ impl<A: Actor> OrderedObservationInput<A> {
             }
         }
         Ok(())
+    }
+}
+/// A single original confirmation continuation. The sole Notified allocation
+/// is covered by the original metadata obligation; it is not a request queue.
+/// A completed/dropped future neither retires the causal role nor proves its
+/// Work/captures exited. Those remain the original executor's responsibility.
+pub(crate) struct ReadConfirmationFuture<'a, A: Actor> {
+    ingress: &'a OrderedObservationInput<A>,
+    key: StreamKey,
+    request: AttemptRequestToken,
+    requested_at: MonotonicInstant,
+    result: &'a mut CausalInputObligation<A>,
+    waiting: Option<Pin<Box<Notified<'a>>>>,
+    done: bool,
+}
+impl<A: Actor> Future for ReadConfirmationFuture<'_, A> {
+    type Output = Result<InputId, ConfirmationFailure<A::Input>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        assert!(
+            !this.done,
+            "completed original read confirmation polled again"
+        );
+        loop {
+            if let Some(waiting) = this.waiting.as_mut() {
+                if waiting.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                // Exit this exact original waiter before allocating its next
+                // continuation; old+new Notified backing never coexists.
+                this.waiting = None;
+            }
+            let mut notified = Box::pin(this.ingress.0.changed.notified());
+            notified.as_mut().enable();
+            let snapshot =
+                match this
+                    .ingress
+                    .snapshot_read_state(this.key, this.request, this.requested_at)
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        this.done = true;
+                        return Poll::Ready(Err(ConfirmationFailure::Snapshot(error)));
+                    }
+                };
+            if snapshot.received_through_snapshot == ReceptionCoverage::Incomplete {
+                this.waiting = Some(notified);
+                continue;
+            }
+            drop(notified);
+            let input =
+                (this.ingress.0.project)(AttemptInput::Executor(ExecutorFact::ReadState(snapshot)));
+            this.done = true;
+            return Poll::Ready(
+                this.result
+                    .fill_with_receipt(None, input)
+                    .map(|(_, id)| id)
+                    .map_err(ConfirmationFailure::Fill),
+            );
+        }
     }
 }
 pub(crate) enum ConfirmationFailure<I> {

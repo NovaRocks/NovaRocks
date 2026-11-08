@@ -45,6 +45,7 @@ pub enum ReadStateDecision {
     Live {
         deadline: MonotonicInstant,
         had_liveness: bool,
+        reading_paused: bool,
     },
     SilenceExpired {
         had_liveness: bool,
@@ -123,6 +124,7 @@ impl ReadConfirmation {
             ReadStateDecision::Live {
                 deadline: at.saturating_add(COVERED_LIVENESS_BUDGET - active),
                 had_liveness: snapshot.had_liveness,
+                reading_paused: snapshot.reading_paused,
             }
         })
     }
@@ -160,6 +162,8 @@ mod tests {
                 through: at(8000),
                 paused: Duration::from_secs(3),
             },
+            reading_paused: false,
+            resume_revision: 0,
             closed: false,
             received_through_snapshot: ReceptionCoverage::Complete,
         };
@@ -172,7 +176,8 @@ mod tests {
             request.evaluate(snapshot).unwrap(),
             ReadStateDecision::Live {
                 deadline: at(9000),
-                had_liveness: false
+                had_liveness: false,
+                reading_paused: false,
             }
         );
         let mut expired = snapshot;
@@ -180,7 +185,7 @@ mod tests {
         assert_eq!(
             request.evaluate(expired).unwrap(),
             ReadStateDecision::SilenceExpired {
-                had_liveness: false
+                had_liveness: false,
             }
         );
     }
@@ -199,7 +204,8 @@ mod tests {
             request.evaluate(snapshot).unwrap(),
             ReadStateDecision::Live {
                 deadline: at(9000),
-                had_liveness: false
+                had_liveness: false,
+                reading_paused: false,
             }
         );
         snapshot.opened_at = None;
@@ -221,7 +227,8 @@ mod tests {
             request.evaluate(snapshot).unwrap(),
             ReadStateDecision::Live {
                 deadline: at(9000),
-                had_liveness: true
+                had_liveness: true,
+                reading_paused: false,
             }
         );
     }

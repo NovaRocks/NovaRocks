@@ -344,6 +344,15 @@ impl EdgeNormalCloseResolution {
     }
 }
 
+/// One frozen edge member's monotonic change. Producer fanout is deliberately
+/// separate: the core charges each exact destination/producer effect before
+/// expanding it, and emits known close work before a pending open.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EdgeMemberResolution {
+    pub(crate) closed: bool,
+    pub(crate) newly_opened: bool,
+}
+
 #[derive(Debug)]
 pub struct EdgeOpenTracker {
     must_drain: BTreeSet<ExchangeEdgeId>,
@@ -417,45 +426,88 @@ impl EdgeOpenTracker {
         self.resolve_destination(destination, true)
     }
 
+    pub(crate) fn destination_edge_count(&self, destination: TaskIdentity) -> usize {
+        self.edges_of_destination
+            .get(&destination)
+            .map_or(0, Vec::len)
+    }
+
+    pub(crate) fn destination_edge(
+        &self,
+        destination: TaskIdentity,
+        index: usize,
+    ) -> Option<ExchangeEdgeId> {
+        self.edges_of_destination
+            .get(&destination)?
+            .get(index)
+            .copied()
+    }
+
+    pub(crate) fn producer_at(&self, edge: ExchangeEdgeId, index: usize) -> Option<TaskIdentity> {
+        self.producers.get(&edge)?.get(index).copied()
+    }
+
+    /// The caller charges this one member before advancing its graph cursor.
+    /// Frozen edge iteration is ordered, so the incidence check is logarithmic
+    /// and does not scan all edges or copy an entire producer/destination set.
+    pub(crate) fn resolve_edge_member(
+        &mut self,
+        destination: TaskIdentity,
+        edge: ExchangeEdgeId,
+        normally_closed: bool,
+    ) -> Result<EdgeMemberResolution, TaskExecutionError> {
+        if !self
+            .edges_of_destination
+            .get(&destination)
+            .is_some_and(|edges| edges.binary_search(&edge).is_ok())
+        {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        if normally_closed && self.must_drain.contains(&edge) {
+            return Ok(EdgeMemberResolution::default());
+        }
+        let pending = self
+            .awaiting
+            .get_mut(&edge)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let closed = normally_closed
+            && self
+                .normally_closed
+                .entry(edge)
+                .or_default()
+                .insert(destination);
+        pending.remove(&destination);
+        Ok(EdgeMemberResolution {
+            closed,
+            newly_opened: pending.is_empty() && self.decided.insert(edge),
+        })
+    }
+
     fn resolve_destination(
         &mut self,
         destination: TaskIdentity,
         normally_closed: bool,
     ) -> EdgeNormalCloseResolution {
         let mut resolution = EdgeNormalCloseResolution::default();
-        for edge_id in self
-            .edges_of_destination
-            .get(&destination)
-            .into_iter()
-            .flatten()
-        {
-            // A Task state says no more input is needed; it does not say
-            // that this exact strict stream was consumed through End.
-            if normally_closed && self.must_drain.contains(edge_id) {
-                continue;
-            }
-            let Some(pending) = self.awaiting.get_mut(edge_id) else {
-                continue;
-            };
-            if normally_closed
-                && self
-                    .normally_closed
-                    .entry(*edge_id)
-                    .or_default()
-                    .insert(destination)
-            {
+        for index in 0..self.destination_edge_count(destination) {
+            let edge_id = self
+                .destination_edge(destination, index)
+                .expect("frozen destination incidence");
+            let delta = self
+                .resolve_edge_member(destination, edge_id, normally_closed)
+                .expect("same frozen edge member");
+            if delta.closed {
                 resolution.closed.push(EdgeNormalCloseEffect {
-                    edge_id: *edge_id,
+                    edge_id,
                     destination,
                 });
             }
-            pending.remove(&destination);
-            if pending.is_empty() && self.decided.insert(*edge_id) {
+            if delta.newly_opened {
                 resolution.opened.push(EdgeReadyDecision {
-                    edge_id: *edge_id,
+                    edge_id,
                     normally_closed: self
                         .normally_closed
-                        .get(edge_id)
+                        .get(&edge_id)
                         .into_iter()
                         .flatten()
                         .copied()
@@ -881,3 +933,5 @@ mod aggregate_tests {
         }
     }
 }
+
+pub(crate) mod derivation;
