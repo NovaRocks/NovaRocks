@@ -295,6 +295,12 @@ pub enum ExecutorFact {
         sampled_at: MonotonicInstant,
         observation: MembershipObservation,
     },
+    /// The original pump's first business failure, visible while its close
+    /// work may still retain captures. This is neither completion nor exit.
+    PumpFailed {
+        pump: PayloadRef,
+        failure: AttemptFailure,
+    },
     PumpFinished {
         pump: PayloadRef,
         result: Result<(), AttemptFailure>,
