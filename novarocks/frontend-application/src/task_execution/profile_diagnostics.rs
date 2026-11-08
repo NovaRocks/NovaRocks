@@ -76,6 +76,7 @@ pub(crate) enum ProfileSplitDiagnostic {
 pub(crate) struct ProfileDiagnosticSnapshot {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) closure: ProfileDiagnosticClosure,
+    pub(crate) selected_at: MonotonicInstant,
     pub(crate) runtime_filters: super::execution::ReleasedRuntimeFilterContributions,
     pub(crate) split: ProfileSplitDiagnostic,
     pub(crate) tasks: Box<[(TaskIdentity, ProfileTaskDiagnostic)]>,
@@ -142,6 +143,8 @@ pub(crate) struct TaskFinalInfoCollector {
     pub(crate) unread: BTreeSet<TaskIdentity>,
     terminal_cursor: usize,
     expected: Arc<[TaskIdentity]>,
+    expected_fragments: Arc<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
+    expected_participations: Arc<[novarocks_execution_contract::ParticipationRef]>,
     root: TaskIdentity,
     missing: BTreeMap<TaskIdentity, ProfileDiagnosticMissing>,
     publication: Option<ProfileDiagnosticPublication>,
@@ -181,6 +184,18 @@ impl TaskFinalInfoCollector {
             unread: expected.iter().copied().collect(),
             terminal_cursor: 0,
             expected,
+            expected_fragments: round
+                .execution()
+                .graph()
+                .tasks()
+                .map(|task| (task.identity(), task.fragment_id()))
+                .collect(),
+            expected_participations: round
+                .execution()
+                .graph()
+                .participations()
+                .copied()
+                .collect(),
             root: round.root_task(),
             missing: BTreeMap::new(),
             publication: None,
@@ -390,6 +405,7 @@ impl TaskFinalInfoCollector {
             .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
                 ready,
                 closure,
+                selected_at: round.execution().monotonic_now(),
                 runtime_filters: round.execution().released_runtime_filter_contributions(),
                 split: self.split_diagnostic(),
                 tasks,
@@ -403,14 +419,13 @@ impl TaskFinalInfoCollector {
     }
     /// Publish the already selected immutable core cut. Observation-window
     /// policy and final-info validation belong to the core, not this owner seam.
-    /// Original RF/split sources are frozen by the host at this same boundary.
+    /// RF/split were selected at the core boundary and resolved exclusively
+    /// from retained original immutable rows, never from later live Sources.
     pub(crate) fn publish_core_cut(
         &mut self,
         ready: ComputationReadyToken,
         cut: novarocks_attempt_protocol::publication::DiagnosticPublication,
-        runtime_filters: super::execution::ReleasedRuntimeFilterContributions,
-        split: ProfileSplitDiagnostic,
-        fragments: Box<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
+        sources: super::host::publication::DiagnosticSourceSnapshot,
     ) -> Result<bool, super::error::TaskExecutionError> {
         use novarocks_attempt_protocol::publication as core;
         let exact = cut.ready.activation == ready.activation()
@@ -429,15 +444,16 @@ impl TaskFinalInfoCollector {
             .iter()
             .zip(self.expected.iter())
             .any(|((task, _), expected)| task != expected)
-            || fragments
-                .iter()
-                .map(|(task, _)| *task)
-                .ne(self.expected.iter().copied())
         {
             return Err(super::error::TaskExecutionError::Schedule(
                 "core diagnostic publication differs from its exact frozen Task order".to_owned(),
             ));
         }
+        let (runtime_filters, split) = sources.into_selected(
+            &cut,
+            &self.expected_participations,
+            &self.expected_fragments,
+        )?;
         self.begin_profile_observation(ready)?;
         let publication = self
             .publication
@@ -492,10 +508,11 @@ impl TaskFinalInfoCollector {
             .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
                 ready,
                 closure,
+                selected_at: cut.sources.selected_at,
                 runtime_filters,
                 split,
                 tasks: tasks.into_boxed_slice(),
-                fragments,
+                fragments: self.expected_fragments.as_ref().into(),
             })));
         Ok(true)
     }

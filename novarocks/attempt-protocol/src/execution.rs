@@ -329,6 +329,7 @@ pub struct QueryTaskExecution {
     stages: BTreeMap<StageId, StageExecution>,
     stage_of_task: BTreeMap<TaskId, StageId>,
     owners: BTreeMap<ParticipationRef, ParticipationOwner>,
+    diagnostic_sources: crate::diagnostics::sources::DiagnosticSourcesState,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
     derived_edges: EdgeDerivations,
@@ -475,9 +476,41 @@ impl QueryTaskExecution {
         admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
         preparing_positions: &BTreeMap<BackendProcessId, usize>,
         now: MonotonicInstant,
-        mut ids: OperationIds,
+        ids: OperationIds,
         requested_leases: RequestedLeaseDurations,
     ) -> Result<Self, TaskExecutionError> {
+        Self::new_with_split_profile_source(
+            graph,
+            budget,
+            transport,
+            native_compatibility_id,
+            admission_epochs,
+            preparing_positions,
+            now,
+            ids,
+            requested_leases,
+            None,
+        )
+    }
+
+    /// Binds the exact original split profile Source during construction.
+    /// None positively declares that this attempt has no split Source.
+    pub(crate) fn new_with_split_profile_source(
+        graph: TaskGraph,
+        budget: DispatchBudget,
+        transport: TransportBudget,
+        native_compatibility_id: NativeCompatibilityId,
+        admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
+        preparing_positions: &BTreeMap<BackendProcessId, usize>,
+        now: MonotonicInstant,
+        mut ids: OperationIds,
+        requested_leases: RequestedLeaseDurations,
+        split_source: Option<PayloadRef>,
+    ) -> Result<Self, TaskExecutionError> {
+        let diagnostic_sources = crate::diagnostics::sources::DiagnosticSourcesState::new(
+            graph.participations().copied(),
+            split_source,
+        );
         let participants = graph
             .participations()
             .map(|participation| participation.backend_process_id())
@@ -608,6 +641,7 @@ impl QueryTaskExecution {
             stages,
             stage_of_task,
             owners,
+            diagnostic_sources,
             dispatcher,
             edges,
             derived_edges: EdgeDerivations::default(),
@@ -990,7 +1024,7 @@ impl QueryTaskExecution {
             .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         owner.observe_actor_abort_closure();
-        Ok(())
+        self.refresh_release_diagnostic(participation)
     }
 
     /// Requests normal closure after the root seal. Strict producers and
@@ -1289,6 +1323,47 @@ impl QueryTaskExecution {
     }
 
     fn acknowledge_participation(
+        &mut self,
+        participation: ParticipationRef,
+        ack: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        let outcome = self.acknowledge_participation_inner(participation, ack);
+        let diagnostic = self.refresh_release_diagnostic(participation);
+        // FailedClosed is still an accepted closure observation. Preserve the
+        // original protocol error if both validations reject the same input.
+        outcome.and(diagnostic)
+    }
+
+    fn refresh_release_diagnostic(
+        &mut self,
+        participation: ParticipationRef,
+    ) -> Result<(), TaskExecutionError> {
+        let owner = self
+            .owners
+            .get(&participation)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        self.diagnostic_sources.observe_release(
+            participation,
+            owner.is_released(),
+            owner.runtime_filter_contribution().copied(),
+        )
+    }
+
+    pub(crate) fn diagnostic_sources(
+        &self,
+    ) -> &crate::diagnostics::sources::DiagnosticSourcesState {
+        &self.diagnostic_sources
+    }
+
+    pub(crate) fn observe_split_diagnostic(
+        &mut self,
+        source: PayloadRef,
+        observation: crate::publication::SplitDiagnosticObservation,
+    ) -> Result<(), TaskExecutionError> {
+        self.diagnostic_sources.observe_split(source, observation)
+    }
+
+    fn acknowledge_participation_inner(
         &mut self,
         participation: ParticipationRef,
         ack: &OperationAcknowledgement,
@@ -2463,5 +2538,76 @@ mod primary_terminal_tests {
                 .contains_key(&identity.backend_process_id())
         );
         assert_eq!(execution.strict_pending.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_release_tests {
+    use super::*;
+    use crate::input::OperationReplyResult;
+    use novarocks_execution_contract::{OperationOutcome, operation::OperationResult};
+
+    #[test]
+    fn rejected_admission_retains_original_error_and_updates_release_cut_in_same_input() {
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let parts = execution
+            .graph
+            .participations()
+            .copied()
+            .collect::<Vec<_>>();
+        for (index, &part) in parts.iter().enumerate() {
+            let intent = execution
+                .owners
+                .get_mut(&part)
+                .unwrap()
+                .admission_intent(execution.now, &mut execution.ids)
+                .unwrap()
+                .unwrap();
+            let reply = OperationAcknowledgement {
+                operation_id: intent.operation_id(),
+                kind: intent.kind(),
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::ResourceExhausted,
+                    detail: None,
+                    acknowledgement: None,
+                }),
+            };
+            assert!(
+                matches!(execution.acknowledge_participation(part,&reply),Err(TaskExecutionError::OperationFailed { participation,.. }) if participation==part)
+            );
+            assert!(execution.owner(part).unwrap().is_released());
+            assert_eq!(
+                execution.diagnostic_sources().all_released(),
+                index + 1 == parts.len()
+            );
+        }
+        assert!(
+            execution
+                .released_runtime_filter_contributions()
+                .is_complete()
+        );
+    }
+    #[test]
+    fn actor_abort_positive_closure_updates_same_original_diagnostic_release_counter() {
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let parts = execution
+            .graph
+            .participations()
+            .copied()
+            .collect::<Vec<_>>();
+        for part in parts {
+            execution
+                .observe_actor_abort_participation_closed(part)
+                .unwrap();
+            execution
+                .observe_actor_abort_participation_closed(part)
+                .unwrap();
+        }
+        assert!(execution.diagnostic_sources().all_released());
+        assert!(
+            execution
+                .released_runtime_filter_contributions()
+                .is_complete()
+        );
     }
 }

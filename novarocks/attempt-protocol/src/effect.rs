@@ -211,6 +211,13 @@ pub enum EffectBody {
         task: TaskIdentity,
         deadline: MonotonicInstant,
     },
+    /// Move the original late/rejected diagnostic object to credentialed
+    /// disposal on its same Source. Pollers must never destroy it locally.
+    DisposeDiagnosticInfo {
+        request: AttemptRequestToken,
+        task: TaskIdentity,
+        information: Box<novarocks_execution_contract::FinalTaskInfo>,
+    },
     ReleaseQueuedInput {
         grant: crate::input::QueuedInputGrantRef,
     },

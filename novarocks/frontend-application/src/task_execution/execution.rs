@@ -311,6 +311,21 @@ pub struct ReleasedRuntimeFilterContributions {
 }
 
 impl ReleasedRuntimeFilterContributions {
+    /// Assemble only previously selected canonical diagnostic rows. The caller
+    /// resolves them under the original Source's admitted publication work.
+    pub(crate) fn from_selected_diagnostics(
+        contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
+        complete: bool,
+        _participations: usize,
+    ) -> Self {
+        Self {
+            contributions,
+            complete,
+            #[cfg(test)]
+            participations: _participations,
+        }
+    }
+
     pub fn contributions(
         &self,
     ) -> &[(BackendProcessId, QueryTerminalProfileContributionTelemetry)] {

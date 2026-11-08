@@ -290,6 +290,12 @@ pub enum ExecutorFact {
         pump: PayloadRef,
         result: Result<(), AttemptFailure>,
     },
+    /// Original profile availability, separate from protocol completion and
+    /// actual pump/capture exit. The Source retains any selected rich record.
+    SplitProfile {
+        pump: PayloadRef,
+        observation: crate::publication::SplitDiagnosticObservation,
+    },
     PumpTaskUpdate {
         pump: PayloadRef,
         delivery: SplitDeliveryRef,

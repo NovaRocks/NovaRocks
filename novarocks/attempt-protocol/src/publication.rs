@@ -61,12 +61,41 @@ pub enum DiagnosticTaskObservation {
     Missing(DiagnosticMissing),
 }
 
-/// Freeze once at this computation cut. The executor samples the original RF
-/// and split-profile sources at the same publication boundary. A pending RPC
-/// remains owned and polled after this snapshot, without changing it.
+/// Exact split outcome selected from the original Source's immutable record.
+/// Absent is positive empty data; SourceGone is missing data. Neither success
+/// nor failure proves that the original job/captures have actually exited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitDiagnosticObservation {
+    Absent,
+    Pending,
+    Available(crate::start::PayloadRef),
+    Failed,
+    SourceGone,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterDiagnostic {
+    pub contributions: Vec<(novarocks_types::BackendProcessId, crate::start::PayloadRef)>,
+    pub complete: bool,
+}
+
+/// The complete Source selection from the actual diagnostic boundary. Hosts
+/// resolve these same original refs; they must never read later live Sources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticSources {
+    pub selected_at: novarocks_coordination_contract::MonotonicInstant,
+    pub runtime_filters: RuntimeFilterDiagnostic,
+    pub split: SplitDiagnosticObservation,
+}
+
+/// Freeze at the original diagnostic boundary, independently of business ready
+/// and actual job exit. Materialization may finish later but uses only this
+/// immutable selection. Vec keeps final transfer constant-time after charged
+/// per-Task assembly; converting a large accumulated Vec to Box may copy it.
 #[derive(Clone, Debug)]
 pub struct DiagnosticPublication {
     pub ready: AttemptComputationCut,
     pub closure: DiagnosticClosure,
-    pub tasks: Box<[(TaskIdentity, DiagnosticTaskObservation)]>,
+    pub sources: DiagnosticSources,
+    pub tasks: Vec<(TaskIdentity, DiagnosticTaskObservation)>,
 }

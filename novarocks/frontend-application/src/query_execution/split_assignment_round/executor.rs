@@ -31,6 +31,20 @@ impl StatusIntakeWake for ExecutorWake {
     }
 }
 
+/// The original Source reserves this one profile-result position before the
+/// runner starts. Implementations register Available in their immutable rich
+/// records before filling ExecutorFact::SplitProfile on that same paid Source.
+/// This synchronous handoff must not allocate a queue, submit Work, await the
+/// core, or use PumpFinished/actual exit as a substitute for profile visibility.
+/// The Source retains the rich record through its final publication consumer.
+/// Production composition must supply this port; there is no silent fallback.
+pub(crate) trait OriginalSplitProfilePublisher: Send + Sync {
+    fn publish_original_profile(
+        &self,
+        observation: SplitAssignmentProfileRead,
+    ) -> Result<(), TaskExecutionError>;
+}
+
 pub(crate) struct SplitAssignmentExecutor {
     pump: Mutex<Option<SplitAssignmentPump>>,
     stop: RoundSplitAssignmentStop,
@@ -154,11 +168,13 @@ impl SplitAssignmentExecutor {
     /// waiter does not destroy this Source-owned physical machine or its jobs.
     pub(crate) async fn run_admitted(
         self: Arc<Self>,
+        profile_publisher: &dyn OriginalSplitProfilePublisher,
     ) -> Result<SplitSourceProfile, TaskExecutionError> {
         assert!(
             !self.started.swap(true, Ordering::AcqRel),
             "one original split runner"
         );
+        let mut published_profile = None;
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -192,6 +208,31 @@ impl SplitAssignmentExecutor {
                         .is_none_or(|job| !job.input_or_value_retained());
                 (moved, completed)
             };
+            // The original outcome can become Failed while its close/enumeration
+            // still owns captures. Publish that immutable diagnostic fact now,
+            // independently of the credentialed runner's eventual physical exit.
+            let profile = self
+                .outcome
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|result| result.as_ref().copied().map_err(|_| ()));
+            if let Some(profile) = profile
+                && published_profile != Some(profile)
+            {
+                published_profile = Some(profile);
+                let observation = match profile {
+                    Ok(profile) => SplitAssignmentProfileRead::Available(profile),
+                    Err(()) => SplitAssignmentProfileRead::Failed,
+                };
+                if let Err(error) = profile_publisher.publish_original_profile(observation) {
+                    let mut primary = self.primary.lock().expect("original split executor error");
+                    if primary.is_none() {
+                        *primary = Some(error);
+                    }
+                    self.stop.stop();
+                }
+            }
             if completed {
                 // Destroy the exact machine and captures in this admitted job,
                 // before its credentialed wrapper can publish physical exit.

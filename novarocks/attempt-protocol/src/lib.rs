@@ -84,3 +84,5 @@ pub mod stage;
 pub mod execution;
 
 pub mod root_control;
+
+pub mod diagnostics;
