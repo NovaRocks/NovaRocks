@@ -822,9 +822,8 @@ impl QueryTaskExecution {
         backend: BackendProcessId,
     ) -> Option<Duration> {
         self.owners
-            .iter()
-            .find(|(participation, _)| participation.backend_process_id() == backend)
-            .and_then(|(_, owner)| owner.pre_ready_observation_remaining(self.now))
+            .get(&self.graph.participation_on_backend(backend)?)?
+            .pre_ready_observation_remaining(self.now)
     }
 
     pub(crate) fn rejected_establish_observation_remaining(

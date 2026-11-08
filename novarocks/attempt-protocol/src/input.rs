@@ -289,9 +289,9 @@ pub enum ExecutorFact {
     /// An exact read requested AFTER the same original QA permission (when
     /// required), resolved against the host's frozen endpoint. Membership
     /// change notifications alone cannot stand in for this correlated sample.
-    PreReadyProcessSnapshot {
+    ProcessSnapshot {
         request: novarocks_coordination_contract::AttemptRequestToken,
-        original: novarocks_types::BackendProcessId,
+        participation: ParticipationRef,
         sampled_at: MonotonicInstant,
         observation: MembershipObservation,
     },

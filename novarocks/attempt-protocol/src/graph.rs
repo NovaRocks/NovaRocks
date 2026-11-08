@@ -319,6 +319,21 @@ impl TaskGraph {
             .get(&consumer)
             .is_some_and(|producers| producers.contains(&producer))
     }
+    /// Resolve only an existing frozen row. Validation fixed one frontend
+    /// for this graph, so this key lookup needs no backend-wide scan and
+    /// creates no participation owner, access right or scheduling authority.
+    pub(crate) fn participation_on_backend(
+        &self,
+        backend: novarocks_types::BackendProcessId,
+    ) -> Option<ParticipationRef> {
+        let root = self.tasks.get(&self.root_task)?;
+        let key = ParticipationRef::new(
+            self.execution_id,
+            root.participation().frontend_process_id(),
+            backend,
+        );
+        self.participations.get(&key).copied()
+    }
     pub fn participations(&self) -> impl ExactSizeIterator<Item = &ParticipationRef> {
         self.participations.iter()
     }

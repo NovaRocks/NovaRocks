@@ -90,12 +90,26 @@ impl ReadyQueue {
     }
     pub fn claim(&mut self) -> Option<ActorId> {
         let actor = self.head?;
+        self.claim_exact(actor)
+    }
+    /// Claim only this registered actor's queued position, leaving every
+    /// other ready actor in its original order. Unknown, idle or already
+    /// claimed actors have no selectable position and leave the queue intact.
+    pub fn claim_exact(&mut self, actor: ActorId) -> Option<ActorId> {
+        if !self.is_ready(actor) {
+            return None;
+        }
         self.unlink_ready(actor);
         let state = self.actors.get_mut(&actor).expect("queued actor exists");
         assert!(!state.claimed, "one poller owns an actor");
         state.claimed = true;
         state.pending = false;
         Some(actor)
+    }
+    /// A queued position is ready only while no caller holds its claim.
+    /// An unknown actor has no position; this query never registers one.
+    pub fn is_ready(&self, actor: ActorId) -> bool {
+        self.actors.get(&actor).is_some_and(|state| state.queued)
     }
     /// Notification racing the end of a turn remains pending under the driver's lock.
     pub fn release(&mut self, actor: ActorId, has_pending: bool) -> Result<(), SchedulerError> {

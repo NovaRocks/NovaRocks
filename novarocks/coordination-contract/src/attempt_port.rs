@@ -134,9 +134,12 @@ pub enum AttemptParticipationConvergence {
 /// Unknown means only that finite remote tracking ended, never actual Worker exit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttemptConvergenceClosure {
-    Evidence(Box<[(ParticipationRef, AttemptParticipationConvergence)]>),
+    /// Rows are assembled under the charged original pass. Vec avoids an
+    /// unbounded shrink/copy when the last row transfers to publication.
+    Evidence(Vec<(ParticipationRef, AttemptParticipationConvergence)>),
     RemoteTrackingEnded {
-        exact_participations: Box<[ParticipationRef]>,
+        // The same immutable frozen set, not a new per-progress graph copy.
+        exact_participations: std::sync::Arc<[ParticipationRef]>,
     },
 }
 
@@ -295,6 +298,6 @@ pub enum AttemptToLogicalBody<F> {
     },
     ConvergenceProgress {
         local_exited: bool,
-        closure: Option<AttemptConvergenceClosure>,
+        closure: Option<std::sync::Arc<AttemptConvergenceClosure>>,
     },
 }

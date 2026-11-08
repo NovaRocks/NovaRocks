@@ -88,3 +88,5 @@ pub mod root_control;
 pub mod diagnostics;
 
 pub(crate) mod terminal;
+
+pub(crate) mod convergence;

@@ -459,6 +459,8 @@ struct Inbox<A: Actor> {
     sealed: bool,
     payloads: BTreeMap<InputId, A::Input>,
     mailbox: MailboxState,
+    input_source: Option<ActorId>,
+    prefer_actor_source: bool,
     inputs: BTreeMap<InputId, InputRecord>,
     standing_inputs: BTreeMap<StandingInputId, StandingInputRecord>,
     counts: [usize; 4],
@@ -485,6 +487,43 @@ struct Inbox<A: Actor> {
     failure_action_watermark: u64,
 }
 impl<A: Actor> Inbox<A> {
+    fn ready_classes(&self, actor: ActorId) -> [bool; 4] {
+        std::array::from_fn(|index| {
+            let class = InputClass::ALL[index];
+            self.input_source.map_or_else(
+                || self.mailbox.has_ready(class),
+                |source| {
+                    self.mailbox.has_ready_from(class, source)
+                        || self.mailbox.has_ready_from(class, actor)
+                },
+            )
+        })
+    }
+    fn has_selectable_input(&self, actor: ActorId) -> bool {
+        self.ready_classes(actor).into_iter().any(|ready| ready)
+    }
+    fn pop_selected(&mut self, actor: ActorId, class: InputClass) -> Option<InputEnvelope> {
+        let Some(source) = self.input_source else {
+            return self.mailbox.pop(class);
+        };
+        let continuation = self.mailbox.has_ready_from(class, source);
+        let own = self.mailbox.has_ready_from(class, actor);
+        let chosen = match (continuation, own) {
+            (true, true) if source != actor => {
+                let chosen = if self.prefer_actor_source {
+                    actor
+                } else {
+                    source
+                };
+                self.prefer_actor_source = !self.prefer_actor_source;
+                chosen
+            }
+            (true, _) => source,
+            (_, true) => actor,
+            _ => return None,
+        };
+        self.mailbox.pop_from(class, chosen)
+    }
     /// The single paid standing-input fill algorithm shared by direct and effect-backed
     /// handoff. The caller holds this inbox and qualifies the scope failure gate.
     fn fill_standing_input(
@@ -2376,6 +2415,8 @@ impl<A: Actor> ActorRuntime<A> {
                     sealed: false,
                     payloads: BTreeMap::new(),
                     mailbox: MailboxState::new(config.mailbox),
+                    input_source: None,
+                    prefer_actor_source: false,
                     inputs: BTreeMap::new(),
                     standing_inputs: BTreeMap::new(),
                     counts: [0; 4],
@@ -3008,15 +3049,14 @@ impl<A: Actor> ActorRuntime<A> {
                 if inbox.failed || inbox.sealed || inbox.batches.len() >= node.config.max_batches {
                     None
                 } else {
-                    let ready =
-                        std::array::from_fn(|i| inbox.mailbox.has_ready(InputClass::ALL[i]));
+                    let ready = inbox.ready_classes(node.id);
                     let mut candidate = budget.clone();
                     let class = candidate.next(ready);
                     class
                         .filter(|_| candidate.charge(node.config.max_step_work))
                         .and_then(|class| {
                             budget = candidate;
-                            inbox.mailbox.pop(class)
+                            inbox.pop_selected(node.id, class)
                         })
                         .map(|input| {
                             let original =
@@ -3099,6 +3139,7 @@ impl<A: Actor> ActorRuntime<A> {
                 Ok(deadline) => {
                     let batch = step.finish();
                     let stop_producing = batch.stop_producing;
+                    let input_source = batch.input_source;
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
                     // Preflight every fallible batch boundary before changing
                     // the scope gate. The same inbox stays locked through commit.
@@ -3133,6 +3174,12 @@ impl<A: Actor> ActorRuntime<A> {
                     inbox
                         .commit_batch(input.input, batch)
                         .expect("preflighted atomic batch commitment");
+                    if let Some(source) = input_source
+                        && inbox.input_source != source
+                    {
+                        inbox.input_source = source;
+                        inbox.prefer_actor_source = false;
+                    }
                     inbox
                         .inputs
                         .get_mut(&input.input)
@@ -3143,8 +3190,11 @@ impl<A: Actor> ActorRuntime<A> {
                         input.input,
                         MetadataConsumption::Consumed,
                     );
-                    self.notify_metadata_credit_sources(
-                        inbox.retire_metadata_input_if_ready(input.input, &mut ledger),
+                    self.retire_metadata_input_and_wake(
+                        &node,
+                        &mut inbox,
+                        input.input,
+                        &mut ledger,
                     );
                     if stop_producing {
                         ledger
@@ -3341,7 +3391,7 @@ impl<A: Actor> ActorRuntime<A> {
         {
             let inbox = node.inbox.lock().expect("actor inbox lock");
             let pending = !inbox.failed
-                && !inbox.mailbox.is_empty()
+                && inbox.has_selectable_input(node.id)
                 && inbox.batches.len() < node.config.max_batches;
             self.shared
                 .state
@@ -3871,9 +3921,10 @@ impl<A: Actor> ActorRuntime<A> {
             .reservations
             .remove(&reservation)
             .expect("validated original reservation");
-        self.notify_metadata_credit_sources(
-            inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-        );
+        self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
+        drop(ledger);
+        drop(inbox);
+        self.shared.changed.notify();
         Ok(guard)
     }
     /// Bounded inventory of the actual guards retained by one committed step.
@@ -4731,9 +4782,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state
@@ -5041,7 +5090,7 @@ impl<A: Actor> ActorRuntime<A> {
                 .timers
                 .acknowledge_tick(actor);
         }
-        if !inbox.failed && !inbox.mailbox.is_empty() {
+        if !inbox.failed && inbox.has_selectable_input(actor) {
             self.shared
                 .state
                 .lock()
@@ -5914,6 +5963,35 @@ impl<A: Actor> ActorRuntime<A> {
         inbox.observation.input_credit_taken(class);
         Ok(delivery)
     }
+    /// The original input's last tail may free max_batches without a new
+    /// message. Restore eligible Core readiness as well as producer credit;
+    /// the caller wakes pollers only after dropping inbox/ledger locks.
+    fn retire_metadata_input_and_wake(
+        &self,
+        node: &ActorCell<A>,
+        inbox: &mut Inbox<A>,
+        input: InputId,
+        ledger: &mut crate::transaction::LedgerState,
+    ) {
+        let existed = inbox.inputs.contains_key(&input);
+        let credit = inbox.retire_metadata_input_if_ready(input, ledger);
+        self.notify_metadata_credit_sources(credit);
+        if existed
+            && !inbox.inputs.contains_key(&input)
+            && !inbox.failed
+            && !inbox.sealed
+            && inbox.batches.len() < node.config.max_batches
+            && inbox.has_selectable_input(node.id)
+        {
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .ready
+                .notify(node.id)
+                .expect("the locked original actor remains registered");
+        }
+    }
     fn notify_metadata_credit_sources(&self, sources: Vec<ActorRegistration>) {
         for source in sources {
             self.notify_metadata_source(&source);
@@ -6243,9 +6321,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state
@@ -6310,9 +6386,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state

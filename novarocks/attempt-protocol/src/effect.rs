@@ -188,9 +188,9 @@ pub enum EffectBody {
     },
     /// Exact local lifecycle read on the original canonical Source. The
     /// original endpoint and access/capture credentials remain in that Source.
-    ObservePreReadyProcess {
+    ObserveProcess {
         request: AttemptRequestToken,
-        original: BackendProcessId,
+        participation: ParticipationRef,
     },
     StartPump {
         pump: PayloadRef,

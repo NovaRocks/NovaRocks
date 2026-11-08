@@ -19,7 +19,9 @@
 
 use novarocks_control_runtime_core::{
     effect::{EffectBatchState, EffectDescriptor, EffectError, EffectKind},
-    identity::{BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, Tick},
+    identity::{
+        ActorId, BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, Tick,
+    },
     mailbox::InputEnvelope,
     scheduler::TurnBudget,
 };
@@ -75,6 +77,7 @@ pub struct ActorStep<'a, E> {
     >,
     metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
+    input_source: Option<Option<ActorId>>,
 }
 impl<'a, E> ActorStep<'a, E> {
     pub(crate) fn new(
@@ -100,6 +103,7 @@ impl<'a, E> ActorStep<'a, E> {
             authors: std::collections::BTreeMap::new(),
             metadata: Vec::new(),
             stop_producing: false,
+            input_source: None,
             batch: EffectBatchState::new(
                 scope.id(),
                 generation,
@@ -173,6 +177,15 @@ impl<'a, E> ActorStep<'a, E> {
             "retained state cannot stop its process payer"
         );
         self.stop_producing = true;
+    }
+    /// Select only the original continuation Source and this actor's own
+    /// source (including its timer). Other sources retain their paid queued
+    /// heads and within-source FIFO. None reopens all sources. This changes
+    /// selection at atomic step commitment, never admission or resource rights.
+    /// Callers keep protocol ingress distinct from these continuation sources;
+    /// changing a Source identity to bypass its earlier input is invalid.
+    pub fn select_input_source(&mut self, source: Option<ActorId>) {
+        self.input_source = Some(source);
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
     /// handoff as its neutral effect. No queue/capture may bind it beforehand.
@@ -280,6 +293,7 @@ impl<'a, E> ActorStep<'a, E> {
             metadata: self.metadata,
             authors: self.authors,
             stop_producing: self.stop_producing,
+            input_source: self.input_source,
         }
     }
 }
@@ -292,6 +306,7 @@ pub(crate) struct MetadataEffect<E> {
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
     pub(crate) stop_producing: bool,
+    pub(crate) input_source: Option<Option<ActorId>>,
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
