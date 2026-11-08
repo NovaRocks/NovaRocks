@@ -59,7 +59,9 @@ pub enum OperationReplyResult {
     Worker(novarocks_execution_contract::operation::OperationResult<AckPayload>),
     Local {
         result: LocalDispatchResult,
-        failure: Option<HostFailureRef>,
+        failure: Option<crate::failure::HostProjectedFailure>,
+        protocol_failure: Option<crate::failure::ProtocolFailure>,
+        detail: Option<novarocks_execution_contract::SafeDetail>,
     },
 }
 
@@ -71,10 +73,19 @@ pub struct OperationReply {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObservationFailure {
-    Transport(&'static str),
-    ConnectionLost,
-    IdentityViolation(&'static str),
+pub enum ObservationFailureKind {
+    RpcRejected,
+    ProtocolViolation,
+    ProcessMismatch,
+    QueryMismatch,
+    RecoverableTransport { observed_connection_loss: bool },
+}
+
+/// Classification comes from the original typed adapter error, never text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservationFailure {
+    pub kind: ObservationFailureKind,
+    pub cause: crate::failure::HostProjectedFailure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,11 +128,23 @@ pub enum ObservationEvent {
     Failed(ObservationFailure),
 }
 
+/// Immutable actual opening facts from this same original generation. Each
+/// frame carries them because independent coalescing phase delivery may be
+/// late. The core checks the opening budget before accepting entity, cursor,
+/// coverage or liveness contributions; a later confirmation cannot undo a seal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservationOpening {
+    pub started_at: MonotonicInstant,
+    /// None is valid for an opening failure, never for a stream entity frame.
+    pub opened_at: Option<MonotonicInstant>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReceivedObservation {
     pub participation: ParticipationRef,
     pub generation: NonZeroU64,
     pub received_at: MonotonicInstant,
+    pub opening: ObservationOpening,
     pub event: ObservationEvent,
 }
 
@@ -177,10 +200,29 @@ pub struct ReadStateSnapshot {
     pub participation: ParticipationRef,
     pub generation: NonZeroU64,
     pub snapshot_at: MonotonicInstant,
+    /// Actual first open-future poll and successful open, from the same
+    /// original Source lock as this read snapshot. Independent phase delivery
+    /// may be late and cannot prove that the RPC is still opening.
+    pub opening_started_at: Option<MonotonicInstant>,
+    pub opened_at: Option<MonotonicInstant>,
+    /// A current-generation first catch-up/new bookmark was actually received.
+    /// Equal clock ticks cannot recover this fact from timestamps alone.
+    pub had_liveness: bool,
     pub last_liveness_at: MonotonicInstant,
     pub pauses: ReadPauseCoverage,
     pub closed: bool,
     pub received_through_snapshot: ReceptionCoverage,
+}
+
+/// Actual execution times, reported through one prepaid per-generation phase
+/// source. Same-generation merging keeps the first start and successful open.
+/// Late phase delivery cannot reopen a generation whose stream already closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubscriptionPhaseSnapshot {
+    pub participation: ParticipationRef,
+    pub generation: NonZeroU64,
+    pub opening_started_at: MonotonicInstant,
+    pub opened_at: Option<MonotonicInstant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,8 +237,16 @@ pub enum WithdrawalOutcome {
 #[derive(Clone, Debug)]
 pub enum ExecutorFact {
     Operation(OperationReply),
+    /// The executor job won its start arbitration. This grants no Create gate.
     SendStarted {
         effect: AttemptActionId,
+        started_at: MonotonicInstant,
+    },
+    /// Produced only when this exact Establish unary future is first polled.
+    EstablishRpcStarted {
+        effect: AttemptActionId,
+        operation: TaskOperationId,
+        participation: ParticipationRef,
         started_at: MonotonicInstant,
     },
     Withdrawn {
@@ -215,11 +265,7 @@ pub enum ExecutorFact {
         operation: TaskOperationId,
         failure: AttemptFailure,
     },
-    SubscriptionOpened {
-        participation: ParticipationRef,
-        generation: NonZeroU64,
-        opened_at: MonotonicInstant,
-    },
+    SubscriptionProgress(SubscriptionPhaseSnapshot),
     Observations(ObservationBatch),
     ReadState(ReadStateSnapshot),
     PumpFinished {
@@ -228,11 +274,24 @@ pub enum ExecutorFact {
     },
     PumpTaskUpdate {
         pump: PayloadRef,
+        delivery: SplitDeliveryRef,
         task: TaskIdentity,
         domains: Box<[crate::effect::TaskDomainIntent]>,
     },
-    DiagnosticsFinished {
+    DynamicFiltersRead {
+        request: AttemptRequestToken,
+        task: TaskIdentity,
+        result: DynamicFilterRead,
+    },
+    DynamicFilterFeedbackAdmitted {
+        request: AttemptRequestToken,
+        task: TaskIdentity,
         result: Result<(), AttemptFailure>,
+    },
+    DiagnosticsFinished {
+        request: AttemptRequestToken,
+        task: TaskIdentity,
+        result: DiagnosticRead,
     },
 }
 
@@ -258,4 +317,121 @@ pub enum AttemptInput {
     Membership(MembershipView),
     CapacityReleased,
     Timer,
+}
+
+/// Identity of the original canonical split-delivery record, without its sender.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SplitDeliveryRef(pub NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateAdmission {
+    Preparing,
+    Queued,
+    DiscardedNoLongerNeeded,
+    DiscardedTerminal,
+}
+
+#[derive(Clone, Debug)]
+pub enum DynamicFilterRead {
+    Empty,
+    Available {
+        version: novarocks_execution_contract::DomainVersion,
+        feedback: PayloadRef,
+    },
+    Unavailable(HostFailureRef),
+    Refused(AttemptFailure),
+}
+
+/// Diagnostics remain observations. Read failure never becomes query failure.
+/// The core closes its diagnostic snapshot before applying a reply at or after
+/// the original deadline, while the host continues to retain the actual job.
+#[derive(Clone, Debug)]
+pub enum DiagnosticRead {
+    Available(Box<novarocks_execution_contract::FinalTaskInfo>),
+    Unavailable(novarocks_execution_contract::OperationOutcome),
+    Failed(HostFailureRef),
+}
+
+impl OperationReply {
+    pub const fn operation_id(&self) -> TaskOperationId {
+        self.operation_id
+    }
+    pub const fn kind(&self) -> OperationKind {
+        self.kind
+    }
+    pub fn worker_outcome(&self) -> Option<novarocks_execution_contract::OperationOutcome> {
+        match &self.result {
+            OperationReplyResult::Worker(result) => Some(result.outcome()),
+            OperationReplyResult::Local { .. } => None,
+        }
+    }
+    pub fn dispatch_result(&self) -> crate::operation::OperationDispatchResult {
+        use crate::operation::{OperationDispatchResult as D, WorkerReceiptOutcome};
+        match &self.result {
+            OperationReplyResult::Worker(result) => {
+                D::WorkerReceipt(WorkerReceiptOutcome::from_contract(result.outcome()))
+            }
+            OperationReplyResult::Local { result, .. } => match result {
+                LocalDispatchResult::IngressRejected(reason) => D::IngressRejected(*reason),
+                LocalDispatchResult::NonWorkerRejected => D::NonWorkerRejected,
+                LocalDispatchResult::TransportUnknown => D::TransportUnknown,
+            },
+        }
+    }
+    pub fn payload(&self) -> &AckPayload {
+        use novarocks_execution_contract::operation::OperationResult;
+        match &self.result {
+            OperationReplyResult::Worker(OperationResult::Verdict {
+                acknowledgement: Some(payload),
+                ..
+            }) => payload,
+            _ => &AckPayload::None,
+        }
+    }
+    pub fn detail(&self) -> Option<&novarocks_execution_contract::SafeDetail> {
+        match &self.result {
+            OperationReplyResult::Worker(result) => result.detail(),
+            OperationReplyResult::Local { detail, .. } => detail.as_ref(),
+        }
+    }
+    pub fn worker_header(
+        &self,
+    ) -> Option<novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>>
+    {
+        use novarocks_execution_contract::operation::OperationResult;
+        match &self.result {
+            OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome, detail, ..
+            }) => Some(OperationResult::Verdict {
+                outcome: *outcome,
+                detail: detail.clone(),
+                acknowledgement: None,
+            }),
+            OperationReplyResult::Worker(OperationResult::DomainFailure { outcome, failure }) => {
+                Some(OperationResult::DomainFailure {
+                    outcome: *outcome,
+                    failure: failure.clone(),
+                })
+            }
+            OperationReplyResult::Local { .. } => None,
+        }
+    }
+    pub fn is_applied(&self) -> bool {
+        use novarocks_execution_contract::OperationOutcome as O;
+        matches!(self.worker_outcome(), Some(O::Accepted | O::Idempotent))
+    }
+    pub fn local_failure(&self) -> Option<&crate::failure::ProtocolFailure> {
+        match &self.result {
+            OperationReplyResult::Local {
+                protocol_failure, ..
+            } => protocol_failure.as_ref(),
+            OperationReplyResult::Worker(_) => None,
+        }
+    }
+    pub fn host_failure(&self) -> Option<&crate::failure::HostProjectedFailure> {
+        match &self.result {
+            OperationReplyResult::Local { failure, .. } => failure.as_ref(),
+            OperationReplyResult::Worker(_) => None,
+        }
+    }
 }

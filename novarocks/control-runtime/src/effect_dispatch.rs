@@ -20,7 +20,9 @@
 //! after publication does not prevent the next metadata publication.
 
 use crate::actor::Actor;
-use crate::actor_turn::{ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket};
+use crate::actor_turn::{
+    ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
+};
 use novarocks_control_runtime_core::{
     effect::EffectState,
     identity::{ActionId, ActorId, BatchId, InputId},
@@ -101,6 +103,15 @@ pub struct IndexedBatches {
     pub units: usize,
 }
 
+/// Original routing index and one coherent runtime inbox observation. Ready
+/// markers are not total pending effects; same-lane tails and unindexed batches
+/// are counted by runtime.states.pending and runtime.unindexed_states.pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectDispatchObservation {
+    pub indexed_routing_positions: usize,
+    pub ready_markers: usize,
+    pub runtime: crate::observation::EffectInventoryObservation,
+}
 pub struct EffectDispatch<A: Actor, P: EffectLanePolicy<A>> {
     actor: ActorId,
     completion_runtime: Option<ActorRuntime<A>>,
@@ -442,6 +453,25 @@ where
         Ok(!runtime
             .committed_batches(self.actor, self.after, 1)?
             .is_empty())
+    }
+    /// Diagnostic only. Busy is unavailable, and an unknown/foreign original
+    /// registration is typed failure rather than an invented empty inventory.
+    pub fn try_observation(
+        &self,
+        runtime: &ActorRuntime<A>,
+        registration: &ActorRegistration,
+    ) -> Result<Option<EffectDispatchObservation>, crate::observation::EffectObservationError> {
+        if registration.actor() != self.actor {
+            return Err(crate::observation::EffectObservationError::WrongActor);
+        }
+        let runtime = self.completion_runtime.as_ref().unwrap_or(runtime);
+        Ok(runtime
+            .try_effect_inventory_observation(registration, self.after)?
+            .map(|snapshot| EffectDispatchObservation {
+                indexed_routing_positions: self.indexed,
+                ready_markers: self.ready.len(),
+                runtime: snapshot,
+            }))
     }
     /// Count current routing markers for one bounded readiness scan. This is
     /// not evidence that a dependency or physical action has completed.

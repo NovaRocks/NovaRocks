@@ -56,10 +56,13 @@ std::thread_local! { static DEFER_CAPACITY_WAKES: Cell<usize> = const { Cell::ne
 #[cfg(loom)]
 loom::thread_local! { static DEFER_CAPACITY_WAKES: Cell<usize> = Cell::new(0); }
 
-/// Marks only the finite actor-turn boundary. It changes no actual lock, lock
-/// order, resource, or lifetime gate. The wrapper flushes after this guard exits.
-pub(crate) struct TurnWakeDeferral;
-impl TurnWakeDeferral {
+/// Marks a finite actor-turn or retirement-owner boundary. It changes no
+/// actual std/loom lock, lock order, resource or lifetime gate. Each caller
+/// flushes only after its original private locks have exited; nested boundaries
+/// leave delivery to the outer owner. Additional caller locks must not conflict
+/// with a registered Waker.
+pub(crate) struct CapacityWakeDeferral;
+impl CapacityWakeDeferral {
     pub(crate) fn enter() -> Self {
         DEFER_CAPACITY_WAKES.with(|depth| {
             depth.set(
@@ -72,7 +75,7 @@ impl TurnWakeDeferral {
         Self
     }
 }
-impl Drop for TurnWakeDeferral {
+impl Drop for CapacityWakeDeferral {
     fn drop(&mut self) {
         DEFER_CAPACITY_WAKES
             .with(|depth| depth.set(depth.get().checked_sub(1).expect("entered actor turn")));
@@ -91,7 +94,7 @@ pub(crate) fn with_capacity_wakes_deferred<T>(
     body: impl FnOnce() -> T,
 ) -> T {
     let result = {
-        let _deferral = TurnWakeDeferral::enter();
+        let _deferral = CapacityWakeDeferral::enter();
         body()
     };
     ledger.shared.pending_capacity_wakes.flush();
@@ -103,6 +106,7 @@ pub(crate) fn with_capacity_wakes_deferred<T>(
 struct RegistrantWake {
     waker: Mutex<Waker>,
     retired: AtomicBool,
+    observation: crate::observation::RuntimeObservation,
 }
 impl RegistrantWake {
     fn wake(&self) {
@@ -112,6 +116,9 @@ impl RegistrantWake {
                 .lock()
                 .expect("capacity registrant waker lock")
                 .clone();
+            // This is actual callback delivery, distinct from taking a wait
+            // under the release transaction or merely queueing a weak hint.
+            self.observation.capacity_wait_delivered();
             waker.wake();
         }
     }
@@ -206,7 +213,8 @@ impl CapacityWaiters {
         &mut self,
         registrant: &CapacityRegistrant,
         denial: CapacityDenial,
-    ) -> bool {
+    ) -> Option<bool> {
+        let new_logical = !self.registrants.contains_key(&registrant.id);
         let domain = WaitDomain::from(denial.wait_target());
         if !self
             .registrants
@@ -214,16 +222,23 @@ impl CapacityWaiters {
             .or_default()
             .insert(domain)
         {
-            return false;
+            return None;
         }
         self.targets
             .entry(domain)
             .or_default()
             .insert(registrant.id, std::sync::Arc::downgrade(&registrant.wake));
-        true
+        Some(new_logical)
     }
     pub(crate) fn len(&self) -> usize {
         self.registrants.len()
+    }
+    fn snapshot(&self) -> crate::observation::CapacityWaiterSnapshot {
+        crate::observation::CapacityWaiterSnapshot {
+            logical_waiters: self.registrants.len(),
+            domain_registrations: self.targets.values().map(BTreeMap::len).sum(),
+            distinct_domains: self.targets.len(),
+        }
     }
     pub(crate) fn take_released(&mut self, resources: &ReservationResources) -> Vec<CapacityWake> {
         let process = resources
@@ -357,8 +372,25 @@ impl RuntimeLedger {
             wake: std::sync::Arc::new(RegistrantWake {
                 waker: Mutex::new(waker),
                 retired: AtomicBool::new(false),
+                observation: self.shared.observation.clone(),
             }),
         })
+    }
+    /// Busy/poisoning are unavailable/error, never guessed zero waits.
+    pub fn try_capacity_waiter_snapshot(
+        &self,
+    ) -> Result<
+        Option<crate::observation::CapacityWaiterSnapshot>,
+        crate::transaction::CapacityObservationError,
+    > {
+        let state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(crate::transaction::CapacityObservationError::Poisoned);
+            }
+        };
+        Ok(Some(state.capacity_waiters.snapshot()))
     }
     pub fn capacity_waiter_count(&self) -> usize {
         self.shared
@@ -459,5 +491,64 @@ mod tests {
         let state = ledger.shared.state.lock().unwrap();
         assert!(state.capacity_waiters.registrants.is_empty());
         assert!(state.capacity_waiters.targets.is_empty());
+    }
+    #[test]
+    fn wait_snapshot_busy_is_unavailable_and_deferred_cancellation_is_not_delivery() {
+        use crate::observation::RuntimeObservation;
+        let dimension = DimensionId::new(1).unwrap();
+        let observation = RuntimeObservation::new(None);
+        let ledger = RuntimeLedger::with_owner_usage_dimensions_and_observation(
+            ResourceVector::new([(dimension, 1)]).unwrap(),
+            [],
+            None,
+            observation.clone(),
+        )
+        .unwrap();
+        let lock = ledger.shared.state.lock().unwrap();
+        assert_eq!(ledger.try_capacity_waiter_snapshot().unwrap(), None);
+        drop(lock);
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let resources =
+            ReservationResources::for_work(ResourceVector::new([(dimension, 1)]).unwrap());
+        let held = scope
+            .reserve_next(
+                Generation::new(1).unwrap(),
+                resources.clone(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let registrant = ledger.capacity_registrant(Waker::noop().clone()).unwrap();
+        with_capacity_wakes_deferred(&ledger, || {
+            assert!(matches!(
+                scope.reserve_next_or_wait(
+                    Generation::new(1).unwrap(),
+                    resources,
+                    WorkKind::Business,
+                    WorkAdmission::External,
+                    &registrant
+                ),
+                Err(RuntimeError::CapacityDenied(_))
+            ));
+            drop(held);
+            assert_eq!(observation.snapshot().unwrap().capacity_wait_deliveries, 0);
+            drop(registrant);
+        });
+        let sample = observation.snapshot().unwrap();
+        assert_eq!(sample.capacity_wait_registrations, 1);
+        assert_eq!(sample.capacity_wait_domains_registered, 1);
+        assert_eq!(sample.capacity_wait_deliveries, 0);
+        assert_eq!(
+            ledger
+                .try_capacity_waiter_snapshot()
+                .unwrap()
+                .unwrap()
+                .logical_waiters,
+            0
+        );
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
     }
 }

@@ -401,6 +401,105 @@ impl TaskFinalInfoCollector {
                     .collect(),
             })));
     }
+    /// Publish the already selected immutable core cut. Observation-window
+    /// policy and final-info validation belong to the core, not this owner seam.
+    /// Original RF/split sources are frozen by the host at this same boundary.
+    pub(crate) fn publish_core_cut(
+        &mut self,
+        ready: ComputationReadyToken,
+        cut: novarocks_attempt_protocol::publication::DiagnosticPublication,
+        runtime_filters: super::execution::ReleasedRuntimeFilterContributions,
+        split: ProfileSplitDiagnostic,
+        fragments: Box<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
+    ) -> Result<bool, super::error::TaskExecutionError> {
+        use novarocks_attempt_protocol::publication as core;
+        let exact = cut.ready.activation == ready.activation()
+            && cut.ready.root == ready.root()
+            && cut.ready.cut == ready.cut()
+            && cut.ready.diagnostic_deadline == ready.diagnostic_deadline()
+            && cut.ready.convergence_deadline == ready.convergence_deadline()
+            && cut.ready.end == ready.end();
+        if !exact || cut.tasks.len() != self.expected.len() {
+            return Err(super::error::TaskExecutionError::Schedule(
+                "core diagnostic cut differs from its original computation/Task binding".to_owned(),
+            ));
+        }
+        if cut
+            .tasks
+            .iter()
+            .zip(self.expected.iter())
+            .any(|((task, _), expected)| task != expected)
+            || fragments
+                .iter()
+                .map(|(task, _)| *task)
+                .ne(self.expected.iter().copied())
+        {
+            return Err(super::error::TaskExecutionError::Schedule(
+                "core diagnostic publication differs from its exact frozen Task order".to_owned(),
+            ));
+        }
+        self.begin_profile_observation(ready)?;
+        let publication = self
+            .publication
+            .as_ref()
+            .expect("original diagnostic observer was validated");
+        if publication.snapshot.borrow().is_some() {
+            return Ok(false);
+        }
+        let mut tasks = Vec::with_capacity(cut.tasks.len());
+        for (task, observation) in cut.tasks {
+            let observation = match observation {
+                core::DiagnosticTaskObservation::Available(info) => {
+                    if info.final_status().identity() != task {
+                        return Err(super::error::TaskExecutionError::Schedule(
+                            "core diagnostic payload names a foreign Task".to_owned(),
+                        ));
+                    }
+                    ProfileTaskDiagnostic::Available(Arc::from(info))
+                }
+                core::DiagnosticTaskObservation::Missing(missing) => {
+                    ProfileTaskDiagnostic::Missing(match missing {
+                        core::DiagnosticMissing::Unavailable(outcome) => {
+                            ProfileDiagnosticMissing::Unavailable(outcome)
+                        }
+                        core::DiagnosticMissing::ReadFailed => ProfileDiagnosticMissing::ReadFailed,
+                        core::DiagnosticMissing::TerminalMismatch => {
+                            ProfileDiagnosticMissing::TerminalMismatch
+                        }
+                        core::DiagnosticMissing::ReadPending => {
+                            ProfileDiagnosticMissing::ReadPending
+                        }
+                        core::DiagnosticMissing::TaskNotTerminal => {
+                            ProfileDiagnosticMissing::TaskNotTerminal
+                        }
+                        core::DiagnosticMissing::NotRead => ProfileDiagnosticMissing::NotRead,
+                    })
+                }
+            };
+            tasks.push((task, observation));
+        }
+        let closure = match cut.closure {
+            core::DiagnosticClosure::FrontierSettled => ProfileDiagnosticClosure::FrontierSettled,
+            core::DiagnosticClosure::ObservationDeadline => {
+                ProfileDiagnosticClosure::ObservationDeadline
+            }
+            core::DiagnosticClosure::Cancelled => ProfileDiagnosticClosure::Cancelled,
+        };
+        self.accepting = false;
+        self.final_info_closure = Some(closure);
+        publication
+            .snapshot
+            .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
+                ready,
+                closure,
+                runtime_filters,
+                split,
+                tasks: tasks.into_boxed_slice(),
+                fragments,
+            })));
+        Ok(true)
+    }
+
     pub(crate) fn stop_starting(&mut self) {
         self.accepting = false;
     }
@@ -495,3 +594,6 @@ impl TaskFinalInfoCollector {
 #[cfg(test)]
 #[path = "profile_diagnostics/property_tests.rs"]
 mod property_tests;
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod core_publication_tests;

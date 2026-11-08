@@ -29,8 +29,8 @@ use novarocks_execution_contract::{
     AbortParticipation, AcquireParticipationAdmissionTicket, AdmissionTicketId, CancelTask,
     ContentFingerprint, CredentialDomainId, CredentialEpoch, DomainVersion, EdgeOpenVersion,
     ExchangeEdgeId, LeaseSequence, LeaseValidFor, OperationEnvelope, ParticipationRef, PlanNodeId,
-    QuiesceParticipation, ReleaseParticipation, SplitOffer, TaskIdentity, TaskOperationId,
-    TaskStatus,
+    QuiesceParticipation, ReleaseParticipation, RenewParticipationLease, SplitOffer, TaskIdentity,
+    TaskOperationId, TaskStatus,
 };
 use novarocks_types::BackendProcessId;
 use std::num::NonZeroU64;
@@ -83,6 +83,7 @@ pub enum ParticipationDomainIntent {
         domain: CredentialDomainId,
         epoch: CredentialEpoch,
         material: PayloadRef,
+        queued_bytes: usize,
     },
 }
 
@@ -98,6 +99,7 @@ pub enum OperationIntent {
         initial_lease_sequence: LeaseSequence,
         initial_lease_valid_for: LeaseValidFor,
         material: PayloadRef,
+        queued_bytes: usize,
     },
     CreateTask {
         envelope: OperationEnvelope,
@@ -108,13 +110,14 @@ pub enum OperationIntent {
     UpdateTask {
         envelope: OperationEnvelope,
         identity: TaskIdentity,
-        domains: Vec<TaskDomainIntent>,
+        domains: std::sync::Arc<[TaskDomainIntent]>,
     },
-    UpdateParticipation {
+    AdvanceParticipationDomain {
         envelope: OperationEnvelope,
         participation: ParticipationRef,
-        domains: Vec<ParticipationDomainIntent>,
+        domain: ParticipationDomainIntent,
     },
+    RenewParticipationLease(RenewParticipationLease),
     CancelTask(CancelTask),
     QuiesceParticipation(QuiesceParticipation),
     AbortParticipation(AbortParticipation),
@@ -125,8 +128,11 @@ pub enum OperationIntent {
 pub struct DispatchBatch {
     pub backend: BackendProcessId,
     pub lane: DispatchLane,
+    pub control_progress: bool,
     pub operations: Box<[OperationIntent]>,
     pub queued_bytes: usize,
+    pub queued_at: MonotonicInstant,
+    pub queued_inputs: Box<[crate::input::QueuedInputGrantRef]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,15 +148,15 @@ pub enum EffectClass {
 pub enum PumpKind {
     SplitAssignment,
     DynamicFilters,
-    CredentialRotation,
 }
 
 #[derive(Clone, Debug)]
 pub enum Publication {
     RootStatus(Box<AttemptRootProjection>),
-    ProtocolTask(TaskStatus),
+    ProtocolBatch(crate::publication::ProtocolPublication),
     FinalTaskInfo(novarocks_execution_contract::FinalTaskInfo),
-    DevRootObservation(TaskStatus),
+    Diagnostics(crate::publication::DiagnosticPublication),
+    DevRootObservation { status: TaskStatus, installed: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -166,14 +172,10 @@ pub enum EffectBody {
     Withdraw {
         effect: AttemptEffectId,
     },
-    OpenSubscription {
-        participation: ParticipationRef,
-        generation: NonZeroU64,
-    },
-    AdjustReadWindow {
-        participation: ParticipationRef,
-        generation: NonZeroU64,
-    },
+    OpenSubscription(crate::observation::SubscriptionRequest),
+    /// Update the same generation's applied request record. This does not
+    /// alter or restart the immutable RPC. Reopen uses explicit Close/Open.
+    AdjustReadWindow(crate::observation::SubscriptionRequest),
     CloseSubscription {
         participation: ParticipationRef,
         generation: NonZeroU64,
@@ -192,23 +194,56 @@ pub enum EffectBody {
         pump: PayloadRef,
     },
     ReadDynamicFilters {
+        operation: TaskOperationId,
+        request: AttemptRequestToken,
         task: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+        advertised: DomainVersion,
+    },
+    AdmitDynamicFilterFeedback {
+        request: AttemptRequestToken,
+        task: TaskIdentity,
+        version: DomainVersion,
+        feedback: PayloadRef,
     },
     CollectDiagnostics {
+        request: AttemptRequestToken,
         task: TaskIdentity,
         deadline: MonotonicInstant,
+    },
+    ReleaseQueuedInput {
+        grant: crate::input::QueuedInputGrantRef,
     },
     ReleaseCreationPayload {
         task: TaskIdentity,
         payload: PayloadRef,
     },
+    /// First freeze the exact original Establish allocation in the canonical
+    /// host record, then forward its matching authorization request. The same
+    /// allocation is resolved by Native transport after the logical reply.
+    EstablishAuthorization {
+        operation: OperationIntent,
+        request: AttemptToLogical<AttemptFailure>,
+    },
     Port(AttemptToLogical<AttemptFailure>),
     Publish(Publication),
-    /// The original producer learns the actual core-accepted operation result.
+    /// Local admission is reported even when no remote operation was released.
+    PumpUpdateAdmitted {
+        pump: PayloadRef,
+        delivery: crate::input::SplitDeliveryRef,
+        settlement: Option<crate::split_delivery::SplitDeliverySettlement>,
+    },
+    /// The association begins only at the original operation release point.
+    PumpOperationReleased {
+        pump: PayloadRef,
+        delivery: crate::input::SplitDeliveryRef,
+        operation: TaskOperationId,
+    },
+    /// Preserve the exact receipt, including split watermarks and queue depth.
     PumpOperationSettled {
         pump: PayloadRef,
-        operation: TaskOperationId,
-        result: crate::operation::OperationDispatchResult,
+        delivery: crate::input::SplitDeliveryRef,
+        settlement: crate::split_delivery::SplitDeliverySettlement,
     },
 }
 
@@ -217,4 +252,140 @@ pub struct AttemptEffect {
     pub id: AttemptEffectId,
     pub class: EffectClass,
     pub body: EffectBody,
+}
+
+impl TaskDomainIntent {
+    pub const fn kind(&self) -> novarocks_execution_contract::TaskDomainKind {
+        use novarocks_execution_contract::TaskDomainKind as K;
+        match self {
+            Self::SplitAssignment { .. } => K::SplitAssignment,
+            Self::TaskDynamicFilter { .. } => K::TaskDynamicFilter,
+            Self::OpenExchangeEdges { .. } => K::OpenExchangeEdges,
+            Self::CloseExchangeDestination { .. } => K::CloseExchangeDestination,
+        }
+    }
+}
+
+impl ParticipationDomainIntent {
+    pub const fn kind(&self) -> novarocks_execution_contract::ParticipationDomainKind {
+        use novarocks_execution_contract::ParticipationDomainKind as K;
+        match self {
+            Self::CatalogBinding { .. } => K::CatalogBinding,
+            Self::SharedDynamicFilter { .. } => K::SharedDynamicFilter,
+            Self::Credential { .. } => K::Credential,
+        }
+    }
+}
+
+pub const OPERATION_FIXED_BYTES: usize = 256;
+
+impl OperationIntent {
+    pub fn envelope(&self) -> OperationEnvelope {
+        match self {
+            Self::AcquireParticipationAdmissionTicket(r) => r.envelope(),
+            Self::EstablishParticipation { envelope, .. }
+            | Self::CreateTask { envelope, .. }
+            | Self::UpdateTask { envelope, .. }
+            | Self::AdvanceParticipationDomain { envelope, .. } => *envelope,
+            Self::RenewParticipationLease(r) => r.envelope(),
+            Self::CancelTask(r) => r.envelope(),
+            Self::QuiesceParticipation(r) => r.envelope(),
+            Self::AbortParticipation(r) => r.envelope(),
+            Self::ReleaseParticipation(r) => r.envelope(),
+        }
+    }
+    pub fn operation_id(&self) -> TaskOperationId {
+        self.envelope().operation_id()
+    }
+    pub fn kind(&self) -> novarocks_execution_contract::OperationKind {
+        self.envelope().kind()
+    }
+    pub fn shape(&self) -> novarocks_execution_contract::OperationShape {
+        use novarocks_execution_contract::OperationShape as S;
+        match self {
+            Self::AcquireParticipationAdmissionTicket(_) => S::AcquireParticipationAdmissionTicket,
+            Self::EstablishParticipation { .. } => S::EstablishParticipation,
+            Self::CreateTask { .. } => S::CreateTask,
+            Self::UpdateTask { .. } => S::UpdateTask,
+            Self::AdvanceParticipationDomain { .. } => S::AdvanceParticipationDomain,
+            Self::RenewParticipationLease(_) => S::RenewParticipationLease,
+            Self::CancelTask(_) => S::CancelTask,
+            Self::QuiesceParticipation(_) => S::QuiesceParticipation,
+            Self::AbortParticipation(_) => S::AbortParticipation,
+            Self::ReleaseParticipation(_) => S::ReleaseParticipation,
+        }
+    }
+    pub fn lane(&self) -> DispatchLane {
+        crate::config::DispatchBudget::lane_of(self.shape())
+    }
+    pub fn backend_process_id(&self) -> BackendProcessId {
+        match self {
+            Self::AcquireParticipationAdmissionTicket(r) => r.participation().backend_process_id(),
+            Self::EstablishParticipation { participation, .. }
+            | Self::AdvanceParticipationDomain { participation, .. } => {
+                participation.backend_process_id()
+            }
+            Self::CreateTask { identity, .. } | Self::UpdateTask { identity, .. } => {
+                identity.backend_process_id()
+            }
+            Self::RenewParticipationLease(r) => r.participation().backend_process_id(),
+            Self::CancelTask(r) => r.identity().backend_process_id(),
+            Self::QuiesceParticipation(r) => r.participation().backend_process_id(),
+            Self::AbortParticipation(r) => r.participation().backend_process_id(),
+            Self::ReleaseParticipation(r) => r.participation().backend_process_id(),
+        }
+    }
+    pub fn requires_control_progress(&self) -> bool {
+        match self {
+            Self::AcquireParticipationAdmissionTicket(_)
+            | Self::EstablishParticipation { .. }
+            | Self::CreateTask { .. }
+            | Self::AdvanceParticipationDomain { .. } => false,
+            Self::UpdateTask { domains, .. } => {
+                !domains.is_empty()
+                    && domains.iter().all(|domain| {
+                        matches!(domain, TaskDomainIntent::CloseExchangeDestination { .. })
+                    })
+            }
+            Self::RenewParticipationLease(_)
+            | Self::CancelTask(_)
+            | Self::QuiesceParticipation(_)
+            | Self::AbortParticipation(_)
+            | Self::ReleaseParticipation(_) => true,
+        }
+    }
+    pub fn queued_bytes(&self) -> usize {
+        let payload = match self {
+            Self::CreateTask { queued_bytes, .. }
+            | Self::EstablishParticipation { queued_bytes, .. } => return *queued_bytes,
+            Self::UpdateTask { domains, .. } => {
+                domains.iter().map(TaskDomainIntent::queued_bytes).sum()
+            }
+            Self::AdvanceParticipationDomain { domain, .. } => domain.queued_bytes(),
+            _ => 0,
+        };
+        payload.saturating_add(OPERATION_FIXED_BYTES)
+    }
+}
+
+impl TaskDomainIntent {
+    /// Payload-side queue charge before the operation fixed allowance.
+    pub fn queued_bytes(&self) -> usize {
+        match self {
+            Self::SplitAssignment { queued_bytes, .. } => *queued_bytes,
+            Self::TaskDynamicFilter { payload, .. } => payload.queued_bytes,
+            Self::OpenExchangeEdges { edges, .. } => edges.len() * size_of::<u32>(),
+            Self::CloseExchangeDestination { .. } => size_of::<TaskIdentity>() + size_of::<u32>(),
+        }
+    }
+}
+impl ParticipationDomainIntent {
+    pub const fn queued_bytes(&self) -> usize {
+        match self {
+            Self::CatalogBinding { payload, .. } | Self::SharedDynamicFilter { payload, .. } => {
+                payload.queued_bytes
+            }
+            Self::Credential { queued_bytes, .. } => *queued_bytes,
+        }
+    }
 }

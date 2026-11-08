@@ -388,6 +388,38 @@ impl AttemptProtocolFactsPublisher {
         execution.clear_accepted_protocol_task_changes();
         Ok(published)
     }
+    /// Apply one core-authored accepted batch through the original publisher.
+    /// The original frozen allocation, PlanSeal, slot map, lock and notification
+    /// remain the only publication author; this method makes no protocol decision.
+    pub(super) fn publish_core_batch(
+        &mut self,
+        activation: AttemptActivationIdentity,
+        batch: novarocks_attempt_protocol::publication::ProtocolPublication,
+    ) -> Result<bool, TaskExecutionError> {
+        self.bind_identity(activation)?;
+        let mut seen = BTreeSet::new();
+        let mut updates = Vec::with_capacity(batch.changes.len());
+        for change in batch.changes {
+            let index = self.shared.frozen.index(change.identity)?;
+            if !seen.insert(index) {
+                return Err(protocol_error(
+                    "core publication repeats a frozen Task slot",
+                ));
+            }
+            updates.push(Update {
+                index,
+                status: change.status.map(Arc::new),
+                writer_witness: change.first_writer_witness.map(Arc::new),
+            });
+        }
+        self.publish_updates(
+            batch.owner_revision,
+            updates,
+            batch.selected_failure.as_ref(),
+            batch.root_success_sealed,
+        )
+    }
+
     fn publish_updates(
         &mut self,
         owner_revision: u64,
@@ -1146,6 +1178,145 @@ mod tests {
                 PerKind::empty(),
             )
             .is_ok()
+        );
+    }
+    #[test]
+    fn core_publication_rejects_duplicate_and_foreign_slots_before_atomic_transfer() {
+        use novarocks_attempt_protocol::publication::{ProtocolPublication, ProtocolTaskChange};
+        let (mut publisher, mut receiver) = pair(&[2]);
+        let batch = |changes| ProtocolPublication {
+            owner_revision: 1,
+            changes,
+            selected_failure: None,
+            root_success_sealed: false,
+        };
+        publisher
+            .publish_core_batch(
+                activation(1),
+                ProtocolPublication {
+                    owner_revision: 0,
+                    changes: Box::default(),
+                    selected_failure: None,
+                    root_success_sealed: false,
+                },
+            )
+            .unwrap();
+        take(&mut receiver);
+        let original_revision = *publisher.revisions.borrow();
+        for bad in [
+            vec![
+                ProtocolTaskChange {
+                    identity: identity(1),
+                    status: Some(status(1, 2)),
+                    first_writer_witness: None,
+                },
+                ProtocolTaskChange {
+                    identity: identity(1),
+                    status: Some(status(1, 3)),
+                    first_writer_witness: None,
+                },
+            ],
+            vec![
+                ProtocolTaskChange {
+                    identity: identity(1),
+                    status: Some(status(1, 2)),
+                    first_writer_witness: None,
+                },
+                ProtocolTaskChange {
+                    identity: identity(4),
+                    status: Some(status(4, 2)),
+                    first_writer_witness: None,
+                },
+            ],
+            vec![ProtocolTaskChange {
+                identity: identity(1),
+                status: Some(status(2, 2)),
+                first_writer_witness: None,
+            }],
+        ] {
+            assert!(
+                publisher
+                    .publish_core_batch(activation(1), batch(bad.into_boxed_slice()))
+                    .is_err()
+            );
+            assert_eq!(*publisher.revisions.borrow(), original_revision);
+            assert!(
+                receiver
+                    .take_changes(activation(1), identity(1), plan())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            publisher
+                .publish_core_batch(activation(2), batch(Box::default()))
+                .is_err()
+        );
+        assert_eq!(*publisher.revisions.borrow(), original_revision);
+        assert_eq!(publisher.activation, Some(activation(1)));
+    }
+
+    #[test]
+    fn core_publication_transfers_status_failure_witness_and_seal_in_one_revision() {
+        use novarocks_attempt_protocol::publication::{ProtocolPublication, ProtocolTaskChange};
+        let (mut publisher, mut receiver) = pair(&[2]);
+        publisher
+            .publish_core_batch(
+                activation(1),
+                ProtocolPublication {
+                    owner_revision: 0,
+                    changes: Box::default(),
+                    selected_failure: None,
+                    root_success_sealed: false,
+                },
+            )
+            .unwrap();
+        take(&mut receiver);
+        let previous = *publisher.revisions.borrow();
+        let witness = running(2, 2).with_writer(TaskWriterFacts::empty());
+        let failure = SelectedTaskTermination::new(
+            identity(3),
+            TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+        );
+        publisher
+            .publish_core_batch(
+                activation(1),
+                ProtocolPublication {
+                    owner_revision: 1,
+                    changes: Box::new([
+                        ProtocolTaskChange {
+                            identity: identity(1),
+                            status: Some(status(1, 2)),
+                            first_writer_witness: None,
+                        },
+                        ProtocolTaskChange {
+                            identity: identity(2),
+                            status: Some(status(2, 3)),
+                            first_writer_witness: Some(witness.clone()),
+                        },
+                    ]),
+                    selected_failure: Some(failure.clone()),
+                    root_success_sealed: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(*publisher.revisions.borrow(), previous + 1);
+        let delta = take(&mut receiver);
+        assert_eq!(delta.tasks.len(), 2);
+        assert_eq!(delta.selected_failure(), Some(&failure));
+        assert!(delta.root_success_sealed());
+        let writer = delta
+            .tasks
+            .iter()
+            .find(|task| task.identity == identity(2))
+            .unwrap();
+        assert_eq!(writer.status.as_deref(), Some(&status(2, 3)));
+        assert_eq!(writer.writer_witness.as_deref(), Some(&witness));
+        assert!(
+            receiver
+                .take_changes(activation(1), identity(1), plan())
+                .unwrap()
+                .is_none()
         );
     }
 }

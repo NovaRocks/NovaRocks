@@ -107,6 +107,7 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     runtime: ActorRuntime<TestActor>,
+    registration: ActorRegistration,
     work: WorkObligation,
     capacity: ReservationObligation,
     inputs: Vec<InputId>,
@@ -135,8 +136,8 @@ impl Fixture {
             .unwrap();
         work.start().unwrap();
         let runtime = ActorRuntime::new();
-        runtime
-            .register_next(
+        let registration = runtime
+            .register_bound(
                 actor(),
                 scope.clone(),
                 TestActor(work.reference()),
@@ -154,6 +155,7 @@ impl Fixture {
             ledger,
             scope,
             runtime,
+            registration,
             work,
             capacity,
             inputs: vec![],
@@ -285,4 +287,91 @@ fn indexing_preserves_atomic_batch_budget_and_prepaid_inventory() {
     assert_eq!(indexed.inputs, vec![input]);
     assert_eq!(indexed.units, 3);
     assert_eq!(values, vec![10, 20]);
+}
+
+#[test]
+fn pending_observation_includes_same_lane_tails_and_unindexed_batches_without_advancing() {
+    let mut f = Fixture::new();
+    f.send(vec![
+        effect(1, EffectRelease::Completed, 10),
+        effect(1, EffectRelease::Completed, 11),
+    ]);
+    f.send(vec![effect(2, EffectRelease::Completed, 20)]);
+    let mut dispatch =
+        EffectDispatch::with_completion_runtime(f.runtime.clone(), actor(), 3, Policy);
+    let before = dispatch
+        .try_observation(&f.runtime, &f.registration)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.runtime.states.pending, 3);
+    assert_eq!(before.runtime.unindexed_states.pending, 3);
+    assert_eq!(before.runtime.unindexed_batches, 2);
+    assert_eq!(before.indexed_routing_positions, 0);
+    assert_eq!(before.ready_markers, 0);
+    assert_eq!(
+        dispatch
+            .index_committed(&f.runtime, 3)
+            .unwrap()
+            .inputs
+            .len(),
+        1
+    );
+    let indexed = dispatch
+        .try_observation(&f.runtime, &f.registration)
+        .unwrap()
+        .unwrap();
+    assert_eq!(indexed.runtime.states.pending, 3);
+    assert_eq!(indexed.runtime.unindexed_states.pending, 1);
+    assert_eq!(indexed.runtime.unindexed_batches, 1);
+    assert_eq!(indexed.indexed_routing_positions, 2);
+    assert_eq!(
+        indexed.ready_markers, 1,
+        "one lane marker still has two pending records"
+    );
+    let first = dispatch.take_ready(&f.runtime, 3).unwrap().unwrap();
+    let started = dispatch
+        .try_observation(&f.runtime, &f.registration)
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.runtime.states.pending, 2);
+    assert_eq!(started.runtime.states.started, 1);
+    assert_eq!(
+        started.ready_markers, 0,
+        "an in-flight head cannot hide the tail from runtime pending inventory"
+    );
+    let completion = f.runtime.effect_completed_with_receipt(first).unwrap();
+    dispatch
+        .completion_observed_with_receipt(1, &completion)
+        .unwrap();
+    dispatch.index_committed(&f.runtime, 3).unwrap();
+    while let Some(ticket) = dispatch.take_ready(&f.runtime, 3).unwrap() {
+        let lane = ticket.effect.lane;
+        let completion = f.runtime.effect_completed_with_receipt(ticket).unwrap();
+        dispatch
+            .completion_observed_with_receipt(lane, &completion)
+            .unwrap();
+    }
+    let complete = dispatch
+        .try_observation(&f.runtime, &f.registration)
+        .unwrap()
+        .unwrap();
+    assert_eq!(complete.runtime.states.pending, 0);
+    assert_eq!(complete.runtime.states.completed, 3);
+    assert_eq!(complete.runtime.unindexed_batches, 0);
+    assert_eq!(complete.indexed_routing_positions, 0);
+    f.finish();
+}
+#[test]
+fn pending_observation_rejects_another_runtime_registration_instead_of_zero() {
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let dispatch = EffectDispatch::with_completion_runtime(f.runtime.clone(), actor(), 1, Policy);
+    assert!(matches!(
+        dispatch.try_observation(&f.runtime, &other.registration),
+        Err(crate::observation::EffectObservationError::Runtime(
+            ActorTurnError::EffectTicketOriginMismatch
+        ))
+    ));
+    other.finish();
+    f.finish();
 }

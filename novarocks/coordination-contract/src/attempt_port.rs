@@ -270,7 +270,7 @@ pub enum AttemptToLogicalBody<F> {
     RootStatus(Box<AttemptRootProjection>),
     SealResult {
         token: AttemptRequestToken,
-        result: Result<Box<[ResultParticipationWithdrawal]>, F>,
+        result: Result<std::sync::Arc<[ResultParticipationWithdrawal]>, F>,
     },
     TerminalControlResult {
         token: AttemptRequestToken,

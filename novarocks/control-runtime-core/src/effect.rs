@@ -41,6 +41,27 @@ pub enum EffectState {
     Completed,
     AbandonedByOwnerFailure,
 }
+/// Read-only counts of original effect records. They never grant dispatch,
+/// publication, completion, storage or Work authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EffectStateObservation {
+    pub pending: usize,
+    pub started: usize,
+    pub published: usize,
+    pub completed: usize,
+    pub abandoned: usize,
+}
+impl EffectStateObservation {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            pending: self.pending.checked_add(other.pending)?,
+            started: self.started.checked_add(other.started)?,
+            published: self.published.checked_add(other.published)?,
+            completed: self.completed.checked_add(other.completed)?,
+            abandoned: self.abandoned.checked_add(other.abandoned)?,
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchPhase {
     Building,
@@ -135,6 +156,21 @@ impl EffectBatchState {
         self.effects.is_empty()
     }
     /// The actual batch watermark; IDs need not be dense or start at one.
+    /// Same original records as dispatch, without cloning payloads/descriptors
+    /// or advancing any cursor. Individual counters cannot exceed record len.
+    pub fn observed_states(&self) -> EffectStateObservation {
+        let mut sample = EffectStateObservation::default();
+        for record in self.effects.values() {
+            match record.state {
+                EffectState::Pending => sample.pending += 1,
+                EffectState::Started => sample.started += 1,
+                EffectState::Published => sample.published += 1,
+                EffectState::Completed => sample.completed += 1,
+                EffectState::AbandonedByOwnerFailure => sample.abandoned += 1,
+            }
+        }
+        sample
+    }
     pub fn last_action_id(&self) -> Option<ActionId> {
         ActionId::new(self.last_action)
     }

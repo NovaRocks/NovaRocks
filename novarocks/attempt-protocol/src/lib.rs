@@ -43,7 +43,9 @@ pub mod ids;
 pub mod input;
 pub mod start;
 
+pub mod observation;
 pub mod operation;
+pub mod publication;
 
 /// The pure protocol surface frozen for host adapters and deterministic worlds.
 /// Implementations must finish application of one bounded input and charge all
@@ -59,3 +61,26 @@ pub trait AttemptCore: Sized {
     ) -> Vec<effect::AttemptEffect>;
     fn next_deadline(&self) -> Option<novarocks_coordination_contract::MonotonicInstant>;
 }
+
+pub mod completion;
+pub mod completion_facts;
+pub mod conclusion;
+pub mod domain_tracker;
+pub mod error;
+pub mod graph;
+pub mod lease;
+pub mod participation_owner;
+pub mod participation_state;
+pub mod status_validation;
+#[cfg(test)]
+mod test_support;
+
+pub mod dispatch;
+pub mod intent;
+pub mod remote_task;
+pub mod split_delivery;
+pub mod stage;
+
+pub mod execution;
+
+pub mod root_control;

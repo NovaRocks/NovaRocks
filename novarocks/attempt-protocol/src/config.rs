@@ -49,3 +49,36 @@ impl FrozenTransportLimits {
         items > 0 && items <= self.max_batch_items && encoded_bytes <= self.max_batch_encoded_bytes
     }
 }
+
+impl FrozenTransportLimits {
+    pub const fn max_batch_items(self) -> usize {
+        self.max_batch_items
+    }
+    pub const fn max_batch_encoded_bytes(self) -> usize {
+        self.max_batch_encoded_bytes
+    }
+    pub const fn max_descriptor_encoded_bytes(self) -> usize {
+        self.max_descriptor_encoded_bytes
+    }
+    pub const fn max_query_backend_queued_operations(self) -> usize {
+        self.max_query_backend_queued_operations
+    }
+    pub const fn max_query_backend_queued_bytes(self) -> usize {
+        self.max_query_backend_queued_bytes
+    }
+    pub const fn max_backend_queued_operations(self) -> usize {
+        self.max_backend_queued_operations
+    }
+    pub const fn max_backend_queued_bytes(self) -> usize {
+        self.max_backend_queued_bytes
+    }
+    pub const fn max_tasks_per_participation(self) -> usize {
+        self.max_tasks_per_participation
+    }
+    pub const fn max_active_tasks_per_backend(self) -> usize {
+        self.max_active_tasks_per_backend
+    }
+    pub const fn frontend_queue_residence(self) -> Duration {
+        self.frontend_queue_residence
+    }
+}

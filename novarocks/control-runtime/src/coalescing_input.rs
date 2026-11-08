@@ -56,7 +56,8 @@ impl<A: Actor, T: Merge> Clone for CoalescingInput<A, T> {
     }
 }
 impl<A: Actor, T: Merge> CoalescingInput<A, T> {
-    /// `standing` must be an idle, prepaid Ordinary input position.
+    /// `standing` must be an idle, prepaid input position. Its original Source
+    /// chooses the input class; constructing this wrapper grants no new credit.
     pub fn new(standing: StandingInputObligation<A>, project: fn(&T) -> A::Input) -> Self {
         Self(Arc::new(Inner {
             standing: Mutex::new(standing),

@@ -72,6 +72,13 @@ pub struct FrozenTaskGraph {
     pub edges: BTreeMap<ExchangeEdgeId, FrozenExchangeEdge>,
 }
 
+/// Original Establish carrier quote, frozen by its host allocation author.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenEstablish {
+    pub material: PayloadRef,
+    pub queued_bytes: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct FrozenAttemptPlan {
     pub graph: FrozenTaskGraph,
@@ -83,7 +90,7 @@ pub struct FrozenAttemptPlan {
     pub preparation_positions: BTreeMap<BackendProcessId, NonZeroUsize>,
     pub deployment_window: NonZeroUsize,
     /// Frozen original binding material, resolved only by the host executor.
-    pub establish_material: BTreeMap<ParticipationRef, PayloadRef>,
+    pub establish_material: BTreeMap<ParticipationRef, FrozenEstablish>,
     pub coordination: CoordinationBudgets,
     pub transport: FrozenTransportLimits,
     pub retry: TaskUpdateRetryPolicy,

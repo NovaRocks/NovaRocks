@@ -1660,8 +1660,12 @@ impl ScopeHandle {
         });
         if let Some(registrant) = registrant
             && let Err(RuntimeError::CapacityDenied(denial)) = &result
-            && state.capacity_waiters.register(registrant, *denial)
+            && let Some(new_logical) = state.capacity_waiters.register(registrant, *denial)
         {
+            self.runtime
+                .shared
+                .observation
+                .capacity_wait_registered(new_logical);
             self.runtime
                 .shared
                 .record(|| HistoryFact::CapacityWaitRegistered {

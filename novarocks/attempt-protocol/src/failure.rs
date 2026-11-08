@@ -70,13 +70,30 @@ pub struct ProtocolFailure {
     pub site: AttemptFailureSite,
 }
 
+/// The original typed host projection, including its unmodified site and phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostProjectedFailure {
+    pub original: HostFailureRef,
+    pub kind: HostFailureKind,
+    pub class: AttemptFailureClass,
+    pub site: AttemptFailureSite,
+}
+
+impl std::fmt::Display for HostProjectedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "host failure {:?} at {:?} (reference {})",
+            self.kind, self.site, self.original.0
+        )
+    }
+}
+impl std::error::Error for HostProjectedFailure {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttemptFailure {
     Protocol(ProtocolFailure),
-    Host {
-        original: HostFailureRef,
-        kind: HostFailureKind,
-        class: AttemptFailureClass,
-    },
+    TaskProtocol(Box<crate::error::TaskExecutionError>),
+    Host(HostProjectedFailure),
     SelectedTask(novarocks_coordination_contract::SelectedTaskTermination),
 }

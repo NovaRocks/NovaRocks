@@ -40,6 +40,7 @@ pub trait StepContext {
     fn reserve_queue_stage(
         &mut self,
         lane: DispatchLane,
+        control_progress: bool,
         target: BackendProcessId,
         records: usize,
         queued_bytes: usize,

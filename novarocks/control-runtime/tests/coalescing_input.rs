@@ -65,6 +65,16 @@ fn fixture() -> (
     ActorRuntime<Recorder>,
     CoalescingInput<Recorder, Signal>,
 ) {
+    fixture_with_class(InputClass::Ordinary)
+}
+fn fixture_with_class(
+    class: InputClass,
+) -> (
+    RuntimeLedger,
+    novarocks_control_runtime::transaction::ScopeHandle,
+    ActorRuntime<Recorder>,
+    CoalescingInput<Recorder, Signal>,
+) {
     let ledger = RuntimeLedger::new(ResourceVector::default());
     let scope = ledger
         .open_scope_next(None, Generation::new(1).unwrap())
@@ -86,7 +96,7 @@ fn fixture() -> (
         )
         .unwrap();
     let standing = runtime
-        .reserve_input(actor(), ActorId::new(2).unwrap(), InputClass::Ordinary)
+        .reserve_input(actor(), ActorId::new(2).unwrap(), class)
         .unwrap()
         .into_standing_input()
         .unwrap();
@@ -171,4 +181,18 @@ fn busy_refill_retains_the_original_update_and_waits_for_real_retirement() {
     runtime.retire_input(actor(), second).unwrap();
     input.after_retire().unwrap();
     assert_eq!(finish(ledger, scope, runtime, input), vec![1, 5]);
+}
+
+#[test]
+fn original_source_can_choose_a_prepaid_lifecycle_position() {
+    let (ledger, scope, runtime, input) = fixture_with_class(InputClass::Lifecycle);
+    let first = input.notify(Signal(1)).unwrap().unwrap();
+    input.notify(Signal(2)).unwrap();
+    runtime.poll_one(Tick(1)).unwrap();
+    runtime.retire_input(actor(), first).unwrap();
+    let second = input.after_retire().unwrap().unwrap();
+    runtime.poll_one(Tick(2)).unwrap();
+    runtime.retire_input(actor(), second).unwrap();
+    input.after_retire().unwrap();
+    assert_eq!(finish(ledger, scope, runtime, input), vec![1, 2]);
 }

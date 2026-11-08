@@ -2144,6 +2144,18 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<SlotId, (ActorTurnError, A)> {
+        self.register_bound(id, scope, actor, config)
+            .map(|registration| registration.attachment)
+    }
+    /// Install an unsupervised actor and return its original admission witness
+    /// atomically. Retaining this witness cannot bind an owner to a replacement.
+    pub fn register_bound(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
         self.register_inner(
             id,
             scope,
@@ -2152,7 +2164,6 @@ impl<A: Actor> ActorRuntime<A> {
             config,
             ActorFailurePolicy::IsolateScope,
         )
-        .map(|registration| registration.attachment)
     }
     /// Bind the original failure-cleanup role outside the actor's mutable
     /// state. Its pure failure hook receives only the role identity, even if
@@ -2958,7 +2969,7 @@ impl<A: Actor> ActorRuntime<A> {
     ) -> Result<bool, ActorTurnError> {
         self.flush_capacity_notifications();
         let result = {
-            let _deferral = crate::capacity_notification::TurnWakeDeferral::enter();
+            let _deferral = crate::capacity_notification::CapacityWakeDeferral::enter();
             self.poll_one_inner(observed, clock)
         };
         self.flush_capacity_notifications();
@@ -3357,6 +3368,71 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(ActorTurnError::UnknownInput)?
             .state
             .poll_ready(budget, generation)?)
+    }
+    /// Nonblocking observation of original committed batches. The caller's
+    /// original registration is qualified under the scheduler gate; the inbox
+    /// snapshot includes lane tails and batches after the supplied real cursor.
+    /// No ready/dispatch cursor is advanced and no payload is cloned.
+    pub fn try_effect_inventory_observation(
+        &self,
+        registration: &ActorRegistration,
+        indexed_through: Option<BatchId>,
+    ) -> Result<
+        Option<crate::observation::EffectInventoryObservation>,
+        crate::observation::EffectObservationError,
+    > {
+        use crate::observation::{EffectInventoryObservation, EffectObservationError};
+        let node = {
+            let state = match self.shared.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(EffectObservationError::Poisoned);
+                }
+            };
+            Self::validate_registration_in_state(&state, registration)
+                .map_err(EffectObservationError::Runtime)?;
+            state
+                .actors
+                .get(&registration.actor())
+                .expect("qualified original actor registration")
+                .clone()
+        };
+        let inbox = match node.inbox.try_lock() {
+            Ok(inbox) => inbox,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(EffectObservationError::Poisoned);
+            }
+        };
+        let mut sample = EffectInventoryObservation::default();
+        for (ordinal, input) in &inbox.batch_order {
+            let states = inbox
+                .batches
+                .get(input)
+                .expect("original committed batch order index")
+                .state
+                .observed_states();
+            sample.states = sample
+                .states
+                .checked_add(states)
+                .ok_or(EffectObservationError::InventoryOverflow)?;
+            sample.batches = sample
+                .batches
+                .checked_add(1)
+                .ok_or(EffectObservationError::InventoryOverflow)?;
+            if indexed_through.is_none_or(|cursor| *ordinal > cursor) {
+                sample.unindexed_states = sample
+                    .unindexed_states
+                    .checked_add(states)
+                    .ok_or(EffectObservationError::InventoryOverflow)?;
+                sample.unindexed_batches = sample
+                    .unindexed_batches
+                    .checked_add(1)
+                    .ok_or(EffectObservationError::InventoryOverflow)?;
+            }
+        }
+        Ok(Some(sample))
     }
     /// Actual bounded dependency metadata, also available to failed-owner
     /// cleanup. Payload custody stays exclusively in the original batch.
@@ -6653,5 +6729,127 @@ mod effect_ticket_incarnation_tests {
             fresh,
             "the same public ActorId cannot inherit an old ticket origin"
         );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod effect_observation_tests {
+    use super::*;
+    use crate::observation::EffectObservationError;
+    use crate::transaction::RuntimeLedger;
+    use novarocks_control_runtime_core::capacity::ResourceVector;
+    struct Empty;
+    impl Actor for Empty {
+        type Input = ();
+        type Effect = ();
+        fn timer_input(_: Tick) {}
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
+    }
+    #[test]
+    fn pending_observation_is_unavailable_on_scheduler_or_inbox_contention() {
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let registration = runtime
+            .register_bound(
+                ActorId::new(1).unwrap(),
+                scope.clone(),
+                Empty,
+                ActorConfig {
+                    mailbox: [1; 4],
+                    max_batches: 1,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+            )
+            .unwrap_or_else(|_| panic!("original actor admission"));
+        let before = scope.snapshot().unwrap();
+        let refused = runtime.register_bound(
+            registration.actor(),
+            scope.clone(),
+            Empty,
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "duplicate admission returns only its original actor"
+        );
+        assert_eq!(
+            scope.snapshot().unwrap().storage,
+            before.storage,
+            "failed admission rolls back its actual attachment"
+        );
+        let lock = runtime.shared.state.lock().unwrap();
+        assert_eq!(
+            runtime
+                .try_effect_inventory_observation(&registration, None)
+                .unwrap(),
+            None
+        );
+        drop(lock);
+        let node = runtime.node(registration.actor()).unwrap();
+        let lock = node.inbox.lock().unwrap();
+        assert_eq!(
+            runtime
+                .try_effect_inventory_observation(&registration, None)
+                .unwrap(),
+            None
+        );
+        drop(lock);
+        let sample = runtime
+            .try_effect_inventory_observation(&registration, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.batches, 0);
+        assert_eq!(sample.states.pending, 0);
+        scope.close_external().unwrap();
+        assert!(runtime.remove_actor(registration.actor()).is_ok());
+        assert_eq!(scope.snapshot().unwrap().storage, 0);
+        runtime.close_admission();
+        let other = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        assert!(
+            runtime
+                .register_bound(
+                    registration.actor(),
+                    other.clone(),
+                    Empty,
+                    ActorConfig {
+                        mailbox: [1; 4],
+                        max_batches: 1,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        turn_budget: 8,
+                        max_step_work: 1
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(other.snapshot().unwrap().storage, 0);
+        other.close_external().unwrap();
+        ledger.remove_scope(other.id()).unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(matches!(
+            runtime.try_effect_inventory_observation(&registration, None),
+            Err(EffectObservationError::Runtime(
+                ActorTurnError::UnknownActor
+            ))
+        ));
     }
 }

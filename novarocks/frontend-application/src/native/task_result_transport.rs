@@ -250,6 +250,45 @@ impl NativeTaskResultTransport {
         })
     }
 
+    /// Asynchronous form over the same original Client/cache. The admitted
+    /// executor supplies the operation identity; no ID or retry is minted here.
+    pub(crate) fn dynamic_filters_async(
+        &self,
+        operation: TaskOperationId,
+        identity: TaskIdentity,
+        acknowledged: Option<DomainVersion>,
+    ) -> BoxFuture<'_, Result<DynamicFilterRead, DynamicFilterReadError>> {
+        Box::pin(async move {
+            let (client, address) = self
+                .client_of(identity)
+                .map_err(DynamicFilterReadError::Refused)?;
+            let request = encode_dynamic_filter_request(operation, identity, acknowledged);
+            let expires_at = tokio::time::Instant::now() + DYNAMIC_FILTER_READ_TIMEOUT;
+            let mut grpc = tokio::time::timeout_at(
+                expires_at,
+                client.grpc_with_channel_error(NativeRpcMethod::FetchTaskDynamicFilters),
+            )
+            .await
+            .map_err(|_| {
+                DynamicFilterReadError::Unavailable(format!(
+                    "{address}: dynamic filter read could not acquire a channel in time"
+                ))
+            })?
+            .map_err(|error| DynamicFilterReadError::Unavailable(error.to_string()))?;
+            let response =
+                tokio::time::timeout_at(expires_at, grpc.fetch_task_dynamic_filters(request))
+                    .await
+                    .map_err(|_| {
+                        DynamicFilterReadError::Unavailable(format!(
+                            "{address}: dynamic filter read did not answer in time"
+                        ))
+                    })?
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| classify_dynamic_filter_status(&address, &error))?;
+            decode_dynamic_filter_response(&address, identity, response)
+        })
+    }
+
     fn client_of(&self, identity: TaskIdentity) -> Result<(&Client, String), String> {
         let process = identity.backend_process_id();
         let client = self.clients.get(&process).ok_or_else(|| {
@@ -748,5 +787,25 @@ mod tests {
     #[test]
     fn a_status_with_no_cause_reports_no_chain() {
         assert!(transport_error_chain(&tonic::Status::resource_exhausted("full")).is_empty());
+    }
+    #[tokio::test]
+    async fn core_publication_async_dynamic_read_preserves_original_refused_classification() {
+        let task = root();
+        let transport = NativeTaskResultTransport {
+            clients: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+            data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
+            grace: TaskReadGrace::new(std::time::Duration::from_secs(1)),
+        };
+        let original = match transport.client_of(task) {
+            Err(original) => original,
+            Ok(_) => panic!("the original task has no frozen Client"),
+        };
+        let reply = transport
+            .dynamic_filters_async(TaskOperationId::new_v7(), task, None)
+            .await;
+        assert!(
+            matches!(reply, Err(DynamicFilterReadError::Refused(detail)) if detail == original)
+        );
     }
 }
