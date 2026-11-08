@@ -1227,3 +1227,6 @@ impl ParticipationOwner {
         request.envelope().operation_id()
     }
 }
+
+#[cfg(test)]
+mod owner_failure_tests;

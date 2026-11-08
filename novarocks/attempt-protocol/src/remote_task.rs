@@ -1723,3 +1723,6 @@ mod bounded_discard_tests {
         assert_eq!(task.take_released_grant(), None);
     }
 }
+
+#[cfg(test)]
+mod destination_close_tests;

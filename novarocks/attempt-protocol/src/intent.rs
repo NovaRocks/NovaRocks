@@ -24,7 +24,7 @@ use novarocks_execution_contract::{
 use novarocks_types::BackendProcessId;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskOperationQueueRequest {
     pub backend: BackendProcessId,
     pub lane: DispatchLane,
