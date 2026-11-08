@@ -38,6 +38,7 @@ use std::time::Duration;
 pub(crate) enum PreReadyObservation {
     Unknown(BackendProcessId),
     RejectedIdentity {
+        task: Option<novarocks_execution_contract::TaskIdentity>,
         participation: ParticipationRef,
         operation: TaskOperationId,
         kind: OperationKind,
@@ -74,12 +75,16 @@ impl OriginalHorizon {
                 participation,
                 operation,
                 kind: OperationKind::UpdateParticipation,
+                ..
             } => execution.rejected_establish_observation_remaining(participation, operation),
             PreReadyObservation::RejectedIdentity {
+                task: Some(identity),
                 participation,
                 operation,
                 kind: OperationKind::CreateTask,
-            } => execution.rejected_create_observation_remaining(participation, operation),
+            } => {
+                execution.rejected_create_observation_remaining(identity, participation, operation)
+            }
             PreReadyObservation::RejectedIdentity { .. } => None,
         };
         Self {
@@ -255,11 +260,13 @@ impl TerminalController {
                         ..
                     },
             } => Some(PreReadyObservation::RejectedIdentity {
+                task: None,
                 participation: *participation,
                 operation: *operation_id,
                 kind: OperationKind::UpdateParticipation,
             }),
             TaskExecutionError::OperationFailed {
+                task: Some(identity),
                 participation,
                 operation_id,
                 kind: OperationKind::CreateTask,
@@ -269,6 +276,7 @@ impl TerminalController {
                         ..
                     },
             } => Some(PreReadyObservation::RejectedIdentity {
+                task: Some(*identity),
                 participation: *participation,
                 operation: *operation_id,
                 kind: OperationKind::CreateTask,
@@ -718,6 +726,7 @@ impl TerminalController {
                 participation,
                 operation,
                 kind,
+                ..
             } => {
                 if !window.open() {
                     self.close_observation();
@@ -810,6 +819,7 @@ mod tests {
         };
         AttemptFailure::TaskProtocol(Box::new(if create {
             TaskExecutionError::OperationFailed {
+                task: Some(crate::test_support::remote(1).identity()),
                 participation: part(),
                 operation_id: operation(10),
                 kind: OperationKind::CreateTask,

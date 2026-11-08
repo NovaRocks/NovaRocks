@@ -659,6 +659,7 @@ impl ParticipationOwner {
         }
         if let Some(_outcome) = ack.worker_outcome() {
             return Err(TaskExecutionError::OperationFailed {
+                task: None,
                 participation: self.participation,
                 operation_id: ack.operation_id(),
                 kind: OperationKind::QuiesceParticipation,
@@ -873,6 +874,7 @@ impl ParticipationOwner {
                 ));
             };
             return Err(TaskExecutionError::OperationFailed {
+                task: None,
                 participation: self.participation,
                 operation_id: ack.operation_id(),
                 kind: OperationKind::AcquireParticipationAdmissionTicket,
@@ -891,6 +893,7 @@ impl ParticipationOwner {
         if receipt.valid_for() != released.request.valid_for() {
             self.fail_admission();
             return Err(TaskExecutionError::OperationFailed {
+                task: None,
                 participation: self.participation,
                 operation_id: ack.operation_id(),
                 kind: OperationKind::AcquireParticipationAdmissionTicket,
@@ -982,6 +985,7 @@ impl ParticipationOwner {
             ))?;
             if lease.sequence() != released_sequence {
                 return Err(TaskExecutionError::OperationFailed {
+                    task: None,
                     participation: self.participation,
                     operation_id: ack.operation_id(),
                     kind: OperationKind::UpdateParticipation,
@@ -1015,7 +1019,7 @@ impl ParticipationOwner {
                         ParticipationTransition::Apply(state) => self.state = state,
                         ParticipationTransition::Idempotent => {}
                         _ => {
-                            return Err(TaskExecutionError::OperationFailed{participation:self.participation,operation_id:ack.operation_id(),kind:OperationKind::UpdateParticipation,rejection:novarocks_execution_contract::operation::OperationResult::Verdict{outcome:OperationOutcome::InvalidStateOrRequest,detail:ack.detail().cloned(),acknowledgement:None}});
+                            return Err(TaskExecutionError::OperationFailed{task:None,participation:self.participation,operation_id:ack.operation_id(),kind:OperationKind::UpdateParticipation,rejection:novarocks_execution_contract::operation::OperationResult::Verdict{outcome:OperationOutcome::InvalidStateOrRequest,detail:ack.detail().cloned(),acknowledgement:None}});
                         }
                     }
                 }
@@ -1089,6 +1093,7 @@ impl ParticipationOwner {
             });
         }
         Err(TaskExecutionError::OperationFailed {
+            task: None,
             participation: self.participation,
             operation_id: ack.operation_id(),
             kind: OperationKind::UpdateParticipation,
@@ -1198,6 +1203,7 @@ impl ParticipationOwner {
     /// Preserves the exact failed-owner verdict without claiming remote exit.
     fn owner_failure_error(&self, ack: &OperationAcknowledgement) -> TaskExecutionError {
         TaskExecutionError::OperationFailed {
+            task: None,
             participation: self.participation,
             operation_id: ack.operation_id(),
             kind: ack.kind(),

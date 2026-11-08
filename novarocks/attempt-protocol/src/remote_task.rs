@@ -1372,6 +1372,7 @@ impl RemoteTask {
         if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
             self.stand_down_after_owner_failure();
             return Err(TaskExecutionError::OperationFailed {
+                task: Some(self.identity),
                 participation: self.participation,
                 operation_id: ack.operation_id(),
                 kind: OperationKind::CancelTask,

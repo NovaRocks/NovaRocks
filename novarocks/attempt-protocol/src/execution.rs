@@ -854,16 +854,15 @@ impl QueryTaskExecution {
     /// snapshot. A participation/op correlation cannot manufacture that evidence.
     pub(crate) fn rejected_create_observation_remaining(
         &self,
+        identity: TaskIdentity,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
     ) -> Option<Duration> {
-        self.graph
-            .tasks()
-            .filter(|task| task.participation() == participation)
-            .find_map(|task| {
-                self.task_by_identity_ref(task.identity())?
-                    .rejected_create_observation_remaining(operation_id, self.now)
-            })
+        let task = self.task_by_identity_ref(identity)?;
+        if task.participation() != participation {
+            return None;
+        }
+        task.rejected_create_observation_remaining(operation_id, self.now)
     }
 
     /// Takes participations whose task-operation acknowledgement requires an
@@ -1258,6 +1257,48 @@ impl QueryTaskExecution {
             )),
         }
     }
+    /// The original Create gate and this Task's lazy Establish materialization.
+    /// The incremental candidate pass charges this one row before calling it.
+    pub(crate) fn create_candidate_for_task(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<Option<crate::remote_task::CreateCandidate>, TaskExecutionError> {
+        if !self.task_input_allowed(identity, false)? {
+            return Ok(None);
+        }
+        let participation = self
+            .task_by_identity_ref(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .participation();
+        if !self
+            .owners
+            .get(&participation)
+            .is_some_and(ParticipationOwner::may_pipeline_first_create)
+        {
+            return Ok(None);
+        }
+        let now = self.now;
+        self.task_by_identity(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .create_candidate(now)
+    }
+    /// Recheck the SAME owner before releasing this original passive request.
+    /// This is not a Native input grant or a physical-send authorization.
+    pub(crate) fn release_create_for_task(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<OperationIntent, TaskExecutionError> {
+        if self.create_candidate_for_task(identity)?.is_none() {
+            return Err(TaskExecutionError::Schedule(
+                "Create release has no current original candidate".into(),
+            ));
+        }
+        let now = self.now;
+        self.task_by_identity(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .release_create(now)
+    }
+
     /// Original external split/filter entry. Drain rejects NEW updates; this
     /// differs from an already admitted input's late grant disposition, and
     /// from the original internal exact-close continuation kept during drain.
@@ -1589,9 +1630,9 @@ impl QueryTaskExecution {
             .task_mut_observed(task_id, &self.stage_demand)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let participation = task.participation();
+        let identity = task.identity();
         match ack.kind() {
             OperationKind::CreateTask => {
-                let identity = task.identity();
                 let participation = task.participation();
                 let was_owned = task.create_ownership_proven();
                 let participation_established = self
@@ -1614,6 +1655,7 @@ impl QueryTaskExecution {
                 if !matches!(settlement, CreateSettlement::Created) {
                     if let CreateSettlement::FailedClosed(_) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
+                            task: Some(identity),
                             participation,
                             operation_id: ack.operation_id(),
                             kind: OperationKind::CreateTask,
@@ -1645,6 +1687,7 @@ impl QueryTaskExecution {
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
                 UpdateSettlement::FailedClosed(_) => Err(TaskExecutionError::OperationFailed {
+                    task: Some(identity),
                     participation,
                     operation_id: ack.operation_id(),
                     kind: OperationKind::UpdateTask,
@@ -1717,17 +1760,10 @@ impl QueryTaskExecution {
         match ack.kind() {
             OperationKind::AcquireParticipationAdmissionTicket => owner.on_admission_ack(ack, now),
             OperationKind::UpdateParticipation => {
-                owner.on_participation_ack(ack)?;
-                if owner.establish_acknowledged() {
-                    for stage in self.stages.values_mut() {
-                        for (_, mut task) in stage.tasks_mut_observed(&self.stage_demand) {
-                            if task.participation() == participation {
-                                task.on_participation_established();
-                            }
-                        }
-                    }
-                }
-                Ok(())
+                // The original owner is the immediate Establish fact. Each
+                // Task materializes its replay eligibility at its own priced
+                // candidate/release access, without an ACK-time graph fanout.
+                owner.on_participation_ack(ack)
             }
             OperationKind::QuiesceParticipation => {
                 let receipt = owner.on_quiesce_ack(ack)?;
@@ -1742,6 +1778,7 @@ impl QueryTaskExecution {
                     .and_then(|settlement| match settlement {
                         ReleaseSettlement::FailedClosed(_) => {
                             Err(TaskExecutionError::OperationFailed {
+                                task: None,
                                 participation,
                                 operation_id: ack.operation_id(),
                                 kind: OperationKind::ReleaseParticipation,
@@ -3012,9 +3049,16 @@ impl QueryTaskExecution {
         identity: TaskIdentity,
     ) -> Option<crate::stage::TaskMutation<'_>> {
         let (stage_id, task_id) = self.locate(identity)?;
-        self.stages
+        let participation = self.stages.get(&stage_id)?.task(task_id)?.participation();
+        let established = self.owners.get(&participation)?.establish_acknowledged();
+        let mut task = self
+            .stages
             .get_mut(&stage_id)?
-            .task_mut_observed(task_id, &self.stage_demand)
+            .task_mut_observed(task_id, &self.stage_demand)?;
+        if established {
+            task.on_participation_established();
+        }
+        Some(task)
     }
 
     fn task_by_identity_ref(&self, identity: TaskIdentity) -> Option<&RemoteTask> {
@@ -3342,6 +3386,207 @@ mod bounded_drain_tests {
         execution
             .apply_published(&status, &mut StatusReport::default())
             .unwrap();
+    }
+    fn begin_test_establish(
+        execution: &mut QueryTaskExecution,
+        participation: ParticipationRef,
+    ) -> OperationIntent {
+        use crate::input::{AckPayload, OperationReplyResult};
+        use novarocks_execution_contract::{
+            AdmissionTicketId, OperationOutcome, ParticipationAdmissionTicketReceipt,
+        };
+        let now = execution.now;
+        let owner = execution.owners.get_mut(&participation).unwrap();
+        let OperationIntent::AcquireParticipationAdmissionTicket(request) = owner
+            .admission_intent(now, &mut execution.ids)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("original admission request")
+        };
+        owner
+            .on_admission_ack(
+                &OperationAcknowledgement {
+                    operation_id: request.envelope().operation_id(),
+                    kind: OperationKind::AcquireParticipationAdmissionTicket,
+                    result: OperationReplyResult::Worker(
+                        novarocks_execution_contract::operation::OperationResult::Verdict {
+                            outcome: OperationOutcome::Accepted,
+                            detail: None,
+                            acknowledgement: Some(AckPayload::AdmissionTicket(
+                                ParticipationAdmissionTicketReceipt::new(
+                                    AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                                    participation,
+                                    request.valid_for(),
+                                ),
+                            )),
+                        },
+                    ),
+                },
+                now,
+            )
+            .unwrap();
+        let intent = owner
+            .establish_intent(
+                ParticipationEstablishFacts {
+                    material: PayloadRef(NonZeroU64::new(900).unwrap()),
+                    queued_bytes: 256,
+                },
+                now,
+                &mut execution.ids,
+            )
+            .unwrap()
+            .unwrap();
+        execution
+            .establish_send_started(participation, intent.operation_id())
+            .unwrap();
+        intent
+    }
+    fn refusal_reply(
+        operation_id: TaskOperationId,
+        outcome: novarocks_execution_contract::OperationOutcome,
+    ) -> OperationAcknowledgement {
+        OperationAcknowledgement {
+            operation_id,
+            kind: OperationKind::CreateTask,
+            result: crate::input::OperationReplyResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome,
+                    detail: None,
+                    acknowledgement: None,
+                },
+            ),
+        }
+    }
+    #[test]
+    fn exact_task_refusal_keeps_its_original_horizon_without_finding_a_sibling() {
+        use novarocks_execution_contract::OperationOutcome;
+        let mut execution = many_tasks(128);
+        let refused = identity(&execution, 128);
+        let sibling = identity(&execution, 1);
+        let participation = execution.task(refused.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let op = enqueue_create(&mut execution, refused, grant(1));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        let error = execution
+            .acknowledge(&refusal_reply(op, OperationOutcome::IdentityMismatch))
+            .unwrap_err();
+        assert!(
+            matches!(error, TaskExecutionError::OperationFailed { task: Some(task), .. } if task == refused)
+        );
+        let original = execution
+            .rejected_create_observation_remaining(refused, participation, op)
+            .unwrap();
+        assert!(original > Duration::ZERO);
+        assert_eq!(
+            execution.rejected_create_observation_remaining(sibling, participation, op),
+            None
+        );
+        let foreign = crate::test_support::remote(2).participation();
+        assert_eq!(
+            execution.rejected_create_observation_remaining(refused, foreign, op),
+            None
+        );
+        let unrelated_operation = execution.ids.issue();
+        assert_eq!(
+            execution.rejected_create_observation_remaining(
+                refused,
+                participation,
+                unrelated_operation
+            ),
+            None
+        );
+        let mut controller = crate::terminal::TerminalController::new();
+        controller
+            .record_execution_failure(error, &execution)
+            .unwrap();
+        assert!(
+            matches!(controller.observation(), Some(crate::terminal::PreReadyObservation::RejectedIdentity {
+            task: Some(task), participation: part, operation, kind: OperationKind::CreateTask
+        }) if task == refused && part == participation && operation == op)
+        );
+        execution
+            .set_now(execution.now.saturating_add(Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(
+            execution.rejected_create_observation_remaining(refused, participation, op),
+            Some(original.saturating_sub(Duration::from_millis(1)))
+        );
+    }
+    #[test]
+    fn pipelined_not_ready_create_becomes_sendable_on_exact_owner_establish_at_its_own_access() {
+        use crate::input::{AckPayload, OperationReplyResult};
+        use novarocks_execution_contract::{LeaseReceipt, OperationOutcome, ParticipationReceipt};
+        let mut execution = many_tasks(128);
+        let task = identity(&execution, 128);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        let establish = begin_test_establish(&mut execution, participation);
+        let op = enqueue_create(&mut execution, task, grant(1));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        execution
+            .acknowledge(&refusal_reply(op, OperationOutcome::NotReady))
+            .unwrap();
+        assert!(execution.create_candidate_for_task(task).unwrap().is_none());
+        assert!(execution.release_create_for_task(task).is_err());
+        let OperationIntent::EstablishParticipation {
+            initial_lease_sequence,
+            initial_lease_valid_for,
+            ..
+        } = establish
+        else {
+            panic!("same immutable Establish")
+        };
+        execution
+            .acknowledge_participation(
+                participation,
+                &OperationAcknowledgement {
+                    operation_id: establish.operation_id(),
+                    kind: OperationKind::UpdateParticipation,
+                    result: OperationReplyResult::Worker(
+                        novarocks_execution_contract::operation::OperationResult::Verdict {
+                            outcome: OperationOutcome::Accepted,
+                            detail: None,
+                            acknowledgement: Some(AckPayload::Participation(
+                                ParticipationReceipt::new(
+                                    participation,
+                                    novarocks_execution_contract::ParticipationState::Active,
+                                )
+                                .with_lease(LeaseReceipt::new(
+                                    initial_lease_sequence,
+                                    initial_lease_valid_for,
+                                    initial_lease_valid_for.get(),
+                                )),
+                            )),
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        assert!(
+            execution
+                .owner(participation)
+                .unwrap()
+                .establish_acknowledged()
+        );
+        assert_eq!(
+            execution
+                .create_candidate_for_task(task)
+                .unwrap()
+                .unwrap()
+                .operation_id(),
+            op
+        );
+        assert_eq!(
+            execution
+                .release_create_for_task(task)
+                .unwrap()
+                .operation_id(),
+            op
+        );
+        assert!(execution.create_candidate_for_task(task).unwrap().is_none());
+        assert!(execution.release_create_for_task(task).is_err());
     }
     #[test]
     fn expiry_keeps_original_priority_first_error_and_frozen_clock_across_charged_turns() {

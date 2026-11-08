@@ -31,7 +31,7 @@ use crate::status_validation::FinalInfoDisagreement;
 use novarocks_coordination_contract::StatusObservation;
 use novarocks_execution_contract::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
-    ParticipationRef, RequestError, TaskOperationId, TaskState,
+    ParticipationRef, RequestError, TaskIdentity, TaskOperationId, TaskState,
 };
 use novarocks_types::identity::BackendProcessId;
 
@@ -136,6 +136,9 @@ pub enum TaskExecutionError {
     },
     /// A backend answered an operation with an outcome that fails the attempt.
     OperationFailed {
+        /// Exact Task owner, when this is a Task operation. Lifecycle failures
+        /// have no Task; callers must not reconstruct one by scanning a graph.
+        task: Option<TaskIdentity>,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
         kind: OperationKind,
