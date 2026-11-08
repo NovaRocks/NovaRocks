@@ -985,7 +985,7 @@ pub(crate) mod tests {
             Some(17),
             370,
             10,
-            196_609,
+            16_384,
         );
         let expected_definition = fixture.definition.clone();
         let expected_inputs = fixture.publication.as_ref().unwrap().inputs.clone();
