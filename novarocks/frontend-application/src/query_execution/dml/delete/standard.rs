@@ -314,11 +314,37 @@ fn delete_position_sink_query_ast(
     let select = build::select(
         projection,
         vec![build::relation(build::table(name, version, None))],
-        Some(where_clause.clone()),
+        Some(delete_selection_for_query(where_clause)),
         ast::GroupBy::None,
     )
     .map_err(|error| format!("internal DELETE query construction failed: {error}"))?;
     Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+}
+
+/// Preserve the grouping at DELETE's generated-query boundary while retaining
+/// the original predicate leaves and their source locations.
+fn delete_selection_for_query(selection: &Expr) -> Expr {
+    use ast::Fold;
+    struct SelectionGrouping;
+    impl ast::Fold for SelectionGrouping {
+        fn fold_expr(&mut self, expression: Expr) -> Expr {
+            let expression = ast::fold_expr(self, expression);
+            let Expr::Binary(binary) = expression else {
+                return expression;
+            };
+            if !matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) {
+                return Expr::Binary(binary);
+            }
+            let mut right = *binary.right;
+            if matches!(&right, Expr::Binary(value) if value.operator == binary.operator) {
+                right = build::nested(right);
+            }
+            // Rebalance exactly once after grouping the original children.
+            // Revisiting newly balanced nodes would introduce extra groups.
+            build::binary(*binary.left, binary.operator, right)
+        }
+    }
+    SelectionGrouping.fold_expr(selection.clone())
 }
 
 #[cfg(debug_assertions)]
@@ -1047,6 +1073,74 @@ mod tests {
                 "the old literal path consumed the branch backslash"
             );
         }
+    }
+
+    #[test]
+    fn delete_position_sink_retains_boolean_grouping_and_source_leaves() {
+        use novarocks_parser::ast::{self, SyntaxEq, Visit};
+        #[derive(Default)]
+        struct Leaves(Vec<Expr>);
+        impl ast::Visit for Leaves {
+            fn visit_expr(&mut self, expression: &Expr) {
+                if matches!(expression, Expr::Identifier(_) | Expr::Literal(_)) {
+                    self.0.push(expression.clone());
+                }
+                ast::walk_expr(self, expression);
+            }
+        }
+        let target = crate::catalog_application::resolver::TargetBackend {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "orders".into(),
+        };
+        let columns = [
+            column("_file", DataType::Utf8),
+            column("_pos", DataType::Int64),
+        ];
+        for operator in ["OR", "AND"] {
+            for count in [4, 8] {
+                let input = (1..=count)
+                    .map(|value| format!("id = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(&format!(" {operator} "));
+                let expected = if count == 4 {
+                    format!("id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4)")
+                } else {
+                    format!(
+                        "id = 1 {operator} id = 2 {operator} (id = 3 {operator} id = 4) \
+                         {operator} (id = 5 {operator} id = 6 {operator} (id = 7 {operator} id = 8))"
+                    )
+                };
+                let original = where_expr(&input);
+                let query =
+                    super::build_delete_position_sink_query(&target, &original, &columns, "main")
+                        .unwrap();
+                let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                    panic!("DELETE selection query");
+                };
+                let actual = select.selection.as_ref().unwrap();
+                assert!(actual.syntax_eq(&where_expr(&expected)), "{input}");
+                let mut original_leaves = Leaves::default();
+                let mut actual_leaves = Leaves::default();
+                original_leaves.visit_expr(&original);
+                actual_leaves.visit_expr(actual);
+                assert_eq!(actual_leaves.0, original_leaves.0, "{input}");
+            }
+        }
+        let predicate = where_expr(
+            "id <= 18000 OR (id > 20000 AND id <= 38000) \
+             OR (id > 40000 AND id <= 58000) OR (id > 60000 AND id <= 78000)",
+        );
+        let query =
+            super::build_delete_position_sink_query(&target, &predicate, &columns, "main").unwrap();
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("DELETE selection query");
+        };
+        assert!(select.selection.as_ref().unwrap().syntax_eq(&where_expr(
+            "id <= 18000 OR (id > 20000 AND id <= 38000) \
+             OR ((id > 40000 AND id <= 58000) OR (id > 60000 AND id <= 78000))"
+        )));
     }
 
     // --------------- Timestamp predicate tests ---------------
