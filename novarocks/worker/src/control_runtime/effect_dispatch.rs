@@ -123,6 +123,7 @@ pub(crate) enum DispatchError {
     Capacity,
     InvalidPublication,
     MissingMetadata,
+    InvalidCandidate,
 }
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -135,6 +136,9 @@ impl std::fmt::Display for DispatchError {
             }
             Self::MissingMetadata => {
                 f.write_str("Worker effect lost its original routing metadata")
+            }
+            Self::InvalidCandidate => {
+                f.write_str("Worker effect candidate differs from its original ready head")
             }
         }
     }
@@ -154,6 +158,7 @@ impl From<effect_dispatch::DispatchError> for DispatchError {
             effect_dispatch::DispatchError::Capacity => Self::Capacity,
             effect_dispatch::DispatchError::InvalidPublication => Self::InvalidPublication,
             effect_dispatch::DispatchError::MissingMetadata => Self::MissingMetadata,
+            effect_dispatch::DispatchError::InvalidCandidate => Self::InvalidCandidate,
         }
     }
 }

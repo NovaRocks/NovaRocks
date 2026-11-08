@@ -3528,15 +3528,22 @@ impl<A: Actor> ActorRuntime<A> {
         }
         Ok(batch.payloads.get(&action).cloned())
     }
-    /// Start is synchronized with the same failure fence as batch commitment.
-    pub fn take_effect(
+    /// Observe only this original host's exact effect start gate. This shares
+    /// the same inbox -> ledger predicate as `take_effect`, without advancing
+    /// a pending cursor, cloning a payload, or claiming a ticket/Work. A later
+    /// claim must still revalidate because stop/failure may race this sample.
+    pub fn effect_ready_for(
         &self,
-        actor: ActorId,
+        host: &ActorHostTurn<A>,
         input: InputId,
         action: ActionId,
-    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
-        let node = self.node(actor)?;
-        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+    ) -> Result<bool, ActorTurnError> {
+        if !host.active || !self.same_runtime(&host.runtime) {
+            return Err(ActorTurnError::EffectTicketOriginMismatch);
+        }
+        self.validate_registration(&host.registration())?;
+        let node = &host.node;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
         let execution_scope = node.scope.current_scope();
         let ledger = execution_scope
             .runtime
@@ -3544,18 +3551,28 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let descriptor = inbox
+        Self::effect_start_status(node, &inbox, &ledger, &execution_scope, input, action)
+            .map(|(ready, _)| ready)
+    }
+    fn effect_start_status(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        execution_scope: &ScopeHandle,
+        input: InputId,
+        action: ActionId,
+    ) -> Result<(bool, Generation), ActorTurnError> {
+        let batch = inbox
             .batches
             .get(&input)
-            .ok_or(ActorTurnError::UnknownInput)?
+            .ok_or(ActorTurnError::UnknownInput)?;
+        let descriptor = batch
             .state
             .record(action)
             .ok_or(EffectError::UnknownAction)?
-            .descriptor()
-            .clone();
+            .descriptor();
         let author_generation =
-            Self::action_author_generation(&node, &inbox, &ledger, input, &descriptor)?;
-        let generation = inbox.generation;
+            Self::action_author_generation(node, inbox, ledger, input, descriptor)?;
         if !node.scope.retained()
             && ledger
                 .scopes
@@ -3580,18 +3597,48 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failed && inbox.failure_input != Some(input) {
             return Err(ActorTurnError::ActorFailed);
         }
+        if stopped
+            && descriptor.kind == novarocks_control_runtime_core::effect::EffectKind::Business
+        {
+            return Ok((false, author_generation));
+        }
+        Ok((
+            batch.state.ready(action, inbox.generation)?,
+            author_generation,
+        ))
+    }
+    /// Start is synchronized with the same failure fence as batch commitment.
+    pub fn take_effect(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        action: ActionId,
+    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let (ready, author_generation) =
+            Self::effect_start_status(&node, &inbox, &ledger, &execution_scope, input, action)?;
+        if !ready {
+            return Err(EffectError::NotReady.into());
+        }
+        let generation = inbox.generation;
         let batch = inbox
             .batches
             .get_mut(&input)
-            .ok_or(ActorTurnError::UnknownInput)?;
-        if stopped
-            && batch.state.record(action).is_some_and(|effect| {
-                effect.descriptor().kind
-                    == novarocks_control_runtime_core::effect::EffectKind::Business
-            })
-        {
-            return Err(EffectError::NotReady.into());
-        }
+            .expect("the qualified original batch remains locked");
+        let descriptor = batch
+            .state
+            .record(action)
+            .expect("the qualified original action remains locked")
+            .descriptor()
+            .clone();
         batch.state.start(action, generation)?;
         self.shared.record(|| HistoryFact::Effect {
             target: node.history_target(),

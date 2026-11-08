@@ -21,8 +21,9 @@
 
 use crate::actor::Actor;
 use crate::actor_turn::{
-    ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
+    ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
 };
+use crate::sync::Arc;
 use novarocks_control_runtime_core::{
     effect::EffectState,
     identity::{ActionId, ActorId, BatchId, InputId},
@@ -63,10 +64,31 @@ struct Lane {
     entries: VecDeque<Entry>,
     in_flight: Option<EffectRef>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Ready<K> {
     Direct(EffectRef),
     Lane(K),
+}
+/// A non-authorizing sample of one original ready marker. Its host borrow
+/// retains the actual actor incarnation; only an exact claim can issue a
+/// ticket. Metadata is absent when the original runtime start gate is blocked.
+pub struct EffectCandidate<'h, A: Actor, K> {
+    origin: Arc<()>,
+    runtime: ActorRuntime<A>,
+    host: &'h ActorHostTurn<A>,
+    marker: Ready<K>,
+    effect: EffectRef,
+    metadata: Option<A::Effect>,
+}
+impl<A: Actor, K> EffectCandidate<'_, A, K> {
+    pub fn effect_ref(&self) -> EffectRef {
+        self.effect
+    }
+    /// None requires no Source loan: defer this same marker and inspect only
+    /// another bounded candidate. Some is a sample, never a start guarantee.
+    pub fn metadata(&self) -> Option<&A::Effect> {
+        self.metadata.as_ref()
+    }
 }
 #[derive(Debug)]
 pub enum DispatchError {
@@ -75,6 +97,7 @@ pub enum DispatchError {
     Capacity,
     InvalidPublication,
     MissingMetadata,
+    InvalidCandidate,
 }
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,6 +109,9 @@ impl std::fmt::Display for DispatchError {
                 f.write_str("effect publication fact is missing or out of order")
             }
             Self::MissingMetadata => f.write_str("effect lost its original routing metadata"),
+            Self::InvalidCandidate => {
+                f.write_str("effect candidate is foreign or no longer the current ready head")
+            }
         }
     }
 }
@@ -114,6 +140,7 @@ pub struct EffectDispatchObservation {
 }
 pub struct EffectDispatch<A: Actor, P: EffectLanePolicy<A>> {
     actor: ActorId,
+    origin: Arc<()>,
     completion_runtime: Option<ActorRuntime<A>>,
     policy: P,
     after: Option<BatchId>,
@@ -131,6 +158,7 @@ where
         assert!(limit > 0, "effect routing positions are prepaid");
         Self {
             actor,
+            origin: Arc::new(()),
             completion_runtime: None,
             policy,
             after: None,
@@ -211,6 +239,150 @@ where
             result.units += units;
         }
         Ok(result)
+    }
+    /// Peek at exactly one indexed head, without taking or rotating it. The
+    /// actual host registration and runtime start predicate qualify this sample
+    /// before any Source loan is borrowed. Only eligible metadata is cloned,
+    /// under the existing neutral, bounded Clone contract; no callback runs
+    /// under a runtime lock. A::Effect must not hide a large body clone here.
+    pub fn peek_candidate<'h>(
+        &self,
+        runtime: &ActorRuntime<A>,
+        host: &'h ActorHostTurn<A>,
+    ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
+        self.validate_candidate_host(runtime, host)?;
+        let Some(marker) = self.ready.front().copied() else {
+            return Ok(None);
+        };
+        let entry = self.candidate_entry(marker)?;
+        let metadata = if runtime.effect_ready_for(host, entry.effect.input, entry.effect.action)? {
+            Some(
+                runtime
+                    .pending_effect_metadata(self.actor, entry.effect.input, entry.effect.action)?
+                    .ok_or(DispatchError::MissingMetadata)?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(EffectCandidate {
+            origin: self.origin.clone(),
+            runtime: runtime.clone(),
+            host,
+            marker,
+            effect: entry.effect,
+            metadata,
+        }))
+    }
+    /// Claim only the sampled original head. NotReady preserves its marker and
+    /// returns None, never another ticket. The caller still owns its original
+    /// Source loan on every refusal and must return it before deferring.
+    pub fn claim_candidate(
+        &mut self,
+        runtime: &ActorRuntime<A>,
+        candidate: &EffectCandidate<'_, A, P::LaneKey>,
+    ) -> Result<Option<EffectTicket<A::Effect>>, DispatchError> {
+        if !runtime.same_runtime(&candidate.runtime) {
+            return Err(DispatchError::InvalidCandidate);
+        }
+        let entry = self.validate_candidate(candidate)?;
+        let ticket = match runtime.take_effect(self.actor, entry.effect.input, entry.effect.action)
+        {
+            Ok(ticket) => ticket,
+            Err(ActorTurnError::Effect(
+                novarocks_control_runtime_core::effect::EffectError::NotReady,
+            )) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.ready
+            .pop_front()
+            .expect("the validated original ready marker");
+        match candidate.marker {
+            Ready::Direct(_) => self.indexed -= 1,
+            Ready::Lane(key) if entry.release != EffectRelease::Started => {
+                self.lanes
+                    .get_mut(&key)
+                    .expect("the original lane")
+                    .in_flight = Some(entry.effect);
+            }
+            Ready::Lane(key) => self.pop_lane(key, entry.effect),
+        }
+        Ok(Some(ticket))
+    }
+    /// Rotate only this current original ready marker once. The runtime effect
+    /// remains Pending and a lane's tail cannot overtake its head. No ticket,
+    /// Work, quota or second queue is created. Charge each visit/defer and retain
+    /// a finite pass boundary across budget yields; all-blocked/all-Full passes
+    /// must park for real readiness/loan-retirement changes, not self-notify.
+    /// Actual executor handoff refusal remains the original host's custody duty.
+    pub fn defer_candidate(
+        &mut self,
+        candidate: &EffectCandidate<'_, A, P::LaneKey>,
+    ) -> Result<(), DispatchError> {
+        self.validate_candidate(candidate)?;
+        let marker = self
+            .ready
+            .pop_front()
+            .expect("the validated original ready marker");
+        self.ready.push_back(marker);
+        Ok(())
+    }
+    fn validate_candidate_host(
+        &self,
+        runtime: &ActorRuntime<A>,
+        host: &ActorHostTurn<A>,
+    ) -> Result<(), DispatchError> {
+        if host.actor() != self.actor
+            || self
+                .completion_runtime
+                .as_ref()
+                .is_some_and(|original| !original.same_runtime(runtime))
+        {
+            return Err(DispatchError::InvalidCandidate);
+        }
+        runtime.validate_registration(&host.registration())?;
+        if runtime.snapshot(self.actor)?.failed {
+            return Err(DispatchError::OwnerFailed);
+        }
+        Ok(())
+    }
+    fn candidate_entry(&self, marker: Ready<P::LaneKey>) -> Result<Entry, DispatchError> {
+        match marker {
+            Ready::Direct(effect) => Ok(Entry {
+                effect,
+                release: EffectRelease::Started,
+            }),
+            Ready::Lane(key) => {
+                let lane = self
+                    .lanes
+                    .get(&key)
+                    .ok_or(DispatchError::InvalidCandidate)?;
+                if lane.in_flight.is_some() {
+                    return Err(DispatchError::InvalidCandidate);
+                }
+                lane.entries
+                    .front()
+                    .copied()
+                    .ok_or(DispatchError::InvalidCandidate)
+            }
+        }
+    }
+    fn validate_candidate(
+        &self,
+        candidate: &EffectCandidate<'_, A, P::LaneKey>,
+    ) -> Result<Entry, DispatchError> {
+        if !Arc::ptr_eq(&self.origin, &candidate.origin)
+            || self.ready.front().copied() != Some(candidate.marker)
+        {
+            return Err(DispatchError::InvalidCandidate);
+        }
+        self.validate_candidate_host(&candidate.runtime, candidate.host)?;
+        let entry = self.candidate_entry(candidate.marker)?;
+        if entry.effect != candidate.effect {
+            return Err(DispatchError::InvalidCandidate);
+        }
+        Ok(entry)
     }
     pub fn take_ready(
         &mut self,
