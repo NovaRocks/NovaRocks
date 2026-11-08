@@ -20,6 +20,8 @@
 //! protocol input cannot overtake an outstanding old inline QA call; its reply,
 //! actual exit and original credit progress remain independently reachable.
 
+pub(crate) mod establish;
+
 #[cfg(test)]
 mod tests;
 
