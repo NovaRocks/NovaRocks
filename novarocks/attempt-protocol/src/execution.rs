@@ -636,6 +636,11 @@ impl QueryTaskExecution {
                 .or_default()
                 .push(task.identity());
         }
+        // Preserve the original stage/task traversal, including the first
+        // membership contradiction and the mutations preceding that error.
+        for tasks in tasks_by_participation.values_mut() {
+            tasks.sort_unstable_by_key(|task| (task.stage_id(), task.task_id()));
+        }
         for (&participation, &tasks) in &tasks_per_participation {
             let admission_epoch_capability = admission_epochs
                 .get(&participation.backend_process_id())
@@ -3587,6 +3592,95 @@ mod bounded_drain_tests {
         );
         assert!(execution.create_candidate_for_task(task).unwrap().is_none());
         assert!(execution.release_create_for_task(task).is_err());
+    }
+    #[test]
+    fn quiesce_membership_preserves_stage_task_failure_and_mutation_order() {
+        let seed = crate::test_support::remote(1);
+        let participation = seed.participation();
+        let mut tasks = BTreeMap::new();
+        let mut stages: BTreeMap<StageId, Vec<TaskIdentity>> = BTreeMap::new();
+        let mut identities = Vec::new();
+        // Task-id order deliberately differs from the original stage/task order.
+        for (value, stage_value) in [(1, 2), (2, 1), (3, 1)] {
+            let id = TaskId::new(value).unwrap();
+            let stage = StageId::new(stage_value).unwrap();
+            let identity = TaskIdentity::new(
+                seed.identity().query_execution_id(),
+                stage,
+                id,
+                seed.identity().backend_process_id(),
+            );
+            tasks.insert(
+                id,
+                FrozenTask {
+                    identity,
+                    participation,
+                    task_key: UniqueId::new(i64::from(value), 1),
+                    fragment_id: stage_value as i32,
+                    split_plan_nodes: Box::new([]),
+                    creation: FrozenCreation {
+                        resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),
+                        queued_bytes: 256,
+                        plan_carrier_bytes: 0,
+                        descriptor_encoded_bytes: 0,
+                    },
+                },
+            );
+            stages.entry(stage).or_default().push(identity);
+            identities.push(identity);
+        }
+        let graph = TaskGraph::from_frozen(FrozenTaskGraph {
+            root: identities[0],
+            tasks,
+            stages: stages
+                .into_iter()
+                .map(|(stage, tasks)| (stage, tasks.into_boxed_slice()))
+                .collect(),
+            edges: BTreeMap::new(),
+        })
+        .unwrap();
+        let mut execution = crate::test_support::execution_with_graph(graph);
+        // Real installed snapshots establish ownership independently of the
+        // first Quiesce receipt. Both omissions are therefore contradictions.
+        for identity in [identities[0], identities[2]] {
+            execution
+                .apply_published(
+                    &TaskStatus::created(identity).with_installed(),
+                    &mut StatusReport::default(),
+                )
+                .unwrap();
+            assert!(
+                execution
+                    .task_by_identity_ref(identity)
+                    .unwrap()
+                    .create_ownership_proven()
+            );
+        }
+        let receipt = QuiesceParticipationReceipt::new(
+            participation,
+            1,
+            Vec::new(),
+            novarocks_execution_contract::ParticipationState::Quiescing,
+        );
+        let result = execution.apply_quiesce_membership(participation, &receipt);
+        assert!(
+            matches!(result, Err(TaskExecutionError::DomainReceipt(message))
+            if message == format!("quiesce omitted previously accepted task {}", identities[2]))
+        );
+        // Stage 1 / Task 2 precedes the first contradiction; its accepted
+        // fence remains real even though Stage 1 / Task 3 rejects the receipt.
+        assert!(
+            execution
+                .task_by_identity_ref(identities[1])
+                .unwrap()
+                .fenced_out()
+        );
+        assert!(
+            !execution
+                .task_by_identity_ref(identities[0])
+                .unwrap()
+                .fenced_out()
+        );
     }
     #[test]
     fn expiry_keeps_original_priority_first_error_and_frozen_clock_across_charged_turns() {
