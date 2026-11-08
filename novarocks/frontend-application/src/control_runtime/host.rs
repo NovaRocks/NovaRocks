@@ -20,6 +20,9 @@
 //! This layer never manufactures a Work from a descriptor identity, never
 //! executes an effect body, and never counts transport quota outside the ledger.
 
+#[cfg(test)]
+mod purpose_tests;
+
 use super::{
     actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendLaneKey},
     metrics::FrontendHostObservations,
@@ -56,13 +59,21 @@ pub(crate) struct PreparedEffectJob {
 pub(crate) trait EffectExecutor: Send + Sync + 'static {
     /// A temporary refusal must arrange the original host's real availability
     /// wake before returning the full job. Retrying uses no timer or new Work.
+    /// Refusal concerns this executor's shared metadata handoff availability.
+    /// Per-purpose workload/transport Full is handled by the already-admitted
+    /// credentialed job, not by refusing it while accepting another purpose.
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob>;
 }
 /// A result position loan from the original admitted per-actor Source. The
 /// callback returns None only after arranging an actual credit/retirement wake.
 /// It may not issue Work by reconstructing a descriptor's numeric WorkId.
 pub(crate) trait EffectSource: Send + 'static {
-    fn prepay_result(&mut self) -> Option<CausalInputObligation<FrontendActor>>;
+    /// The original, exact pending metadata selects its own already-priced
+    /// purpose role. The host has not claimed its ticket or step guard yet.
+    fn prepay_result(
+        &mut self,
+        effect: &FrontendEffect,
+    ) -> Option<CausalInputObligation<FrontendActor>>;
     /// Binding is an already-preflighted original transfer: retrieve the exact
     /// step guard under this ticket, bind its original Work/report/captures and
     /// keep ExitCustody with this Source. Scope failure is handled by the later
@@ -102,6 +113,10 @@ pub(crate) trait EffectSource: Send + 'static {
 }
 pub(crate) struct SourceProgress {
     pub(crate) units: usize,
+    /// Actual original state changed, including a purpose loan becoming
+    /// available. Cursor inspection and self-notification alone are not
+    /// progress. A real credit wake consumed during a partial host scan must
+    /// preserve this fact so an earlier Full candidate can be revisited.
     pub(crate) progressed: bool,
     pub(crate) more: bool,
     pub(crate) retired: bool,
@@ -129,7 +144,11 @@ struct HostMachine {
     policy: FrontendLanePolicy,
     source: Box<dyn EffectSource>,
     executor: Arc<dyn EffectExecutor>,
-    prepaid: Option<CausalInputObligation<FrontendActor>>,
+    // A finite pass over original ready markers survives host-budget yield.
+    // Resetting this to ready.len() on every turn would busy-loop when all
+    // purposes are Full and ready markers outnumber one host allowance.
+    scan_remaining: Option<usize>,
+    rescan_requested: bool,
     pending: Option<PendingHandoff>,
     external_closed: bool,
 }
@@ -274,7 +293,8 @@ impl HostRegistry {
                     policy: binding.policy,
                     source: binding.source,
                     executor: binding.executor,
-                    prepaid: None,
+                    scan_remaining: None,
+                    rescan_requested: false,
                     pending: None,
                     external_closed: false,
                 })),
@@ -406,9 +426,7 @@ impl HostRegistry {
             .host_turn(began, progress.units, progress.handoffs);
         if progress.retired {
             assert!(
-                machine.pending.is_none()
-                    && machine.prepaid.is_none()
-                    && machine.dispatch.is_empty(),
+                machine.pending.is_none() && machine.dispatch.is_empty(),
                 "retired Source has returned every original host object"
             );
             // Source progress already destroyed rich captures and retired all
@@ -466,15 +484,32 @@ impl HostRegistry {
     ) -> Result<HostProgress, HostError> {
         let mut budget = entry.budget;
         let mut handoffs = 0;
+        // Every dispatch observation can race the Core's real failure fence,
+        // including indexing and defer after a Source callback. Preserve the
+        // original custodian turn rather than escalating that race to abort.
+        macro_rules! original_dispatch {
+            ($operation:expr) => {
+                match $operation {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if owner_failed_dispatch(&self.runtime, &entry.registration, &error)? {
+                            machine.scan_remaining = None;
+                            return Ok(HostProgress {
+                                units: entry.budget - budget,
+                                handoffs,
+                                more: true,
+                                retired: false,
+                            });
+                        }
+                        return Err(error.into());
+                    }
+                }
+            };
+        }
         let failed = self.runtime.snapshot(entry.registration.actor())?.failed;
         if entry.close_requested.load(Ordering::Acquire) && !machine.external_closed {
             machine.source.close_external();
             machine.external_closed = true;
-        }
-        if (failed || machine.source.result_admission_closed())
-            && let Some(prepaid) = machine.prepaid.take()
-        {
-            machine.source.return_unclaimed_result(prepaid);
         }
         if failed && let Some(pending) = machine.pending.take() {
             machine.source.owner_failed_pending(pending);
@@ -487,6 +522,9 @@ impl HostRegistry {
             "Source work uses the original finite host allowance"
         );
         budget -= retired.units;
+        if retired.progressed && machine.scan_remaining.is_some() {
+            machine.rescan_requested = true;
+        }
         if retired.retired {
             if failed && !machine.dispatch.is_empty() {
                 let drained = machine
@@ -521,38 +559,96 @@ impl HostRegistry {
         }
         let mut blocked = false;
         if budget != 0 {
-            let indexed = machine.dispatch.index_committed(&self.runtime, budget)?;
+            let indexed =
+                original_dispatch!(machine.dispatch.index_committed(&self.runtime, budget));
             budget -= indexed.units;
+            if !indexed.inputs.is_empty() && machine.scan_remaining.is_some() {
+                machine.rescan_requested = true;
+            }
             machine.source.core_consumed(&indexed.inputs);
         }
         while budget != 0 {
             if machine.pending.is_none() {
-                if machine.dispatch.ready_positions() == 0 {
-                    break;
-                }
-                if machine.prepaid.is_none() {
-                    machine.prepaid = machine.source.prepay_result();
-                }
-                let Some(prepaid) = machine.prepaid.take() else {
+                if machine.source.result_admission_closed() {
                     blocked = true;
                     break;
+                }
+                let remaining = machine
+                    .scan_remaining
+                    .get_or_insert_with(|| machine.dispatch.ready_positions());
+                if *remaining == 0 {
+                    break;
+                }
+                // A visit is paid even when this purpose is Full or the
+                // original dependency/stop predicate currently blocks it.
+                *remaining -= 1;
+                budget -= 1;
+                let candidate = match machine.dispatch.peek_candidate(&self.runtime, turn) {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => {
+                        machine.scan_remaining = Some(0);
+                        break;
+                    }
+                    Err(error)
+                        if owner_failed_dispatch(&self.runtime, &entry.registration, &error)? =>
+                    {
+                        machine.scan_remaining = None;
+                        return Ok(HostProgress {
+                            units: entry.budget - budget,
+                            handoffs,
+                            more: true,
+                            retired: false,
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
                 };
-                // Prepay precedes both the exclusive ticket and step-guard
-                // claim. The Source has already installed its real credit wake.
-                let Some(ticket) = machine.dispatch.take_ready(&self.runtime, budget)? else {
-                    machine.prepaid = Some(prepaid);
-                    blocked = true;
-                    break;
+                let Some(metadata) = candidate.metadata() else {
+                    original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    continue;
+                };
+                let Some(prepaid) = machine.source.prepay_result(metadata) else {
+                    // Rotate this same original marker, never its same-lane
+                    // tail. An independent purpose may have its own paid role.
+                    original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    continue;
+                };
+                // Prepay precedes this exact ticket and its step-guard claim.
+                // A gate changing after peek returns the same unclaimed role;
+                // the next visit rechecks readiness before borrowing again.
+                let ticket = match machine.dispatch.claim_candidate(&self.runtime, &candidate) {
+                    Ok(Some(ticket)) => ticket,
+                    Ok(None) => {
+                        machine.source.return_unclaimed_result(prepaid);
+                        original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                        continue;
+                    }
+                    Err(error) => {
+                        machine.source.return_unclaimed_result(prepaid);
+                        if owner_failed_dispatch(&self.runtime, &entry.registration, &error)? {
+                            machine.scan_remaining = None;
+                            return Ok(HostProgress {
+                                units: entry.budget - budget,
+                                handoffs,
+                                more: true,
+                                retired: false,
+                            });
+                        }
+                        return Err(error.into());
+                    }
                 };
                 let job = machine
                     .source
                     .bind_job(&self.runtime, turn, &ticket, prepaid);
                 machine.pending = Some(PendingHandoff { ticket, job });
+                if budget == 0 {
+                    break;
+                }
             }
             let pending = machine
                 .pending
                 .take()
                 .expect("one original prepared handoff");
+            budget -= 1;
             match machine.executor.handoff(pending.job) {
                 Err(job) => {
                     machine.pending = Some(PendingHandoff {
@@ -569,25 +665,61 @@ impl HostRegistry {
                         .effect_completed_with_receipt(pending.ticket)
                         .map_err(|refusal| HostError::Runtime(refusal.error))?;
                     if let Some((key, EffectRelease::Completed)) = lane {
-                        machine
-                            .dispatch
-                            .completion_observed_with_receipt(key, &receipt)?;
+                        original_dispatch!(
+                            machine
+                                .dispatch
+                                .completion_observed_with_receipt(key, &receipt)
+                        );
+                    }
+                    if machine.scan_remaining.is_some() {
+                        // This actual completion may expose a same-lane head
+                        // or satisfy an earlier deferred head's dependency.
+                        // Its wake can be consumed before a yielded old pass
+                        // ends, so retain the real change through that cut.
+                        machine.rescan_requested = true;
                     }
                     handoffs += 1;
-                    budget -= 1;
                 }
             }
         }
+        let mut rescan = false;
+        if machine.scan_remaining == Some(0) {
+            machine.scan_remaining = None;
+            rescan = std::mem::take(&mut machine.rescan_requested);
+            // An exhausted pass is not work. In particular, all-Full must
+            // await actual purpose-credit change rather than restarting a lap.
+            blocked |= machine.pending.is_none() && !rescan;
+        }
         let more = retired.more
+            || rescan
+            || machine.dispatch.has_unindexed(&self.runtime)?
             || (!blocked
-                && (machine.dispatch.has_unindexed(&self.runtime)?
-                    || (budget == 0 && machine.dispatch.ready_positions() != 0)));
+                && budget == 0
+                && (machine.pending.is_some() || machine.scan_remaining.is_some_and(|n| n != 0)));
         Ok(HostProgress {
             units: entry.budget - budget,
             handoffs,
             more,
             retired: false,
         })
+    }
+}
+fn owner_failed_dispatch(
+    runtime: &ActorRuntime<FrontendActor>,
+    registration: &ActorRegistration,
+    error: &DispatchError,
+) -> Result<bool, ActorTurnError> {
+    match error {
+        DispatchError::OwnerFailed | DispatchError::Runtime(ActorTurnError::ActorFailed) => {
+            Ok(true)
+        }
+        // The original financial-author check can precede ActorFailed. Keep
+        // that exact error when its author alone is invalid; only an actually
+        // failed Core may enter the existing failure-custodian turn here.
+        DispatchError::Runtime(ActorTurnError::InputAuthorInactive) => {
+            Ok(runtime.snapshot(registration.actor())?.failed)
+        }
+        _ => Ok(false),
     }
 }
 struct HostProgress {
@@ -675,7 +807,10 @@ mod tests {
         closing: bool,
     }
     impl EffectSource for MetadataSource {
-        fn prepay_result(&mut self) -> Option<CausalInputObligation<FrontendActor>> {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
             unreachable!("this metadata actor has no effect bodies")
         }
         fn bind_job(
@@ -896,7 +1031,10 @@ mod tests {
         report_consumed: bool,
     }
     impl EffectSource for RealSource {
-        fn prepay_result(&mut self) -> Option<CausalInputObligation<FrontendActor>> {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
             self.result.take()
         }
         fn bind_job(
